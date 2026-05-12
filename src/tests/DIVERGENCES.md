@@ -15,10 +15,8 @@ survive the mask are real port drift.
 
 | source | tier | tag | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|---------|---------|---------------|--------------------------|
-| src/tests/DiagAnalyze.pas | tier2 | pragma | 3 | 3 | rc | `CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a); INSERT INTO t VALUES(1,1),(2,2),(3...` |
-| src/tests/DiagBloom.pas | tier2 | dql | 9 | 1 | rc | `CREATE TABLE sqlite_stat1(tbl,idx,stat)` |
 
-_End of file._
+_End of file — corpus is clean (2259/2259 scripts match the C oracle)._
 
 Phase 9.1.divbug.2 (2026-05-12) closed the 3-site PRAGMA shape cluster
 (DiagPragma `mmap_size` x2 + DiagTxn `journal_mode`) — `passqlite3codegen.pas`
@@ -31,5 +29,16 @@ Phase 9.1.divbug.3 (2026-05-12) closed the 1-site `DROP INDEX` errmsg
 truncation in `sqlite3DropIndex` (`passqlite3codegen.pas:38974`) — message
 now formats `"no such index: %s"` via `sqlite3MPrintf` (build.c:4614).
 
-Remaining open clusters: 9.1.divbug.4 (DiagAnalyze rc x3),
-9.1.divbug.8 (DiagBloom stat1 rc x1).
+Phase 9.1.divbug.4 + 9.1.divbug.8 (2026-05-12) closed the remaining 4 sites
+(DiagAnalyze x3 + DiagBloom x1) with a single root-cause fix in
+`sqlite3WritableSchema` (`passqlite3codegen.pas:36421`).  The flag check
+was using bit `0x20` (`SQLITE_CacheSpill`, sqliteInt.h:1834) instead of
+`0x01` (`SQLITE_WriteSchema`, sqliteInt.h:1829), so writable_schema read as
+permanently ON.  `sqlite3CheckObjectName` short-circuited on every CREATE,
+letting callers hand-create `sqlite_stat1` / any `sqlite_*` table where C
+returns `SQLITE_ERROR "object name reserved for internal use"`
+(build.c:1054..1060).  Companion fix in `passqlite3shell.pas:8540` —
+`paramTableInit` now toggles `SQLITE_DBCONFIG_WRITABLE_SCHEMA` around the
+`CREATE TABLE IF NOT EXISTS temp.sqlite_parameters` to match
+`bind_table_init` (shell.c.in:2964).  Final corpus: 2259/2259 OK, 0
+divergences; explain parity 1026/1026; regression 88/88.

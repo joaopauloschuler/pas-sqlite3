@@ -36420,8 +36420,8 @@ end;
 { sqlite3WritableSchema — return 1 if PRAGMA writable_schema is on (build.c:1009) }
 function sqlite3WritableSchema(db: PTsqlite3): i32;
 begin
-  { Check SQLITE_WriteSchema flag (bit 0x00000020 of db.flags) }
-  if (db^.flags and u64($00000020)) <> 0 then Result := 1 else Result := 0;
+  { Check SQLITE_WriteSchema flag (bit 0x00000001 of db.flags — sqliteInt.h:1829). }
+  if (db^.flags and SQLITE_WriteSchema) <> 0 then Result := 1 else Result := 0;
 end;
 
 { sqlite3CheckObjectName — port of build.c:1031.

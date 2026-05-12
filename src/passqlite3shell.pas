@@ -8533,9 +8533,10 @@ end;
 
 { 10.1.11 — `.parameter init|list|set|unset|clear`  (shell.c.in:10264..10367).
 
-  Bind-parameter table lives in TEMP.sqlite_parameters; the upstream
-  defensive/writable_schema toggles around bind_table_init are skipped
-  here — defensive mode is not engaged in this Pascal cut. }
+  Bind-parameter table lives in TEMP.sqlite_parameters; mirror the
+  upstream bind_table_init (shell.c.in:2964) by toggling
+  WRITABLE_SCHEMA on around the CREATE so the reserved "sqlite_"
+  prefix is accepted, then restoring the prior setting. }
 
 procedure paramTableInit(p: PShellState);
 const
@@ -8544,9 +8545,15 @@ const
     '  key TEXT PRIMARY KEY,'#10 +
     '  value'#10 +
     ') WITHOUT ROWID;';
+var
+  wrSchema: i32;
 begin
   if p^.db = nil then Exit;
+  wrSchema := 0;
+  sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_WRITABLE_SCHEMA, -1, @wrSchema);
+  sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_WRITABLE_SCHEMA,  1, nil);
   sqlite3_exec(p^.db, zCreate, nil, nil, nil);
+  sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_WRITABLE_SCHEMA, wrSchema, nil);
 end;
 
 function looksLikeSqlLiteral(const z: AnsiString): Boolean;

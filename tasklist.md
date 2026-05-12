@@ -278,8 +278,15 @@ regressions without human triage.
     `"no such index: %s"` with `pItem^.zName` via `sqlite3MPrintf` + free,
     matching C `build.c:4614` `"no such index: %S"` for the common
     non-quoted/non-attached case.  Closed 1/1 site.*
-  - [ ] **9.1.divbug.4** DiagAnalyze full-script rc divergence (3 sites)
+  - [X] **9.1.divbug.4** DiagAnalyze full-script rc divergence (3 sites)
     — ANALYZE itself runs but exit rc differs.
+    *Landed 2026-05-12: root cause was `sqlite3WritableSchema`
+    (`passqlite3codegen.pas:36421`) reading bit `0x20`
+    (`SQLITE_CacheSpill`) instead of `0x01` (`SQLITE_WriteSchema`,
+    sqliteInt.h:1829), so `sqlite3CheckObjectName` (build.c:1031..1064)
+    short-circuited on `writable_schema=ON` for every CREATE — users could
+    fabricate `sqlite_stat1` rows that then collided with the real ANALYZE
+    insert path.  Fixed the mask; same patch closes divbug.8.*
   - [ ] **9.1.divbug.5** db-blob: DiagFeatureProbe ALTER COLUMN arm —
     on-disk schema bytes diverge after rename.  Likely related to the
     sqlite3AddColumn drift arms closed in 6.28.4 or a downstream
@@ -289,8 +296,14 @@ regressions without human triage.
   - [ ] **9.1.divbug.7** db-blob: DiagDropTable — diverge after DROP
     TABLE (orphaned pages? freelist linkage? schema cookie?).  Verify
     against `sqlite3DropTable` + `clearDatabasePage` arms in build.c.
-  - [ ] **9.1.divbug.8** DiagBloom pre-existing sqlite_stat1 (1 site) —
+  - [X] **9.1.divbug.8** DiagBloom pre-existing sqlite_stat1 (1 site) —
     Pascal side emits an extra row when stat1 is already populated.
+    *Landed 2026-05-12 alongside divbug.4 via the same `SQLITE_WriteSchema`
+    bit-mask fix.  Companion shell fix in `passqlite3shell.pas:8540`
+    (`paramTableInit` now toggles `SQLITE_DBCONFIG_WRITABLE_SCHEMA` around
+    `CREATE TABLE IF NOT EXISTS temp.sqlite_parameters`, mirroring
+    `bind_table_init` shell.c.in:2964).  Corpus 4 → 0 divergences;
+    explain parity 1026/1026; regression 88/88.*
 
 - [ ] **9.1.5** Tag corpus categories by status: `pas-strict`
   (byte-identical), `pas-soft` (output identical, db differs in
