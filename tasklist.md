@@ -909,9 +909,9 @@ partial landings cannot silently no-op.
   - [X] **10.1f.0** `.backup` — gated by `src/tests/TestShellBackup.pas` (byte-parity vs upstream).
   - [X] **10.1f.1** `.restore` — gated by `src/tests/TestShellBackup.pas` (round-trip + byte-parity).
   - [X] **10.1f.2** `.clone` — gated by `src/tests/TestShellBackup.pas` (byte-parity + content diff).
-  - [ ] **10.1f.3** `.archive`/`.ar`
-  - [ ] **10.1f.4** `.session`
-  - [ ] **10.1f.5** `.recover`
+  - [X] **10.1f.3** `.archive`/`.ar` — gated by `src/tests/TestShellArchive.pas` (byte-parity vs upstream: create/list-verbose/glob-filter/extract-roundtrip/--dryrun/--help).
+  - [X] **10.1f.4** `.session` — gated by `src/tests/TestShellArchive.pas` shape arm (port emits friendly "session extension not compiled in" stub per 10.1.47; upstream falls through to unknown-command — deliberate divergence).
+  - [X] **10.1f.5** `.recover` — gated by `src/tests/TestShellArchive.pas` (byte-parity vs upstream over 3-row+index fixture; complements DiagRecover.pas shape gate).
   - [ ] **10.1f.6** `.dbinfo`
   - [ ] **10.1f.7** `.dbconfig`
   - [ ] **10.1f.8** `.filectrl`
