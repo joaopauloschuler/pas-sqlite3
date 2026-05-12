@@ -841,8 +841,18 @@ partial landings cannot silently no-op.
       leverage: lands `Skip/New/Update/vs` rows in solver progress,
       `Solution cost=` summary, `OR-term sub-WHERE-clause` print,
       `WHERE clause at end of analysis` print.
-    - [ ] **10.1.42.a.6.1** Port `havingToWhere` (select.c:7047) so the
+    - [X] **10.1.42.a.6.1** Port `havingToWhere` (select.c:7047) so the
       0x100 TREETRACE arm at the same site (10.1.42.a.3 deferred) can land.
+      Landed: `havingToWhere` + `havingToWhereExprCb` in
+      passqlite3codegen.pas (with the prerequisite
+      `sqlite3ExprIsConstantOrGroupBy` + `exprNodeIsConstantOrGroupBy`
+      pair just above sqlite3ExprIsSingleTableConstraint).  Wired at
+      the SF_Aggregate+GROUP-BY main path, between
+      `sqlite3ExprAnalyzeAggList(pEList)` and
+      `sqlite3ExprAnalyzeAggregates(pHaving)` (mirrors select.c:8422..8431).
+      0x100 TREETRACE arm landed `{$IFDEF SQLITE_DEBUG}` at the tail of
+      havingToWhere (select.c:7045..7050).  Builds clean default +
+      SQLITE_DEBUG=1; TestExplainParity 1026/1026, TestSQLCorpus 2259/2259.
     - [ ] **10.1.42.a.6.2** Port `countOfViewOptimization` (select.c:7199)
       so the 0x200 TREETRACE arm can land.
     - [ ] **10.1.42.a.6.3** Port `optimizeAggregateUseOfIndexedExpr`

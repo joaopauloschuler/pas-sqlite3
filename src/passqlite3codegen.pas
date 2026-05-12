@@ -6888,6 +6888,70 @@ begin
   Result := i32(w.eCode);
 end;
 
+{ exprNodeIsConstantOrGroupBy — Walker callback used by
+  sqlite3ExprIsConstantOrGroupBy.  Faithful translation of
+  expr.c:2790..2813.  If pExpr matches any GROUP BY term whose collation
+  is BINARY, treat it as constant (prune).  Otherwise fall through to
+  the standard exprNodeIsConstant pure-constant check. }
+function exprNodeIsConstantOrGroupBy(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pGroupBy: PExprList;
+  i:        i32;
+  pE:       PExpr;
+  pColl:    Pointer;
+  items:    PExprListItem;
+begin
+  pGroupBy := pWalker^.u.pGroupBy;
+
+  { Check if pExpr is identical to any GROUP BY term.  If so, consider
+    it constant. }
+  if (pGroupBy <> nil) and (pGroupBy^.nExpr > 0) then
+  begin
+    items := ExprListItems(pGroupBy);
+    for i := 0 to i32(pGroupBy^.nExpr) - 1 do
+    begin
+      pE := items[i].pExpr;
+      if sqlite3ExprCompare(nil, pExpr, pE, -1) < 2 then
+      begin
+        pColl := sqlite3ExprNNCollSeq(pWalker^.pParse, pE);
+        if sqlite3IsBinary(pColl) <> 0 then
+        begin
+          Result := WRC_Prune;
+          Exit;
+        end;
+      end;
+    end;
+  end;
+
+  { Sub-select disqualifies. }
+  if ExprUseXSelect(pExpr) then
+  begin
+    pWalker^.eCode := 0;
+    Result := WRC_Abort;
+    Exit;
+  end;
+
+  Result := exprNodeIsConstant(pWalker, pExpr);
+end;
+
+{ sqlite3ExprIsConstantOrGroupBy — return non-zero when p consists
+  entirely of constants and copies of GROUP BY terms that sort with the
+  BINARY collation.  Faithful port of expr.c:2834..2843. }
+function sqlite3ExprIsConstantOrGroupBy(pParse: PParse; p: PExpr;
+  pGroupBy: PExprList): i32;
+var
+  w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.eCode           := 1;
+  w.xExprCallback   := @exprNodeIsConstantOrGroupBy;
+  w.xSelectCallback := nil;
+  w.u.pGroupBy      := pGroupBy;
+  w.pParse          := pParse;
+  sqlite3WalkExpr(@w, p);
+  Result := i32(w.eCode);
+end;
+
 { sqlite3ExprIsSingleTableConstraint — true when pExpr is a constraint that
   applies exclusively to the table at pSrcList->a[iSrc].
   Faithful port of expr.c:2753..2784. }
@@ -24688,6 +24752,81 @@ begin
   sqlite3DbFree(db, p);
 end;
 
+{ havingToWhereExprCb — sqlite3WalkExpr() callback used by havingToWhere.
+  Faithful translation of select.c:6994..7021.  If pExpr is a TK_AND
+  return WRC_Continue to keep splitting the AND tree.  Otherwise check
+  whether the sub-expression is eligible for promotion into WHERE:
+  must be constant-or-GROUP-BY (BINARY collation), not always-false,
+  and not carry an outer-AggInfo reference.  Eligible nodes get their
+  payload SWAPped with a freshly-allocated TK_INTEGER "1" node so the
+  HAVING tree keeps the same Expr* but evaluates trivially, while the
+  original payload is appended (via sqlite3ExprAnd) onto pS^.pWhere.
+  pWalker^.eCode latches 1 on the first successful move so the
+  TREETRACE arm in havingToWhere can detect "something happened". }
+function havingToWhereExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pS:     PSelect;
+  db:     PTsqlite3;
+  pNew:   PExpr;
+  pWhere: PExpr;
+  tmp:    TExpr;
+begin
+  if pExpr^.op <> TK_AND then
+  begin
+    pS := pWalker^.u.pSelect;
+    { This routine runs before the HAVING clause is analyzed for
+      aggregates.  A non-nil pAggInfo on a node here means the node
+      references an outer aggregate query — do not move it. }
+    if (sqlite3ExprIsConstantOrGroupBy(pWalker^.pParse, pExpr, pS^.pGroupBy) <> 0)
+       and (not ExprAlwaysFalse(pExpr))
+       and (pExpr^.pAggInfo = nil)
+    then begin
+      db := pWalker^.pParse^.db;
+      pNew := sqlite3ExprInt32(db, 1);
+      if pNew <> nil then
+      begin
+        pWhere := pS^.pWhere;
+        { SWAP(Expr, *pNew, *pExpr).  Pascal has no built-in C-style
+          struct swap; use a record temp. }
+        tmp    := pNew^;
+        pNew^  := pExpr^;
+        pExpr^ := tmp;
+        pNew := sqlite3ExprAnd(pWalker^.pParse, pWhere, pNew);
+        pS^.pWhere := pNew;
+        pWalker^.eCode := 1;
+      end;
+    end;
+    Result := WRC_Prune;
+    Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ havingToWhere — transfer eligible HAVING terms into pSelect^.pWhere.
+  Faithful translation of select.c:7038..7051.  Walked once over
+  p^.pHaving; eligible sub-expressions (constants or GROUP BY refs with
+  BINARY collation) are appended to p^.pWhere via sqlite3ExprAnd and
+  their place in the HAVING tree is replaced with a literal 1.  The
+  0x100 TREETRACE arm fires when at least one move occurred (latched
+  via sWalker.eCode). }
+procedure havingToWhere(pParse: PParse; p: PSelect);
+var
+  sWalker: TWalker;
+begin
+  FillChar(sWalker, SizeOf(sWalker), 0);
+  sWalker.pParse        := pParse;
+  sWalker.xExprCallback := @havingToWhereExprCb;
+  sWalker.u.pSelect     := p;
+  sqlite3WalkExpr(@sWalker, p^.pHaving);
+  {$IFDEF SQLITE_DEBUG}
+  if (sWalker.eCode <> 0) and ((sqlite3TreeTrace and $100) <> 0) then
+  begin
+    sqlite3DebugPrintf('Move HAVING terms into WHERE:'#10, []);
+    sqlite3TreeViewSelect(nil, p, 0);
+  end;
+  {$ENDIF}
+end;
+
 { assignAggregateRegisters — select.c:6643.  Allocate a contiguous block
   of registers spanning all aCol[] + aFunc[] entries; record the first
   register in pAggInfo^.iFirstReg.  After this call,
@@ -26047,7 +26186,19 @@ begin
       markAggregateInExprList(pParse, p^.pOrderBy);
     sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
     if pHavingLoc <> nil then
+    begin
+      { 10.1.42.a.6.1 — havingToWhere (select.c:8422..8431).  Promote
+        eligible HAVING sub-expressions (constants / BINARY GROUP BY
+        refs) into pWhere before HAVING is analyzed for aggregates.
+        Only runs when a GROUP BY clause is present — that's already
+        the gate for this whole pAggI2 setup block. }
+      if pGroupByLoc <> nil then
+      begin
+        havingToWhere(pParse, p);
+        pHavingLoc := p^.pHaving;
+      end;
       sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc);
+    end;
     if needSortOB then
       sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pOrderBy);
     pAggI2^.nAccumulator := pAggI2^.nColumn;
