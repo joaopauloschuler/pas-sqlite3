@@ -484,10 +484,24 @@ partial landings cannot silently no-op.
       flattening:", mask 0x4) on flattenSubquery success-tail, and
       select.c:6339 ("After result-set wildcard expansion:", mask 0x8
       — upstream uses 0x8, not 0x100) on the star-expansion pass tail.
-    - [ ] **10.1.42.a.3** AggInfo / HAVING→WHERE / count-of-view /
+    - [~] **10.1.42.a.3** AggInfo / HAVING→WHERE / count-of-view /
       EXISTS→JOIN TREETRACE arms (mask 0x40 / 0x400): `AggInfo`
       adjustments, `HAVING moves to WHERE`, count-of-view rewrite,
       `EXISTS-to-IN` and `EXISTS-to-JOIN` traces in optimizer arms.
+      Landed: select.c:7368 ("After EXISTS-to-JOIN optimization:",
+      mask 0x100000) inside existsToJoin's hoist tail, and
+      select.c:8442 ("After aggregate analysis %p:", mask 0x20) at
+      the tail of the main GROUP BY analyzeAggFuncArgs.  Upstream
+      C masks are 0x20 / 0x100 / 0x200 / 0x100000 (the tasklist's
+      "0x40 / 0x400" referred to the bundle ID, not C bits).
+      Deferred (no Pas counterpart yet): havingToWhere (select.c:7047,
+      mask 0x100), countOfViewOptimization (select.c:7199, mask 0x200),
+      "AggInfo adjusted for Indexed Exprs" (6572) /
+      "function expressions converted to reference index" (8609) /
+      "Finished with AggInfo" (8937) — none of
+      optimizeAggregateUseOfIndexedExpr /
+      aggregateConvertIndexedExprRefToColumn / late select_end
+      AggInfo teardown are ported yet.
     - [ ] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
       TREETRACE arms (mask 0x1000 / 0x8000): `dropping ORDER BY`,
       `window rewrite`, `DISTINCT->GROUP BY`.

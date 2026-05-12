@@ -10649,6 +10649,15 @@ begin
   pSub^.pSrc := nil;
   sqlite3ParserAddCleanup(pParse, @sqlite3SelectDeleteGeneric, pSub);
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a.3 — TREETRACE(0x100000) "After EXISTS-to-JOIN optimization"
+    (select.c:7367..7372).  Lands after the FROM-clause splice + WHERE
+    AND-fold succeed, before the recursive descent into the lifted
+    pSubWhere. }
+  if (sqlite3TreeTrace and $100000) <> 0 then
+    sqlite3DebugPrintf('After EXISTS-to-JOIN optimization:'#10, []);
+  {$ENDIF}
+
   { Recurse into the (now-detached) subselect WHERE in case it contains
     another nested EXISTS that should also be hoisted. }
   existsToJoin(pParse, p, pSubWhere);
@@ -25851,6 +25860,19 @@ begin
       sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pOrderBy);
     pAggI2^.nAccumulator := pAggI2^.nColumn;
     analyzeAggFuncArgs(pAggI2, @sNCAgg);
+    {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.a.3 — TREETRACE(0x20) "After aggregate analysis %p"
+      (select.c:8440..8448).  Lands at the tail of the main GROUP BY
+      aggregate-analysis pass, right after analyzeAggFuncArgs.  The
+      sister 0x20 arms upstream (select.c:6572 "AggInfo adjusted for
+      Indexed Exprs", 8609 "AggInfo function expressions converted to
+      reference index", 8937 "Finished with AggInfo") don't have a
+      Pas counterpart yet (no optimizeAggregateUseOfIndexedExpr /
+      aggregateConvertIndexedExprRefToColumn / late-select-end teardown
+      ported) — they remain on the deferred sub-arm note below. }
+    if (sqlite3TreeTrace and $20) <> 0 then
+      sqlite3DebugPrintf('After aggregate analysis %p:'#10, [Pointer(pAggI2)]);
+    {$ENDIF}
 
     { Bail on iOBTab / EP_WinFunc (non-FILTER) aggregates — those need
       additional plumbing not in scope here.  DISTINCT aggregates are
