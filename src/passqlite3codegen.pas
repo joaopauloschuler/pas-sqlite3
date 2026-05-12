@@ -10573,6 +10573,14 @@ begin
   sqlite3AggInfoPersistWalkerInit(@w, pParse);
   sqlite3WalkSelect(@w, pSub1);
   sqlite3SelectDelete(db, pSub1);
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a.2 — TREETRACE(0x4) "After flattening" (select.c:4704..4708).
+    Sister breadcrumb to the "flatten %u.%p from term %d" trace at the
+    top of flattenSubquery; printed on the success tail so the
+    .treetrace 0xFFFF stream from the C oracle and Pas match. }
+  if (sqlite3TreeTrace and $4) <> 0 then
+    sqlite3DebugPrintf('After flattening:'#10, []);
+  {$ENDIF}
   Result := 1;
 end;
 
@@ -23597,6 +23605,17 @@ begin
       expandStar(pParse, pCur);
     pCur := pCur^.pPrior;
   end;
+
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a.2 — TREETRACE(0x8) "After result-set wildcard expansion"
+    (select.c:6337..6341).  Lands at the tail of the star-expansion
+    pass — sister breadcrumb to the "begin processing" trace, prints
+    once per top-level expand call.  Mask 0x8 in upstream; the
+    tasklist's "0x100" naming refers to the post-flatten/wildcard
+    bundle ID, not the C mask. }
+  if (sqlite3TreeTrace and $8) <> 0 then
+    sqlite3DebugPrintf('After result-set wildcard expansion:'#10, []);
+  {$ENDIF}
 
   { Tail-call sqlite3SelectPopWith via walker so the parser-supplied
     pWith stack stays balanced.  This was the only behaviour of the

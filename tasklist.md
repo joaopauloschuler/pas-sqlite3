@@ -478,9 +478,12 @@ partial landings cannot silently no-op.
       3030).  Pas's multiSelect is inlined into sqlite3Select; the
       compound-end breadcrumb (select.c:7887, mask 0x400) lives on the
       sqlite3Select dispatch path and lands as part of 10.1.42.a.3.
-    - [ ] **10.1.42.a.2** Post-flatten / wildcard-expansion TREETRACE
+    - [X] **10.1.42.a.2** Post-flatten / wildcard-expansion TREETRACE
       (mask 0x4 / 0x100): `after flattening`, `after wildcard expansion`
-      in `sqlite3Select` body.
+      in `sqlite3Select` body.  Landed: select.c:4706 ("After
+      flattening:", mask 0x4) on flattenSubquery success-tail, and
+      select.c:6339 ("After result-set wildcard expansion:", mask 0x8
+      — upstream uses 0x8, not 0x100) on the star-expansion pass tail.
     - [ ] **10.1.42.a.3** AggInfo / HAVING→WHERE / count-of-view /
       EXISTS→JOIN TREETRACE arms (mask 0x40 / 0x400): `AggInfo`
       adjustments, `HAVING moves to WHERE`, count-of-view rewrite,
