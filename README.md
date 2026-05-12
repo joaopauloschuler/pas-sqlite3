@@ -1,6 +1,6 @@
 # pas-sqlite3
 
-A faithful AI made port of **SQLite 3.53.0** (D. Richard Hipp et al.)
+A faithful **AI made** port of **SQLite 3.53.0** (D. Richard Hipp et al.)
 from C to **Free Pascal (FPC 3.2.2+)** targeting x86-64 Linux.
 
 > **Status: Phases 0–5 complete; Phases 6–8 ported — in testing.**  The Pascal port now opens databases, parses SQL,
