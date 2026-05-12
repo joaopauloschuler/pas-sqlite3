@@ -559,9 +559,24 @@ partial landings cannot silently no-op.
       under WHERETRACE — the only WHERETRACE in whereLoopInsert family
       is the 0xffffffff non-viable-vtab-plan reject (where.c:4416) which
       lives in `whereLoopAddVirtualOne` and is tracked under b.3.
-    - [ ] **10.1.42.b.3** Virtual-table constraint enumeration WHERETRACE
-      in `whereLoopAddVirtualOne` (mask 0x40): `all-usable` /
-      `disabled` constraint walks.
+    - [X] **10.1.42.b.3** Virtual-table constraint enumeration WHERETRACE
+      arms.  Target tasklist mask 0x40 in `whereLoopAddVirtualOne`;
+      verified against where.c the actual host is the driver
+      `whereLoopAddVirtual` (not `whereLoopAddVirtualOne`) and the
+      mask is **0x800** for the four constraint-walk prints (matches
+      the BEGIN/END addVirtual mask already wired in commit ec9413f).
+      Landed inside the Pas driver:
+        * `  VirtualOne: all usable`            (where.c:4720, 0x800)
+        * `  VirtualOne: all usable w/o IN`     (4745, 0x800)
+        * `  VirtualOne: mPrev=%04llx mNext=%04llx` (4770, 0x800)
+        * `  VirtualOne: all disabled`          (4784, 0x800)
+        * `  VirtualOne: all disabled and w/o IN` (4794, 0x800)
+      Plus the two arms inside `whereLoopAddVirtualOne` itself:
+        * `  ^^^^--- non-viable plan rejected!` (4416, 0xffffffff)
+          on SQLITE_CONSTRAINT short-circuit.
+        * `  bIn=%d prereqIn=%04llx prereqOut=%04llx` (4531, 0xffffffff)
+          on every successful exit.
+      All gated by `{$IFDEF SQLITE_DEBUG}`.
     - [ ] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
       `wherePathSolver` (mask 0x80): `optimizer search-limit`,
       per-iteration path costs.

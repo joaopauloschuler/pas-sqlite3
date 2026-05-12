@@ -15519,6 +15519,13 @@ begin
   begin
     if rc = SQLITE_CONSTRAINT then
     begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b.3 — WHERETRACE(0xffffffff) "non-viable plan rejected"
+        (where.c:4416).  Emitted when xBestIndex flags the combination
+        as unusable (SQLITE_CONSTRAINT). }
+      if sqlite3WhereTrace <> 0 then
+        sqlite3DebugPrintf('  ^^^^--- non-viable plan rejected!'#10, []);
+      {$ENDIF}
       freeIdxStr(pIdxInfo);
       Result := SQLITE_OK;
       Exit;
@@ -15611,6 +15618,14 @@ begin
     sqlite3_free(pNew^.u.vtab.idxStr);
     pNew^.u.vtab.bFlags := pNew^.u.vtab.bFlags and u8(not $01);
   end;
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b.3 — WHERETRACE(0xffffffff) per-VirtualOne exit summary
+    `bIn=%d prereqIn=%04llx prereqOut=%04llx` (where.c:4531..4533).
+    Emitted on every successful return from whereLoopAddVirtualOne. }
+  if sqlite3WhereTrace <> 0 then
+    sqlite3DebugPrintf('  bIn=%d prereqIn=%04llx prereqOut=%04llx'#10,
+                       [pbIn, u64(mPrereq), u64(pNew^.prereq and (not mPrereq))]);
+  {$ENDIF}
   Result := rc;
 end;
 
@@ -15689,6 +15704,14 @@ begin
     Exit;
   end;
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b.3 — WHERETRACE(0x800) "VirtualOne: all usable"
+    (where.c:4720) — unconditional pre-pass print before the first
+    xBestIndex call. }
+  if (sqlite3WhereTrace and $800) <> 0 then
+    sqlite3DebugPrintf('  VirtualOne: all usable'#10, []);
+  {$ENDIF}
+
   bRetry := 0; bIn := 0;
   rc := whereLoopAddVirtualOne(pBuilder, mPrereq, ALLBITS, 0,
                                pIdxInfo, mNoOmit, bIn, @bRetry);
@@ -15708,6 +15731,12 @@ begin
 
     if bIn <> 0 then
     begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b.3 — WHERETRACE(0x800) "VirtualOne: all usable w/o IN"
+        (where.c:4745). }
+      if (sqlite3WhereTrace and $800) <> 0 then
+        sqlite3DebugPrintf('  VirtualOne: all usable w/o IN'#10, []);
+      {$ENDIF}
       rc := whereLoopAddVirtualOne(pBuilder, mPrereq, ALLBITS, u16(WO_IN),
                                    pIdxInfo, mNoOmit, bIn, nil);
       mBestNoIn := pNew^.prereq and (not mPrereq);
@@ -15732,6 +15761,15 @@ begin
       mPrev := mNext;
       if mNext = ALLBITS then Break;
       if (mNext = mBest) or (mNext = mBestNoIn) then Continue;
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b.3 — WHERETRACE(0x800) "VirtualOne: mPrev=%04llx
+        mNext=%04llx" (where.c:4770..4771).  Upstream renders the
+        Bitmask as a zero-padded 4-hex-digit u64; snpFmt/%04x output is
+        the standard match. }
+      if (sqlite3WhereTrace and $800) <> 0 then
+        sqlite3DebugPrintf('  VirtualOne: mPrev=%04llx mNext=%04llx'#10,
+                           [u64(mPrev), u64(mNext)]);
+      {$ENDIF}
       rc := whereLoopAddVirtualOne(pBuilder, mPrereq,
                                    mNext or mPrereq, 0,
                                    pIdxInfo, mNoOmit, bIn, nil);
@@ -15744,6 +15782,12 @@ begin
 
     if (rc = SQLITE_OK) and (seenZero = 0) then
     begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b.3 — WHERETRACE(0x800) "VirtualOne: all disabled"
+        (where.c:4784). }
+      if (sqlite3WhereTrace and $800) <> 0 then
+        sqlite3DebugPrintf('  VirtualOne: all disabled'#10, []);
+      {$ENDIF}
       rc := whereLoopAddVirtualOne(pBuilder, mPrereq, mPrereq, 0,
                                    pIdxInfo, mNoOmit, bIn, nil);
       if bIn = 0 then seenZeroNoIN := 1;
@@ -15751,6 +15795,12 @@ begin
 
     if (rc = SQLITE_OK) and (seenZeroNoIN = 0) then
     begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b.3 — WHERETRACE(0x800) "VirtualOne: all disabled and
+        w/o IN" (where.c:4794). }
+      if (sqlite3WhereTrace and $800) <> 0 then
+        sqlite3DebugPrintf('  VirtualOne: all disabled and w/o IN'#10, []);
+      {$ENDIF}
       rc := whereLoopAddVirtualOne(pBuilder, mPrereq, mPrereq, u16(WO_IN),
                                    pIdxInfo, mNoOmit, bIn, nil);
     end;
