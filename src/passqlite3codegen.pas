@@ -15909,6 +15909,22 @@ begin
         end;
 
         sCur.n := 0;
+        {$IFDEF SQLITE_DEBUG}
+        { 10.1.42.b.5 — WHERETRACE(0x400) "OR-term %d of %p has %d subterms"
+          (where.c:4866..4867).  Mask 0x400 verified against sqliteInt.h:1191
+          (OR optimization) and matches tasklist hint.  Per-subterm breadcrumb
+          inside the deeper OR-clause arm.
+
+          TODO 10.1.42.b.5: the companion `if (sqlite3WhereTrace & 0x20000)
+          sqlite3WhereClausePrint(sSubBuild.pWC)` at where.c:4868..4870 is
+          deferred — sqlite3WhereClausePrint is not yet ported in
+          passqlite3codegen.pas.  Mask 0x20000 (WHERE-clause dump). }
+        if (sqlite3WhereTrace and $400) <> 0 then
+          sqlite3DebugPrintf('OR-term %d of %p has %d subterms:'#10,
+            [i32((PtrUInt(pOrTerm) - PtrUInt(pOrWC^.a))
+                  div PtrUInt(SizeOf(TWhereTerm))),
+             Pointer(pTerm), sSubBuild.pWC^.nTerm]);
+        {$ENDIF}
         if pItem^.pSTab^.eTabType = TABTYP_VTAB then
           rc := whereLoopAddVirtual(@sSubBuild, mPrereq, mUnusable)
         else

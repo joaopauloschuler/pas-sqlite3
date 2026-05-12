@@ -647,9 +647,21 @@ partial landings cannot silently no-op.
       are deferred behind a `TODO 10.1.42.b.4` marker in
       passqlite3codegen.pas — they consume `wherePathName(WherePath*,iLoop,
       WhereLoop*)` which is not yet ported.  Land once wherePathName drops.
-    - [ ] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
-      in `whereLoopAddOr` (mask 0x400 deeper arms): cost compares,
-      pseudo-index selection.
+    - [~] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
+      in `whereLoopAddOr` (mask **0x400** verified, matches tasklist hint
+      and sqliteInt.h:1191 — OR optimization).  Landed the per-subterm
+      breadcrumb at where.c:4866..4867: `"OR-term %d of %p has %d
+      subterms:"`.  The "Begin processing OR-clause" / "End processing
+      OR-clause" arms were already ported in batch 10.1.42.b.
+      Deferral note: the tasklist title mentioned "cost compares, pseudo-
+      index selection" but where.c review shows whereLoopAddOr itself
+      carries only mask-0x400 breadcrumbs — no cost-compare or pseudo-
+      index 0x400 arms exist in this function.  The 0x40 (IN-operator)
+      and 0x80 (cost-adjustment) arms live in `whereLoopAddBtreeIndex`,
+      not `whereLoopAddOr`, and are tracked separately under earlier
+      10.1.42.b sub-tasks.  Also deferred behind a `TODO 10.1.42.b.5`
+      marker: the companion mask-0x20000 sub-arm `sqlite3WhereClausePrint
+      (sSubBuild.pWC)` at where.c:4868..4870 — host helper not yet ported.
     - [ ] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
       trailing WHERETRACE in `sqlite3WhereBegin` epilogue (mask 0x1):
       `Optimizer Finished` summary line.
