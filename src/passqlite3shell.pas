@@ -7393,23 +7393,17 @@ begin
   shellEPutZ('Error: session extension not compiled in to this build.'#10);
 end;
 
-{ 10.1.38 — `.iotrace FILE|off|on` (shell.c.in:8946..8993).
+{ 10.1.38 — `.iotrace FILE|off|on` (shell.c.in:9979..9999).
 
-  Wires sqlite3IoTrace to the named file (or stdout on `on`, /dev/null
-  on `off`).  The upstream global is gated on SQLITE_ENABLE_IOTRACE; the
-  Pascal port has the dispatch surface (passqlite3vdbe.pas:4122) but no
-  installed sink because sqlite3VdbeIOTraceSql is a no-op stub.  Stub
-  here matches the convention used by .scanstats — record the request
-  and emit a "not available" breadcrumb so partial landings don't fall
-  through to the unknown-command arm. }
-
-procedure cmdIotrace(p: PShellState; const args: array of AnsiString;
-                     nArg: SizeInt);
-begin
-  if (p = nil) or (nArg = 0) or (Length(args) = 0) then
-    ;
-  shellEPutZ('Warning: .iotrace not available in this build.'#10);
-end;
+  The upstream `.iotrace` arm is wrapped in `#ifdef SQLITE_ENABLE_IOTRACE`;
+  the standard CLI build leaves the symbol undefined so `.iotrace` falls
+  through to the unknown-command tail (`Error: unknown command ... rc=1`).
+  Phase 10.1e.11 (TestShellMeta) gates byte-parity against that non-debug
+  build, so the port follows suit: doMetaCommand simply does not route
+  `iotrace` to a handler, letting it land in the unknown-command arm.
+  When SQLITE_ENABLE_IOTRACE support is wired (sqlite3IoTrace sink in
+  passqlite3vdbe.pas:4122 is currently a no-op stub) this stub body and
+  the dispatch line can be restored together. }
 
 procedure cmdRecover(p: PShellState; const args: array of AnsiString;
                     nArg: SizeInt);
@@ -7488,16 +7482,23 @@ end;
   10.1.42  `.selecttrace` / `.wheretrace` / `.treetrace`
                                     — shell.c.in:10711..10716, 12042..
 
-  Compile-time-debug toggles in the C reference; in the Pascal port the
-  TRACEFLAGS variant of sqlite3_test_control is not yet bound, so we
-  swallow the args and report the no-op rather than emit
-  "unknown command".
+  Both upstream arms unconditionally call
+  `sqlite3_test_control(SQLITE_TESTCTRL_TRACEFLAGS, ...)` which in a
+  non-debug CLI build is a silent no-op (the C body is wrapped in
+  SQLITE_DEBUG / SQLITE_ENABLE_SELECTTRACE / _WHERETRACE).  Upstream
+  thus emits nothing on stdout/stderr and returns rc=0 regardless of
+  args.  We mirror that exactly so 10.1e.G can byte-diff against the
+  reference binary.  When the underlying TRACEFLAGS dispatch is wired
+  in a future debug-build profile this stub can install the flag word
+  via sqlite3_test_control; until then `silent` is the correct port.
   ---------------------------------------------------------------------- }
 
 procedure cmdTraceFlags(const cmdName: AnsiString);
 begin
-  shellEPutZ(Format('Note: .%s requires a debug build; ignored'#10,
-                    [cmdName]));
+  { Silent: mirrors the non-debug-build SQLITE_TESTCTRL_TRACEFLAGS no-op
+    so `.selecttrace`/`.wheretrace`/`.treetrace` produce no output and
+    rc=0 in lock-step with upstream's standard CLI build. }
+  if cmdName = '' then ;  { unused-param sentinel }
 end;
 
 { ----------------------------------------------------------------------
@@ -7601,11 +7602,13 @@ end;
   emit upstream's "not available in this build" warning.
   ---------------------------------------------------------------------- }
 
-procedure cmdScanstats(p: PShellState; const args: array of AnsiString;
-                       nArg: SizeInt);
+function cmdScanstats(p: PShellState; const args: array of AnsiString;
+                      nArg: SizeInt): i32;
 begin
+  Result := 0;
   if nArg <> 1 then begin
     shellEPutZ('Usage: .scanstats on|off|est'#10);
+    Result := 1;
     Exit;
   end;
   if args[0] = 'vm' then p^.mode.scanstatsOn := 3
@@ -9496,14 +9499,15 @@ begin
   if zCmd = 'expert'    then begin cmdExpert(p, args, nArg); Result := 1; Exit; end;
   if zCmd = 'recover'   then begin cmdRecover(p, args, nArg); Exit; end;
   if zCmd = 'session'   then begin cmdSession(p, args, nArg); Exit; end;
-  if zCmd = 'iotrace'   then begin cmdIotrace(p, args, nArg); Exit; end;
+  { .iotrace: upstream is SQLITE_ENABLE_IOTRACE-gated; in the non-debug
+    build it falls through to the unknown-command arm, so do NOT route. }
   if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd); Exit; end;
   if zCmd = 'testcase'  then begin cmdTestcase(p, args, nArg); Exit; end;
   if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
   if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
-    cmdScanstats(p, args, nArg); Exit;
+    Result := cmdScanstats(p, args, nArg); Exit;
   end;
   if (zCmd = 'output') or (zCmd = 'once') or (zCmd = 'excel')
      or (zCmd = 'www') then begin

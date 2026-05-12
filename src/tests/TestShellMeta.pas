@@ -16,12 +16,12 @@
     - cd                .cd                            (10.1e.8)  [COVERED]
     - log               .log                           (10.1e.9)  TODO
     - trace             .trace                         (10.1e.10) [COVERED]
-    - iotrace           .iotrace                       (10.1e.11) TODO
-    - scanstats         .scanstats                     (10.1e.12) TODO
+    - iotrace           .iotrace                       (10.1e.11) [COVERED]
+    - scanstats         .scanstats                     (10.1e.12) [COVERED]
     - testcase          .testcase                      (10.1e.13) [COVERED]
     - testctrl          .testctrl                      (10.1e.14) [COVERED]
-    - selecttrace       .selecttrace                   (10.1e.15) TODO
-    - wheretrace        .wheretrace                    (10.1e.16) TODO
+    - selecttrace       .selecttrace                   (10.1e.15) [COVERED]
+    - wheretrace        .wheretrace                    (10.1e.16) [COVERED]
 
   Skips with PASS if the upstream sqlite3 binary is unavailable on
   PATH or at $UPSTREAM_SQLITE3.
@@ -453,6 +453,87 @@ begin
 
   script := '.testctrl no_such_op_xyz'#10;
   DiffMeta('testctrl-unknown', ':memory:', script);
+
+  { -------- iotrace (10.1e.11) ------------------------------------ }
+  { Upstream `.iotrace` (shell.c.in:9979..9999) is wrapped in
+    `#ifdef SQLITE_ENABLE_IOTRACE`; the standard CLI build leaves the
+    symbol undefined, so every `.iotrace ...` invocation falls through
+    to the unknown-command tail (`Error: unknown command or invalid
+    arguments:  "iotrace". Enter ".help" for help\n`, rc=1).  Scope of
+    this gate is therefore the non-debug build: the port must NOT route
+    `.iotrace` to a handler — it must reach the unknown-command arm so
+    the byte-for-byte diff holds against the upstream binary.  When the
+    SQLITE_ENABLE_IOTRACE sink (sqlite3IoTrace, currently a no-op stub
+    in passqlite3vdbe.pas) is wired, a separate gate will exercise the
+    `off` / `-` / FILE / bad-file arms; for now we only exercise the
+    no-op-from-the-shell-side fall-through. }
+  script := '.iotrace off'#10;
+  DiffMeta('iotrace-off', ':memory:', script);
+
+  script := '.iotrace -'#10;
+  DiffMeta('iotrace-stdout', ':memory:', script);
+
+  script := '.iotrace ' + workDir + '/io.out'#10;
+  DiffMeta('iotrace-file', ':memory:', script);
+
+  script := '.iotrace'#10;
+  DiffMeta('iotrace-bare', ':memory:', script);
+
+  { -------- scanstats (10.1e.12) ---------------------------------- }
+  { cmdScanstats (shell.c.in:10545..10573) accepts one positional arg
+    (`on|off|est|vm`) and routes the value into ShellState.mode
+    .scanstatsOn, then calls sqlite3_db_config with
+    SQLITE_DBCONFIG_STMT_SCANSTATUS.  In a non-debug build
+    (SQLITE_ENABLE_STMT_SCANSTATUS undefined, which is the upstream
+    default) the C arm unconditionally emits
+    `Warning: .scanstats not available in this build.\n` on stderr for
+    every recognised arg, including `vm`.  Wrong arg count (nArg!=2)
+    emits `Usage: .scanstats on|off|est\n` on stderr with rc=1.  Scope
+    here is the state-flip arms and the usage error — the runtime
+    consumer (display_scanstats() before each finalize, shell.c.in
+    3352..) is out of scope and tracked separately. }
+  script :=
+    '.scanstats on'#10 +
+    '.scanstats off'#10 +
+    '.scanstats est'#10 +
+    '.scanstats vm'#10;
+  DiffMeta('scanstats-state', ':memory:', script);
+
+  script := '.scanstats on extra'#10;
+  DiffMeta('scanstats-usage', ':memory:', script);
+
+  script := '.scanstats'#10;
+  DiffMeta('scanstats-bare', ':memory:', script);
+
+  { -------- selecttrace (10.1e.15) -------------------------------- }
+  { cmdSelecttrace (shell.c.in:10711..10716) and cmdTreetrace share the
+    same arm: they call sqlite3_test_control(SQLITE_TESTCTRL_TRACEFLAGS,
+    1, &x).  The TRACEFLAGS sub-control is wrapped in SQLITE_DEBUG /
+    SQLITE_ENABLE_SELECTTRACE; in a non-debug CLI build it is a silent
+    no-op.  Upstream therefore produces no stdout/stderr and rc=0 for
+    every `.selecttrace ...` invocation (with or without numeric arg).
+    The port matches that exactly via the cmdTraceFlags silent stub. }
+  script := '.selecttrace 0'#10;
+  DiffMeta('selecttrace-zero', ':memory:', script);
+
+  script := '.selecttrace 0xffff'#10;
+  DiffMeta('selecttrace-mask', ':memory:', script);
+
+  script := '.selecttrace'#10;
+  DiffMeta('selecttrace-bare', ':memory:', script);
+
+  { -------- wheretrace (10.1e.16) --------------------------------- }
+  { cmdWheretrace (shell.c.in:12042..12045) calls sqlite3_test_control
+    (SQLITE_TESTCTRL_TRACEFLAGS, 3, &x), and like .selecttrace is a
+    silent no-op in a non-debug CLI build (rc=0, no stdout/stderr). }
+  script := '.wheretrace 0'#10;
+  DiffMeta('wheretrace-zero', ':memory:', script);
+
+  script := '.wheretrace 0xff'#10;
+  DiffMeta('wheretrace-mask', ':memory:', script);
+
+  script := '.wheretrace'#10;
+  DiffMeta('wheretrace-bare', ':memory:', script);
 
   CleanupPaths;
 
