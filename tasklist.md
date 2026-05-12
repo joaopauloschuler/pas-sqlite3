@@ -405,19 +405,19 @@ existing `speedtest.tcl` diff workflow keeps working.  Lives in
 
 ---
 
-## Phase 13 — Performance optimisation (enter only after Phase 9 green)
+## Phase 12 — Performance optimisation (enter only after Phase 9 green)
 
 Changes here must preserve byte-for-byte on-disk parity.  Compile
 flags: `-dAVX2 -CfAVX2 -CpCOREAVX -OpCOREAVX`.  Note: in FPC,
 functions with `asm` content cannot be inlined.
 
-- [ ] **13.1** `perf record` on benchmark workloads; identify the
+- [ ] **12.1** `perf record` on benchmark workloads; identify the
   top 10 hot functions.
 
-- [ ] **13.2** Aggressive `inline` on VDBE opcode helpers, varint
+- [ ] **12.2** Aggressive `inline` on VDBE opcode helpers, varint
   codecs, and page cell accessors.
 
-- [ ] **13.3** Consider replacing the VDBE big `case` with threaded
+- [ ] **12.3** Consider replacing the VDBE big `case` with threaded
   dispatch (computed-goto-style) using `{$GOTO ON}`.  Land only if
   profiling shows the switch is a real bottleneck.
 
