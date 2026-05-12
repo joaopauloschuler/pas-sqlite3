@@ -662,9 +662,23 @@ partial landings cannot silently no-op.
       10.1.42.b sub-tasks.  Also deferred behind a `TODO 10.1.42.b.5`
       marker: the companion mask-0x20000 sub-arm `sqlite3WhereClausePrint
       (sSubBuild.pWC)` at where.c:4868..4870 — host helper not yet ported.
-    - [ ] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
-      trailing WHERETRACE in `sqlite3WhereBegin` epilogue (mask 0x1):
-      `Optimizer Finished` summary line.
+    - [~] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
+      trailing WHERETRACE in `sqlite3WhereBegin` epilogue.  Mask divergence
+      vs tasklist hint: tasklist suggested 0x1 (code generation per
+      sqliteInt.h:1180); the actual upstream literals are
+      **0x0080** (WhereLoop cost adjustments, sqliteInt.h:1188) for the
+      DISTINCT-reduction print at where.c:7118 and **0xffffffff**
+      (any-trace) for the "*** Optimizer Finished ***" line at
+      where.c:7195.  Both landed in passqlite3codegen.pas — the DISTINCT
+      block also carries the `nRowOut -= 30` body that the WHERETRACE
+      bracket calls out (tag-20250414a).  Build green pre/post both
+      ways: -30 nRowOut shift does not change any TestExplainParity or
+      TestWhereCorpus row.  Deferred behind `TODO 10.1.42.b.6`:
+        * "---- Solution cost=%d, nRow=%d ... DISTINCT=..." summary
+          block at where.c:7132..7157 (consumes sqlite3WhereLoopPrint).
+        * mask-0x4000 "---- WHERE clause at end of analysis:" dump at
+          where.c:7190..7194 (consumes sqlite3WhereClausePrint).
+      Land both once their host printers drop.
     - [ ] **10.1.42.b.7** Port the STAT4 cost-estimator helpers that
       gate the 4 deferred 10.1.42.b.1 arms: `whereRangeSkipScanEst`
       (where.c:2036), `whereEqualScanEst` (:2215 / :2313),

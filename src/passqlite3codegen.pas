@@ -18870,6 +18870,24 @@ begin
       end;
     end;
 
+    { where.c:7113..7121 — TUNING: a DISTINCT clause on a subquery is
+      assumed to reduce output cardinality by a factor of 8 (LogEst -30).
+      Mirrors upstream tag-20250414a. }
+    if (pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
+    begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b.6 — WHERETRACE(0x0080) "nRowOut reduced from %d to %d
+        due to DISTINCT" (where.c:7118..7119).  Mask 0x0080 verified
+        against sqliteInt.h:1188 (WhereLoop cost adjustments) — tasklist
+        hint said 0x1; the actual upstream literal is 0x0080. }
+      if (sqlite3WhereTrace and $0080) <> 0 then
+        sqlite3DebugPrintf(
+          'nRowOut reduced from %d to %d due to DISTINCT'#10,
+          [pWInfo^.nRowOut, pWInfo^.nRowOut - 30]);
+      {$ENDIF}
+      pWInfo^.nRowOut := i16(pWInfo^.nRowOut - 30);
+    end;
+
     if pParse^.nErr <> 0 then
     begin
       whereInfoFree(db, pWInfo);
@@ -18885,6 +18903,23 @@ begin
     if (pWInfo^.nLevel >= 2)
        and OptimizationEnabled(db, SQLITE_BloomFilter) then
       whereCheckIfBloomFilterIsUseful(pWInfo);
+
+    {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.b.6 — WHERETRACE(0xffffffff) "*** Optimizer Finished ***"
+      (where.c:7195).  Mask 0xffffffff (any-trace) verified against
+      where.c:7195 — tasklist hint said 0x1; the actual upstream literal
+      is 0xffffffff (matched by `if sqlite3WhereTrace <> 0`).
+
+      TODO 10.1.42.b.6: the immediately-preceding "---- Solution cost=%d,
+      nRow=%d ... DISTINCT=..." summary block at where.c:7132..7157 and
+      the mask-0x4000 "---- WHERE clause at end of analysis:" dump at
+      where.c:7190..7194 both depend on host helpers
+      (sqlite3WhereLoopPrint, sqlite3WhereClausePrint) that are not yet
+      ported in passqlite3codegen.pas.  Defer those two until the
+      printers land. }
+    if sqlite3WhereTrace <> 0 then
+      sqlite3DebugPrintf('*** Optimizer Finished ***'#10, []);
+    {$ENDIF}
 
     { where.c:7197 — accumulate row-count estimate. }
     pParse^.nQueryLoop := i16(pParse^.nQueryLoop + pWInfo^.nRowOut);
