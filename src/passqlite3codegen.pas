@@ -1366,7 +1366,7 @@ type
     aLTermSpace: array[0..2] of PWhereTerm; { 24 bytes @ 80 }
   end;
 
-  { --- TWhereLevel (sizeof=120) --- }
+  { --- TWhereLevel (sizeof=128 with SQLITE_ENABLE_STMT_SCANSTATUS) --- }
   TWhereLevelU = record
     case Integer of
       0: (in_nIn: i32; _in_pad: i32; in_aInLoop: PInLoop);
@@ -1400,6 +1400,13 @@ type
     u:           TWhereLevelU; { 16 bytes @ 88 }
     pWLoop:      PWhereLoop;   { 8 bytes @ 104 }
     notReady:    Bitmask;      { 8 bytes @ 112 }
+    { SQLITE_ENABLE_STMT_SCANSTATUS — address at which row is visited.
+      Stamped once per loop by sqlite3WhereCodeOneLoopStart right after the
+      Rewind/Last/VFilter/Next/Prev cursor-init opcode, mirroring
+      whereInt.h:111.  Consumed by sqlite3WhereAddScanStatus →
+      sqlite3VdbeScanStatusCounters to fill SCANSTAT_NVISIT. }
+    addrVisit:   i32;          { 4 bytes @ 120 }
+    _padScan:    i32;          { 4 bytes @ 124 (8-byte align of trailer) }
   end;
 
   { --- TWhereLoopBuilder (sizeof=40) --- }
@@ -17367,23 +17374,28 @@ end;
 
 procedure sqlite3WhereAddScanStatus(v: PVdbe; pSrclist: PSrcList;
   pLvl: PWhereLevel; addrExplain: i32);
-{ Phase 8.2.1 — partial port of wherecode.c:333..374.  Records the
-  scanned table/index name and the planner's row-count estimate
-  (LogEst pLoop->nOut).  pLvl->addrVisit is gated on
-  SQLITE_ENABLE_STMT_SCANSTATUS in C (not present on the pas
-  TWhereLevel); we pass 0 so SCANSTAT_NVISIT reports -1.  The
-  addrLoop wiring (sqlite3VdbeScanStatusRange/Counters) is deferred
-  along with addrVisit. }
+{ Phase 10.1.39.a — full port of wherecode.c:333..374.  Records the
+  scanned table/index name, the planner's row-count estimate
+  (LogEst pLoop->nOut), addrBody (loop opcode head) and addrVisit
+  (per-row visit address — stamped at wherecode.c:2584 mirror site
+  in sqlite3WhereCodeOneLoopStart).  Followed by ScanStatusRange
+  calls keyed on iTabCur/iIdxCur (or the addrFillSub coroutine range
+  for viaCoroutine subqueries) so the SCANSTAT_NLOOP / NVISIT
+  readers can recover aOp[].nExec counts. }
 var
-  pLoop:   PWhereLoop;
-  wsFlags: u32;
-  zObj:    PAnsiChar;
-  pItem:   PSrcItem;
+  pLoop:        PWhereLoop;
+  wsFlags:      u32;
+  zObj:         PAnsiChar;
+  pItem:        PSrcItem;
+  viaCoroutine: i32;
+  addrFill:     i32;
+  pOp:          PVdbeOp;
 begin
   if (PTsqlite3(v^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
   pLoop := pLvl^.pWLoop;
   wsFlags := pLoop^.wsFlags;
   zObj := nil;
+  viaCoroutine := 0;
   if ((wsFlags and WHERE_VIRTUALTABLE) = 0)
      and (pLoop^.u.btree.pIndex <> nil) then
     zObj := pLoop^.u.btree.pIndex^.zName
@@ -17391,8 +17403,33 @@ begin
     pItem := SrcListItems(pSrclist);
     Inc(pItem, pLvl^.iFrom);
     zObj := pItem^.zName;
+    if (pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then
+      viaCoroutine := 1;
   end;
-  sqlite3VdbeScanStatus(v, addrExplain, 0, 0, pLoop^.nOut, zObj);
+  sqlite3VdbeScanStatus(v, addrExplain, pLvl^.addrBody, pLvl^.addrVisit,
+                        pLoop^.nOut, zObj);
+
+  if viaCoroutine = 0 then
+  begin
+    if (wsFlags and (WHERE_MULTI_OR or WHERE_AUTO_INDEX)) = 0 then
+      sqlite3VdbeScanStatusRange(v, addrExplain, -1, pLvl^.iTabCur);
+    if (wsFlags and WHERE_INDEXED) <> 0 then
+      sqlite3VdbeScanStatusRange(v, addrExplain, -1, pLvl^.iIdxCur);
+  end else begin
+    { viaCoroutine — pSrclist->a[iFrom].u4.pSubq->addrFillSub is the
+      InitCoroutine target; pOp[addr-1] is the OP_InitCoroutine whose
+      P2 marks the end of the coroutine body.  Mirror wherecode.c
+      :362..371. }
+    pItem := SrcListItems(pSrclist);
+    Inc(pItem, pLvl^.iFrom);
+    if (pItem^.u4.pSubq <> nil) then
+    begin
+      addrFill := pItem^.u4.pSubq^.addrFillSub;
+      pOp := sqlite3VdbeGetOp(v, addrFill - 1);
+      if pOp <> nil then
+        sqlite3VdbeScanStatusRange(v, addrExplain, addrFill, pOp^.p2 - 1);
+    end;
+  end;
 end;
 
 
@@ -20603,6 +20640,14 @@ begin
       pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP;
     end;
   end;
+
+  { wherecode.c:2583..2585 — SQLITE_ENABLE_STMT_SCANSTATUS stamp.  After every
+    case (1..6) has installed its loop-init opcode (VFilter / Rewind / Last /
+    OpenEphemeral / etc.), the next address is the per-row visit point.
+    sqlite3WhereAddScanStatus forwards this through to
+    sqlite3VdbeScanStatusCounters → aOp[addrVisit].nExec which feeds
+    SCANSTAT_NVISIT. }
+  pLevel^.addrVisit := sqlite3VdbeCurrentAddr(v);
 
   { wherecode.c:2587..2727 — per-loop body push-down + transitive constraint
     + LEFT-JOIN match-flag set.  Tests every WHERE-clause sub-expression
