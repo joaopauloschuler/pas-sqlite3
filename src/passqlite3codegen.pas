@@ -25361,6 +25361,14 @@ begin
         pLimitDupCS := sqlite3ExprDup(pParse^.db, p^.pLimit, 0);
       pPriorSel^.pLimit := pLimitDupCS;
 
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.a.1 — TREETRACE(0x200) "multiSelect UNION ALL left..."
+        (select.c:3011).  Mask 0x200 traces compound-SELECT peer
+        recursion in multiSelect; printed immediately before recursing
+        into the left arm with the propagated LIMIT/OFFSET. }
+      if (sqlite3TreeTrace and $200) <> 0 then
+        sqlite3DebugPrintf('multiSelect UNION ALL left...'#10, []);
+      {$ENDIF}
       rcSel := sqlite3Select(pParse, pPriorSel, pDest);
 
       { Drop the duplicated LIMIT Expr (select.c:3013..3014). }
@@ -25385,6 +25393,13 @@ begin
                                 p^.iLimit, p^.iOffset + 1, p^.iOffset);
           end;
         end;
+        {$IFDEF SQLITE_DEBUG}
+        { 10.1.42.a.1 — TREETRACE(0x200) "multiSelect UNION ALL right..."
+          (select.c:3030).  Pairs with the "left" breadcrumb; printed
+          right before the right-arm recursion. }
+        if (sqlite3TreeTrace and $200) <> 0 then
+          sqlite3DebugPrintf('multiSelect UNION ALL right...'#10, []);
+        {$ENDIF}
         rcSel := sqlite3Select(pParse, p, pDest);
         p^.pPrior := pPriorSel;
         if addrLimJmp <> 0 then

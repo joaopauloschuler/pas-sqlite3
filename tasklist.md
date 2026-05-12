@@ -472,9 +472,12 @@ partial landings cannot silently no-op.
     full enumeration documented inline at the tail of sqlite3Select.
     Doable follow-up subtasks (each is a small grep+port batch in
     `../sqlite3/src/select.c`, all gated by `{$IFDEF SQLITE_DEBUG}`):
-    - [ ] **10.1.42.a.1** multiSelect / compound flattener TREETRACE
+    - [X] **10.1.42.a.1** multiSelect / compound flattener TREETRACE
       arms (mask 0x200): `compound-select` begin/peer/end breadcrumbs
-      in `multiSelect`.
+      in `multiSelect`.  Landed: UNION ALL left/right (select.c:3011,
+      3030).  Pas's multiSelect is inlined into sqlite3Select; the
+      compound-end breadcrumb (select.c:7887, mask 0x400) lives on the
+      sqlite3Select dispatch path and lands as part of 10.1.42.a.3.
     - [ ] **10.1.42.a.2** Post-flatten / wildcard-expansion TREETRACE
       (mask 0x4 / 0x100): `after flattening`, `after wildcard expansion`
       in `sqlite3Select` body.
