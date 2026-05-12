@@ -6229,12 +6229,15 @@ begin
 end;
 
 { ============================================================================
-  Phase 5.7 — vdbesort.c external sorter stubs
+  Phase 5.7 — vdbesort.c external sorter (in-memory port real;
+  PMA / disk-spill deferred).
 
-  Full implementation requires KeyInfo/UnpackedRecord (Phase 6+) and the
-  PmaReader / MergeEngine / SortSubtask subsystems. The public functions
-  handle nil-guard and state-check behavior correctly; the actual sort logic
-  is deferred until ORDER BY opcodes are active (Phase 6.bis onward).
+  The in-memory single-PMA mergesort path is fully ported (see
+  vdbeSorterMergeSort / vdbeSorterCompareRec / sqlite3VdbeSorterWrite /
+  Rewind / Next / Rowkey / Compare below).  KeyInfo/UnpackedRecord landed
+  with Phase 6.  What remains deferred is the PmaReader / MergeEngine /
+  SortSubtask disk-spill subsystem — ORDER BY past the in-memory cap
+  silently truncates to RAM-only sort (no PMA spill).
   ============================================================================ }
 
 function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;

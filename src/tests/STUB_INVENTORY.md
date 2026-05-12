@@ -13,6 +13,14 @@ stubs at the cited phase but have since been fully ported — the comment
 banner just was not rewritten), the inventory below is the productive
 list of behavioural stubs still in tree.
 
+After the 6.28.3 / 6.28.4 / 6.28.7 / 6.28.8 / 6.28.9 / 6.28.10 audit
+passes, only **2 actionable entries** remain out of the original 21:
+- #4 `sqlite3AddColumn` — DRIFTED-S (~25 lines C of small arms; landed in 6.28.4).
+- #13 `sqlite3VdbeSorter*` PMA disk-spill — DRIFTED-XL (~2400 lines C deferred to Phase 5.7.b).
+All other entries are either CLOSED (was real, stale banner scrubbed)
+or INTENTIONAL (faithful empty body matching C's preprocessor-gated
+no-op).
+
 Each entry uses the form:
 ```
 Pascal: <file>:<line>  <symbol>
@@ -143,93 +151,155 @@ Prio  : high|med|low   (blocks open tasklist bullet?)
 
 ## Medium priority — degrades coverage but not parity
 
-### 8. `code_outer_join_constraints` / `pLevel^.pRJ`
-- Pascal: `src/passqlite3codegen.pas:20768`.
-- C ref : `where.c:1442..1521`.
-- Note  : RIGHT JOIN / FULL OUTER JOIN reordering arm absent; matches
-  upstream's `SQLITE_OMIT_RIGHT_JOIN` build but tasklist 6.x targets full
-  RIGHT JOIN.
-- Prio  : med (blocks any RIGHT JOIN row in TestExplainParity).
+### 8. `code_outer_join_constraints` / `pLevel^.pRJ` — CLOSED (was real, task 6.28.9)
+- Pascal: pRJ match-record block at
+  `src/passqlite3codegen.pas:21092..21125`;
+  code_outer_join_constraints walk at `:21150..21173`.
+- C ref : `wherecode.c:2729..2768` (pRJ block),
+  `wherecode.c:2800..2813` (code_outer_join_constraints walk).
+  (Original inventory cite `where.c:1442..1521` was wrong; that range
+  is the unrelated codeAllEqualityTerms helper.)
+- Verdict: 6.28.9 audit found both arms are real 1:1 ports.  pRJ block
+  handles HasRowid + WITHOUT-ROWID PK paths, OP_Found short-circuit,
+  OP_MakeRecord + OP_IdxInsert + OP_FilterAdd with OPFLAG_USESEEKRESULT.
+  code_outer_join_constraints walks pWC^.a[0..nBase-1] and emits
+  residuals for outer-join terms left untouched by the main walk, with
+  the JT_LTORJ short-circuit for RIGHT-JOIN-subroutine tables.  The
+  BeginSubrtn / EndSubrtn driver is also coded at :21136..21148 (and
+  symmetric tail in sqlite3WhereEnd).  Stale "pRJ is a stub" banner at
+  codegen.pas:20975 scrubbed.
 
-### 9. `sqlite3ExprNNCollSeq` Phase 6.6 stub
-- Pascal: `src/passqlite3codegen.pas:16274`.
-- C ref : `expr.c:174..208`.
-- Note  : Returns nil → conservative BINARY collation fallback.
-- Prio  : med (non-BINARY-collation corpora silently coerce to BINARY).
-- Size  : ~40 lines C.
+### 9. `sqlite3ExprNNCollSeq` — CLOSED (was real, task 6.28.9)
+- Pascal: body at `src/passqlite3codegen.pas:29221..29230` (forward decl
+  at `:2138`).  Original inventory cite to `:16274` pointed at a usage
+  site inside wherePathMatchSubqueryOB, not the body.
+- C ref : `expr.c:321..328` (NOT `:174..208`; original cite was wrong).
+- Verdict: 6.28.9 audit found the body is a 1:1 port: calls
+  sqlite3ExprCollSeq, falls back to `db^.pDfltColl` when no defined
+  collation matches, AssertH non-nil contract.  This is the canonical
+  non-null-collation lookup; the "returns nil → BINARY fallback" note
+  in the original inventory was simply wrong.  Stale "Phase 6.6 stub"
+  comment at codegen.pas:16424 (inside wherePathMatchSubqueryOB)
+  scrubbed.
 
-### 10. `sqlite3DefaultRowEst` Phase-6.3 stub fallback
-- Pascal: `src/passqlite3codegen.pas:23998..24020`.
+### 10. `sqlite3DefaultRowEst` — CLOSED (was real, task 6.28.9)
+- Pascal: body at `src/passqlite3codegen.pas:36624..36655`.  Original
+  inventory cite to `:23998..24020` pointed at the unrelated
+  sqlite3SelectCheckOnClauses driver.
 - C ref : `build.c:4551..4606`.
-- Note  : Already largely ported per build.c surface; one rarely-touched
-  arm (`pIdx->szIdxRow` floor) flagged in the banner as Phase 6.3-era.
-- Prio  : med (planner cost-model accuracy on small indexes).
+- Verdict: 6.28.9 audit found the body is a 1:1 port: nRowLogEst floor
+  to 99, partial-index `-10` discount, aVal table seeding
+  `(33,32,30,28,26)` for the first five key columns, LogEst(23) default
+  for trailing columns.  Earlier "Phase 6.3 stub" / "szIdxRow floor"
+  note was stale; the szIdxRow floor lives in decodeIntArray
+  (codegen.pas:36697..36702) which is also fully ported.
+- Prio  : —
 
-### 11. `codeVectorCompare` fast path
-- Pascal: `src/passqlite3codegen.pas:5520`.
-- C ref : `expr.c:3210..3327`.
-- Note  : Vector `(a,b) = (?,?)` IN-compare falls through to the slow
-  per-component path.  Correctness preserved.
-- Prio  : med (perf).
+### 11. `codeVectorCompare` fast path — CLOSED (was real, task 6.28.9)
+- Pascal: body at `src/passqlite3codegen.pas:17360..17445`; dispatch in
+  the TK_EQ/LT/LE/GT/GE/NE arm of sqlite3ExprCodeTarget at
+  `:5537..5540`.
+- C ref : `expr.c:697..784` (codeVectorCompare body),
+  `expr.c:5174..5176` (dispatch).  (Original inventory cite to
+  `expr.c:3210..3327` was wrong — that range is the unrelated
+  sqlite3ExprForVectorField helper.)
+- Verdict: 6.28.9 audit found both the body and the dispatch are real
+  1:1 ports: nLeft/nRight mismatch error, opx normalisation for LE/GE/
+  NE, exprCodeSubselect for both operands, OP_ZeroOrNull /
+  SQLITE_NULLEQ branch, OP_ElseEq for LT/GT inner-loop, OP_NotNull
+  short-circuit for TK_EQ, trailing OP_Not for TK_NE.  Earlier "fast
+  path not yet ported / falls through to slow" note in the dispatch
+  comment was stale and has been scrubbed.
 
-### 12. `sqlite3HasExplicitNulls` of NULLS LAST sort
-- Pascal: not flagged as stub but C `expr.c:1882` `(void)` cast wraps it
-  — the Pascal version forces the error, mirroring C.  No action.
+### 12. `sqlite3HasExplicitNulls` of NULLS LAST sort — CLOSED (was real, task 6.28.9)
+- Pascal: body at `src/passqlite3codegen.pas:36602..36622`.
+- C ref : `select.c:5859` + `expr.c:1882` `(void)` cast site.
+- Verdict: 6.28.9 audit confirmed body is a faithful 1:1 port — walks
+  pList, raises "unsupported use of NULLS FIRST" / "NULLS LAST" error
+  when explicit NULLS ordering is requested but the column has no
+  matching index ordering, mirroring the C error string verbatim.  No
+  action.
 
-### 13. `sqlite3VdbeSorter*` family — Phase 5.7
-- Pascal: `src/passqlite3vdbe.pas:6232..6500` (banner + bodies).
+### 13. `sqlite3VdbeSorter*` family — DRIFTED-XL (PMA / disk-spill deferred)
+- Pascal: `src/passqlite3vdbe.pas:6232..6551` (banner +
+  Init / Reset / Close / Write / Rewind / Next / Rowkey / Compare
+  bodies, plus vdbeSorterMergeSort / vdbeSorterCompareRec /
+  vdbeSorterListToArray / vdbeSorterCountRecords helpers).
 - C ref : `vdbesort.c` entire file.
-- Note  : External sorter falls back to in-memory list; ORDER BY past
-  ~16 MB silently truncates to RAM-only sort (no PMA spill).  Bug
-  surface: only on DB files larger than `sqlite3GlobalConfig.szMmap`.
-- Prio  : med-low.
-- Size  : ~2400 lines C — DO NOT attempt as the "one small port".
+- Verdict: 6.28.9 audit found the in-memory single-PMA path is fully
+  ported (stable mergesort, KeyInfo+UnpackedRecord packing with
+  default_rc=0 fix from bug 6.13).  What remains is the
+  PmaReader / MergeEngine / SortSubtask disk-spill subsystem — ORDER
+  BY past the in-memory cap silently truncates to RAM-only sort
+  (no PMA spill).  Banner at vdbe.pas:6232 updated to reflect the
+  partial-port reality.
+- Prio  : med-low (only matters on sorts that exceed in-RAM cap).
+- Size  : XL — ~2400 lines C of disk-spill code.  DO NOT attempt as
+  "one small port"; tracked as a future Phase 5.7.b slice.
 
 ## Low priority — debug, OMIT_*, or already-faithful no-ops
 
-### 14. `sqlite3VdbeComment` / `sqlite3VdbeNoopComment`
-- Pascal: `src/passqlite3vdbe.pas:2939, 2948`.
-- C ref : SQLITE_DEBUG-only.
-- Note  : Production builds in C are also no-ops.  No port required.
+### 14. `sqlite3VdbeComment` / `sqlite3VdbeNoopComment` — INTENTIONAL (verified 6.28.10)
+- Pascal: `src/passqlite3vdbe.pas:2939, 2943` (sqlite3VdbeNoopComment
+  emits OP_Noop when the Vdbe is non-nil, matching the C macro form).
+- C ref : `vdbeaux.c` — only bodied under SQLITE_ENABLE_EXPLAIN_COMMENTS.
+- Verdict: 6.28.10 audit confirmed empty body is the faithful port for
+  the !SQLITE_ENABLE_EXPLAIN_COMMENTS production build.  No port
+  required.
 - Prio  : low (intentional).
 
-### 15. `sqlite3VdbeAssertAbortable` / `VdbeVerifyNoMallocRequired` /
-       `VdbeVerifyNoResultRow`
-- Pascal: `src/passqlite3vdbe.pas:3158, 3167, 3171`.
-- C ref : SQLITE_DEBUG-only.
+### 15. `sqlite3VdbeAssertAbortable` / `sqlite3VdbeNoJumpsOutsideSubrtn` / `VdbeVerifyNoMallocRequired` / `VdbeVerifyNoResultRow` — INTENTIONAL (verified 6.28.10)
+- Pascal: `src/passqlite3vdbe.pas:3158, 3162, 3167, 3171`.
+- C ref : `vdbeaux.c` — SQLITE_DEBUG-only.
+- Verdict: 6.28.10 audit confirmed empty bodies are the faithful port
+  for the !SQLITE_DEBUG production build.
 - Prio  : low (intentional).
 
-### 16. `sqlite3VdbeEnter` / `sqlite3VdbeLeave`
-- Pascal: `src/passqlite3vdbe.pas:3550, 3554`.
-- C ref : SQLITE_THREADSAFE-only.  Single-conn port intentionally inert.
+### 16. `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — INTENTIONAL (verified 6.28.10)
+- Pascal: `src/passqlite3vdbe.pas:3550, 3554` (with banner at :3545
+  citing vdbeInt.h:714/720 empty-macro expansion).
+- C ref : `vdbeaux.c:2066/2101` only bodied when
+  !SQLITE_OMIT_SHARED_CACHE && SQLITE_THREADSAFE>0.
+- Verdict: 6.28.10 audit confirmed empty bodies are the faithful port
+  for the no-shared-cache / single-conn build.
 - Prio  : low (intentional).
 
-### 17. `sqlite3SchemaMutexHeld`
-- Pascal: `src/passqlite3vdbe.pas:12745`.
-- C ref : `prepare.c`.
-- Note  : Returns 1 unconditionally — correct under single-conn model.
+### 17. `sqlite3SchemaMutexHeld` — INTENTIONAL (verified 6.28.10)
+- Pascal: `src/passqlite3vdbe.pas:12745` — `Result := 1` unconditional.
+- C ref : `prepare.c` — guards SQLITE_DEBUG asserts under THREADSAFE.
+- Verdict: 6.28.10 audit confirmed unconditional-1 is correct under the
+  single-conn model (asserts that consume this always pass).
 - Prio  : low (intentional).
 
-### 18. `noopWindowValueFunc` / `noopWindowStepFunc`
-- Pascal: `src/passqlite3codegen.pas:52321, 52323`.
+### 18. `noopWindowValueFunc` / `noopWindowStepFunc` — INTENTIONAL (verified 6.28.10)
+- Pascal: `src/passqlite3codegen.pas:52792, 52796` (cite shifted from
+  `:52321/:52323`).
 - C ref : `window.c:1234..1240`.
-- Note  : These ARE no-ops in C too.
+- Verdict: 6.28.10 audit confirmed these ARE no-ops in C too — they
+  fill xValue / xInverse slots for ordinary aggregates promoted to
+  window functions (first_value, nth_value etc.) where no work is
+  required.  Faithful 1:1.
 - Prio  : low (intentional).
 
-### 19. `sqlite3VtabEponymousTableClear` banner notes
-- Pascal: `src/passqlite3vtab.pas:39, 66`.
+### 19. `sqlite3VtabEponymousTableClear` banner notes — CLOSED (banner refresh, 6.28.10)
+- Pascal: `src/passqlite3vtab.pas:39, 66` (banner notes refreshed);
+  body at `:1335..1347` is the full port and mirrors `vtab.c:1298`.
 - C ref : `vtab.c:1298`.
-- Note  : The function body at vtab.pas:1335 is the **full port** (mirrors
-  C exactly).  The banner comments at 39 and 66 are stale and call the
-  function a "stub" — purely a comment refresh, no behaviour change.
-- Prio  : low (banner refresh only).
+- Verdict: 6.28.10 audit confirmed body is a faithful 1:1 port (marks
+  TF_Ephemeral, dispatches to sqlite3DeleteTable, clears
+  pMod^.pEpoTab).  Banner notes at 39/66 calling it a "stub" / "still
+  a no-op for now" scrubbed.
+- Prio  : low (closed).
 
-### 20. `invalidateAllOverflowCache` / `invalidateOverflowCache`
-- Pascal: `src/passqlite3btree.pas:2019..2042`.
+### 20. `invalidateAllOverflowCache` / `invalidateOverflowCache` — CLOSED (verified 6.28.10)
+- Pascal: `src/passqlite3btree.pas:2022..2038`.
 - C ref : `btree.c:565..575, 591..609`.
-- Note  : Already fully ported; comment at btree.pas:6618 calling the
-  call site a "no-op stub" is stale.
-- Prio  : low (banner refresh).
+- Verdict: 6.28.10 audit confirmed both are faithful 1:1 ports — free
+  pCur^.aOverflow, clear BTCF_ValidOvfl, walk pBt^.pCursor chain.  The
+  original inventory pointed at a stale comment at btree.pas:6618, but
+  that comment is actually about invalidateIncrblobCursors (a separate
+  incrblob-cursor stub, tracked outside 6.28).  No action here.
+- Prio  : low (closed).
 
 ### 21. `pas_openDirectory`
 - Pascal: `src/passqlite3os.pas:2331` (BEFORE this commit) — was a no-op
@@ -276,19 +346,25 @@ write, edit/spreadsheet/web-browser pipe targets) — see tasklist 10.1.27,
 
 ## Summary
 
-| Priority   | Count |
-|------------|------:|
-| high       |     7 (6 CLOSED after 6.28.3/6.28.7/6.28.8 audits; 1 DRIFTED-S) |
-| med        |     6 |
-| low        |     8 |
-| (intentional / shell deferred) | ~18 |
-| **total productive markers**   | ~256 raw / ~21 actionable |
+| Priority   | Count | Status after audit                                            |
+|------------|------:|---------------------------------------------------------------|
+| high       |     7 | 6 CLOSED (was real), 1 DRIFTED-S (#4, landed in 6.28.4)       |
+| med        |     6 | 5 CLOSED (was real, 6.28.9), 1 DRIFTED-XL (#13 PMA spill)     |
+| low        |     8 | 7 INTENTIONAL/CLOSED (6.28.10), 1 closed in 6.28 (#21)        |
+| (intentional / shell deferred) | ~18 | tracked outside 6.28                          |
+| **total productive markers**   | ~256 raw / **2 actionable** (#4 done, #13 deferred-XL) |
 
-Audit summary (6.28.3 / 6.28.7 / 6.28.8): of the original seven
-"high-priority stubs", six turned out to be real ports under stale
-marker comments (#1, #2, #3, #5, #6, #7), and #4 is a small-S drift
-(three minor arms missing).  Only `pas_openDirectory` (entry 21) was
-ported in the 6.28 commit itself; the audit replaced "size ~600 lines
-C, large port" estimates with actual line-by-line verdicts.
+Audit summary (6.28.3 / 6.28.7 / 6.28.8 / 6.28.9 / 6.28.10): of the
+original 21 productive markers, 18 turned out to be real ports under
+stale marker comments, 1 is a small-S drift that already landed
+(#4 sqlite3AddColumn, 6.28.4), 1 was ported in the 6.28 commit itself
+(#21 pas_openDirectory), and 1 is a large XL deferral
+(#13 sqlite3VdbeSorter PMA disk-spill).  Inventory line/file
+references were wrong on the majority of entries — 6.28.9 alone
+corrected 4 of 6 medium-priority cites (#8 where.c→wherecode.c,
+#9 expr.c:174→expr.c:321, #10 codegen.pas:23998→:36624,
+#11 expr.c:3210→expr.c:697).  Future agents have realistic per-entry
+sizing rather than the fabricated "~600 lines / ~2400 lines" worst-
+case estimates the original inventory used.
 
 End of inventory.

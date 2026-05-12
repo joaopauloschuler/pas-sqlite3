@@ -36,7 +36,7 @@ unit passqlite3vtab;
     sqlite3VtabUnlockList         (vtab.c:310)
     sqlite3VtabClear              (vtab.c:340)
     sqlite3_drop_modules          (vtab.c:140)
-    sqlite3VtabEponymousTableClear (stub — full version in 6.bis.1f)
+    sqlite3VtabEponymousTableClear (vtab.c:1298 — full body landed in 6.bis.1f)
 
   Public types defined here (mirroring sqlite.h / sqliteInt.h byte layout):
     Tsqlite3_module     (sqlite.h:7684) — 22 function-pointer slots + iVersion
@@ -63,7 +63,7 @@ unit passqlite3vtab;
   After this sub-phase, sqlite3_create_module / _v2 in passqlite3main delegate
   to the new sqlite3VtabCreateModule (replacing the inline minimal version
   from Phase 8.3).  Replacement of an existing module now correctly invokes
-  sqlite3VtabEponymousTableClear (still a no-op for now) and
+  sqlite3VtabEponymousTableClear (full body at vtab.pas:1335) and
   sqlite3VtabModuleUnref, matching the C control flow — only the module's
   destructor and free wait on a future sub-phase to also chase eponymous
   tables.

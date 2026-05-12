@@ -5513,11 +5513,9 @@ begin
         begin
           { Faithful port of expr.c:5161..5208.  TK_IS / TK_ISNOT fold
             into TK_EQ / TK_NE with p5=SQLITE_NULLEQ ("NULLs compare
-            equal").  All other arms keep p5=0.  The vector-compare
-            fast path (codeVectorCompare) is not yet ported; once
-            sqlite3ExprIsVector returns true here the arm degrades to
-            OP_Null — vector EQ inside a non-row-value WHERE clause
-            does not arise on the corpus this slice gates on.
+            equal").  All other arms keep p5=0.  Vector compares
+            (sqlite3ExprIsVector(pLeft)) dispatch to codeVectorCompare
+            below, matching the C arm at expr.c:5174..5176.
 
             Sub-select short-circuit: when EP_Subquery is set and we are
             *not* in NULLEQ mode, exprComputeOperands codes the cheaper
@@ -16421,9 +16419,10 @@ begin
         pPrs := pWInfo^.pParse;
         pColl1 := PTCollSeq(sqlite3ExprNNCollSeq(pPrs, obItems[i].pExpr));
         pColl2 := PTCollSeq(sqlite3ExprCompareCollSeq(pPrs, pTerm^.pExpr));
-        { Phase 6.6 stub: sqlite3ExprNNCollSeq returns nil → conservatively
-          accept (BINARY-default match) so the most common corpus shape
-          isn't disqualified by missing collation metadata. }
+        { sqlite3ExprNNCollSeq honours the C non-null contract (falls
+          back to db^.pDfltColl), so both pColl1 and pColl2 are normally
+          non-nil here; the guard remains defensive against malloc-fail
+          paths that propagate nil through the walker. }
         if (pColl1 <> nil) and (pColl2 <> nil) then
           if sqlite3StrICmp(pColl1^.zName, pColl2^.zName) <> 0 then Continue;
       end;
@@ -20973,10 +20972,12 @@ begin
     BLOB-comparison pass (the range bound suffices for strings).
 
     RIGHT JOIN match-recording (pRJ) and the JT_LEFT post-pass via
-    code_outer_join_constraints are deferred — pLevel^.pRJ is a stub for
-    now and the JT_LEFT/LTORJ/RIGHT skip path inside the main walk already
-    leaves outer-join terms uncoded so a future batch can pick them up
-    once the RIGHT JOIN subroutine driver lands. }
+    code_outer_join_constraints are coded below (RIGHT JOIN match-record
+    block at wherecode.c:2729..2768 mirror; code_outer_join_constraints
+    walk at wherecode.c:2800..2813 mirror).  The JT_LEFT/LTORJ/RIGHT skip
+    inside the main walk intentionally defers those terms to the
+    code_outer_join_constraints block so they land after the match flag
+    is set. }
   pWCBody := @pWInfo^.sWC;
   if (pLoop^.wsFlags and WHERE_INDEXED) <> 0 then
     pIdxBody := pLoop^.u.btree.pIndex
