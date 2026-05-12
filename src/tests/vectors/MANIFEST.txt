@@ -1,0 +1,82 @@
+Reference vector inventory (tasklist 9.2.1).
+=============================================
+
+Each vector is a `.db` blob produced from a sibling `.sql` script by
+the C reference shell (`../sqlite3/sqlite3`).  Re-running
+`./regen.sh` (tasklist 9.2.5) must reproduce every committed `.db`
+byte-identically.  All blobs were generated against:
+
+    SQLite 3.53.0 2026-04-09 (../sqlite3/sqlite3)
+
+Status legend: [X] complete  [~] partial / known-limited  [SKIP] script
+only, no .db committed (extension not yet ported).
+
+Phase-6/7/8 column links each vector to the Phase tasklist bullet that
+will (or already does) consume it.  Vectors without a direct gate are
+marked "general".
+
+vector                  status  phase-gate                summary
+----------------------  ------  ------------------------  ----------------------------------------
+simple.db               [~]     general (Phase 3 pager)   2-row rowid table; 3 separate write txns.
+                                                          Committed blob predates the current C
+                                                          oracle (3.53.0): byte 96..99 carry an
+                                                          older sqlite_version_number stamp.
+                                                          regen.sh checks this vector by .dump
+                                                          equivalence, not byte-identity (see
+                                                          EQUIV_LIST in regen.sh).  Per the Phase
+                                                          9.2.1 hard rule the blob is left
+                                                          untouched.
+multipage.db            [~]     general (Phase 3 pager)   199-row rowid table.  Same vintage
+                                                          caveat as simple.db; the per-page cell
+                                                          packing also drifted between SQLite
+                                                          3.45.x and 3.53.x, so byte-identity is
+                                                          impossible and regen.sh falls back to
+                                                          .dump equivalence.
+wal.db                  [~]     general / 9.2.x (WAL)     journal_mode=WAL; passive-checkpointed.
+                                                          Limit: .db-wal sidecar embeds a random
+                                                          salt so it cannot be made deterministic
+                                                          via the shell — only the .db is committed.
+                                                          See wal.sql header for the full note.
+autovacuum.db           [X]     6.27 / 9.2.4              auto_vacuum=FULL with a freelist-creating delete.
+incrvacuum.db           [X]     6.27 / 9.2.4              auto_vacuum=INCREMENTAL + PRAGMA incremental_vacuum.
+fts5.db                 [SKIP]  Phase 8 / out-of-scope    FTS5 ext not ported; .sql kept for future regen.
+rtree.db                [SKIP]  Phase 8 / out-of-scope    R*Tree ext not ported; .sql kept for future regen.
+utf16.db                [X]     general / 9.2.2           PRAGMA encoding='UTF-16le' incl. non-BMP code points.
+withoutrowid.db         [X]     6.x / 9.2.2               Composite-PK WITHOUT ROWID table.
+generated-column.db     [X]     6.x / 9.2.2               VIRTUAL + STORED generated columns.
+triggers.db             [X]     6.x / 9.2.4               BEFORE/AFTER row triggers + INSTEAD OF on view.
+view-cte.db             [X]     6.x / 9.2.2               Plain VIEW + WITH RECURSIVE materialised into a table.
+partial-index.db        [X]     6.x / 9.2.4               Partial index `WHERE status='active'`.
+
+Notes for future agents
+-----------------------
+
+* Do NOT regenerate `simple.db` / `multipage.db` casually — they pin
+  Phase 3 pager-test expectations.  If the C oracle ever changes the
+  on-disk layout for these schemas, bump the test fixtures together.
+
+* `wal.db` carries WAL mode in its header (bytes 18..19 = 02 02) but
+  has no live frames; the C shell's clean shutdown final-checkpoints
+  and removes the .db-wal sidecar.  A truly mid-checkpoint vector
+  would require crashing the writer between PASSIVE checkpoint and
+  exit, which is not portable across kernels — flagged here so the
+  Phase 9 read-only probe can still exercise the WAL header path
+  without depending on the sidecar.
+
+* `fts5.db` and `rtree.db` are intentionally absent.  The Phase 8
+  tasklist marks the matching extensions as out-of-scope until the
+  upstream `ext/fts5/` and `ext/rtree/` trees are ported.  When those
+  ports land, drop the [SKIP] tag here, run `./regen.sh`, and commit
+  the new blobs alongside.
+
+* All scripts must remain executable by `sqlite3 file.db < file.sql`
+  with no extra flags.  Shell-only directives (`.filectrl`, `.read`)
+  are allowed because the script flows through the shell, not raw
+  libsqlite.
+
+Reproducibility gate
+--------------------
+
+`./regen.sh` (tasklist 9.2.5) iterates every `*.sql` here, regenerates
+the `.db` into a tempdir, and `cmp`s against the committed blob.  Any
+mismatch (other than for [SKIP] entries) is a hard failure.
