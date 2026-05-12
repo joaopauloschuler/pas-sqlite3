@@ -184,7 +184,7 @@ regressions without human triage.
   Cross-reference against the 1026-statement TestExplainParity input
   so nothing already covered is duplicated.
 
-- [ ] **9.1.2** Oracle runner helper.  `src/tests/CorpusOracle.pas`:
+- [X] **9.1.2** Oracle runner helper.  `src/tests/CorpusOracle.pas`:
   given a `.sql` path and an empty workdir, runs the C reference via
   `libsqlite3.so` (in-process, not the `sqlite3` shell — avoid Phase
   10 dependency) and captures `(stdout, stderr, rc, db-blob)`.
