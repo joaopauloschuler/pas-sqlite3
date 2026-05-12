@@ -120,9 +120,9 @@ cannot be silently ignored.
 
 ### Full SQL corpus differential (`TestSQLCorpus`)
 
-The broadest single gate: `bin/TestSQLCorpus` harvests SQL string literals
-embedded in every `Diag*.pas` / `Test*.pas` source file (the existing
-differential probes), then runs each statement through both oracles in
+`TestSQLCorpus` harvests SQL string literals embedded in every
+`Diag*.pas` / `Test*.pas` source file (the existing
+differential probes), then runs each statement through both pascal and C oracles in
 isolated workdirs and byte-compares stdout, stderr, rc, and the on-disk
 db blob (with documented non-deterministic bytes masked).
 
