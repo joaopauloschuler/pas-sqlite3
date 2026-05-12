@@ -14108,6 +14108,20 @@ begin
   if nNew < 10 then nNew := 10;
   if nNew < nOut then nOut := nNew;
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b.1 — WHERETRACE(0x20) "Range scan lowers nOut" (where.c:2247..
+    2250).  Upstream mask is 0x20 (the tasklist's 0x10 was guidance — the
+    actual macro guard uses 0x20).  Emitted under the WHERETRACE_ENABLED
+    block at where.c:2246; we gate on SQLITE_DEBUG (the umbrella) for
+    parity with the other arms in this batch. }
+  if (sqlite3WhereTrace and $20) <> 0 then
+  begin
+    if pLoop^.nOut > i16(nOut) then
+      sqlite3DebugPrintf('Range scan lowers nOut from %d to %d'#10,
+                         [pLoop^.nOut, nOut]);
+  end;
+  {$ENDIF}
+
   pLoop^.nOut := i16(nOut);
   Result := rc;
 end;

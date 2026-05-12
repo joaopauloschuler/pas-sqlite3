@@ -526,9 +526,18 @@ partial landings cannot silently no-op.
     counterpart is confidently anchored.  Doable follow-up subtasks
     (each is a small grep+port in `../sqlite3/src/where*.c`, all gated
     by `{$IFDEF SQLITE_DEBUG}`):
-    - [ ] **10.1.42.b.1** Range-scan cost-estimate WHERETRACE arms in
-      `whereRangeScanEst` / `whereRangeSkipScanEst` (mask 0x10) —
-      STAT4-aware range cost prints.
+    - [~] **10.1.42.b.1** Range-scan cost-estimate WHERETRACE arms in
+      `whereRangeScanEst` / `whereRangeSkipScanEst` (target tasklist mask
+      0x10; upstream actual mask 0x20).  Landed: `Range scan lowers nOut
+      from %d to %d` (where.c:2247..2250) at the tail of the Pas
+      `whereRangeScanEst` — the only WHERETRACE arm reachable in the
+      no-STAT4 build that this project compiles against.  Deferred
+      (STAT4-only, no Pas counterpart): `range skip-scan regions`
+      (where.c:2036), `STAT4 range scan` (2215), `equality scan regions`
+      (2313), `IN row estimate` (2363) — these live inside
+      `whereRangeSkipScanEst` / `whereEqualScanEst` / `whereInScanEst`
+      which are gated behind `SQLITE_ENABLE_STAT4` and have no Pascal
+      port.  Will fold them in once the STAT4 family is ported.
     - [ ] **10.1.42.b.2** Subset-cost adjustment WHERETRACE in
       `whereLoopAddBtree` / `whereLoopInsert` (mask 0x800) — `cost`,
       `subset cost adjusted`, `… not helpful` decisions.
