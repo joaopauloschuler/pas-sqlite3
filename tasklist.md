@@ -437,12 +437,20 @@ partial landings cannot silently no-op.
     unknown-option, missing-argument) still emit the legacy "Error: ...\n"
     form — promoting them is mechanical follow-up; not blocking 10.1.40
     closure.
-  - [ ] **10.1.40.a.followup** Route the remaining `.check` cluster
-    "Error: …\n" callsites through `shellDotError` so every error path
-    in `cmdCheck` / `cmdTestcase` carries the caret prefix, not just
-    the two sites wired in 10.1.40.a.  Grep `Error: ` in
-    `passqlite3shell.pas` near the `.check` arm.  Extend
-    TestShellMeta `dotcmd-error-caret` to cover the additional paths.
+  - [X] **10.1.40.a.followup** Routed the remaining `.check`/`.testcase`
+    cluster Error sites through `shellDotError` — cmdCheck now caret-
+    formats incompatible-with-prior-options (×3: --glob/--notglob/--exact
+    branches) and unknown-option-after-PATTERN; cmdTestcase caret-formats
+    missing-argument and unknown-option, and now returns i32 so the
+    dispatcher propagates rc=1.  TestShellMeta gained two new arms
+    (`dotcmd-error-caret-tc-unknown`, `dotcmd-error-caret-tc-missing`)
+    byte-diffed against upstream sqlite3 :memory:.  The cmdCheck cluster
+    sites are wired but not byte-diffed: upstream's cli_output_capture
+    swallows both stdout AND stderr while a testcase is armed; our
+    fd-level capture only redirects fd 1, so those error strings leak to
+    real stderr.  Extending the capture to fd 2 is left as separate
+    follow-up (the shellDotError wiring is already correct for when
+    that lands).
   - [ ] **10.1.40.b** `<<ENDMARK` heredoc PATTERN form for `.check` —
     upstream allows multi-line PATTERN delimited by `<<ENDMARK …
     ENDMARK`.  Needs a seekable PFILE input replay (currently the

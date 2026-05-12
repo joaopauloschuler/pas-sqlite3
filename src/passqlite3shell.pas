@@ -7837,8 +7837,8 @@ begin
   end;
 end;
 
-procedure cmdTestcase(p: PShellState; const args: array of AnsiString;
-                      nArg: SizeInt);
+function cmdTestcase(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
 { shell.c.in:8868..8904.  We accept the same NAME-only form; --error-prefix
   is parsed and stored on p^.zErrPrefix for parity, otherwise the single
   positional is the testcase name.  When omitted, NAME defaults to
@@ -7849,6 +7849,7 @@ var
   haveName: Int32;
   z: AnsiString;
 begin
+  Result := 0;
   haveName := 0;
   zName := '';
   i := 0;
@@ -7858,8 +7859,9 @@ begin
       z := Copy(z, 2, MaxInt);
     if z = '-error-prefix' then begin
       if i + 1 >= nArg then begin
-        shellEPutZ(Format('Error: missing argument to %s'#10, [args[i]]));
-        Exit;
+        { shell.c.in:8879 — dotCmdError(p, i, "missing argument", 0). }
+        shellDotError(p, i32(i) + 1, 'missing argument', '');
+        Result := 1; Exit;
       end;
       Inc(i);
       if args[i] = '' then begin
@@ -7870,8 +7872,9 @@ begin
         p^.zErrPrefix := PAnsiChar(gErrPrefixBacking);
       end;
     end else if haveName <> 0 then begin
-      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
-      Exit;
+      { shell.c.in:8886 — dotCmdError(p, i, "unknown option", 0). }
+      shellDotError(p, i32(i) + 1, 'unknown option', '');
+      Result := 1; Exit;
     end else begin
       zName := args[i];
       haveName := 1;
@@ -7966,24 +7969,26 @@ begin
       bKeep := 1;
     end else if z = '-glob' then begin
       if (eCheck <> 0) and (eCheck <> 1) then begin
-        shellEPutZ('Error: incompatible with prior options'#10);
+        { shell.c.in:8768 — dotCmdError(p, i, "incompatible with prior options", 0). }
+        shellDotError(p, i32(i) + 1, 'incompatible with prior options', '');
         Result := 1; Exit;
       end;
       eCheck := 1;
     end else if z = '-notglob' then begin
       if (eCheck <> 0) and (eCheck <> 2) then begin
-        shellEPutZ('Error: incompatible with prior options'#10);
+        shellDotError(p, i32(i) + 1, 'incompatible with prior options', '');
         Result := 1; Exit;
       end;
       eCheck := 2;
     end else if z = '-exact' then begin
       if (eCheck <> 0) and (eCheck <> 3) then begin
-        shellEPutZ('Error: incompatible with prior options'#10);
+        shellDotError(p, i32(i) + 1, 'incompatible with prior options', '');
         Result := 1; Exit;
       end;
       eCheck := 3;
     end else if sawZCheck <> 0 then begin
-      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+      { shell.c.in:8773 — dotCmdError(p, i, "unknown option", 0). }
+      shellDotError(p, i32(i) + 1, 'unknown option', '');
       Result := 1; Exit;
     end else begin
       zCheck := args[i];
@@ -10363,7 +10368,7 @@ begin
   if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd, args, nArg); Exit; end;
-  if zCmd = 'testcase'  then begin cmdTestcase(p, args, nArg); Exit; end;
+  if zCmd = 'testcase'  then begin Result := cmdTestcase(p, args, nArg); Exit; end;
   if zCmd = 'check'     then begin Result := cmdCheck(p, args, nArg); Exit; end;
   if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
   if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin

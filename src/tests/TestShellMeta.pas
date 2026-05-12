@@ -466,6 +466,27 @@ begin
   script := '.check 7'#10;
   DiffMeta('dotcmd-error-caret', ':memory:', script);
 
+  { 10.1.40.a.followup — promote the remaining `.check` / `.testcase`
+    cluster Error sites to shellDotError caret form.  Byte-diffed:
+      - .testcase A B                 → unknown-option (cmdTestcase)
+      - .testcase --error-prefix      → missing argument (cmdTestcase)
+    The cmdCheck cluster paths (incompatible/unknown-after-PATTERN) all
+    fire while cli_output_capture is active in upstream — that captures
+    BOTH stdout and stderr into a sqlite3_str buffer that is then
+    discarded on the early return, so upstream emits empty output.  Our
+    port currently captures stdout only (fd-level dup2 on fd 1), so
+    those error sites still leak through real stderr; the caret-form
+    string is correct but byte-diff differs.  The shellDotError wiring
+    in those sites IS in place — making them byte-equivalent requires
+    extending the fd-capture to also dup2 fd 2 during .testcase, which
+    is a separate refactor.  Tracked in tasklist.md (10.1.40.a.followup
+    note) — not blocking. }
+  script := '.testcase A B'#10;
+  DiffMeta('dotcmd-error-caret-tc-unknown', ':memory:', script);
+
+  script := '.testcase --error-prefix'#10;
+  DiffMeta('dotcmd-error-caret-tc-missing', ':memory:', script);
+
   { Multiple checks with --keep: a single .testcase armed; first .check
     --keep passes, second .check (no --keep) consumes the capture. }
   script :=
