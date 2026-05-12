@@ -1208,10 +1208,14 @@ begin
     related shell features. }
   sqlite3FileioInit(p^.db);
   { Phase 10.1.87 — vfsstat eponymous virtual table from
-    ext/misc/vfsstat.c (825 C lines).  The first call also installs the
-    "vfslog"-named (sic — upstream zName typo) VFS shim that increments
-    the underlying counters; the vtab itself is registered per-db. }
-  sqlite3VfsstatInit(p^.db);
+    ext/misc/vfsstat.c (825 C lines).  Upstream shell.c.in does NOT
+    auto-install vfsstat (it's a separately-loadable extension), so
+    matching the upstream shell precedent (cf. 10.1.90 cksumvfs) we
+    keep sqlite3VfsstatInit / sqlite3_register_vfsstat exported but
+    do NOT auto-call them here.  Wiring this in unconditionally would
+    add a "vfslog"-named VFS shim to sqlite3_vfs_find(0)->pNext and
+    break byte-parity for the `.vfslist` dot-command (10.1f.15). }
+  { sqlite3VfsstatInit(p^.db); }
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it
@@ -6544,7 +6548,11 @@ var
   zDb: AnsiString;
   pVfs: Psqlite3_vfs;
 begin
-  if nArg >= 1 then zDb := args[0] else zDb := 'main';
+  { shell.c.in:11999 — `nArg==2 ? azArg[1] : "main"`.  The Pascal nArg
+    excludes the dot-command name, so the equivalent gate is nArg=1
+    (exactly one trailing token).  >1 trailing tokens silently fall back
+    to "main" in C. }
+  if nArg = 1 then zDb := args[0] else zDb := 'main';
   openDb(p, 0);
   if p^.db = nil then Exit;
   pVfs := nil;
@@ -6586,7 +6594,9 @@ var
   zDb: AnsiString;
   zName: PAnsiChar;
 begin
-  if nArg >= 1 then zDb := args[0] else zDb := 'main';
+  { shell.c.in:12031 — `nArg==2 ? azArg[1] : "main"`.  Pascal nArg
+    excludes the dot-command name, so the equivalent is nArg=1. }
+  if nArg = 1 then zDb := args[0] else zDb := 'main';
   openDb(p, 0);
   if p^.db = nil then Exit;
   zName := nil;

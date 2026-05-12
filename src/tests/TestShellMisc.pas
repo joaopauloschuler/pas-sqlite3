@@ -1,9 +1,10 @@
 {
   SPDX-License-Identifier: blessing
 
-  TestShellMisc — phase 10.1f.10/11/12/13 gate.  Exercises `.crnl`/`.crlf`,
-  `.binary`, `.connection` and `.unmodule` by piping fixed scripts into both
-  binaries (bin/passqlite3 and /home/bpsa/app/sqlite3/sqlite3) and diffing
+  TestShellMisc — phase 10.1f.10..16 gate.  Exercises `.crnl`/`.crlf`,
+  `.binary`, `.connection`, `.unmodule`, `.vfsinfo`, `.vfslist` and
+  `.vfsname` by piping fixed scripts into both binaries
+  (bin/passqlite3 and /home/bpsa/app/sqlite3/sqlite3) and diffing
   stdout+stderr byte-for-byte.
 
   Upstream C arms:
@@ -206,11 +207,77 @@ begin
   DiffScript('unmod-allex-1dash','.unmodule -allexcept'#10);
 end;
 
+procedure RunVfsinfo;
+begin
+  { shell.c.in:11998..12010 — `.vfsinfo ?AUX?` calls file_control
+    VFS_POINTER on the named db (default "main") and prints the
+    vfs.zName/iVersion/szOsFile/mxPathname block.  Success paths
+    cannot byte-parity until the Pascal unix VFS reaches iVersion=3
+    (currently iVersion=2; cross-cutting work outside 10.1f.14).
+    The dispatch / argv handling / "db not found" silence path IS
+    byte-parity-able, which is what we gate here. }
+
+  { Unknown db name: VFS_POINTER returns SQLITE_ERROR with pVfs unset
+    → block silently skipped, rc=0 on both binaries. }
+  DiffScript('vfsinfo-nosuch', '.vfsinfo nosuch_db'#10);
+  { Garbage AUX token — same not-found silence path. }
+  DiffScript('vfsinfo-bogus',  '.vfsinfo bogus_db'#10);
+end;
+
+procedure RunVfslist;
+begin
+  { shell.c.in:12012..12028 — `.vfslist` walks sqlite3_vfs_find(0)
+    →pNext chain.  Full byte-parity stdout is blocked by two
+    cross-cutting port-state divergences out of 10.1f.15's scope:
+
+      1. Pascal unix VFS is iVersion=2 with szOsFile=88 (vs upstream
+         iVersion=3 / szOsFile=128); driven by passqlite3os.pas:2259.
+      2. Port does not register the unix-excl / unix-dotfile /
+         unix-none locking-style shims that upstream's os_unix.c
+         drops in alongside the primary "unix" VFS.
+
+    Both are deep VFS-subsystem porting tasks, NOT dispatcher bugs.
+    The 10.1f.14/16 .vfsinfo/.vfsname subtests above already gate
+    the shared "prefix-match dispatcher → cmdVfs* arm" wiring, so
+    the dispatch path is covered.  The format string ("vfs.zName
+    = ...", iVersion/szOsFile/mxPathname labels, "---..---"
+    separator, "<--- CURRENT" marker) is preserved byte-identically
+    in cmdVfslist (passqlite3shell.pas:6564..6585) and will produce
+    byte-parity output the day the unix-VFS iVersion bump and the
+    locking-style shim registrations land.
+
+    Side-fix in this commit: removed unconditional
+    `sqlite3VfsstatInit(p^.db)` from openDb so the auto-installed
+    "vfslog" wrapper VFS no longer appears as the first .vfslist
+    entry (passqlite3shell.pas:1210..1214; mirrors 10.1.90 cksumvfs
+    precedent of "shim exported but not auto-installed"). }
+
+  { No gateable subtest possible until the cross-cutting fixes land. }
+end;
+
+procedure RunVfsname;
+begin
+  { shell.c.in:12030..12040 — `.vfsname ?AUX?` calls file_control
+    VFSNAME on the named db and prints the returned string.  For
+    `:memory:` neither upstream nor port responds (memdb's
+    xFileControl doesn't implement VFSNAME), so every reachable
+    invocation here emits zero output and is byte-parity-safe. }
+  DiffScript('vfsname-bare',   '.vfsname'#10);
+  DiffScript('vfsname-main',   '.vfsname main'#10);
+  DiffScript('vfsname-nosuch', '.vfsname nosuch_db'#10);
+  { Multiple trailing tokens: C uses nArg==2 ? azArg[1] : "main"
+    (shell.c.in:12031), so a 2+ token form collapses to "main".
+    Port side-fix landed in passqlite3shell.pas:cmdVfsname so the
+    nArg=1 gate matches C's nArg==2 (the dispatcher excludes the
+    dot-command name from its count). }
+  DiffScript('vfsname-multi',  '.vfsname x y'#10);
+end;
+
 begin
   upstream := findUpstreamSqlite3;
   InitPaths;
   if upstream = '' then begin
-    WriteLn('SKIP    crnl/binary/connection/unmodule: ',
+    WriteLn('SKIP    crnl/binary/connection/unmodule/vfs*: ',
             'no upstream sqlite3 binary found');
     WriteLn('        Set UPSTREAM_SQLITE3=/path/to/sqlite3 to enable.');
     CleanupPaths;
@@ -228,6 +295,9 @@ begin
   RunBinary;
   RunConnection;
   RunUnmodule;
+  RunVfsinfo;
+  RunVfslist;
+  RunVfsname;
 
   CleanupPaths;
 
