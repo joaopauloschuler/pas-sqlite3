@@ -223,12 +223,23 @@ regressions without human triage.
   pre-existing sqlite_stat1 (1).  bin/TestSQLCorpus rc=0; full
   regression 88/88 binaries pass.*
 
-- [ ] **9.1.4** Determinism scrub.  Strip the known non-deterministic
+- [X] **9.1.4** Determinism scrub.  Strip the known non-deterministic
   fields (file-change-counter at offset 24, version-valid-for at 92,
   in-header text encoding when unset, freelist trunk order under
   identical workloads — verify each before stripping).  Document
   every masked byte range in `src/tests/corpus/MASK.md` with the C
   source citation that justifies the mask.
+  *Landed 2026-05-12: `CorpusOracle.ApplyHeaderMask` zeros 4 verified
+  byte ranges (24..27 change counter, 56..59 text encoding default-fill,
+  92..95 version-valid-for, 96..99 SQLITE_VERSION_NUMBER) — each cites
+  the C source that writes the field (pager.c:3089..3096, build.c:1354).
+  Freelist trunk order + offsets 28/40/52/etc. evaluated and **rejected**
+  (deterministic under identical workloads) with the rationale recorded
+  in `src/tests/corpus/MASK.md`.  TestSQLCorpus now gates the db-blob
+  channel ON; mask uncovers **+25 new db-blob divergences** (total
+  divergence count 52 → 77; 2182 ok / 2259 scripts) cataloged in
+  `DIVERGENCES.md` per skip-and-cite contract.  bin/TestSQLCorpus rc=0;
+  88/88 regression binaries pass.*
 
 - [ ] **9.1.5** Tag corpus categories by status: `pas-strict`
   (byte-identical), `pas-soft` (output identical, db differs in

@@ -9,16 +9,26 @@ divergences in the same file are counted but not quoted.
 TestSQLCorpus exits rc=0 regardless of divergence count — the
 purpose is *coverage breadth* and *cataloguing*, not gating.
 Real fixes are picked up under the relevant Phase 6/7/8
-ticket; db-blob differences are deferred to Phase 9.1.4.
+ticket.  Phase 9.1.4 landed the determinism mask (see
+`src/tests/corpus/MASK.md`); db-blob divergences that
+survive the mask are real port drift.
 
 | source | tier | tag | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|---------|---------|---------------|--------------------------|
 | src/tests/TestExplainParity.pas | tier1 | mixed | 1024 | 40 | stderr | `RELEASE s1` |
 | src/tests/TestBytecodeParity.pas | tier1 | mixed | 32 | 2 | stderr | `RELEASE s1` |
 | src/tests/TestParser.pas | tier1 | mixed | 40 | 2 | stderr | `RELEASE sp1` |
+| src/tests/DiagArith.pas | tier2 | dql | 131 | 4 | stdout | `SELECT 9223372036854775807 + 1` |
+| src/tests/DiagFeatureProbe.pas | tier2 | mixed | 34 | 2 | db-blob | `CREATE TABLE t(a, b, c); ALTER TABLE t DROP COLUMN b; SELECT count(*) FROM pragm...` |
+| src/tests/DiagScalarFunc.pas | tier2 | dql | 85 | 3 | rc | `SELECT soundex('Robert')` |
+| src/tests/DiagMoreFunc.pas | tier2 | dql | 73 | 7 | stdout | `SELECT pi()` |
 | src/tests/DiagIndexing.pas | tier2 | ddl | 42 | 1 | stderr | `DROP INDEX ix_t_a; SELECT name FROM sqlite_schema WHERE type='index'` |
-| src/tests/DiagPragma.pas | tier2 | pragma | 62 | 2 | stdout | `PRAGMA mmap_size` |
+| src/tests/DiagFunctions.pas | tier2 | dql | 72 | 1 | stdout | `SELECT 9223372036854775807 + 1` |
+| src/tests/DiagPragma.pas | tier2 | pragma | 62 | 3 | stdout | `PRAGMA secure_delete` |
+| src/tests/DiagCast.pas | tier2 | dql | 55 | 1 | stdout | `SELECT 9223372036854775807+1` |
 | src/tests/DiagTxn.pas | tier2 | txn | 40 | 1 | stdout | `PRAGMA journal_mode` |
+| src/tests/DiagDml.pas | tier2 | dml | 14 | 1 | db-blob | `CREATE TABLE s(x,y); CREATE TABLE d(x,y); INSERT INTO s VALUES(1,10),(2,20),(3,3...` |
+| src/tests/DiagDropTable.pas | tier2 | ddl | 6 | 5 | db-blob | `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ; DROP TABLE t; SELECT * FROM t` |
 | src/tests/DiagAnalyze.pas | tier2 | pragma | 3 | 3 | rc | `CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a); INSERT INTO t VALUES(1,1),(2,2),(3...` |
 | src/tests/DiagBloom.pas | tier2 | dql | 9 | 1 | rc | `CREATE TABLE sqlite_stat1(tbl,idx,stat)` |
 

@@ -58,6 +58,22 @@ procedure RunPasOracle(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
                       out outStdout, outStderr: AnsiString;
                       out outRc: i32; out outDbBlob: AnsiString);
 
+{ ApplyHeaderMask — zero the non-deterministic byte ranges of an SQLite
+  database file header.  Operates in place on the first 100 bytes.
+
+  Masked ranges (verified against ../sqlite3/src/ — see
+  src/tests/corpus/MASK.md for the full citations + rationale):
+
+    24..27  file change counter             pager.c:3089-3090
+    56..59  text encoding (when unset)      build.c:1354 (deferred to
+            first CREATE TABLE; pre-DDL the field stays 0)
+    92..95  version-valid-for change ctr    pager.c:3095
+    96..99  SQLITE_VERSION_NUMBER           pager.c:3096
+
+  See btreeInt.h:55..82 for the canonical 100-byte file-header layout.
+  No-op on blobs shorter than 100 bytes (empty/never-created DB). }
+procedure ApplyHeaderMask(var blob: AnsiString);
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -73,6 +89,35 @@ implementation
   Both oracles share the implementation so any reformatting drift is
   impossible by construction.
   ---------------------------------------------------------------------- }
+
+procedure ApplyHeaderMask(var blob: AnsiString);
+var
+  p: PByte;
+  i: i32;
+begin
+  if Length(blob) < 100 then Exit;
+  { AnsiString here is used as a byte container — index from 1, but
+    take the raw byte pointer to keep the offset arithmetic 0-based
+    and identical to the C reference's `aData[N]` notation. }
+  UniqueString(blob); { ensure no other ref shares the bytes }
+  p := PByte(@blob[1]);
+  { 24..27 — file change counter (pager.c:3089-3090, btreeInt.h:66) }
+  for i := 24 to 27 do (p + i)^ := 0;
+  { 56..59 — text encoding default-fill (build.c:1354, btreeInt.h:76).
+    Both oracles set this to ENC(db)=UTF-8 on first CREATE TABLE, but
+    blobs from pre-DDL scripts leave it as 0 vs whatever a partial-write
+    left.  Masking unconditionally is safe because the *post-DDL* value
+    is deterministic (always 1 = UTF-8) — zeroing 1 is a no-op for
+    parity. }
+  for i := 56 to 59 do (p + i)^ := 0;
+  { 92..95 — version-valid-for (pager.c:3095, btreeInt.h:81) — tracks
+    the change-counter snapshot of the last writer's library version. }
+  for i := 92 to 95 do (p + i)^ := 0;
+  { 96..99 — SQLITE_VERSION_NUMBER (pager.c:3096, btreeInt.h:82).  The
+    Pascal port stamps its own version constant; the C oracle stamps
+    libsqlite3.so's — these differ by construction. }
+  for i := 96 to 99 do (p + i)^ := 0;
+end;
 
 function FormatRow(nCol: i32; argv: PPAnsiChar): AnsiString;
 var

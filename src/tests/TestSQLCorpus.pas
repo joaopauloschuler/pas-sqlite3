@@ -242,12 +242,17 @@ begin
     which := 'stderr'; cVal := cErr; pVal := pErr;
     Result := 1; Exit;
   end;
-  { db-blob is intentionally not asserted here — see Phase 9.1.4. }
+  { Phase 9.1.4 — db-blob channel is now gated on, with the
+    non-deterministic header fields zeroed by ApplyHeaderMask.  See
+    src/tests/corpus/MASK.md for the full list of masked byte ranges +
+    C-source citations.  Per the skip-and-cite contract divergences are
+    *cataloged* into DIVERGENCES.md but do NOT fail the binary. }
+  ApplyHeaderMask(cBlob);
+  ApplyHeaderMask(pBlob);
   if cBlob <> pBlob then begin
-    which := 'db-blob (log-only, gated on 9.1.4)';
-    cVal := AnsiString(IntToStr(Length(cBlob)));
-    pVal := AnsiString(IntToStr(Length(pBlob)));
-    { not a failure }
+    which := 'db-blob';
+    cVal := cBlob; pVal := pBlob;
+    Result := 1; Exit;
   end;
 end;
 
@@ -351,7 +356,9 @@ begin
     md.Add('TestSQLCorpus exits rc=0 regardless of divergence count — the');
     md.Add('purpose is *coverage breadth* and *cataloguing*, not gating.');
     md.Add('Real fixes are picked up under the relevant Phase 6/7/8');
-    md.Add('ticket; db-blob differences are deferred to Phase 9.1.4.');
+    md.Add('ticket.  Phase 9.1.4 landed the determinism mask (see');
+    md.Add('`src/tests/corpus/MASK.md`); db-blob divergences that');
+    md.Add('survive the mask are real port drift.');
     md.Add('');
     md.Add('| source | tier | tag | scripts | diverge | first channel | first script (truncated) |');
     md.Add('|--------|------|-----|---------|---------|---------------|--------------------------|');
