@@ -93,10 +93,9 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.29 / 6.29.followup** `sum(b) OVER ()` / `avg(b) OVER ()` — colUsed propagation across window-rewrite boundary in sqlite3WindowRewrite.
 - [X] **6.30** unix VFS iVersion bumped to 3 — ported `aSyscall[]` table + `unixSetSystemCall`/`unixGetSystemCall`/`unixNextSystemCall` in `passqlite3os.pas`, wired into `unixVfsObj`.
 - [X] **6.31** unix-VFS locking-style shims — `sqlite3_os_init` now auto-registers `unix-none`/`unix-dotfile`/`unix-excl` siblings alongside `unix`, mirroring the `UNIXVFS` chain at `os_unix.c:8499..8542`. `.vfslist` enumeration now matches upstream's name/order. Limitation: the 4 VFS records share one `xOpen` and the C `pAppData`→finder dispatch is not yet wired through `unixOpen`, so files opened via the sibling names still get the base posix `unixIoMethods` rather than nolock/dotlock locking. Functional locking-style dispatch + dotlock `lockingContext`/mkdir machinery is a follow-up.
+- [X] **6.13.B.11** `.expert` (10.1.101) reported `(no new indexes)`. Original triage blamed an `eTabType`-after-OP_ParseSchema reload, but tracing showed eTabType was correctly `TABTYP_VTAB` on republished vtabs; the real surface was the eponymous-vtab fast arm in `sqlite3Select` firing unconditionally for every single-source vtab SELECT — no WHERE/ORDER BY pushdown, so `xBestIndex` never saw the constraints and `pScan` stayed empty. Fix: in `passqlite3codegen.sqlite3Select` (passqlite3codegen.pas:~26956) restrict the fast arm to the simple `SELECT … FROM <vtab>` shape (`pWhere=nil and pOrderBy=nil and pGroupBy=nil and pHaving=nil and pLimit=nil`); other shapes fall through to `sqlite3WhereBegin → whereLoopAddVirtual` (Phase 6.13.B.7). Verified: `.expert` now emits `CREATE INDEX t1_idx_… ON t1(b)` for `SELECT * FROM t1 WHERE b=?`.
 
 ### Open Bugs (re-opened 2026-05-11)
-
-- [ ] **6.13.B.11** CREATE VIRTUAL TABLE + OP_ParseSchema vtab `eTabType` not preserved across the schema reload. Surfaces as: `.expert` (10.1.101) always reports `(no new indexes)` because the synthetic dbv mirror schema's republished vtabs come back from execParseSchemaImpl with `eTabType = 0`, so `sqlite3WhereBegin` never reaches `whereLoopAddVirtual` and `pScan` stays empty. Fix: stamp `eTabType = TABTYP_VTAB` (and the module pointer) in `execParseSchemaImpl` / `sqlite3InitCallback` when the parsed CREATE was a `CREATE VIRTUAL TABLE`.
 
 - [ ] **6.32** DiagTxn savepoint-rollback hang (pre-existing). Symptom: `ROLLBACK TO sp` after a deep savepoint stack never returns. Root cause not yet investigated; `timeout 10` is the standing workaround so the suite stays green. Fix: bisect against C oracle to find which savepoint-tree walk loops.
 
@@ -305,7 +304,7 @@ partial landings cannot silently no-op.
   - [X] **10.1c.4** `.databases`
   - [X] **10.1c.5** `.fullschema`
   - [X] **10.1c.6** `.lint fkey-indexes` — closed via 6.13.B and 6.16.
-  - [X] **10.1c.7** `.expert` (read-only subset) — engine ported in 10.1.101; recommendations degenerate ("(no new indexes)") pending 6.13.B.11.
+  - [X] **10.1c.7** `.expert` (read-only subset) — engine ported in 10.1.101; productive recommendations restored by 6.13.B.11.
 - [X] **10.1.15..10.1.21** `.schema --indent`, `.tables`, `.indexes`, `.databases`, `.fullschema`, `.lint fkey-indexes`, `.expert` all landed.
 
 ### 10.1d Data I/O dot-commands
@@ -347,7 +346,7 @@ partial landings cannot silently no-op.
 - [X] **10.1.43..10.1.45** `.backup`, `.restore`, `.clone` all landed.
 - [X] **10.1.46** `.archive`/`.ar` — full port; closed via bugs 6.17.A/B for GLOB range-bound truncation.
 - [X] **10.1.47** `.session` — stub (session extension not ported).
-- [X] **10.1.48** `.recover` — full port (~957 lines + LAF arm + wrapper-VFS arm). Sub-arms 10.1.48.a/b/c/d all closed; remaining issue (eTabType reload) tracked in 6.13.B.11.
+- [X] **10.1.48** `.recover` — full port (~957 lines + LAF arm + wrapper-VFS arm). Sub-arms 10.1.48.a/b/c/d all closed (related .expert surface tracked under 6.13.B.11, now closed).
 - [X] **10.1.49** `.dbinfo`.
 - [X] **10.1.50** `.dbconfig` — boolean DBCONFIG_* + FP_DIGITS dispatched. Counter/pointer ops gated on 8.1.1.
 - [X] **10.1.51..10.1.59** `.filectrl`, `.sha3sum`, `.crnl`, `.binary`, `.connection`, `.unmodule`, `.vfsinfo`/`.vfslist`/`.vfsname`, `.dbtotxt`, `.breakpoint` all landed.
@@ -400,7 +399,7 @@ ports: bare table-valued or MATCH-style invocations are blocked by bug 6.13
 - [X] **10.1.98** zipfile.c → passqlite3zipfile.pas
 - [X] **10.1.99** spellfix.c → passqlite3spellfix.pas
 - [X] **10.1.100** Built-in shell SQL UDFs: strtod, dtostr, shell_add_schema, shell_module_schema, shell_putsnl, usleep. editFunc deferred.
-- [X] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`. Known limitation: degenerate recommendations pending 6.13.B.11.
+- [X] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`. Productive recommendations confirmed once 6.13.B.11 was closed.
 - [X] **10.1.102** `.open --zip` / `--deserialize` / `--hexdb` shell glue + faithful `sqlite3_deserialize` port.
 
 - [ ] **10.1a.1** fill the next porting chunk here.
