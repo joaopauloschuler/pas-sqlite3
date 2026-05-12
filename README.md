@@ -110,12 +110,7 @@ Per-test logs are retained under a temporary directory only when at least
 one binary fails; an all-green run cleans them up.  The script exits
 non-zero if any binary fails, so it can be wired into CI directly.
 
-- **Known failures** (tracked, not regressions introduced by the gate):
-  - `TestPagerReadOnly` — 1 / 10 sub-tests pass; `sqlite3PagerOpen` returns
-    `SQLITE_CANTOPEN` (rc=14) for cases T1–T9.  Phase 3.B.2a fixture work
-    pending.
-
-Failures are deliberately left visible rather than quarantined so they
+- **Known failures**: Failures are deliberately left visible rather than quarantined so they
 cannot be silently ignored.
 
 ### Full SQL corpus differential (`TestSQLCorpus`)
@@ -308,7 +303,7 @@ pas-sqlite3/
 | 6 | Code generators (SQL → VDBE) | 🧪 Ported — in testing |
 | 7 | Parser (tokenizer + Lemon grammar) | 🧪 Ported — in testing |
 | 8 | Public API | 🧪 Ported — in testing |
-| 9 | Acceptance: differential + fuzz testing | 🔲 Pending |
+| 9 | Acceptance: differential + fuzz testing | 🚧 In progress |
 | 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🚧 In progress |
 | 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
 | 12 | Performance optimisation | 🔲 Pending |
