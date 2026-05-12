@@ -538,9 +538,27 @@ partial landings cannot silently no-op.
       `whereRangeSkipScanEst` / `whereEqualScanEst` / `whereInScanEst`
       which are gated behind `SQLITE_ENABLE_STAT4` and have no Pascal
       port.  Will fold them in once the STAT4 family is ported.
-    - [ ] **10.1.42.b.2** Subset-cost adjustment WHERETRACE in
-      `whereLoopAddBtree` / `whereLoopInsert` (mask 0x800) — `cost`,
-      `subset cost adjusted`, `… not helpful` decisions.
+    - [X] **10.1.42.b.2** Subset-cost adjustment WHERETRACE in
+      `whereLoopAdjustCost` and covering-index decision arms in
+      `whereLoopAddBtree` (target tasklist mask 0x800 — upstream actual
+      masks are 0x80 for subset adjustments and 0x200 for covering-index
+      decisions; verified against where.c).  Landed:
+        * `subset cost adjustment %d,%d to %d,%d` x2 (where.c:2711..2714
+          and 2720..2723, mask 0x80) inside `whereLoopAdjustCost` —
+          symmetric arms for proper-subset / proper-superset cases.
+        * `-> %s is not a covering index according to
+          whereIsCoveringIndex()` (where.c:4203, 0x200).
+        * `-> %s is a covering expression index according to
+          whereIsCoveringIndex()` (where.c:4210, 0x200).
+        * `-> %s might be a covering expression index according to
+          whereIsCoveringIndex()` (where.c:4216, 0x200).
+        * `-> %s is a covering index according to bitmasks`
+          (where.c:4224, 0x200).
+      All inside whereLoopAddBtree's covering-index analysis switch.
+      `whereLoopInsert` itself has no plain "cost" / "not helpful" arms
+      under WHERETRACE — the only WHERETRACE in whereLoopInsert family
+      is the 0xffffffff non-viable-vtab-plan reject (where.c:4416) which
+      lives in `whereLoopAddVirtualOne` and is tracked under b.3.
     - [ ] **10.1.42.b.3** Virtual-table constraint enumeration WHERETRACE
       in `whereLoopAddVirtualOne` (mask 0x40): `all-usable` /
       `disabled` constraint walks.

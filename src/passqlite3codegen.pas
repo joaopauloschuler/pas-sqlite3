@@ -12959,10 +12959,30 @@ begin
       begin
         if whereLoopCheaperProperSubset(p, pTemplate) <> 0 then
         begin
+          {$IFDEF SQLITE_DEBUG}
+          { 10.1.42.b.2 — WHERETRACE(0x80) "subset cost adjustment"
+            (where.c:2711..2714).  Print pTemplate's pre-adjust rRun/nOut
+            alongside the post-adjust min(p,pTemplate) values. }
+          if (sqlite3WhereTrace and $80) <> 0 then
+            sqlite3DebugPrintf('subset cost adjustment %d,%d to %d,%d'#10,
+              [pTemplate^.rRun, pTemplate^.nOut,
+               logEstMin(p^.rRun, pTemplate^.rRun),
+               logEstMin(LogEst(p^.nOut - 1), pTemplate^.nOut)]);
+          {$ENDIF}
           pTemplate^.rRun := logEstMin(p^.rRun, pTemplate^.rRun);
           pTemplate^.nOut := logEstMin(LogEst(p^.nOut - 1), pTemplate^.nOut);
         end else if whereLoopCheaperProperSubset(pTemplate, p) <> 0 then
         begin
+          {$IFDEF SQLITE_DEBUG}
+          { 10.1.42.b.2 — WHERETRACE(0x80) "subset cost adjustment"
+            (where.c:2720..2723).  Same shape, but max() — pTemplate is
+            the proper subset so its cost is forced up. }
+          if (sqlite3WhereTrace and $80) <> 0 then
+            sqlite3DebugPrintf('subset cost adjustment %d,%d to %d,%d'#10,
+              [pTemplate^.rRun, pTemplate^.nOut,
+               logEstMax(p^.rRun, pTemplate^.rRun),
+               logEstMax(LogEst(p^.nOut + 1), pTemplate^.nOut)]);
+          {$ENDIF}
           pTemplate^.rRun := logEstMax(p^.rRun, pTemplate^.rRun);
           pTemplate^.nOut := logEstMax(LogEst(p^.nOut + 1), pTemplate^.nOut);
         end;
@@ -14904,16 +14924,52 @@ begin
                and (m <> 0)) then
         begin
           isCov := whereIsCoveringIndex(pWInfo, pProbe, pSrc^.iCursor);
-          if isCov <> 0 then
+          if isCov = 0 then
+          begin
+            {$IFDEF SQLITE_DEBUG}
+            { 10.1.42.b.2 — WHERETRACE(0x200) "is not a covering index"
+              (where.c:4203..4205). }
+            if (sqlite3WhereTrace and $200) <> 0 then
+              sqlite3DebugPrintf(
+                '-> %s is not a covering index according to whereIsCoveringIndex()'#10,
+                [pProbe^.zName]);
+            {$ENDIF}
+          end
+          else
           begin
             m := 0;
             pNew^.wsFlags := pNew^.wsFlags or isCov;
+            {$IFDEF SQLITE_DEBUG}
+            { 10.1.42.b.2 — WHERETRACE(0x200) covering-expression-index
+              decision (where.c:4210..4218).  WHERE_IDX_ONLY bit set =>
+              "is a covering expression index"; otherwise (WHERE_EXPRIDX
+              only) => "might be a covering expression index". }
+            if (sqlite3WhereTrace and $200) <> 0 then
+            begin
+              if (isCov and WHERE_IDX_ONLY) <> 0 then
+                sqlite3DebugPrintf(
+                  '-> %s is a covering expression index according to whereIsCoveringIndex()'#10,
+                  [pProbe^.zName])
+              else
+                sqlite3DebugPrintf(
+                  '-> %s might be a covering expression index according to whereIsCoveringIndex()'#10,
+                  [pProbe^.zName]);
+            end;
+            {$ENDIF}
           end;
         end
         else if (m = 0)
                 and (HasRowid(pTab) or (pWInfo^.pSelect <> nil)
                      or (sqlite3FaultSim(700) <> 0)) then
         begin
+          {$IFDEF SQLITE_DEBUG}
+          { 10.1.42.b.2 — WHERETRACE(0x200) "is a covering index according
+            to bitmasks" (where.c:4224..4226). }
+          if (sqlite3WhereTrace and $200) <> 0 then
+            sqlite3DebugPrintf(
+              '-> %s is a covering index according to bitmasks'#10,
+              [pProbe^.zName]);
+          {$ENDIF}
           pNew^.wsFlags := WHERE_IDX_ONLY or WHERE_INDEXED;
         end;
       end;
