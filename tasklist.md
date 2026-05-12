@@ -516,6 +516,16 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.15** TestExplainParity transient regression — resolved on clean rebuild.
 - [X] **6.29 / 6.29.followup** `sum(b) OVER ()` / `avg(b) OVER ()` — closed via colUsed propagation across window-rewrite boundary in sqlite3WindowRewrite.
 
+### Open Bugs (re-opened 2026-05-11)
+
+- [ ] **6.30** unix VFS `iVersion = 2` vs upstream `3`. Surfaces in `.vfslist` success-path stdout (deferred from the 10.1f.15 byte-parity gate). Pas `sqlite3_vfs.iVersion` is initialised at `2` in the unix-VFS registration; C upstream `os_unix.c` sets it to `3` (the version that adds `xSetSystemCall`/`xGetSystemCall`/`xNextSystemCall`). Fix: bump iVersion + port the three missing v3 method slots. Gate: extend TestShellMisc `.vfslist` arm to assert stdout parity, not just rc parity.
+
+- [ ] **6.31** Missing unix-VFS locking-style shims (`unix-excl`, `unix-dotfile`, `unix-none`, and the rest of the autolist at `os_unix.c:8200..8240`). Pas registers only the base `unix` VFS, so `.vfslist` shows one entry instead of upstream's full chain. Same root cause as 6.30 (incomplete unix-VFS port). Fix: port the per-locking-style auto-registration block; each shim is a thin wrapper that overrides `xOpen` to force a fixed locking method. Gate: `.vfslist` stdout byte-parity.
+
+- [ ] **6.13.B.11** CREATE VIRTUAL TABLE + OP_ParseSchema vtab `eTabType` not preserved across the schema reload. Surfaces as: `.expert` (10.1.101) always reports `(no new indexes)` because the synthetic dbv mirror schema's republished vtabs come back from execParseSchemaImpl with `eTabType = 0`, so `sqlite3WhereBegin` never reaches `whereLoopAddVirtual` and `pScan` stays empty. Fix: stamp `eTabType = TABTYP_VTAB` (and the module pointer) in `execParseSchemaImpl` / `sqlite3InitCallback` when the parsed CREATE was a `CREATE VIRTUAL TABLE`. Already referenced inline from the 10.1.101 / 10.1c.7 ledger entries; given its own bullet so it's trackable from the index.
+
+- [ ] **6.32** DiagTxn savepoint-rollback hang (pre-existing). Mentioned in the orientation block at line ~44 ("Always wrap `DiagTxn` in `timeout 10` — it has a known hang at savepoint rollback"). Symptom: a `ROLLBACK TO sp` after a deep savepoint stack never returns. Root cause not yet investigated; `timeout 10` is the standing workaround so the suite stays green. Fix: bisect against C oracle to find which savepoint-tree walk loops.
+
 ---
 
 ## Phase 7 — Parser
