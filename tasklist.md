@@ -190,10 +190,21 @@ regressions without human triage.
   10 dependency) and captures `(stdout, stderr, rc, db-blob)`.
   Wire the same plumbing for the Pascal port via passqlite3.
 
-- [ ] **9.1.3** `TestSQLCorpus.pas` skeleton.  Iterate MANIFEST, run
+- [~] **9.1.3** `TestSQLCorpus.pas` skeleton.  Iterate MANIFEST, run
   both oracles, byte-compare all four channels.  First diverging file
   prints a one-screen summary (file, channel, first 16-byte window)
   and exits non-zero.  Gate: `bin/TestSQLCorpus` rc=0.
+  *Skeleton landed 2026-05-12 with 4 inline scripts (ddl/dml/dql/pragma)
+  drawn from MANIFEST tier-1/tier-2 entries; bin/TestSQLCorpus rc=0;
+  db-blob channel currently logs-only (gated on 9.1.4 mask).*
+
+- [ ] **9.1.3.followup** Expand `TestSQLCorpus.pas` to full MANIFEST
+  coverage: pull every tier-1 source file's SQL list out of its `.pas`
+  literals (the spine is the 1026-row TestExplainParity corpus) and
+  every tier-2 Diag* feature-corner.  Skip tier-4 (shell-driven) and
+  tier-3 entries already overlapped by tier-1.  Requires a small
+  SQL-literal-extractor — landing it under this subtask keeps the
+  9.1.3 skeleton diff small.
 
 - [ ] **9.1.4** Determinism scrub.  Strip the known non-deterministic
   fields (file-change-counter at offset 24, version-valid-for at 92,
