@@ -24959,6 +24959,44 @@ begin
   {$ENDIF}
 end;
 
+{ aggregateIdxEprRefToColCallback — select.c:6591..6608.  Walker callback
+  used by aggregateConvertIndexedExprRefToColumn.  Convert any node with
+  pAggInfo set into a TK_AGG_COLUMN node so the value is pulled from the
+  index rather than recomputed. }
+function aggregateIdxEprRefToColCallback(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pAggI: PAggInfo;
+  pCol:  PAggInfoCol;
+begin
+  if pExpr^.pAggInfo = nil then begin Result := WRC_Continue; Exit; end;
+  if pExpr^.op = TK_AGG_COLUMN   then begin Result := WRC_Continue; Exit; end;
+  if pExpr^.op = TK_AGG_FUNCTION then begin Result := WRC_Continue; Exit; end;
+  if pExpr^.op = TK_IF_NULL_ROW  then begin Result := WRC_Continue; Exit; end;
+  pAggI := pExpr^.pAggInfo;
+  if pExpr^.iAgg >= pAggI^.nColumn then begin Result := WRC_Continue; Exit; end;  { NEVER }
+  Assert(pExpr^.iAgg >= 0);
+  pCol := @pAggI^.aCol[pExpr^.iAgg];
+  pExpr^.op      := TK_AGG_COLUMN;
+  pExpr^.iTable  := pCol^.iTable;
+  pExpr^.iColumn := pCol^.iColumn;
+  ExprClearProperty(pExpr, EP_Skip or EP_Collate or EP_Unlikely);
+  Result := WRC_Prune;
+end;
+
+{ aggregateConvertIndexedExprRefToColumn — select.c:6615..6623.  Convert
+  every pAggInfo->aFunc[].pExpr such that any node with pAggInfo set is
+  changed into a TK_AGG_COLUMN opcode. }
+procedure aggregateConvertIndexedExprRefToColumn(pAggI: PAggInfo);
+var
+  ii: i32;
+  w:  TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback := @aggregateIdxEprRefToColCallback;
+  for ii := 0 to pAggI^.nFunc - 1 do
+    sqlite3WalkExpr(@w, pAggI^.aFunc[ii].pFExpr);
+end;
+
 { assignAggregateRegisters — select.c:6643.  Allocate a contiguous block
   of registers spanning all aCol[] + aFunc[] entries; record the first
   register in pAggInfo^.iFirstReg.  After this call,
@@ -26586,6 +26624,19 @@ begin
         TreeTraceLine($2, 'WhereEnd');  { select.c:8702 }
         {$ENDIF}
         sqlite3WhereEnd(pWInfo);
+      end;
+
+      { 10.1.42.a.6.4 — convert pAggInfo->aFunc[].pExpr nodes that were
+        previously identified as referring to indexed expressions into
+        TK_AGG_COLUMN reads of the index.  Mirrors select.c:8600..8615. }
+      if pParse^.pIdxEpr <> nil then
+      begin
+        aggregateConvertIndexedExprRefToColumn(pAggI2);
+        {$IFDEF SQLITE_DEBUG}
+        if (sqlite3TreeTrace and $20) <> 0 then
+          sqlite3DebugPrintf(
+            'AggInfo function expressions converted to reference index'#10, []);
+        {$ENDIF}
       end;
 
       pAggI2^.sortingIdxPTab := pParse^.nTab; Inc(pParse^.nTab);

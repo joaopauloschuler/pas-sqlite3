@@ -948,8 +948,15 @@ partial landings cannot silently no-op.
       data-cursor / index dump lands at the tail under `{$IFDEF SQLITE_DEBUG}`.
       Builds clean default + SQLITE_DEBUG=1; TestExplainParity 1026/1026,
       TestSQLCorpus rc=0, 92/92 5177/5177.
-    - [ ] **10.1.42.a.6.4** Port `aggregateConvertIndexedExprRefToColumn`
-      (select.c:8609) so the function-expr-converted print can land.
+    - [X] **10.1.42.a.6.4** Port `aggregateConvertIndexedExprRefToColumn`
+      (select.c:6615..6623) + walker callback `aggregateIdxEprRefToColCallback`
+      (select.c:6591..6608) landed at passqlite3codegen.pas next to
+      optimizeAggregateUseOfIndexedExpr; wired in the SF_Aggregate+GROUP BY +
+      WHERE arm right after sqlite3WhereEnd, gated on pParse^.pIdxEpr (mirrors
+      select.c:8600..8615).  0x20 TREETRACE "AggInfo function expressions
+      converted to reference index" arm at the wire-in site under
+      `{$IFDEF SQLITE_DEBUG}`.  Builds clean default + SQLITE_DEBUG=1;
+      TestExplainParity 1026/1026, TestSQLCorpus rc=0, 92/92 5177/5177.
     - [ ] **10.1.42.a.6.5** Port the `select_end` AggInfo teardown
       (select.c:8937) so the "Finished with AggInfo" trailing print can land.
     - [ ] **10.1.42.a.7** Port `simplifyOuterJoins` outer-join simplifier
