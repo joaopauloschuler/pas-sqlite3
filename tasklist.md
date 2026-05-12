@@ -383,9 +383,22 @@ regressions without human triage.
   same gate begins actually byte-diffing the mutated blobs.  Gate
   exits rc=0 today by skipping; no new divergence buckets surfaced.*
 
-- [ ] **9.2.4** Schema-change probe.  Subset where ALTER / CREATE
+- [~] **9.2.4** Schema-change probe.  Subset where ALTER / CREATE
   INDEX / VACUUM is exercised.  Validates Phase 6 OP_ParseSchema +
   AddColumn paths (see memory entries) under non-synthetic schemas.
+  *Landed `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql`
+  (8 vectors: simple, multipage, withoutrowid, view-cte, partial-index,
+  generated-column, triggers, autovacuum).  Unlike 9.2.2/9.2.3 this
+  gate opens RW so it does **not** inherit bucket-A; instead it
+  surfaced four new buckets (B: VACUUM EAccessViolation; C: ALTER
+  RENAME with dependent VIEW/CTAS; D: CREATE INDEX byte layout on
+  WITHOUT ROWID; E: ALTER RENAME COLUMN on table with partial index),
+  catalogued in `src/tests/vectors/DIVERGENCES.md`.  Per-vector cites
+  added to MANIFEST.txt (e.g. `pas-skip view-cte.db bucket-A,bucket-C`).
+  Gate today: gated=4 ok=4 diverged=0 skipped=4 rc=0; the 4 OK vectors
+  (simple/multipage/generated-column/triggers) actually exercise the
+  AddColumn + OP_ParseSchema paths byte-identically against the C
+  oracle.*
 
 - [X] **9.2.5** Vector regen script.  `src/tests/vectors/regen.sh`
   walks every `*.sql`, regenerates the `.db` via the C oracle

@@ -76,4 +76,136 @@ beyond bucket A — every gated `<name>.mutate.sql` runs cleanly under
 the C oracle (verified out-of-band with `../sqlite3/sqlite3` before
 landing the test), so no further bucket entries are added here.
 
+## Bucket B — VACUUM raises EAccessViolation on the Pascal port (9.2.4)
+
+Symptom: a bare `VACUUM;` statement against any committed `.db` vector
+crashes the Pascal port with `EAccessViolation` and rc=217 (uncaught
+FPC exception).  The C oracle returns rc=0 and rewrites the database
+in-place.
+
+Reproducer:
+
+```bash
+cp src/tests/vectors/simple.db /tmp/t.db
+LD_LIBRARY_PATH=src ./bin/passqlite3 /tmp/t.db "VACUUM;"
+# An unhandled exception occurred at $...:
+# EAccessViolation: Access violation
+# rc=217
+```
+
+Likely root cause: tasklist 6.27 marked OP_Vacuum / `sqlite3RunVacuum`
+as ported but the auto-vacuum / ptrmap-relocation arms enumerated in
+6.28 (`incrVacuumStep` / `relocatePage` / `modifyPagePointer` —
+"gated on productive ptrmap") are still stubs in the Pascal source.
+A plain VACUUM walks `sqlite3RunVacuum` → `BtreeCopyFile` →
+relocate-page paths and dereferences a NULL/uninitialised page
+descriptor when the ptrmap arm short-circuits.  C reference:
+`../sqlite3/src/vacuum.c (sqlite3RunVacuum)` and
+`../sqlite3/src/btree.c (relocatePage / btreeOverwriteCell)`.
+
+Affected vectors (every 9.2.4 schema script that ends with a `VACUUM;`):
+
+* `autovacuum.db`     — bucket B (also bucket-A)
+* `withoutrowid.db`   — bucket B (script ends with VACUUM; also bucket-D)
+* `partial-index.db`  — bucket B (script ends with VACUUM; also bucket-E)
+* `view-cte.db`       — bucket B (script ends with VACUUM; also bucket-C)
+
+Tagged `pas-skip` for 9.2.4 in `MANIFEST.txt`.  Closing this bucket
+unblocks the autovacuum vector immediately and is a prerequisite for
+re-enabling the other three.
+
+## Bucket C — ALTER RENAME with dependent VIEW / CTAS (9.2.4)
+
+Symptom: `ALTER TABLE base RENAME COLUMN n TO value;` against the
+`view-cte.db` vector (which has `CREATE VIEW v_doubled AS SELECT id,
+n*2 AS n2 FROM base;`) raises `EAccessViolation` on the Pascal port.
+Same crash for `ALTER TABLE cte_seed RENAME TO cte_snapshot;` (a
+CTAS-derived table).  C oracle returns rc=0 and rewrites the
+view-definition AST.
+
+Reproducer:
+
+```bash
+cp src/tests/vectors/view-cte.db /tmp/t.db
+LD_LIBRARY_PATH=src ./bin/passqlite3 /tmp/t.db \
+  "ALTER TABLE base RENAME COLUMN n TO value;"
+# EAccessViolation
+```
+
+Likely root cause: `alter.c` `renameColumnFunc` walks the dependent
+view's `Select` parse tree and calls back into `sqlite3RenameToken*`
+to rewrite each `Expr` node referencing the old name.  The Pascal
+port's `renameTokenFind` / `renameTokenCheckAll` may be returning a
+NULL token for view-internal expressions (`n*2 AS n2`), triggering the
+NULL deref one frame up.  C reference:
+`../sqlite3/src/alter.c (renameColumnFunc, renameTokenFind)`.
+
+Affected vector:
+
+* `view-cte.db` — bucket C (also bucket-A, bucket-B via VACUUM)
+
+## Bucket D — CREATE INDEX on WITHOUT ROWID table — page byte divergence (9.2.4)
+
+Symptom: `CREATE INDEX idx_c ON t(c);` against the `withoutrowid.db`
+vector produces a byte-different `.db` blob between the C oracle and
+the Pascal port (both rc=0, no error).  Diff first surfaces inside the
+new index b-tree page payload (cell-pointer ordering / payload
+prefix), strongly suggesting a key-encoding divergence specific to
+WITHOUT ROWID indexes (where the index entries carry the full
+composite primary key, not a 64-bit rowid suffix).
+
+Reproducer:
+
+```bash
+cp src/tests/vectors/withoutrowid.db /tmp/c.db
+cp src/tests/vectors/withoutrowid.db /tmp/p.db
+/home/bpsa/app/sqlite3/sqlite3 /tmp/c.db "CREATE INDEX idx_c ON t(c);"
+LD_LIBRARY_PATH=src ./bin/passqlite3 /tmp/p.db "CREATE INDEX idx_c ON t(c);"
+cmp /tmp/c.db /tmp/p.db
+# Files /tmp/c.db and /tmp/p.db differ at byte ~8200 (inside index page).
+```
+
+Likely root cause: `build.c` `sqlite3CreateIndex` HasRowid==0 arm emits
+an OP_SorterOpen with a key-info that includes the table's full PK
+columns; the Pascal port may emit them in a different order or with a
+different collation default for WITHOUT ROWID indexes.  C reference:
+`../sqlite3/src/build.c (sqlite3CreateIndex, HasRowid arm)` and
+`../sqlite3/src/insert.c (xferOptimization for WITHOUT ROWID)`.
+
+Affected vector:
+
+* `withoutrowid.db` — bucket D (also bucket-A, bucket-B via VACUUM)
+
+## Bucket E — ALTER RENAME COLUMN on table with partial index (9.2.4)
+
+Symptom: `ALTER TABLE t RENAME COLUMN val TO amount;` against
+`partial-index.db` produces a byte-different `.db` blob (both rc=0).
+The partial index `idx_active_val ON t(val) WHERE status='active'`
+references the renamed column directly; `alter.c` `renameColumnFunc`
+must rewrite the index DDL to `ON t(amount) WHERE status='active'`.
+The Pascal port writes a different sqlite_master payload (the new
+DDL string differs from the C oracle's, possibly in whitespace or
+quoting).
+
+Reproducer:
+
+```bash
+cp src/tests/vectors/partial-index.db /tmp/c.db
+cp src/tests/vectors/partial-index.db /tmp/p.db
+/home/bpsa/app/sqlite3/sqlite3 /tmp/c.db "ALTER TABLE t RENAME COLUMN val TO amount;"
+LD_LIBRARY_PATH=src ./bin/passqlite3 /tmp/p.db "ALTER TABLE t RENAME COLUMN val TO amount;"
+cmp /tmp/c.db /tmp/p.db
+# differ at byte ~102 (inside sqlite_master row for idx_active_val)
+```
+
+Likely root cause: the `addcolumn_renametokenmap` fix (memory entry)
+covers the AddColumn path; the parallel index-DDL rewrite for partial
+indexes may be missing a similar `RenameTokenMap` call, so the
+re-emitted DDL doesn't preserve the original tokenisation.  C
+reference: `../sqlite3/src/alter.c (renameColumnFunc, renameColumnIdxNames)`.
+
+Affected vector:
+
+* `partial-index.db` — bucket E (also bucket-A, bucket-B via VACUUM)
+
 _End of file._

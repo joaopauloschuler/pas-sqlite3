@@ -85,17 +85,21 @@ Vectors listed below are tagged `pas-skip` for the 9.2.x parity probes
 `bin/TestVectorReadOnly`) skip these so the binary still exits rc=0;
 each line cites the divergence bucket in `DIVERGENCES.md`.
 
+Bucket A (read-only schema-init) gates 9.2.2 / 9.2.3 only.  9.2.4
+opens RW so it does not inherit bucket-A; 9.2.4-specific buckets are
+B/C/D/E below and gate 9.2.4 alone.
+
   pas-skip simple.db           bucket-A (read-only schema-init)
   pas-skip multipage.db        bucket-A
   pas-skip wal.db              bucket-A
-  pas-skip autovacuum.db       bucket-A
+  pas-skip autovacuum.db       bucket-A,bucket-B (VACUUM EAccessViolation)
   pas-skip incrvacuum.db       bucket-A
   pas-skip utf16.db            bucket-A
-  pas-skip withoutrowid.db     bucket-A
+  pas-skip withoutrowid.db     bucket-A,bucket-D (CREATE INDEX byte layout on WITHOUT ROWID)
   pas-skip generated-column.db bucket-A
   pas-skip triggers.db         bucket-A
-  pas-skip view-cte.db         bucket-A
-  pas-skip partial-index.db    bucket-A
+  pas-skip view-cte.db         bucket-A,bucket-C (ALTER RENAME with dependent VIEW/CTAS — EAccessViolation)
+  pas-skip partial-index.db    bucket-A,bucket-E (ALTER RENAME COLUMN on table with partial index)
 
 Reproducibility gate
 --------------------
