@@ -37398,10 +37398,37 @@ begin
     Exit;
   end;
 
+  { build.c:1507 — pre-allocation dequote of the column name token.
+    Skipped under IN_RENAME_OBJECT so the rename machinery sees the raw
+    token offsets. }
+  if not InRenameObject(pParse) then
+    sqlite3DequoteToken(@sName);
+
   { Default attributes — used when sType is empty. }
   eType    := COLTYPE_CUSTOM;
   szEst    := 1;
   affinity := AnsiChar(SQLITE_AFF_BLOB);
+
+  { build.c:1513..1524 — GENERATE ALWAYS keyword can be re-tokenised as
+    an identifier and end up tacked onto the typename ("INT GENERATED
+    ALWAYS").  Strip the trailing "always" / "generated" (each followed
+    by any trailing whitespace) before standard-typename detection. }
+  if (sType.n >= 16)
+     and (sqlite3_strnicmp(sType.z + (sType.n - 6), PAnsiChar('always'), 6) = 0) then
+  begin
+    Dec(sType.n, 6);
+    while (sType.n > 0)
+          and (sqlite3Isspace(u8(Byte((sType.z + (sType.n - 1))^))) <> 0) do
+      Dec(sType.n);
+    if (sType.n >= 9)
+       and (sqlite3_strnicmp(sType.z + (sType.n - 9), PAnsiChar('generated'), 9) = 0) then
+    begin
+      Dec(sType.n, 9);
+      while (sType.n > 0)
+            and (sqlite3Isspace(u8(Byte((sType.z + (sType.n - 1))^))) <> 0) do
+        Dec(sType.n);
+    end;
+  end;
 
   { Standard-typename detection — port of build.c:1526..1542.
     On match, set sType.n=0 so the type string is not stored after the
@@ -37410,6 +37437,9 @@ begin
     sqlite3StdTypeLen[] = 3/4/3/7/4/4,
     sqlite3StdTypeAffinity[] = NUM/BLOB/INT/INT/REAL/TEXT. }
   if sType.n >= 3 then begin
+    { build.c:1530 — dequote the type token in place before comparing
+      against the standard-typename table. }
+    sqlite3DequoteToken(@sType);
     if (sType.n = 3) and (sqlite3_strnicmp(sType.z, PAnsiChar('ANY'), 3) = 0) then begin
       eType := 1; affinity := AnsiChar(SQLITE_AFF_NUMERIC); sType.n := 0;
     end
