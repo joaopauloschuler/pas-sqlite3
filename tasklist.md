@@ -80,6 +80,21 @@ FPC porting traps that recur often enough to call out up-front:
   - [X] **6.28.6** Port `OP_IntegrityCk` body — audit verdict (6.28.8): stub-was-real.  OP_IntegrityCk arm at passqlite3vdbe.pas:10715..10748 and sqlite3BtreeIntegrityCheck driver at passqlite3btree.pas:7916..8043 are both real 1:1 ports (freelist + auto-vacuum cross-check + checkTreePage walk + page-coverage map + SQLITE_DYNAMIC error string).  Remaining gap is driver-side: `PRAGMA integrity_check` in codegen.pas:45844 still emits hardcoded "ok" instead of building an OP_IntegrityCk plan — that pragma-wiring slice is **not** "port OP_IntegrityCk" and is filed as a follow-up bullet below.  Stale "OP_IntegrityCk is a stub" comment scrubbed.  STUB_INVENTORY #6 closed.
   - [ ] **6.28.6.a** Wire `PRAGMA integrity_check / quick_check` to emit OP_IntegrityCk — codegen.pas:45844 currently emits literal "ok" rather than building the root-page array and OP_IntegrityCk plan (pragma.c:1695 reference).  Complexity: M (~120 lines C — root-page enumeration across all attached schemas, P4_INTARRAY allocation, OP_ResultRow loop on aMem[p1+1]).
   - [X] **6.28.7** Wire `getRowTrigger` mask helper — audit verdict: stub-was-real. `trgGetRowTrigger` (passqlite3codegen.pas:30884) + `codeRowTrigger` (:30709) are 1:1 with trigger.c:1347 / 1231; aColmask[0/1] populated from sub-Parse oldmask/newmask; `sqlite3TriggerColmask` picks up real per-column bits for ordinary triggers. Stale "not yet ported" comments scrubbed; STUB_INVENTORY #7 closed.
+  - [ ] **6.28.9** STUB_INVENTORY medium-priority audit pass — entries
+    #8..#13 (`code_outer_join_constraints`/pRJ, `sqlite3ExprNNCollSeq`,
+    `sqlite3DefaultRowEst`, `codeVectorCompare` fast path,
+    `sqlite3HasExplicitNulls` of NULLS LAST, `sqlite3VdbeSorter*`).
+    Same audit pattern as 6.28.8 — verify each is actually a stub vs. a
+    misleading marker comment over a real body; fix any drifted size
+    estimates (6.28.8 found 3 of 5 high-priority estimates were
+    fabricated; medium-priority entries likely have similar drift).
+    Update STUB_INVENTORY.md per-entry status.
+  - [ ] **6.28.10** STUB_INVENTORY low-priority audit pass — entries
+    #14..#21 (Vdbe debug helpers, mutex held checks, noop window funcs,
+    eponymous-vtab banner notes, overflow-cache invalidators).  Most
+    are likely intentional no-ops on the non-debug build; verify and
+    annotate so the "21 actionable entries" header in STUB_INVENTORY.md
+    becomes accurate.
   - [X] **6.28.8** Audit-pass remaining high-priority STUB_INVENTORY entries (#1 `whereLoopAddVirtual`, #2 `sqlite3OpenTableAndIndices`, #4 `sqlite3AddColumn`, #5 `sqlite3LimitWhere`, #6 `OP_IntegrityCk`).  Verdicts: #1, #2, #5, #6 were CLOSED (was real) — bodies are 1:1 with their C reference points, the inventory was citing stale marker comments at unrelated call sites; #4 is DRIFTED-S (~25 lines C of small arms — see 6.28.4 note).  Original inventory line-references / C cites were wrong on three of five entries (sqlite3AddColumn cited build.c:1862 but body is at 1490; sqlite3OpenTableAndIndices cited build.c but body is in insert.c; sqlite3LimitWhere cited delete.c:330+ but body ends at 277).  Stale "stub" comments scrubbed in passqlite3codegen.pas at the audit sites.  Net: six of seven original "high-priority" stubs are now closed; future agents have clear S/M/L estimates rather than misleading "~600 lines C" sizing.  Build 87/87 still green.
 
 ### Closed bugs (kept as ticked stubs)
@@ -485,6 +500,13 @@ partial landings cannot silently no-op.
   shape + TRACEFLAGS toggle landed: sqlite3TreeTrace/sqlite3WhereTrace
   u32 globals now mutate through sqlite3_test_control(TRACEFLAGS, …).
   Trace-emission still gated on consumer-side blocks in codegen.
+  **Mask hint convention (verified the hard way across the b.* / a.*
+  rounds):** mask numbers written into the subtask bodies below are
+  HINTS only — they are often bundle IDs (the planning grouping)
+  rather than the literal C bit.  Always verify against
+  `../sqlite3/src/sqliteInt.h` (`TREETRACE_*`) or
+  `../sqlite3/src/whereInt.h` (`WHERETRACE_*`) before stamping a new
+  arm, and note divergences in the commit body.
   Remaining subtasks:
   - [X] **10.1.42.a** TREETRACE consumer macros in select.c → passqlite3codegen.pas.
     First batch landed: `begin processing` / `end processing` (mask 0x1),
@@ -698,6 +720,41 @@ partial landings cannot silently no-op.
       against whereInt.h, NOT 0x10 as tasklist initially suggested).
       Treat as 3 independent micro-tasks; drop the WHERETRACE call at
       each host function as it lands.
+    - [ ] **10.1.42.b.8** Port the WHERE-clause / where-loop / path
+      debug-printer helpers that gate ~7 deferred WHERETRACE arms
+      across 10.1.42.b.4/5/6: `wherePathName` (where.c — grep for the
+      definition, prints `wherePath` letters), `sqlite3WhereLoopPrint`
+      (where.c), `sqlite3WhereClausePrint` (where.c).  All three are
+      `#ifdef WHERETRACE_ENABLED` helpers in C.  Port under
+      `{$IFDEF SQLITE_DEBUG}` into passqlite3codegen.pas.  High
+      leverage: lands `Skip/New/Update/vs` rows in solver progress,
+      `Solution cost=` summary, `OR-term sub-WHERE-clause` print,
+      `WHERE clause at end of analysis` print.
+    - [ ] **10.1.42.a.6.1** Port `havingToWhere` (select.c:7047) so the
+      0x100 TREETRACE arm at the same site (10.1.42.a.3 deferred) can land.
+    - [ ] **10.1.42.a.6.2** Port `countOfViewOptimization` (select.c:7199)
+      so the 0x200 TREETRACE arm can land.
+    - [ ] **10.1.42.a.6.3** Port `optimizeAggregateUseOfIndexedExpr`
+      (select.c:6572) so the AggInfo-adjusted-for-indexed-exprs print can land.
+    - [ ] **10.1.42.a.6.4** Port `aggregateConvertIndexedExprRefToColumn`
+      (select.c:8609) so the function-expr-converted print can land.
+    - [ ] **10.1.42.a.6.5** Port the `select_end` AggInfo teardown
+      (select.c:8937) so the "Finished with AggInfo" trailing print can land.
+    - [ ] **10.1.42.a.7** Port `simplifyOuterJoins` outer-join simplifier
+      loop (select.c:7737..7756) so the 0x1000 FULL/LEFT/RIGHT-JOIN
+      simplification TREETRACE arms (10.1.42.a.5 deferred) can land.
+    - [ ] **10.1.42.a.8** Port the omit-FROM-subquery-ORDER-BY arm
+      (select.c:7832) so the 0x800 TREETRACE arm can land.
+    - [ ] **10.1.42.a.9** Port `pushDownWhereTerms` +
+      `disableUnusedSubqueryResultColumns` (select.c:8011/8030) so the
+      0x4000 WHERE-clause push-down and unused-col NULL TREETRACE arms can land.
+    - [ ] **10.1.42.a.10** Port the all-FROM-clause final analysis loop
+      (select.c:8146) so the 0x8000 TREETRACE arm can land.
+    - [ ] **10.1.42.a.11** Port the optimizer arm that drops superfluous
+      ORDER BY (select.c:7631, mask 0x800) so the deferred 10.1.42.a.4
+      arm can land.
+    - [ ] **10.1.42.a.12** Port the DISTINCT→GROUP BY transform
+      (select.c:8192, mask 0x20000) so the deferred 10.1.42.a.4 arm can land.
   - [X] **10.1.42.c** sqlite3DebugPrintf — ported from printf.c:1514..1532 as
     `procedure sqlite3DebugPrintf(zFormat: PAnsiChar; const args: array of const)`
     in passqlite3printf.pas.  Renders via the existing sqlite3FormatStr core,
