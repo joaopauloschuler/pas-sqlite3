@@ -25732,6 +25732,12 @@ var
   kHC, jHC:      i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
+  { 10.1.42.a.6.5 — Pre-zero the local AggInfo handle so the select_end tail
+    (below) can guard on `pAggI2<>nil` even when the aggregate-codegen
+    branches at 26187/26353/27369 never fired. C uses C-scope semantics +
+    NULL init via SelectInit; Pas locals start as garbage, so we initialise
+    explicitly. }
+  pAggI2 := nil;
   {$IFDEF SQLITE_DEBUG}
   { 10.1.42.a — TREETRACE(0x1) "begin processing" (select.c:7610).
     Verbatim: `TREETRACE(0x1,pParse,p,("begin processing:\n",
@@ -29244,8 +29250,8 @@ begin
             no Pas optimiser arm)
       8442  After aggregate analysis                — LANDED (a.3)
       8609  AggInfo function exprs -> indexed ref   — deferred (a.6.4)
-      8937  Finished with AggInfo (0x20)            — deferred (a.5/
-            a.6.5, late select_end AggInfo teardown not ported)
+      8937  Finished with AggInfo (0x20)            — LANDED (a.6.5,
+            print only; printAggInfo + aCol/aFunc self-asserts deferred)
     The mask gating still works (no-ops in non-debug, silent on missing
     masks in debug). }
   {$ENDIF}
@@ -29366,6 +29372,18 @@ begin
   if pParse^.nErr <> 0 then Result := SQLITE_ERROR
   else Result := SQLITE_OK;
   {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a.6.5 — TREETRACE(0x20) "Finished with AggInfo" (select.c:8933..
+    8945).  C runs the self-check + trace at the `select_end:` label, gated
+    on `pAggInfo && !db->mallocFailed`.  Pas has no formal `select_end:`
+    label (early-exit returns short-circuit instead), but lands the same
+    breadcrumb on the productive tail.  The companion `printAggInfo()` host
+    (select.c:6447) is not ported yet, so the body is the bare TREETRACE
+    print — the AggInfo aCol/aFunc self-asserts and the late
+    `sqlite3ExprListDelete(pMinMaxOrderBy)` teardown stay deferred (Pas
+    doesn't allocate pMinMaxOrderBy on this path). }
+  if (pAggI2 <> nil) and (pParse^.db^.mallocFailed = 0)
+     and ((sqlite3TreeTrace and $20) <> 0) then
+    sqlite3DebugPrintf('Finished with AggInfo'#10, []);
   { 10.1.42.a — TREETRACE(0x1) "end processing" (select.c:8957).
     Last debug breadcrumb before the C oracle returns from
     sqlite3Select.  Pas's sqlite3Select has multiple early-exit

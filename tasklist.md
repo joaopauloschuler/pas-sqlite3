@@ -597,7 +597,7 @@ partial landings cannot silently no-op.
     - [X] **10.1.42.a.6.2** Ported `countOfViewOptimization` (select.c:7128..7204); wired after propagateConstants (select.c:7924..7930). 0x200 TREETRACE arm. SQLITE_CountOfView constant added.
     - [X] **10.1.42.a.6.3** Ported `optimizeAggregateUseOfIndexedExpr` (select.c:6549..6586); wired between sqlite3WhereBegin and assignAggregateRegisters (select.c:8527..8529, gated on pParse^.pIdxEpr). 0x20 TREETRACE arm.
     - [X] **10.1.42.a.6.4** Ported `aggregateConvertIndexedExprRefToColumn` + walker callback (select.c:6591..6623); wired after sqlite3WhereEnd (select.c:8600..8615, gated on pParse^.pIdxEpr). 0x20 TREETRACE arm.
-    - [ ] **10.1.42.a.6.5** Port the `select_end` AggInfo teardown
+    - [X] **10.1.42.a.6.5** Ported "Finished with AggInfo" 0x20 TREETRACE arm at sqlite3Select tail (select.c:8933..8945); pAggI2 pre-zeroed at entry, printAggInfo + aCol/aFunc self-asserts deferred (no host).
       (select.c:8937) so the "Finished with AggInfo" trailing print can land.
     - [ ] **10.1.42.a.7** Port `simplifyOuterJoins` outer-join simplifier
       loop (select.c:7737..7756) so the 0x1000 FULL/LEFT/RIGHT-JOIN
