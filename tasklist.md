@@ -916,8 +916,8 @@ partial landings cannot silently no-op.
   - [X] **10.1f.7** `.dbconfig` — gated by `src/tests/TestShellDbinfo.pas` (bare-list + per-op read + toggle, 11 subtests). Side-fixes: aDbConfig table now mirrors shell.c.in:9280 (names + order + FP_DIGITS); openDatabase default flags now include SQLITE_EnableView/LoadExtension per main.c:3430,3473. Counter/pointer-style DBCONFIG_* ops still gated on Phase 8.1.1.
   - [X] **10.1f.8** `.filectrl` — gated by `src/tests/TestShellFilectrl.pas` (byte-parity vs upstream over --help/chunk_size set+usage/size_limit/bogus/--schema shift, plus data_version shape-only). Side-fixes: cmdFilectrl now returns rc (Usage/help paths set rc=1); bad-nArg arms fall through to the Usage path instead of `Exit`-ing silently (mirrors C's `break`); ambiguous-control sets rc=1. PERSIST_WAL/POWERSAFE_OVERWRITE skipped — port unix VFS xFileControl lacks those arms (orthogonal port gap, documented in test header).
   - [X] **10.1f.9** `.sha3sum` — gated by `src/tests/TestShellFilectrl.pas` (default 256-bit + sha3-224/384/512 + --schema + LIKE-pattern + --bogus). Side-fixes: cmdSha3sum now returns rc; unknown-option path emits showHelp('sha3sum') dump and rc=1 like C (shell.c.in:11094..11098); error-line label changed from ".sha3sum" to "sha3sum" to match azArg[0].
-  - [ ] **10.1f.10** `.crnl`
-  - [ ] **10.1f.11** `.binary`
+  - [X] **10.1f.10** `.crnl` — gated by `src/tests/TestShellMisc.pas` (byte-parity vs upstream over bare/`on`/`off`/`.crlf` alias/two-call script, 6 subtests). On POSIX the arm unconditionally clears MFLG_CRLF and prints "crlf is OFF\n" to stderr regardless of nArg; port matches byte-for-byte, no side-fixes needed.
+  - [X] **10.1f.11** `.binary` — gated by `src/tests/TestShellMisc.pas` (bare/`on`/`off`/bogus, 4 subtests, all rc=1 with "The \".binary\" command is deprecated.\n" deprecation line). Port matches upstream byte-for-byte (shell.c.in:9114..9117), no side-fixes needed.
   - [ ] **10.1f.12** `.connection`
   - [ ] **10.1f.13** `.unmodule`
   - [ ] **10.1f.14** `.vfsinfo`
