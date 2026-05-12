@@ -71,7 +71,7 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.24** Aggregate-with-ORDER-BY codegen.
 - [~] **6.26** Window functions (window.c). DiagWindow: 0 divergences. Reopen if DiagWindow regresses.
 - [X] **6.27** schema-mutation + statistics. Analyze, Vacuum, RunVacuum, FkCheck/FkActions.
-- [ ] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap).
+- [~] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap). Inventory landed at `src/tests/STUB_INVENTORY.md` (21 actionable entries: 7 high / 6 med / 8 low). One small high-priority entry ported in this commit (`pas_openDirectory`, os_unix.c:3874..3894 → src/passqlite3os.pas:2331); the remaining 6 high-priority entries (`whereLoopAddVirtual`, `sqlite3OpenTableAndIndices`, `sqlite3NestedParse`, `sqlite3AddColumn` STRICT-arm, `sqlite3LimitWhere` view-rewrite arm, `OP_IntegrityCk`, `getRowTrigger` mask) each cite the open Phase-6/9 bullet they block.
 
 ### Closed bugs (kept as ticked stubs)
 

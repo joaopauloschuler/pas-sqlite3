@@ -2325,14 +2325,49 @@ function  c_readlink(zPath, buf: PChar; n: csize_t): cint;
 function  c_lstat(zPath: PChar; buf: Pointer): cint;
   cdecl; external 'c' name 'lstat';
 
-{ os_unix.c ~415: openDirectory forward; pas wraps this inline elsewhere.
-  Provide a stub address so the "openDirectory" syscall slot is non-nil
-  and shows up in unixNextSystemCall enumeration. }
+{ os_unix.c:3874..3894 — openDirectory(zFilename, *pFd):
+  Compute the parent-directory path of zFilename and open it O_RDONLY.
+  On success *pFd holds the fd (caller closes); on failure *pFd = -1 and
+  SQLITE_CANTOPEN is returned.  The truncation rules match C exactly:
+    * walk back from end of zDirname looking for '/';
+    * if found at ii>0, terminate at that slash;
+    * else if zDirname[0]!='/' replace [0] with '.', [1] with NUL;
+    * else (path starts with '/') leave it as "/".
+  Note: O_BINARY does not exist on Linux/Unix — C #defines it to 0 there.
+  Used by unixSync(SYNC_DATAONLY) on directory-fsync paths.  Bug 6.28 —
+  was previously a no-op stub; now matches upstream. }
 function  pas_openDirectory(zPath: PChar; pFd: PcInt): cint; cdecl;
+var
+  zDirname : array[0..MAX_PATHNAME] of char;
+  ii       : cint;
+  fd       : cint;
 begin
-  { Not dispatched at runtime — kept as a non-nil marker for aSyscall[]. }
-  if Assigned(pFd) then pFd^ := -1;
-  Result := 0;
+  if pFd = nil then begin Result := SQLITE_CANTOPEN; Exit; end;
+  pFd^ := -1;
+  if zPath = nil then begin Result := SQLITE_CANTOPEN; Exit; end;
+
+  { sqlite3_snprintf-equivalent: copy zPath into zDirname, NUL-terminated,
+    capped at MAX_PATHNAME (StrLCopy already enforces the cap). }
+  StrLCopy(@zDirname[0], zPath, MAX_PATHNAME);
+
+  { Walk back to the last '/' (mirrors C's `for(ii=strlen; ii>0 && zDirname[ii]!='/'; ii--)`). }
+  ii := cint(StrLen(@zDirname[0]));
+  while (ii > 0) and (zDirname[ii] <> '/') do Dec(ii);
+
+  if ii > 0 then begin
+    zDirname[ii] := #0;
+  end else begin
+    if zDirname[0] <> '/' then zDirname[0] := '.';
+    zDirname[1] := #0;
+  end;
+
+  fd := FpOpen(@zDirname[0], O_RDONLY, 0);
+  if fd >= 0 then begin
+    pFd^   := fd;
+    Result := SQLITE_OK;
+  end else begin
+    Result := SQLITE_CANTOPEN;
+  end;
 end;
 
 { os_unix.c ~7100: unixGetpagesize stub for the table slot. }
