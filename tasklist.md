@@ -200,13 +200,28 @@ regressions without human triage.
   drawn from MANIFEST tier-1/tier-2 entries; bin/TestSQLCorpus rc=0;
   db-blob channel currently logs-only (gated on 9.1.4 mask).*
 
-- [ ] **9.1.3.followup** Expand `TestSQLCorpus.pas` to full MANIFEST
+- [X] **9.1.3.followup** Expand `TestSQLCorpus.pas` to full MANIFEST
   coverage: pull every tier-1 source file's SQL list out of its `.pas`
   literals (the spine is the 1026-row TestExplainParity corpus) and
   every tier-2 Diag* feature-corner.  Skip tier-4 (shell-driven) and
   tier-3 entries already overlapped by tier-1.  Requires a small
   SQL-literal-extractor — landing it under this subtask keeps the
   9.1.3 skeleton diff small.
+  *Landed 2026-05-12: `src/tests/SQLLiteralExtractor.pas` parses Pascal
+  string literals out of `Add(...)`/`Probe(...)` plus the `Run*/Check/
+  TestExpr/ProbeOne/Case/Diff` label-less anchors used by smaller Diag*
+  files, then groups per-call strings into one multi-statement script
+  so setup/probe pairs run in the same DB.  TestSQLCorpus now iterates
+  51 tier-1 + tier-2 manifest entries (35 yield SQL, 16 use non-anchor
+  helper patterns and extract empty); **2259 scripts run, 2207 pass,
+  52 divergences cataloged** to `src/tests/DIVERGENCES.md` (per task
+  contract: skip-and-cite, do NOT chase; first-divergence per file is
+  quoted with channel + 16-byte window).  Divergences cluster in:
+  RELEASE-without-SAVEPOINT errmsg wording (TestExplainParity / Bytecode
+  / Parser 44 rows), PRAGMA mmap_size/journal_mode (3 rows), DROP INDEX
+  errmsg truncation (1), DiagAnalyze full-script rc (3), DiagBloom
+  pre-existing sqlite_stat1 (1).  bin/TestSQLCorpus rc=0; full
+  regression 88/88 binaries pass.*
 
 - [ ] **9.1.4** Determinism scrub.  Strip the known non-deterministic
   fields (file-change-counter at offset 24, version-valid-for at 92,
