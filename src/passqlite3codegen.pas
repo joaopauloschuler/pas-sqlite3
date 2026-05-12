@@ -1929,13 +1929,10 @@ function  whereLoopAddBtreeIndex(pBuilder: PWhereLoopBuilder;
 function  whereLoopAddBtree(pBuilder: PWhereLoopBuilder;
   mPrereq: Bitmask): i32;
 
-{ Phase 6.9-bis (step 11g.2.d sub-progress) — virtual-table planner stub.
-  Real port of where.c:4357..4810 (whereLoopAddVirtualOne / whereLoopAddVirtual)
-  is deferred until the vtab corpus is exercised; the project currently has
-  no virtual-table workload going through the planner.  The stub returns
-  SQLITE_OK with no template loops added so whereLoopAddOr / whereLoopAddAll
-  can still dispatch correctly through the IsVirtual branch on the rare
-  shapes where a vtab survives parser checks. }
+{ Phase 6.13.B.7 — virtual-table planner driver.  Forward decl; full
+  body at the four-pass driver below (mirrors where.c:4681..4803).
+  Callees whereLoopAddVirtualOne / allocateIndexInfo / freeIndexInfo /
+  whereLoopResize are all real ports. }
 function  whereLoopAddVirtual(pBuilder: PWhereLoopBuilder;
   mPrereq: Bitmask; mUnusable: Bitmask): i32;
 
@@ -31117,9 +31114,10 @@ end;
 { sqlite3LimitWhere — port of delete.c:182.
   Rewrite the WHERE clause of a DELETE/UPDATE that carries an ORDER BY/LIMIT
   into "rowid IN (SELECT rowid FROM ... ORDER BY ... LIMIT ...)" (or the PK
-  equivalent for WITHOUT ROWID tables).  Dead-code at present (the parser's
-  delete/update arms still drop pOrderBy/pLimit before reaching here), but
-  the body is the line-for-line port the catch-all 6.28 sweep calls for. }
+  equivalent for WITHOUT ROWID tables).  Faithful 1:1 with the upstream
+  body (all rowid / single-PK / vector-PK / isIndexedBy / isCte arms
+  present); pending work is caller-side wiring inside
+  sqlite3DeleteFrom / sqlite3Update (see TODO comments at those sites). }
 function sqlite3LimitWhere(pParse: PParse; pSrc: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pLimit: PExpr; zStmtType: PAnsiChar): PExpr;
 var
@@ -31230,16 +31228,10 @@ end;
     * where-loop two-pass arm (rowid-table RowSet path).
 
   Productive arms still gated:
-    * sqlite3OpenTableAndIndices is a Phase 6.4 stub (codegen.pas:18221) —
-      it sets piDataCur/piIdxCur but does NOT emit OP_OpenWrite for the
-      data / index cursors.  As a result the where-loop arm only emits a
-      productive program when the WHERE-search itself reuses iDataCur
-      (the ONEPASS case).  For two-pass DELETE, OP_Delete would target an
-      unopened write cursor and AV at runtime — guarded with a Phase 6.5
-      TODO leaf.
     * ONEPASS_MULTI / virtual-table xUpdate / view INSTEAD-OF / WITHOUT
       ROWID PK-key path / RETURNING / preupdate hooks: deferred to Phase
       6.5 (verbatim TODOs at the call sites).
+      (sqlite3OpenTableAndIndices is real — see codegen.pas:35900.)
 
   This function flips DROP TABLE rows in TestExplainParity once the
   truncate path gets exercised AND OpenTableAndIndices becomes
@@ -31335,9 +31327,11 @@ begin
   else
     bComplex := 0;
 
-  { TODO(Phase 6.x): sqlite3LimitWhere call (delete.c:374) — DELETE/UPDATE
-    LIMIT support.  Productive path doesn't touch LIMIT for schema-row
-    DELETEs from sqlite3NestedParse, and the helper is a no-op stub today. }
+  { TODO(Phase 6.x): wire sqlite3LimitWhere call (delete.c:374) —
+    DELETE/UPDATE LIMIT support.  The helper itself is fully ported (see
+    codegen.pas:31123); only the caller-side wiring inside this driver
+    is still pending.  Productive path today doesn't touch LIMIT for
+    schema-row DELETEs from sqlite3NestedParse. }
 
   if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto delete_from_cleanup;
 
@@ -31374,10 +31368,11 @@ begin
 
     Phase 6.9-bis step 11g.2.f: only the truncate-optimization path is
     enabled (pWhere = nil, !bComplex, !virtual).  The where-loop / one-pass
-    arm is gated on real sqlite3OpenTableAndIndices (today a stub); see
-    function-header comment.  When the WHERE-loop arm doesn't run, the
-    schema-row DELETEs emitted by sqlite3NestedParse fall through to the
-    no-op tail — same observable behavior as the prior skeleton. }
+    arm wiring is still pending in this driver (the helper itself,
+    sqlite3OpenTableAndIndices at codegen.pas:35900, is real).  When the
+    WHERE-loop arm doesn't run, the schema-row DELETEs emitted by
+    sqlite3NestedParse fall through to the no-op tail — same observable
+    behavior as the prior skeleton. }
 
   { TODO(Phase 6.5): sqlite3MaterializeView (delete.c:428).  isView=0 in the
     productive corpus today (sqlite_master is a real table). }
@@ -32416,8 +32411,9 @@ begin
     nChangeFrom := 0;
   AssertH((nChangeFrom = 0) or (pUpsert = nil), 'Update FROM with UPSERT');
 
-  { sqlite3LimitWhere — helper is a no-op stub today; productive path has
-    no LIMIT (update.c:398..406). }
+  { TODO(Phase 6.x): wire sqlite3LimitWhere call (update.c:398..406) —
+    helper is real (codegen.pas:31123); only the caller-side wiring in
+    this driver is pending.  Productive path has no LIMIT today. }
 
   if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto update_cleanup;
   if sqlite3IsReadOnly(pParse, pTab, pTrg) <> 0 then goto update_cleanup;
@@ -45836,11 +45832,14 @@ begin
 
   { PragTyp_INTEGRITY_CHECK / quick_check (pragma.c:1695).  The full C body
     walks every btree page and emits an error row per corruption; on a
-    clean database it emits the literal string "ok".  The Pas port has no
-    real integrity walker yet (OP_IntegrityCk is a stub that sets the
-    output register to NULL — see vdbe.pas), so the result on any db this
-    port produced is "ok" by construction.  Emit that directly to match
-    the C oracle's clean-db output and unblock the DiagPragma probe. }
+    clean database it emits the literal string "ok".  OP_IntegrityCk
+    (vdbe.pas:10708) and sqlite3BtreeIntegrityCheck (btree.pas:7916) are
+    now both real ports, but this pragma driver still emits "ok"
+    directly rather than building the OP_IntegrityCk plan — driver
+    wiring (root-page enumeration, OP_IntegrityCk emission, multi-row
+    error reporting) is the pending slice.  Productive corpora the Pas
+    port produced are clean by construction so "ok" matches the C
+    oracle. }
   if SameText(zName, 'integrity_check') or SameText(zName, 'quick_check') then
   begin
     sqlite3VdbeLoadString(v, 1, 'ok');

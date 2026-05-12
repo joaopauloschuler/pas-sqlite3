@@ -25,26 +25,34 @@ Prio  : high|med|low   (blocks open tasklist bullet?)
 
 ## High priority — actively blocks an open tasklist bullet
 
-### 1. `whereLoopAddVirtual` (vtab planner)
-- Pascal: `src/passqlite3codegen.pas:1932..1940` (decl) + body further down.
-- C ref : `where.c:4357..4810` (whereLoopAddVirtualOne / whereLoopAddVirtual).
-- Note  : Returns SQLITE_OK with no template loops added.  Vtab corpus
-  never exercises planner so existing gates stay green; the moment Phase
-  9.1 enables a vtab-heavy `.sql` row, this stub will mis-plan.
-- Prio  : high (blocks 9.1.5 `pas-strict` tag for any vtab corpus member;
-  also blocks 6.bis.1g+ vtab planning sub-progress).
-- Size  : ~450 lines C — DO NOT attempt as the "one small port".
+### 1. `whereLoopAddVirtual` (vtab planner) — CLOSED (was real, task 6.28.8)
+- Pascal: forward decl `src/passqlite3codegen.pas:1932`, body
+  `src/passqlite3codegen.pas:15658..15818` (driver) +
+  `:15458..15630` (whereLoopAddVirtualOne).
+- C ref : `where.c:4681..4803` (whereLoopAddVirtual),
+  `where.c:4313..4530` (whereLoopAddVirtualOne).
+- Verdict: 6.28.8 audit found the body is a 1:1 four-pass driver port:
+  (1) ALLBITS+IN-allowed with bRetry for LIMIT/IN conflict;
+  (2) ALLBITS+WO_IN excluded if first plan used IN;
+  (3) per-distinct-prereqRight loop;
+  (4) all-disabled and all-disabled+no-IN fallbacks.  WHERETRACE 0x800
+  banners faithful to where.c:4719..4801.  Callees
+  (allocateIndexInfo, freeIndexInfo, whereLoopResize,
+  whereLoopAddVirtualOne) are all real.  Stale "stub" banner at decl
+  scrubbed.
 
-### 2. `sqlite3OpenTableAndIndices` Phase 6.4 stub
-- Pascal: `src/passqlite3codegen.pas:31057..31058`, also line 31201.
-- C ref : `build.c:5054..5147`.
-- Note  : sqlite3NestedParse path bypasses the stub; productive callers
-  (DELETE/UPDATE rewrite arms) gate on this — see the comment at codegen
-  44722.  Bug 6.29 ADD COLUMN partial fix depends on this for ALTER
-  TABLE round-trip.
-- Prio  : high (blocks tasklist §6.29 follow-on, and any ALTER-heavy
-  9.1.x corpus row).
-- Size  : ~90 lines C.
+### 2. `sqlite3OpenTableAndIndices` — CLOSED (was real, task 6.28.8)
+- Pascal: forward decl `src/passqlite3codegen.pas:2507`, body
+  `src/passqlite3codegen.pas:35907..35963`.
+- C ref : `insert.c:2870..2925` (not build.c; original inventory cite
+  was wrong).
+- Verdict: 6.28.8 audit found the body is a 1:1 port: vtab no-op,
+  iDataCur/iIdxCur cursor assignment, HasRowid + aToOpen[0] gate to
+  sqlite3OpenTable, index loop with IsPrimaryKeyIndex+!HasRowid
+  re-routing, sqlite3VdbeSetP4KeyInfo + ChangeP5.  The sqlite3TableLock
+  fallback is correctly inert under the OMIT_SHARED_CACHE build (note
+  in body matches C's `db->noSharedCache==0` arm).  Multiple stale
+  "Phase 6.4 stub" comments in sqlite3DeleteFrom / its tail scrubbed.
 
 ### 3. `sqlite3NestedParse` — CLOSED (task 6.28.3)
 - Pascal: `src/passqlite3codegen.pas:40499` (body), hook at
@@ -62,32 +70,64 @@ Prio  : high|med|low   (blocks open tasklist bullet?)
 - Prio  : —
 - Size  : ~25 lines Pascal mirroring ~30 lines C.
 
-### 4. `sqlite3AddColumn` (still partial — bug 6.29 trail)
-- Pascal: `src/passqlite3codegen.pas:37846`.
-- C ref : `build.c:1862..2026`.
-- Note  : STRICT-mode column iteration arm missing; the MEMORY entry
-  *feedback_addcolumn_renametokenmap.md* covers the RenameTokenMap fix
-  but the STRICT and CHECK-collation arms are still no-op.
-- Prio  : high (open Phase-6 bullet).
-- Size  : remaining slice ~60 lines C.
+### 4. `sqlite3AddColumn` — DRIFTED (port-extend: 3 small arms, S)
+- Pascal: `src/passqlite3codegen.pas:37284..37407` (body).
+- C ref : `build.c:1490..1596` (NOT 1862..2026; original inventory cite
+  was wrong — STRICT-table column enforcement does not live in
+  sqlite3AddColumn, it lives in sqlite3EndTable).
+- Verdict: 6.28.8 audit found the body is largely 1:1.  Missing arms
+  (all small, total ~25 lines C):
+  - build.c:1507 `if( !IN_RENAME_OBJECT ) sqlite3DequoteToken(&sName);`
+    — pre-allocation token dequote.
+  - build.c:1513..1524 `GENERATED ALWAYS` trailing-text strip — surplus
+    keyword trim when type ends with "always" / "generated always".
+  - build.c:1530 `sqlite3DequoteToken(&sType);` inside the standard-
+    typename check (Pascal compares against quoted tokens).
+  - cosmetic: build.c:1531 uses a table-driven loop over
+    sqlite3StdType[] / StdTypeLen[] / StdTypeAffinity[]; Pascal hardcodes
+    the 6 branches — functionally equivalent but the table form would
+    track upstream additions.
+  No STRICT-arm work to do here (STRICT lives downstream).
+- Prio  : low-med (none of the missing arms regress productive corpora;
+  the GENERATED ALWAYS strip only affects unusual user-supplied type
+  tokens).
+- Size  : S (~25 lines C).
 
-### 5. `sqlite3LimitWhere` helper
-- Pascal: `src/passqlite3codegen.pas:32243`.
-- C ref : `delete.c:182..330`.
-- Note  : Productive path replaces the no-op stub; comment is mostly
-  stale, but two arms (`useTempRow` flag and view-on-DELETE rewrite)
-  remain unported.
-- Prio  : med-high.
-- Size  : ~140 lines C (two arms ~50 lines each).
+### 5. `sqlite3LimitWhere` helper — CLOSED (was real, task 6.28.8)
+- Pascal: `src/passqlite3codegen.pas:31123..31217` (body).
+- C ref : `delete.c:182..277` (only ~95 lines — earlier "..330" /
+  "two arms" inventory cite was wrong; C has no useTempRow or
+  view-on-DELETE rewrite arm in this helper).
+- Verdict: 6.28.8 audit found the body is a 1:1 port: ORDER-BY-without-
+  LIMIT error, LIMIT==NULL early-out, rowid arm (TK_ROW LHS + TK_ROW
+  EList), single-column WITHOUT-ROWID PK arm, multi-column PK vector
+  arm with TK_VECTOR LHS, FROM dup with isIndexedBy / isCte handling,
+  inner SELECT build and TK_IN wrap.  Pending work is caller-side
+  (sqlite3DeleteFrom / sqlite3Update do not yet pass pOrderBy/pLimit
+  through to this helper) — annotated at the TODO sites in
+  codegen.pas:31338 and :32419.  Stale "no-op stub" comments scrubbed.
 
-### 6. `OP_IntegrityCk`
-- Pascal: `src/passqlite3codegen.pas:45668` (citation).
-- C ref : `vdbe.c:OP_IntegrityCk` + `btree.c:sqlite3BtreeIntegrityCheck`.
-- Note  : Sets an empty error string and falls through; integrity-check
-  pragma therefore reports clean even on corrupt DBs.
-- Prio  : high if 9.2.x reference vectors include a deliberately-corrupt
-  fixture; med otherwise.
-- Size  : ~600 lines C — large.
+### 6. `OP_IntegrityCk` opcode — CLOSED (was real, task 6.28.8)
+- Pascal: `src/passqlite3vdbe.pas:10715..10748` (opcode arm),
+  `src/passqlite3btree.pas:7916..8043` (sqlite3BtreeIntegrityCheck
+  driver, with checkTreePage / checkPtrmap / checkAppendMsg /
+  checkList callees all real).
+- C ref : `vdbe.c` OP_IntegrityCk arm + `btree.c
+  sqlite3BtreeIntegrityCheck`.
+- Verdict: 6.28.8 audit found both the opcode arm and the btree
+  integrity walker are real 1:1 ports.  Opcode marshals nRoot / aRoot,
+  allocates per-tree row-count buffer, calls
+  sqlite3BtreeIntegrityCheck, marshals row counts into aMem[p3..],
+  handles SQLITE_DYNAMIC error-string marshalling and encoding
+  conversion.  The walker covers freelist integrity, auto-vacuum
+  rootpage cross-check, per-tree checkTreePage walk, page-coverage
+  map.  Pending work is **pragma-driver-side**: `PRAGMA integrity_check`
+  in codegen.pas:45844 still emits a hardcoded "ok" instead of building
+  the OP_IntegrityCk plan.  Wiring slice (root-page enumeration,
+  OP_IntegrityCk emission with P4_INTARRAY, multi-row error output)
+  belongs in a future tasklist bullet — not "port OP_IntegrityCk".
+  Stale "OP_IntegrityCk is a stub" comment at codegen.pas:45840
+  scrubbed.
 
 ### 7. `getRowTrigger` mask helper — CLOSED (task 6.28.7)
 - Pascal: `src/passqlite3codegen.pas:30884` (`trgGetRowTrigger`) +
@@ -238,15 +278,17 @@ write, edit/spreadsheet/web-browser pipe targets) — see tasklist 10.1.27,
 
 | Priority   | Count |
 |------------|------:|
-| high       |     7 |
+| high       |     7 (6 CLOSED after 6.28.3/6.28.7/6.28.8 audits; 1 DRIFTED-S) |
 | med        |     6 |
 | low        |     8 |
 | (intentional / shell deferred) | ~18 |
 | **total productive markers**   | ~256 raw / ~21 actionable |
 
-This commit (6.28) ports **one** high-priority entry — `pas_openDirectory`
-(entry 21) — as a concrete deliverable.  The remaining six high-priority
-entries are listed for future Phase 6 / 6.bis / 9 sub-progress work and
-explicitly cite the open tasklist bullets they block.
+Audit summary (6.28.3 / 6.28.7 / 6.28.8): of the original seven
+"high-priority stubs", six turned out to be real ports under stale
+marker comments (#1, #2, #3, #5, #6, #7), and #4 is a small-S drift
+(three minor arms missing).  Only `pas_openDirectory` (entry 21) was
+ported in the 6.28 commit itself; the audit replaced "size ~600 lines
+C, large port" estimates with actual line-by-line verdicts.
 
 End of inventory.
