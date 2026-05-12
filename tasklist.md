@@ -119,6 +119,17 @@ Public-API gap analysis: `../sqlite3/src/sqlite.h.in` exports
 ~238 `sqlite3_*` symbols; the Pascal port currently exposes ~156.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs are excluded.
 
+- [X] **8.4.1** sqlite3_test_control full varargs coverage (overload-based) —
+  testCtrlImpl shared dispatcher with typed overloads (op-only / int /
+  db / db+int / db+pN / int+pU32 / pI32) replaces the 1-arg stub.
+  Arms: PRNG_SAVE/RESTORE/SEED, FK_NO_ACTION, OPTIMIZATIONS, GETOPT,
+  PENDING_BYTE, ASSERT, ALWAYS, LOCALTIME_FAULT, INTERNAL_FUNCTIONS,
+  NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS, ONCE_RESET_THRESHOLD, SORTER_MMAP,
+  BYTEORDER, ISINIT, TRACEFLAGS, JSON_SELFCHECK.  Adds public
+  sqlite3TreeTrace/sqlite3WhereTrace u32 globals (storage only — pas
+  consumer-side WHERETRACE/TREETRACE blocks were skipped during port,
+  matching upstream's non-debug build).  Fixed shell.pas
+  SQLITE_TESTCTRL_FK_NO_ACTION (was 33, now 7 per sqlite.h.in:8690).
 - [X] **8.2.1** sqlite3VdbeScanStatus + sqlite3VdbeScanStatusRange + sqlite3VdbeScanStatusCounters
   arms ported (vdbeaux.c:1186..1274); per-loop aScan[] / nScan added to TVdbe; nExec
   added to TVdbeOp and bumped in the dispatch loop; sqlite3_stmt_scanstatus_v2 reader
@@ -349,8 +360,19 @@ partial landings cannot silently no-op.
   upstream.  Upstream's "Warning: .scanstats not available in this build." is still
   echoed verbatim to keep TestShellMeta golden diff clean.
 - [~] **10.1.40** `.testcase NAME` — records NAME; `.check ANSWER` comparator side pending.
-- [~] **10.1.41** `.testctrl` — dispatcher landed; non-PRNG/BYTEORDER opcodes stub-return 0 (gated on Phase 8.4.1 varargs cdecl boundary).
-- [~] **10.1.42** `.selecttrace`/`.wheretrace`/`.treetrace` — silent no-op (matches non-debug build); full wiring needs varargs sqlite3_test_control variant (deferred).
+- [X] **10.1.41** `.testctrl` — dispatcher routes through 8.4.1 overloads
+  for OPTIMIZATIONS, FK_NO_ACTION, PRNG_SEED, PENDING_BYTE, SORTER_MMAP,
+  ASSERT/ALWAYS, LOCALTIME_FAULT, NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS,
+  INTERNAL_FUNCTIONS, JSON_SELFCHECK, plus the existing PRNG/BYTEORDER.
+  Remaining opcodes (BITVEC_TEST, FAULT_INSTALL, IMPOSTER, TUNE,
+  PARSER_COVERAGE) fall through to the generic isOk=3 stub — those need
+  callback / coverage infrastructure not yet ported.
+- [~] **10.1.42** `.selecttrace`/`.wheretrace`/`.treetrace` — command
+  shape + TRACEFLAGS toggle landed: sqlite3TreeTrace/sqlite3WhereTrace
+  u32 globals now mutate through sqlite3_test_control(TRACEFLAGS, …);
+  trace-emission still gated on consumer-side WHERETRACE/TREETRACE
+  blocks in select/where codegen (skipped during port — mirrors
+  upstream's non-debug build).
 
 ### 10.1f Long-tail / specialised dot-commands
 

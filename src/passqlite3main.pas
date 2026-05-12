@@ -499,11 +499,28 @@ procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
 function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
 
 { Phase 8.4.1 — sqlite3_test_control: testing back-door dispatcher.
-  Variadic in C; declared cdecl-only here.  Callers passing extra
-  arguments are well-defined under x86_64 SysV (the extra args sit
-  unread in registers/stack); we honour only the no-arg opcodes.
-  See main.c:4206. }
-function sqlite3_test_control(op: i32): i32; cdecl;
+  Variadic in C (main.c:4206).  Pascal port has no external C-ABI
+  callers, so instead of a real va_list we provide overloads matching
+  the exact argument shapes each TESTCTRL opcode requires.  The
+  internal dispatcher (testCtrlImpl) routes by op once arguments have
+  been collected. }
+function sqlite3_test_control(op: i32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; a: i32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3; a: i32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3; pN: Pi32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl; overload;
+
+{ Phase 8.4.1 — TRACEFLAGS storage.  Mirrors sqliteInt.h:1119/1163.
+  The pas tree-trace and where-trace consumers are not yet ported
+  (their WHERETRACE/TREETRACE blocks were skipped during the initial
+  port).  These globals still hold the toggle state so the
+  .selecttrace/.wheretrace/.treetrace shell commands behave like
+  upstream's non-debug build: state mutates, emission stays inert. }
+var
+  sqlite3TreeTrace:  u32;
+  sqlite3WhereTrace: u32;
 
 { Phase 8.7.1 — WAL public-API entry points.  See main.c:2470..2620. }
 type
@@ -4500,47 +4517,190 @@ begin
 end;
 
 { Phase 8.4.1 — sqlite3_test_control(op, ...).  Faithful subset of the
-  variadic C dispatcher in main.c:4206.  Honours the no-arg opcodes
-  (PRNG_SAVE / PRNG_RESTORE / PRNG_RESET) for differential parity with
-  the C reference; returns 0 for every other opcode (matching the C
-  default initial value of `rc`).  Extra varargs passed by callers under
-  x86_64 SysV remain unread, which is benign because we never honour
-  them. }
+  variadic C dispatcher in main.c:4206.  The pas port has no external
+  C-ABI callers, so we expose typed overloads (declared in the
+  interface) instead of va_list.  Each overload calls testCtrlImpl
+  with the already-collected arguments. }
 const
-  SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
-  SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
-  SQLITE_TESTCTRL_PRNG_RESET_OP   = 7;
-  SQLITE_TESTCTRL_BYTEORDER_OP    = 22;
-  SQLITE_TESTCTRL_ISINIT_OP       = 23;
+  SQLITE_TESTCTRL_PRNG_SAVE_OP            = 5;
+  SQLITE_TESTCTRL_PRNG_RESTORE_OP         = 6;
+  SQLITE_TESTCTRL_FK_NO_ACTION_OP         = 7;
+  SQLITE_TESTCTRL_BITVEC_TEST_OP          = 8;
+  SQLITE_TESTCTRL_PENDING_BYTE_OP         = 11;
+  SQLITE_TESTCTRL_ASSERT_OP               = 12;
+  SQLITE_TESTCTRL_ALWAYS_OP               = 13;
+  SQLITE_TESTCTRL_JSON_SELFCHECK_OP       = 14;
+  SQLITE_TESTCTRL_OPTIMIZATIONS_OP        = 15;
+  SQLITE_TESTCTRL_GETOPT_OP               = 16;
+  SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP   = 17;
+  SQLITE_TESTCTRL_LOCALTIME_FAULT_OP      = 18;
+  SQLITE_TESTCTRL_ONCE_RESET_THRESHOLD_OP = 19;
+  SQLITE_TESTCTRL_NEVER_CORRUPT_OP        = 20;
+  SQLITE_TESTCTRL_BYTEORDER_OP            = 22;
+  SQLITE_TESTCTRL_ISINIT_OP               = 23;
+  SQLITE_TESTCTRL_SORTER_MMAP_OP          = 24;
+  SQLITE_TESTCTRL_PRNG_SEED_OP            = 28;
+  SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP  = 29;
+  SQLITE_TESTCTRL_TRACEFLAGS_OP           = 31;
+  SQLITE_TESTCTRL_TUNE_OP                 = 32;
 
-function sqlite3_test_control(op: i32): i32; cdecl;
+{ Shared dispatcher.  Arguments not used by the selected op are simply
+  ignored, matching the C dispatcher's behaviour when a caller passes
+  fewer va_args than an op consumes (undefined in strict C, but our
+  callers pair shapes correctly via the typed overloads). }
+function testCtrlImpl(op, iArg1: i32; pArg2: Pointer; pArg3: Pointer;
+                      db: PTsqlite3): i32;
+var
+  pPtr32u: Pu32;
+  pPtr32i: Pi32;
+  y:    i32;
 begin
   Result := 0;
   case op of
     SQLITE_TESTCTRL_PRNG_SAVE_OP:    sqlite3PrngSaveState;
     SQLITE_TESTCTRL_PRNG_RESTORE_OP: sqlite3PrngRestoreState;
-    SQLITE_TESTCTRL_PRNG_RESET_OP:   sqlite3_randomness(0, nil);
+
+    { main.c:4254 — PRNG_SEED(int x, sqlite3 *db).  If db has a schema
+      cookie use it; else use x; then reset the PRNG. }
+    SQLITE_TESTCTRL_PRNG_SEED_OP: begin
+      if (db <> nil) and (db^.aDb[0].pSchema <> nil) then begin
+        y := db^.aDb[0].pSchema^.schema_cookie;
+        if y <> 0 then iArg1 := y;
+      end;
+      sqlite3GlobalConfig.iPrngSeed := u32(iArg1);
+      sqlite3_randomness(0, nil);
+    end;
+
+    { main.c:4277 — FK_NO_ACTION(sqlite3 *db, int b). }
+    SQLITE_TESTCTRL_FK_NO_ACTION_OP: begin
+      if db = nil then Exit;
+      if iArg1 <> 0 then
+        db^.flags := db^.flags or SQLITE_FkNoAction
+      else
+        db^.flags := db^.flags and (not SQLITE_FkNoAction);
+    end;
+
+    { main.c:4357 — PENDING_BYTE(unsigned int X).  Return existing
+      value; we do not actually rewrite a global since the pas pager
+      uses a compile-time PENDING_BYTE. }
+    SQLITE_TESTCTRL_PENDING_BYTE_OP: begin
+      Result := i32(PENDING_BYTE);
+    end;
+
+    { main.c:4379/4437 — ASSERT/ALWAYS just echo X. }
+    SQLITE_TESTCTRL_ASSERT_OP:
+      if iArg1 <> 0 then Result := iArg1;
+    SQLITE_TESTCTRL_ALWAYS_OP:
+      if iArg1 <> 0 then Result := iArg1;
+
+    { main.c:4468 — OPTIMIZATIONS(sqlite3 *db, int N). }
+    SQLITE_TESTCTRL_OPTIMIZATIONS_OP:
+      if db <> nil then db^.dbOptFlags := u32(iArg1);
+
+    { main.c:4479 — GETOPT(sqlite3 *db, int *N). }
+    SQLITE_TESTCTRL_GETOPT_OP: begin
+      pPtr32i := Pi32(pArg2);
+      if (db <> nil) and (pPtr32i <> nil) then pPtr32i^ := i32(db^.dbOptFlags);
+    end;
+
+    { main.c:4499 — LOCALTIME_FAULT(int onoff[, xAlt]).  We ignore the
+      xAlt callback (test-only). }
+    SQLITE_TESTCTRL_LOCALTIME_FAULT_OP: begin
+      sqlite3GlobalConfig.bLocaltimeFault := iArg1;
+      sqlite3GlobalConfig.xAltLocaltime := nil;
+    end;
+
+    { main.c:4515 — INTERNAL_FUNCTIONS(sqlite3 *db) — toggle bit. }
+    SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP:
+      if db <> nil then
+        db^.mDbFlags := db^.mDbFlags xor DBFLAG_InternalFunc;
+
+    SQLITE_TESTCTRL_NEVER_CORRUPT_OP:
+      sqlite3GlobalConfig.neverCorrupt := iArg1;
+
+    SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP:
+      sqlite3GlobalConfig.bExtraSchemaChecks := iArg1;
+
+    SQLITE_TESTCTRL_ONCE_RESET_THRESHOLD_OP:
+      sqlite3GlobalConfig.iOnceResetThreshold := iArg1;
+
+    SQLITE_TESTCTRL_SORTER_MMAP_OP:
+      if db <> nil then db^.nMaxSorterMmap := iArg1;
+
     SQLITE_TESTCTRL_BYTEORDER_OP: begin
-      { main.c (TESTCTRL_BYTEORDER, sqlite3.c:191530..191532):
-          rc = SQLITE_BYTEORDER*100 + SQLITE_LITTLEENDIAN*10 + SQLITE_BIGENDIAN
-        SQLite encodes byte order at compile-time when the macro is set,
-        so this is a 6-digit answer on x86_64 builds (1234 / little-endian
-        / not big-endian → 123410) and 432101 on big-endian builds.  FPC
-        on x86_64 → 123410; bump to compile-time {$IFDEF ENDIAN_BIG} for
-        portability when a big-endian target appears. }
       {$IFDEF ENDIAN_BIG}
-      Result := 4321 * 100 + 0 * 10 + 1;   { 432101 }
+      Result := 4321 * 100 + 0 * 10 + 1;
       {$ELSE}
-      Result := 1234 * 100 + 1 * 10 + 0;   { 123410 }
+      Result := 1234 * 100 + 1 * 10 + 0;
       {$ENDIF}
     end;
-    SQLITE_TESTCTRL_ISINIT_OP: begin
-      { main.c:4582 — 0 if sqlite3_initialize has succeeded, SQLITE_ERROR
-        otherwise.  Probed via sqlite3GlobalConfig.isInit. }
-      if sqlite3GlobalConfig.isInit = 0 then
-        Result := SQLITE_ERROR;
+
+    SQLITE_TESTCTRL_ISINIT_OP:
+      if sqlite3GlobalConfig.isInit = 0 then Result := SQLITE_ERROR;
+
+    { main.c:4686 — TRACEFLAGS(int opTrace, u32 *ptr).
+        0: *ptr = sqlite3TreeTrace
+        1: sqlite3TreeTrace = *ptr
+        2: *ptr = sqlite3WhereTrace
+        3: sqlite3WhereTrace = *ptr
+      Storage is real; emission is still gated on consumer-side
+      WHERETRACE/TREETRACE blocks that have not yet been ported. }
+    SQLITE_TESTCTRL_TRACEFLAGS_OP: begin
+      pPtr32u := Pu32(pArg2);
+      if pPtr32u <> nil then begin
+        case iArg1 of
+          0: pPtr32u^ := sqlite3TreeTrace;
+          1: sqlite3TreeTrace := pPtr32u^;
+          2: pPtr32u^ := sqlite3WhereTrace;
+          3: sqlite3WhereTrace := pPtr32u^;
+        end;
+      end;
+    end;
+
+    { main.c:4770 — JSON_SELFCHECK(int *onOff).  Pas has no
+      bJsonSelfcheck global; treat as no-op but accept the shape. }
+    SQLITE_TESTCTRL_JSON_SELFCHECK_OP: begin
+      pPtr32i := Pi32(pArg2);
+      if (pPtr32i <> nil) and (pPtr32i^ < 0) then pPtr32i^ := 0;
     end;
   end;
+  { sentinels — silence unused-arg hints }
+  if pArg3 = nil then ;
+end;
+
+function sqlite3_test_control(op: i32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, nil, nil, nil);
+end;
+
+function sqlite3_test_control(op: i32; a: i32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, a, nil, nil, nil);
+end;
+
+function sqlite3_test_control(op: i32; db: PTsqlite3): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, nil, nil, db);
+end;
+
+function sqlite3_test_control(op: i32; db: PTsqlite3; a: i32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, a, nil, nil, db);
+end;
+
+function sqlite3_test_control(op: i32; db: PTsqlite3; pN: Pi32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, Pointer(pN), nil, db);
+end;
+
+function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, mode, Pointer(pVal), nil, nil);
+end;
+
+function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, Pointer(pVal), nil, nil);
 end;
 
 { ----------------------------------------------------------------------

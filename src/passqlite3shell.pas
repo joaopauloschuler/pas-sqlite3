@@ -6919,7 +6919,7 @@ const
   SQLITE_TESTCTRL_SEEK_COUNT           = 30;
   SQLITE_TESTCTRL_TUNE                 = 32;
   SQLITE_TESTCTRL_BYTEORDER            = 22;
-  SQLITE_TESTCTRL_FK_NO_ACTION         = 33;
+  SQLITE_TESTCTRL_FK_NO_ACTION         = 7;   { sqlite.h.in:8690 }
   SQLITE_TESTCTRL_INTERNAL_FUNCTIONS   = 17;
   SQLITE_TESTCTRL_JSON_SELFCHECK       = 14;
 
@@ -7022,6 +7022,68 @@ begin
         if testctrl = SQLITE_TESTCTRL_BYTEORDER then isOk := 1
         else isOk := 3;
       end;
+    end;
+    SQLITE_TESTCTRL_OPTIMIZATIONS: begin
+      { shell.c.in:11487 — accept an unsigned int mask (label parsing
+        deferred); apply via sqlite3_test_control(OPTIMIZATIONS,db,N). }
+      if nArg >= 2 then begin
+        rc2 := sqlite3_test_control(testctrl, p^.db,
+                                    i32(shellIntegerValue(args[1])));
+        isOk := 3;
+      end;
+    end;
+    SQLITE_TESTCTRL_FK_NO_ACTION,
+    SQLITE_TESTCTRL_SORTER_MMAP: begin
+      if nArg = 2 then begin
+        rc2 := sqlite3_test_control(testctrl, p^.db,
+                                    i32(shellIntegerValue(args[1])));
+        isOk := 3;
+      end;
+    end;
+    SQLITE_TESTCTRL_PENDING_BYTE: begin
+      if nArg = 2 then begin
+        rc2 := sqlite3_test_control(testctrl,
+                                    i32(shellIntegerValue(args[1])));
+        isOk := 3;
+      end;
+    end;
+    SQLITE_TESTCTRL_PRNG_SEED: begin
+      if (nArg = 2) or (nArg = 3) then begin
+        rc2 := sqlite3_test_control(testctrl, p^.db,
+                                    i32(shellIntegerValue(args[1])));
+        isOk := 3;
+      end;
+    end;
+    SQLITE_TESTCTRL_ASSERT,
+    SQLITE_TESTCTRL_ALWAYS: begin
+      if nArg = 2 then begin
+        rc2 := sqlite3_test_control(testctrl,
+                                    i32(shellIntegerValue(args[1])));
+        isOk := 1;
+      end;
+    end;
+    SQLITE_TESTCTRL_LOCALTIME_FAULT,
+    SQLITE_TESTCTRL_NEVER_CORRUPT,
+    SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS: begin
+      if nArg = 2 then begin
+        rc2 := sqlite3_test_control(testctrl,
+                                    i32(shellIntegerValue(args[1])));
+        isOk := 3;
+      end;
+    end;
+    SQLITE_TESTCTRL_INTERNAL_FUNCTIONS: begin
+      rc2 := sqlite3_test_control(testctrl, p^.db);
+      isOk := 3;
+    end;
+    SQLITE_TESTCTRL_JSON_SELFCHECK: begin
+      if nArg = 1 then begin
+        rc2 := -1;
+        isOk := 1;
+      end else begin
+        rc2 := i32(shellIntegerValue(args[1]));
+        isOk := 3;
+      end;
+      sqlite3_test_control(testctrl, Pi32(@rc2));
     end;
     SQLITE_TESTCTRL_SEEK_COUNT: begin
       { Stub: would call sqlite3_test_control(op, db, &x) and print x. }
@@ -7593,12 +7655,25 @@ end;
   via sqlite3_test_control; until then `silent` is the correct port.
   ---------------------------------------------------------------------- }
 
-procedure cmdTraceFlags(const cmdName: AnsiString);
+procedure cmdTraceFlags(const cmdName: AnsiString;
+                        const args: array of AnsiString; nArg: SizeInt);
+var
+  x: u32;
 begin
-  { Silent: mirrors the non-debug-build SQLITE_TESTCTRL_TRACEFLAGS no-op
-    so `.selecttrace`/`.wheretrace`/`.treetrace` produce no output and
-    rc=0 in lock-step with upstream's standard CLI build. }
-  if cmdName = '' then ;  { unused-param sentinel }
+  { shell.c.in:10711..10716 (.selecttrace/.treetrace, opTrace=1) and
+    :12042..12045 (.wheretrace, opTrace=3): if no arg, mask = 0xffffffff
+    else integerValue(args[0]).  Pas's sqlite3_test_control(TRACEFLAGS)
+    stores the mask in sqlite3TreeTrace / sqlite3WhereTrace; emission
+    is still gated on consumer-side WHERETRACE / TREETRACE blocks that
+    were skipped during the port (see passqlite3main.pas:4502). }
+  if nArg >= 2 then
+    x := u32(shellIntegerValue(args[1]))
+  else
+    x := u32($FFFFFFFF);
+  if (cmdName = 'selecttrace') or (cmdName = 'treetrace') then
+    sqlite3_test_control(31 { SQLITE_TESTCTRL_TRACEFLAGS }, 1, Pu32(@x))
+  else if cmdName = 'wheretrace' then
+    sqlite3_test_control(31 { SQLITE_TESTCTRL_TRACEFLAGS }, 3, Pu32(@x));
 end;
 
 { ----------------------------------------------------------------------
@@ -9670,7 +9745,7 @@ begin
     build it falls through to the unknown-command arm, so do NOT route. }
   if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
      or (zCmd = 'treetrace') then
-  begin cmdTraceFlags(zCmd); Exit; end;
+  begin cmdTraceFlags(zCmd, args, nArg); Exit; end;
   if zCmd = 'testcase'  then begin cmdTestcase(p, args, nArg); Exit; end;
   if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
   if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
