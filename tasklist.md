@@ -918,8 +918,8 @@ partial landings cannot silently no-op.
   - [X] **10.1f.9** `.sha3sum` — gated by `src/tests/TestShellFilectrl.pas` (default 256-bit + sha3-224/384/512 + --schema + LIKE-pattern + --bogus). Side-fixes: cmdSha3sum now returns rc; unknown-option path emits showHelp('sha3sum') dump and rc=1 like C (shell.c.in:11094..11098); error-line label changed from ".sha3sum" to "sha3sum" to match azArg[0].
   - [X] **10.1f.10** `.crnl` — gated by `src/tests/TestShellMisc.pas` (byte-parity vs upstream over bare/`on`/`off`/`.crlf` alias/two-call script, 6 subtests). On POSIX the arm unconditionally clears MFLG_CRLF and prints "crlf is OFF\n" to stderr regardless of nArg; port matches byte-for-byte, no side-fixes needed.
   - [X] **10.1f.11** `.binary` — gated by `src/tests/TestShellMisc.pas` (bare/`on`/`off`/bogus, 4 subtests, all rc=1 with "The \".binary\" command is deprecated.\n" deprecation line). Port matches upstream byte-for-byte (shell.c.in:9114..9117), no side-fixes needed.
-  - [ ] **10.1f.12** `.connection`
-  - [ ] **10.1f.13** `.unmodule`
+  - [X] **10.1f.12** `.connection` — gated by `src/tests/TestShellMisc.pas` (bare-list/switch-0/switch-9/close-active/close-9/close-bare/close-bad/bogus, 8 subtests). Side-fix: cmdConnection now returns rc; usage path and "cannot close the active database connection" path propagate rc=1 (shell.c.in:9210,9218); dispatcher arm passqlite3shell.pas:9537 wired to forward Result.
+  - [X] **10.1f.13** `.unmodule` — gated by `src/tests/TestShellMisc.pas` (bare/single-name/multi-name/--allexcept bare/--allexcept keep/single-dash -allexcept, 6 subtests). Side-fix: cmdUnmodule now returns rc; missing-arg path propagates rc=1 (shell.c.in:11960); dispatcher arm passqlite3shell.pas:9538 wired to forward Result.
   - [ ] **10.1f.14** `.vfsinfo`
   - [ ] **10.1f.15** `.vfslist`
   - [ ] **10.1f.16** `.vfsname`

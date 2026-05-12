@@ -1,13 +1,18 @@
 {
   SPDX-License-Identifier: blessing
 
-  TestShellMisc — phase 10.1f.10/11 gate.  Exercises `.crnl`/`.crlf` and
-  `.binary` by piping fixed scripts into both binaries (bin/passqlite3 and
-  /home/bpsa/app/sqlite3/sqlite3) and diffing stdout+stderr byte-for-byte.
+  TestShellMisc — phase 10.1f.10/11/12/13 gate.  Exercises `.crnl`/`.crlf`,
+  `.binary`, `.connection` and `.unmodule` by piping fixed scripts into both
+  binaries (bin/passqlite3 and /home/bpsa/app/sqlite3/sqlite3) and diffing
+  stdout+stderr byte-for-byte.
 
   Upstream C arms:
     - .crnl / .crlf  shell.c.in:9223..9240   (n==4, "crlf"/"crnl")
     - .binary        shell.c.in:9113..9117   (deprecated stub, rc=1)
+    - .connection    shell.c.in:9177..9221   (aAuxDb slot switch, rc=1 on
+                                              usage / active-close)
+    - .unmodule      shell.c.in:11954..11975 (drop / --allexcept, rc=1 on
+                                              missing arg)
 
   Both arms are essentially no-ops on POSIX:
     - .crnl always emits "crlf is OFF\n" on stderr, rc=0, regardless of
@@ -167,11 +172,46 @@ begin
   DiffScript('binary-bogus','.binary bogus'#10);
 end;
 
+procedure RunConnection;
+begin
+  { Bare: lists slots. With :memory: argv we get a single ACTIVE 0 row. }
+  DiffScript('conn-bare',       '.connection'#10);
+  { Switch to slot 0 (already active) — silent no-op, rc=0. }
+  DiffScript('conn-switch-0',   '.connection 0'#10);
+  { Out-of-range single digit — body's range check fails silently, rc=0. }
+  DiffScript('conn-switch-9',   '.connection 9'#10);
+  { Close the active slot — eputz + rc=1. }
+  DiffScript('conn-close-active', '.connection close 0'#10);
+  { Close an out-of-range slot — no-op, rc=0. }
+  DiffScript('conn-close-9',    '.connection close 9'#10);
+  { Usage paths: missing arg / non-digit / multi-char digit-string. }
+  DiffScript('conn-close-bare', '.connection close'#10);
+  DiffScript('conn-close-bad',  '.connection close foo'#10);
+  DiffScript('conn-bogus',      '.connection wibble'#10);
+end;
+
+procedure RunUnmodule;
+begin
+  { Missing arg: Usage on stderr, rc=1. }
+  DiffScript('unmod-bare',      '.unmodule'#10);
+  { Drop a non-existent module: silent, rc=0 (create_module(NULL,NULL)). }
+  DiffScript('unmod-name',      '.unmodule nosuchmod'#10);
+  { Drop multiple non-existent modules: silent, rc=0. }
+  DiffScript('unmod-names',     '.unmodule one two three'#10);
+  { --allexcept with no names: drops every registered module, silent rc=0. }
+  DiffScript('unmod-allex-bare','.unmodule --allexcept'#10);
+  { --allexcept keeping some names: silent rc=0. }
+  DiffScript('unmod-allex-keep','.unmodule --allexcept json json_tree'#10);
+  { Single-dash prefix is accepted too (zOpt++ runs only on `--`). }
+  DiffScript('unmod-allex-1dash','.unmodule -allexcept'#10);
+end;
+
 begin
   upstream := findUpstreamSqlite3;
   InitPaths;
   if upstream = '' then begin
-    WriteLn('SKIP    crnl/binary: no upstream sqlite3 binary found');
+    WriteLn('SKIP    crnl/binary/connection/unmodule: ',
+            'no upstream sqlite3 binary found');
     WriteLn('        Set UPSTREAM_SQLITE3=/path/to/sqlite3 to enable.');
     CleanupPaths;
     WriteLn;
@@ -186,6 +226,8 @@ begin
 
   RunCrnl;
   RunBinary;
+  RunConnection;
+  RunUnmodule;
 
   CleanupPaths;
 

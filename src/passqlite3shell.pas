@@ -6430,14 +6430,15 @@ end;
   swap which slot of the array p^.pAuxDb points at.
   ---------------------------------------------------------------------- }
 
-procedure cmdConnection(p: PShellState; const args: array of AnsiString;
-                        nArg: SizeInt);
+function cmdConnection(p: PShellState; const args: array of AnsiString;
+                       nArg: SizeInt): i32;
 var
   i: SizeInt;
   zFile: AnsiString;
   zPtr: PAnsiChar;
   ix: i32;
 begin
+  Result := 0;
   if nArg = 0 then begin
     for i := 0 to High(p^.aAuxDb) do begin
       zPtr := p^.aAuxDb[i].zDbFilename;
@@ -6475,6 +6476,7 @@ begin
     if (ix < 0) or (ix > High(p^.aAuxDb)) then Exit;
     if p^.pAuxDb = @p^.aAuxDb[ix] then begin
       shellEPutZ('cannot close the active database connection'#10);
+      Result := 1;
       Exit;
     end;
     if p^.aAuxDb[ix].db <> nil then begin
@@ -6484,6 +6486,7 @@ begin
     Exit;
   end;
   shellEPutZ('Usage: .connection [close] [CONNECTION-NUMBER]'#10);
+  Result := 1;
 end;
 
 { ----------------------------------------------------------------------
@@ -6493,16 +6496,18 @@ end;
   except those listed; otherwise NAME ... lists modules to drop.
   ---------------------------------------------------------------------- }
 
-procedure cmdUnmodule(p: PShellState; const args: array of AnsiString;
-                      nArg: SizeInt);
+function cmdUnmodule(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
 var
   ii: SizeInt;
   zOpt: AnsiString;
   cArgs: array of PAnsiChar;
   cBack: array of AnsiString;
 begin
+  Result := 0;
   if nArg < 1 then begin
     shellEPutZ('Usage: .unmodule [--allexcept] NAME ...'#10);
+    Result := 1;
     Exit;
   end;
   openDb(p, 0);
@@ -9529,8 +9534,8 @@ begin
   if zCmd = 'restore'   then begin Result := cmdRestore(p, args, nArg); Exit; end;
   if zCmd = 'clone'     then begin Result := cmdClone(p, args, nArg); Exit; end;
   if zCmd = 'open'      then begin cmdOpen(p, args, nArg); Exit; end;
-  if zCmd = 'connection' then begin cmdConnection(p, args, nArg); Exit; end;
-  if zCmd = 'unmodule'  then begin cmdUnmodule(p, args, nArg); Exit; end;
+  if zCmd = 'connection' then begin Result := cmdConnection(p, args, nArg); Exit; end;
+  if zCmd = 'unmodule'  then begin Result := cmdUnmodule(p, args, nArg); Exit; end;
   if zCmd = 'vfsinfo'   then begin cmdVfsinfo(p, args, nArg); Exit; end;
   if zCmd = 'vfslist'   then begin cmdVfslist(p); Exit; end;
   if zCmd = 'vfsname'   then begin cmdVfsname(p, args, nArg); Exit; end;
