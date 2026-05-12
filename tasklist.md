@@ -263,10 +263,21 @@ regressions without human triage.
     DbStrDup inside sqlite3VdbeError, then freeing the temp buffer.  Closed
     44/44 RELEASE sites; TestSQLCorpus divergence count 77 → 8; explain parity
     holds at 1026/1026; full regression 88/88.*
-  - [ ] **9.1.divbug.2** PRAGMA mmap_size / journal_mode output shape (3
+  - [X] **9.1.divbug.2** PRAGMA mmap_size / journal_mode output shape (3
     sites).  Likely missing newline / wrong column count vs upstream.
-  - [ ] **9.1.divbug.3** DROP INDEX errmsg truncation (1 site) — verify
+    *Landed 2026-05-12: `passqlite3codegen.pas:45911..45931` PRAGMA-default
+    table now seeds `mmap_size`=0 (pragma.c:951..978 disabled-mmap arm), and
+    the `journal_mode` read arm at `:45962..45980` queries the actual pager
+    via `sqlite3PagerGetJournalMode` + `sqlite3JournalModename` instead of
+    hard-coding the memdb literal `"memory"` (pragma.c:734..771).  Closed
+    3/3 sites; corpus 8 → 4 divergences; explain parity 1026/1026; full
+    regression 88/88.*
+  - [X] **9.1.divbug.3** DROP INDEX errmsg truncation (1 site) — verify
     against `sqlite3DropIndex` / `sqlite3ErrorMsg` arms in delete.c.
+    *Landed 2026-05-12: `passqlite3codegen.pas:38974..38985` now formats
+    `"no such index: %s"` with `pItem^.zName` via `sqlite3MPrintf` + free,
+    matching C `build.c:4614` `"no such index: %S"` for the common
+    non-quoted/non-attached case.  Closed 1/1 site.*
   - [ ] **9.1.divbug.4** DiagAnalyze full-script rc divergence (3 sites)
     — ANALYZE itself runs but exit rc differs.
   - [ ] **9.1.divbug.5** db-blob: DiagFeatureProbe ALTER COLUMN arm —

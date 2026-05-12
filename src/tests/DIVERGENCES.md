@@ -15,18 +15,21 @@ survive the mask are real port drift.
 
 | source | tier | tag | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|---------|---------|---------------|--------------------------|
-| src/tests/DiagIndexing.pas | tier2 | ddl | 42 | 1 | stderr | `DROP INDEX ix_t_a; SELECT name FROM sqlite_schema WHERE type='index'` |
-| src/tests/DiagPragma.pas | tier2 | pragma | 62 | 2 | stdout | `PRAGMA mmap_size` |
-| src/tests/DiagTxn.pas | tier2 | txn | 40 | 1 | stdout | `PRAGMA journal_mode` |
 | src/tests/DiagAnalyze.pas | tier2 | pragma | 3 | 3 | rc | `CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a); INSERT INTO t VALUES(1,1),(2,2),(3...` |
 | src/tests/DiagBloom.pas | tier2 | dql | 9 | 1 | rc | `CREATE TABLE sqlite_stat1(tbl,idx,stat)` |
 
 _End of file._
 
-Phase 9.1.divbug.1 (2026-05-12) closed the 44-site RELEASE-without-SAVEPOINT
-cluster (TestExplainParity 40 / TestBytecodeParity 2 / TestParser 2) by
-formatting the missing `: <name>` suffix in OP_Savepoint — see
-`passqlite3vdbe.pas:9678` (vdbe.c:3902 reference).  Earlier tier-2 db-blob
-rollups (DiagFeatureProbe / DiagDml / DiagDropTable) dropped out of the
-post-fix rerun and are no longer reproducing under the current build;
-re-catalog when their root-cause tickets (9.1.divbug.5..7) are revisited.
+Phase 9.1.divbug.2 (2026-05-12) closed the 3-site PRAGMA shape cluster
+(DiagPragma `mmap_size` x2 + DiagTxn `journal_mode`) — `passqlite3codegen.pas`
+`PragTyp_MMAP_SIZE` arm now returns 0 (pragma.c:951..978), and the
+`journal_mode` read arm now reflects the pager's actual mode via
+`sqlite3PagerGetJournalMode` / `sqlite3JournalModename` (pragma.c:734..771)
+instead of always emitting the memdb literal `"memory"`.
+
+Phase 9.1.divbug.3 (2026-05-12) closed the 1-site `DROP INDEX` errmsg
+truncation in `sqlite3DropIndex` (`passqlite3codegen.pas:38974`) — message
+now formats `"no such index: %s"` via `sqlite3MPrintf` (build.c:4614).
+
+Remaining open clusters: 9.1.divbug.4 (DiagAnalyze rc x3),
+9.1.divbug.8 (DiagBloom stat1 rc x1).

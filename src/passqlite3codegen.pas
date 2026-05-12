@@ -42,7 +42,7 @@ interface
 
 uses
   passqlite3types, passqlite3internal, passqlite3util, passqlite3os,
-  passqlite3vdbe, passqlite3btree,
+  passqlite3vdbe, passqlite3btree, passqlite3pager,
   SysUtils;
 
 // ---------------------------------------------------------------------------
@@ -38953,6 +38953,7 @@ var
   db:     PTsqlite3;
   iDb:    i32;
   pItem:  PSrcItem;
+  zNoIdxMsg: PAnsiChar;
 {$IFNDEF SQLITE_OMIT_AUTHORIZATION}
   code:   i32;
   pTab:   PTable2;
@@ -38973,7 +38974,16 @@ begin
   pIndex := sqlite3FindIndex(db, pItem^.zName, pItem^.u4.zDatabase);
   if pIndex = nil then begin
     if ifExists = 0 then begin
-      sqlite3ErrorMsg(pParse, 'no such index');
+      { build.c:4614 — "no such index: %S" formats the SrcItem token.  We
+        do not have a %S handler in sqlite3MPrintf yet, so synthesise the
+        suffix via %s + pItem^.zName, matching the C output byte-for-byte
+        for the common (non-quoted, non-attached) case driven by the corpus.
+        sqlite3ErrorMsg re-copies via DbStrDup-equivalent, so free the temp. }
+      begin
+        zNoIdxMsg := PAnsiChar(sqlite3MPrintf(db, 'no such index: %s', [pItem^.zName]));
+        sqlite3ErrorMsg(pParse, zNoIdxMsg);
+        if zNoIdxMsg <> nil then sqlite3DbFree(db, zNoIdxMsg);
+      end;
     end else begin
       sqlite3CodeVerifyNamedSchema(pParse, pItem^.u4.zDatabase);
       sqlite3ForceNotReadOnly(pParse);
@@ -45911,7 +45921,12 @@ begin
     else if SameText(zName, 'journal_size_limit') then iVal := -1
     else if SameText(zName, 'auto_vacuum')        then iVal := 0
     else if SameText(zName, 'freelist_count')     then iVal := 0
-    else if SameText(zName, 'schema_version')     then iVal := 0;
+    else if SameText(zName, 'schema_version')     then iVal := 0
+    { pragma.c:951..978 PragTyp_MMAP_SIZE — when SQLITE_MAX_MMAP_SIZE<=0
+      sz=0 and returnSingleInt(v, 0).  The Pas port does not yet wire
+      sqlite3_file_control(SQLITE_FCNTL_MMAP_SIZE) so default to 0,
+      matching the disabled-mmap C reference (Phase 9.1.divbug.2). }
+    else if SameText(zName, 'mmap_size')          then iVal := 0;
     if iVal <> MaxInt then begin
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
@@ -45950,10 +45965,20 @@ begin
     always end with `OP_ResultRow` carrying the (possibly updated) current
     mode (pragma.c:770 / pragma.c:725). }
   if SameText(zName, 'journal_mode') then begin
-    { memdb's pager rejects any non-"memory" mode, so the result is
-      always "memory" regardless of zRight.  Matches C's
-      sqlite3PagerJournalMode(...) outcome on memdb. }
-    sqlite3VdbeLoadString(v, 1, 'memory');
+    { pragma.c:734..771 — emit the *current* journal mode name from the
+      attached pager.  On an in-memory DB this is "memory"; on an on-disk
+      DB the default is "delete".  Previously the Pas port hard-coded
+      "memory" which diverged from the C oracle on file-backed corpora
+      (Phase 9.1.divbug.2).  We do not yet port the OP_JournalMode opcode
+      so the mode-switch arm of zRight is still a silent no-op; reads now
+      reflect reality, which is what TestSQLCorpus exercises. }
+    pBtArg := PBtree(db^.aDb[iDb].pBt);
+    if pBtArg <> nil then
+      sqlite3VdbeLoadString(v, 1,
+        PChar(AnsiString(sqlite3JournalModename(
+          sqlite3PagerGetJournalMode(sqlite3BtreePager(pBtArg))))))
+    else
+      sqlite3VdbeLoadString(v, 1, 'memory');
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
