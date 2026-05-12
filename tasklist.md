@@ -299,11 +299,16 @@ regressions without human triage.
     add column, rename column+SELECT, add column+SELECT, rename table+SELECT,
     rename table+pragma, drop column+pragma, drop column+SELECT).  Corpus
     2259/2259 OK, 0 divergences; explain parity 1026/1026.*
-  - [ ] **9.1.divbug.6** db-blob: DiagDml multi-table writes — diverge
-    on multi-statement INSERT/UPDATE/DELETE workloads.
-  - [ ] **9.1.divbug.7** db-blob: DiagDropTable — diverge after DROP
-    TABLE (orphaned pages? freelist linkage? schema cookie?).  Verify
-    against `sqlite3DropTable` + `clearDatabasePage` arms in build.c.
+  - [X] **9.1.divbug.6** db-blob: DiagDml multi-table writes.
+    *Confirmed closed 2026-05-12 by the divbug.4+8 SQLITE_WriteSchema
+    bit-mask fix.  Corpus 2259/2259 OK after the bit-mask landing —
+    no separate fix needed.*
+  - [X] **9.1.divbug.7** db-blob: DiagDropTable.
+    *Confirmed closed 2026-05-12 by the divbug.4+8 SQLITE_WriteSchema
+    bit-mask fix.  Same writable-schema gate had been letting DROP TABLE
+    drift on reserved internal names; once the gate reads bit 0x01
+    correctly, DROP TABLE freelist+schema-cookie rewrite is byte-parity
+    with C.  Corpus 2259/2259 OK.*
   - [X] **9.1.divbug.8** DiagBloom pre-existing sqlite_stat1 (1 site) —
     Pascal side emits an extra row when stat1 is already populated.
     *Landed 2026-05-12 alongside divbug.4 via the same `SQLITE_WriteSchema`
