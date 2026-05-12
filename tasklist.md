@@ -354,11 +354,27 @@ partial landings cannot silently no-op.
 - [X] **10.1.38** `.iotrace` — stub; full sqlite3IoTrace fanout gated on sqlite3VdbeIOTraceSql arm (currently a stub at passqlite3vdbe.pas:4122).
 - [~] **10.1.39** `.scanstats` — basic per-loop dump landed (8.2.1: aScan[] +
   sqlite3_stmt_scanstatus_v2 reader + WhereAddScanStatus producer wired).  Output
-  shows NAME/EXPLAIN/EST/SELECTID/PARENTID correctly.  NLOOP/NVISIT report -1 until
-  TWhereLevel.addrVisit is added; NCYCLE deferred (hwtime sampling); the qrf.c
-  qrfEqpStats EQP-tree formatter is not yet ported, so text shape diverges from
-  upstream.  Upstream's "Warning: .scanstats not available in this build." is still
-  echoed verbatim to keep TestShellMeta golden diff clean.
+  shows NAME/EXPLAIN/EST/SELECTID/PARENTID correctly.  Remaining subtasks:
+  - [ ] **10.1.39.a** TWhereLevel.addrVisit field — add to the where-loop
+    record, populate at the WhereCodeOneLoopStart emit site (mirrors where.c
+    around the `pLevel->addrVisit = sqlite3VdbeCurrentAddr(v);` stamps), and
+    feed it into sqlite3VdbeScanStatusCounters at the WhereAddScanStatus
+    callsite.  Unblocks NVISIT (currently -1).
+  - [ ] **10.1.39.b** NLOOP counter — confirm `aOp[].nExec` increments at the
+    correct loop-head opcode (Next/VNext/Prev/Rewind) and that the reader's
+    NLOOP arm consults the *loop* opcode, not the *visit* opcode.  Cross-check
+    against vdbeapi.c.  Likely just a 1-line dispatch tweak.
+  - [ ] **10.1.39.c** qrfEqpStats EQP-tree formatter port (`../sqlite3/ext/misc/qpvtab.c`
+    or wherever the upstream `.scanstats` text shaper lives — grep `qrfEqpStats`).
+    Replaces the current flat "Loop N: …" dump with the indented EQP-tree text
+    that matches upstream byte-for-byte.  Gate: TestShellMeta `.scanstats` arm
+    bumps from shape-only to byte-diff.
+  - [ ] **10.1.39.d** NCYCLE / hwtime sampling — deferred until a real consumer
+    appears; gated on `SQLITE_ENABLE_STMT_SCANSTATUS=2` equivalent and TVdbeOp
+    gaining an `nCycle` field.  Not blocking 10.1.39 closure.
+
+  Upstream's "Warning: .scanstats not available in this build." is still echoed
+  verbatim to keep TestShellMeta golden diff clean while a..c land.
 - [~] **10.1.40** `.testcase NAME` — records NAME; `.check ANSWER` comparator side pending.
 - [X] **10.1.41** `.testctrl` — dispatcher routes through 8.4.1 overloads
   for OPTIMIZATIONS, FK_NO_ACTION, PRNG_SEED, PENDING_BYTE, SORTER_MMAP,
@@ -369,10 +385,30 @@ partial landings cannot silently no-op.
   callback / coverage infrastructure not yet ported.
 - [~] **10.1.42** `.selecttrace`/`.wheretrace`/`.treetrace` — command
   shape + TRACEFLAGS toggle landed: sqlite3TreeTrace/sqlite3WhereTrace
-  u32 globals now mutate through sqlite3_test_control(TRACEFLAGS, …);
-  trace-emission still gated on consumer-side WHERETRACE/TREETRACE
-  blocks in select/where codegen (skipped during port — mirrors
-  upstream's non-debug build).
+  u32 globals now mutate through sqlite3_test_control(TRACEFLAGS, …).
+  Trace-emission still gated on consumer-side blocks in codegen.
+  Remaining subtasks:
+  - [ ] **10.1.42.a** TREETRACE consumer macros in select.c → passqlite3codegen.pas.
+    Grep `TREETRACE(` in ../sqlite3/src/select.c — each call expands to
+    `if(sqlite3TreeTrace & MASK){ sqlite3DebugPrintf(...); }`.  Port verbatim
+    (under `{$IFDEF SQLITE_DEBUG}` so non-debug builds stay silent and the
+    upstream non-debug parity is preserved).  Gate: `.treetrace 0xFFFF` against
+    a SELECT produces non-empty output that matches upstream's debug build
+    (compare against `../sqlite3/sqlite3 -DSQLITE_DEBUG` if rebuilt).
+  - [ ] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
+    wherecode.c → passqlite3codegen.pas.  Same pattern as 10.1.42.a but for
+    `WHERETRACE(` calls.  Larger surface (~30 callsites).  Subset-port: start
+    with the top-level whereLoopAddBtree / whereLoopAddVirtual / whereLoopAddOr
+    arms; gradually add the deeper sub-arms in follow-up commits.
+  - [ ] **10.1.42.c** sqlite3DebugPrintf — confirm a `cdecl` printf-shim with
+    upstream signature already exists; if not, port from util.c.  Required by
+    both a/b.  (Likely already present from earlier debug work — verify before
+    porting.)
+  - [ ] **10.1.42.d** Build-flag gating.  Add `{$DEFINE SQLITE_DEBUG}` to a
+    test-only build variant so a/b only emit under that flag.  Default builds
+    must continue to compile the macro bodies out (or render them as silent
+    no-ops) so non-debug parity stays clean — mirrors upstream where
+    `SQLITE_DEBUG` is the gate.
 
 ### 10.1f Long-tail / specialised dot-commands
 
