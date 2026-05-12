@@ -19184,7 +19184,13 @@ begin
     pLevel^.op := OP_Next;
     pLevel^.p1 := pLevel^.iTabCur;
     pLevel^.p2 := startAddr;
-    pLevel^.addrBody := startAddr;
+    { 10.1.39.b — do NOT overwrite pLevel^.addrBody here.  In C
+      (where.c:7467) addrBody is stamped ONCE before
+      sqlite3WhereCodeOneLoopStart and points at the loop-head opcode
+      (Rewind/Last); sqlite3WhereAddScanStatus then feeds it as
+      addrLoop into the per-scan record.  Overriding addrBody to
+      startAddr (= post-Rewind body) would make SCANSTAT_NLOOP
+      report per-row visit counts instead of loop entries. }
     if testOp <> OP_Noop then
     begin
       Inc(pParse^.nMem);
@@ -19221,14 +19227,18 @@ begin
     begin
       { 6.10 step 9(f) — recursive-CTE pseudo-cursor (one row, populated
         per outer dequeue iteration in generateWithRecursiveQuery).  No
-        Rewind/Next; mirrors wherecode.c:2568..2571 isRecursive arm. }
-      pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+        Rewind/Next; mirrors wherecode.c:2568..2571 isRecursive arm.
+        10.1.39.b — leave pLevel^.addrBody as the where.c:7467 stamp;
+        no Rewind here so the head opcode is the next emitted op
+        anyway. }
       pLevel^.op       := OP_Noop;
     end
     else
     begin
       sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
-      pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+      { 10.1.39.b — keep addrBody = Rewind addr (from where.c:7467 mirror);
+        track the post-Rewind landing site locally for OP_Next.p2. }
+      startAddr := sqlite3VdbeCurrentAddr(v);
       if HasInRhsToHoist then
       begin
         sqlite3VdbeAddOp0(v, OP_Noop);
@@ -19236,7 +19246,7 @@ begin
       end;
       pLevel^.op := OP_Next;
       pLevel^.p1 := pLevel^.iTabCur;
-      pLevel^.p2 := pLevel^.addrBody;
+      pLevel^.p2 := startAddr;
       { pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP — stmt-status counter
         bump emitted on every iteration of a no-index scan (wherecode.c:2221
         and 2579 both set this for the table-scan / index-scan tail).
