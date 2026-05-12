@@ -118,6 +118,32 @@ non-zero if any binary fails, so it can be wired into CI directly.
 Failures are deliberately left visible rather than quarantined so they
 cannot be silently ignored.
 
+### Full SQL corpus differential (`TestSQLCorpus`)
+
+The broadest single gate: `bin/TestSQLCorpus` harvests SQL string literals
+embedded in every `Diag*.pas` / `Test*.pas` source file (the existing
+differential probes), then runs each statement through both oracles in
+isolated workdirs and byte-compares stdout, stderr, rc, and the on-disk
+db blob (with documented non-deterministic bytes masked).
+
+```bash
+LD_LIBRARY_PATH=src/ bin/TestSQLCorpus
+```
+
+The summary line reports `scripts run / ok / diverge`.  Any divergence is
+catalogued in `src/tests/DIVERGENCES.md` (per-file rollup + first 16-byte
+window for db-blob mismatches) so each one is bisectable against the C
+oracle — see Phase 9.1 in `tasklist.md` for the workflow.  Supporting
+artefacts:
+
+- `src/tests/corpus/MANIFEST.txt` — tier-1 / tier-2 source-file inventory
+- `src/tests/corpus/MASK.md` — masked db-header byte ranges + C cites
+- `src/tests/SQLLiteralExtractor.pas` — the literal-extraction scanner
+- `src/tests/CorpusOracle.pas` — Pascal-port + libsqlite3 oracle plumbing
+
+The harness exits rc=0 even when divergences exist (catalogue-only by
+design); promotion to a hard CI gate is tracked under `9.1.5`.
+
 ---
 
 ## Quick start examples
