@@ -287,10 +287,18 @@ regressions without human triage.
     short-circuited on `writable_schema=ON` for every CREATE — users could
     fabricate `sqlite_stat1` rows that then collided with the real ANALYZE
     insert path.  Fixed the mask; same patch closes divbug.8.*
-  - [ ] **9.1.divbug.5** db-blob: DiagFeatureProbe ALTER COLUMN arm —
-    on-disk schema bytes diverge after rename.  Likely related to the
-    sqlite3AddColumn drift arms closed in 6.28.4 or a downstream
-    sqlite_schema rewrite in `sqlite3RenameToken*`.
+  - [X] **9.1.divbug.5** db-blob: DiagFeatureProbe ALTER COLUMN arm.
+    *Landed 2026-05-12: confirmed already closed as a side-effect of the
+    `sqlite3WritableSchema` bit-mask fix in 9.1.divbug.4+8
+    (`passqlite3codegen.pas:36421`, bit `0x01` SQLITE_WriteSchema vs the
+    previous `0x20` SQLITE_CacheSpill).  ALTER paths re-enter
+    `sqlite3CheckObjectName` during the sqlite_schema rewrite + OP_ParseSchema
+    reload (build.c:1031..1064), and the broken writable-schema read had been
+    letting the rewrite drift on internal names.  DiagFeatureProbe now reports
+    PASS on all 8 ALTER COLUMN / RENAME / DROP COLUMN probes (rename column,
+    add column, rename column+SELECT, add column+SELECT, rename table+SELECT,
+    rename table+pragma, drop column+pragma, drop column+SELECT).  Corpus
+    2259/2259 OK, 0 divergences; explain parity 1026/1026.*
   - [ ] **9.1.divbug.6** db-blob: DiagDml multi-table writes — diverge
     on multi-statement INSERT/UPDATE/DELETE workloads.
   - [ ] **9.1.divbug.7** db-blob: DiagDropTable — diverge after DROP

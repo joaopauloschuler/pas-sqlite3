@@ -42,3 +42,13 @@ returns `SQLITE_ERROR "object name reserved for internal use"`
 `CREATE TABLE IF NOT EXISTS temp.sqlite_parameters` to match
 `bind_table_init` (shell.c.in:2964).  Final corpus: 2259/2259 OK, 0
 divergences; explain parity 1026/1026; regression 88/88.
+
+Phase 9.1.divbug.5 (2026-05-12) confirmed closed as a side-effect of the
+divbug.4+8 `SQLITE_WriteSchema` bit-mask fix.  DiagFeatureProbe's eight
+ALTER COLUMN / RENAME / DROP COLUMN probes (rename column, add column,
+rename column+SELECT, add column+SELECT, rename table+SELECT, rename
+table+pragma, drop column+pragma, drop column+SELECT) all PASS.  The ALTER
+paths re-enter `sqlite3CheckObjectName` during the sqlite_schema rewrite +
+`OP_ParseSchema` reload (build.c:1031..1064); the broken writable-schema
+read had been letting the rewrite drift on reserved internal names.
+Corpus stays 2259/2259 OK, 0 divergences; explain parity 1026/1026.
