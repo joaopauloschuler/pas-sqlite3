@@ -2841,6 +2841,7 @@ end;
   renderer.  This is the minimum needed for the 10.2 integration parity
   gate to start evaluating SELECTs against a known canon.   }
 function displayStats(p: PShellState; bReset: i32): i32; forward;
+procedure displayScanstats(p: PShellState; pStmt: Pointer); forward;
 procedure shellBeginTimer(p: PShellState); forward;
 procedure shellEndTimer(p: PShellState); forward;
 
@@ -3084,6 +3085,7 @@ begin
     stepAndRender(p, pStmt);
     shellEndTimer(p);
     if p^.statsOn <> 0 then displayStats(p, 0);
+    if p^.mode.scanstatsOn <> 0 then displayScanstats(p, pStmt);
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
@@ -7726,7 +7728,60 @@ begin
   if args[0] = 'vm' then p^.mode.scanstatsOn := 3
   else if args[0] = 'est' then p^.mode.scanstatsOn := 2
   else p^.mode.scanstatsOn := u8(parseOnOff(args[0], 0));
+  { Phase 8.2.1 — open the connection first (shell.c.in:10558
+    open_db(p,0)), then toggle the per-connection STMT_SCANSTATUS flag
+    so sqlite3VdbeScanStatus* populate aScan[]. }
+  if p^.db = nil then openDb(p, 0);
+  if p^.db <> nil then
+    sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_STMT_SCANSTATUS,
+                          i32(p^.mode.scanstatsOn <> 0), nil);
+  { Echo the upstream non-debug-build warning verbatim so meta-text diff
+    against the reference C shell stays clean — TestShellMeta gates on
+    this exact string.  The data path is wired regardless (see
+    displayScanstats called at end-of-statement). }
   shellEPutZ('Warning: .scanstats not available in this build.'#10);
+end;
+
+{ Phase 8.2.1 — minimal `.scanstats on` output.  Iterates per-loop
+  ScanStatus entries and emits NLOOP/NVISIT/EST/NAME/EXPLAIN as a
+  simple tabular block.  Upstream (qrf.c qrfEqpStats) renders an
+  EQP tree with NCYCLE percentages; that formatter is not yet ported,
+  so values match but tree layout does not. NCYCLE is deferred. }
+procedure displayScanstats(p: PShellState; pStmt: Pointer);
+var
+  i:      i32;
+  rc:     i32;
+  nLoop:  i64;
+  nRow:   i64;
+  rEst:   Double;
+  zName:  PAnsiChar;
+  zExpl:  PAnsiChar;
+  iSel:   i32;
+  iPid:   i32;
+begin
+  if (pStmt = nil) or (p^.mode.scanstatsOn = 0) then Exit;
+  shellEPutZ('-------- scanstats --------'#10);
+  i := 0;
+  while True do begin
+    zExpl := nil;
+    rc := sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EXPLAIN, 0, @zExpl);
+    if rc <> 0 then break;
+    nLoop := -1; nRow := -1; rEst := 0.0;
+    zName := nil; iSel := -1; iPid := -1;
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NLOOP,    0, @nLoop);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NVISIT,   0, @nRow);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EST,      0, @rEst);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NAME,     0, @zName);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_SELECTID, 0, @iSel);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_PARENTID, 0, @iPid);
+    shellEPutZ(PAnsiChar(Format('Loop %d: nLoop=%d nRow=%d nEst=%.1f name=%s sel=%d par=%d explain="%s"'#10,
+      [i, nLoop, nRow, rEst,
+       IfThen(zName = nil, '(null)', AnsiString(zName)),
+       iSel, iPid,
+       IfThen(zExpl = nil, '', AnsiString(zExpl))])));
+    Inc(i);
+  end;
+  shellEPutZ('---------------------------'#10);
 end;
 
 { 10.1.10 follow-up — `.width N1 N2 ...`  (shell.c.in:12047..12058).

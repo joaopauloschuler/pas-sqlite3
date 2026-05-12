@@ -17367,9 +17367,32 @@ end;
 
 procedure sqlite3WhereAddScanStatus(v: PVdbe; pSrclist: PSrcList;
   pLvl: PWhereLevel; addrExplain: i32);
+{ Phase 8.2.1 — partial port of wherecode.c:333..374.  Records the
+  scanned table/index name and the planner's row-count estimate
+  (LogEst pLoop->nOut).  pLvl->addrVisit is gated on
+  SQLITE_ENABLE_STMT_SCANSTATUS in C (not present on the pas
+  TWhereLevel); we pass 0 so SCANSTAT_NVISIT reports -1.  The
+  addrLoop wiring (sqlite3VdbeScanStatusRange/Counters) is deferred
+  along with addrVisit. }
+var
+  pLoop:   PWhereLoop;
+  wsFlags: u32;
+  zObj:    PAnsiChar;
+  pItem:   PSrcItem;
 begin
-  { No-op: SQLITE_ENABLE_STMT_SCANSTATUS not defined — matches upstream
-    wherecode.c's #else fallthrough. }
+  if (PTsqlite3(v^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  pLoop := pLvl^.pWLoop;
+  wsFlags := pLoop^.wsFlags;
+  zObj := nil;
+  if ((wsFlags and WHERE_VIRTUALTABLE) = 0)
+     and (pLoop^.u.btree.pIndex <> nil) then
+    zObj := pLoop^.u.btree.pIndex^.zName
+  else begin
+    pItem := SrcListItems(pSrclist);
+    Inc(pItem, pLvl^.iFrom);
+    zObj := pItem^.zName;
+  end;
+  sqlite3VdbeScanStatus(v, addrExplain, 0, 0, pLoop^.nOut, zObj);
 end;
 
 
@@ -18203,6 +18226,7 @@ var
   jRng:        i32;
   iInTabDummy: i32;
   fSingleTabCoroutine: Boolean;
+  addrExplainScan: i32;          { Phase 8.2.1 — scanstatus wiring }
 
   { Phase 6.9-bis 11g.2.f sub-progress 21 — hoist nested helper.
     Walks every base WHERE term whose root is a TK_IN with a literal-list
@@ -18761,11 +18785,15 @@ begin
       end;
       { Phase 6.10 step 7 — emit OP_Explain for this scan, before
         addrBody is captured (mirrors where.c:7464). }
-      sqlite3WhereExplainOneScan(pParse, pTabList, pLevel, wctrlFlags);
+      addrExplainScan := sqlite3WhereExplainOneScan(pParse, pTabList, pLevel, wctrlFlags);
       pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
       notReady := sqlite3WhereCodeOneLoopStart(pParse, v, pWInfo, ii,
                                                pLevel, notReady);
       pWInfo^.iContinue := pLevel^.addrCont;
+      { Phase 8.2.1 — wire per-scan ScanStatus entry (where.c:7470). }
+      if ((pLevel^.pWLoop^.wsFlags and WHERE_MULTI_OR) = 0)
+         and ((wctrlFlags and WHERE_OR_SUBCLAUSE) = 0) then
+        sqlite3WhereAddScanStatus(v, pTabList, pLevel, addrExplainScan);
     end;
 
     pWInfo^.iEndWhere := sqlite3VdbeCurrentAddr(v);
@@ -18933,10 +18961,16 @@ begin
   { Phase 6.10 step 7 — emit OP_Explain for this scan (mirrors
     where.c:7464 sqlite3WhereExplainOneScan call, before pLevel->addrBody
     is captured). }
-  sqlite3WhereExplainOneScan(pParse, pTabList, pLevel, wctrlFlags);
+  addrExplainScan := sqlite3WhereExplainOneScan(pParse, pTabList, pLevel, wctrlFlags);
 
   pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
   pLevel^.addrNxt  := pLevel^.addrBrk;
+
+  { Phase 8.2.1 — wire per-scan ScanStatus entry for the rowid-EQ /
+    whereShortCut alternate path (where.c:7470 — same gate). }
+  if ((pLoop^.wsFlags and WHERE_MULTI_OR) = 0)
+     and ((wctrlFlags and WHERE_OR_SUBCLAUSE) = 0) then
+    sqlite3WhereAddScanStatus(v, pTabList, pLevel, addrExplainScan);
 
   if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
   begin

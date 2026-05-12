@@ -842,6 +842,12 @@ type
     p2:      i32;     { second operand (often jump destination) }
     p3:      i32;     { third operand }
     p4:      Tp4union;{ fourth operand }
+    { Phase 8.2.1 — sqlite3_stmt_scanstatus() per-op execution counter.
+      Mirrors u64 nExec in vdbe.h struct VdbeOp (gated on
+      SQLITE_ENABLE_STMT_SCANSTATUS in C; unconditional here so
+      .scanstats works without a rebuild flag). nCycle is deferred
+      (requires hwtime sampling around dispatch). }
+    nExec:   u64;     { times this opcode has been executed }
   end;
 
   { -----------------------------------------------------------------------
@@ -1151,6 +1157,11 @@ type
     expmask:         u32;            { binding changes that invalidate VM }
     pProgram:        PSubProgram;    { all sub-programs used by this VM }
     pAuxData:        PAuxData;       { linked list of auxdata allocations }
+    { Phase 8.2.1 — sqlite3_stmt_scanstatus() data.  Mirrors C
+      vdbeInt.h:526..527 gated on SQLITE_ENABLE_STMT_SCANSTATUS;
+      unconditional here so .scanstats works without a rebuild flag. }
+    nScan:           i32;            { entries in aScan[] }
+    aScan:           PScanStatus;    { per-loop scan definitions }
   end;
 
   { -----------------------------------------------------------------------
@@ -1313,8 +1324,8 @@ function  sqlite3VdbeAddOpList(p: PVdbe; nOp: i32; aOp: PVdbeOpList;
                                iLineno: i32): PVdbeOp;
 procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
                                 nEst: LogEst; zName: PAnsiChar);
-procedure sqlite3VdbeScanStatusRange(p: PVdbe; iScan, addrA, addrB: i32);
-procedure sqlite3VdbeScanStatusCounters(p: PVdbe; iScan, iScan2: i32; iLip: i32);
+procedure sqlite3VdbeScanStatusRange(p: PVdbe; addrExplain, addrStart, addrEnd: i32);
+procedure sqlite3VdbeScanStatusCounters(p: PVdbe; addrExplain, addrLoop, addrVisit: i32);
 procedure sqlite3VdbeChangeOpcode(p: PVdbe; addr: i32; iNewOpcode: u8);
 procedure sqlite3VdbeChangeP1(p: PVdbe; addr, val: i32);
 procedure sqlite3VdbeChangeP2(p: PVdbe; addr, val: i32);
@@ -2294,6 +2305,7 @@ begin
   pOp^.p3      := p3;
   pOp^.p4.p   := nil;
   pOp^.p4type := P4_NOTUSED;
+  pOp^.nExec  := 0;        { Phase 8.2.1 — scanstatus counter }
   Result := i;
 end;
 
@@ -2316,6 +2328,7 @@ begin
   pOp^.p3      := p3;
   pOp^.p4.i   := p4;
   pOp^.p4type := P4_INT32;
+  pOp^.nExec  := 0;        { Phase 8.2.1 — scanstatus counter }
   Result := i;
 end;
 
@@ -2720,6 +2733,7 @@ begin
     pOut^.p4type  := P4_NOTUSED;
     pOut^.p4.p   := nil;
     pOut^.p5      := 0;
+    pOut^.nExec   := 0;        { Phase 8.2.1 — scanstatus counter }
     Inc(pOut);
     Inc(pSrc);
   end;
@@ -2728,21 +2742,78 @@ begin
 end;
 
 { --- Scan status --- }
-{ All three scan-status entry points (vdbeaux.c:1190, :1222, :1254) are
-  gated by SQLITE_ENABLE_STMT_SCANSTATUS (off in default upstream build);
-  the no-op bodies match default-build behaviour exactly. }
+{ Phase 8.2.1 — sqlite3VdbeScanStatus*.  Ports vdbeaux.c:1186..1274.
+  In C these are gated by SQLITE_ENABLE_STMT_SCANSTATUS; this port
+  enables the data path unconditionally so `.scanstats` works without
+  a rebuild flag (callers in codegen.pas always emit the calls).
+  The IS_STMT_SCANSTATUS(db) gate is still honoured so a connection
+  that has not enabled SQLITE_DBCONFIG_STMT_SCANSTATUS pays no cost. }
 
 procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
                                 nEst: LogEst; zName: PAnsiChar);
+var
+  nByte:  i64;
+  aNew:   PScanStatus;
+  pSc:    PScanStatus;
 begin
+  if (PTsqlite3(p^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  nByte := (i64(1) + i64(p^.nScan)) * i64(SizeOf(TScanStatus));
+  aNew := PScanStatus(sqlite3DbRealloc(p^.db, p^.aScan, u64(nByte)));
+  if aNew <> nil then begin
+    pSc := @aNew[p^.nScan];
+    Inc(p^.nScan);
+    FillChar(pSc^, SizeOf(TScanStatus), 0);
+    pSc^.addrExplain := addrExplain;
+    pSc^.addrLoop    := addrLoop;
+    pSc^.addrVisit   := addrVisit;
+    pSc^.nEst        := nEst;
+    pSc^.zName       := sqlite3DbStrDup(p^.db, zName);
+    p^.aScan := aNew;
+  end;
 end;
 
-procedure sqlite3VdbeScanStatusRange(p: PVdbe; iScan, addrA, addrB: i32);
+procedure sqlite3VdbeScanStatusRange(p: PVdbe; addrExplain, addrStart, addrEnd: i32);
+var
+  pSc: PScanStatus;
+  ii:  i32;
 begin
+  if (PTsqlite3(p^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  pSc := nil;
+  for ii := p^.nScan - 1 downto 0 do begin
+    pSc := @p^.aScan[ii];
+    if pSc^.addrExplain = addrExplain then break;
+    pSc := nil;
+  end;
+  if pSc <> nil then begin
+    if addrEnd < 0 then addrEnd := sqlite3VdbeCurrentAddr(p) - 1;
+    ii := 0;
+    while ii < Length(pSc^.aAddrRange) do begin
+      if pSc^.aAddrRange[ii] = 0 then begin
+        pSc^.aAddrRange[ii]     := addrStart;
+        pSc^.aAddrRange[ii + 1] := addrEnd;
+        break;
+      end;
+      Inc(ii, 2);
+    end;
+  end;
 end;
 
-procedure sqlite3VdbeScanStatusCounters(p: PVdbe; iScan, iScan2: i32; iLip: i32);
+procedure sqlite3VdbeScanStatusCounters(p: PVdbe; addrExplain, addrLoop, addrVisit: i32);
+var
+  pSc: PScanStatus;
+  ii:  i32;
 begin
+  if (PTsqlite3(p^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  pSc := nil;
+  for ii := p^.nScan - 1 downto 0 do begin
+    pSc := @p^.aScan[ii];
+    if pSc^.addrExplain = addrExplain then break;
+    pSc := nil;
+  end;
+  if pSc <> nil then begin
+    if addrLoop  > 0 then pSc^.addrLoop  := addrLoop;
+    if addrVisit > 0 then pSc^.addrVisit := addrVisit;
+  end;
 end;
 
 { --- P4 management --- }
@@ -4781,6 +4852,15 @@ begin
   sqlite3DbFree(db, p^.zErrMsg);
   sqlite3DbFree(db, p^.zSql);
   sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);
+  { Phase 8.2.1 — free scanstatus aScan[] array and its duped zName strings
+    (vdbeaux.c:3765..3771). }
+  if p^.aScan <> nil then begin
+    for i := 0 to p^.nScan - 1 do
+      sqlite3DbFree(db, p^.aScan[i].zName);
+    sqlite3DbFree(db, p^.aScan);
+    p^.aScan := nil;
+    p^.nScan := 0;
+  end;
 end;
 
 procedure sqlite3VdbeDelete(p: PVdbe);
@@ -7531,6 +7611,11 @@ begin
   { ── Main interpreter loop ── }
   repeat
     Inc(nVmStep);
+
+    { Phase 8.2.1 — bump per-op execution counter for
+      sqlite3_stmt_scanstatus() (vdbe.c:940 `pOp->nExec++`).  nCycle
+      hwtime sampling is deferred. }
+    Inc(pOp^.nExec);
 
     { Phase 7.4c — opcode-trace capture (mirrors C sqlite3VdbePrintOp call
       gated by db->flags & SQLITE_VdbeTrace at vdbe.c:954). }

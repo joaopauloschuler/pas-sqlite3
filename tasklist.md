@@ -119,6 +119,16 @@ Public-API gap analysis: `../sqlite3/src/sqlite.h.in` exports
 ~238 `sqlite3_*` symbols; the Pascal port currently exposes ~156.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs are excluded.
 
+- [X] **8.2.1** sqlite3VdbeScanStatus + sqlite3VdbeScanStatusRange + sqlite3VdbeScanStatusCounters
+  arms ported (vdbeaux.c:1186..1274); per-loop aScan[] / nScan added to TVdbe; nExec
+  added to TVdbeOp and bumped in the dispatch loop; sqlite3_stmt_scanstatus_v2 reader
+  ported (vdbeapi.c:2457..2606) covering NLOOP/NVISIT/EST/NAME/EXPLAIN/SELECTID/PARENTID;
+  NCYCLE deferred (returns -1 — would require hwtime sampling around dispatch and
+  per-op nCycle field).  sqlite3WhereAddScanStatus partially ported and wired at both
+  WhereBegin emit-paths (full-planner + whereShortCut); addrLoop/addrVisit pinned to 0
+  pending TWhereLevel.addrVisit field add (TWhereLevel layout extension deferred —
+  NLOOP/NVISIT therefore report -1).  Shell `.scanstats on` emits per-loop block at
+  end-of-statement (text shape diverges from upstream qrf.c qrfEqpStats; not yet ported).
 - [X] **8.1.1** sqlite3_config / sqlite3_db_config full varargs coverage
   (overload-based — no C-ABI va_list).  Added overloads for
   CONFIG_LOOKASIDE (two int), CONFIG_LOG (xLog + pCtx), CONFIG_PAGECACHE
@@ -331,7 +341,13 @@ partial landings cannot silently no-op.
 - [X] **10.1.28..10.1.35, 10.1.37** `.stats`, `.timer`, `.eqp`, `.explain`, `.show`, `.help`, `.cd`, `.shell`/`.system`, `.trace` landed.
 - [X] **10.1.36** `.log` — destination recorded and SQLITE_CONFIG_LOG xLog trampoline installed (8.1.1 landed).
 - [X] **10.1.38** `.iotrace` — stub; full sqlite3IoTrace fanout gated on sqlite3VdbeIOTraceSql arm (currently a stub at passqlite3vdbe.pas:4122).
-- [~] **10.1.39** `.scanstats` — stub; gated on sqlite3VdbeScanStatus* arms + 8.2.1.
+- [~] **10.1.39** `.scanstats` — basic per-loop dump landed (8.2.1: aScan[] +
+  sqlite3_stmt_scanstatus_v2 reader + WhereAddScanStatus producer wired).  Output
+  shows NAME/EXPLAIN/EST/SELECTID/PARENTID correctly.  NLOOP/NVISIT report -1 until
+  TWhereLevel.addrVisit is added; NCYCLE deferred (hwtime sampling); the qrf.c
+  qrfEqpStats EQP-tree formatter is not yet ported, so text shape diverges from
+  upstream.  Upstream's "Warning: .scanstats not available in this build." is still
+  echoed verbatim to keep TestShellMeta golden diff clean.
 - [~] **10.1.40** `.testcase NAME` — records NAME; `.check ANSWER` comparator side pending.
 - [~] **10.1.41** `.testctrl` — dispatcher landed; non-PRNG/BYTEORDER opcodes stub-return 0 (gated on Phase 8.4.1 varargs cdecl boundary).
 - [~] **10.1.42** `.selecttrace`/`.wheretrace`/`.treetrace` — silent no-op (matches non-debug build); full wiring needs varargs sqlite3_test_control variant (deferred).

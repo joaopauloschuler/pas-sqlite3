@@ -263,6 +263,7 @@ const
   SQLITE_TrustedSchema  = u64($00000080);
   SQLITE_NullCallback   = u64($00000100);
   SQLITE_IgnoreChecks   = u64($00000200);
+  SQLITE_StmtScanStatus = u64($00000400);  { Enable stmt_scanstatus() counters }
   SQLITE_ReverseOrder   = u64($00001000);
   SQLITE_RecTriggers    = u64($00002000);
   SQLITE_ForeignKeys    = u64($00004000);

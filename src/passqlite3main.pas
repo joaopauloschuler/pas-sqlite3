@@ -81,6 +81,17 @@ const
   SQLITE_STATE_ERROR  = $D5;  { An SQLITE_MISUSE error occurred }
   SQLITE_STATE_ZOMBIE = $A7;  { Close with last statement close }
 
+  { Phase 8.2.1 — sqlite3_stmt_scanstatus() opcodes (sqlite.h.in:10690..10697) }
+  SQLITE_SCANSTAT_NLOOP    = 0;
+  SQLITE_SCANSTAT_NVISIT   = 1;
+  SQLITE_SCANSTAT_EST      = 2;
+  SQLITE_SCANSTAT_NAME     = 3;
+  SQLITE_SCANSTAT_EXPLAIN  = 4;
+  SQLITE_SCANSTAT_SELECTID = 5;
+  SQLITE_SCANSTAT_PARENTID = 6;
+  SQLITE_SCANSTAT_NCYCLE   = 7;
+  SQLITE_SCANSTAT_COMPLEX  = $0001;
+
 { ----------------------------------------------------------------------
   Phase 8.4 — public sqlite3.h DBCONFIG / CONFIG opcode values.
   ---------------------------------------------------------------------- }
@@ -3768,27 +3779,117 @@ begin
   Result := nil;
 end;
 
-{ vdbeapi.c:2623 — sqlite3_stmt_scanstatus_reset.  Zero the per-op
-  nExec/nCycle counters used by sqlite3_stmt_scanstatus.  Gated on
-  SQLITE_ENABLE_STMT_SCANSTATUS in C; this port does not carry those
-  counters on VdbeOp, so the body is a no-op.  Exposed so dlsym/loadext
-  link order matches the C reference. }
+{ Phase 8.2.1 — sqlite3_stmt_scanstatus_* now reads the per-loop
+  aScan[] data populated by sqlite3VdbeScanStatus* in vdbeaux.c.
+  NLOOP/NVISIT pull nExec from the VDBE op array.  NCYCLE returns
+  -1 (deferred — would require hwtime sampling around dispatch). }
+
+{ vdbeapi.c:2623 — sqlite3_stmt_scanstatus_reset.  Zero per-op
+  nExec counters (and nCycle, deferred — field not yet on TVdbeOp). }
 procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
+var
+  p:  PVdbe;
+  ii: i32;
 begin
+  p := PVdbe(pStmt);
+  if p = nil then Exit;
+  for ii := 0 to p^.nOp - 1 do
+    p^.aOp[ii].nExec := 0;
 end;
 
-{ vdbeapi.c:2457 — sqlite3_stmt_scanstatus_v2.  Gated on
-  SQLITE_ENABLE_STMT_SCANSTATUS in C; this port does not carry the
-  per-loop ScanStatus aScan[] array on Vdbe (Phase 6.8 ScanStatus
-  arms not yet ported), so the symbol is exposed for dlsym/loadext
-  parity and unconditionally returns 1 (no scan-status data
-  available) — matches the C return value when iScan is out of
-  range, which it always is here. }
+{ vdbeapi.c:2457 — sqlite3_stmt_scanstatus_v2. }
 function sqlite3_stmt_scanstatus_v2(pStmt: Pointer; iScan: i32;
                                     iScanStatusOp: i32; flags: i32;
                                     pOut: Pointer): i32; cdecl;
+var
+  p:     PVdbe;
+  aOp:   PVdbeOp;
+  nOp:   i32;
+  pSc:   PScanStatus;
+  idx:   i32;
+  x:     LogEst;
+  rEst:  Double;
 begin
-  Result := 1;
+  p := PVdbe(pStmt);
+  if (p = nil) or (pOut = nil)
+     or (iScanStatusOp < SQLITE_SCANSTAT_NLOOP)
+     or (iScanStatusOp > SQLITE_SCANSTAT_NCYCLE) then begin
+    Result := 1; Exit;
+  end;
+  aOp := p^.aOp;
+  nOp := p^.nOp;
+  if iScan < 0 then begin
+    { Aggregate-NCYCLE path: not supported (nCycle deferred). }
+    Result := 1; Exit;
+  end;
+  pSc := nil;
+  if (flags and SQLITE_SCANSTAT_COMPLEX) <> 0 then begin
+    idx := iScan;
+  end else begin
+    idx := 0;
+    while idx < p^.nScan do begin
+      pSc := @p^.aScan[idx];
+      if pSc^.zName <> nil then begin
+        Dec(iScan);
+        if iScan < 0 then break;
+      end;
+      Inc(idx);
+    end;
+  end;
+  if idx >= p^.nScan then begin Result := 1; Exit; end;
+  pSc := @p^.aScan[idx];
+
+  case iScanStatusOp of
+    SQLITE_SCANSTAT_NLOOP: begin
+      if pSc^.addrLoop > 0 then
+        Pi64(pOut)^ := i64(aOp[pSc^.addrLoop].nExec)
+      else
+        Pi64(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_NVISIT: begin
+      if pSc^.addrVisit > 0 then
+        Pi64(pOut)^ := i64(aOp[pSc^.addrVisit].nExec)
+      else
+        Pi64(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_EST: begin
+      rEst := 1.0;
+      x := pSc^.nEst;
+      while x < 100 do begin
+        x := x + 10;
+        rEst := rEst * 0.5;
+      end;
+      PDouble(pOut)^ := rEst * Double(sqlite3LogEstToInt(x));
+    end;
+    SQLITE_SCANSTAT_NAME: begin
+      PPointer(pOut)^ := Pointer(pSc^.zName);
+    end;
+    SQLITE_SCANSTAT_EXPLAIN: begin
+      if pSc^.addrExplain <> 0 then
+        PPointer(pOut)^ := Pointer(aOp[pSc^.addrExplain].p4.z)
+      else
+        PPointer(pOut)^ := nil;
+    end;
+    SQLITE_SCANSTAT_SELECTID: begin
+      if pSc^.addrExplain <> 0 then
+        Pi32(pOut)^ := aOp[pSc^.addrExplain].p1
+      else
+        Pi32(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_PARENTID: begin
+      if pSc^.addrExplain <> 0 then
+        Pi32(pOut)^ := aOp[pSc^.addrExplain].p2
+      else
+        Pi32(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_NCYCLE: begin
+      { Deferred — nCycle requires hwtime sampling in dispatch loop. }
+      Pi64(pOut)^ := -1;
+    end;
+  else
+    Result := 1; Exit;
+  end;
+  Result := 0;
 end;
 
 { vdbeapi.c:2611 — sqlite3_stmt_scanstatus.  Thin wrapper that calls
