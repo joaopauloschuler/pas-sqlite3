@@ -280,6 +280,7 @@ compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors
 compile_test TestVectorReadOnly
+compile_test TestVectorRoundTrip
 compile_test Benchmark
 
 # ---- Phase 10: passqlite3 CLI tool ----

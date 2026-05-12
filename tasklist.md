@@ -367,11 +367,21 @@ regressions without human triage.
   + MANIFEST `pas-skip` block).  Gate exits rc=0 by skipping; will
   begin gating once bucket-A is fixed under Phase 6/7.*
 
-- [ ] **9.2.3** Round-trip probe.  Open vector, run a fixed mutator
+- [~] **9.2.3** Round-trip probe.  Open vector, run a fixed mutator
   script (`*.mutate.sql`: a handful of INSERT/UPDATE/DELETE inside
   a single txn), close, byte-diff the resulting blob against the C
   oracle's output.  Skip vectors flagged `read-only` in the
-  manifest.
+  manifest.  *Landed `bin/TestVectorRoundTrip` + per-vector
+  `<name>.mutate.sql` (11 mutators; each exercises the feature the
+  vector demonstrates — triggers fire, partial-index toggles,
+  generated-column STORED recompute, etc.).  Re-uses
+  `CorpusOracle.ApplyHeaderMask` for the post-mutator blob diff.
+  All 11 mutators verified to run cleanly under `../sqlite3/sqlite3`
+  before landing the test.  The probe currently skips all 11 via
+  the existing bucket-A `pas-skip` block (see
+  `src/tests/vectors/DIVERGENCES.md`); once bucket A is fixed the
+  same gate begins actually byte-diffing the mutated blobs.  Gate
+  exits rc=0 today by skipping; no new divergence buckets surfaced.*
 
 - [ ] **9.2.4** Schema-change probe.  Subset where ALTER / CREATE
   INDEX / VACUUM is exercised.  Validates Phase 6 OP_ParseSchema +

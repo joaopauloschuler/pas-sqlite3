@@ -10,7 +10,7 @@ and the Phase 9.1.5 / 9.1.6 follow-up tickets) we **do not chase
 divergences inside a 9.2.x ticket**.  Real fixes are picked up under the
 relevant Phase 6 / 7 ticket once the bucket has been triaged.
 
-## Bucket A — read-only open returns SQLITE_READONLY (9.2.2)
+## Bucket A — read-only open returns SQLITE_READONLY (9.2.2 / 9.2.3)
 
 Symptom: opening any committed `.db` vector with
 `sqlite3_open_v2(..., SQLITE_OPEN_READONLY, nil)` and running a plain
@@ -61,5 +61,19 @@ All eleven are tagged `pas-skip` in `MANIFEST.txt` so
 fully wired — once Bucket A is fixed, drop the `pas-skip` tag here and
 in MANIFEST and re-run `bin/TestVectorReadOnly` to gate against the
 full corpus.
+
+### 9.2.3 follow-up note (round-trip mutator probe)
+
+`bin/TestVectorRoundTrip` (Phase 9.2.3) honours the same `pas-skip`
+override block.  Although the round-trip probe opens the seed `.db`
+via `sqlite3_open` (RW path, not the read-only path that bucket-A
+specifically surfaces), the same eleven vectors are gated out at the
+manifest stage so the gate exits rc=0 today.  Once bucket A is fixed
+in Phase 6/7 the `pas-skip` tags can be dropped wholesale and both
+9.2.2 + 9.2.3 will begin actually exercising the full vector set.
+The 9.2.3 gate did not surface any *new* divergence buckets above and
+beyond bucket A — every gated `<name>.mutate.sql` runs cleanly under
+the C oracle (verified out-of-band with `../sqlite3/sqlite3` before
+landing the test), so no further bucket entries are added here.
 
 _End of file._
