@@ -637,9 +637,16 @@ partial landings cannot silently no-op.
         * `  bIn=%d prereqIn=%04llx prereqOut=%04llx` (4531, 0xffffffff)
           on every successful exit.
       All gated by `{$IFDEF SQLITE_DEBUG}`.
-    - [ ] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
-      `wherePathSolver` (mask 0x80): `optimizer search-limit`,
-      per-iteration path costs.
+    - [~] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
+      `wherePathSolver` (mask **0x002 / 0x004**, NOT 0x80 — verified against
+      sqliteInt.h:1181 / where.c:5857 / :5988 / :6032 / :6129).  Landed the
+      two mask-0x002 arms: "---- begin solver" (where.c:5857) and the
+      sort-cost increase line (where.c:5988..5991).  The four mask-0x004
+      candidate prints (Skip / New / Update / `vs`) at where.c:6032..6101
+      and the mask-0x002 "---- after round %d" summary at where.c:6129
+      are deferred behind a `TODO 10.1.42.b.4` marker in
+      passqlite3codegen.pas — they consume `wherePathName(WherePath*,iLoop,
+      WhereLoop*)` which is not yet ported.  Land once wherePathName drops.
     - [ ] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
       in `whereLoopAddOr` (mask 0x400 deeper arms): cost compares,
       pseudo-index selection.

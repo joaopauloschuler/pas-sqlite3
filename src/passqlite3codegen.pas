@@ -16767,6 +16767,15 @@ begin
   pPrs := pWInfo^.pParse;
   nLoop  := i32(pWInfo^.nLevel);
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b.4 — WHERETRACE(0x002) "---- begin solver" (where.c:5857).
+    Mask verified against sqliteInt.h:1181 (0x00000002 = Solver).  Tasklist
+    hint had 0x80; the actual upstream literal at this callsite is 0x002. }
+  if (sqlite3WhereTrace and $002) <> 0 then
+    sqlite3DebugPrintf('---- begin solver.  (nRowEst=%d, nQueryLoop=%d)'#10,
+      [nRowEst, pPrs^.nQueryLoop]);
+  {$ENDIF}
+
   { TUNING: mxChoice based on nLoop. }
   if nLoop <= 1 then mxChoice := 1
   else if nLoop = 2 then mxChoice := 5
@@ -16877,6 +16886,15 @@ begin
                 pWInfo, nRowEst, nOrderBy, isOrdered);
           { TUNING: +3 LogEst encourages ORDER-BY-via-index plans. }
           rCost := i16(sqlite3LogEstAdd(rUnsort, aSortCost[isOrdered]) + 3);
+          {$IFDEF SQLITE_DEBUG}
+          { 10.1.42.b.4 — WHERETRACE(0x002) sort-cost increase
+            (where.c:5988..5991).  Mask 0x002 (Solver) per sqliteInt.h:1181. }
+          if (sqlite3WhereTrace and $002) <> 0 then
+            sqlite3DebugPrintf(
+              '---- sort cost=%-3d (%d/%d) increases cost %3d to %-3d'#10,
+              [aSortCost[isOrdered], (nOrderBy - isOrdered), nOrderBy,
+               rUnsort, rCost]);
+          {$ENDIF}
         end
         else
         begin
@@ -16975,6 +16993,11 @@ begin
       Inc(ii);
       Inc(pFrom);
     end;
+
+    { TODO 10.1.42.b.4: WHERETRACE(0x004) Skip/New/Update/vs candidate prints
+      (where.c:6032..6101) and WHERETRACE(0x002) "---- after round %d" summary
+      (where.c:6129..6157) both depend on wherePathName(), which is not yet
+      ported in passqlite3codegen.pas.  Defer until wherePathName lands. }
 
     { Swap aFrom and aTo for next generation. }
     pSwap := aTo;
