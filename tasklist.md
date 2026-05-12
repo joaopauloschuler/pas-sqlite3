@@ -71,7 +71,14 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.24** Aggregate-with-ORDER-BY codegen.
 - [~] **6.26** Window functions (window.c). DiagWindow: 0 divergences. Reopen if DiagWindow regresses.
 - [X] **6.27** schema-mutation + statistics. Analyze, Vacuum, RunVacuum, FkCheck/FkActions.
-- [~] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap). Inventory landed at `src/tests/STUB_INVENTORY.md` (21 actionable entries: 7 high / 6 med / 8 low). One small high-priority entry ported in this commit (`pas_openDirectory`, os_unix.c:3874..3894 → src/passqlite3os.pas:2331); the remaining 6 high-priority entries (`whereLoopAddVirtual`, `sqlite3OpenTableAndIndices`, `sqlite3NestedParse`, `sqlite3AddColumn` STRICT-arm, `sqlite3LimitWhere` view-rewrite arm, `OP_IntegrityCk`, `getRowTrigger` mask) each cite the open Phase-6/9 bullet they block.
+- [~] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap). Inventory landed at `src/tests/STUB_INVENTORY.md` (21 actionable entries: 7 high / 6 med / 8 low). One small high-priority entry ported in 6.28 commit (`pas_openDirectory`, os_unix.c:3874..3894 → src/passqlite3os.pas:2331). Doable subtasks for the remaining six high-priority stubs (each cites the open Phase-6/9 bullet it blocks; see STUB_INVENTORY.md for full Pascal/C citations):
+  - [ ] **6.28.1** Port `whereLoopAddVirtual` deeper arms — vtab planner is currently truncated; blocks 9.1.5 `pas-strict` tag for any vtab corpus member. C source: `../sqlite3/src/where.c` (grep `whereLoopAddVirtual`).
+  - [ ] **6.28.2** Port `sqlite3OpenTableAndIndices` full body — currently a Phase 6.4 stub; blocks §6.29 follow-on and ALTER-heavy corpora. C source: `../sqlite3/src/insert.c`.
+  - [ ] **6.28.3** Port `sqlite3NestedParse` body — today a no-op stub; once landed, AddColumn / ALTER-via-recreate paths auto-unblock. C source: `../sqlite3/src/build.c`.
+  - [ ] **6.28.4** Complete `sqlite3AddColumn` STRICT-table arm (bug 6.29 trail) — partial port today; STRICT typing rejects unknown affinity. C source: `../sqlite3/src/build.c` (grep `STRICT`).
+  - [ ] **6.28.5** Port `sqlite3LimitWhere` view-rewrite arm — currently bails on views. C source: `../sqlite3/src/delete.c` (grep `sqlite3LimitWhere`).
+  - [ ] **6.28.6** Port `OP_IntegrityCk` body — high priority if 9.2.x reference vectors include a deliberately-corrupt vector. C source: `../sqlite3/src/vdbe.c` (grep `case OP_IntegrityCk`).
+  - [ ] **6.28.7** Wire `getRowTrigger` mask helper — currently returns 0, suppressing trigger-fire dispatch in row-update arms. C source: `../sqlite3/src/trigger.c` (grep `getRowTrigger`).
 
 ### Closed bugs (kept as ticked stubs)
 
@@ -379,7 +386,25 @@ partial landings cannot silently no-op.
     this subtask.
   - [ ] **10.1.39.d** NCYCLE / hwtime sampling — deferred until a real consumer
     appears; gated on `SQLITE_ENABLE_STMT_SCANSTATUS=2` equivalent and TVdbeOp
-    gaining an `nCycle` field.  Not blocking 10.1.39 closure.
+    gaining an `nCycle` field.  Not blocking 10.1.39 closure.  Doable subtasks:
+    - [ ] **10.1.39.d.1** Add `nCycle: u64` field to TVdbeOp; verify all
+      TVdbeOp allocators / FillChar paths zero-init it (cross-check vdbe.c
+      around `pOp->nCycle` references).
+    - [ ] **10.1.39.d.2** Port `sqlite3Hwtime()` from `../sqlite3/src/hwtime.h`
+      (rdtsc on x86_64; PMCCNTR on aarch64 with fallback to monotonic clock).
+      Pascal location: passqlite3os.pas alongside the existing time helpers.
+    - [ ] **10.1.39.d.3** Bracket the dispatch loop in passqlite3vdbe.pas:7618
+      with `t0:=sqlite3Hwtime(); … pOp^.nCycle += sqlite3Hwtime()-t0;` under
+      `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}` (default-off — adds non-zero
+      per-op overhead in non-debug builds otherwise).
+    - [ ] **10.1.39.d.4** Wire SCANSTAT_NCYCLE reader arm in
+      passqlite3main.pas:3860 to sum `aOp[addrLoop..addrLoop+nOp].nCycle`
+      (matches vdbeapi.c:2530 NCYCLE arm).
+  - [ ] **10.1.39.e** Re-enable EXPLAIN text in qrfEqpStats by gating the v2
+    reader's NAME arm on `aOp[addrExplain].p4type=P4_DYNAMIC` and routing
+    through sqlite3VdbeExplainParent.  Current fallback uses `zName`; upstream
+    prefers `aOp[addrExplain].p4.z`.  Removes the zName preference doc'd in
+    10.1.39.c limitation.
 
   Upstream's "Warning: .scanstats not available in this build." is still echoed
   verbatim to keep TestShellMeta golden diff clean while a..c land.
@@ -392,6 +417,20 @@ partial landings cannot silently no-op.
   Deferred: dotCmdError caret-formatted location prefix (richer than our
   "Error: ...\n") — kept out of the byte-diff for the error paths, and
   the "<<ENDMARK" multi-line PATTERN form (needs seekable PFILE input).
+  Doable follow-up subtasks:
+  - [ ] **10.1.40.a** Port `dotCmdError` caret-formatted location prefix
+    from `../sqlite3/src/shell.c.in` (grep `dotCmdError` — emits
+    `Error: near "x": syntax error\n` + caret line under the offending
+    column).  Pascal callsites currently emit `"Error: ...\n"` directly;
+    route them through a new `shellDotError(...)` helper that mirrors
+    the upstream format.  Gate: TestShellMeta error-path arms switch
+    from shape-only to byte-diff.
+  - [ ] **10.1.40.b** `<<ENDMARK` heredoc PATTERN form for `.check` —
+    upstream allows multi-line PATTERN delimited by `<<ENDMARK …
+    ENDMARK`.  Needs a seekable PFILE input replay (currently the
+    line-reader consumes the stream).  Approach: buffer subsequent
+    REPL lines until the marker line, then feed the joined text as
+    PATTERN.  Grep `<<` in shell.c.in for the upstream tokeniser.
 - [X] **10.1.41** `.testctrl` — dispatcher routes through 8.4.1 overloads
   for OPTIMIZATIONS, FK_NO_ACTION, PRNG_SEED, PENDING_BYTE, SORTER_MMAP,
   ASSERT/ALWAYS, LOCALTIME_FAULT, NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS,
@@ -421,6 +460,25 @@ partial landings cannot silently no-op.
     end compound-select, WHERE-clause push-down, all-FROM analysis,
     DISTINCT→GROUP BY, post-aggregate analysis, Finished with AggInfo) —
     full enumeration documented inline at the tail of sqlite3Select.
+    Doable follow-up subtasks (each is a small grep+port batch in
+    `../sqlite3/src/select.c`, all gated by `{$IFDEF SQLITE_DEBUG}`):
+    - [ ] **10.1.42.a.1** multiSelect / compound flattener TREETRACE
+      arms (mask 0x200): `compound-select` begin/peer/end breadcrumbs
+      in `multiSelect`.
+    - [ ] **10.1.42.a.2** Post-flatten / wildcard-expansion TREETRACE
+      (mask 0x4 / 0x100): `after flattening`, `after wildcard expansion`
+      in `sqlite3Select` body.
+    - [ ] **10.1.42.a.3** AggInfo / HAVING→WHERE / count-of-view /
+      EXISTS→JOIN TREETRACE arms (mask 0x40 / 0x400): `AggInfo`
+      adjustments, `HAVING moves to WHERE`, count-of-view rewrite,
+      `EXISTS-to-IN` and `EXISTS-to-JOIN` traces in optimizer arms.
+    - [ ] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
+      TREETRACE arms (mask 0x1000 / 0x8000): `dropping ORDER BY`,
+      `window rewrite`, `DISTINCT->GROUP BY`.
+    - [ ] **10.1.42.a.5** Outer-join simplification + FROM-subquery
+      TREETRACE arms: FULL/LEFT/RIGHT-JOIN simplifies, omit
+      FROM-subquery ORDER BY, WHERE push-down, all-FROM analysis,
+      Finished-with-AggInfo trailing print.
   - [~] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
     wherecode.c → passqlite3codegen.pas.  First batch landed: BEGIN/END
     `addBtreeIdx(%s)` in `whereLoopAddBtreeIndex` (mask 0x800), BEGIN/END
@@ -435,7 +493,27 @@ partial landings cannot silently no-op.
     constraint enumeration, solver/optimizer progress, DISTINCT row-count
     reduction, optimizer-finished marker) — enumerated inline at the
     tail of `whereLoopAddOr`; land in follow-up commits as each pas
-    counterpart is confidently anchored.
+    counterpart is confidently anchored.  Doable follow-up subtasks
+    (each is a small grep+port in `../sqlite3/src/where*.c`, all gated
+    by `{$IFDEF SQLITE_DEBUG}`):
+    - [ ] **10.1.42.b.1** Range-scan cost-estimate WHERETRACE arms in
+      `whereRangeScanEst` / `whereRangeSkipScanEst` (mask 0x10) —
+      STAT4-aware range cost prints.
+    - [ ] **10.1.42.b.2** Subset-cost adjustment WHERETRACE in
+      `whereLoopAddBtree` / `whereLoopInsert` (mask 0x800) — `cost`,
+      `subset cost adjusted`, `… not helpful` decisions.
+    - [ ] **10.1.42.b.3** Virtual-table constraint enumeration WHERETRACE
+      in `whereLoopAddVirtualOne` (mask 0x40): `all-usable` /
+      `disabled` constraint walks.
+    - [ ] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
+      `wherePathSolver` (mask 0x80): `optimizer search-limit`,
+      per-iteration path costs.
+    - [ ] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
+      in `whereLoopAddOr` (mask 0x400 deeper arms): cost compares,
+      pseudo-index selection.
+    - [ ] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
+      trailing WHERETRACE in `sqlite3WhereBegin` epilogue (mask 0x1):
+      `Optimizer Finished` summary line.
   - [X] **10.1.42.c** sqlite3DebugPrintf — ported from printf.c:1514..1532 as
     `procedure sqlite3DebugPrintf(zFormat: PAnsiChar; const args: array of const)`
     in passqlite3printf.pas.  Renders via the existing sqlite3FormatStr core,
