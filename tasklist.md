@@ -932,8 +932,13 @@ partial landings cannot silently no-op.
       0x100 TREETRACE arm landed `{$IFDEF SQLITE_DEBUG}` at the tail of
       havingToWhere (select.c:7045..7050).  Builds clean default +
       SQLITE_DEBUG=1; TestExplainParity 1026/1026, TestSQLCorpus 2259/2259.
-    - [ ] **10.1.42.a.6.2** Port `countOfViewOptimization` (select.c:7199)
-      so the 0x200 TREETRACE arm can land.
+    - [X] **10.1.42.a.6.2** Port `countOfViewOptimization` (select.c:7128..7204)
+      landed at passqlite3codegen.pas:24837 next to havingToWhere; wired at the
+      sqlite3Select main path right after the propagateConstants block (mirrors
+      select.c:7924..7930 "tag-select-0350").  SQLITE_CountOfView = 0x200 constant
+      added.  0x200 TREETRACE "After count-of-view optimization" arm lands at the
+      tail under `{$IFDEF SQLITE_DEBUG}`.  Builds clean default + SQLITE_DEBUG=1;
+      TestExplainParity 1026/1026, TestSQLCorpus rc=0, 92/92 5177/5177.
     - [ ] **10.1.42.a.6.3** Port `optimizeAggregateUseOfIndexedExpr`
       (select.c:6572) so the AggInfo-adjusted-for-indexed-exprs print can land.
     - [ ] **10.1.42.a.6.4** Port `aggregateConvertIndexedExprRefToColumn`

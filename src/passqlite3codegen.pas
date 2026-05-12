@@ -1606,6 +1606,7 @@ const
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
   SQLITE_StarQuery      = u32($20000000);  { Star-query heuristic in computeMxChoice (sqliteInt.h:1931) }
   SQLITE_PropagateConst = u32($00008000);  { Constant propagation optimization (sqliteInt.h:1915) }
+  SQLITE_CountOfView    = u32($00000200);  { count-of-view optimization (sqliteInt.h:1908) }
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
   SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
   SQLITE_Coroutines     = u32($02000000);  { Co-routines for subqueries (sqliteInt.h:1927) }
@@ -24827,6 +24828,93 @@ begin
   {$ENDIF}
 end;
 
+{ countOfViewOptimization — select.c:7128..7204.  When the outer SELECT
+  is `SELECT count(*) FROM (compound-of-UNION-ALL-of-non-aggregate-SELECTs)`
+  rewrite it into a sum of count(*) per compound arm so each arm can use
+  its own count-of-rows shortcut instead of materialising the union view.
+  Returns 1 on transformation, 0 if the shape didn't match.  Faithful 1:1
+  port of the C reference; mask 0x200 TREETRACE arm at the tail. }
+function countOfViewOptimization(pParse: PParse; p: PSelect): i32;
+var
+  pSub:    PSelect;
+  pPriorS: PSelect;
+  pExp:    PExpr;
+  pCnt:    PExpr;
+  pTrm:    PExpr;
+  db:      PTsqlite3;
+  pFrom:   PSrcItem;
+  pSubLoc: PSelect;
+begin
+  Result := 0;
+  if (p^.selFlags and SF_Aggregate) = 0 then Exit;       { aggregate          }
+  if p^.pEList^.nExpr <> 1               then Exit;      { single result col  }
+  if p^.pWhere   <> nil                  then Exit;
+  if p^.pHaving  <> nil                  then Exit;
+  if p^.pGroupBy <> nil                  then Exit;
+  if p^.pOrderBy <> nil                  then Exit;
+  pExp := ExprListItems(p^.pEList)[0].pExpr;
+  if pExp^.op <> TK_AGG_FUNCTION then Exit;              { aggregate          }
+  Assert((pExp^.flags and EP_IntValue) = 0);             { ExprUseUToken      }
+  if sqlite3_stricmp(pExp^.u.zToken, 'count') <> 0 then Exit;  { is count()   }
+  Assert((pExp^.flags and EP_IntValue) = 0);             { ExprUseXList       }
+  if pExp^.x.pList <> nil then Exit;                     { count(*)           }
+  if p^.pSrc^.nSrc <> 1 then Exit;                       { single FROM term   }
+  if ExprHasProperty(pExp, EP_WinFunc) then Exit;        { not window         }
+  pFrom := SrcListItems(p^.pSrc);
+  if (pFrom^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Exit;
+  pSub := pFrom^.u4.pSubq^.pSelect;
+  if pSub^.pPrior = nil then Exit;                       { compound           }
+  if (pSub^.selFlags and SF_CopyCte) <> 0 then Exit;     { not a CTE          }
+  pSubLoc := pSub;
+  repeat
+    if (pSubLoc^.op <> TK_ALL) and (pSubLoc^.pPrior <> nil) then Exit; { UNION ALL }
+    if pSubLoc^.pWhere <> nil then Exit;
+    if pSubLoc^.pLimit <> nil then Exit;
+    if (pSubLoc^.selFlags and (SF_Aggregate or SF_Distinct)) <> 0 then Exit;
+    Assert(pSubLoc^.pHaving = nil);
+    pSubLoc := pSubLoc^.pPrior;
+  until pSubLoc = nil;
+
+  { Shape matches — perform the transformation. }
+  db := pParse^.db;
+  pCnt := pExp;
+  pExp := nil;
+  pSub := sqlite3SubqueryDetach(db, pFrom);
+  sqlite3SrcListDelete(db, p^.pSrc);
+  p^.pSrc := PSrcList(sqlite3DbMallocZero(pParse^.db,
+                       SZ_SRCLIST_HEADER + SZ_SRCLIST_ITEM));
+  while pSub <> nil do
+  begin
+    pPriorS := pSub^.pPrior;
+    pSub^.pPrior := nil;
+    pSub^.pNext  := nil;
+    pSub^.selFlags := pSub^.selFlags or SF_Aggregate;
+    pSub^.selFlags := pSub^.selFlags and (not u32(SF_Compound));
+    pSub^.nSelectRow := 0;
+    sqlite3ParserAddCleanup(pParse, @sqlite3ExprListDeleteGeneric, pSub^.pEList);
+    if pPriorS <> nil then
+      pTrm := sqlite3ExprDup(db, pCnt, 0)
+    else
+      pTrm := pCnt;
+    pSub^.pEList := sqlite3ExprListAppend(pParse, nil, pTrm);
+    pTrm := sqlite3PExpr(pParse, TK_SELECT, nil, nil);
+    sqlite3PExprAddSelect(pParse, pTrm, pSub);
+    if pExp = nil then
+      pExp := pTrm
+    else
+      pExp := sqlite3PExpr(pParse, TK_PLUS, pTrm, pExp);
+    pSub := pPriorS;
+  end;
+  ExprListItems(p^.pEList)[0].pExpr := pExp;
+  p^.selFlags := p^.selFlags and (not u32(SF_Aggregate));
+
+  {$IFDEF SQLITE_DEBUG}
+  if (sqlite3TreeTrace and $200) <> 0 then
+    sqlite3DebugPrintf('After count-of-view optimization:'#10, []);
+  {$ENDIF}
+  Result := 1;
+end;
+
 { assignAggregateRegisters — select.c:6643.  Allocate a contiguous block
   of registers spanning all aCol[] + aFunc[] entries; record the first
   register in pAggInfo^.iFirstReg.  After this call,
@@ -25640,6 +25728,20 @@ begin
         sqlite3DebugPrintf('Constant propagation not helpful'#10, []);
       {$ENDIF}
     end;
+  end;
+
+  { count-of-view optimisation — select.c:7924..7930 (sub-progress 50).
+    Mirror C exactly: gate on SQLITE_QueryFlattener|SQLITE_CountOfView
+    and call countOfViewOptimization which, on success, rewrites
+    SELECT count(*) FROM (UNION-ALL-of-non-aggregate-selects)
+    into a sum-of-counts; refresh the local pTabList. }
+  if OptimizationEnabled(pParse^.db,
+                         SQLITE_QueryFlattener or SQLITE_CountOfView)
+     and (countOfViewOptimization(pParse, p) <> 0) then
+  begin
+    if pParse^.db^.mallocFailed <> 0 then
+      begin Result := SQLITE_NOMEM; Exit; end;
+    pTabList := p^.pSrc;
   end;
 
   { Trivial-gate guards — bail out (same as the prior stub) for any
