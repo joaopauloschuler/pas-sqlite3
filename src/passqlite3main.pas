@@ -3881,7 +3881,16 @@ begin
       PPointer(pOut)^ := Pointer(pSc^.zName);
     end;
     SQLITE_SCANSTAT_EXPLAIN: begin
-      if pSc^.addrExplain <> 0 then
+      { 10.1.39.e — upstream (vdbeapi.c:2546) blindly returns
+        aOp[addrExplain].p4.z; we gate on p4type=P4_DYNAMIC to defend
+        against addrExplain stamps that landed on a non-Explain opcode
+        (the qrf.c:162..454 EQP-tree formatter dereferences the result
+        as a NUL-terminated C string).  sqlite3ExplainBegin/sqlite3VdbeExplain
+        always allocate the EXPLAIN payload via sqlite3VMPrintf and stamp
+        it with P4_DYNAMIC (vdbeaux.c:551), so this gate is transparent
+        for the well-formed case. }
+      if (pSc^.addrExplain <> 0)
+         and (aOp[pSc^.addrExplain].p4type = P4_DYNAMIC) then
         PPointer(pOut)^ := Pointer(aOp[pSc^.addrExplain].p4.z)
       else
         PPointer(pOut)^ := nil;

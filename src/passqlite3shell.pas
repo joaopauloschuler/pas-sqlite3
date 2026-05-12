@@ -8304,10 +8304,13 @@ begin
     zo := nil;
     if sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EXPLAIN, f, @zo) <> 0 then
       break;
-    { 10.1.39.c — see second-pass comment; we use zName, not zo. }
+    { 10.1.39.e — prefer EXPLAIN-string width (now p4type-gated in the
+      v2 reader) and fall back to "SCAN <zName>" width otherwise. }
     zName := nil;
     sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NAME, f, @zName);
-    if (zName <> nil) and (CStrLen(zName) < 1024) then
+    if (zo <> nil) and (CStrLen(zo) < 1024) then
+      n := i32(CStrLen(zo)) + qrfStatsHeight(pStmt, i) * 3
+    else if (zName <> nil) and (CStrLen(zName) < 1024) then
       n := i32(CStrLen(zName)) + 5 { "SCAN " } + qrfStatsHeight(pStmt, i) * 3
     else
       n := qrfStatsHeight(pStmt, i) * 3;
@@ -8336,17 +8339,16 @@ begin
     sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_SELECTID, f, @iId);
     sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NAME,     f, @zName);
 
-    { 10.1.39.c — the SCANSTAT_EXPLAIN path returns
-      aOp[addrExplain].p4.z which is only safe when the addr really
-      points to OP_Explain; we currently don't have a way to verify
-      that without an opcode-type check in the reader.  Until that
-      lands, prefer zName (always sqlite3DbStrDup'd by
-      sqlite3VdbeScanStatus) over the raw EXPLAIN ptr.  Tree shape
-      and counts (NLOOP/NVISIT) are still correct, only the
-      per-loop label trades the EXPLAIN-string for the table/index
-      name. }
+    { 10.1.39.e — SCANSTAT_EXPLAIN now gates on p4type=P4_DYNAMIC
+      (passqlite3main.pas:SQLITE_SCANSTAT_EXPLAIN), so the raw EXPLAIN
+      string is safe to consume here.  Upstream qrf.c:312 prefers the
+      EXPLAIN-string label ("SCAN t1 USING INDEX i1") over the bare
+      table/index name; fall back to "SCAN <zName>" only when the
+      addrExplain stamp is missing or p4type is non-DYNAMIC. }
     zoStr := '';
-    if (zName <> nil) and (CStrLen(zName) > 0) and (CStrLen(zName) < 1024) then
+    if (zo <> nil) and (CStrLen(zo) > 0) and (CStrLen(zo) < 1024) then
+      zoStr := AnsiString(zo)
+    else if (zName <> nil) and (CStrLen(zName) > 0) and (CStrLen(zName) < 1024) then
       zoStr := 'SCAN ' + AnsiString(zName);
 
     if (nLoop >= 0) or (nRow >= 0) then

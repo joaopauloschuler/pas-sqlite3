@@ -400,11 +400,13 @@ partial landings cannot silently no-op.
     - [ ] **10.1.39.d.4** Wire SCANSTAT_NCYCLE reader arm in
       passqlite3main.pas:3860 to sum `aOp[addrLoop..addrLoop+nOp].nCycle`
       (matches vdbeapi.c:2530 NCYCLE arm).
-  - [ ] **10.1.39.e** Re-enable EXPLAIN text in qrfEqpStats by gating the v2
-    reader's NAME arm on `aOp[addrExplain].p4type=P4_DYNAMIC` and routing
-    through sqlite3VdbeExplainParent.  Current fallback uses `zName`; upstream
-    prefers `aOp[addrExplain].p4.z`.  Removes the zName preference doc'd in
-    10.1.39.c limitation.
+  - [X] **10.1.39.e** EXPLAIN text re-enabled: SCANSTAT_EXPLAIN arm in
+    passqlite3main.pas now gates on `aOp[addrExplain].p4type=P4_DYNAMIC`
+    before dereferencing p4.z (sqlite3VdbeExplainParent already wired via
+    8.2.1).  `displayScanstats` in passqlite3shell.pas prefers the raw
+    EXPLAIN string over zName, falling back to "SCAN <zName>" when the
+    addrExplain stamp is absent or non-DYNAMIC.  Removes the zName
+    preference doc'd in 10.1.39.c.
 
   Upstream's "Warning: .scanstats not available in this build." is still echoed
   verbatim to keep TestShellMeta golden diff clean while a..c land.
