@@ -318,11 +318,16 @@ regressions without human triage.
     `bind_table_init` shell.c.in:2964).  Corpus 4 → 0 divergences;
     explain parity 1026/1026; regression 88/88.*
 
-- [ ] **9.1.5** Tag corpus categories by status: `pas-strict`
+- [X] **9.1.5** Tag corpus categories by status: `pas-strict`
   (byte-identical), `pas-soft` (output identical, db differs in
   documented mask), `pas-skip` (gated on an open Phase 6/7/8 bullet —
   must cite the bullet).  Strict tag is the CI gate; soft/skip are
   tracked but non-blocking.
+  *Tags landed in `src/tests/corpus/STATUS.txt` (TAB-delimited path /
+  status / cite / note); `bin/TestSQLCorpus` loads it via
+  `LoadStatusTags` and bumps per-status counters.  Strict gate fires
+  `Halt(1)` if any pas-strict row diverges; current corpus run is 35
+  pas-strict / 0 diverge.*
 
 - [ ] **9.1.6** Coverage check.  Re-run with `--coverage` against the
   port's opcode dispatcher; assert every executed opcode in

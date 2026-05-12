@@ -72,6 +72,12 @@ type
     path:    AnsiString;
     tier:    AnsiString;
     tag:     AnsiString;
+    { 9.1.5 — status tag from corpus/STATUS.txt; one of
+      'pas-strict', 'pas-soft', 'pas-skip'.  Resolved at startup
+      via LoadStatusTags; pas-strict is the CI gate (any divergence
+      fails rc≠0).  pas-soft / pas-skip are reported but pass. }
+    status:  AnsiString;
+    cite:    AnsiString;
   end;
 
 const
@@ -83,6 +89,10 @@ var
   gFilesProcessed, gFilesEmpty: i32;
   gDivergenceLog: TStringList;
   gRepoRoot: AnsiString;
+  { 9.1.5 — strict-tag CI gate counters.  gStrictDiverge is the
+    number of divergences in pas-strict rows; non-zero => rc≠0. }
+  gStrictDiverge, gSoftDiverge, gSkipDiverge: i32;
+  gStrictFiles, gSoftFiles, gSkipFiles: i32;
 
 function ResolveRepoRoot: AnsiString;
 var
@@ -100,9 +110,14 @@ end;
 procedure InitFiles;
   procedure E(i: i32; const p, t, g: AnsiString);
   begin
-    FILES[i].path := p;
-    FILES[i].tier := t;
-    FILES[i].tag  := g;
+    FILES[i].path   := p;
+    FILES[i].tier   := t;
+    FILES[i].tag    := g;
+    { Default status before STATUS.txt is consulted.  Any row not
+      explicitly listed in STATUS.txt is treated as pas-strict so
+      new MANIFEST entries default to the gate (fail-open is unsafe). }
+    FILES[i].status := 'pas-strict';
+    FILES[i].cite   := '-';
   end;
 var i: i32;
 begin
@@ -168,6 +183,68 @@ begin
     WriteLn('FATAL: file-table count mismatch: filled=', i,
             ' decl=', N_FILES);
     Halt(2);
+  end;
+end;
+
+{ ----------------------------------------------------------------------
+  9.1.5 — Status-tag loader.
+
+  Parses src/tests/corpus/STATUS.txt (TAB-delimited, '#' comments
+  ignored) and overlays the resolved status/cite onto the FILES[]
+  table.  Any MANIFEST row missing from STATUS.txt is left at its
+  InitFiles default (pas-strict) — failing the gate is the
+  conservative posture for an unclassified row.
+  ---------------------------------------------------------------------- }
+
+procedure LoadStatusTags(const path: AnsiString);
+var
+  sl: TStringList;
+  i, j, k, n: i32;
+  line, p, st, ct: AnsiString;
+  parts: array[0..3] of AnsiString;
+  np: i32;
+begin
+  if not FileExists(path) then begin
+    WriteLn('WARN: STATUS.txt not found at ', path,
+            ' — every row defaults to pas-strict (CI gate).');
+    Exit;
+  end;
+  sl := TStringList.Create;
+  try
+    sl.LoadFromFile(path);
+    for i := 0 to sl.Count - 1 do begin
+      line := sl[i];
+      { Trim leading whitespace }
+      while (Length(line) > 0) and ((line[1] = ' ') or (line[1] = #9)) do
+        Delete(line, 1, 1);
+      if Length(line) = 0 then continue;
+      if line[1] = '#' then continue;
+      { Split on TAB into up to 4 fields. }
+      np := 0;
+      for k := 0 to 3 do parts[k] := '';
+      j := 1;
+      while (j <= Length(line)) and (np < 4) do begin
+        n := j;
+        while (n <= Length(line)) and (line[n] <> #9) do Inc(n);
+        parts[np] := Copy(line, j, n - j);
+        Inc(np);
+        j := n + 1;
+      end;
+      if np < 2 then continue;
+      p  := parts[0];
+      st := parts[1];
+      if np >= 3 then ct := parts[2] else ct := '-';
+      { Match against FILES[]. }
+      for k := 0 to N_FILES - 1 do begin
+        if FILES[k].path = p then begin
+          FILES[k].status := st;
+          FILES[k].cite   := ct;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    sl.Free;
   end;
 end;
 
@@ -324,11 +401,40 @@ begin
     end;
 
     WriteLn('[', fe.tier, '] ', fe.path,
+            ' [', fe.status, ']',
             ' — scripts=', n,
             ' ok=', fileOK,
             ' diverge=', fileDiverge);
+
+    { 9.1.5 — bucket per-file divergence by status tag. }
+    if fe.status = 'pas-strict' then begin
+      Inc(gStrictFiles);
+      Inc(gStrictDiverge, fileDiverge);
+      if fileDiverge > 0 then
+        WriteLn('  STRICT-GATE FAIL: pas-strict row diverged ',
+                fileDiverge, ' time(s) — gate will fail.');
+    end else if fe.status = 'pas-soft' then begin
+      Inc(gSoftFiles);
+      Inc(gSoftDiverge, fileDiverge);
+      if fileDiverge > 0 then
+        WriteLn('  pas-soft (cite=', fe.cite,
+                '): ', fileDiverge, ' divergence(s) tracked, non-blocking.');
+    end else if fe.status = 'pas-skip' then begin
+      Inc(gSkipFiles);
+      Inc(gSkipDiverge, fileDiverge);
+      if fileDiverge > 0 then
+        WriteLn('  pas-skip (cite=', fe.cite,
+                '): ', fileDiverge, ' divergence(s) tracked, gated on cited bullet.');
+    end else begin
+      WriteLn('  WARN: unknown status="', fe.status,
+              '" treated as pas-strict (gate failure on diverge).');
+      Inc(gStrictFiles);
+      Inc(gStrictDiverge, fileDiverge);
+    end;
+
     if fileDiverge > 0 then begin
       gDivergenceLog.Add('| ' + fe.path + ' | ' + fe.tier + ' | ' + fe.tag +
+                        ' | ' + fe.status + ' | ' + fe.cite +
                         ' | ' + IntToStr(n) + ' | ' + IntToStr(fileDiverge) +
                         ' | ' + firstDivChan + ' | `' +
                         ShortenSQL(firstDivSql, 80) + '` |');
@@ -360,8 +466,8 @@ begin
     md.Add('`src/tests/corpus/MASK.md`); db-blob divergences that');
     md.Add('survive the mask are real port drift.');
     md.Add('');
-    md.Add('| source | tier | tag | scripts | diverge | first channel | first script (truncated) |');
-    md.Add('|--------|------|-----|---------|---------|---------------|--------------------------|');
+    md.Add('| source | tier | tag | status | cite | scripts | diverge | first channel | first script (truncated) |');
+    md.Add('|--------|------|-----|--------|------|---------|---------|---------------|--------------------------|');
     for i := 0 to gDivergenceLog.Count - 1 do
       md.Add(gDivergenceLog[i]);
     md.Add('');
@@ -384,12 +490,19 @@ begin
   gRepoRoot := ResolveRepoRoot;
   WriteLn('Repo root        : ', gRepoRoot);
   InitFiles;
+  LoadStatusTags(gRepoRoot + 'src/tests/corpus/STATUS.txt');
   gTotalScripts   := 0;
   gTotalDiverge   := 0;
   gTotalOK        := 0;
   gTotalErr       := 0;
   gFilesProcessed := 0;
   gFilesEmpty     := 0;
+  gStrictDiverge  := 0;
+  gSoftDiverge    := 0;
+  gSkipDiverge    := 0;
+  gStrictFiles    := 0;
+  gSoftFiles      := 0;
+  gSkipFiles      := 0;
   gDivergenceLog  := TStringList.Create;
 
   try
@@ -403,6 +516,13 @@ begin
     WriteLn('  scripts run     : ', gTotalScripts);
     WriteLn('  scripts ok      : ', gTotalOK);
     WriteLn('  scripts diverge : ', gTotalDiverge);
+    WriteLn('  status breakdown:');
+    WriteLn('    pas-strict files=', gStrictFiles, ' diverge=', gStrictDiverge,
+            ' (CI gate)');
+    WriteLn('    pas-soft   files=', gSoftFiles,   ' diverge=', gSoftDiverge,
+            ' (mask-covered, non-blocking)');
+    WriteLn('    pas-skip   files=', gSkipFiles,   ' diverge=', gSkipDiverge,
+            ' (gated on open Phase-6/7/8 bullet, non-blocking)');
     if SCRIPT_BYTE_HINT >= 0 then ; { silence unused-const warning }
 
     WriteDivergencesMd(gRepoRoot + 'src/tests/DIVERGENCES.md');
@@ -412,7 +532,13 @@ begin
   end;
 
   WriteLn;
-  WriteLn('TestSQLCorpus: OK (rc=0; divergences catalogued, not gated — see');
-  WriteLn('  tasklist 9.1.3.followup + 9.1.4)');
+  if gStrictDiverge > 0 then begin
+    WriteLn('TestSQLCorpus: FAIL (rc=1; ', gStrictDiverge,
+            ' pas-strict divergence(s) — 9.1.5 CI gate.');
+    WriteLn('  pas-soft / pas-skip divergences are tracked but non-blocking;');
+    WriteLn('  see src/tests/corpus/STATUS.txt for the per-row tagging.');
+    Halt(1);
+  end;
+  WriteLn('TestSQLCorpus: OK (rc=0; pas-strict gate clean, soft/skip catalogued).');
   Halt(0);
 end.

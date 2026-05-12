@@ -13,7 +13,7 @@ ticket.  Phase 9.1.4 landed the determinism mask (see
 `src/tests/corpus/MASK.md`); db-blob divergences that
 survive the mask are real port drift.
 
-| source | tier | tag | scripts | diverge | first channel | first script (truncated) |
-|--------|------|-----|---------|---------|---------------|--------------------------|
+| source | tier | tag | status | cite | scripts | diverge | first channel | first script (truncated) |
+|--------|------|-----|--------|------|---------|---------|---------------|--------------------------|
 
 _End of file._
