@@ -61,6 +61,12 @@ FPC porting traps that recur often enough to call out up-front:
 
 ---
 
+## Phase 5 — Deferred carry-overs
+
+- [ ] **5.7.b** `sqlite3VdbeSorter*` PMA disk-spill — STUB_INVENTORY #13 DRIFTED-XL (~2400 lines C, vdbesort.c).  In-memory mergesort is real and 1:1; PMA (Packed Memory Array) on-disk merge for sorts larger than the in-memory buffer is not yet ported.  Symptom when missed: large ORDER BY / GROUP BY / CREATE INDEX over multi-page data will fail or silently degrade once the sort buffer overflows.  Complexity: XL.  Blockers: none (self-contained — driver and PMA writer/reader port without touching the VDBE dispatch).
+
+---
+
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
 > TestExplainParity reports **1026 / 1026 PASS** as of 2026-05-06 (a3).
@@ -78,6 +84,7 @@ FPC porting traps that recur often enough to call out up-front:
   - [X] **6.28.4** Complete `sqlite3AddColumn` drift arms — audit verdict (6.28.8): DRIFTED-S (~25 lines C).  Body at passqlite3codegen.pas:37284 is largely 1:1; missing arms: (a) build.c:1507 `if(!IN_RENAME_OBJECT) sqlite3DequoteToken(&sName)` pre-allocation dequote; (b) build.c:1513..1524 GENERATED-ALWAYS trailing-text strip; (c) build.c:1530 `sqlite3DequoteToken(&sType)` inside standard-typename check.  No STRICT work to do here — STRICT enforcement lives downstream in sqlite3EndTable (original inventory cite to build.c:1862..2026 was wrong).  Complexity: S.  Landed: all three arms ported 1:1 at passqlite3codegen.pas:37400..37445 (pre-alloc dequote of sName, GENERATED ALWAYS trailing-text strip, sType dequote before standard-typename match).  Build 88/88, 5177/5177; TestExplainParity 1026/1026.
   - [X] **6.28.5** Port `sqlite3LimitWhere` view-rewrite arm — audit verdict (6.28.8): stub-was-real.  Body at passqlite3codegen.pas:31123..31217 is a 1:1 port of delete.c:182..277 (rowid arm, single-PK arm, vector-PK arm, isIndexedBy/isCte FROM-dup, TK_IN wrap).  C has NO useTempRow / view-rewrite arm in this helper (original inventory "two unported arms" was wrong).  Pending work is caller-side wiring in sqlite3DeleteFrom (codegen.pas:31338 TODO) and sqlite3Update (codegen.pas:32419 TODO) — annotated as separate Phase-6.x slices, not part of this helper.  Stale "no-op stub" comments scrubbed.  STUB_INVENTORY #5 closed.
   - [X] **6.28.6** Port `OP_IntegrityCk` body — audit verdict (6.28.8): stub-was-real.  OP_IntegrityCk arm at passqlite3vdbe.pas:10715..10748 and sqlite3BtreeIntegrityCheck driver at passqlite3btree.pas:7916..8043 are both real 1:1 ports (freelist + auto-vacuum cross-check + checkTreePage walk + page-coverage map + SQLITE_DYNAMIC error string).  Remaining gap is driver-side: `PRAGMA integrity_check` in codegen.pas:45844 still emits hardcoded "ok" instead of building an OP_IntegrityCk plan — that pragma-wiring slice is **not** "port OP_IntegrityCk" and is filed as a follow-up bullet below.  Stale "OP_IntegrityCk is a stub" comment scrubbed.  STUB_INVENTORY #6 closed.
+  - [ ] **6.28.6.b** Higher-level `PRAGMA integrity_check` walk arms — pragma.c:1792..2194 (~430 lines C): index-row-count cross-check, full row walk, CHECK / STRICT / UNIQUE / FK / vtab.xIntegrity per-table arms.  6.28.6.a wired the b-tree slice; this slot lands the schema-level integrity arms.  Complexity: L.
   - [X] **6.28.6.a** Wire `PRAGMA integrity_check / quick_check` to emit OP_IntegrityCk — landed at codegen.pas:45968 (pragma.c:1695..1820 + endCode at 2195..2217).  Per-attached-db root-page enumeration via tblHash walk, P4_INTARRAY (sqlite3DbMallocZero, owned by VDBE), OP_IntegrityCk emission with banner row + inline integrityCheckResultRow, plus the trailing AddImm/IfNotZero/"ok"/Halt/"corrupt"/Goto endCode block.  Higher-level walk arms (index-row-count cross-check, full row/CHECK/STRICT/UNIQUE/FK/vtab.xIntegrity — pragma.c:1792..2194) filed as 6.28.6.b follow-up.  Smoke: `PRAGMA integrity_check` and `PRAGMA quick_check` both emit "ok" via real OP_IntegrityCk on clean DBs (matches C oracle); DiagPragma integrity_check/quick_check rows green; TestExplainParity 1026/1026.
   - [X] **6.28.7** Wire `getRowTrigger` mask helper — audit verdict: stub-was-real. `trgGetRowTrigger` (passqlite3codegen.pas:30884) + `codeRowTrigger` (:30709) are 1:1 with trigger.c:1347 / 1231; aColmask[0/1] populated from sub-Parse oldmask/newmask; `sqlite3TriggerColmask` picks up real per-column bits for ordinary triggers. Stale "not yet ported" comments scrubbed; STUB_INVENTORY #7 closed.
   - [X] **6.28.9** STUB_INVENTORY medium-priority audit pass — audit verdict: 5 stub-was-real (#8 code_outer_join_constraints/pRJ, #9 sqlite3ExprNNCollSeq, #10 sqlite3DefaultRowEst, #11 codeVectorCompare, #12 sqlite3HasExplicitNulls), 1 DRIFTED-XL (#13 sqlite3VdbeSorter PMA-spill deferred; in-memory path fully ported).  Original inventory cites were wrong on 4 of 6 entries (where.c→wherecode.c, expr.c:174→:321, codegen.pas:23998→:36624, expr.c:3210→:697).  Stale "stub" / "Phase 6.6 stub" / "not yet ported" comments scrubbed at codegen.pas:20975 (pRJ banner), :16424 (NNCollSeq banner), :5517 (codeVectorCompare banner), and vdbe.pas:6232 (sorter banner refreshed to "in-memory real; PMA deferred").  STUB_INVENTORY.md updated per-entry.  Build clean.
@@ -240,6 +247,31 @@ regressions without human triage.
   divergence count 52 → 77; 2182 ok / 2259 scripts) cataloged in
   `DIVERGENCES.md` per skip-and-cite contract.  bin/TestSQLCorpus rc=0;
   88/88 regression binaries pass.*
+
+- Triage of `DIVERGENCES.md` clusters surfaced by 9.1.3.followup + 9.1.4
+  (77 cataloged sites, ~7 distinct root causes — each a Pascal-only bug
+  bisectable against the C oracle, skip-and-cite per the corpus contract):
+  - [ ] **9.1.divbug.1** RELEASE-without-SAVEPOINT errmsg wording (44 sites
+    across TestExplainParity/Bytecode/Parser) — single root cause, single
+    fix.  Likely in `sqlite3Savepoint` / errmsg formatter; cross-check
+    against `../sqlite3/src/vdbe.c` OP_Savepoint OP_REL_S arm.
+  - [ ] **9.1.divbug.2** PRAGMA mmap_size / journal_mode output shape (3
+    sites).  Likely missing newline / wrong column count vs upstream.
+  - [ ] **9.1.divbug.3** DROP INDEX errmsg truncation (1 site) — verify
+    against `sqlite3DropIndex` / `sqlite3ErrorMsg` arms in delete.c.
+  - [ ] **9.1.divbug.4** DiagAnalyze full-script rc divergence (3 sites)
+    — ANALYZE itself runs but exit rc differs.
+  - [ ] **9.1.divbug.5** db-blob: DiagFeatureProbe ALTER COLUMN arm —
+    on-disk schema bytes diverge after rename.  Likely related to the
+    sqlite3AddColumn drift arms closed in 6.28.4 or a downstream
+    sqlite_schema rewrite in `sqlite3RenameToken*`.
+  - [ ] **9.1.divbug.6** db-blob: DiagDml multi-table writes — diverge
+    on multi-statement INSERT/UPDATE/DELETE workloads.
+  - [ ] **9.1.divbug.7** db-blob: DiagDropTable — diverge after DROP
+    TABLE (orphaned pages? freelist linkage? schema cookie?).  Verify
+    against `sqlite3DropTable` + `clearDatabasePage` arms in build.c.
+  - [ ] **9.1.divbug.8** DiagBloom pre-existing sqlite_stat1 (1 site) —
+    Pascal side emits an extra row when stat1 is already populated.
 
 - [ ] **9.1.5** Tag corpus categories by status: `pas-strict`
   (byte-identical), `pas-soft` (output identical, db differs in
@@ -448,6 +480,17 @@ partial landings cannot silently no-op.
       (vdbeapi.c:2485..2495); per-scan arm walks `pSc^.aAddrRange[]` with
       both inclusive-range and negative-start (cursor-id, OPFLG_NCYCLE)
       protocols (vdbeapi.c:2574..2606).
+  - [ ] **10.1.39.d.5** `TestShellMeta .scanstats vm2` byte-diff arm under a
+    `SQLITE_ENABLE_STMT_SCANSTATUS=2` build.  10.1.39.d.1..d.4 wired the
+    full Hwtime → nCycle → SCANSTAT_NCYCLE plumbing but the existing
+    TestShellMeta `.scanstats` arm runs against the default build (where
+    the dispatch bracket compiles out and NCYCLE returns -1).  Add a
+    second arm that (a) rebuilds with `SQLITE_ENABLE_STMT_SCANSTATUS=2`,
+    (b) runs a SELECT, (c) `.scanstats vm2`, (d) byte-diffs the
+    non-cycle columns against upstream sqlite3 (cycles themselves stay
+    out of the diff — wall-clock variance).  Closes the d-chain loop
+    with an end-to-end gate, not just a "compiles clean" check.
+    Complexity: S.
   - [X] **10.1.39.e** EXPLAIN text re-enabled: SCANSTAT_EXPLAIN arm in
     passqlite3main.pas now gates on `aOp[addrExplain].p4type=P4_DYNAMIC`
     before dereferencing p4.z (sqlite3VdbeExplainParent already wired via
