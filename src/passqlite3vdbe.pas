@@ -1444,6 +1444,18 @@ function  sqlite3OpcodeName(n: i32): PAnsiChar;
 var
   gVdbeTraceBuf: AnsiString;
 
+{ Phase 9.1.6 — opcode coverage counters.  When gVdbeOpCoverageEnabled
+  is non-zero the dispatch loop bumps gVdbeOpCoverage[opcode] once per
+  step.  Default-off (zero) so non-coverage builds pay one branch per
+  step.  Consumers (bin/TestSQLCorpus --coverage) flip the flag, run
+  the corpus, then walk the array and assert every opcode reachable
+  from passqlite3codegen is non-zero.  See tasklist 9.1.6. }
+const
+  SQLITE_NUM_OPCODES = 192;  { 0..191 inclusive (vdbe.pas:67). }
+var
+  gVdbeOpCoverage: array[0..SQLITE_NUM_OPCODES - 1] of u64;
+  gVdbeOpCoverageEnabled: i32;
+
 { sqlite3BuiltinFunctions — global table of built-in SQL functions (callback.c).
   Initialized by sqlite3RegisterBuiltinFunctions. }
 var
@@ -7653,6 +7665,15 @@ begin
       sqlite3_stmt_scanstatus() (vdbe.c:940 `pOp->nExec++`).  nCycle
       hwtime sampling is bracketed below under SQLITE_ENABLE_STMT_SCANSTATUS. }
     Inc(pOp^.nExec);
+
+    { Phase 9.1.6 — opcode coverage hook.  Single predictable branch
+      that compiles to a near-zero-cost no-op when the flag is off
+      (default).  Tests that need coverage flip gVdbeOpCoverageEnabled
+      to 1 before driving the workload. }
+    if gVdbeOpCoverageEnabled <> 0 then begin
+      if (pOp^.opcode >= 0) and (pOp^.opcode < SQLITE_NUM_OPCODES) then
+        Inc(gVdbeOpCoverage[pOp^.opcode]);
+    end;
     {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
     { Phase 10.1.39.d.3 — start cycle window.  Mirrors vdbe.c:944..948
       (`pnCycle = &pOp->nCycle; *pnCycle -= sqlite3Hwtime();`).  We stash

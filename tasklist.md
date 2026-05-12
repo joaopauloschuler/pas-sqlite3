@@ -327,12 +327,20 @@ regressions without human triage.
   status / cite / note); `bin/TestSQLCorpus` loads it via
   `LoadStatusTags` and bumps per-status counters.  Strict gate fires
   `Halt(1)` if any pas-strict row diverges; current corpus run is 35
-  pas-strict / 0 diverge.*
+  pas-strict / 0 diverge / 0 cold.*
 
-- [ ] **9.1.6** Coverage check.  Re-run with `--coverage` against the
+- [X] **9.1.6** Coverage check.  Re-run with `--coverage` against the
   port's opcode dispatcher; assert every executed opcode in
   `passqlite3vdbe.pas` is hit at least once.  Any cold opcode means
   the corpus has a gap — add a targeted `.sql`.
+  *Coverage hook lives in `passqlite3vdbe.pas:gVdbeOpCoverage[]` /
+  `gVdbeOpCoverageEnabled` (single predictable branch in the
+  dispatcher, default-off zero cost).  `bin/TestSQLCorpus --coverage`
+  flips the flag, runs the corpus + 14-script coverage-driver inline
+  set, then asserts every cold opcode is allow-listed in
+  `IsCoverageGap`.  Snapshot: 145 hot / 47 catalogued in
+  `src/tests/corpus/COVERAGE_GAPS.md` / 0 real cold.  Allow-list
+  entries each cite the planner shape that gates them.*
 
 ### 9.2 `TestReferenceVectors.pas` — canonical `.db` snapshots
 
