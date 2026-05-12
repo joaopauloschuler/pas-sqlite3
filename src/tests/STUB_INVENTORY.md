@@ -46,15 +46,21 @@ Prio  : high|med|low   (blocks open tasklist bullet?)
   9.1.x corpus row).
 - Size  : ~90 lines C.
 
-### 3. `sqlite3NestedParse` (no-op while a stub today)
-- Pascal: `src/passqlite3codegen.pas:31164`, 37841, 38937.
-- C ref : `build.c:3076`.
-- Note  : Every productive caller (seed CREATE TABLEs after schema
-  publish, sqlite_schema-row UPDATEs) is gated off.  Listed at multiple
-  sites because three independent code-paths note its absence.
-- Prio  : high (the stub is a force-multiplier — once landed, AddColumn
-  / NestedParse / Reindex chains unlock).
-- Size  : ~110 lines C.
+### 3. `sqlite3NestedParse` — CLOSED (task 6.28.3)
+- Pascal: `src/passqlite3codegen.pas:40499` (body), hook at
+  `passqlite3parser.pas:4687`.
+- C ref : `build.c:293..323`.
+- Note  : Fully ported.  Mirrors C control flow byte-for-byte: early-out
+  on nErr/eParseMode, sqlite3VMPrintf format, PARSE_TAIL save/restore via
+  Move/FillChar, DBFLAG_PreferBuiltin toggle, dispatch through
+  gNestedRunParser hook to sqlite3RunParser.  The stale "stub" notes at
+  31164 / 37841 / 38937 are comments inside unrelated helpers (the line
+  numbers shifted as code grew); the actual driver is at 40499 and was
+  already structurally complete since commit c8aaa43.  Task 6.28.3
+  removed the residual `if zFormat = nil then Exit` deviation from C and
+  refreshed the banner to reflect production status.
+- Prio  : —
+- Size  : ~25 lines Pascal mirroring ~30 lines C.
 
 ### 4. `sqlite3AddColumn` (still partial — bug 6.29 trail)
 - Pascal: `src/passqlite3codegen.pas:37846`.

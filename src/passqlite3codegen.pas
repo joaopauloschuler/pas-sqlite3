@@ -40485,17 +40485,14 @@ end;
   destroyRootPage's autovacuum arm) to emit the schema-row UPDATE /
   INSERT / DELETE sub-statements.
 
-  Phase 6.9-bis (step 9) structural port: implements the C control flow
-  byte-for-byte against build.c:293..323 — early-out on nErr / eParseMode,
-  format SQL via sqlite3VMPrintf, save/restore PARSE_TAIL, set
+  Task 6.28.3 full port: implements C control flow byte-for-byte against
+  build.c:293..323 — early-out on nErr / eParseMode, format SQL via
+  sqlite3VMPrintf, save/restore PARSE_TAIL via FillChar, set
   DBFLAG_PreferBuiltin, dispatch to the real sqlite3RunParser via the
   gNestedRunParser hook (registered by passqlite3parser at init).  When
   the hook is nil (codegen-only test programs that don't link the parser
-  unit), the formatted SQL is simply discarded — same observable result
-  as the previous full-stub.  When zFormat is nil, the function returns
-  early without touching the parse state — call sites that haven't been
-  wired with real format strings yet pass nil + [] to keep the call
-  graph correct without producing spurious sub-statements. }
+  unit), the formatted SQL is freed without dispatch — preserves the
+  Move/Restore/Dec(nested) cleanup symmetry. }
 procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar;
   const args: array of const);
 var
@@ -40506,7 +40503,6 @@ var
 begin
   if pParse^.nErr <> 0 then Exit;
   if pParse^.eParseMode <> 0 then Exit;
-  if zFormat = nil then Exit;
 
   db := pParse^.db;
   savedDbFlags := db^.mDbFlags;
