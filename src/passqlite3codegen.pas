@@ -45370,6 +45370,22 @@ var
   pModA:    passqlite3vtab.PVtabModule;
   bShowInternal: i32;
   pPragmaId: PToken;
+  { 6.28.6.a — locals for PRAGMA integrity_check / quick_check.  Match
+    C var names from pragma.c:1696 (i, j, addr, mxErr, x, pTbls, aRoot,
+    cnt, pTab, pIdx, nIdx, isQuick).  Renamed to *Ic suffix where the
+    bare C name collides with another local declared above. }
+  isQuickIc:  i32;
+  mxErrIc:    i32;
+  addrIc:     i32;
+  cntIc:      i32;
+  iDbIc:      i32;
+  nIdxIc:     i32;
+  aRootIc:    PPgno;
+  pTblsIc:    passqlite3util.PHash;
+  xIc:        passqlite3util.PHashElem;
+  pTabIc:     PTable2;
+  pIdxIc:     PIndex2;
+  aOpIc:      PVdbeOp;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
@@ -45955,21 +45971,182 @@ begin
     Exit;
   end;
 
-  { PragTyp_INTEGRITY_CHECK / quick_check (pragma.c:1695).  The full C body
-    walks every btree page and emits an error row per corruption; on a
-    clean database it emits the literal string "ok".  OP_IntegrityCk
-    (vdbe.pas:10708) and sqlite3BtreeIntegrityCheck (btree.pas:7916) are
-    now both real ports, but this pragma driver still emits "ok"
-    directly rather than building the OP_IntegrityCk plan — driver
-    wiring (root-page enumeration, OP_IntegrityCk emission, multi-row
-    error reporting) is the pending slice.  Productive corpora the Pas
-    port produced are clean by construction so "ok" matches the C
-    oracle. }
+  { PragTyp_INTEGRITY_CHECK / quick_check (pragma.c:1695..2220).  Faithful
+    port of the b-tree-integrity slice: per-attached-db root-page
+    enumeration, OP_IntegrityCk emission with banner row on error, plus
+    the trailing endCode block that emits "ok" or "database disk image
+    is malformed" depending on whether the error counter (reg 1) was
+    fully decremented.  Higher-level arms in the C body (index row-count
+    cross-check, full row/CHECK/STRICT/UNIQUE walk, FK and vtab xIntegrity
+    checks — pragma.c:1792..2194) are not yet ported; on clean databases
+    the OP_IntegrityCk pass alone yields the same "ok" the literal stub
+    used to print, but now via the real opcode (so genuine page-level
+    corruption is now surfaced).  Tracked as a follow-up. }
   if SameText(zName, 'integrity_check') or SameText(zName, 'quick_check') then
   begin
-    sqlite3VdbeLoadString(v, 1, 'ok');
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
+    { C: int isQuick = (sqlite3Tolower(zLeft[0])=='q'); }
+    if (Length(zName) > 0) and ((zName[1] = 'q') or (zName[1] = 'Q')) then
+      isQuickIc := 1
+    else
+      isQuickIc := 0;
+    if isQuickIc = 0 then begin end; { silence "unused" — kept for parity }
+
+    { pragma.c:1710..1712 — when no schema qualifier, check all attached
+      databases by passing iDb = -1.  iDb already populated from
+      sqlite3TwoPartName above. }
+    Assert(iDb >= 0);
+    if (pId2 = nil) or (pId2^.n = 0) then iDb := -1;
+
+    { pragma.c:1715 — reserve 6 mems for the per-arm scratch registers
+      (counter, error string, banner reg, index-name reg, plus 2 more for
+      the WITHOUT ROWID key-order check that the higher-level walk would
+      use). }
+    pParse^.nMem := 6;
+
+    { pragma.c:1718..1728 — max error count.  Optional argument may be
+      either an integer (then it's mxErr) or a table name (we skip the
+      table-name branch — tracked as a follow-up).  Default 100 from
+      SQLITE_INTEGRITY_CHECK_ERROR_MAX. }
+    mxErrIc := 100;
+    if (pValue <> nil) and (Length(zRight) > 0) then
+    begin
+      if sqlite3GetInt32(PAnsiChar(zRight), @mxErrIc) <> 0 then
+      begin
+        if mxErrIc <= 0 then mxErrIc := 100;
+      end;
+      { else branch — pObjTab via sqlite3LocateTable — not yet ported.
+        Without a real pObjTab the walk simply covers every table, which
+        is a superset; on clean DBs this still emits "ok". }
+    end;
+
+    { pragma.c:1729 — reg[1] holds errors-left counter (mxErr-1 because
+      each emit checks IfPos which decrements by 1 first). }
+    sqlite3VdbeAddOp2(v, OP_Integer, mxErrIc - 1, 1);
+
+    { pragma.c:1732..1820 — per-attached-database loop: enumerate root
+      pages of every ordinary table and its indices, emit OP_IntegrityCk
+      and the banner / first-error result-row block. }
+    for iDbIc := 0 to db^.nDb - 1 do
+    begin
+      if (iDb >= 0) and (iDbIc <> iDb) then Continue;
+      if db^.aDb[iDbIc].pBt = nil then Continue;
+      if db^.aDb[iDbIc].pSchema = nil then Continue;
+
+      sqlite3CodeVerifySchema(pParse, iDbIc);
+      { tag-20230327-1 — clear okConstFactor for this arm (Pas port
+        stores the flag in parseFlags rather than as a dedicated u8). }
+      pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
+
+      { First pass — count tables (rowid) + indices that will be checked. }
+      pTblsIc := @db^.aDb[iDbIc].pSchema^.tblHash;
+      cntIc := 0;
+      xIc := pTblsIc^.first;
+      while xIc <> nil do
+      begin
+        pTabIc := PTable2(xIc^.data);
+        { tableSkipIntegrityCheck (pragma.c:402): with pObjTab=NULL the
+          only skip predicate is TF_Imposter. }
+        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0) then
+        begin
+          if HasRowid(pTabIc) then Inc(cntIc);
+          pIdxIc := pTabIc^.pIndex;
+          nIdxIc := 0;
+          while pIdxIc <> nil do
+          begin
+            Inc(cntIc);
+            Inc(nIdxIc);
+            pIdxIc := pIdxIc^.pNext;
+          end;
+        end;
+        xIc := xIc^.next;
+      end;
+      if cntIc = 0 then Continue;
+
+      { Allocate the P4_INTARRAY.  Pascal OP_IntegrityCk arm passes the
+        base pointer directly to sqlite3BtreeIntegrityCheck (vdbe.pas:
+        10727), unlike C VDBE which passes &aRoot[1].  So we lay out
+        the array as plain [root0..rootN-1] with no leading count
+        sentinel — btree.pas then sees aRoot[0]=firstRoot (non-zero,
+        bPartial=0) which matches a full check.  Lifetime is owned by
+        the VDBE via P4_INTARRAY. }
+      aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc)));
+      if aRootIc = nil then Break;
+      cntIc := 0;
+      xIc := pTblsIc^.first;
+      while xIc <> nil do
+      begin
+        pTabIc := PTable2(xIc^.data);
+        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0) then
+        begin
+          if HasRowid(pTabIc) then
+          begin
+            aRootIc[cntIc] := Pgno(pTabIc^.tnum);
+            Inc(cntIc);
+          end;
+          pIdxIc := pTabIc^.pIndex;
+          while pIdxIc <> nil do
+          begin
+            aRootIc[cntIc] := Pgno(pIdxIc^.tnum);
+            Inc(cntIc);
+            pIdxIc := pIdxIc^.pNext;
+          end;
+        end;
+        xIc := xIc^.next;
+      end;
+
+      { pragma.c:1777..1779 — make room for per-tree row-count regs
+        starting at reg 8.  Even though our slice does not emit the
+        index-row-count cross-check (pragma.c:1792..1820), OP_IntegrityCk
+        still writes one i64 per root into aMem[p3..p3+nRoot-1], so the
+        registers must exist. }
+      sqlite3TouchRegister(pParse, 8 + cntIc);
+      sqlite3VdbeAddOp3(v, OP_Null, 0, 8, 8 + cntIc);
+      sqlite3ClearTempRegCache(pParse);
+
+      { pragma.c:1782..1790 — emit OP_IntegrityCk; on error (reg 2 not
+        NULL) wrap with banner "*** in database X ***\n" and emit a
+        result row that decrements reg 1. }
+      sqlite3VdbeAddOp4(v, OP_IntegrityCk, 1, cntIc, 8,
+                        PAnsiChar(aRootIc), P4_INTARRAY);
+      sqlite3VdbeChangeP5(v, u16(iDbIc));
+      addrIc := sqlite3VdbeAddOp1(v, OP_IsNull, 2);
+      sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+        sqlite3MPrintf(db, '*** in database %s ***'#10,
+                       [db^.aDb[iDbIc].zDbSName]),
+        P4_DYNAMIC);
+      sqlite3VdbeAddOp3(v, OP_Concat, 2, 3, 3);
+      { integrityCheckResultRow inline (pragma.c:385): emit reg 3, then
+        IfPos reg1, addr+2, 1 (decrement-and-skip-halt); else Halt. }
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+      sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+      sqlite3VdbeAddOp0(v, OP_Halt);
+      sqlite3VdbeJumpHere(v, addrIc);
+
+      { TODO(6.28.6.b) — pragma.c:1792..2194: index-row-count
+        cross-check, full row / CHECK / STRICT / NOT NULL / UNIQUE
+        index / FK / vtab xIntegrity walks.  These emit additional
+        error rows for higher-level corruption that OP_IntegrityCk
+        alone cannot detect.  Until ported, those classes of
+        corruption go unreported. }
+    end;
+
+    { pragma.c:2195..2217 — endCode trailer.  When reg 1 was fully
+      decremented to (1-mxErr) we ran out of error budget: emit
+      "database disk image is malformed" and jump back to ResultRow.
+      Otherwise (reg 1 still >= 1-mxErr+1 i.e. >0 after AddImm 1):
+      emit "ok" via ResultRow then Halt.  C uses sqlite3VdbeAddOpList
+      with the static endCode template and patches p2 of slot 0. }
+    addrIc := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp2(v, OP_AddImm, 1, 0);               { 0: reg1 += 0 — patched below to 1-mxErr }
+    aOpIc := sqlite3VdbeGetOp(v, addrIc);
+    if aOpIc <> nil then aOpIc^.p2 := 1 - mxErrIc;
+    sqlite3VdbeAddOp2(v, OP_IfNotZero, 1, addrIc + 4);   { 1: if reg1<>0 jump to slot 4 (Halt) }
+    sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, 'ok', P4_STATIC); { 2 }
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);            { 3 }
+    sqlite3VdbeAddOp0(v, OP_Halt);                       { 4 }
+    sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+      sqlite3ErrStr(SQLITE_CORRUPT), P4_STATIC);         { 5 }
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addrIc + 3);        { 6: goto ResultRow at slot 3 }
     Exit;
   end;
 end;
