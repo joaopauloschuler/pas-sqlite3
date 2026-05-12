@@ -408,6 +408,59 @@ regressions without human triage.
   equivalence because their on-disk byte layout predates 3.53.x.
   Clean run after 9.2.1: 11 OK + 2 skipped + 0 mismatch, rc=0.
 
+- Triage of `src/tests/vectors/DIVERGENCES.md` clusters surfaced by
+  9.2.2 / 9.2.3 / 9.2.4 (5 buckets, each a Pascal-only port bug
+  bisectable against the C oracle — skip-and-cite per the corpus
+  contract; mirrors the `9.1.divbug.*` pattern):
+  - [ ] **9.2.divbug.A** Read-only open writes the schema cookie /
+    trips `SQLITE_READONLY` on first SELECT (11 sites — every gated
+    vector under `bin/TestVectorReadOnly`).  Likely surface: schema-
+    init / write-cookie path firing under `SQLITE_OPEN_READONLY`.
+    Cross-check against `passqlite3codegen.pas:44225..44232` (existing
+    comment block names a related write-cookie / readonly-schema-init
+    issue) and `../sqlite3/src/main.c sqlite3_open_v2` /
+    `prepare.c sqlite3InitOne`.  Closes both 9.2.2 and 9.2.3 gates
+    when fixed.
+  - [ ] **9.2.divbug.B** Bare `VACUUM;` raises `EAccessViolation` on
+    the Pascal port (1 site: autovacuum vector).  Almost certainly the
+    unported `incrVacuumStep` / `relocatePage` / `modifyPagePointer`
+    arms enumerated in **6.28** (gated on productive ptrmap).  Cross-
+    link: closing 6.28's incremental-vacuum step closes this bucket.
+  - [ ] **9.2.divbug.C** `ALTER TABLE … RENAME COLUMN/TABLE` on tables
+    with a dependent VIEW or CTAS-derived table raises
+    `EAccessViolation` in `renameColumnFunc` → `renameTokenFind` NULL
+    deref (1 site: view-cte vector).  Cross-check against
+    `../sqlite3/src/alter.c renameTokenFind` and the
+    `addcolumn_renametokenmap` memory note.
+  - [ ] **9.2.divbug.D** `CREATE INDEX` on a WITHOUT ROWID table
+    produces byte-different b-tree page payload vs the C oracle (1
+    site: withoutrowid vector).  Cross-check
+    `../sqlite3/src/build.c sqlite3CreateIndex` + `btree.c` cell
+    packing for index-on-WITHOUT-ROWID-with-PK-suffix.
+  - [ ] **9.2.divbug.E** `ALTER TABLE … RENAME COLUMN` on a table
+    referenced by a partial index produces byte-different
+    `sqlite_master` row (1 site: partial-index vector).  Cross-check
+    `../sqlite3/src/alter.c sqlite3AlterRenameColumn` for the partial-
+    index DDL rewrite arm.
+
+- [ ] **9.2.3.followup** `bin/TestVectorRoundTrip` currently inherits
+  the bucket-A `pas-skip` block from MANIFEST and therefore skips all
+  11 vectors — but bucket-A is a *read-only* open bug; round-trip
+  opens RW and could exercise these vectors for real.  Fix the gate
+  to consult only buckets that actually apply to RW round-trip
+  (drop the bucket-A inheritance for this specific binary), re-run,
+  and triage whatever new buckets surface into 9.2.divbug.* slots
+  above.  Without this, 9.2.3 is a silent no-op gate.
+
+- [ ] **9.1.6.followup** Categorize the 47 cold opcodes currently
+  allow-listed in `src/tests/corpus/COVERAGE_GAPS.md` into either
+  (a) gated on an unported feature → cite the Phase 6/7/8 bullet
+  (e.g. FTS5, R-tree, STAT4, PMA disk-spill 5.7.b) and keep
+  allow-listed; or (b) reachable from current `passqlite3codegen.pas`
+  paths → land a targeted `.sql` driver and drop from the allow-list.
+  Goal: shrink the allow-list to (a)-only so it stops being a silent
+  escape hatch for new gaps.
+
 ### 9.3 `TestFuzzDiff.pas` — differential fuzzer
 
 - [ ] **9.3.1** In-process harness.  `TestFuzzDiff.pas` reads a single
