@@ -3151,30 +3151,59 @@ end;
   Honours single- and double-quoted runs (quotes are stripped) so that
   `.separator " "` and `.nullvalue 'null'` parse exactly as upstream's
   `do_meta_command` token loop (shell.c.in:8995..9070). }
+{ Per-line offset capture for shellDotError caret rendering.  We hold a
+  static 0-based offset array sized to the same upper bound as the args[]
+  buffer in doMetaCommand (16 slots); offsets are 1-based into zLine. }
+const
+  SHELL_MAX_DOT_ARGS = 16;
+var
+  gDotOfst: array[0 .. SHELL_MAX_DOT_ARGS - 1] of i32;
+  gDotOrig: AnsiString;  { last zLine fed through splitDotArgs }
+
 procedure splitDotArgs(const zLine: AnsiString; out args: array of AnsiString;
                        out nArg: SizeInt);
-var i, n, k: SizeInt;
+var i, n, k, iStart: SizeInt;
     quote: AnsiChar;
     cur: AnsiString;
+    trimmed: AnsiString;
 begin
   nArg := 0;
-  n := Length(zLine);
+  { Mirror parseDotCmdArgs (shell.c.in:8925..8973): trim trailing whitespace
+    and a single trailing ';' so gDotOrig matches p->dot.zOrig byte-for-byte. }
+  trimmed := zLine;
+  while (Length(trimmed) > 0) and (trimmed[Length(trimmed)] in [' ', #9, #10, #13]) do
+    SetLength(trimmed, Length(trimmed) - 1);
+  if (Length(trimmed) > 0) and (trimmed[Length(trimmed)] = ';') then begin
+    SetLength(trimmed, Length(trimmed) - 1);
+    while (Length(trimmed) > 0) and (trimmed[Length(trimmed)] in [' ', #9, #10, #13]) do
+      SetLength(trimmed, Length(trimmed) - 1);
+  end;
+  gDotOrig := trimmed;
+  FillChar(gDotOfst, SizeOf(gDotOfst), 0);
+  n := Length(trimmed);
   i := 1;
-  { Skip past leading whitespace and the dot-command name. }
-  while (i <= n) and (zLine[i] in [' ', #9]) do Inc(i);
-  if (i <= n) and (zLine[i] = '.') then Inc(i);
-  while (i <= n) and not (zLine[i] in [' ', #9]) do Inc(i);
+  { Upstream parser starts at h=1 (skips the leading '.') and treats the
+    command name as azArg[0]; we expose args[] without the cmd-name slot but
+    record offsets including it — gDotOfst[0]=cmd-name offset, gDotOfst[1+k]
+    =arg k offset, so iArg in shellDotError matches the C semantics. }
+  if (i <= n) and (trimmed[i] = '.') then Inc(i);
+  { Capture the cmd-name offset into gDotOfst[0]. }
+  while (i <= n) and (trimmed[i] in [' ', #9]) do Inc(i);
+  if i <= n then gDotOfst[0] := i32(i);
+  while (i <= n) and not (trimmed[i] in [' ', #9]) do Inc(i);
   while i <= n do begin
-    while (i <= n) and (zLine[i] in [' ', #9]) do Inc(i);
+    while (i <= n) and (trimmed[i] in [' ', #9]) do Inc(i);
     if i > n then Break;
+    iStart := i;
     cur := '';
-    if zLine[i] in ['''', '"'] then begin
-      quote := zLine[i];
+    if trimmed[i] in ['''', '"'] then begin
+      quote := trimmed[i];
       Inc(i);
-      while (i <= n) and (zLine[i] <> quote) do begin
-        if (zLine[i] = '\') and (i < n) then begin
+      iStart := i;  { aiOfst points past opening quote (shell.c.in:8952) }
+      while (i <= n) and (trimmed[i] <> quote) do begin
+        if (trimmed[i] = '\') and (i < n) then begin
           Inc(i);
-          case zLine[i] of
+          case trimmed[i] of
             'n': cur := cur + #10;
             't': cur := cur + #9;
             'r': cur := cur + #13;
@@ -3182,27 +3211,80 @@ begin
             '''': cur := cur + '''';
             '"': cur := cur + '"';
           else
-            cur := cur + zLine[i];
+            cur := cur + trimmed[i];
           end;
           Inc(i);
         end else begin
-          cur := cur + zLine[i];
+          cur := cur + trimmed[i];
           Inc(i);
         end;
       end;
-      if (i <= n) and (zLine[i] = quote) then Inc(i);
+      if (i <= n) and (trimmed[i] = quote) then Inc(i);
     end else begin
-      while (i <= n) and not (zLine[i] in [' ', #9]) do begin
-        cur := cur + zLine[i];
+      while (i <= n) and not (trimmed[i] in [' ', #9]) do begin
+        cur := cur + trimmed[i];
         Inc(i);
       end;
     end;
     k := nArg;
     if k <= High(args) then begin
       args[k] := cur;
+      { gDotOfst[0] holds the cmd-name offset; arg k goes into slot k+1. }
+      if (k + 1) < SHELL_MAX_DOT_ARGS then gDotOfst[k + 1] := i32(iStart);
       Inc(nArg);
     end;
   end;
+end;
+
+{ shellErrorLocation — shell.c.in:1779.  Format the "<file>:<line>:" or
+  "line <n>:" prefix used by failIfSafeMode / dotCmdError.  Returns a
+  newly built AnsiString. }
+function shellErrorLocation(p: PShellState): AnsiString;
+begin
+  if p^.zErrPrefix <> nil then
+    Result := AnsiString(p^.zErrPrefix)
+  else if (p^.zInFile = nil) or (StrPas(p^.zInFile) = '<stdin>') then
+    Result := Format('line %d:', [p^.lineno])
+  else
+    Result := Format('%s:%d:', [StrPas(p^.zInFile), p^.lineno]);
+end;
+
+{ shellDotError — port of dotCmdError (shell.c.in:1815..1844).  Emits
+
+    <loc> <zLine>\n
+    <loc> <spaces>caret-marker <zBrief> ---^\n      (caret right of brief)
+        or
+    <loc> <spaces>^--- <zBrief>\n                   (caret left of brief)
+
+  followed by an optional <loc> <zDetail>\n line.  The caret block is
+  only emitted when zBrief<>'' and we have a valid iArg with a captured
+  source offset; otherwise we fall back to the plain "Error: <zDetail>\n"
+  form used pre-10.1.40.a.  Routes through gDotOrig/gDotOfst populated
+  by splitDotArgs on each dispatch. }
+procedure shellDotError(p: PShellState; iArg: i32;
+                        const zBrief, zDetail: AnsiString);
+var
+  zLoc: AnsiString;
+  iOfst, nPrompt: i32;
+  pad: AnsiString;
+begin
+  zLoc := shellErrorLocation(p);
+  if (zBrief <> '') and (iArg >= 0) and (iArg < SHELL_MAX_DOT_ARGS)
+     and (gDotOrig <> '') and (gDotOfst[iArg] > 0) then
+  begin
+    iOfst := gDotOfst[iArg] - 1;   { 0-based to match C aiOfst[] }
+    nPrompt := i32(Length(zBrief)) + 5;
+    shellEPutZ(zLoc + ' ' + gDotOrig + #10);
+    if iOfst > nPrompt then begin
+      pad := StringOfChar(' ', 1 + iOfst - nPrompt);
+      shellEPutZ(zLoc + ' ' + pad + zBrief + ' ---^'#10);
+    end else begin
+      pad := StringOfChar(' ', iOfst);
+      shellEPutZ(zLoc + ' ' + pad + '^--- ' + zBrief + #10);
+    end;
+  end;
+  if zDetail <> '' then
+    shellEPutZ(zLoc + ' ' + zDetail + #10);
 end;
 
 function parseOnOff(const z: AnsiString; defaultVal: i32): i32;
@@ -7837,8 +7919,8 @@ begin
     Result := 0;
 end;
 
-procedure cmdCheck(p: PShellState; const args: array of AnsiString;
-                   nArg: SizeInt);
+function cmdCheck(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
 { shell.c.in:8737..8855 dotCmdCheck.  Supports: --keep, --show, --glob,
   --notglob, --exact, plus the bare-default comparator.  PATTERN is the
   first non-option positional.  The "<<ENDMARK" multi-line PATTERN form
@@ -7853,9 +7935,12 @@ var
   testcaseName: AnsiString;
   pchLen: SizeInt;
 begin
+  Result := 0;
   iStart := p^.lineno;
   if p^.zTestcase[0] = #0 then begin
-    shellEPutZ('Error: no .testcase is active'#10);
+    { Upstream shell.c.in:8751 — `dotCmdError(p, 0, "no .testcase is active", 0);` }
+    shellDotError(p, 0, 'no .testcase is active', '');
+    Result := 1;
     Exit;
   end;
   bKeep := 0;
@@ -7882,24 +7967,24 @@ begin
     end else if z = '-glob' then begin
       if (eCheck <> 0) and (eCheck <> 1) then begin
         shellEPutZ('Error: incompatible with prior options'#10);
-        Exit;
+        Result := 1; Exit;
       end;
       eCheck := 1;
     end else if z = '-notglob' then begin
       if (eCheck <> 0) and (eCheck <> 2) then begin
         shellEPutZ('Error: incompatible with prior options'#10);
-        Exit;
+        Result := 1; Exit;
       end;
       eCheck := 2;
     end else if z = '-exact' then begin
       if (eCheck <> 0) and (eCheck <> 3) then begin
         shellEPutZ('Error: incompatible with prior options'#10);
-        Exit;
+        Result := 1; Exit;
       end;
       eCheck := 3;
     end else if sawZCheck <> 0 then begin
       shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
-      Exit;
+      Result := 1; Exit;
     end else begin
       zCheck := args[i];
       sawZCheck := 1;
@@ -7907,8 +7992,10 @@ begin
     Inc(i);
   end;
   if sawZCheck = 0 then begin
-    shellEPutZ('Error: no PATTERN specified'#10);
-    Exit;
+    { Upstream `dotCmdError(p, 0, "no PATTERN specified", 0);` (shell.c.in
+      :8775 equivalent).  iArg=0 caret block fires only when nArg>0. }
+    shellDotError(p, 0, 'no PATTERN specified', '');
+    Result := 1; Exit;
   end;
 
   { Flush captured output before reading the file back. }
@@ -10277,7 +10364,7 @@ begin
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd, args, nArg); Exit; end;
   if zCmd = 'testcase'  then begin cmdTestcase(p, args, nArg); Exit; end;
-  if zCmd = 'check'     then begin cmdCheck(p, args, nArg); Exit; end;
+  if zCmd = 'check'     then begin Result := cmdCheck(p, args, nArg); Exit; end;
   if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
   if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
     Result := cmdScanstats(p, args, nArg); Exit;

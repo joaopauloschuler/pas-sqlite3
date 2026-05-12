@@ -458,13 +458,13 @@ begin
     '.check --exact '''''#10;
   DiffMeta('check-exact-empty', ':memory:', script);
 
-  { No-testcase-active: the C code routes through dotCmdError which
-    formats "<file> <line>" location plus a caret line — those bytes
-    depend on the C tokenizer's character-offset accounting which we
-    do not replicate exactly.  We emit a simplified
-    "Error: no .testcase is active\n" on stderr; the upstream variant
-    has a different (richer) prefix, so this arm is excluded from the
-    byte-diff and tested at the smoke level by Bash above. }
+  { 10.1.40.a — No-testcase-active routes through shellDotError
+    (passqlite3shell.pas) which mirrors dotCmdError (shell.c.in:1815..1844)
+    byte-for-byte: emits `<loc> <zOrig>\n<loc> <spaces>^--- <brief>\n`
+    with `<loc>` from shellErrorLocation (`line N:` for stdin).  Verified
+    against upstream `sqlite3 :memory:`: identical output. }
+  script := '.check 7'#10;
+  DiffMeta('dotcmd-error-caret', ':memory:', script);
 
   { Multiple checks with --keep: a single .testcase armed; first .check
     --keep passes, second .check (no --keep) consumes the capture. }

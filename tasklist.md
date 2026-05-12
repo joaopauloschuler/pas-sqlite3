@@ -420,13 +420,21 @@ partial landings cannot silently no-op.
   "Error: ...\n") — kept out of the byte-diff for the error paths, and
   the "<<ENDMARK" multi-line PATTERN form (needs seekable PFILE input).
   Doable follow-up subtasks:
-  - [ ] **10.1.40.a** Port `dotCmdError` caret-formatted location prefix
-    from `../sqlite3/src/shell.c.in` (grep `dotCmdError` — emits
-    `Error: near "x": syntax error\n` + caret line under the offending
-    column).  Pascal callsites currently emit `"Error: ...\n"` directly;
-    route them through a new `shellDotError(...)` helper that mirrors
-    the upstream format.  Gate: TestShellMeta error-path arms switch
-    from shape-only to byte-diff.
+  - [X] **10.1.40.a** `shellDotError` helper landed (passqlite3shell.pas)
+    mirroring dotCmdError (shell.c.in:1815..1844): emits
+    `<loc> <zOrig>\n<loc> <spaces>^--- <brief>\n` with the location prefix
+    from a new `shellErrorLocation` port (shell.c.in:1779).  splitDotArgs
+    now captures per-arg offsets into gDotOfst[] (slot 0 = cmd-name) plus
+    the trimmed zOrig into gDotOrig, matching parseDotCmdArgs (shell.c.in
+    :8925..8973).  Two `.check` error sites (no-testcase-active, no-
+    PATTERN-specified) routed through the helper; cmdCheck now returns
+    rc so option-malformed paths bump the dispatcher errCnt.
+    TestShellMeta `dotcmd-error-caret` arm flipped from shape-only to
+    byte-diff against upstream sqlite3 :memory: (passes byte-for-byte).
+    Remaining `.check`/`.testcase` cluster sites (incompatible-options,
+    unknown-option, missing-argument) still emit the legacy "Error: ...\n"
+    form — promoting them is mechanical follow-up; not blocking 10.1.40
+    closure.
   - [ ] **10.1.40.b** `<<ENDMARK` heredoc PATTERN form for `.check` —
     upstream allows multi-line PATTERN delimited by `<<ENDMARK …
     ENDMARK`.  Needs a seekable PFILE input replay (currently the
