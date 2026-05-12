@@ -167,7 +167,7 @@ regressions without human triage.
 
 ### 9.1 `TestSQLCorpus.pas` — full SQL corpus differential
 
-- [ ] **9.1.1** Corpus inventory.  Enumerate every `.sql` referenced by
+- [X] **9.1.1** Corpus inventory.  Enumerate every `.sql` referenced by
   existing Diag*/Test* gates (TestSQLCorpus shares the source files —
   do not copy).  Land `src/tests/corpus/MANIFEST.txt` listing each
   file with a one-line tag (`ddl`, `dml`, `dql`, `pragma`, `txn`,

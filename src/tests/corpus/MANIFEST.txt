@@ -1,0 +1,169 @@
+# corpus/MANIFEST.txt — task 9.1.1 (Phase 9 corpus inventory)
+#
+# This MANIFEST enumerates every source-of-truth file that contributes SQL
+# statements to the existing Diag*/Test* differential gates.  In this port
+# the corpus is carried as *embedded SQL string literals inside .pas files*
+# rather than free-standing .sql files on disk — `find src/tests -name
+# '*.sql'` returns zero hits, and shell-driven harnesses (TestShell*) write
+# their .sql scratch files into the workdir at runtime via SysUtils.GetTempDir
+# (those scratch files are not source corpus and are excluded).
+#
+# TestSQLCorpus.pas (Phase 9.1.3) will share these same source files — it
+# must NOT copy them.  For each entry we record:
+#
+#   path<TAB>tag<TAB>note
+#
+# `path` is relative to repo root.
+# `tag` is one of:
+#   ddl       CREATE/DROP TABLE/INDEX (no ALTER)
+#   alter     ALTER TABLE (rename/add/drop column)
+#   dml       INSERT/UPDATE/DELETE
+#   dql       SELECT-heavy probe (joins, subselects, expressions)
+#   pragma    PRAGMA workload
+#   txn       BEGIN/COMMIT/ROLLBACK/SAVEPOINT
+#   trigger   CREATE TRIGGER + fire path
+#   view      CREATE VIEW
+#   cte       WITH ... AS recursive/non-recursive
+#   window    OVER(...) window-function clauses
+#   json      json1 family
+#   vacuum    VACUUM / INTO
+#   mixed     multi-tag corpus (annotate dominant categories in note)
+#
+# `note` is one short clause: cardinality, whether it overlaps the 1026-row
+# TestExplainParity differential, and the dominant SQL families.
+#
+# Cardinality reference (TestExplainParity.pas:N_CORPUS = 983+3+4+15+21 = 1026).
+# The other large corpora (TestWhereCorpus, TestBytecodeParity, TestParser)
+# are tagged "subset/overlap" where their SQL families are already covered
+# by the TestExplainParity 1026-row matrix; TestSQLCorpus should treat
+# TestExplainParity as the spine and pull the dialect-specific corners
+# (PRAGMA, TXN, TRIGGER, VIEW, WINDOW, JSON, VACUUM, ALTER) from the Diag*
+# files because the parity tests deliberately skip statements whose plans
+# are non-deterministic or run-time only.
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tier 1 — parity spines (cross-checked against C oracle)
+# ─────────────────────────────────────────────────────────────────────────
+src/tests/TestExplainParity.pas	mixed	1026 rows; ddl+dml+dql+pragma+txn+window+cte+view; the canonical 1026-statement spine — TestSQLCorpus must NOT re-emit these.
+src/tests/TestWhereCorpus.pas	dql	~100 SELECTs probing WHERE planner; overlaps TestExplainParity dql tier (same fixture t/s/u schema).
+src/tests/TestBytecodeParity.pas	mixed	~40 rows; smoke subset of TestExplainParity, overlap.
+src/tests/TestParser.pas	mixed	~40 rows; parser-only smoke, overlaps TestExplainParity.
+src/tests/TestParserSmoke.pas	mixed	~16 rows; parser-only, overlap.
+src/tests/TestTokenizer.pas	mixed	~30 rows; lexer probes — token-level, not statement-level (no overlap claim).
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tier 2 — feature-corner Diag* files (NOT in the 1026 spine)
+# ─────────────────────────────────────────────────────────────────────────
+src/tests/DiagArith.pas	dql	131 rows; integer/real/affinity arithmetic; expression-only, runtime values — NOT in parity spine (parity strips runtime output).
+src/tests/DiagFeatureProbe.pas	mixed	108 rows; pragma+ddl+dql feature flags probe; some overlap with DiagPragma.
+src/tests/DiagPredicates.pas	dql	87 rows; CASE/COALESCE/IS-NULL/comparison runtime; no spine overlap.
+src/tests/DiagScalarFunc.pas	dql	85 rows; scalar functions (length, substr, abs, ...); no spine overlap.
+src/tests/DiagOps.pas	dql	78 rows; operator coverage (||, %, <<, ...); no spine overlap.
+src/tests/DiagMoreFunc.pas	dql	73 rows; further scalar functions (printf, randomblob, ...).
+src/tests/DiagIndexing.pas	ddl	73 rows; index creation + planner usage; overlaps DiagCovering/DiagAutoIdx.
+src/tests/DiagFunctions.pas	dql	72 rows; builtins; overlaps DiagScalarFunc/DiagMoreFunc.
+src/tests/DiagPragma.pas	pragma	68 rows; PRAGMA exhaustive; no spine overlap.
+src/tests/DiagMisc.pas	mixed	65 rows; uncategorised; mix of ddl+dql.
+src/tests/DiagLikeGlob.pas	dql	55 rows; LIKE/GLOB/REGEXP; no spine overlap.
+src/tests/DiagDate.pas	dql	55 rows; date/time functions; no spine overlap.
+src/tests/DiagCast.pas	dql	55 rows; CAST + affinity; no spine overlap.
+src/tests/DiagWindow.pas	window	53 rows; OVER() frames + xInverse; partial overlap with TestExplainParity window tier (21 rows there).
+src/tests/DiagTxn.pas	txn	53 rows; SAVEPOINT / nested txn / hot journal; no spine overlap (parity skips txn output).
+src/tests/DiagPrintfFmt.pas	dql	38 rows; printf() format specifiers.
+src/tests/DiagDml.pas	dml	37 rows; INSERT/UPDATE/DELETE corners (ON CONFLICT, RETURNING).
+src/tests/DiagDropTable.pas	ddl	21 rows; DROP TABLE corner cases.
+src/tests/DiagSumOverflow.pas	dql	24 rows; SUM/AVG numeric overflow.
+src/tests/DiagSampleProg.pas	mixed	26 rows; quickstart-style end-to-end.
+src/tests/DiagRecover.pas	mixed	18 rows; recover extension corpus.
+src/tests/DiagInsertSelectGroupBy.pas	dml	15 rows; INSERT…SELECT…GROUP BY.
+src/tests/DiagPubApi.pas	mixed	15 rows; public-API smoke.
+src/tests/DiagAnalyze.pas	pragma	14 rows; ANALYZE + sqlite_stat1.
+src/tests/DiagTempTbl.pas	ddl	13 rows; TEMP TABLE.
+src/tests/DiagOrderLimitTopN.pas	dql	13 rows; ORDER BY + LIMIT TopN heap path.
+src/tests/DiagJoinTrace.pas	dql	13 rows; join-strategy tracing.
+src/tests/DiagDbdump.pas	mixed	12 rows; dbdump extension probe (DDL+DML round-trip).
+src/tests/DiagFloatRender.pas	dql	11 rows; double-to-text formatting.
+src/tests/DiagBloom.pas	dql	11 rows; bloom-filter planner hint.
+src/tests/DiagTrig.pas	trigger	10 rows; CREATE TRIGGER + fire path; no spine overlap.
+src/tests/DiagInRecursive.pas	dql	9 rows; IN with recursive subquery.
+src/tests/DiagGroupOrder.pas	dql	9 rows; GROUP BY + ORDER BY interaction.
+src/tests/DiagErrMsg.pas	mixed	9 rows; error-message rendering.
+src/tests/DiagCovering.pas	dql	8 rows; covering-index planner.
+src/tests/DiagTmstmpvfs.pas	mixed	8 rows; timestamp VFS.
+src/tests/DiagInnerJoin.pas	dql	7 rows; INNER JOIN + planner.
+src/tests/DiagCreateIdx.pas	ddl	7 rows; CREATE INDEX corners (partial, expr).
+src/tests/DiagVacuum.pas	vacuum	6 rows; VACUUM / VACUUM INTO; no spine overlap (parity skips VACUUM).
+src/tests/DiagConcat.pas	dql	6 rows; ||/concat builtin.
+src/tests/DiagMultiValues.pas	dml	5 rows; multi-row VALUES.
+src/tests/DiagColName.pas	dql	5 rows; AS / column alias rendering.
+src/tests/DiagAutoIdx.pas	dql	5 rows; automatic-index planner.
+src/tests/DiagAggWhere.pas	dql	5 rows; aggregate + WHERE.
+src/tests/DiagScrub.pas	mixed	5 rows; scrub-backup extension corpus.
+src/tests/DiagVfslog.pas	mixed	4 rows; vfslog extension.
+src/tests/DiagAppendvfs.pas	mixed	4 rows; appendvfs extension.
+src/tests/DiagVfstrace.pas	mixed	3 rows; vfstrace extension.
+src/tests/DiagSubsel.pas	dql	3 rows; sub-select.
+src/tests/DiagIntck.pas	pragma	3 rows; integrity-check.
+src/tests/DiagCollate.pas	dql	3 rows; COLLATE.
+src/tests/DiagMaxGroupBy.pas	dql	2 rows; MAX() + GROUP BY.
+src/tests/DiagExplainRec.pas	dql	2 rows; EXPLAIN recording.
+src/tests/DiagExplainList.pas	dql	2 rows; EXPLAIN listing.
+src/tests/DiagDbFileObject.pas	mixed	1 row; db file-object probe.
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tier 3 — focused Test* gates (small SQL surface, often runtime-specific)
+# ─────────────────────────────────────────────────────────────────────────
+src/tests/TestRowidIn.pas	dql	20 rows; IN with rowid; runtime-specific.
+src/tests/TestDateModifiers.pas	dql	13 rows; strftime / date modifiers; runtime.
+src/tests/TestJoinNatural.pas	dql	12 rows; NATURAL JOIN; some spine overlap.
+src/tests/TestGroupOrder.pas	dql	12 rows; GROUP/ORDER; spine overlap.
+src/tests/TestVtabLateral.pas	dql	11 rows; LATERAL join with vtab.
+src/tests/TestUpdateCorrelated.pas	dml	11 rows; correlated UPDATE.
+src/tests/TestLimitOffset.pas	dql	11 rows; LIMIT/OFFSET; spine overlap.
+src/tests/TestCteOuterID.pas	cte	7 rows; CTE outer column ID resolution; no spine overlap.
+src/tests/TestWalCompat.pas	pragma	7 rows; WAL pragma + journal_mode.
+src/tests/TestVdbeTrace.pas	dql	9 rows; vdbe tracing.
+src/tests/TestSerialize.pas	mixed	5 rows; serialize/deserialize.
+src/tests/TestPCache.pas	mixed	5 rows; pcache probe.
+src/tests/TestInitCallback.pas	mixed	5 rows; init callback.
+src/tests/TestBtreeCompat.pas	mixed	5 rows; btree on-disk compat.
+src/tests/TestVtab.pas	mixed	5 rows; vtab module wiring.
+src/tests/TestPublicApi.pas	mixed	4 rows; public API smoke.
+src/tests/TestPagerCompat.pas	mixed	4 rows; pager on-disk compat.
+src/tests/TestPagerCrash.pas	mixed	3 rows; pager crash recovery.
+src/tests/TestPrepareBasic.pas	mixed	3 rows; prepare/finalize.
+src/tests/TestCarray.pas	dql	2 rows; carray vtab.
+src/tests/TestSmoke.pas	mixed	1 row; smoke.
+src/tests/TestSelectBasic.pas	dql	1 row; basic SELECT smoke.
+src/tests/TestPrintf.pas	dql	1 row; printf() smoke.
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tier 4 — TestShell* and harness gates (shell-driven; .sql files synthesised
+# at runtime into a temp workdir — not source corpus, listed for completeness)
+# ─────────────────────────────────────────────────────────────────────────
+src/tests/TestShellSchema.pas	mixed	22 inline; shell-driven, runtime .sql.
+src/tests/TestShellModes.pas	mixed	22 inline; shell-driven.
+src/tests/TestShellIO.pas	mixed	18 inline; shell-driven.
+src/tests/TestShellRepl.pas	mixed	15 inline; shell-driven.
+src/tests/TestShellBackup.pas	mixed	14 inline; shell-driven.
+src/tests/TestShellEcho.pas	mixed	12 inline; shell-driven.
+src/tests/TestShellSemiComment.pas	mixed	8 inline; shell-driven.
+src/tests/TestShellMeta.pas	mixed	8 inline; shell-driven.
+src/tests/TestShellChanges.pas	mixed	7 inline; shell-driven.
+src/tests/TestShellMisc.pas	mixed	(varies); shell-driven, runtime .sql.
+src/tests/TestShellParameter.pas	mixed	5 inline; shell-driven.
+src/tests/TestShellFilectrl.pas	mixed	4 inline; shell-driven.
+src/tests/TestShellTrustedSchema.pas	mixed	3 inline; shell-driven.
+src/tests/TestShellDbinfo.pas	mixed	3 inline; shell-driven.
+src/tests/TestShellArchive.pas	mixed	3 inline; shell-driven.
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tier 5 — known feature gaps (no source file yet; tracked for Phase 9.1.6
+# coverage closure).  Add a targeted Diag* once the gap is closed.
+# ─────────────────────────────────────────────────────────────────────────
+#   alter      ALTER TABLE — drag-along of bug 6.29 ADD COLUMN fix; no Diag* yet, only TestExplainParity edge rows.
+#   view       CREATE VIEW — only TestExplainParity inline rows; no Diag*View.
+#   json       json1 — TestJson*.pas exercises the API; no SQL-string corpus.
+#   trigger    DiagTrig.pas covers it but cardinality is low (10 rows).
+#
+# end of MANIFEST.txt
