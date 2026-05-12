@@ -4662,6 +4662,29 @@ function shellLibcFRead(buf: Pointer; size, n: PtrUInt; stream: Pointer): PtrUIn
   cdecl; external 'c' name 'fread';
 function shellLibcFClose(stream: Pointer): cint;
   cdecl; external 'c' name 'fclose';
+{ 10.1.36 — libc fopen + stdout + fprintf for SQLITE_CONFIG_LOG plumbing.
+  Mirrors output_file_open / cli_printf in shell.c.in:1754. }
+function shellLibcFOpen(path, mode: PAnsiChar): Pointer;
+  cdecl; external 'c' name 'fopen';
+function shellLibcFFlush(stream: Pointer): cint;
+  cdecl; external 'c' name 'fflush';
+function shellLibcFPrintf(stream: Pointer; const fmt: PAnsiChar): cint; cdecl; varargs;
+  external 'c' name 'fprintf';
+var
+  shellLibcStdout: Pointer; external 'c' name 'stdout';
+  { 10.1.36 — pLog FILE* installed via SQLITE_CONFIG_LOG.  nil ⇒ logging
+    disabled.  Mirrors shell_state.pLog in shell.c.in:403. }
+  gLogFile: Pointer = nil;
+
+{ 10.1.36 — shellLog: xLog trampoline registered with sqlite3_config
+  (SQLITE_CONFIG_LOG).  Mirrors shell.c.in:1751..1756. }
+procedure shellLog(pArg: Pointer; iErrCode: i32; zMsg: PAnsiChar); cdecl;
+begin
+  if pArg = nil then ;
+  if gLogFile = nil then Exit;
+  shellLibcFPrintf(gLogFile, '(%d) %s'#10, iErrCode, zMsg);
+  shellLibcFFlush(gLogFile);
+end;
 
 var
   shellTimerBeginRU: TRUsagePas;
@@ -4833,11 +4856,14 @@ end;
 
 { 10.1.36 — `.log FILENAME|on|off`  (shell.c.in:10091..10109).
 
-  Records the destination so `.show` and future logger plumbing have
-  a stable view.  Actually wiring SQLITE_CONFIG_LOG is gated on the
-  raw-varargs sqlite3_config port (out of phase-10 scope). }
+  Records the destination string (for `.show`) and routes log output
+  through the xLog trampoline registered via SQLITE_CONFIG_LOG (the
+  Phase 8.1.1 overload).  Closes any previously-open log file before
+  opening a new one. }
 
 function cmdLog(const args: array of AnsiString; nArg: SizeInt): i32;
+var
+  zFile: AnsiString;
 begin
   Result := 0;
   if nArg <> 1 then begin
@@ -4845,8 +4871,35 @@ begin
     Result := 1;
     Exit;
   end;
-  if args[0] = 'on' then zLogFile := 'stdout'
-  else zLogFile := args[0];
+  zFile := args[0];
+  { Close any user-opened file from a previous .log call.  stdout/stderr
+    are libc globals and must not be fclose()d (matches output_file_close
+    in shell.c.in). }
+  if (gLogFile <> nil)
+     and (gLogFile <> shellLibcStdout)
+     and (gLogFile <> shellLibcStderr) then
+    shellLibcFClose(gLogFile);
+  gLogFile := nil;
+  if zFile = 'on' then begin
+    gLogFile := shellLibcStdout;
+    zLogFile := 'stdout';
+  end else if (zFile = 'off') or (zFile = '') then begin
+    zLogFile := 'off';
+  end else if zFile = 'stdout' then begin
+    gLogFile := shellLibcStdout;
+    zLogFile := zFile;
+  end else if zFile = 'stderr' then begin
+    gLogFile := shellLibcStderr;
+    zLogFile := zFile;
+  end else begin
+    gLogFile := shellLibcFOpen(PAnsiChar(zFile), 'wb');
+    if gLogFile = nil then begin
+      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      Result := 1;
+      Exit;
+    end;
+    zLogFile := zFile;
+  end;
 end;
 
 { 10.1.49 — `.dbinfo ?DB?`  (shell.c.in:5485..5575).  Reads the 100-byte
@@ -10124,6 +10177,12 @@ begin
   { shell.c.in:12820 — enable URI filenames so `file:...?mode=rwc` etc. are
     honored both on the CLI and via `.open`. }
   sqlite3_config(SQLITE_CONFIG_URI, 1);
+
+  { shell.c.in:12816 — install the shellLog trampoline so `.log` can route
+    sqlite3_log() output through the configured FILE*.  pCtx is unused on
+    the Pascal side (gLogFile is module-level) but we still pass `state`
+    to match the C-shell shape. }
+  sqlite3_config(SQLITE_CONFIG_LOG, @shellLog, @state);
 
   n := ParamCount;
   nOptsEnd := n + 1;          { everything is fair game for flags by default }

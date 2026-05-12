@@ -119,6 +119,14 @@ Public-API gap analysis: `../sqlite3/src/sqlite.h.in` exports
 ~238 `sqlite3_*` symbols; the Pascal port currently exposes ~156.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs are excluded.
 
+- [X] **8.1.1** sqlite3_config / sqlite3_db_config full varargs coverage
+  (overload-based — no C-ABI va_list).  Added overloads for
+  CONFIG_LOOKASIDE (two int), CONFIG_LOG (xLog + pCtx), CONFIG_PAGECACHE
+  (ptr + sz + N), CONFIG_MMAP_SIZE / MEMDB_MAXSIZE (two i64), and a
+  CONFIG_PMASZ arm on the int overload.  sqlite3_db_config typed
+  entry points (_text / _lookaside / _int) cover all upstream db-config
+  shapes including MAINDBNAME, LOOKASIDE, FP_DIGITS, and all flag-toggle
+  ops.  `.log` now installs a real xLog trampoline.
 - [X] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 - [X] **8.x** unixCurrentTimeInt64; VFS iVersion bumped 1→2.
 - [X] **8.10** Public-API sample-program gate (DiagSampleProg 6 PASS / 0 FAIL).
@@ -321,7 +329,7 @@ partial landings cannot silently no-op.
 
 - [X] **10.1e** Gate: src/tests/TestShellMeta.pas (10.1e.G, 48/48 PASS) across .help/.show/.eqp/.explain/.cd/.shell/.system/.stats/.trace/.testcase/.testctrl/.iotrace/.scanstats/.selecttrace/.wheretrace/.timer/.log within their deterministic scope. Non-debug-build arms (`.iotrace`, `.selecttrace`, `.wheretrace`) are silent rc=0/rc=1 fall-through to match the undefined SQLITE_DEBUG / SQLITE_ENABLE_IOTRACE / SQLITE_ENABLE_SELECTTRACE C build.
 - [X] **10.1.28..10.1.35, 10.1.37** `.stats`, `.timer`, `.eqp`, `.explain`, `.show`, `.help`, `.cd`, `.shell`/`.system`, `.trace` landed.
-- [~] **10.1.36** `.log` — destination recorded; SQLITE_CONFIG_LOG wiring gated on raw-varargs sqlite3_config (8.1.1).
+- [X] **10.1.36** `.log` — destination recorded and SQLITE_CONFIG_LOG xLog trampoline installed (8.1.1 landed).
 - [X] **10.1.38** `.iotrace` — stub; full sqlite3IoTrace fanout gated on sqlite3VdbeIOTraceSql arm (currently a stub at passqlite3vdbe.pas:4122).
 - [~] **10.1.39** `.scanstats` — stub; gated on sqlite3VdbeScanStatus* arms + 8.2.1.
 - [~] **10.1.40** `.testcase NAME` — records NAME; `.check ANSWER` comparator side pending.
@@ -336,7 +344,7 @@ partial landings cannot silently no-op.
   - [X] **10.1f.4** `.session` — gated by `src/tests/TestShellArchive.pas` shape arm (stub per 10.1.47).
   - [X] **10.1f.5** `.recover` — gated by `src/tests/TestShellArchive.pas`.
   - [X] **10.1f.6** `.dbinfo` — gated by `src/tests/TestShellDbinfo.pas`. Side-fix: route positional dot-cmd rc through process exit (shell.c.in:13548).
-  - [X] **10.1f.7** `.dbconfig` — gated by `src/tests/TestShellDbinfo.pas`. Counter/pointer-style DBCONFIG_* ops still gated on Phase 8.1.1.
+  - [X] **10.1f.7** `.dbconfig` — gated by `src/tests/TestShellDbinfo.pas`. Counter/pointer DBCONFIG_* ops now reachable via the typed sqlite3_db_config_* entry points (8.1.1).
   - [X] **10.1f.8** `.filectrl` — gated by `src/tests/TestShellFilectrl.pas`. PERSIST_WAL/POWERSAFE_OVERWRITE skipped (port unix VFS xFileControl lacks those arms).
   - [X] **10.1f.9** `.sha3sum` — gated by `src/tests/TestShellFilectrl.pas`.
   - [X] **10.1f.10..10.1f.13** `.crnl`/`.binary`/`.connection`/`.unmodule` — gated by `src/tests/TestShellMisc.pas`.
@@ -347,7 +355,7 @@ partial landings cannot silently no-op.
 - [X] **10.1.47** `.session` — stub (session extension not ported).
 - [X] **10.1.48** `.recover` — full port (~957 lines + LAF arm + wrapper-VFS arm). Sub-arms 10.1.48.a/b/c/d all closed (related .expert surface tracked under 6.13.B.11, now closed).
 - [X] **10.1.49** `.dbinfo`.
-- [X] **10.1.50** `.dbconfig` — boolean DBCONFIG_* + FP_DIGITS dispatched. Counter/pointer ops gated on 8.1.1.
+- [X] **10.1.50** `.dbconfig` — boolean DBCONFIG_* + FP_DIGITS dispatched; counter/pointer DBCONFIG_* (LOOKASIDE, MAINDBNAME) reachable via sqlite3_db_config_lookaside / sqlite3_db_config_text (8.1.1).
 - [X] **10.1.51..10.1.59** `.filectrl`, `.sha3sum`, `.crnl`, `.binary`, `.connection`, `.unmodule`, `.vfsinfo`/`.vfslist`/`.vfsname`, `.dbtotxt`, `.breakpoint` all landed.
 
 ### 10.1.60..10.1.100 — ext/misc and ext/* extension ports (all landed)

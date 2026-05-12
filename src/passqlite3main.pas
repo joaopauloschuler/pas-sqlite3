@@ -114,8 +114,13 @@ const
   SQLITE_CONFIG_MULTITHREAD  = 2;
   SQLITE_CONFIG_SERIALIZED   = 3;
   SQLITE_CONFIG_MEMSTATUS    = 9;
+  SQLITE_CONFIG_LOOKASIDE    = 13;  { int, int }
+  SQLITE_CONFIG_LOG          = 16;  { xLog, void* }
   SQLITE_CONFIG_URI          = 17;
   SQLITE_CONFIG_COVERING_INDEX_SCAN = 20;
+  SQLITE_CONFIG_MMAP_SIZE    = 22;  { i64, i64 }
+  SQLITE_CONFIG_PCACHE_HDRSZ = 24;  { int* }
+  SQLITE_CONFIG_PMASZ        = 25;  { unsigned int }
   SQLITE_CONFIG_STMTJRNL_SPILL = 26;
   SQLITE_CONFIG_SMALL_MALLOC = 27;
   SQLITE_CONFIG_SORTERREF_SIZE = 28;
@@ -220,6 +225,21 @@ function sqlite3_db_config_int(db: PTsqlite3; op: i32;
   pointer-shape sqlite3_config(op, pArg) (overloaded); this adds the
   int-shape used by SQLITE_CONFIG_MEMSTATUS / SINGLETHREAD / etc. }
 function sqlite3_config(op: i32; arg: i32): i32; overload;
+
+{ Phase 8.1.1 — additional sqlite3_config overloads.  The C varargs entry
+  point at main.c:426 fans out to a handful of fixed signatures; we expose
+  one overload per signature instead of a true C-ABI va_list.  All call
+  sites within the port go through these typed wrappers. }
+type
+  { Matches the C `void(*)(void*,int,const char*)` xLog callback. }
+  Tsqlite3_config_log_cb =
+    procedure(pCtx: Pointer; iErrCode: i32; zMsg: PAnsiChar); cdecl;
+
+function sqlite3_config(op: i32; a, b: i32): i32; overload;
+function sqlite3_config(op: i32; xLog: Tsqlite3_config_log_cb;
+  pCtx: Pointer): i32; overload;
+function sqlite3_config(op: i32; pBuf: Pointer; sz, cnt: i32): i32; overload;
+function sqlite3_config(op: i32; sz, mx: i64): i32; overload;
 
 { Phase 8.5 — library-wide initialize / shutdown (main.c:190 / :372). }
 function sqlite3_initialize: i32;
@@ -1884,6 +1904,93 @@ begin
     SQLITE_CONFIG_STMTJRNL_SPILL: sqlite3GlobalConfig.nStmtSpill := arg;
     SQLITE_CONFIG_SORTERREF_SIZE: sqlite3GlobalConfig.szSorterRef := u32(arg);
     SQLITE_CONFIG_MEMDB_MAXSIZE:  sqlite3GlobalConfig.mxMemdbSize := arg;
+    SQLITE_CONFIG_PMASZ:          sqlite3GlobalConfig.szPma := u32(arg);
+  else
+    Result := SQLITE_MISUSE;
+  end;
+end;
+
+{ Phase 8.1.1 — two-int overload.  Used by SQLITE_CONFIG_LOOKASIDE
+  (main.c:639). }
+function sqlite3_config(op: i32; a, b: i32): i32; overload;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  case op of
+    SQLITE_CONFIG_LOOKASIDE: begin
+      sqlite3GlobalConfig.szLookaside := a;
+      sqlite3GlobalConfig.nLookaside  := b;
+      Result := SQLITE_OK;
+    end;
+  else
+    Result := SQLITE_MISUSE;
+  end;
+end;
+
+{ Phase 8.1.1 — xLog callback overload.  Used by SQLITE_CONFIG_LOG
+  (main.c:649).  Anytime-config: legal while sqlite3GlobalConfig.isInit
+  is set (per C main.c:435..445). }
+function sqlite3_config(op: i32; xLog: Tsqlite3_config_log_cb;
+  pCtx: Pointer): i32; overload;
+begin
+  if op <> SQLITE_CONFIG_LOG then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  sqlite3GlobalConfig.xLog    := Pointer({$IFDEF FPC}@{$ENDIF}xLog);
+  sqlite3GlobalConfig.pLogArg := pCtx;
+  Result := SQLITE_OK;
+end;
+
+{ Phase 8.1.1 — pBuf + two-int overload.  Used by SQLITE_CONFIG_PAGECACHE
+  (main.c:553).  HEAP path (main.c:600) gated on MEMSYS3/5 — not ported. }
+function sqlite3_config(op: i32; pBuf: Pointer; sz, cnt: i32): i32; overload;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  case op of
+    SQLITE_CONFIG_PAGECACHE: begin
+      sqlite3GlobalConfig.pPage  := pBuf;
+      sqlite3GlobalConfig.szPage := sz;
+      sqlite3GlobalConfig.nPage  := cnt;
+      Result := SQLITE_OK;
+    end;
+  else
+    Result := SQLITE_MISUSE;
+  end;
+end;
+
+{ Phase 8.1.1 — two-i64 overload.  Used by SQLITE_CONFIG_MMAP_SIZE
+  (main.c:711) and SQLITE_CONFIG_MEMDB_MAXSIZE when invoked with a 64-bit
+  literal (the int-shape arm above handles the smaller-value case). }
+function sqlite3_config(op: i32; sz, mx: i64): i32; overload;
+const
+  { Local stand-in for SQLITE_MAX_MMAP_SIZE — the pager treats mmap as
+    disabled (passqlite3os.pas:47) so the actual cap is immaterial, but we
+    must still clamp to keep mxMmap honest. }
+  kMaxMmap: i64 = $7fffffff;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  case op of
+    SQLITE_CONFIG_MMAP_SIZE: begin
+      if (mx < 0) or (mx > kMaxMmap) then mx := kMaxMmap;
+      if sz < 0 then sz := 0;
+      if sz > mx then sz := mx;
+      sqlite3GlobalConfig.mxMmap := mx;
+      sqlite3GlobalConfig.szMmap := sz;
+      Result := SQLITE_OK;
+    end;
+    SQLITE_CONFIG_MEMDB_MAXSIZE: begin
+      sqlite3GlobalConfig.mxMemdbSize := sz;
+      Result := SQLITE_OK;
+    end;
   else
     Result := SQLITE_MISUSE;
   end;
