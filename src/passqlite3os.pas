@@ -631,9 +631,19 @@ function  unixCurrentTime(pVfs: Psqlite3_vfs;
 function  unixGetLastError(pVfs: Psqlite3_vfs; n: cint;
                            zBuf: PChar): cint; cdecl;
 
-{ The singleton unix VFS object }
+{ The singleton unix VFS objects.
+  Upstream `os_unix.c:8499..8542` auto-registers a small chain of
+  locking-style siblings; on a non-Apple, non-VxWorks, non-LOCKING_STYLE
+  Linux build that chain is: unix / unix-none / unix-dotfile / unix-excl.
+  Each is a separate `sqlite3_vfs` record that shares xOpen/xDelete/etc.
+  with the base "unix" VFS but advertises a distinct zName so that the
+  shell `.vfslist`/`.vfsname` surface, sqlite3_vfs_find(), and the
+  TCL test-suite see the same enumeration as upstream.  See bug 6.31. }
 var
-  unixVfsObj : sqlite3_vfs;
+  unixVfsObj        : sqlite3_vfs;   { "unix"          (posixIoFinder)  }
+  unixVfsObjNone    : sqlite3_vfs;   { "unix-none"     (nolockIoFinder) }
+  unixVfsObjDotfile : sqlite3_vfs;   { "unix-dotfile"  (dotlockIoFinder, stub) }
+  unixVfsObjExcl    : sqlite3_vfs;   { "unix-excl"     (posixIoFinder)  }
 
 { ============================================================
   Section 15: Global mutex state
@@ -2479,6 +2489,29 @@ begin
 
   { Register as the default VFS }
   sqlite3_vfs_register(@unixVfsObj, 1);
+
+  { Locking-style sibling VFSes (os_unix.c:8499..8542 UNIXVFS chain).
+    Each sibling is a byte-for-byte copy of `unixVfsObj` with a fresh
+    zName and pNext cleared.  Functional locking-style dispatch is a
+    follow-up (pAppData/finder mechanism not yet wired through
+    `unixOpen` — see bug 6.31 closed-bug note).  For now these exist
+    so that `.vfslist`, `.vfsname`, and `sqlite3_vfs_find()` enumerate
+    the same names as upstream. }
+  unixVfsObjNone        := unixVfsObj;
+  unixVfsObjNone.pNext  := nil;
+  unixVfsObjNone.zName  := 'unix-none';
+  sqlite3_vfs_register(@unixVfsObjNone, 0);
+
+  unixVfsObjDotfile        := unixVfsObj;
+  unixVfsObjDotfile.pNext  := nil;
+  unixVfsObjDotfile.zName  := 'unix-dotfile';
+  sqlite3_vfs_register(@unixVfsObjDotfile, 0);
+
+  unixVfsObjExcl        := unixVfsObj;
+  unixVfsObjExcl.pNext  := nil;
+  unixVfsObjExcl.zName  := 'unix-excl';
+  sqlite3_vfs_register(@unixVfsObjExcl, 0);
+
   Result := SQLITE_OK;
 end;
 

@@ -227,14 +227,17 @@ end;
 procedure RunVfslist;
 begin
   { shell.c.in:12012..12028 — `.vfslist` walks sqlite3_vfs_find(0)
-    →pNext chain.  Full byte-parity stdout is blocked by two
-    cross-cutting port-state divergences out of 10.1f.15's scope:
+    →pNext chain.  Full byte-parity stdout is now blocked by a single
+    remaining port-state divergence out of 10.1f.15's scope:
 
-      1. Pascal unix VFS is iVersion=2 with szOsFile=88 (vs upstream
-         iVersion=3 / szOsFile=128); driven by passqlite3os.pas:2259.
-      2. Port does not register the unix-excl / unix-dotfile /
-         unix-none locking-style shims that upstream's os_unix.c
-         drops in alongside the primary "unix" VFS.
+      1. Pascal unixFile record is szOsFile=88 (vs upstream 128) —
+         a struct-layout divergence (extra padding/inode flags) that
+         is orthogonal to dot-command dispatch.
+
+    Previously also blocked by (a) iVersion=2 [bug 6.30, fixed] and
+    (b) missing unix-excl / unix-dotfile / unix-none locking-style
+    shims [bug 6.31, fixed: passqlite3os.pas:sqlite3_os_init now
+    registers all four siblings].
 
     Both are deep VFS-subsystem porting tasks, NOT dispatcher bugs.
     The 10.1f.14/16 .vfsinfo/.vfsname subtests above already gate

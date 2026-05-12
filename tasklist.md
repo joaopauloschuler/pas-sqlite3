@@ -92,10 +92,9 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.23** `sqlite3_open_v2` doesn't honor `file:` URI filenames — wired `sqlite3ParseUri` into `openDatabase`; CLI calls `sqlite3_config(SQLITE_CONFIG_URI, 1)`.
 - [X] **6.29 / 6.29.followup** `sum(b) OVER ()` / `avg(b) OVER ()` — colUsed propagation across window-rewrite boundary in sqlite3WindowRewrite.
 - [X] **6.30** unix VFS iVersion bumped to 3 — ported `aSyscall[]` table + `unixSetSystemCall`/`unixGetSystemCall`/`unixNextSystemCall` in `passqlite3os.pas`, wired into `unixVfsObj`.
+- [X] **6.31** unix-VFS locking-style shims — `sqlite3_os_init` now auto-registers `unix-none`/`unix-dotfile`/`unix-excl` siblings alongside `unix`, mirroring the `UNIXVFS` chain at `os_unix.c:8499..8542`. `.vfslist` enumeration now matches upstream's name/order. Limitation: the 4 VFS records share one `xOpen` and the C `pAppData`→finder dispatch is not yet wired through `unixOpen`, so files opened via the sibling names still get the base posix `unixIoMethods` rather than nolock/dotlock locking. Functional locking-style dispatch + dotlock `lockingContext`/mkdir machinery is a follow-up.
 
 ### Open Bugs (re-opened 2026-05-11)
-
-- [ ] **6.31** Missing unix-VFS locking-style shims (`unix-excl`, `unix-dotfile`, `unix-none`, and the rest of the autolist at `os_unix.c:8200..8240`). Pas registers only the base `unix` VFS, so `.vfslist` shows one entry instead of upstream's full chain. Same root cause as 6.30. Fix: port the per-locking-style auto-registration block; each shim is a thin wrapper that overrides `xOpen` to force a fixed locking method. Gate: `.vfslist` stdout byte-parity.
 
 - [ ] **6.13.B.11** CREATE VIRTUAL TABLE + OP_ParseSchema vtab `eTabType` not preserved across the schema reload. Surfaces as: `.expert` (10.1.101) always reports `(no new indexes)` because the synthetic dbv mirror schema's republished vtabs come back from execParseSchemaImpl with `eTabType = 0`, so `sqlite3WhereBegin` never reaches `whereLoopAddVirtual` and `pScan` stays empty. Fix: stamp `eTabType = TABTYP_VTAB` (and the module pointer) in `execParseSchemaImpl` / `sqlite3InitCallback` when the parsed CREATE was a `CREATE VIRTUAL TABLE`.
 
@@ -343,7 +342,7 @@ partial landings cannot silently no-op.
   - [X] **10.1f.8** `.filectrl` — gated by `src/tests/TestShellFilectrl.pas`. PERSIST_WAL/POWERSAFE_OVERWRITE skipped (port unix VFS xFileControl lacks those arms).
   - [X] **10.1f.9** `.sha3sum` — gated by `src/tests/TestShellFilectrl.pas`.
   - [X] **10.1f.10..10.1f.13** `.crnl`/`.binary`/`.connection`/`.unmodule` — gated by `src/tests/TestShellMisc.pas`.
-  - [X] **10.1f.14..10.1f.16** `.vfsinfo`/`.vfslist`/`.vfsname` — handler-shape parity in `src/tests/TestShellMisc.pas`; success-path stdout byte-parity blocked by 6.30/6.31.
+  - [X] **10.1f.14..10.1f.16** `.vfsinfo`/`.vfslist`/`.vfsname` — handler-shape parity in `src/tests/TestShellMisc.pas`; success-path stdout byte-parity blocked by szOsFile=88 layout divergence (unixFile record padding), 6.30/6.31 fixed.
 
 - [X] **10.1.43..10.1.45** `.backup`, `.restore`, `.clone` all landed.
 - [X] **10.1.46** `.archive`/`.ar` — full port; closed via bugs 6.17.A/B for GLOB range-bound truncation.
