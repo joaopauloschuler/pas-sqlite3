@@ -84,7 +84,17 @@ else
 fi
 
 # ---- Step 2: Compile Pascal test binaries ----
-FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
+# 10.1.42.d — opt-in SQLITE_DEBUG gate.  Default builds leave it
+# undefined so {$IFDEF SQLITE_DEBUG} consumer arms (TREETRACE /
+# WHERETRACE / OSTRACE / IOTRACE, ...) compile out, preserving
+# non-debug parity with upstream's plain ./configure && make.
+# Opt in with:  SQLITE_DEBUG=1 ./src/tests/build.sh
+DEBUG_FLAGS=""
+if [ "${SQLITE_DEBUG:-0}" = "1" ]; then
+  DEBUG_FLAGS="-dSQLITE_DEBUG"
+  echo "SQLITE_DEBUG=1 — passing -dSQLITE_DEBUG to fpc (trace consumers enabled)."
+fi
+FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {
   local name="$1"

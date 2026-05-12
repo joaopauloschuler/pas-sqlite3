@@ -423,11 +423,15 @@ partial landings cannot silently no-op.
     `fprintf(stdout, "%s", zBuf); fflush(stdout);`.  No earlier shim existed
     (grep returned no Pascal-side definition).  Callable from every unit that
     already imports passqlite3printf (codegen, where, ...).
-  - [ ] **10.1.42.d** Build-flag gating.  Add `{$DEFINE SQLITE_DEBUG}` to a
-    test-only build variant so a/b only emit under that flag.  Default builds
-    must continue to compile the macro bodies out (or render them as silent
-    no-ops) so non-debug parity stays clean — mirrors upstream where
-    `SQLITE_DEBUG` is the gate.
+  - [X] **10.1.42.d** Build-flag gating landed.  `src/tests/build.sh` now
+    honours an `SQLITE_DEBUG=1` env var by forwarding `-dSQLITE_DEBUG` to
+    fpc; default invocations (`./src/tests/build.sh`) leave it undefined so
+    every `{$IFDEF SQLITE_DEBUG}` consumer block compiles out to a silent
+    no-op — preserves non-debug parity with upstream's plain
+    `./configure && make`.  Gate documented in `src/passqlite3.inc`.  Both
+    default and `SQLITE_DEBUG=1` variants now compile cleanly (only
+    pre-existing range/ptr-conv warnings); the future 10.1.42.a/b
+    TREETRACE/WHERETRACE arms drop straight into this gate.
 
 ### 10.1f Long-tail / specialised dot-commands
 
