@@ -45,8 +45,7 @@ assertions.  Two gates matter:
   starts passing, tick the bullet.
 
 Build with `src/tests/build.sh`; run binaries with
-`LD_LIBRARY_PATH=src/ bin/<TestName>`.  **Always wrap `DiagTxn` in `timeout 10`** —
-it has a known hang at savepoint rollback (see 6.32).
+`LD_LIBRARY_PATH=src/ bin/<TestName>`.
 
 FPC porting traps that recur often enough to call out up-front:
 
@@ -97,7 +96,7 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs (re-opened 2026-05-11)
 
-- [ ] **6.32** DiagTxn savepoint-rollback hang (pre-existing). Symptom: `ROLLBACK TO sp` after a deep savepoint stack never returns. Root cause not yet investigated; `timeout 10` is the standing workaround so the suite stays green. Fix: bisect against C oracle to find which savepoint-tree walk loops.
+- [X] **6.32** DiagTxn savepoint-rollback hang — closed 2026-05-12 as no-longer-reproduces. Verified `bin/DiagTxn` completes in ~107 ms with 0 divergences, and a fresh 16-deep `SAVEPOINT`/`ROLLBACK TO` stress (interleaved rollback-to with re-insertion, both `:memory:` and file-backed pagers via `bin/passqlite3`) returns correct results in under 150 ms. Likely fixed in-passing by the OP_Savepoint / pager-savepoint work landed during 6.10/6.11 and the VdbeMakeReady zero-init (bug 6.16). Removed the `timeout 10` standing workaround from `src/tests/build.sh` comment and the Phase-6 orientation note.
 
 ---
 

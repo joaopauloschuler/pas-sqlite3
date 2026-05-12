@@ -245,7 +245,8 @@ compile_test DiagTrig          # Tasklist 6.23: AFTER INSERT trigger fire.
 compile_test DiagTxn           # Tasklist 6.10 step 15(b)/(c):
                                # BEGIN/ROLLBACK + savepoint rollback
                                # divergences (memdb pager regression).
-                               # Always wrap runs with `timeout 10`.
+                               # Bug 6.32 (hang) closed 2026-05-12; no
+                               # timeout wrapper needed any more.
 compile_test DiagVacuum
 compile_test DiagTmstmpvfs
 compile_test DiagVfslog
