@@ -1315,4 +1315,10 @@ begin Result := ROUND8(SizeOf(PgHdr1)); end;
 function sqlite3Pcache1MutexActual: Psqlite3_mutex;
 begin Result := pcache1_g.mutex; end;
 
+initialization
+  { Publish SetDefault to passqlite3util so SQLITE_CONFIG_GETPCACHE2 can install
+    pcache1 defaults before sqlite3_initialize runs (mirrors C main.c:564..574).
+    Avoids a circular uses since passqlite3pcache already imports passqlite3util. }
+  gPCacheSetDefaultHook := @sqlite3PCacheSetDefault;
+
 end.

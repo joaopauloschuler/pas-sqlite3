@@ -84,7 +84,29 @@ else
 fi
 
 # ---- Step 2: Compile Pascal test binaries ----
-FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
+# 10.1.42.d — opt-in SQLITE_DEBUG gate.  Default builds leave it
+# undefined so {$IFDEF SQLITE_DEBUG} consumer arms (TREETRACE /
+# WHERETRACE / OSTRACE / IOTRACE, ...) compile out, preserving
+# non-debug parity with upstream's plain ./configure && make.
+# Opt in with:  SQLITE_DEBUG=1 ./src/tests/build.sh
+DEBUG_FLAGS=""
+if [ "${SQLITE_DEBUG:-0}" = "1" ]; then
+  DEBUG_FLAGS="-dSQLITE_DEBUG"
+  echo "SQLITE_DEBUG=1 — passing -dSQLITE_DEBUG to fpc (trace consumers enabled)."
+fi
+# 10.1.39.d — opt-in SQLITE_ENABLE_STMT_SCANSTATUS gate.  Wraps the
+# hwtime bracket around the VDBE dispatch loop (vdbe.pas:7627) and
+# enables SCANSTAT_NCYCLE reads.  Default-off because the bracket adds
+# two rdtsc calls per VDBE step.  Opt in with:
+#   SQLITE_ENABLE_STMT_SCANSTATUS=1 ./src/tests/build.sh
+# Upstream uses the value 2 to enable NCYCLE specifically; we treat
+# any truthy value the same way since the Pascal port doesn't split
+# the gate by value.
+if [ "${SQLITE_ENABLE_STMT_SCANSTATUS:-0}" != "0" ]; then
+  DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STMT_SCANSTATUS"
+  echo "SQLITE_ENABLE_STMT_SCANSTATUS=${SQLITE_ENABLE_STMT_SCANSTATUS} — passing -dSQLITE_ENABLE_STMT_SCANSTATUS to fpc (NCYCLE hwtime bracket enabled)."
+fi
+FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {
   local name="$1"
@@ -141,6 +163,9 @@ compile_test TestAuthBuiltins
 compile_test TestDMLBasic
 compile_test TestSchemaBasic
 compile_test TestWindowBasic
+compile_test TestGroupOrder
+compile_test TestJoinNatural
+compile_test TestDateModifiers
 compile_test TestOpenClose
 compile_test TestPrepareBasic
 compile_test TestInitCallback
@@ -161,6 +186,25 @@ compile_test TestSerialize
 compile_test TestUnlockNotify
 compile_test TestLoadExt
 compile_test TestRowidIn
+compile_test TestShellTrustedSchema
+compile_test TestUpdateCorrelated
+compile_test TestCteOuterID
+compile_test TestShellSemiComment
+compile_test TestShellEcho
+compile_test TestShellParameter
+compile_test TestShellChanges
+compile_test TestShellModes
+compile_test TestShellSchema
+compile_test TestShellRepl
+compile_test TestShellIO
+compile_test TestShellMeta
+compile_test TestShellScanstatsVm2
+compile_test TestShellBackup
+compile_test TestShellArchive
+compile_test TestShellDbinfo
+compile_test TestShellFilectrl
+compile_test TestShellMisc
+compile_test TestVtabLateral
 compile_test TestExplainParity
 compile_test TestBytecodeParity
 compile_test TestWhereCorpus
@@ -204,6 +248,7 @@ compile_test DiagPragma
 compile_test DiagPredicates
 compile_test DiagPrintfFmt
 compile_test DiagPubApi
+compile_test DiagRecover       # Phase 10.1.48.c: .recover end-to-end gate.
 compile_test DiagSampleProg    # Phase 8.10: canonical SQLite quickstart /
                                # cintro sample programs run through both
                                # the C reference and the Pascal port; gate
@@ -223,7 +268,8 @@ compile_test DiagTrig          # Tasklist 6.23: AFTER INSERT trigger fire.
 compile_test DiagTxn           # Tasklist 6.10 step 15(b)/(c):
                                # BEGIN/ROLLBACK + savepoint rollback
                                # divergences (memdb pager regression).
-                               # Always wrap runs with `timeout 10`.
+                               # Bug 6.32 (hang) closed 2026-05-12; no
+                               # timeout wrapper needed any more.
 compile_test DiagVacuum
 compile_test DiagTmstmpvfs
 compile_test DiagVfslog
@@ -268,3 +314,22 @@ echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestDMLBasic"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestSchemaBasic"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors
   LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestTokenizer"
+
+# ---- Step 4: Run the regression gate (build succeeded if we got here) ----
+# `set -e` aborts before this point on any compile error, so reaching here
+# means every Pascal binary built cleanly.  Set SKIP_REGRESSION=1 to skip
+# (e.g. when iterating on a single test by hand).
+if [ "${SKIP_REGRESSION:-0}" = "1" ]; then
+  echo
+  echo "SKIP_REGRESSION=1 set — skipping regression gate."
+else
+  echo
+  echo "Build succeeded — running regression gate."
+  echo
+  # Don't let a failing test abort the script before we've shown the summary.
+  set +e
+  "$SCRIPT_DIR/run_regression.sh"
+  regression_rc=$?
+  set -e
+  exit "$regression_rc"
+fi

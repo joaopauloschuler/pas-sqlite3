@@ -490,9 +490,13 @@ begin
     if SQLITE_ROW = sqlite3_step(pStmt) then begin
       aPg  := sqlite3_column_blob(pStmt, 0);
       nPgB := sqlite3_column_bytes(pStmt, 0);
-      { The page-1 cache divergence-injection optimisation in upstream
-        is conditional on pPage1Cache being populated by the wrapper VFS;
-        the wrapper is not yet ported, so we always serve the raw blob. }
+      { Mirror sqlite3recover.c:723 — when the wrapper-VFS sanitized
+        page 1 matches the cached recovered copy, swap in the
+        original on-disk bytes so sqlite_dbdata/dbptr see the real
+        b-tree header. }
+      if (pgno = 1) and (nPgB = p^.pgsz) and (p^.pPage1Cache <> nil)
+        and (CompareByte(p^.pPage1Cache^, aPg^, nPgB) = 0) then
+        aPg := p^.pPage1Disk;
       sqlite3_result_blob(pCtx, aPg, nPgB - p^.nReserve, SQLITE_TRANSIENT);
     end;
     recoverReset(p, pStmt);
@@ -759,8 +763,9 @@ begin
   pTab := p^.pTblList;
   while pTab <> nil do begin
     pNext := pTab^.pNext;
-    if pTab^.zTab <> nil then sqlite3_free(pTab^.zTab);
-    if pTab^.aCol <> nil then sqlite3_free(pTab^.aCol);
+    { aCol/zTab point inside the single pTab allocation (recoverAddTable
+      lays them out as &pTab[1] and after the aCol array) — don't free
+      them separately.  Mirrors sqlite3recover.c:2031..2034. }
     sqlite3_free(pTab);
     pTab := pNext;
   end;
@@ -1545,8 +1550,20 @@ begin
     'SELECT pgno, child FROM sqlite_dbptr(''getpage()'') ' +
     ' UNION ALL ' +
     'SELECT NULL, ii FROM seq', [p^.laf.nPg]);
+  { 10.1.48.c — port deviation: C upstream's SQL is
+    `sqlite_dbdata('getpage')` (no parens).  C relies on the planner
+    pushing `WHERE pgno = ?` into xBestIndex so dbdataFilter sees the
+    pgno constraint and never reaches dbdataDbsize / the PRAGMA path.
+    The Pas eponymous-vtab agg arm (codegen.pas:26621..26743) does not
+    push regular-column WHERE constraints into BestIndex, so the
+    schema-only `idxNum=1, argc=1` call falls through to
+    dbdataDbsize, then `PRAGMA 'getpage'.page_count` fails with
+    "unknown database 'getpage'".  Forcing the function form here
+    keeps the runtime semantics identical (dbdataDbsize takes the
+    `SELECT getpage(0)` path that returns the page count) without
+    requiring the codegen pushdown to land first. }
   pLaf^.pMaxField := recoverPreparePrintf(p, p^.dbOut,
-    'SELECT max(field)+1 FROM sqlite_dbdata(''getpage'') WHERE pgno = ?',
+    'SELECT max(field)+1 FROM sqlite_dbdata(''getpage()'') WHERE pgno = ?',
     []);
 end;
 
@@ -1974,9 +1991,9 @@ begin
       aHdr[60] := $FF; aHdr[61] := $FF; aHdr[62] := $FF; aHdr[63] := $FF;
       aHdr[64] := $FF; aHdr[65] := $FF; aHdr[66] := $FF; aHdr[67] := $FF;
       aHdr[68] := $FF; aHdr[69] := $FF; aHdr[70] := $FF; aHdr[71] := $FF;
-      aHdr[101] := $2e; aHdr[102] := $5b; aHdr[103] := $30;
-      aHdr[104] := $0D; aHdr[105] := $00; aHdr[106] := $00; aHdr[107] := $00;
-      { (the sentinel 0xFF/0xFF at 105/106 is overwritten below.) }
+      aHdr[97]  := $2e; aHdr[98]  := $5b; aHdr[99]  := $30;
+      aHdr[100] := $0D;
+      { aHdr[105/106] = 0xFF/0xFF is overwritten below by recoverPutU16. }
 
       a := PByte(aBuf);
       pgsz     := recoverGetU16(a + 16);

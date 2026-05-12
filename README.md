@@ -83,6 +83,69 @@ TestSmoke PASSED.
 
 ---
 
+## Regression testing
+
+The formal regression gate runs every `Test*` binary under `bin/` and treats
+each binary's exit code as its pass/fail signal (exit 0 = pass, non-zero =
+fail).  All `Test*` binaries follow this convention, so the gate auto-discovers
+new tests by construction — adding a `Test*.pas` to `src/tests/build.sh` is
+enough to put it under the gate.
+
+`Diag*` binaries are *differential probes* (port vs. C oracle) rather than
+pass/fail tests, and many legitimately emit non-zero divergence counts while
+the port matures.  They are deliberately **not** part of the binary
+pass/fail gate; their divergence counts are tracked in `tasklist.md`
+instead.
+
+To run the test:
+
+```bash
+src/tests/run_regression.sh    # run every bin/Test* and aggregate results
+```
+
+Each test runs in its own temporary working directory under a per-test
+timeout (default 60s, override with `REGRESSION_TIMEOUT=<seconds>`).
+
+Per-test logs are retained under a temporary directory only when at least
+one binary fails; an all-green run cleans them up.  The script exits
+non-zero if any binary fails, so it can be wired into CI directly.
+
+- **Known failures** (tracked, not regressions introduced by the gate):
+  - `TestPagerReadOnly` — 1 / 10 sub-tests pass; `sqlite3PagerOpen` returns
+    `SQLITE_CANTOPEN` (rc=14) for cases T1–T9.  Phase 3.B.2a fixture work
+    pending.
+
+Failures are deliberately left visible rather than quarantined so they
+cannot be silently ignored.
+
+### Full SQL corpus differential (`TestSQLCorpus`)
+
+`TestSQLCorpus` harvests SQL string literals embedded in every
+`Diag*.pas` / `Test*.pas` source file (the existing
+differential probes), then runs each statement through both pascal and C oracles in
+isolated workdirs and byte-compares stdout, stderr, rc, and the on-disk
+db blob (with documented non-deterministic bytes masked).
+
+```bash
+LD_LIBRARY_PATH=src/ bin/TestSQLCorpus
+```
+
+The summary line reports `scripts run / ok / diverge`.  Any divergence is
+catalogued in `src/tests/DIVERGENCES.md` (per-file rollup + first 16-byte
+window for db-blob mismatches) so each one is bisectable against the C
+oracle — see Phase 9.1 in `tasklist.md` for the workflow.  Supporting
+artefacts:
+
+- `src/tests/corpus/MANIFEST.txt` — tier-1 / tier-2 source-file inventory
+- `src/tests/corpus/MASK.md` — masked db-header byte ranges + C cites
+- `src/tests/SQLLiteralExtractor.pas` — the literal-extraction scanner
+- `src/tests/CorpusOracle.pas` — Pascal-port + libsqlite3 oracle plumbing
+
+The harness exits rc=0 even when divergences exist (catalogue-only by
+design); promotion to a hard CI gate is tracked under `9.1.5`.
+
+---
+
 ## Quick start examples
 
 Two ways to drive the Pascal port: link against the `passqlite3*` units
@@ -245,10 +308,10 @@ pas-sqlite3/
 | 6 | Code generators (SQL → VDBE) | 🧪 Ported — in testing |
 | 7 | Parser (tokenizer + Lemon grammar) | 🧪 Ported — in testing |
 | 8 | Public API | 🧪 Ported — in testing |
+| 9 | Acceptance: differential + fuzz testing | 🔲 Pending |
 | 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🚧 In progress |
 | 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
-| 12 | Acceptance: differential + fuzz testing | 🔲 Pending |
-| 13 | Performance optimisation | 🔲 Pending |
+| 12 | Performance optimisation | 🔲 Pending |
 
 See `tasklist.md` for the full per-task breakdown.
 

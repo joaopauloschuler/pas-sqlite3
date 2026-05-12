@@ -560,6 +560,9 @@ end;
   Initialiser — appendvfs.c:649..672 sqlite3_appendvfs_init.
   ---------------------------------------------------------------------- }
 
+var
+  gApndvfsInitialised: Boolean = False;
+
 function sqlite3AppendvfsInit(db: PTsqlite3): i32;
 var
   pOrig: Psqlite3_vfs;
@@ -568,50 +571,62 @@ begin
   pOrig := sqlite3_vfs_find(nil);
   if pOrig = nil then Exit(SQLITE_ERROR);
 
-  { Initialise io_methods table (every call is idempotent). }
-  FillChar(apnd_io_methods, SizeOf(apnd_io_methods), 0);
-  apnd_io_methods.iVersion               := 3;
-  apnd_io_methods.xClose                 := @apndClose;
-  apnd_io_methods.xRead                  := @apndRead;
-  apnd_io_methods.xWrite                 := @apndWrite;
-  apnd_io_methods.xTruncate              := @apndTruncate;
-  apnd_io_methods.xSync                  := @apndSync;
-  apnd_io_methods.xFileSize              := @apndFileSize;
-  apnd_io_methods.xLock                  := @apndLock;
-  apnd_io_methods.xUnlock                := @apndUnlock;
-  apnd_io_methods.xCheckReservedLock     := @apndCheckReservedLock;
-  apnd_io_methods.xFileControl           := @apndFileControl;
-  apnd_io_methods.xSectorSize            := @apndSectorSize;
-  apnd_io_methods.xDeviceCharacteristics := @apndDeviceCharacteristics;
-  apnd_io_methods.xShmMap                := @apndShmMap;
-  apnd_io_methods.xShmLock               := @apndShmLock;
-  apnd_io_methods.xShmBarrier            := @apndShmBarrier;
-  apnd_io_methods.xShmUnmap              := @apndShmUnmap;
-  apnd_io_methods.xFetch                 := @apndFetch;
-  apnd_io_methods.xUnfetch               := @apndUnfetch;
+  { Mirrors appendvfs.c:177..200 — apnd_vfs / apnd_io_methods are static
+    struct-literal initialised exactly once.  The Pascal port previously
+    re-ran FillChar + per-field assignment on every call; if apnd_vfs was
+    already linked in the VFS list, FillChar would zero its pNext pointer
+    BEFORE vfs_register's vfsUnlink walked the chain, severing the list
+    after apnd_vfs and dropping every subsequent VFS (notably memdb).
+    That broke `.open --deserialize` (bug 6.19) because the reopen-as-memdb
+    arm in attachFunc could no longer find the memdb VFS. }
+  if not gApndvfsInitialised then begin
+    FillChar(apnd_io_methods, SizeOf(apnd_io_methods), 0);
+    apnd_io_methods.iVersion               := 3;
+    apnd_io_methods.xClose                 := @apndClose;
+    apnd_io_methods.xRead                  := @apndRead;
+    apnd_io_methods.xWrite                 := @apndWrite;
+    apnd_io_methods.xTruncate              := @apndTruncate;
+    apnd_io_methods.xSync                  := @apndSync;
+    apnd_io_methods.xFileSize              := @apndFileSize;
+    apnd_io_methods.xLock                  := @apndLock;
+    apnd_io_methods.xUnlock                := @apndUnlock;
+    apnd_io_methods.xCheckReservedLock     := @apndCheckReservedLock;
+    apnd_io_methods.xFileControl           := @apndFileControl;
+    apnd_io_methods.xSectorSize            := @apndSectorSize;
+    apnd_io_methods.xDeviceCharacteristics := @apndDeviceCharacteristics;
+    apnd_io_methods.xShmMap                := @apndShmMap;
+    apnd_io_methods.xShmLock               := @apndShmLock;
+    apnd_io_methods.xShmBarrier            := @apndShmBarrier;
+    apnd_io_methods.xShmUnmap              := @apndShmUnmap;
+    apnd_io_methods.xFetch                 := @apndFetch;
+    apnd_io_methods.xUnfetch               := @apndUnfetch;
 
-  FillChar(apnd_vfs, SizeOf(apnd_vfs), 0);
+    FillChar(apnd_vfs, SizeOf(apnd_vfs), 0);
+    apnd_vfs.mxPathname      := 1024;
+    apnd_vfs.zName           := 'apndvfs';
+    apnd_vfs.xOpen           := @apndOpen;
+    apnd_vfs.xDelete         := @apndDelete;
+    apnd_vfs.xAccess         := @apndAccess;
+    apnd_vfs.xFullPathname   := @apndFullPathname;
+    apnd_vfs.xDlOpen         := @apndDlOpen;
+    apnd_vfs.xDlError        := @apndDlError;
+    apnd_vfs.xDlSym          := @apndDlSym;
+    apnd_vfs.xDlClose        := @apndDlClose;
+    apnd_vfs.xRandomness     := @apndRandomness;
+    apnd_vfs.xSleep          := @apndSleep;
+    apnd_vfs.xCurrentTime    := @apndCurrentTime;
+    apnd_vfs.xGetLastError   := @apndGetLastError;
+    apnd_vfs.xCurrentTimeInt64 := @apndCurrentTimeInt64;
+    apnd_vfs.xSetSystemCall  := @apndSetSystemCall;
+    apnd_vfs.xGetSystemCall  := @apndGetSystemCall;
+    apnd_vfs.xNextSystemCall := @apndNextSystemCall;
+    gApndvfsInitialised := True;
+  end;
+  { iVersion / szOsFile / pAppData track the underlying default VFS, which
+    may have changed since the previous init call; mirror appendvfs.c:661.. }
   apnd_vfs.iVersion        := pOrig^.iVersion;
   apnd_vfs.szOsFile        := pOrig^.szOsFile + SizeOf(TApndFile);
-  apnd_vfs.mxPathname      := 1024;
-  apnd_vfs.zName           := 'apndvfs';
   apnd_vfs.pAppData        := pOrig;
-  apnd_vfs.xOpen           := @apndOpen;
-  apnd_vfs.xDelete         := @apndDelete;
-  apnd_vfs.xAccess         := @apndAccess;
-  apnd_vfs.xFullPathname   := @apndFullPathname;
-  apnd_vfs.xDlOpen         := @apndDlOpen;
-  apnd_vfs.xDlError        := @apndDlError;
-  apnd_vfs.xDlSym          := @apndDlSym;
-  apnd_vfs.xDlClose        := @apndDlClose;
-  apnd_vfs.xRandomness     := @apndRandomness;
-  apnd_vfs.xSleep          := @apndSleep;
-  apnd_vfs.xCurrentTime    := @apndCurrentTime;
-  apnd_vfs.xGetLastError   := @apndGetLastError;
-  apnd_vfs.xCurrentTimeInt64 := @apndCurrentTimeInt64;
-  apnd_vfs.xSetSystemCall  := @apndSetSystemCall;
-  apnd_vfs.xGetSystemCall  := @apndGetSystemCall;
-  apnd_vfs.xNextSystemCall := @apndNextSystemCall;
 
   Result := sqlite3_vfs_register(@apnd_vfs, 0);
 end;

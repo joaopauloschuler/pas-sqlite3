@@ -110,7 +110,10 @@ begin
   rc := sqlite3_enable_load_extension(nil, 1);
   ExpectEq(rc, SQLITE_MISUSE, 'T3 enable_load_extension(db=nil)');
 
-  { T4 / T5 }
+  { T4 / T5.  LoadExtension is default-on (main.c:3473 with
+    SQLITE_ENABLE_LOAD_EXTENSION) so first clear, snapshot the rest of
+    flags, then exercise toggle on/off and verify byte parity. }
+  sqlite3_enable_load_extension(db, 0);
   flagBefore := db^.flags;
   rc := sqlite3_enable_load_extension(db, 1);
   ExpectEq(rc, SQLITE_OK, 'T4 enable rc');

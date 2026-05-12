@@ -842,6 +842,21 @@ type
     p2:      i32;     { second operand (often jump destination) }
     p3:      i32;     { third operand }
     p4:      Tp4union;{ fourth operand }
+    { Phase 8.2.1 — sqlite3_stmt_scanstatus() per-op execution counter.
+      Mirrors u64 nExec in vdbe.h struct VdbeOp (gated on
+      SQLITE_ENABLE_STMT_SCANSTATUS in C; unconditional here so
+      .scanstats works without a rebuild flag). }
+    nExec:   u64;     { times this opcode has been executed }
+    { Phase 10.1.39.d.1 — sqlite3_stmt_scanstatus(SCANSTAT_NCYCLE)
+      per-op hardware-time counter.  Mirrors u64 nCycle in vdbe.h
+      struct VdbeOp (gated on SQLITE_ENABLE_STMT_SCANSTATUS in C).
+      The bracket that increments this is conditional on
+      {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS} around the dispatch
+      loop in vdbe.pas (vdbe.c:940..950 + vdbe.c:9246..9251).
+      Field is always present so the record layout/size stays stable
+      across debug/non-debug builds; in non-default builds it just
+      stays 0 and the SCANSTAT_NCYCLE reader returns sum-of-zeros. }
+    nCycle:  u64;     { hwtime cycles attributed to this opcode }
   end;
 
   { -----------------------------------------------------------------------
@@ -1151,6 +1166,11 @@ type
     expmask:         u32;            { binding changes that invalidate VM }
     pProgram:        PSubProgram;    { all sub-programs used by this VM }
     pAuxData:        PAuxData;       { linked list of auxdata allocations }
+    { Phase 8.2.1 — sqlite3_stmt_scanstatus() data.  Mirrors C
+      vdbeInt.h:526..527 gated on SQLITE_ENABLE_STMT_SCANSTATUS;
+      unconditional here so .scanstats works without a rebuild flag. }
+    nScan:           i32;            { entries in aScan[] }
+    aScan:           PScanStatus;    { per-loop scan definitions }
   end;
 
   { -----------------------------------------------------------------------
@@ -1313,8 +1333,8 @@ function  sqlite3VdbeAddOpList(p: PVdbe; nOp: i32; aOp: PVdbeOpList;
                                iLineno: i32): PVdbeOp;
 procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
                                 nEst: LogEst; zName: PAnsiChar);
-procedure sqlite3VdbeScanStatusRange(p: PVdbe; iScan, addrA, addrB: i32);
-procedure sqlite3VdbeScanStatusCounters(p: PVdbe; iScan, iScan2: i32; iLip: i32);
+procedure sqlite3VdbeScanStatusRange(p: PVdbe; addrExplain, addrStart, addrEnd: i32);
+procedure sqlite3VdbeScanStatusCounters(p: PVdbe; addrExplain, addrLoop, addrVisit: i32);
 procedure sqlite3VdbeChangeOpcode(p: PVdbe; addr: i32; iNewOpcode: u8);
 procedure sqlite3VdbeChangeP1(p: PVdbe; addr, val: i32);
 procedure sqlite3VdbeChangeP2(p: PVdbe; addr, val: i32);
@@ -2294,6 +2314,8 @@ begin
   pOp^.p3      := p3;
   pOp^.p4.p   := nil;
   pOp^.p4type := P4_NOTUSED;
+  pOp^.nExec  := 0;        { Phase 8.2.1 — scanstatus counter }
+  pOp^.nCycle := 0;        { Phase 10.1.39.d.1 — scanstatus NCYCLE }
   Result := i;
 end;
 
@@ -2316,6 +2338,8 @@ begin
   pOp^.p3      := p3;
   pOp^.p4.i   := p4;
   pOp^.p4type := P4_INT32;
+  pOp^.nExec  := 0;        { Phase 8.2.1 — scanstatus counter }
+  pOp^.nCycle := 0;        { Phase 10.1.39.d.1 — scanstatus NCYCLE }
   Result := i;
 end;
 
@@ -2720,6 +2744,8 @@ begin
     pOut^.p4type  := P4_NOTUSED;
     pOut^.p4.p   := nil;
     pOut^.p5      := 0;
+    pOut^.nExec   := 0;        { Phase 8.2.1 — scanstatus counter }
+    pOut^.nCycle  := 0;        { Phase 10.1.39.d.1 — scanstatus NCYCLE }
     Inc(pOut);
     Inc(pSrc);
   end;
@@ -2728,21 +2754,78 @@ begin
 end;
 
 { --- Scan status --- }
-{ All three scan-status entry points (vdbeaux.c:1190, :1222, :1254) are
-  gated by SQLITE_ENABLE_STMT_SCANSTATUS (off in default upstream build);
-  the no-op bodies match default-build behaviour exactly. }
+{ Phase 8.2.1 — sqlite3VdbeScanStatus*.  Ports vdbeaux.c:1186..1274.
+  In C these are gated by SQLITE_ENABLE_STMT_SCANSTATUS; this port
+  enables the data path unconditionally so `.scanstats` works without
+  a rebuild flag (callers in codegen.pas always emit the calls).
+  The IS_STMT_SCANSTATUS(db) gate is still honoured so a connection
+  that has not enabled SQLITE_DBCONFIG_STMT_SCANSTATUS pays no cost. }
 
 procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
                                 nEst: LogEst; zName: PAnsiChar);
+var
+  nByte:  i64;
+  aNew:   PScanStatus;
+  pSc:    PScanStatus;
 begin
+  if (PTsqlite3(p^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  nByte := (i64(1) + i64(p^.nScan)) * i64(SizeOf(TScanStatus));
+  aNew := PScanStatus(sqlite3DbRealloc(p^.db, p^.aScan, u64(nByte)));
+  if aNew <> nil then begin
+    pSc := @aNew[p^.nScan];
+    Inc(p^.nScan);
+    FillChar(pSc^, SizeOf(TScanStatus), 0);
+    pSc^.addrExplain := addrExplain;
+    pSc^.addrLoop    := addrLoop;
+    pSc^.addrVisit   := addrVisit;
+    pSc^.nEst        := nEst;
+    pSc^.zName       := sqlite3DbStrDup(p^.db, zName);
+    p^.aScan := aNew;
+  end;
 end;
 
-procedure sqlite3VdbeScanStatusRange(p: PVdbe; iScan, addrA, addrB: i32);
+procedure sqlite3VdbeScanStatusRange(p: PVdbe; addrExplain, addrStart, addrEnd: i32);
+var
+  pSc: PScanStatus;
+  ii:  i32;
 begin
+  if (PTsqlite3(p^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  pSc := nil;
+  for ii := p^.nScan - 1 downto 0 do begin
+    pSc := @p^.aScan[ii];
+    if pSc^.addrExplain = addrExplain then break;
+    pSc := nil;
+  end;
+  if pSc <> nil then begin
+    if addrEnd < 0 then addrEnd := sqlite3VdbeCurrentAddr(p) - 1;
+    ii := 0;
+    while ii < Length(pSc^.aAddrRange) do begin
+      if pSc^.aAddrRange[ii] = 0 then begin
+        pSc^.aAddrRange[ii]     := addrStart;
+        pSc^.aAddrRange[ii + 1] := addrEnd;
+        break;
+      end;
+      Inc(ii, 2);
+    end;
+  end;
 end;
 
-procedure sqlite3VdbeScanStatusCounters(p: PVdbe; iScan, iScan2: i32; iLip: i32);
+procedure sqlite3VdbeScanStatusCounters(p: PVdbe; addrExplain, addrLoop, addrVisit: i32);
+var
+  pSc: PScanStatus;
+  ii:  i32;
 begin
+  if (PTsqlite3(p^.db)^.flags and SQLITE_StmtScanStatus) = 0 then Exit;
+  pSc := nil;
+  for ii := p^.nScan - 1 downto 0 do begin
+    pSc := @p^.aScan[ii];
+    if pSc^.addrExplain = addrExplain then break;
+    pSc := nil;
+  end;
+  if pSc <> nil then begin
+    if addrLoop  > 0 then pSc^.addrLoop  := addrLoop;
+    if addrVisit > 0 then pSc^.addrVisit := addrVisit;
+  end;
 end;
 
 { --- P4 management --- }
@@ -3710,6 +3793,12 @@ begin
 
   { allocate Mem registers (aMem[1..nMem] are user registers; aMem[0] is
     the unused slot held by all VDBE programs).  Phase 6.9-bis. }
+  { Bug 6.16: nMem/aMem must be set unconditionally to avoid stale values
+    from the raw-malloc'd Vdbe surviving when nMem=0. }
+  if vdbeDbMallocFailed(db) or (nMem <= 0) then begin
+    p^.nMem := 0;
+    p^.aMem := nil;
+  end;
   if (not vdbeDbMallocFailed(db)) and (nMem > 0) then begin
     p^.aMem := PMem(sqlite3DbMallocZero(db,
                                        u64(nMem + 1) * SizeOf(TMem)));
@@ -3726,10 +3815,21 @@ begin
       end;
     end;
   end;
-  if (not vdbeDbMallocFailed(db)) and (nCursor > 0) then begin
+  { vdbeaux.c:2731-2742 — apCsr/nCursor must be set unconditionally so
+    closeAllCursors sees a coherent (apCsr=nil, nCursor=0) on the
+    zero-cursor path; otherwise the raw-malloc'd Vdbe retains stale
+    apCsr/nCursor from a previously freed Vdbe at the same address and
+    sqlite3VdbeHalt dereferences a bogus pointer (bug 6.16). }
+  if vdbeDbMallocFailed(db) then begin
+    p^.nCursor := 0;
+    p^.apCsr   := nil;
+  end else if nCursor > 0 then begin
     p^.apCsr := PPVdbeCursor(sqlite3DbMallocZero(db,
                              u64(nCursor) * SizeOf(PVdbeCursor)));
     p^.nCursor := nCursor;
+  end else begin
+    p^.nCursor := 0;
+    p^.apCsr   := nil;
   end;
 
   { Port of vdbeaux.c:2714/2737-2738 — allocate aVar[] and set nVar so
@@ -4460,7 +4560,10 @@ begin
       db^.errCode := p^.rc;
   end;
   p^.eVdbeState := VDBE_READY_STATE;
-  Result := p^.rc;
+  if db <> nil then
+    Result := p^.rc and db^.errMask
+  else
+    Result := p^.rc;
 end;
 
 function sqlite3VdbeFinalize(p: PVdbe): i32;
@@ -4761,6 +4864,15 @@ begin
   sqlite3DbFree(db, p^.zErrMsg);
   sqlite3DbFree(db, p^.zSql);
   sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);
+  { Phase 8.2.1 — free scanstatus aScan[] array and its duped zName strings
+    (vdbeaux.c:3765..3771). }
+  if p^.aScan <> nil then begin
+    for i := 0 to p^.nScan - 1 do
+      sqlite3DbFree(db, p^.aScan[i].zName);
+    sqlite3DbFree(db, p^.aScan);
+    p^.aScan := nil;
+    p^.nScan := 0;
+  end;
 end;
 
 procedure sqlite3VdbeDelete(p: PVdbe);
@@ -6129,12 +6241,15 @@ begin
 end;
 
 { ============================================================================
-  Phase 5.7 — vdbesort.c external sorter stubs
+  Phase 5.7 — vdbesort.c external sorter (in-memory port real;
+  PMA / disk-spill deferred).
 
-  Full implementation requires KeyInfo/UnpackedRecord (Phase 6+) and the
-  PmaReader / MergeEngine / SortSubtask subsystems. The public functions
-  handle nil-guard and state-check behavior correctly; the actual sort logic
-  is deferred until ORDER BY opcodes are active (Phase 6.bis onward).
+  The in-memory single-PMA mergesort path is fully ported (see
+  vdbeSorterMergeSort / vdbeSorterCompareRec / sqlite3VdbeSorterWrite /
+  Rewind / Next / Rowkey / Compare below).  KeyInfo/UnpackedRecord landed
+  with Phase 6.  What remains deferred is the PmaReader / MergeEngine /
+  SortSubtask disk-spill subsystem — ORDER BY past the in-memory cap
+  silently truncates to RAM-only sort (no PMA spill).
   ============================================================================ }
 
 function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
@@ -6207,17 +6322,25 @@ end;
 const
   SORTER_REC_HDR = 16;   { offset of payload bytes after pNext+nVal+pad }
 
+function vdbeSorterCountRecords(pSorter: PVdbeSorter): i32; forward;
+
 procedure vdbeSorterListToArray(pSorter: PVdbeSorter;
   out aRec: array of Pointer; out nRec: i32);
 var
   p, pNxt: Pointer;
-  i: i32;
+  i, n: i32;
 begin
+  { sqlite3VdbeSorterWrite inserts at the list head, so head→tail walks
+    records in REVERSE insertion order.  Pre-count and fill from the back
+    so aRec ends up in INSERTION order; the stable merge sort then keeps
+    tied keys in the order rows arrived (matches upstream PMA semantics). }
+  n := vdbeSorterCountRecords(pSorter);
+  if n > High(aRec) + 1 then n := High(aRec) + 1;
   nRec := 0;
   p := pSorter^.list.pList;
   i := 0;
-  while (p <> nil) and (i <= High(aRec)) do begin
-    aRec[i] := p;
+  while (p <> nil) and (i < n) do begin
+    aRec[n - 1 - i] := p;
     pNxt := PPointer(p)^;
     p := pNxt;
     Inc(i);
@@ -6253,6 +6376,11 @@ begin
     pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
   pUR := PUnpackedRecord(pSorter^.pUnpacked);
   if pUR = nil then begin Result := 0; Exit; end;
+  { default_rc must be 0 so that equal keys compare equal — the raw
+    DbMallocRaw in sqlite3VdbeAllocUnpackedRecord leaves it indeterminate.
+    Without this, tied records sort to a random side and group_concat /
+    aggregate row order becomes heap-layout-dependent (bug 6.13 residual). }
+  pUR^.default_rc := 0;
   aLen   := Pi32(PByte(pA) + 8)^;
   bLen   := Pi32(PByte(pB) + 8)^;
   aBytes := PByte(pA) + SORTER_REC_HDR;
@@ -6404,6 +6532,8 @@ var
   curBytes:Pointer;
   curLen:  i32;
   nKeyCol: i32;
+  pVal:    PMem;
+  i:       i32;
 begin
   pRes := 0;
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
@@ -6412,17 +6542,26 @@ begin
   pSorter := pCsr^.uc.pSorter;
   cur := pSorter^.pReader;
   if cur = nil then begin Result := SQLITE_OK; Exit; end;
-  if pSorter^.pUnpacked = nil then
+  pVal := PMem(pKey);
+  nKeyCol := nKey;
+  if bOmitRowid <> 0 then Dec(nKeyCol);
+  if pSorter^.pUnpacked = nil then begin
     pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
+    if pSorter^.pUnpacked = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  end;
   pUR := PUnpackedRecord(pSorter^.pUnpacked);
-  if pUR = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
   curLen   := Pi32(PByte(cur) + 8)^;
   curBytes := PByte(cur) + SORTER_REC_HDR;
   sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, curLen, curBytes, pUR);
-  nKeyCol := i32(Pu16(Pu8(pSorter^.pKeyInfo) + 6)^);
-  if bOmitRowid <> 0 then Dec(nKeyCol);
-  if pUR^.nField > nKeyCol then pUR^.nField := nKeyCol;
-  pRes := sqlite3VdbeRecordCompare(nKey, pKey, pUR);
+  pUR^.nField := nKeyCol;
+  for i := 0 to nKeyCol - 1 do begin
+    if (PMem(pUR^.aMem)[i].flags and MEM_Null) <> 0 then begin
+      pRes := -1;
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+  pRes := sqlite3VdbeRecordCompare(pVal^.n, pVal^.z, pUR);
   Result := SQLITE_OK;
 end;
 
@@ -6962,24 +7101,29 @@ begin
 end;
 
 { numericType — return numeric flags of pMem without modifying it.
-  Port of vdbe.c:498 (computeNumericType + numericType). }
+  Port of vdbe.c:467..490 (computeNumericType + numericType).
+  The (rc and 2) = 0 guard rejects "has decimal point/exponent" parses
+  from the integer arm — without it a string like '3.14abc' would
+  truncate to integer 3 (C falls through to MEM_Real with rValue=3.14). }
 function numericType(pMem: PMem): u16;
-var r: Double; iVal: i64;
+var r: Double; iVal: i64; rcM: i32;
 begin
   if (pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null)) <> 0 then begin
     Result := pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null);
     Exit;
   end;
-  { Str or Blob: try numeric parse (conservative — return MEM_Real on failure) }
-  if sqlite3MemRealValueRC(pMem, r) <= 0 then begin
-    if (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
+  rcM := sqlite3MemRealValueRC(pMem, r);
+  if rcM <= 0 then begin
+    if ((rcM and 2) = 0) and
+       (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
       pMem^.u.i := iVal;
       Result := MEM_Int;
     end else begin
       pMem^.u.r := r;
       Result := MEM_Real;
     end;
-  end else if (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
+  end else if ((rcM and 2) = 0) and
+              (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
     pMem^.u.i := iVal;
     Result := MEM_Int;
   end else begin
@@ -7342,6 +7486,7 @@ var
   pSvpt5g:     PSavepoint;    { OP_Savepoint: iterator / found savepoint }
   pNewSvpt5g:  PSavepoint;    { OP_Savepoint: newly-allocated savepoint }
   zSvptName5g: PAnsiChar;     { OP_Savepoint: savepoint name }
+  zSvptFmtMsg5g: PAnsiChar;   { OP_Savepoint: formatted "no such savepoint: <name>" }
   nSvptName5g: i32;           { OP_Savepoint: name length }
   iSvpt5g:     i32;           { OP_Savepoint: depth counter }
   isTxnSvpt5g: i32;           { OP_Savepoint: is this a transaction savepoint? }
@@ -7448,6 +7593,13 @@ var
   icnRoot:   i32;
   icnErr:    i32;
   icIdx:     i32;
+  {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+  { Phase 10.1.39.d.3 — hwtime cycle bracket around the dispatch loop.
+    pCycleOp pins the opcode being measured (in case the body mutates pOp
+    via jump arms); t0Cycle is the start TSC sample. }
+  pCycleOp: PVdbeOp;
+  t0Cycle:  u64;
+  {$ENDIF}
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -7480,8 +7632,35 @@ begin
   if db^.u1.isInterrupted <> 0 then goto abort_due_to_interrupt;
 
   { ── Main interpreter loop ── }
+  {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+  pCycleOp := nil;
+  t0Cycle  := 0;
+  {$ENDIF}
   repeat
+    {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+    { Phase 10.1.39.d.3 — close out the previous op's cycle window.
+      Mirrors vdbe.c:9249..9252 (the `if(pnCycle){ *pnCycle += sqlite3Hwtime(); }`
+      epilogue) — but since we accumulate at loop-top rather than loop-bottom
+      we can credit any continue/goto exit without per-continue stamping. }
+    if pCycleOp <> nil then begin
+      pCycleOp^.nCycle := pCycleOp^.nCycle + (sqlite3Hwtime - t0Cycle);
+      pCycleOp := nil;
+    end;
+    {$ENDIF}
     Inc(nVmStep);
+
+    { Phase 8.2.1 — bump per-op execution counter for
+      sqlite3_stmt_scanstatus() (vdbe.c:940 `pOp->nExec++`).  nCycle
+      hwtime sampling is bracketed below under SQLITE_ENABLE_STMT_SCANSTATUS. }
+    Inc(pOp^.nExec);
+    {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+    { Phase 10.1.39.d.3 — start cycle window.  Mirrors vdbe.c:944..948
+      (`pnCycle = &pOp->nCycle; *pnCycle -= sqlite3Hwtime();`).  We stash
+      pOp itself rather than &pOp->nCycle because Pascal opcodes that
+      mutate pOp (jump arms) still need the *original* op to be debited. }
+    pCycleOp := pOp;
+    t0Cycle  := sqlite3Hwtime;
+    {$ENDIF}
 
     { Phase 7.4c — opcode-trace capture (mirrors C sqlite3VdbePrintOp call
       gated by db->flags & SQLITE_VdbeTrace at vdbe.c:954). }
@@ -8559,6 +8738,27 @@ begin
             Inc(vRow);
         end;
       end;
+      { AUTOINCREMENT — port of vdbe.c:5652..5681.  When P3 is non-zero, it
+        names the register holding the running max ROWID (the regCtr emitted
+        by sqlite3AutoincrementBegin from sqlite_sequence).  Bump the new
+        rowid to at least mem[P3]+1, then store it back into mem[P3] so the
+        autoincrement epilogue writes the updated counter. }
+      if pOp^.p3 <> 0 then begin
+        if v^.pFrame <> nil then begin
+          pFrame := v^.pFrame;
+          while pFrame^.pParent <> nil do pFrame := pFrame^.pParent;
+          pIn3 := @pFrame^.aMem[pOp^.p3];
+        end else
+          pIn3 := @aMem[pOp^.p3];
+        sqlite3VdbeMemIntegerify(pIn3);
+        if (pIn3^.u.i = i64($7FFFFFFFFFFFFFFF))
+           or ((pCur^.cursorFlags and VDBC_RandomRowid) <> 0) then begin
+          rc := SQLITE_FULL;
+          goto abort_due_to_error;
+        end;
+        if vRow < pIn3^.u.i + 1 then vRow := pIn3^.u.i + 1;
+        pIn3^.u.i := vRow;
+      end;
       if (pCur^.cursorFlags and VDBC_RandomRowid) <> 0 then begin
         cntNR := 0;
         repeat
@@ -9476,7 +9676,13 @@ begin
           pSvpt5g := pSvpt5g^.pNext;
         end;
         if pSvpt5g = nil then begin
-          sqlite3VdbeError(v, 'no such savepoint');
+          { C: sqlite3VdbeError(p, "no such savepoint: %s", zName) — vdbe.c:3902.
+            Pascal sqlite3VdbeError takes a pre-formatted string and DbStrDup's
+            it; format via sqlite3MPrintf into a temp buffer, then free. }
+          zSvptFmtMsg5g := PAnsiChar(sqlite3MPrintf(PTsqlite3(db),
+            'no such savepoint: %s', [zSvptName5g]));
+          sqlite3VdbeError(v, zSvptFmtMsg5g);
+          sqlite3DbFree(db, zSvptFmtMsg5g);
           rc := SQLITE_ERROR;
         end else if (db^.nVdbeWrite > 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
           sqlite3VdbeError(v,
@@ -11133,6 +11339,14 @@ begin
     sqlite3ResetOneSchema(db, i32(resetSchemaOnFault) - 1);
 
   vdbe_return:
+  {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+  { Phase 10.1.39.d.3 — credit the last op on abnormal exit (mirrors
+    vdbe.c:9328..9332 the vdbe_return `if(pnCycle){ *pnCycle += sqlite3Hwtime(); }`). }
+  if pCycleOp <> nil then begin
+    pCycleOp^.nCycle := pCycleOp^.nCycle + (sqlite3Hwtime - t0Cycle);
+    pCycleOp := nil;
+  end;
+  {$ENDIF}
   Inc(v^.aCounter[SQLITE_STMTSTATUS_VM_STEP], i32(nVmStep));
   if v^.lockMask <> 0 then
     sqlite3VdbeLeave(v);
@@ -12798,9 +13012,16 @@ begin
     if (flags and MEM_Term) <> 0 then begin
       if enc = SQLITE_UTF8 then Inc(nAlloc) else Inc(nAlloc, 2);
     end;
-    if nAlloc < 32 then nAlloc := 32;
-    if sqlite3VdbeMemClearAndResize(pMem, i32(nAlloc)) <> 0 then begin
-      Result := SQLITE_NOMEM_BKPT; Exit;
+    { Mirror vdbemem.c:1338 — MAX(nAlloc,32) is the resize floor; the
+      memcpy still copies just nAlloc bytes (z is only that large). }
+    if nAlloc < 32 then begin
+      if sqlite3VdbeMemClearAndResize(pMem, 32) <> 0 then begin
+        Result := SQLITE_NOMEM_BKPT; Exit;
+      end;
+    end else begin
+      if sqlite3VdbeMemClearAndResize(pMem, i32(nAlloc)) <> 0 then begin
+        Result := SQLITE_NOMEM_BKPT; Exit;
+      end;
     end;
     Move(z^, pMem^.z^, nAlloc);
   end else begin

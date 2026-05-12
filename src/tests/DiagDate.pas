@@ -99,8 +99,29 @@ begin
   Probe('date minus mo',    'SELECT date(''2024-03-15'',''-1 month'')');
   Probe('date start mo',    'SELECT date(''2024-03-15'',''start of month'')');
   Probe('strftime weekday', 'SELECT strftime(''%w'',''2024-01-15'')');
+  Probe('strftime %u Sat',  'SELECT strftime(''%u'',''2024-06-15'')');
+  Probe('strftime %u Sun',  'SELECT strftime(''%u'',''2024-06-16'')');
+  Probe('strftime %u Mon',  'SELECT strftime(''%u'',''2024-06-17'')');
   Probe('unixepoch',        'SELECT unixepoch(''2024-01-01'')');
   Probe('time HM',          'SELECT time(''13:45'')');
+  Probe('tz +01:30',        'SELECT datetime(''2024-06-15 12:00:00+01:30'')');
+  Probe('tz -05:00',        'SELECT datetime(''2024-06-15 12:00:00-05:00'')');
+  Probe('tz Z',             'SELECT datetime(''2024-06-15T12:00:00Z'')');
+  Probe('tz time-only',     'SELECT time(''12:00:00+02:00'')');
+  Probe('tz date rollover', 'SELECT date(''2024-06-15T23:00:00-05:00'')');
+
+  // localtime / utc modifiers (10.1.bug.106).  Round-trip is identity;
+  // use the round-trip form so the test is timezone-independent.
+  Probe('utc/local roundtrip',
+        'SELECT datetime(''2024-06-15 12:00:00'',''utc'',''localtime'')');
+  Probe('local/utc roundtrip',
+        'SELECT datetime(''2024-06-15 12:00:00'',''localtime'',''utc'')');
+  Probe('localtime not null',
+        'SELECT datetime(''2024-06-15 12:00:00'',''localtime'') IS NOT NULL');
+  Probe('utc not null',
+        'SELECT datetime(''2024-06-15 12:00:00'',''utc'') IS NOT NULL');
+  Probe('time localtime',
+        'SELECT time(''2024-06-15 12:00:00'',''utc'',''localtime'')');
 
   // Numeric / scalar variants
   Probe('round 0',          'SELECT round(3.5)');

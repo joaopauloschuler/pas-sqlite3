@@ -81,6 +81,17 @@ const
   SQLITE_STATE_ERROR  = $D5;  { An SQLITE_MISUSE error occurred }
   SQLITE_STATE_ZOMBIE = $A7;  { Close with last statement close }
 
+  { Phase 8.2.1 — sqlite3_stmt_scanstatus() opcodes (sqlite.h.in:10690..10697) }
+  SQLITE_SCANSTAT_NLOOP    = 0;
+  SQLITE_SCANSTAT_NVISIT   = 1;
+  SQLITE_SCANSTAT_EST      = 2;
+  SQLITE_SCANSTAT_NAME     = 3;
+  SQLITE_SCANSTAT_EXPLAIN  = 4;
+  SQLITE_SCANSTAT_SELECTID = 5;
+  SQLITE_SCANSTAT_PARENTID = 6;
+  SQLITE_SCANSTAT_NCYCLE   = 7;
+  SQLITE_SCANSTAT_COMPLEX  = $0001;
+
 { ----------------------------------------------------------------------
   Phase 8.4 — public sqlite3.h DBCONFIG / CONFIG opcode values.
   ---------------------------------------------------------------------- }
@@ -114,8 +125,13 @@ const
   SQLITE_CONFIG_MULTITHREAD  = 2;
   SQLITE_CONFIG_SERIALIZED   = 3;
   SQLITE_CONFIG_MEMSTATUS    = 9;
+  SQLITE_CONFIG_LOOKASIDE    = 13;  { int, int }
+  SQLITE_CONFIG_LOG          = 16;  { xLog, void* }
   SQLITE_CONFIG_URI          = 17;
   SQLITE_CONFIG_COVERING_INDEX_SCAN = 20;
+  SQLITE_CONFIG_MMAP_SIZE    = 22;  { i64, i64 }
+  SQLITE_CONFIG_PCACHE_HDRSZ = 24;  { int* }
+  SQLITE_CONFIG_PMASZ        = 25;  { unsigned int }
   SQLITE_CONFIG_STMTJRNL_SPILL = 26;
   SQLITE_CONFIG_SMALL_MALLOC = 27;
   SQLITE_CONFIG_SORTERREF_SIZE = 28;
@@ -220,6 +236,21 @@ function sqlite3_db_config_int(db: PTsqlite3; op: i32;
   pointer-shape sqlite3_config(op, pArg) (overloaded); this adds the
   int-shape used by SQLITE_CONFIG_MEMSTATUS / SINGLETHREAD / etc. }
 function sqlite3_config(op: i32; arg: i32): i32; overload;
+
+{ Phase 8.1.1 — additional sqlite3_config overloads.  The C varargs entry
+  point at main.c:426 fans out to a handful of fixed signatures; we expose
+  one overload per signature instead of a true C-ABI va_list.  All call
+  sites within the port go through these typed wrappers. }
+type
+  { Matches the C `void(*)(void*,int,const char*)` xLog callback. }
+  Tsqlite3_config_log_cb =
+    procedure(pCtx: Pointer; iErrCode: i32; zMsg: PAnsiChar); cdecl;
+
+function sqlite3_config(op: i32; a, b: i32): i32; overload;
+function sqlite3_config(op: i32; xLog: Tsqlite3_config_log_cb;
+  pCtx: Pointer): i32; overload;
+function sqlite3_config(op: i32; pBuf: Pointer; sz, cnt: i32): i32; overload;
+function sqlite3_config(op: i32; sz, mx: i64): i32; overload;
 
 { Phase 8.5 — library-wide initialize / shutdown (main.c:190 / :372). }
 function sqlite3_initialize: i32;
@@ -468,11 +499,27 @@ procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
 function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
 
 { Phase 8.4.1 — sqlite3_test_control: testing back-door dispatcher.
-  Variadic in C; declared cdecl-only here.  Callers passing extra
-  arguments are well-defined under x86_64 SysV (the extra args sit
-  unread in registers/stack); we honour only the no-arg opcodes.
-  See main.c:4206. }
-function sqlite3_test_control(op: i32): i32; cdecl;
+  Variadic in C (main.c:4206).  Pascal port has no external C-ABI
+  callers, so instead of a real va_list we provide overloads matching
+  the exact argument shapes each TESTCTRL opcode requires.  The
+  internal dispatcher (testCtrlImpl) routes by op once arguments have
+  been collected. }
+function sqlite3_test_control(op: i32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; a: i32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3; a: i32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3; pN: Pi32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl; overload;
+
+{ Phase 8.4.1 — TRACEFLAGS storage.  Mirrors sqliteInt.h:1119/1163.
+  10.1.42 update: the consumer-side TREETRACE / WHERETRACE arms now
+  live in passqlite3codegen.pas under {$IFDEF SQLITE_DEBUG}, so the
+  mask globals have been relocated there (the {$IFDEF SQLITE_DEBUG}
+  arms need to read them without a uses-cycle through this unit).
+  This unit re-exports the names by virtue of `uses passqlite3codegen`
+  in its implementation, so test_control's TESTCTRL_TRACEFLAGS
+  load/store continues to see the same storage. }
 
 { Phase 8.7.1 — WAL public-API entry points.  See main.c:2470..2620. }
 type
@@ -735,12 +782,17 @@ function createCollation(db: PTsqlite3; zName: PAnsiChar; enc: u8;
 function openDatabase(zFilename: PAnsiChar; ppDb: PPTsqlite3;
                       flags: i32; zVfs: PAnsiChar): i32;
 var
-  db   : PTsqlite3;
-  rc   : i32;
-  i    : i32;
-  pVfs : Psqlite3_vfs;
+  db      : PTsqlite3;
+  rc      : i32;
+  i       : i32;
+  pVfs    : Psqlite3_vfs;
+  zOpen   : PAnsiChar;     { Filename buffer returned by sqlite3ParseUri }
+  zErrMsg : PAnsiChar;     { Error message from sqlite3ParseUri }
+  uFlags  : u32;
   label opendb_out;
 begin
+  zOpen   := nil;
+  zErrMsg := nil;
   if ppDb = nil then begin Result := SQLITE_MISUSE; Exit; end;
   ppDb^ := nil;
 
@@ -803,6 +855,8 @@ begin
     SQLITE_AutoIndex or      { SQLITE_DEFAULT_AUTOMATIC_INDEX default-on }
     SQLITE_CacheSpill or     { main.c:3428 default-on }
     SQLITE_EnableTrigger or  { main.c:3428 default-on }
+    u64($80000000) or        { SQLITE_EnableView_Bit — main.c:3430 default-on }
+    u64($00010000) or        { SQLITE_LoadExtension_Bit — main.c:3473 default-on }
     (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
     (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
@@ -811,20 +865,13 @@ begin
   sqlite3HashInit(@db^.aModule);
   sqlite3HashInit(@db^.aFunc);
 
-  { Locate the requested VFS.  Lazily run sqlite3_os_init the first
-    time around — main.c does this via sqlite3_initialize(). }
-  pVfs := sqlite3_vfs_find(zVfs);
-  if pVfs = nil then begin
+  { Lazily run sqlite3_os_init so that VFS registrations exist before
+    sqlite3ParseUri looks them up.  Matches main.c's reliance on
+    sqlite3_initialize having already populated the VFS list. }
+  if sqlite3_vfs_find(nil) = nil then begin
     sqlite3_os_init;
     sqlite3PcacheInitialize;
-    pVfs := sqlite3_vfs_find(zVfs);
   end;
-  if pVfs = nil then begin
-    rc := SQLITE_ERROR;
-    sqlite3ErrorWithMsg(db, rc, 'no such vfs');
-    goto opendb_out;
-  end;
-  db^.pVfs := pVfs;
 
   { Validate flags{0..2} — must be exactly READONLY, READWRITE, or
     READWRITE|CREATE.  Mirrors main.c:3556. }
@@ -836,8 +883,26 @@ begin
   if (zFilename = nil) or (zFilename[0] = #0) then
     zFilename := ':memory:';
 
+  { Port of main.c:3560 — peel URI parameters (mode=, cache=, vfs=, ...)
+    and resolve the VFS.  Bug 6.23. }
+  uFlags := u32(flags);
+  rc := sqlite3ParseUri(zVfs, zFilename, @uFlags, @db^.pVfs,
+                        @zOpen, @zErrMsg);
+  if rc <> SQLITE_OK then begin
+    if (rc and $FF) = SQLITE_NOMEM then sqlite3OomFault(db);
+    if zErrMsg <> nil then
+      sqlite3ErrorWithMsg(db, rc, zErrMsg)
+    else
+      sqlite3ErrorWithMsg(db, rc, nil);
+    sqlite3_free(zErrMsg);
+    zErrMsg := nil;
+    goto opendb_out;
+  end;
+  flags := i32(uFlags);
+  pVfs := db^.pVfs;
+
   { Open the back-end b-tree. }
-  rc := sqlite3BtreeOpen(pVfs, PChar(zFilename), Psqlite3(db),
+  rc := sqlite3BtreeOpen(pVfs, PChar(zOpen), Psqlite3(db),
                          PPBtree(@db^.aDb[0].pBt), 0,
                          flags or SQLITE_OPEN_MAIN_DB);
   if rc <> SQLITE_OK then begin
@@ -898,6 +963,8 @@ opendb_out:
     if db <> nil then db^.eOpenState := SQLITE_STATE_SICK;
   end;
   ppDb^  := db;
+  { main.c:3678 — sqlite3_free_filename(zOpen). }
+  if zOpen <> nil then sqlite3_free_filename(zOpen);
   Result := rc;
 end;
 
@@ -1864,6 +1931,93 @@ begin
     SQLITE_CONFIG_STMTJRNL_SPILL: sqlite3GlobalConfig.nStmtSpill := arg;
     SQLITE_CONFIG_SORTERREF_SIZE: sqlite3GlobalConfig.szSorterRef := u32(arg);
     SQLITE_CONFIG_MEMDB_MAXSIZE:  sqlite3GlobalConfig.mxMemdbSize := arg;
+    SQLITE_CONFIG_PMASZ:          sqlite3GlobalConfig.szPma := u32(arg);
+  else
+    Result := SQLITE_MISUSE;
+  end;
+end;
+
+{ Phase 8.1.1 — two-int overload.  Used by SQLITE_CONFIG_LOOKASIDE
+  (main.c:639). }
+function sqlite3_config(op: i32; a, b: i32): i32; overload;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  case op of
+    SQLITE_CONFIG_LOOKASIDE: begin
+      sqlite3GlobalConfig.szLookaside := a;
+      sqlite3GlobalConfig.nLookaside  := b;
+      Result := SQLITE_OK;
+    end;
+  else
+    Result := SQLITE_MISUSE;
+  end;
+end;
+
+{ Phase 8.1.1 — xLog callback overload.  Used by SQLITE_CONFIG_LOG
+  (main.c:649).  Anytime-config: legal while sqlite3GlobalConfig.isInit
+  is set (per C main.c:435..445). }
+function sqlite3_config(op: i32; xLog: Tsqlite3_config_log_cb;
+  pCtx: Pointer): i32; overload;
+begin
+  if op <> SQLITE_CONFIG_LOG then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  sqlite3GlobalConfig.xLog    := Pointer({$IFDEF FPC}@{$ENDIF}xLog);
+  sqlite3GlobalConfig.pLogArg := pCtx;
+  Result := SQLITE_OK;
+end;
+
+{ Phase 8.1.1 — pBuf + two-int overload.  Used by SQLITE_CONFIG_PAGECACHE
+  (main.c:553).  HEAP path (main.c:600) gated on MEMSYS3/5 — not ported. }
+function sqlite3_config(op: i32; pBuf: Pointer; sz, cnt: i32): i32; overload;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  case op of
+    SQLITE_CONFIG_PAGECACHE: begin
+      sqlite3GlobalConfig.pPage  := pBuf;
+      sqlite3GlobalConfig.szPage := sz;
+      sqlite3GlobalConfig.nPage  := cnt;
+      Result := SQLITE_OK;
+    end;
+  else
+    Result := SQLITE_MISUSE;
+  end;
+end;
+
+{ Phase 8.1.1 — two-i64 overload.  Used by SQLITE_CONFIG_MMAP_SIZE
+  (main.c:711) and SQLITE_CONFIG_MEMDB_MAXSIZE when invoked with a 64-bit
+  literal (the int-shape arm above handles the smaller-value case). }
+function sqlite3_config(op: i32; sz, mx: i64): i32; overload;
+const
+  { Local stand-in for SQLITE_MAX_MMAP_SIZE — the pager treats mmap as
+    disabled (passqlite3os.pas:47) so the actual cap is immaterial, but we
+    must still clamp to keep mxMmap honest. }
+  kMaxMmap: i64 = $7fffffff;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  case op of
+    SQLITE_CONFIG_MMAP_SIZE: begin
+      if (mx < 0) or (mx > kMaxMmap) then mx := kMaxMmap;
+      if sz < 0 then sz := 0;
+      if sz > mx then sz := mx;
+      sqlite3GlobalConfig.mxMmap := mx;
+      sqlite3GlobalConfig.szMmap := sz;
+      Result := SQLITE_OK;
+    end;
+    SQLITE_CONFIG_MEMDB_MAXSIZE: begin
+      sqlite3GlobalConfig.mxMemdbSize := sz;
+      Result := SQLITE_OK;
+    end;
   else
     Result := SQLITE_MISUSE;
   end;
@@ -2751,14 +2905,19 @@ begin
     (A qualified "<dbname>.<table>" form still trips the codegen's
     silent-bail on qualified lookups; revisit when that gate is
     closed.) }
+  { vdbe.c:7152..7154 — qualify the schema name with the per-db zDbSName
+    so OP_ParseSchema reads from the correct attached database's
+    sqlite_master.  Without the qualifier, every iDb>0 fell through to
+    main's sqlite_master and CREATE TABLE in attached dbs never appeared
+    in the cache. }
   if iDb = 1 then
     zSql := sqlite3MPrintf(db,
               'SELECT type,name,tbl_name,rootpage,sql FROM %s',
               [LEGACY_TEMP_SCHEMA_TABLE])
   else
     zSql := sqlite3MPrintf(db,
-              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
-              [LEGACY_SCHEMA_TABLE]);
+              'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s',
+              [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
     Exit;
@@ -3636,27 +3795,165 @@ begin
   Result := nil;
 end;
 
-{ vdbeapi.c:2623 — sqlite3_stmt_scanstatus_reset.  Zero the per-op
-  nExec/nCycle counters used by sqlite3_stmt_scanstatus.  Gated on
-  SQLITE_ENABLE_STMT_SCANSTATUS in C; this port does not carry those
-  counters on VdbeOp, so the body is a no-op.  Exposed so dlsym/loadext
-  link order matches the C reference. }
+{ Phase 8.2.1 — sqlite3_stmt_scanstatus_* now reads the per-loop
+  aScan[] data populated by sqlite3VdbeScanStatus* in vdbeaux.c.
+  NLOOP/NVISIT pull nExec from the VDBE op array.  NCYCLE returns
+  -1 (deferred — would require hwtime sampling around dispatch). }
+
+{ vdbeapi.c:2623 — sqlite3_stmt_scanstatus_reset.  Zero per-op
+  nExec and nCycle counters (Phase 10.1.39.d.1). }
 procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
+var
+  p:  PVdbe;
+  ii: i32;
 begin
+  p := PVdbe(pStmt);
+  if p = nil then Exit;
+  for ii := 0 to p^.nOp - 1 do begin
+    p^.aOp[ii].nExec  := 0;
+    p^.aOp[ii].nCycle := 0;
+  end;
 end;
 
-{ vdbeapi.c:2457 — sqlite3_stmt_scanstatus_v2.  Gated on
-  SQLITE_ENABLE_STMT_SCANSTATUS in C; this port does not carry the
-  per-loop ScanStatus aScan[] array on Vdbe (Phase 6.8 ScanStatus
-  arms not yet ported), so the symbol is exposed for dlsym/loadext
-  parity and unconditionally returns 1 (no scan-status data
-  available) — matches the C return value when iScan is out of
-  range, which it always is here. }
+{ vdbeapi.c:2457 — sqlite3_stmt_scanstatus_v2. }
 function sqlite3_stmt_scanstatus_v2(pStmt: Pointer; iScan: i32;
                                     iScanStatusOp: i32; flags: i32;
                                     pOut: Pointer): i32; cdecl;
+var
+  p:     PVdbe;
+  aOp:   PVdbeOp;
+  nOp:   i32;
+  pSc:   PScanStatus;
+  idx:   i32;
+  x:     LogEst;
+  rEst:  Double;
+  ncRes: i64;
+  ncII:  i32;
 begin
-  Result := 1;
+  p := PVdbe(pStmt);
+  if (p = nil) or (pOut = nil)
+     or (iScanStatusOp < SQLITE_SCANSTAT_NLOOP)
+     or (iScanStatusOp > SQLITE_SCANSTAT_NCYCLE) then begin
+    Result := 1; Exit;
+  end;
+  aOp := p^.aOp;
+  nOp := p^.nOp;
+  if iScan < 0 then begin
+    { vdbeapi.c:2485..2495 — iScan<0 aggregate NCYCLE arm: sum nCycle
+      across every opcode in the program. }
+    if iScanStatusOp = SQLITE_SCANSTAT_NCYCLE then begin
+      ncRes := 0;
+      for ncII := 0 to nOp - 1 do
+        ncRes := ncRes + i64(aOp[ncII].nCycle);
+      Pi64(pOut)^ := ncRes;
+      Result := 0; Exit;
+    end;
+    Result := 1; Exit;
+  end;
+  pSc := nil;
+  if (flags and SQLITE_SCANSTAT_COMPLEX) <> 0 then begin
+    idx := iScan;
+  end else begin
+    idx := 0;
+    while idx < p^.nScan do begin
+      pSc := @p^.aScan[idx];
+      if pSc^.zName <> nil then begin
+        Dec(iScan);
+        if iScan < 0 then break;
+      end;
+      Inc(idx);
+    end;
+  end;
+  if idx >= p^.nScan then begin Result := 1; Exit; end;
+  pSc := @p^.aScan[idx];
+
+  case iScanStatusOp of
+    SQLITE_SCANSTAT_NLOOP: begin
+      if pSc^.addrLoop > 0 then
+        Pi64(pOut)^ := i64(aOp[pSc^.addrLoop].nExec)
+      else
+        Pi64(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_NVISIT: begin
+      if pSc^.addrVisit > 0 then
+        Pi64(pOut)^ := i64(aOp[pSc^.addrVisit].nExec)
+      else
+        Pi64(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_EST: begin
+      rEst := 1.0;
+      x := pSc^.nEst;
+      while x < 100 do begin
+        x := x + 10;
+        rEst := rEst * 0.5;
+      end;
+      PDouble(pOut)^ := rEst * Double(sqlite3LogEstToInt(x));
+    end;
+    SQLITE_SCANSTAT_NAME: begin
+      PPointer(pOut)^ := Pointer(pSc^.zName);
+    end;
+    SQLITE_SCANSTAT_EXPLAIN: begin
+      { 10.1.39.e — upstream (vdbeapi.c:2546) blindly returns
+        aOp[addrExplain].p4.z; we gate on p4type=P4_DYNAMIC to defend
+        against addrExplain stamps that landed on a non-Explain opcode
+        (the qrf.c:162..454 EQP-tree formatter dereferences the result
+        as a NUL-terminated C string).  sqlite3ExplainBegin/sqlite3VdbeExplain
+        always allocate the EXPLAIN payload via sqlite3VMPrintf and stamp
+        it with P4_DYNAMIC (vdbeaux.c:551), so this gate is transparent
+        for the well-formed case. }
+      if (pSc^.addrExplain <> 0)
+         and (aOp[pSc^.addrExplain].p4type = P4_DYNAMIC) then
+        PPointer(pOut)^ := Pointer(aOp[pSc^.addrExplain].p4.z)
+      else
+        PPointer(pOut)^ := nil;
+    end;
+    SQLITE_SCANSTAT_SELECTID: begin
+      if pSc^.addrExplain <> 0 then
+        Pi32(pOut)^ := aOp[pSc^.addrExplain].p1
+      else
+        Pi32(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_PARENTID: begin
+      if pSc^.addrExplain <> 0 then
+        Pi32(pOut)^ := aOp[pSc^.addrExplain].p2
+      else
+        Pi32(pOut)^ := -1;
+    end;
+    SQLITE_SCANSTAT_NCYCLE: begin
+      { vdbeapi.c:2574..2606 — per-scan NCYCLE arm.  aAddrRange holds
+        up to 3 [start,end] pairs.  start>0 = inclusive VM-address range.
+        start<0 = "sum nCycle of all ops whose p1 == end AND opcode has
+        OPFLG_NCYCLE set" (matches the negative-start NCYCLE protocol the
+        Where producer stamps for cursor-id based scans). }
+      if pSc^.aAddrRange[0] = 0 then
+        ncRes := -1
+      else begin
+        ncRes := 0;
+        ncII := 0;
+        while ncII < Length(pSc^.aAddrRange) do begin
+          if pSc^.aAddrRange[ncII] = 0 then break;
+          if pSc^.aAddrRange[ncII] > 0 then begin
+            idx := pSc^.aAddrRange[ncII];
+            while idx <= pSc^.aAddrRange[ncII + 1] do begin
+              ncRes := ncRes + i64(aOp[idx].nCycle);
+              Inc(idx);
+            end;
+          end else begin
+            for idx := 0 to nOp - 1 do begin
+              if aOp[idx].p1 <> pSc^.aAddrRange[ncII + 1] then continue;
+              if (sqlite3OpcodeProperty[aOp[idx].opcode] and OPFLG_NCYCLE) = 0 then continue;
+              ncRes := ncRes + i64(aOp[idx].nCycle);
+            end;
+          end;
+          Inc(ncII, 2);
+        end;
+      end;
+      Pi64(pOut)^ := ncRes;
+    end;
+  else
+    Result := 1; Exit;
+  end;
+  Result := 0;
 end;
 
 { vdbeapi.c:2611 — sqlite3_stmt_scanstatus.  Thin wrapper that calls
@@ -4267,38 +4564,190 @@ begin
 end;
 
 { Phase 8.4.1 — sqlite3_test_control(op, ...).  Faithful subset of the
-  variadic C dispatcher in main.c:4206.  Honours the no-arg opcodes
-  (PRNG_SAVE / PRNG_RESTORE / PRNG_RESET) for differential parity with
-  the C reference; returns 0 for every other opcode (matching the C
-  default initial value of `rc`).  Extra varargs passed by callers under
-  x86_64 SysV remain unread, which is benign because we never honour
-  them. }
+  variadic C dispatcher in main.c:4206.  The pas port has no external
+  C-ABI callers, so we expose typed overloads (declared in the
+  interface) instead of va_list.  Each overload calls testCtrlImpl
+  with the already-collected arguments. }
 const
-  SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
-  SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
-  SQLITE_TESTCTRL_PRNG_RESET_OP   = 7;
-  SQLITE_TESTCTRL_BYTEORDER_OP    = 22;
-  SQLITE_TESTCTRL_ISINIT_OP       = 23;
+  SQLITE_TESTCTRL_PRNG_SAVE_OP            = 5;
+  SQLITE_TESTCTRL_PRNG_RESTORE_OP         = 6;
+  SQLITE_TESTCTRL_FK_NO_ACTION_OP         = 7;
+  SQLITE_TESTCTRL_BITVEC_TEST_OP          = 8;
+  SQLITE_TESTCTRL_PENDING_BYTE_OP         = 11;
+  SQLITE_TESTCTRL_ASSERT_OP               = 12;
+  SQLITE_TESTCTRL_ALWAYS_OP               = 13;
+  SQLITE_TESTCTRL_JSON_SELFCHECK_OP       = 14;
+  SQLITE_TESTCTRL_OPTIMIZATIONS_OP        = 15;
+  SQLITE_TESTCTRL_GETOPT_OP               = 16;
+  SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP   = 17;
+  SQLITE_TESTCTRL_LOCALTIME_FAULT_OP      = 18;
+  SQLITE_TESTCTRL_ONCE_RESET_THRESHOLD_OP = 19;
+  SQLITE_TESTCTRL_NEVER_CORRUPT_OP        = 20;
+  SQLITE_TESTCTRL_BYTEORDER_OP            = 22;
+  SQLITE_TESTCTRL_ISINIT_OP               = 23;
+  SQLITE_TESTCTRL_SORTER_MMAP_OP          = 24;
+  SQLITE_TESTCTRL_PRNG_SEED_OP            = 28;
+  SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP  = 29;
+  SQLITE_TESTCTRL_TRACEFLAGS_OP           = 31;
+  SQLITE_TESTCTRL_TUNE_OP                 = 32;
 
-function sqlite3_test_control(op: i32): i32; cdecl;
+{ Shared dispatcher.  Arguments not used by the selected op are simply
+  ignored, matching the C dispatcher's behaviour when a caller passes
+  fewer va_args than an op consumes (undefined in strict C, but our
+  callers pair shapes correctly via the typed overloads). }
+function testCtrlImpl(op, iArg1: i32; pArg2: Pointer; pArg3: Pointer;
+                      db: PTsqlite3): i32;
+var
+  pPtr32u: Pu32;
+  pPtr32i: Pi32;
+  y:    i32;
 begin
   Result := 0;
   case op of
     SQLITE_TESTCTRL_PRNG_SAVE_OP:    sqlite3PrngSaveState;
     SQLITE_TESTCTRL_PRNG_RESTORE_OP: sqlite3PrngRestoreState;
-    SQLITE_TESTCTRL_PRNG_RESET_OP:   sqlite3_randomness(0, nil);
-    SQLITE_TESTCTRL_BYTEORDER_OP: begin
-      { main.c:4502 — return non-zero on big-endian platform.  FPC on
-        x86_64 is little-endian; report 0. }
-      Result := 0;
+
+    { main.c:4254 — PRNG_SEED(int x, sqlite3 *db).  If db has a schema
+      cookie use it; else use x; then reset the PRNG. }
+    SQLITE_TESTCTRL_PRNG_SEED_OP: begin
+      if (db <> nil) and (db^.aDb[0].pSchema <> nil) then begin
+        y := db^.aDb[0].pSchema^.schema_cookie;
+        if y <> 0 then iArg1 := y;
+      end;
+      sqlite3GlobalConfig.iPrngSeed := u32(iArg1);
+      sqlite3_randomness(0, nil);
     end;
-    SQLITE_TESTCTRL_ISINIT_OP: begin
-      { main.c:4582 — 0 if sqlite3_initialize has succeeded, SQLITE_ERROR
-        otherwise.  Probed via sqlite3GlobalConfig.isInit. }
-      if sqlite3GlobalConfig.isInit = 0 then
-        Result := SQLITE_ERROR;
+
+    { main.c:4277 — FK_NO_ACTION(sqlite3 *db, int b). }
+    SQLITE_TESTCTRL_FK_NO_ACTION_OP: begin
+      if db = nil then Exit;
+      if iArg1 <> 0 then
+        db^.flags := db^.flags or SQLITE_FkNoAction
+      else
+        db^.flags := db^.flags and (not SQLITE_FkNoAction);
+    end;
+
+    { main.c:4357 — PENDING_BYTE(unsigned int X).  Return existing
+      value; we do not actually rewrite a global since the pas pager
+      uses a compile-time PENDING_BYTE. }
+    SQLITE_TESTCTRL_PENDING_BYTE_OP: begin
+      Result := i32(PENDING_BYTE);
+    end;
+
+    { main.c:4379/4437 — ASSERT/ALWAYS just echo X. }
+    SQLITE_TESTCTRL_ASSERT_OP:
+      if iArg1 <> 0 then Result := iArg1;
+    SQLITE_TESTCTRL_ALWAYS_OP:
+      if iArg1 <> 0 then Result := iArg1;
+
+    { main.c:4468 — OPTIMIZATIONS(sqlite3 *db, int N). }
+    SQLITE_TESTCTRL_OPTIMIZATIONS_OP:
+      if db <> nil then db^.dbOptFlags := u32(iArg1);
+
+    { main.c:4479 — GETOPT(sqlite3 *db, int *N). }
+    SQLITE_TESTCTRL_GETOPT_OP: begin
+      pPtr32i := Pi32(pArg2);
+      if (db <> nil) and (pPtr32i <> nil) then pPtr32i^ := i32(db^.dbOptFlags);
+    end;
+
+    { main.c:4499 — LOCALTIME_FAULT(int onoff[, xAlt]).  We ignore the
+      xAlt callback (test-only). }
+    SQLITE_TESTCTRL_LOCALTIME_FAULT_OP: begin
+      sqlite3GlobalConfig.bLocaltimeFault := iArg1;
+      sqlite3GlobalConfig.xAltLocaltime := nil;
+    end;
+
+    { main.c:4515 — INTERNAL_FUNCTIONS(sqlite3 *db) — toggle bit. }
+    SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP:
+      if db <> nil then
+        db^.mDbFlags := db^.mDbFlags xor DBFLAG_InternalFunc;
+
+    SQLITE_TESTCTRL_NEVER_CORRUPT_OP:
+      sqlite3GlobalConfig.neverCorrupt := iArg1;
+
+    SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP:
+      sqlite3GlobalConfig.bExtraSchemaChecks := iArg1;
+
+    SQLITE_TESTCTRL_ONCE_RESET_THRESHOLD_OP:
+      sqlite3GlobalConfig.iOnceResetThreshold := iArg1;
+
+    SQLITE_TESTCTRL_SORTER_MMAP_OP:
+      if db <> nil then db^.nMaxSorterMmap := iArg1;
+
+    SQLITE_TESTCTRL_BYTEORDER_OP: begin
+      {$IFDEF ENDIAN_BIG}
+      Result := 4321 * 100 + 0 * 10 + 1;
+      {$ELSE}
+      Result := 1234 * 100 + 1 * 10 + 0;
+      {$ENDIF}
+    end;
+
+    SQLITE_TESTCTRL_ISINIT_OP:
+      if sqlite3GlobalConfig.isInit = 0 then Result := SQLITE_ERROR;
+
+    { main.c:4686 — TRACEFLAGS(int opTrace, u32 *ptr).
+        0: *ptr = sqlite3TreeTrace
+        1: sqlite3TreeTrace = *ptr
+        2: *ptr = sqlite3WhereTrace
+        3: sqlite3WhereTrace = *ptr
+      Storage is real; emission is still gated on consumer-side
+      WHERETRACE/TREETRACE blocks that have not yet been ported. }
+    SQLITE_TESTCTRL_TRACEFLAGS_OP: begin
+      pPtr32u := Pu32(pArg2);
+      if pPtr32u <> nil then begin
+        case iArg1 of
+          0: pPtr32u^ := sqlite3TreeTrace;
+          1: sqlite3TreeTrace := pPtr32u^;
+          2: pPtr32u^ := sqlite3WhereTrace;
+          3: sqlite3WhereTrace := pPtr32u^;
+        end;
+      end;
+    end;
+
+    { main.c:4770 — JSON_SELFCHECK(int *onOff).  Pas has no
+      bJsonSelfcheck global; treat as no-op but accept the shape. }
+    SQLITE_TESTCTRL_JSON_SELFCHECK_OP: begin
+      pPtr32i := Pi32(pArg2);
+      if (pPtr32i <> nil) and (pPtr32i^ < 0) then pPtr32i^ := 0;
     end;
   end;
+  { sentinels — silence unused-arg hints }
+  if pArg3 = nil then ;
+end;
+
+function sqlite3_test_control(op: i32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, nil, nil, nil);
+end;
+
+function sqlite3_test_control(op: i32; a: i32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, a, nil, nil, nil);
+end;
+
+function sqlite3_test_control(op: i32; db: PTsqlite3): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, nil, nil, db);
+end;
+
+function sqlite3_test_control(op: i32; db: PTsqlite3; a: i32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, a, nil, nil, db);
+end;
+
+function sqlite3_test_control(op: i32; db: PTsqlite3; pN: Pi32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, Pointer(pN), nil, db);
+end;
+
+function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, mode, Pointer(pVal), nil, nil);
+end;
+
+function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl;
+begin
+  Result := testCtrlImpl(op, 0, Pointer(pVal), nil, nil);
 end;
 
 { ----------------------------------------------------------------------
@@ -4491,15 +4940,42 @@ begin
   Result := pOut;
 end;
 
-{ memdb.c:839 — sqlite3_deserialize.  In the upstream build this would
-  ATTACH a fresh memdb VFS file and swap pData into its MemStore backing
-  buffer.  The memdb VFS is not yet ported here, so the operation cannot
-  succeed; mirror the SQLITE_OMIT_DESERIALIZE-equivalent semantics by
-  reporting SQLITE_ERROR.  The FREEONCLOSE flag still has to be honoured
-  on the failure path (memdb.c:903) so the caller's "we hand over the
-  buffer" contract remains intact. }
+{ memdb.c:734 — Translate (db, zSchema) to its backing MemFile, or nil if
+  the slot is not memdb-backed (or is a shared/named store).  Uses
+  sqlite3_file_control(FCNTL_FILE_POINTER) to grab the sqlite3_file*, then
+  matches its pMethods against the memdb_io_methods vtable. }
+function memdbFromDbSchema(db: PTsqlite3; zSchema: PAnsiChar): PMemFile;
+var
+  pFile:  Psqlite3_file;
+  rc:     i32;
+  pStore: PMemStore;
+begin
+  Result := nil;
+  pFile  := nil;
+  rc := sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, @pFile);
+  if (rc <> SQLITE_OK) or (pFile = nil) then Exit;
+  if pFile^.pMethods <> Psqlite3_io_methods(sqlite3MemdbIoMethods) then Exit;
+  Result := PMemFile(pFile);
+  pStore := Result^.pStore;
+  sqlite3_mutex_enter(pStore^.pMutex);
+  if pStore^.zFName <> nil then Result := nil;
+  sqlite3_mutex_leave(pStore^.pMutex);
+end;
+
+{ memdb.c:839 — sqlite3_deserialize.  Faithful port: ATTACHes a fresh memdb
+  btree onto schema iDb (via the reopenMemdb flag honoured by attachFunc),
+  then swaps pData into the MemStore backing the new slot.  Honours
+  SQLITE_DESERIALIZE_FREEONCLOSE on the failure path. }
 function sqlite3_deserialize(db: PTsqlite3; zSchema: PAnsiChar;
   pData: Pu8; szDb, szBuf: i64; mFlags: u32): i32; cdecl;
+var
+  p:      PMemFile;
+  zSql:   PAnsiChar;
+  pStmt:  Pointer;
+  rc:     i32;
+  iDb:    i32;
+  pStore: PMemStore;
+  label end_deserialize;
 begin
 {$IFDEF SQLITE_ENABLE_API_ARMOR}
   if sqlite3SafetyCheckOk(db) = 0 then begin
@@ -4509,10 +4985,55 @@ begin
     Result := SQLITE_MISUSE; Exit;
   end;
 {$ENDIF}
+  pStmt := nil;
+  sqlite3_mutex_enter(db^.mutex);
+  if zSchema = nil then zSchema := db^.aDb[0].zDbSName;
+  iDb := sqlite3FindDbName(db, zSchema);
+  if (iDb < 2) and (iDb <> 0) then begin
+    rc := SQLITE_ERROR;
+    goto end_deserialize;
+  end;
+  zSql := sqlite3MPrintf(db, 'ATTACH x AS %Q', [zSchema]);
+  if zSql = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    rc := sqlite3_prepare_v2(db, zSql, -1, @pStmt, nil);
+    sqlite3DbFree(db, zSql);
+  end;
+  if rc <> SQLITE_OK then goto end_deserialize;
+  db^.init.iDb := u8(iDb);
+  { Set reopenMemdb bit (Tsqlite3InitInfo.flags bit 2 = $04).  attachFunc
+    branches on this to replace the existing slot's pBt with a memdb btree
+    rather than growing aDb[]. }
+  db^.init.flags := db^.init.flags or u8($04);
+  rc := sqlite3_step(PVdbe(pStmt));
+  db^.init.flags := db^.init.flags and not u8($04);
+  if rc <> SQLITE_DONE then begin
+    rc := SQLITE_ERROR;
+    goto end_deserialize;
+  end;
+  p := memdbFromDbSchema(db, zSchema);
+  if p = nil then begin
+    rc := SQLITE_ERROR;
+  end else begin
+    pStore := p^.pStore;
+    pStore^.aData    := pData;
+    pData            := nil;
+    pStore^.sz       := szDb;
+    pStore^.szAlloc  := szBuf;
+    pStore^.szMax    := szBuf;
+    if pStore^.szMax < sqlite3GlobalConfig.mxMemdbSize then
+      pStore^.szMax := sqlite3GlobalConfig.mxMemdbSize;
+    pStore^.mFlags   := mFlags;
+    rc := SQLITE_OK;
+  end;
+end_deserialize:
+  if pStmt <> nil then sqlite3_finalize(PVdbe(pStmt));
   if (pData <> nil)
      and ((mFlags and SQLITE_DESERIALIZE_FREEONCLOSE) <> 0) then
     sqlite3_free(pData);
-  Result := SQLITE_ERROR;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 { ----------------------------------------------------------------------

@@ -41,7 +41,7 @@ program TestWhereBasic;
     T13 SizeOf(TWhereLoopBtree)  = 24
     T14 SizeOf(TWhereLoopVtab)   = 24
     T15 SizeOf(TWhereLoop)       = 104
-    T16 SizeOf(TWhereLevel)      = 120
+    T16 SizeOf(TWhereLevel)      = 128 (with SQLITE_ENABLE_STMT_SCANSTATUS addrVisit + pad)
     T17 SizeOf(TWhereLoopBuilder)= 40
     T18 WO_LT = $10, WO_LE = $08, WO_GT_WO = $04, WO_GE = $20
     T19 SZ_WHERETERM_STATIC = 8 (TWhereClause.aStatic array size)
@@ -138,7 +138,7 @@ begin
   Check('T13 SizeOf(TWhereLoopBtree)=24',   SizeOf(TWhereLoopBtree)   = 24);
   Check('T14 SizeOf(TWhereLoopVtab)=24',    SizeOf(TWhereLoopVtab)    = 24);
   Check('T15 SizeOf(TWhereLoop)=104',       SizeOf(TWhereLoop)        = 104);
-  Check('T16 SizeOf(TWhereLevel)=120',      SizeOf(TWhereLevel)       = 120);
+  Check('T16 SizeOf(TWhereLevel)=128',      SizeOf(TWhereLevel)       = 128);
   Check('T17 SizeOf(TWhereLoopBuilder)=40', SizeOf(TWhereLoopBuilder) = 40);
 
   { --- T18: WO_* constant values --- }

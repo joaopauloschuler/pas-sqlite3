@@ -157,6 +157,10 @@ begin
 
   // --- replace / instr ---
   Probe('replace',        'SELECT replace(''abc'', ''b'', ''XY'')');
+  Probe('replace null pat',  'SELECT replace(''abc'', NULL, ''b'')');
+  Probe('replace null rep',  'SELECT replace(''abc'', ''a'', NULL)');
+  Probe('replace null str',  'SELECT replace(NULL, ''a'', ''b'')');
+  Probe('replace empty pat', 'SELECT replace(''abc'', '''', ''XY'')');
   Probe('instr found',    'SELECT instr(''abcde'', ''cd'')');
   Probe('instr not',      'SELECT instr(''abcde'', ''zz'')');
 
@@ -181,6 +185,14 @@ begin
   Probe('min2',           'SELECT min(3, 5)');
   Probe('max2',           'SELECT max(3, 5)');
   Probe('min3 with null', 'SELECT min(3, NULL, 5)');
+
+  // --- min/max aggregate over only-NULL rows (10.1.bug.117 regression) ---
+  Probe('agg min all null',
+    'SELECT typeof(min(x)), min(x) FROM (SELECT NULL AS x)');
+  Probe('agg max all null',
+    'SELECT typeof(max(x)), max(x) FROM (SELECT NULL AS x)');
+  Probe('agg min mix null',
+    'SELECT min(x), max(x) FROM (SELECT NULL AS x UNION ALL SELECT 5)');
 
   // --- arithmetic / coercion ---
   Probe('text+int',       'SELECT ''5''+3');

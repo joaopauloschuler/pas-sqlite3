@@ -70,13 +70,31 @@ uses
   ============================================================ }
 
 { Direct calls to libc malloc/calloc/free avoid going through FPC's heap
-  so that sqlite3_memory_used() counters (Phase 2) stay accurate.        }
-function  sqlite3_malloc(n: i32): Pointer; external 'c' name 'malloc';
-function  sqlite3_malloc64(n: u64): Pointer; external 'c' name 'malloc';
-function  sqlite3_realloc(p: Pointer; n: i32): Pointer; external 'c' name 'realloc';
-function  sqlite3_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'realloc';
-procedure sqlite3_free(p: Pointer); external 'c' name 'free';
+  so that sqlite3_memory_used() counters (Phase 2) stay accurate.
+
+  Bug 6.21 (2026-05-11): these are now the LOW-LEVEL libc bindings used
+  by the mem1 backend.  The public API entry points sqlite3_malloc /
+  sqlite3_malloc64 / sqlite3_realloc / sqlite3_realloc64 / sqlite3_free
+  are implemented in passqlite3util.pas and dispatch through
+  sqlite3GlobalConfig.m.xMalloc / xFree / xRealloc / xSize / xRoundup
+  so that shims installed via SQLITE_CONFIG_MALLOC (memtrace, etc.)
+  observe every allocation.  C oracle: malloc.c sqlite3_malloc and
+  friends route through sqlite3GlobalConfig.m.xMalloc.            }
+function  libc_malloc(n: i32): Pointer; external 'c' name 'malloc';
+function  libc_malloc64(n: u64): Pointer; external 'c' name 'malloc';
+function  libc_realloc(p: Pointer; n: i32): Pointer; external 'c' name 'realloc';
+function  libc_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'realloc';
+procedure libc_free(p: Pointer); external 'c' name 'free';
 function  libc_calloc(nmemb, size: csize_t): Pointer; external 'c' name 'calloc';
+
+{ Public API entry points — forwarded to the util.pas implementations
+  that dispatch through sqlite3GlobalConfig.m.  Declared here so the
+  many existing call sites (~835 in the tree) continue to compile.    }
+function  sqlite3_malloc(n: i32): Pointer; cdecl;
+function  sqlite3_malloc64(n: u64): Pointer; cdecl;
+function  sqlite3_realloc(p: Pointer; n: i32): Pointer; cdecl;
+function  sqlite3_realloc64(p: Pointer; n: u64): Pointer; cdecl;
+procedure sqlite3_free(p: Pointer); cdecl;
 
 function  sqlite3MallocZero(n: csize_t): Pointer;
 function  sqlite3StrDup(z: PChar): PChar;
@@ -580,6 +598,21 @@ function  sqlite3OsCurrentTimeInt64(pVfs: Psqlite3_vfs;
 function  sqlite3OsCurrentTime(pVfs: Psqlite3_vfs;
                                pTimeOut: PDouble): cint;
 
+{ Phase 10.1.39.d.2 — sqlite3Hwtime (../sqlite3/src/hwtime.h).
+  High-performance cycle counter used by SQLITE_ENABLE_STMT_SCANSTATUS
+  (NCYCLE) and VDBE_PROFILE bracket around the dispatch loop.
+
+  x86_64: rdtsc (in-line asm)
+  aarch64: cntvct_el0 (in-line asm) — note hwtime.h uses cntvct_el0
+           even though the comment says PMCCNTR; we mirror C exactly.
+  fallback: monotonic clock (clock_gettime CLOCK_MONOTONIC) scaled to ns
+           — non-zero so consumers can still observe ordering.
+
+  FPC cannot inline a routine whose body contains an `asm` block, so
+  this is declared as a plain function (matches __inline__ semantics
+  closely enough — the call is one rdtsc instruction inside). }
+function  sqlite3Hwtime: u64;
+
 { ============================================================
   Section 13: VFS registration (os.c)
   ============================================================ }
@@ -613,9 +646,19 @@ function  unixCurrentTime(pVfs: Psqlite3_vfs;
 function  unixGetLastError(pVfs: Psqlite3_vfs; n: cint;
                            zBuf: PChar): cint; cdecl;
 
-{ The singleton unix VFS object }
+{ The singleton unix VFS objects.
+  Upstream `os_unix.c:8499..8542` auto-registers a small chain of
+  locking-style siblings; on a non-Apple, non-VxWorks, non-LOCKING_STYLE
+  Linux build that chain is: unix / unix-none / unix-dotfile / unix-excl.
+  Each is a separate `sqlite3_vfs` record that shares xOpen/xDelete/etc.
+  with the base "unix" VFS but advertises a distinct zName so that the
+  shell `.vfslist`/`.vfsname` surface, sqlite3_vfs_find(), and the
+  TCL test-suite see the same enumeration as upstream.  See bug 6.31. }
 var
-  unixVfsObj : sqlite3_vfs;
+  unixVfsObj        : sqlite3_vfs;   { "unix"          (posixIoFinder)  }
+  unixVfsObjNone    : sqlite3_vfs;   { "unix-none"     (nolockIoFinder) }
+  unixVfsObjDotfile : sqlite3_vfs;   { "unix-dotfile"  (dotlockIoFinder, stub) }
+  unixVfsObjExcl    : sqlite3_vfs;   { "unix-excl"     (posixIoFinder)  }
 
 { ============================================================
   Section 15: Global mutex state
@@ -655,6 +698,66 @@ type
 const
   { PTHREAD_MUTEX_RECURSIVE on Linux x86_64 = 1 }
   PTHREAD_MUTEX_RECURSIVE_KIND = 1;
+
+{ ----------------------------------------------------------------
+  Bug 6.21 — Public malloc/free/realloc dispatch through
+  sqlite3GlobalConfig.m.  C oracle: malloc.c sqlite3_malloc /
+  sqlite3_malloc64 / sqlite3_realloc / sqlite3_realloc64 /
+  sqlite3_free.  Implementation lives here (os.pas) because that's
+  where the declarations live; the work is delegated to the helpers
+  in passqlite3util.pas which own the accounting and alarm logic.
+  ---------------------------------------------------------------- }
+function sqlite3_malloc(n: i32): Pointer; cdecl;
+begin
+  { malloc.c:316 — n<=0 short-circuit then sqlite3Malloc.
+    (autoinit elided: shell calls sqlite3_initialize before allocating,
+    and this unit cannot reference sqlite3_initialize without a
+    circular dependency on passqlite3main.) }
+  if n <= 0 then Exit(nil);
+  Result := sqlite3Malloc(n);
+end;
+
+function sqlite3_malloc64(n: u64): Pointer; cdecl;
+begin
+  { malloc.c:322 — sqlite3Malloc64. }
+  if (n = 0) or (n > $7FFFFFFF) then Exit(nil);
+  Result := sqlite3Malloc(i32(n));
+end;
+
+function sqlite3_realloc(p: Pointer; n: i32): Pointer; cdecl;
+begin
+  { malloc.c:562 — n<0 -> 0, then sqlite3Realloc. }
+  if n < 0 then n := 0;
+  Result := sqlite3Realloc(p, u64(n));
+end;
+
+function sqlite3_realloc64(p: Pointer; n: u64): Pointer; cdecl;
+begin
+  { malloc.c:569 — sqlite3Realloc. }
+  Result := sqlite3Realloc(p, n);
+end;
+
+procedure sqlite3_free(p: Pointer); cdecl;
+begin
+  { malloc.c:391 — dispatch through xFree, with bMemstat accounting. }
+  if p = nil then Exit;
+  if sqlite3GlobalConfig.bMemstat <> 0 then
+  begin
+    if sqlite3MallocMutex <> nil then sqlite3_mutex_enter(sqlite3MallocMutex);
+    sqlite3StatusDown(SQLITE_STATUS_MEMORY_USED, sqlite3MallocSize(p));
+    sqlite3StatusDown(SQLITE_STATUS_MALLOC_COUNT, 1);
+    if Assigned(sqlite3GlobalConfig.m.xFree) then
+      sqlite3GlobalConfig.m.xFree(p)
+    else
+      libc_free(p);
+    if sqlite3MallocMutex <> nil then sqlite3_mutex_leave(sqlite3MallocMutex);
+  end else begin
+    if Assigned(sqlite3GlobalConfig.m.xFree) then
+      sqlite3GlobalConfig.m.xFree(p)
+    else
+      libc_free(p);
+  end;
+end;
 
 function c_nanosleep(req: Pointer; rem: Pointer): cint; cdecl;
   external 'c' name 'nanosleep';
@@ -1208,6 +1311,43 @@ function sqlite3OsCurrentTime(pVfs: Psqlite3_vfs; pTimeOut: PDouble): cint;
 begin
   Result := pVfs^.xCurrentTime(pVfs, pTimeOut);
 end;
+
+{ Phase 10.1.39.d.2 — sqlite3Hwtime.  Port of hwtime.h.
+
+  Returns a monotonically-increasing 64-bit counter.  On x86_64 this
+  is the TSC (rdtsc).  On aarch64 this is cntvct_el0.  On any other
+  architecture we fall back to clock_gettime(CLOCK_MONOTONIC) scaled
+  to nanoseconds — this is what the upstream "no asm" arm reduces to
+  in spirit, except hwtime.h there returns 0; we prefer a real value
+  so SCANSTAT_NCYCLE consumers see ordering even on exotic targets. }
+{$IFDEF CPUX86_64}
+function sqlite3Hwtime: u64; assembler; nostackframe;
+{ FPC's default x86_64 dialect is Intel syntax.  `rdtsc` puts the
+  low 32 bits in EAX and the high 32 bits in EDX; SysV/AMD64 returns
+  a 64-bit scalar in RAX.  Shift RDX up and OR into RAX. }
+asm
+  rdtsc
+  shl rdx, 32
+  or  rax, rdx
+end;
+{$ELSE}
+  {$IFDEF CPUAARCH64}
+function sqlite3Hwtime: u64; assembler; nostackframe;
+asm
+  mrs x0, cntvct_el0
+end;
+  {$ELSE}
+function sqlite3Hwtime: u64;
+var
+  ts: TTimeSpec;
+begin
+  if clock_gettime(CLOCK_MONOTONIC, @ts) = 0 then
+    Result := u64(ts.tv_sec) * u64(1000000000) + u64(ts.tv_nsec)
+  else
+    Result := 0;
+end;
+  {$ENDIF}
+{$ENDIF}
 
 { ============================================================
   Section 13: VFS registration  (os.c ~390)
@@ -2170,6 +2310,236 @@ begin
 end;
 
 { ============================================================
+  Section 14c.5: Overrideable system-call table  (os_unix.c §417..596)
+  Mirrors C `aSyscall[]`.  The pas port dispatches I/O through BaseUnix
+  wrappers (FpXxx) directly rather than through this table, but the
+  table is exposed via the v3 VFS slots xSetSystemCall/xGetSystemCall/
+  xNextSystemCall so that sqlite3-level callers (test_syscall, the
+  `.vfslist` shell builtin, etc.) see the same surface as upstream.
+  ============================================================ }
+
+type
+  Punix_syscall = ^unix_syscall;
+  unix_syscall = record
+    zName    : PChar;             { Name of the system call }
+    pCurrent : sqlite3_syscall_ptr; { Current value of the system call }
+    pDefault : sqlite3_syscall_ptr; { Default value }
+  end;
+
+{ libc bindings used purely as default pCurrent values for aSyscall[].
+  None of these are dispatched through the table at runtime; the table
+  exists to mirror the C ABI surface for v3 VFS introspection.        }
+function  c_posixOpen(zFile: PChar; flags, mode: cint): cint;
+  cdecl; external 'c' name 'open';
+function  c_close(fd: cint): cint;
+  cdecl; external 'c' name 'close';
+function  c_access(zPath: PChar; mode: cint): cint;
+  cdecl; external 'c' name 'access';
+function  c_getcwd(buf: PChar; size: csize_t): PChar;
+  cdecl; external 'c' name 'getcwd';
+function  c_stat(zPath: PChar; buf: Pointer): cint;
+  cdecl; external 'c' name 'stat';
+function  c_fstat(fd: cint; buf: Pointer): cint;
+  cdecl; external 'c' name 'fstat';
+function  c_ftruncate(fd: cint; len: i64): cint;
+  cdecl; external 'c' name 'ftruncate';
+function  c_fcntl(fd, cmd: cint): cint;
+  cdecl; varargs; external 'c' name 'fcntl';
+function  c_read(fd: cint; buf: Pointer; n: csize_t): cint;
+  cdecl; external 'c' name 'read';
+function  c_pread(fd: cint; buf: Pointer; n: csize_t; off: i64): cint;
+  cdecl; external 'c' name 'pread';
+function  c_write(fd: cint; buf: Pointer; n: csize_t): cint;
+  cdecl; external 'c' name 'write';
+function  c_pwrite(fd: cint; buf: Pointer; n: csize_t; off: i64): cint;
+  cdecl; external 'c' name 'pwrite';
+function  c_fchmod(fd: cint; mode: cint): cint;
+  cdecl; external 'c' name 'fchmod';
+function  c_fallocate(fd: cint; off, len: i64): cint;
+  cdecl; external 'c' name 'posix_fallocate';
+function  c_unlink(zPath: PChar): cint;
+  cdecl; external 'c' name 'unlink';
+function  c_mkdir(zPath: PChar; mode: cint): cint;
+  cdecl; external 'c' name 'mkdir';
+function  c_rmdir(zPath: PChar): cint;
+  cdecl; external 'c' name 'rmdir';
+function  c_fchown(fd: cint; uid, gid: cint): cint;
+  cdecl; external 'c' name 'fchown';
+function  c_geteuid: cint;
+  cdecl; external 'c' name 'geteuid';
+function  c_mmap(addr: Pointer; len: csize_t; prot, flags, fd: cint;
+                 off: i64): Pointer;
+  cdecl; external 'c' name 'mmap';
+function  c_munmap(addr: Pointer; len: csize_t): cint;
+  cdecl; external 'c' name 'munmap';
+function  c_readlink(zPath, buf: PChar; n: csize_t): cint;
+  cdecl; external 'c' name 'readlink';
+function  c_lstat(zPath: PChar; buf: Pointer): cint;
+  cdecl; external 'c' name 'lstat';
+
+{ os_unix.c:3874..3894 — openDirectory(zFilename, *pFd):
+  Compute the parent-directory path of zFilename and open it O_RDONLY.
+  On success *pFd holds the fd (caller closes); on failure *pFd = -1 and
+  SQLITE_CANTOPEN is returned.  The truncation rules match C exactly:
+    * walk back from end of zDirname looking for '/';
+    * if found at ii>0, terminate at that slash;
+    * else if zDirname[0]!='/' replace [0] with '.', [1] with NUL;
+    * else (path starts with '/') leave it as "/".
+  Note: O_BINARY does not exist on Linux/Unix — C #defines it to 0 there.
+  Used by unixSync(SYNC_DATAONLY) on directory-fsync paths.  Bug 6.28 —
+  was previously a no-op stub; now matches upstream. }
+function  pas_openDirectory(zPath: PChar; pFd: PcInt): cint; cdecl;
+var
+  zDirname : array[0..MAX_PATHNAME] of char;
+  ii       : cint;
+  fd       : cint;
+begin
+  if pFd = nil then begin Result := SQLITE_CANTOPEN; Exit; end;
+  pFd^ := -1;
+  if zPath = nil then begin Result := SQLITE_CANTOPEN; Exit; end;
+
+  { sqlite3_snprintf-equivalent: copy zPath into zDirname, NUL-terminated,
+    capped at MAX_PATHNAME (StrLCopy already enforces the cap). }
+  StrLCopy(@zDirname[0], zPath, MAX_PATHNAME);
+
+  { Walk back to the last '/' (mirrors C's `for(ii=strlen; ii>0 && zDirname[ii]!='/'; ii--)`). }
+  ii := cint(StrLen(@zDirname[0]));
+  while (ii > 0) and (zDirname[ii] <> '/') do Dec(ii);
+
+  if ii > 0 then begin
+    zDirname[ii] := #0;
+  end else begin
+    if zDirname[0] <> '/' then zDirname[0] := '.';
+    zDirname[1] := #0;
+  end;
+
+  fd := FpOpen(@zDirname[0], O_RDONLY, 0);
+  if fd >= 0 then begin
+    pFd^   := fd;
+    Result := SQLITE_OK;
+  end else begin
+    Result := SQLITE_CANTOPEN;
+  end;
+end;
+
+{ os_unix.c ~7100: unixGetpagesize stub for the table slot. }
+function  c_getpagesize_sysc: cint;
+  cdecl; external 'c' name 'getpagesize';
+function  pas_getpagesize: cint; cdecl;
+begin
+  Result := c_getpagesize_sysc;
+end;
+
+{ The table.  Order matches os_unix.c §427..596 exactly so any index-
+  based reference from a shared header stays in sync.                 }
+var
+  aSyscall : array[0..28] of unix_syscall = (
+    (zName: 'open';          pCurrent: sqlite3_syscall_ptr(@c_posixOpen);    pDefault: nil),
+    (zName: 'close';         pCurrent: sqlite3_syscall_ptr(@c_close);        pDefault: nil),
+    (zName: 'access';        pCurrent: sqlite3_syscall_ptr(@c_access);       pDefault: nil),
+    (zName: 'getcwd';        pCurrent: sqlite3_syscall_ptr(@c_getcwd);       pDefault: nil),
+    (zName: 'stat';          pCurrent: sqlite3_syscall_ptr(@c_stat);         pDefault: nil),
+    (zName: 'fstat';         pCurrent: sqlite3_syscall_ptr(@c_fstat);        pDefault: nil),
+    (zName: 'ftruncate';     pCurrent: sqlite3_syscall_ptr(@c_ftruncate);    pDefault: nil),
+    (zName: 'fcntl';         pCurrent: sqlite3_syscall_ptr(@c_fcntl);        pDefault: nil),
+    (zName: 'read';          pCurrent: sqlite3_syscall_ptr(@c_read);         pDefault: nil),
+    (zName: 'pread';         pCurrent: sqlite3_syscall_ptr(@c_pread);        pDefault: nil),
+    (zName: 'pread64';       pCurrent: nil;                                  pDefault: nil),
+    (zName: 'write';         pCurrent: sqlite3_syscall_ptr(@c_write);        pDefault: nil),
+    (zName: 'pwrite';        pCurrent: sqlite3_syscall_ptr(@c_pwrite);       pDefault: nil),
+    (zName: 'pwrite64';      pCurrent: nil;                                  pDefault: nil),
+    (zName: 'fchmod';        pCurrent: sqlite3_syscall_ptr(@c_fchmod);       pDefault: nil),
+    (zName: 'fallocate';     pCurrent: sqlite3_syscall_ptr(@c_fallocate);    pDefault: nil),
+    (zName: 'unlink';        pCurrent: sqlite3_syscall_ptr(@c_unlink);       pDefault: nil),
+    (zName: 'openDirectory'; pCurrent: sqlite3_syscall_ptr(@pas_openDirectory); pDefault: nil),
+    (zName: 'mkdir';         pCurrent: sqlite3_syscall_ptr(@c_mkdir);        pDefault: nil),
+    (zName: 'rmdir';         pCurrent: sqlite3_syscall_ptr(@c_rmdir);        pDefault: nil),
+    (zName: 'fchown';        pCurrent: sqlite3_syscall_ptr(@c_fchown);       pDefault: nil),
+    (zName: 'geteuid';       pCurrent: sqlite3_syscall_ptr(@c_geteuid);      pDefault: nil),
+    (zName: 'mmap';          pCurrent: sqlite3_syscall_ptr(@c_mmap);         pDefault: nil),
+    (zName: 'munmap';        pCurrent: sqlite3_syscall_ptr(@c_munmap);       pDefault: nil),
+    (zName: 'mremap';        pCurrent: nil;                                  pDefault: nil),
+    (zName: 'getpagesize';   pCurrent: sqlite3_syscall_ptr(@pas_getpagesize); pDefault: nil),
+    (zName: 'readlink';      pCurrent: sqlite3_syscall_ptr(@c_readlink);     pDefault: nil),
+    (zName: 'lstat';         pCurrent: sqlite3_syscall_ptr(@c_lstat);        pDefault: nil),
+    (zName: 'ioctl';         pCurrent: nil;                                  pDefault: nil)
+  );
+
+{ os_unix.c:731 — unixSetSystemCall.  Override or restore one slot
+  (or, when zName=NULL, reset every slot to its default). }
+function unixSetSystemCall(pNotUsed: Psqlite3_vfs; zName: PChar;
+                           pNewFunc: sqlite3_syscall_ptr): cint; cdecl;
+var
+  i  : cint;
+  rc : cint;
+begin
+  rc := SQLITE_NOTFOUND;
+  if zName = nil then
+  begin
+    rc := SQLITE_OK;
+    for i := 0 to High(aSyscall) do
+      if aSyscall[i].pDefault <> nil then
+        aSyscall[i].pCurrent := aSyscall[i].pDefault;
+  end
+  else
+  begin
+    for i := 0 to High(aSyscall) do
+      if StrComp(zName, aSyscall[i].zName) = 0 then
+      begin
+        if aSyscall[i].pDefault = nil then
+          aSyscall[i].pDefault := aSyscall[i].pCurrent;
+        rc := SQLITE_OK;
+        if pNewFunc = nil then pNewFunc := aSyscall[i].pDefault;
+        aSyscall[i].pCurrent := pNewFunc;
+        Break;
+      end;
+  end;
+  Result := rc;
+end;
+
+{ os_unix.c:774 — unixGetSystemCall.  Return current slot value, or NULL
+  if zName is unknown / the slot is undefined. }
+function unixGetSystemCall(pNotUsed: Psqlite3_vfs;
+                           zName: PChar): sqlite3_syscall_ptr; cdecl;
+var
+  i : cint;
+begin
+  for i := 0 to High(aSyscall) do
+    if StrComp(zName, aSyscall[i].zName) = 0 then
+    begin
+      Result := aSyscall[i].pCurrent;
+      Exit;
+    end;
+  Result := nil;
+end;
+
+{ os_unix.c:793 — unixNextSystemCall.  Enumerate the table, skipping
+  slots whose pCurrent is NULL.  zName=NULL means "first call". }
+function unixNextSystemCall(pNotUsed: Psqlite3_vfs;
+                            zName: PChar): PChar; cdecl;
+var
+  i : cint;
+begin
+  i := -1;
+  if zName <> nil then
+  begin
+    for i := 0 to High(aSyscall) - 1 do
+      if StrComp(zName, aSyscall[i].zName) = 0 then Break;
+  end;
+  Inc(i);
+  while i <= High(aSyscall) do
+  begin
+    if aSyscall[i].pCurrent <> nil then
+    begin
+      Result := aSyscall[i].zName;
+      Exit;
+    end;
+    Inc(i);
+  end;
+  Result := nil;
+end;
+
+{ ============================================================
   Section 14d: sqlite3_os_init / sqlite3_os_end  (os_unix.c ~8448)
   ============================================================ }
 
@@ -2178,7 +2548,7 @@ function sqlite3_os_init: cint;
 begin
   { Fill in the singleton unixVfsObj (declared in interface section) }
   FillChar(unixVfsObj, SizeOf(unixVfsObj), 0);
-  unixVfsObj.iVersion        := 2;    { v2: xCurrentTimeInt64 wired below }
+  unixVfsObj.iVersion        := 3;    { v3: xSetSystemCall et al. wired below }
   unixVfsObj.szOsFile        := SizeOf(unixFile);
   unixVfsObj.mxPathname      := MAX_PATHNAME;
   unixVfsObj.pNext           := nil;
@@ -2197,15 +2567,38 @@ begin
   unixVfsObj.xCurrentTime    := @unixCurrentTime;
   unixVfsObj.xGetLastError   := @unixGetLastError;
   unixVfsObj.xCurrentTimeInt64 := @unixCurrentTimeInt64;
-  unixVfsObj.xSetSystemCall  := nil;
-  unixVfsObj.xGetSystemCall  := nil;
-  unixVfsObj.xNextSystemCall := nil;
+  unixVfsObj.xSetSystemCall  := @unixSetSystemCall;
+  unixVfsObj.xGetSystemCall  := @unixGetSystemCall;
+  unixVfsObj.xNextSystemCall := @unixNextSystemCall;
 
   { Capture $SQLITE_TMPDIR / $TMPDIR for unixTempFileDir's fallback list. }
   unixTempFileInit;
 
   { Register as the default VFS }
   sqlite3_vfs_register(@unixVfsObj, 1);
+
+  { Locking-style sibling VFSes (os_unix.c:8499..8542 UNIXVFS chain).
+    Each sibling is a byte-for-byte copy of `unixVfsObj` with a fresh
+    zName and pNext cleared.  Functional locking-style dispatch is a
+    follow-up (pAppData/finder mechanism not yet wired through
+    `unixOpen` — see bug 6.31 closed-bug note).  For now these exist
+    so that `.vfslist`, `.vfsname`, and `sqlite3_vfs_find()` enumerate
+    the same names as upstream. }
+  unixVfsObjNone        := unixVfsObj;
+  unixVfsObjNone.pNext  := nil;
+  unixVfsObjNone.zName  := 'unix-none';
+  sqlite3_vfs_register(@unixVfsObjNone, 0);
+
+  unixVfsObjDotfile        := unixVfsObj;
+  unixVfsObjDotfile.pNext  := nil;
+  unixVfsObjDotfile.zName  := 'unix-dotfile';
+  sqlite3_vfs_register(@unixVfsObjDotfile, 0);
+
+  unixVfsObjExcl        := unixVfsObj;
+  unixVfsObjExcl.pNext  := nil;
+  unixVfsObjExcl.zName  := 'unix-excl';
+  sqlite3_vfs_register(@unixVfsObjExcl, 0);
+
   Result := SQLITE_OK;
 end;
 

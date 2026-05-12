@@ -169,6 +169,7 @@ function tmstmpNextSystemCall(pVfs: Psqlite3_vfs;
 var
   tmstmp_vfs        : sqlite3_vfs;
   tmstmp_io_methods : sqlite3_io_methods;
+  gTmstmpvfsInitialised : Boolean = False;
 
 { -------- ORIGVFS / ORIGFILE helpers (tmstmpvfs.c:320..321) ------------ }
 
@@ -752,6 +753,13 @@ end;
 
 procedure ensureMethodTablesPopulated;
 begin
+  { Mirrors tmstmpvfs.c:406 — tmstmp_vfs is a static struct-literal initialised
+    exactly once.  Without this guard, re-invocation while tmstmp_vfs is
+    already linked into the VFS list would FillChar+zero pNext BEFORE
+    vfs_register's vfsUnlink walked the chain, severing every subsequent VFS
+    (bug 6.20, mirrors the appendvfs 6.19 fix). }
+  if gTmstmpvfsInitialised then Exit;
+
   FillChar(tmstmp_io_methods, SizeOf(tmstmp_io_methods), 0);
   tmstmp_io_methods.iVersion               := 3;
   tmstmp_io_methods.xClose                 := @tmstmpClose;
@@ -794,6 +802,8 @@ begin
   tmstmp_vfs.xSetSystemCall  := @tmstmpSetSystemCall;
   tmstmp_vfs.xGetSystemCall  := @tmstmpGetSystemCall;
   tmstmp_vfs.xNextSystemCall := @tmstmpNextSystemCall;
+
+  gTmstmpvfsInitialised := True;
 end;
 
 function tmstmpRegisterVfs: i32;
