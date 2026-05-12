@@ -28792,22 +28792,35 @@ begin
   {$IFDEF SQLITE_DEBUG}
   TreeTraceLine($2, 'WhereEnd');  { select.c:8341 }
   { 10.1.42.a deferred sub-arms — the remaining TREETRACE callsites in
-    upstream select.c:3011..3030 (multiSelect UNION ALL left/right),
-    4525 (compound-subquery flattener peer-creation), 4706
-    (After flattening), 6339 (After result-set wildcard expansion),
-    6572 (AggInfo adjusted for Indexed Exprs), 7047 (Move HAVING into
-    WHERE), 7199 (After count-of-view optimization), 7369
-    (EXISTS-to-JOIN optimization), 7631 (dropping superfluous ORDER BY),
-    7693 (after window rewrite), 7737..7756 (FULL/LEFT/RIGHT-JOIN
-    simplifies), 7832 (omit superfluous ORDER BY on FROM-subquery),
-    7887 (end compound-select processing), 8011..8030 (WHERE-clause
-    push-down / Change unused result columns to NULL), 8146 (After
-    all FROM-clause analysis), 8192 (Transform DISTINCT into GROUP BY),
-    8442/8609 (After aggregate analysis / AggInfo function expressions
-    converted to reference index), 8937 (Finished with AggInfo) — to
-    be landed individually once each pas codegen counterpart is
-    confidently anchored.  The mask gating still works (these are no-ops
-    in non-debug and silent on missing masks in debug). }
+    upstream select.c.  Anchor status (10.1.42.a.5 verification):
+      3011/3030 multiSelect UNION ALL left/right    — LANDED (a.1)
+      4525  compound-subquery flattener peer       — deferred (no anchor)
+      4706  After flattening                       — LANDED (a.2)
+      6339  After wildcard expansion (mask 0x8)    — LANDED (a.2)
+      6572  AggInfo adjusted for Indexed Exprs     — deferred (no host)
+      7047  Move HAVING into WHERE                 — deferred (no host)
+      7199  After count-of-view optimization       — deferred (no host)
+      7369  EXISTS-to-JOIN optimization            — LANDED (a.3)
+      7631  dropping superfluous ORDER BY (0x800)  — deferred (no host)
+      7693  after window rewrite (0x40)            — LANDED (a.4)
+      7737..7756 FULL/LEFT/RIGHT-JOIN simpl (0x1000) — deferred (a.5,
+            no outer-join simplifier loop in Pas's sqlite3Select)
+      7832  omit FROM-subquery ORDER BY (0x800)    — deferred (a.5,
+            no FROM-clause optimisation loop)
+      7887  end compound-select processing        — deferred (no host)
+      8011/8030 WHERE-clause push-down (0x4000)    — deferred (a.5,
+            pushDownWhereTerms / disableUnusedSubqueryResultColumns
+            not ported)
+      8146  After all FROM-clause analysis (0x8000) — deferred (a.5,
+            no Pas counterpart to the post-FROM-loop snapshot point)
+      8192  Transform DISTINCT into GROUP BY (0x20000) — deferred (a.4,
+            no Pas optimiser arm)
+      8442  After aggregate analysis                — LANDED (a.3)
+      8609  AggInfo function exprs -> indexed ref   — deferred (a.6.4)
+      8937  Finished with AggInfo (0x20)            — deferred (a.5/
+            a.6.5, late select_end AggInfo teardown not ported)
+    The mask gating still works (no-ops in non-debug, silent on missing
+    masks in debug). }
   {$ENDIF}
   sqlite3WhereEnd(pWInfo);
 

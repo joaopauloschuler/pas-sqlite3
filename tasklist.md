@@ -537,10 +537,30 @@ partial landings cannot silently no-op.
       "Transform DISTINCT into GROUP BY" (select.c:8192) — the SF_Distinct
       → pGroupBy optimizer arm (post-FROM-clause analysis) is not ported.
       Both land when the surrounding optimizer arms land.
-    - [ ] **10.1.42.a.5** Outer-join simplification + FROM-subquery
-      TREETRACE arms: FULL/LEFT/RIGHT-JOIN simplifies, omit
-      FROM-subquery ORDER BY, WHERE push-down, all-FROM analysis,
-      Finished-with-AggInfo trailing print.
+    - [~] **10.1.42.a.5** Outer-join simplification + FROM-subquery
+      TREETRACE arms (VERIFIED C masks: 0x1000 FULL/LEFT/RIGHT
+      simplifies select.c:7737..7756; 0x800 omit FROM-subquery
+      ORDER BY :7832; 0x4000 WHERE push-down :8011 and Change-unused-
+      result-columns :8030; 0x8000 all-FROM analysis :8146; 0x20
+      Finished-with-AggInfo :8937).  All five arms are entirely
+      deferred — none of the host optimizer passes are ported yet:
+      - select.c:7708..7877 outer FROM-clause optimization loop
+        (JT_LEFT/RIGHT/LTORJ simplifier + IgnorableOrderby
+        FROM-subquery pOrderBy drop) is not ported; Pas's sqlite3Select
+        runs `existsToJoin` + `propagateConstants` then jumps straight
+        into the per-shape codegen, without the per-FROM-item walk.
+      - pushDownWhereTerms (where.c) and
+        disableUnusedSubqueryResultColumns (select.c) are not ported,
+        so the 0x4000 push-down/null-out arms have no callsite to
+        attach to.
+      - select.c:8136..8149 (the post-FROM-loop snapshot, mask 0x8000)
+        has no Pas anchor — the snapshot point doesn't exist because
+        the loop it terminates doesn't exist.
+      - "Finished with AggInfo" (select.c:8937, mask 0x20) lives in
+        the late select_end AggInfo teardown that's already listed
+        deferred under 10.1.42.a.6 (a.6.5).
+      Land in lock-step with the host ports under 10.1.42.a.6 / future
+      optimizer-pass batches.
     - [ ] **10.1.42.a.6** Port the host optimizer helpers gating the
       remaining 10.1.42.a.3 sub-arms: `havingToWhere` (select.c:7047),
       `countOfViewOptimization` (:7199), `optimizeAggregateUseOfIndexedExpr`
