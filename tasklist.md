@@ -363,21 +363,37 @@ regressions without human triage.
 
 - [ ] **9.3.1** In-process harness.  `TestFuzzDiff.pas` reads a single
   `dbsqlfuzz`-format input (db prefix + SQL tail per upstream
-  `test/fuzzcheck.c`), runs it under both oracles in isolated
-  workdirs, byte-diffs all output channels.  No AFL yet — just the
-  one-shot driver that AFL will later call.
+  `test/fuzzcheck.c` — read its `ossfuzz_set_data` / db-prefix parser
+  for the exact frame layout before implementing), runs it under both
+  oracles in isolated workdirs, byte-diffs all four output channels
+  (stdout, stderr, rc, db-blob — reuse `src/tests/CorpusOracle.pas`
+  plumbing rather than re-implementing).  Apply the existing
+  `ApplyHeaderMask` from 9.1.4 to the db-blob channel.  No AFL yet —
+  just the one-shot driver that AFL will later call.
 
 - [ ] **9.3.2** Seed corpus import.  Pull the upstream `dbsqlfuzz`
-  seed set from `../sqlite3/test/fuzzdata*.db` into
-  `src/tests/fuzz/seeds/`.  Run the one-shot driver across every
-  seed; any divergence under the seed set is a Phase 6/7 bullet
-  (file it before continuing).
+  seed set from `../sqlite3/test/fuzzdata*.db` (8 seed files as of
+  2026-05-12) into `src/tests/fuzz/seeds/`.  Run the one-shot driver
+  across every seed.  Any divergence is catalogued in
+  `src/tests/DIVERGENCES.md` per the skip-and-cite contract
+  established by 9.1.3.followup — do **not** chase fixes during this
+  task; just surface and bucket each cluster.  Each cluster then
+  becomes a `9.3.divbug.N` follow-up bullet (mirroring the
+  `9.1.divbug.*` pattern).
 
 - [ ] **9.3.3** AFL wiring.  `src/tests/fuzz/afl-driver.pas` wraps
   9.3.1 for `afl-fuzz` (read input from stdin, write to a tmp file,
   invoke the in-process harness, return AFL-compatible exit codes).
-  Document the `AFL_LLVM_INSTRUMENT` / persistent-mode build line.
-  Skip if AFL isn't installed — script must self-report.
+  **FPC-AFL gotcha:** FPC has no `afl-clang-fast` equivalent (no LLVM
+  instrumentation pass).  Realistic options: (a) `afl-gcc` with
+  deferred instrumentation via FPC's `{$LINKLIB}` + a small C
+  shim that hosts the `__AFL_LOOP` macro; (b) black-box
+  `afl-fuzz -n` (no instrumentation, dumb-fuzz only — much lower
+  coverage but always works); (c) port the persistent-mode entry
+  to a thin C wrapper that calls into the Pascal harness via
+  `cdecl`.  Pick whichever the first agent can stand up cleanly;
+  document the choice in `src/tests/fuzz/README.md`.  Skip
+  gracefully if AFL isn't installed — script must self-report.
 
 - [ ] **9.3.4** Crash-vs-divergence classifier.  Triage helper that
   separates (a) Pascal crash, (b) C crash, (c) silent divergence,
@@ -402,16 +418,30 @@ regressions without human triage.
   `tcl-perf` (defer to Phase 11).  Land `src/tests/tcl/MANIFEST.txt`.
 
 - [ ] **9.4.2** Tcl binding shim.  Reuse / port the minimum of
-  `src/tclsqlite.c` (Phase 8 dependency) needed so the upstream
-  `interp` can attach to passqlite3 via the same `sqlite3` Tcl
-  command.  Internal helpers (`db_eval_one_with_callback`) port as
-  thin wrappers; the public `sqlite3 db1 :memory:` command is
-  enough for ~80% of `tcl-feature`.
+  `../sqlite3/src/tclsqlite.c` (~6000 C lines total, but only a
+  small subset is needed) so the upstream `interp` can attach to
+  passqlite3 via the same `sqlite3` Tcl command.  Realistic complexity:
+  **M** for the minimal `sqlite3 db1 :memory:` + `db eval` + `db close`
+  trio that unblocks ~80% of `tcl-feature`; **L** if `db function` /
+  `db trace` / `db authorizer` callbacks also need wiring (many
+  feature tests use them).  Pre-requisite: a working
+  FPC↔Tcl bridge (likely `tcl.pp` from fpc-extras or a hand-rolled
+  cdecl binding to libtcl).  Sub-step before any porting: port
+  `../sqlite3/test/tester.tcl` dependencies — it's the common harness
+  every `.test` file loads via `source $testdir/tester.tcl`, and it
+  pulls in `do_test` / `do_execsql_test` / `expected` / etc.  Without
+  tester.tcl no `.test` file runs.
 
 - [ ] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
   `tclsh` against each manifest entry with the port's shim
-  preloaded; collects pass/fail/skip per test; the gate is "every
+  preloaded; collects pass/fail/skip per test.  Output format:
+  one line per test (`PASS|FAIL|SKIP <path> <assertions> <duration>`),
+  matching upstream's `make test` log shape.  The gate is "every
   `tcl-feature` test exits 0 or matches the upstream skip list".
+  Per the skip-and-cite contract from 9.1.3.followup, divergences
+  surface into `src/tests/tcl/DIVERGENCES.md` rather than blocking
+  the driver — each cluster becomes a `9.4.divbug.N` follow-up
+  bullet for triage.
 
 - [ ] **9.4.4** Skip-list curation.  Tests that depend on
   `sqlite3_test_control`, `PRAGMA legacy_*`, or other internal
