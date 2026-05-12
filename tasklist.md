@@ -79,6 +79,7 @@ FPC porting traps that recur often enough to call out up-front:
   - [ ] **6.28.5** Port `sqlite3LimitWhere` view-rewrite arm — currently bails on views. C source: `../sqlite3/src/delete.c` (grep `sqlite3LimitWhere`).
   - [ ] **6.28.6** Port `OP_IntegrityCk` body — high priority if 9.2.x reference vectors include a deliberately-corrupt vector. C source: `../sqlite3/src/vdbe.c` (grep `case OP_IntegrityCk`).
   - [X] **6.28.7** Wire `getRowTrigger` mask helper — audit verdict: stub-was-real. `trgGetRowTrigger` (passqlite3codegen.pas:30884) + `codeRowTrigger` (:30709) are 1:1 with trigger.c:1347 / 1231; aColmask[0/1] populated from sub-Parse oldmask/newmask; `sqlite3TriggerColmask` picks up real per-column bits for ordinary triggers. Stale "not yet ported" comments scrubbed; STUB_INVENTORY #7 closed.
+  - [ ] **6.28.8** Audit-pass remaining high-priority STUB_INVENTORY entries (#1 `whereLoopAddVirtual`, #2 `sqlite3OpenTableAndIndices`, #4 `sqlite3AddColumn` STRICT, #5 `sqlite3LimitWhere` view, #6 `OP_IntegrityCk`) the same way #3/#7 were audited: confirm each is actually a stub vs. a misleading marker comment over a real body before assigning porting work. Two of the seven turned out already-real (#3, #7) — re-verify the other five so future agents don't repeat the fake-port temptation. Update STUB_INVENTORY.md status column per entry.
 
 ### Closed bugs (kept as ticked stubs)
 
@@ -435,6 +436,12 @@ partial landings cannot silently no-op.
     unknown-option, missing-argument) still emit the legacy "Error: ...\n"
     form — promoting them is mechanical follow-up; not blocking 10.1.40
     closure.
+  - [ ] **10.1.40.a.followup** Route the remaining `.check` cluster
+    "Error: …\n" callsites through `shellDotError` so every error path
+    in `cmdCheck` / `cmdTestcase` carries the caret prefix, not just
+    the two sites wired in 10.1.40.a.  Grep `Error: ` in
+    `passqlite3shell.pas` near the `.check` arm.  Extend
+    TestShellMeta `dotcmd-error-caret` to cover the additional paths.
   - [ ] **10.1.40.b** `<<ENDMARK` heredoc PATTERN form for `.check` —
     upstream allows multi-line PATTERN delimited by `<<ENDMARK …
     ENDMARK`.  Needs a seekable PFILE input replay (currently the
@@ -509,6 +516,14 @@ partial landings cannot silently no-op.
       TREETRACE arms: FULL/LEFT/RIGHT-JOIN simplifies, omit
       FROM-subquery ORDER BY, WHERE push-down, all-FROM analysis,
       Finished-with-AggInfo trailing print.
+    - [ ] **10.1.42.a.6** Port the host optimizer helpers gating the
+      remaining 10.1.42.a.3 sub-arms: `havingToWhere` (select.c:7047),
+      `countOfViewOptimization` (:7199), `optimizeAggregateUseOfIndexedExpr`
+      (:6572), `aggregateConvertIndexedExprRefToColumn` (:8609), and the
+      `select_end` AggInfo teardown print (:8937).  Each is a host function
+      not yet ported; once any one lands, drop its `{$IFDEF SQLITE_DEBUG}`
+      TREETRACE arm at the same call site.  Treat as 5 independent
+      micro-tasks (a.6.1..a.6.5) when work begins — file as needed.
   - [~] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
     wherecode.c → passqlite3codegen.pas.  First batch landed: BEGIN/END
     `addBtreeIdx(%s)` in `whereLoopAddBtreeIndex` (mask 0x800), BEGIN/END
@@ -586,6 +601,14 @@ partial landings cannot silently no-op.
     - [ ] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
       trailing WHERETRACE in `sqlite3WhereBegin` epilogue (mask 0x1):
       `Optimizer Finished` summary line.
+    - [ ] **10.1.42.b.7** Port the STAT4 cost-estimator helpers that
+      gate the 4 deferred 10.1.42.b.1 arms: `whereRangeSkipScanEst`
+      (where.c:2036), `whereEqualScanEst` (:2215 / :2313),
+      `whereInScanEst` (:2363).  Each is a STAT4-driven planner helper
+      not yet present in passqlite3codegen.pas.  Mask: 0x20 (verified
+      against whereInt.h, NOT 0x10 as tasklist initially suggested).
+      Treat as 3 independent micro-tasks; drop the WHERETRACE call at
+      each host function as it lands.
   - [X] **10.1.42.c** sqlite3DebugPrintf — ported from printf.c:1514..1532 as
     `procedure sqlite3DebugPrintf(zFormat: PAnsiChar; const args: array of const)`
     in passqlite3printf.pas.  Renders via the existing sqlite3FormatStr core,
