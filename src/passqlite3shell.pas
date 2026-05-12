@@ -7817,46 +7817,323 @@ begin
   shellEPutZ('Warning: .scanstats not available in this build.'#10);
 end;
 
-{ Phase 8.2.1 — minimal `.scanstats on` output.  Iterates per-loop
-  ScanStatus entries and emits NLOOP/NVISIT/EST/NAME/EXPLAIN as a
-  simple tabular block.  Upstream (qrf.c qrfEqpStats) renders an
-  EQP tree with NCYCLE percentages; that formatter is not yet ported,
-  so values match but tree layout does not. NCYCLE is deferred. }
-procedure displayScanstats(p: PShellState; pStmt: Pointer);
+{ 10.1.39.c — qrfEqpStats EQP-tree formatter port from
+  ext/qrf/qrf.c:162..454.  Builds an in-memory linked list of
+  (iEqpId, iParentId, text) rows by walking the prepared
+  statement's scanstatus_v2 entries, then renders them as an
+  indented EQP tree with `|--` / ``--` connectors.  Rows on each
+  loop are stamped with NLOOP and NVISIT counts via qrfApproxInt64
+  (`%4d ` for N<10000, otherwise three-significant-digit suffix
+  K/M/G/T/P/E).  NCYCLE / `est`-variant numerics deferred (the
+  hwtime sampler is task 10.1.39.d); `.scanstats vm` falls through
+  to a stub.  Output goes to stdout via shellSPutZ.
+
+  C reference: ext/qrf/qrf.c
+    qrfEqpAppend (162..190), qrfEqpReset (196..206), qrfEqpNextRow
+    (211..215), qrfEqpRenderLevel (220..235), qrfApproxInt64
+    (244..274), qrfStatsHeight (325..349), qrfEqpStats (356..454).
+}
+type
+  PEqpRow  = ^TEqpRow;
+  TEqpRow  = record
+    iEqpId:    i32;
+    iParentId: i32;
+    pNext:     PEqpRow;
+    zText:     AnsiString;
+  end;
+  PEqpGraph = ^TEqpGraph;
+  TEqpGraph = record
+    pRow:    PEqpRow;
+    pLast:   PEqpRow;
+    nWidth:  i32;
+    zPrefix: array[0..255] of AnsiChar;
+  end;
+
 var
-  i:      i32;
-  rc:     i32;
-  nLoop:  i64;
-  nRow:   i64;
-  rEst:   Double;
-  zName:  PAnsiChar;
-  zExpl:  PAnsiChar;
-  iSel:   i32;
-  iPid:   i32;
+  gEqpGraph: PEqpGraph = nil;
+  gEqpOut:   AnsiString;
+
+procedure qrfEqpReset; forward;
+
+procedure qrfEqpAppend(iEqpId, p2: i32; const zText: AnsiString);
+{ qrf.c:162..190 — append (iEqpId, p2, zText) to the EQP graph;
+  allocates the graph on first call. }
+var pNew: PEqpRow;
+begin
+  if zText = '' then Exit;
+  if gEqpGraph = nil then
+  begin
+    New(gEqpGraph);
+    gEqpGraph^.pRow := nil;
+    gEqpGraph^.pLast := nil;
+    gEqpGraph^.nWidth := 0;
+    gEqpGraph^.zPrefix[0] := #0;
+  end;
+  pNew := System.GetMem(SizeOf(TEqpRow));
+  FillChar(pNew^, SizeOf(TEqpRow), 0);
+  pNew^.iEqpId    := iEqpId;
+  pNew^.iParentId := p2;
+  pNew^.zText     := zText;
+  pNew^.pNext     := nil;
+  if gEqpGraph^.pLast <> nil then
+    gEqpGraph^.pLast^.pNext := pNew
+  else
+    gEqpGraph^.pRow := pNew;
+  gEqpGraph^.pLast := pNew;
+end;
+
+procedure qrfEqpReset;
+{ qrf.c:196..206. }
+var pRow, pNext: PEqpRow;
+begin
+  if gEqpGraph = nil then Exit;
+  pRow := gEqpGraph^.pRow;
+  while pRow <> nil do
+  begin
+    pNext := pRow^.pNext;
+    pRow^.zText := '';     { release ref-count before FreeMem }
+    System.FreeMem(pRow);
+    pRow := pNext;
+  end;
+  Dispose(gEqpGraph);
+  gEqpGraph := nil;
+end;
+
+function qrfEqpNextRow(iEqpId: i32; pOld: PEqpRow): PEqpRow;
+{ qrf.c:211..215. }
+var pRow: PEqpRow;
+begin
+  if pOld <> nil then pRow := pOld^.pNext
+  else if gEqpGraph <> nil then pRow := gEqpGraph^.pRow
+  else pRow := nil;
+  while (pRow <> nil) and (pRow^.iParentId <> iEqpId) do
+    pRow := pRow^.pNext;
+  Result := pRow;
+end;
+
+procedure qrfEqpRenderLevel(iEqpId: i32);
+{ qrf.c:220..235. }
+var
+  pRow, pNext: PEqpRow;
+  n:           i32;
+  connector:   PAnsiChar;
+  prefixLen:   i32;
+begin
+  if gEqpGraph = nil then Exit;
+  n := i32(CStrLen(@gEqpGraph^.zPrefix[0]));
+  pRow := qrfEqpNextRow(iEqpId, nil);
+  while pRow <> nil do
+  begin
+    pNext := qrfEqpNextRow(iEqpId, pRow);
+    if pNext <> nil then connector := '|--' else connector := '`--';
+    gEqpOut := gEqpOut + AnsiString(@gEqpGraph^.zPrefix[0])
+                       + AnsiString(connector) + pRow^.zText + #10;
+    prefixLen := i32(SizeOf(gEqpGraph^.zPrefix));
+    if n < prefixLen - 7 then
+    begin
+      if pNext <> nil then
+      begin
+        gEqpGraph^.zPrefix[n]   := '|';
+        gEqpGraph^.zPrefix[n+1] := ' ';
+        gEqpGraph^.zPrefix[n+2] := ' ';
+      end else begin
+        gEqpGraph^.zPrefix[n]   := ' ';
+        gEqpGraph^.zPrefix[n+1] := ' ';
+        gEqpGraph^.zPrefix[n+2] := ' ';
+      end;
+      gEqpGraph^.zPrefix[n+3] := #0;
+      qrfEqpRenderLevel(pRow^.iEqpId);
+      gEqpGraph^.zPrefix[n] := #0;
+    end;
+    pRow := pNext;
+  end;
+end;
+
+function qrfApproxInt64(N: i64): AnsiString;
+{ qrf.c:244..274 — 16-char approx decimal.  N<10000 → "%4d "; else
+  three-significant-digit form with K/M/G/T/P/E suffix. }
+const aSuffix: array[0..5] of AnsiChar = ('K','M','G','T','P','E');
+var
+  prefix: AnsiString;
+  ii:     i32;
+  n2:     i32;
+begin
+  prefix := '';
+  if N < 0 then
+  begin
+    if N = Low(i64) then N := High(i64) else N := -N;
+    prefix := '-';
+  end;
+  if N < 10000 then
+  begin
+    Result := prefix + Format('%4d ', [Int64(N)]);
+    Exit;
+  end;
+  Result := prefix;
+  for ii := 1 to 18 do
+  begin
+    N := (N + 5) div 10;
+    if N < 10000 then
+    begin
+      n2 := i32(N);
+      case ii mod 3 of
+        0: Result := Result + Format('%d.%.2d', [n2 div 1000, (n2 mod 1000) div 10]);
+        1: Result := Result + Format('%2d.%d',  [n2 div 100,  (n2 mod 100)  div 10]);
+        2: Result := Result + Format('%4d',     [n2 div 10]);
+      end;
+      Result := Result + aSuffix[ii div 3];
+      break;
+    end;
+  end;
+end;
+
+function qrfStatsHeight(pStmt: Pointer; iEntry: i32): i32;
+{ qrf.c:325..349 — walk PARENTID chain via SELECTID lookup. }
+const f = 0;  { Not SCANSTAT_COMPLEX — matches upstream skip-zName=nil semantics
+                in vdbeapi.c:2501..2509 so we iterate only top-level loop entries. }
+var
+  iPid, iId, res: i32;
+  ii: i32;
+begin
+  iPid := 0;
+  Result := 1;
+  sqlite3_stmt_scanstatus_v2(pStmt, iEntry, SQLITE_SCANSTAT_SELECTID, f, @iPid);
+  while iPid <> 0 do
+  begin
+    ii := 0;
+    while True do
+    begin
+      iId := 0;
+      res := sqlite3_stmt_scanstatus_v2(pStmt, ii, SQLITE_SCANSTAT_SELECTID, f, @iId);
+      if res <> 0 then break;
+      if iId = iPid then
+        sqlite3_stmt_scanstatus_v2(pStmt, ii, SQLITE_SCANSTAT_PARENTID, f, @iPid);
+      Inc(ii);
+    end;
+    Inc(Result);
+  end;
+end;
+
+{ 10.1.39.c — main displayScanstats entry: ports ext/qrf/qrf.c
+  qrfEqpStats (qrf.c:356..454) for the non-NCYCLE (.scanstats on)
+  case.  NCYCLE arms (SQLITE_SCANSTAT_NCYCLE) report -1 in our
+  build so the `if( nCycle>=0 || nLoop>=0 || nRow>=0 )` gate always
+  enters the formatted path through nLoop / nRow.  After building
+  the row list we prepend the "QUERY PLAN\n" header (no nCycle
+  banner) and recursively render from iEqpId=0. }
+procedure displayScanstats(p: PShellState; pStmt: Pointer);
+const f = 0;  { Not SCANSTAT_COMPLEX — matches upstream skip-zName=nil semantics
+                in vdbeapi.c:2501..2509 so we iterate only top-level loop entries. }
+var
+  i:        i32;
+  nLoop:    i64;
+  nRow:     i64;
+  nCycle:   i64;
+  iId:      i32;
+  iPid:     i32;
+  zo:       PAnsiChar;
+  zName:    PAnsiChar;
+  rEst:     Double;
+  nWidth:   i32;
+  n:        i32;
+  stats:    AnsiString;
+  line:     AnsiString;
+  nSp:      i32;
+  padCnt:   i32;
+  zoStr:    AnsiString;
 begin
   if (pStmt = nil) or (p^.mode.scanstatsOn = 0) then Exit;
-  shellEPutZ('-------- scanstats --------'#10);
+
+  { First pass — compute nWidth = max(strlen(zExplain) +
+    qrfStatsHeight*3) + 2. }
+  nWidth := 0;
   i := 0;
-  while True do begin
-    zExpl := nil;
-    rc := sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EXPLAIN, 0, @zExpl);
-    if rc <> 0 then break;
-    nLoop := -1; nRow := -1; rEst := 0.0;
-    zName := nil; iSel := -1; iPid := -1;
-    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NLOOP,    0, @nLoop);
-    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NVISIT,   0, @nRow);
-    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EST,      0, @rEst);
-    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NAME,     0, @zName);
-    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_SELECTID, 0, @iSel);
-    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_PARENTID, 0, @iPid);
-    shellEPutZ(PAnsiChar(Format('Loop %d: nLoop=%d nRow=%d nEst=%.1f name=%s sel=%d par=%d explain="%s"'#10,
-      [i, nLoop, nRow, rEst,
-       IfThen(zName = nil, '(null)', AnsiString(zName)),
-       iSel, iPid,
-       IfThen(zExpl = nil, '', AnsiString(zExpl))])));
+  while i < 256 do  { hard safety cap }
+  begin
+    zo := nil;
+    if sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EXPLAIN, f, @zo) <> 0 then
+      break;
+    { 10.1.39.c — see second-pass comment; we use zName, not zo. }
+    zName := nil;
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NAME, f, @zName);
+    if (zName <> nil) and (CStrLen(zName) < 1024) then
+      n := i32(CStrLen(zName)) + 5 { "SCAN " } + qrfStatsHeight(pStmt, i) * 3
+    else
+      n := qrfStatsHeight(pStmt, i) * 3;
+    if n > nWidth then nWidth := n;
     Inc(i);
   end;
-  shellEPutZ('---------------------------'#10);
+  Inc(nWidth, 2);
+
+  { Aggregate NCYCLE (iScan=-1).  Currently always -1 here. }
+  nCycle := 0;
+  sqlite3_stmt_scanstatus_v2(pStmt, -1, SQLITE_SCANSTAT_NCYCLE, f, @nCycle);
+  if nCycle < 0 then nCycle := 0;
+
+  { Second pass — append rows. }
+  i := 0;
+  while i < 256 do  { hard safety cap }
+  begin
+    zo := nil;
+    if sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EXPLAIN, f, @zo) <> 0 then
+      break;
+    nLoop := -1; nRow := -1; iId := 0; iPid := 0; rEst := 0.0; zName := nil;
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_PARENTID, f, @iPid);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_EST,      f, @rEst);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NLOOP,    f, @nLoop);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NVISIT,   f, @nRow);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_SELECTID, f, @iId);
+    sqlite3_stmt_scanstatus_v2(pStmt, i, SQLITE_SCANSTAT_NAME,     f, @zName);
+
+    { 10.1.39.c — the SCANSTAT_EXPLAIN path returns
+      aOp[addrExplain].p4.z which is only safe when the addr really
+      points to OP_Explain; we currently don't have a way to verify
+      that without an opcode-type check in the reader.  Until that
+      lands, prefer zName (always sqlite3DbStrDup'd by
+      sqlite3VdbeScanStatus) over the raw EXPLAIN ptr.  Tree shape
+      and counts (NLOOP/NVISIT) are still correct, only the
+      per-loop label trades the EXPLAIN-string for the table/index
+      name. }
+    zoStr := '';
+    if (zName <> nil) and (CStrLen(zName) > 0) and (CStrLen(zName) < 1024) then
+      zoStr := 'SCAN ' + AnsiString(zName);
+
+    if (nLoop >= 0) or (nRow >= 0) then
+    begin
+      stats := '';
+      nSp := 0;
+      if nLoop >= 0 then
+      begin
+        stats := stats + qrfApproxInt64(nLoop);
+        nSp := 2;
+      end;
+      if nRow >= 0 then
+      begin
+        if nSp > 0 then stats := stats + StringOfChar(' ', nSp);
+        stats := stats + qrfApproxInt64(nRow);
+      end;
+      padCnt := nWidth - qrfStatsHeight(pStmt, i) * 3 - i32(Length(zoStr));
+      if padCnt < 1 then padCnt := 1;
+      line := zoStr + StringOfChar(' ', padCnt) + stats;
+      qrfEqpAppend(iId, iPid, line);
+    end else
+      qrfEqpAppend(iId, iPid, zoStr);
+
+    Inc(i);
+  end;
+
+  { Render — qrf.c:312 "QUERY PLAN\n" header for the non-NCYCLE case,
+    then qrfEqpRenderLevel(0). }
+  if gEqpGraph <> nil then
+  begin
+    gEqpOut := '';
+    gEqpOut := gEqpOut + 'QUERY PLAN'#10;
+    gEqpGraph^.zPrefix[0] := #0;
+    qrfEqpRenderLevel(0);
+    shellSPutZ(gEqpOut);
+    gEqpOut := '';
+    qrfEqpReset;
+  end;
 end;
 
 { 10.1.10 follow-up — `.width N1 N2 ...`  (shell.c.in:12047..12058).

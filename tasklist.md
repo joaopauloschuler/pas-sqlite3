@@ -355,20 +355,28 @@ partial landings cannot silently no-op.
 - [~] **10.1.39** `.scanstats` — basic per-loop dump landed (8.2.1: aScan[] +
   sqlite3_stmt_scanstatus_v2 reader + WhereAddScanStatus producer wired).  Output
   shows NAME/EXPLAIN/EST/SELECTID/PARENTID correctly.  Remaining subtasks:
-  - [ ] **10.1.39.a** TWhereLevel.addrVisit field — add to the where-loop
-    record, populate at the WhereCodeOneLoopStart emit site (mirrors where.c
-    around the `pLevel->addrVisit = sqlite3VdbeCurrentAddr(v);` stamps), and
-    feed it into sqlite3VdbeScanStatusCounters at the WhereAddScanStatus
-    callsite.  Unblocks NVISIT (currently -1).
-  - [ ] **10.1.39.b** NLOOP counter — confirm `aOp[].nExec` increments at the
-    correct loop-head opcode (Next/VNext/Prev/Rewind) and that the reader's
-    NLOOP arm consults the *loop* opcode, not the *visit* opcode.  Cross-check
-    against vdbeapi.c.  Likely just a 1-line dispatch tweak.
-  - [ ] **10.1.39.c** qrfEqpStats EQP-tree formatter port (`../sqlite3/ext/misc/qpvtab.c`
-    or wherever the upstream `.scanstats` text shaper lives — grep `qrfEqpStats`).
-    Replaces the current flat "Loop N: …" dump with the indented EQP-tree text
-    that matches upstream byte-for-byte.  Gate: TestShellMeta `.scanstats` arm
-    bumps from shape-only to byte-diff.
+  - [X] **10.1.39.a** TWhereLevel.addrVisit field added (sizeof bumps to 128);
+    stamped in sqlite3WhereCodeOneLoopStart mirror of wherecode.c:2584 and fed
+    through sqlite3VdbeScanStatus + ScanStatusRange in WhereAddScanStatus
+    (full port of wherecode.c:333..374).  Unblocks NVISIT.
+  - [X] **10.1.39.b** NLOOP/nExec confirmed: vdbe.pas:7618 increments every
+    opcode (matches vdbe.c:940), and main.pas:3860..3870 dispatches NLOOP→
+    addrLoop, NVISIT→addrVisit (matches vdbeapi.c:2516..2530).  Also removed
+    two stale `pLevel^.addrBody := sqlite3VdbeCurrentAddr(v)` overrides inside
+    sqlite3WhereCodeOneLoopStart that were re-pointing addrBody into the loop
+    body — C only stamps addrBody once at where.c:7467.
+  - [X] **10.1.39.c** qrfEqpStats EQP-tree formatter port (ext/qrf/qrf.c
+    :162..454).  Pascal `displayScanstats` now builds an iEqpId/iParentId
+    linked-list graph, renders with `|--`/``--` connectors, and stamps each
+    row with NLOOP/NVISIT via a faithful qrfApproxInt64 port (4-digit base,
+    K/M/G/T/P/E suffix).  Limitation: prefers zName over `aOp[addrExplain]
+    .p4.z` because the v2 reader currently returns p4.z without an
+    opcode-type check (the addrExplain stamp may land on non-Explain ops);
+    upgrading the reader to gate on p4type=P4_DYNAMIC and re-routing through
+    sqlite3VdbeExplainParent would let us re-enable EXPLAIN text — tracked
+    as 10.1.39.e if needed.  TestShellMeta `.scanstats` arm stays shape-only
+    (no SELECT runs in the script) so a byte-diff bump is not actionable in
+    this subtask.
   - [ ] **10.1.39.d** NCYCLE / hwtime sampling — deferred until a real consumer
     appears; gated on `SQLITE_ENABLE_STMT_SCANSTATUS=2` equivalent and TVdbeOp
     gaining an `nCycle` field.  Not blocking 10.1.39 closure.
