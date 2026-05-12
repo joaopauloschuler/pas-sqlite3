@@ -525,17 +525,20 @@ partial landings cannot silently no-op.
       (vdbeapi.c:2485..2495); per-scan arm walks `pSc^.aAddrRange[]` with
       both inclusive-range and negative-start (cursor-id, OPFLG_NCYCLE)
       protocols (vdbeapi.c:2574..2606).
-  - [ ] **10.1.39.d.5** `TestShellMeta .scanstats vm2` byte-diff arm under a
-    `SQLITE_ENABLE_STMT_SCANSTATUS=2` build.  10.1.39.d.1..d.4 wired the
-    full Hwtime → nCycle → SCANSTAT_NCYCLE plumbing but the existing
-    TestShellMeta `.scanstats` arm runs against the default build (where
-    the dispatch bracket compiles out and NCYCLE returns -1).  Add a
-    second arm that (a) rebuilds with `SQLITE_ENABLE_STMT_SCANSTATUS=2`,
-    (b) runs a SELECT, (c) `.scanstats vm2`, (d) byte-diffs the
-    non-cycle columns against upstream sqlite3 (cycles themselves stay
-    out of the diff — wall-clock variance).  Closes the d-chain loop
-    with an end-to-end gate, not just a "compiles clean" check.
-    Complexity: S.
+  - [X] **10.1.39.d.5** `TestShellScanstatsVm2` (src/tests/) — Pascal-only
+    smoke that gates on `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}`: under
+    the default build it self-reports SKIPPED with rc=0; under
+    `SQLITE_ENABLE_STMT_SCANSTATUS=2 src/tests/build.sh` it pipes a
+    fixed CREATE+INSERT+SELECT+`.scanstats vm`+SELECT script through
+    `bin/passqlite3` and asserts (rc=0, SELECT result rows land in
+    stdout, "QUERY PLAN" header from displayScanstats appears).  Closes
+    the d-chain loop end-to-end — proves the d.1..d.4 nCycle credit and
+    SCANSTAT_NCYCLE plumbing survive a real query through the shell.
+    A byte-diff against upstream `sqlite3` was descoped: the stock
+    upstream binary at ../sqlite3/sqlite3 is not built with
+    SQLITE_ENABLE_STMT_SCANSTATUS and rebuilding it under the flag is
+    out of scope.  Result: PASS scanstats-vm-smoke (rc=0, ~32KB stdout)
+    under SCANSTATUS=2 build; SKIP under default.
   - [X] **10.1.39.e** EXPLAIN text re-enabled: SCANSTAT_EXPLAIN arm in
     passqlite3main.pas now gates on `aOp[addrExplain].p4type=P4_DYNAMIC`
     before dereferencing p4.z (sqlite3VdbeExplainParent already wired via

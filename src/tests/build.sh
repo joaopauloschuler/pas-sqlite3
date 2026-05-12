@@ -198,6 +198,7 @@ compile_test TestShellSchema
 compile_test TestShellRepl
 compile_test TestShellIO
 compile_test TestShellMeta
+compile_test TestShellScanstatsVm2
 compile_test TestShellBackup
 compile_test TestShellArchive
 compile_test TestShellDbinfo
