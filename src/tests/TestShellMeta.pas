@@ -15,7 +15,7 @@
     - shell-system      .shell / .system               (10.1e.7)  [COVERED]
     - cd                .cd                            (10.1e.8)  [COVERED]
     - log               .log                           (10.1e.9)  TODO
-    - trace             .trace                         (10.1e.10) TODO
+    - trace             .trace                         (10.1e.10) [COVERED]
     - iotrace           .iotrace                       (10.1e.11) TODO
     - scanstats         .scanstats                     (10.1e.12) TODO
     - testcase          .testcase                      (10.1e.13) TODO
@@ -332,6 +332,58 @@ begin
     '.cd /tmp'#10 +
     '.cd no_such_relative_dir_pas'#10;
   DiffMeta('cd-mixed', ':memory:', script);
+
+  { -------- trace (10.1e.10) -------------------------------------- }
+  { cmdTrace (shell.c.in:11903..11950) installs sqlite3_trace_v2 with a
+    callback that emits "<SQL>;\n" for SQLITE_TRACE_STMT / _ROW,
+    "<SQL>; -- <ns> ns\n" for _PROFILE, and "-- closing database
+    connection\n" for _CLOSE.  Trailing semicolons in the source SQL
+    are stripped before one is re-added.  Each positional arg (file
+    path, "stdout", "stderr", "off") routes through output_file_open;
+    when the resulting traceOut is NULL the callback is uninstalled.
+
+    Scope of this gate (byte-deterministic):
+      - SQL-text trace, default --stmt mask, plain (default) format
+      - destinations: stderr, stdout, FILE, and "off"
+      - usage / unknown-option error wording (rc propagation)
+    Out of scope (intentionally not byte-deterministic):
+      - --profile output (timing in ns varies per run)
+      - --expanded / --normalized formatting (current port writes the
+        same text but the gate does not exercise it)
+      - the SQLITE_TRACE_CLOSE arm (emitted only at shutdown ordering
+        that drifts across binaries) }
+
+  script :=
+    '.trace stderr'#10 +
+    'SELECT 1;'#10 +
+    '.trace off'#10;
+  DiffMeta('trace-stderr', ':memory:', script);
+
+  script :=
+    '.trace stdout'#10 +
+    'SELECT 2;'#10 +
+    '.trace off'#10;
+  DiffMeta('trace-stdout', ':memory:', script);
+
+  { FILE sink: trace landing site must match.  We .trace into a file,
+    run a SELECT, then .trace off and `.shell cat FILE` to surface the
+    captured bytes onto stdout (which is diffed). }
+  script :=
+    '.trace ' + workDir + '/trace.out'#10 +
+    'SELECT 3;'#10 +
+    '.trace off'#10 +
+    '.shell cat "' + workDir + '/trace.out"'#10;
+  DiffMeta('trace-file', ':memory:', script);
+
+  { Bare `.trace` (no positional arg) leaves trace disabled and is
+    silent — confirms the no-op path. }
+  script := '.trace'#10;
+  DiffMeta('trace-bare', ':memory:', script);
+
+  { Unknown option emits `Unknown option "X" on ".trace"\n` to stderr
+    and rc-bumps the per-statement error counter. }
+  script := '.trace --bogus'#10;
+  DiffMeta('trace-unknown', ':memory:', script);
 
   CleanupPaths;
 

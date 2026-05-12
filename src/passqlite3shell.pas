@@ -3484,46 +3484,54 @@ end;
 
 function traceCallback(traceType: u32; pCtx: Pointer;
                        pP, pX: Pointer): i32; cdecl;
+{ Faithful port of sql_trace_callback (shell.c.in:4886..4940).
+  STMT/ROW: emit "<SQL>;\n" with trailing semicolons stripped, one re-added.
+  PROFILE : "<SQL>; -- <ns> ns\n"  (timing — non-deterministic across runs).
+  CLOSE   : "-- closing database connection\n". }
 var
   zSql, zExpanded: PAnsiChar;
-  ns: PInt64;
   zOut: AnsiString;
+  nSql: SizeInt;
+  ns: Int64;
 begin
   Result := 0;
+  if traceSink = 0 then Exit;
+  if traceType = u32(SQLITE_TRACE_CLOSE) then begin
+    traceWrite('-- closing database connection'#10);
+    Exit;
+  end;
+  zOut := '';
+  if (traceType <> u32(SQLITE_TRACE_ROW)) and (pX <> nil)
+     and (PAnsiChar(pX)^ = '-') then
+    zOut := AnsiString(PAnsiChar(pX))
+  else if traceFmt = 1 then begin
+    zExpanded := sqlite3_expanded_sql(pP);
+    if zExpanded <> nil then begin
+      zOut := AnsiString(zExpanded);
+      sqlite3_free(zExpanded);
+    end else begin
+      zSql := sqlite3_sql(pP);
+      if zSql <> nil then zOut := AnsiString(zSql);
+    end;
+  end else begin
+    zSql := sqlite3_sql(pP);
+    if zSql <> nil then zOut := AnsiString(zSql);
+  end;
+  if zOut = '' then Exit;
+  nSql := Length(zOut);
+  while (nSql > 0) and (zOut[nSql] = ';') do Dec(nSql);
+  SetLength(zOut, nSql);
   case traceType of
-    SQLITE_TRACE_STMT: begin
-      zSql := PAnsiChar(pX);
-      if (zSql <> nil) and (zSql^ = '-') and (PAnsiChar(zSql)[1] = '-') then
-        zOut := AnsiString(zSql)
-      else if traceFmt = 1 then begin
-        zExpanded := sqlite3_expanded_sql(pP);
-        if zExpanded <> nil then begin
-          zOut := AnsiString(zExpanded);
-          sqlite3_free(zExpanded);
-        end else
-          zOut := AnsiString(sqlite3_sql(pP));
-      end else
-        zOut := AnsiString(sqlite3_sql(pP));
-      traceWrite(zOut + #10);
-    end;
-    SQLITE_TRACE_PROFILE: begin
-      zSql := sqlite3_sql(pP);
-      ns := PInt64(pX);
-      if zSql = nil then zOut := '' else zOut := AnsiString(zSql);
-      traceWrite(zOut + Format(' --- %d'#10, [ns^]));
-    end;
-    SQLITE_TRACE_ROW: begin
-      zSql := sqlite3_sql(pP);
-      if zSql = nil then zOut := '' else zOut := AnsiString(zSql);
-      traceWrite('[ROW ' + zOut + ']'#10);
-    end;
-    SQLITE_TRACE_CLOSE: begin
-      traceWrite('[CLOSE]'#10);
+    u32(SQLITE_TRACE_STMT), u32(SQLITE_TRACE_ROW):
+      traceWrite(zOut + ';'#10);
+    u32(SQLITE_TRACE_PROFILE): begin
+      if pX <> nil then ns := PInt64(pX)^ else ns := 0;
+      traceWrite(zOut + Format('; -- %d ns'#10, [ns]));
     end;
   end;
 end;
 
-procedure cmdTrace(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+function cmdTrace(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 var
   i: SizeInt;
   mask: u32;
@@ -3531,6 +3539,7 @@ var
   zFile: AnsiString;
   newSink: i32;
 begin
+  Result := 0;
   if p^.db = nil then openDb(p, 0);
   mask := 0;
   zFile := '';
@@ -3555,21 +3564,29 @@ begin
       zFile := s; newSink := 3;
     end
     else begin
-      shellEPutZ(Format('Unknown option: "%s"'#10, [s]));
+      shellEPutZ(Format('Unknown option "%s" on ".trace"'#10, [s]));
+      Result := 1;
       Exit;
     end;
   end;
   if mask = 0 then mask := u32(SQLITE_TRACE_STMT);
   traceCloseSink;
   case newSink of
-    0, 1: traceSink := 1;
-    2:    traceSink := 2;
+    { No positional argument → leave trace off (mirrors output_file_open
+      with no file, traceOut stays NULL, sqlite3_trace_v2(...,0,0,0)). }
+    0: begin
+      sqlite3_trace_v2(p^.db, 0, nil, nil);
+      Exit;
+    end;
+    1: traceSink := 1;
+    2: traceSink := 2;
     3: begin
       AssignFile(traceFile, zFile);
       {$I-} Rewrite(traceFile); {$I+}
       if IOResult <> 0 then begin
-        shellEPutZ(Format('Cannot open "%s" for writing'#10, [zFile]));
+        shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
         traceSink := 0;
+        sqlite3_trace_v2(p^.db, 0, nil, nil);
         Exit;
       end;
       traceSink := 3;
@@ -9419,7 +9436,7 @@ begin
   if (zCmd = 'quit') or (zCmd = 'exit') then begin Result := 2; Exit; end;
   if zCmd = 'help'      then begin cmdHelp(args, nArg); Exit; end;
   if zCmd = 'stats'     then begin Result := cmdStats(p, args, nArg); Exit; end;
-  if zCmd = 'trace'     then begin cmdTrace(p, args, nArg); Exit; end;
+  if zCmd = 'trace'     then begin Result := cmdTrace(p, args, nArg); Exit; end;
   if zCmd = 'show'      then begin Result := cmdShow(p, nArg); Exit; end;
   if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;
   if zCmd = 'headers'   then begin cmdHeaders(p, args, nArg); Exit; end;

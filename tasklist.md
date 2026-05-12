@@ -878,7 +878,7 @@ partial landings cannot silently no-op.
   - [X] **10.1e.7** `.shell`/`.system` — byte-parity gate (shell-echo / system-echo / shell-multiarg / shell-usage / system-usage / shell-safemode); fixed cmdShell to return rc=1 on missing-arg so dispatcher/exit code matches C (shell.c.in:11241..11264).  FILE*-vs-fd redirect divergence (10.1.34) and runner-shell not-found wording deliberately out of scope; documented in section header.
   - [X] **10.1e.8** `.cd` — byte-parity gate (cd-ok / cd-usage / cd-missing / cd-mixed); fixed cmdCd to return rc=1 on usage+chdir-failure and added failIfSafeMode gate so dispatcher/exit code matches C (shell.c.in:9127..9145).
   - [ ] **10.1e.9** `.log`
-  - [ ] **10.1e.10** `.trace`
+  - [X] **10.1e.10** `.trace` — byte-parity gate (trace-stderr / trace-stdout / trace-file / trace-bare / trace-unknown).  Rewrote traceCallback to mirror sql_trace_callback (shell.c.in:4886..4940): STMT/ROW emit `<SQL>;\n` with trailing semicolons stripped + one re-added, CLOSE emits `-- closing database connection\n`, PROFILE emits `<SQL>; -- <ns> ns\n`.  Fixed unknown-option wording to `Unknown option "%s" on ".trace"\n`, file-open error to `Error: cannot open "%s"\n`, and converted cmdTrace to a function so rc=1 propagates on unknown option.  Scope: SQL-text trace in default --stmt + plain mode and trace destinations (stdout / stderr / FILE / no-arg = off).  Deterministic-only: --profile (ns timing), --expanded round-trips, and the SQLITE_TRACE_CLOSE arm are kept out of the gate.
   - [ ] **10.1e.11** `.iotrace`
   - [ ] **10.1e.12** `.scanstats`
   - [ ] **10.1e.13** `.testcase`
