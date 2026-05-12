@@ -855,8 +855,15 @@ partial landings cannot silently no-op.
 - [ ] **10.1e** Gate: `tests/cli/10e_meta/`.
   - [ ] **10.1e.1** `.stats`
   - [ ] **10.1e.2** `.timer`
-  - [ ] **10.1e.3** `.eqp`
-  - [ ] **10.1e.4** `.explain`
+  - [X] **10.1e.3** `.eqp` — byte-parity gate landed in
+        src/tests/TestShellMeta.pas (eqp-state round-trips on/full/
+        trigger/off via `.show`; eqp-usage covers nArg<1 → `Usage:
+        .eqp off|on|trace|trigger|full` rc=1).  cmdEqp now returns
+        rc=1 on the usage path (was silent rc=0).
+  - [X] **10.1e.4** `.explain` — byte-parity gate landed in
+        src/tests/TestShellMeta.pas (explain-state round-trips
+        auto/on/off/auto via `.show`, reading the
+        autoExplain ? 'auto' : 'off' slot at shell.c.in:11279).
   - [X] **10.1e.5** `.show` — byte-parity gate landed in
         src/tests/TestShellMeta.pas (show-default, show-tweaked covering
         csv/headers/nullvalue/separator, show-usage for `nArg!=1`); fixed

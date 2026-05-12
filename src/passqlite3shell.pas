@@ -4721,10 +4721,12 @@ end;
 
 { 10.1.30 — `.eqp off|on|trace|trigger|full`  (shell.c.in:9479..9504) }
 
-procedure cmdEqp(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+function cmdEqp(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 begin
+  Result := 0;
   if nArg < 1 then begin
     shellEPutZ('Usage: .eqp off|on|trace|trigger|full'#10);
+    Result := 1;
     Exit;
   end;
   if p^.mode.autoEQPtrace <> 0 then begin
@@ -9429,7 +9431,7 @@ begin
   if zCmd = 'databases' then begin cmdDatabases(p); Exit; end;
   if zCmd = 'schema'    then begin cmdSchema(p, args, nArg); Exit; end;
   if zCmd = 'timer'     then begin cmdTimer(p, args, nArg); Exit; end;
-  if zCmd = 'eqp'       then begin cmdEqp(p, args, nArg); Exit; end;
+  if zCmd = 'eqp'       then begin Result := cmdEqp(p, args, nArg); Exit; end;
   if zCmd = 'explain'   then begin cmdExplain(p, args, nArg); Exit; end;
   if (zCmd = 'shell') or (zCmd = 'system') then begin
     cmdShell(p, args, nArg, zCmd); Exit;

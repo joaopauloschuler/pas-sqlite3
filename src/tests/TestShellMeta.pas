@@ -9,8 +9,8 @@
     - help              .help / .help schema           (10.1e.6)  [COVERED]
     - stats             .stats                         (10.1e.1)  TODO
     - timer             .timer                         (10.1e.2)  TODO
-    - eqp               .eqp                           (10.1e.3)  TODO
-    - explain           .explain                       (10.1e.4)  TODO
+    - eqp               .eqp                           (10.1e.3)  [COVERED]
+    - explain           .explain                       (10.1e.4)  [COVERED]
     - show              .show                          (10.1e.5)  [COVERED]
     - shell-system      .shell / .system               (10.1e.7)  TODO
     - cd                .cd                            (10.1e.8)  TODO
@@ -190,6 +190,53 @@ begin
 
   script := '.show foo'#10;
   DiffMeta('show-usage', ':memory:', script);
+
+  { -------- eqp (10.1e.3) ----------------------------------------- }
+  { `.eqp off|on|trigger|full` mutates ShellState.mode.autoEQP and
+    clears the autoEQPtrace bit (shell.c.in cmdEqp at 9479..9504).
+    The dot-command logic itself produces no stdout — it only toggles
+    state.  We round-trip the state through `.show`, which reads the
+    azBool[autoEQP&3] slot at shell.c.in:11278 ('off'/'on'/'trigger'/
+    'full').  `.eqp` with no argument is a usage error: `Usage: .eqp
+    off|on|trace|trigger|full` on stderr with rc=1.  NB: the runtime
+    consumer (shell.c.in:3298..3327, emitting EXPLAIN QUERY PLAN
+    before each SQL statement) is a separate port task (10.1.32) and
+    not exercised here. }
+  script :=
+    '.eqp on'#10 +
+    '.show'#10 +
+    '.eqp full'#10 +
+    '.show'#10 +
+    '.eqp trigger'#10 +
+    '.show'#10 +
+    '.eqp off'#10 +
+    '.show'#10;
+  DiffMeta('eqp-state', ':memory:', script);
+
+  script := '.eqp'#10;
+  DiffMeta('eqp-usage', ':memory:', script);
+
+  { -------- explain (10.1e.4) ------------------------------------- }
+  { `.explain auto|on|off` flips ShellState.mode.autoExplain
+    (shell.c.in cmdExplain at 9515..9523).  The dot-command itself
+    produces no stdout — only state changes; `.show` renders the slot
+    as 'auto' (non-zero) or 'off' (shell.c.in:11279..11280).  No
+    usage error path: C silently no-ops on missing arg, and on an
+    unrecognised token routes through booleanValue() which emits
+    `ERROR: Not a boolean value: "X". Assuming "no".` on stderr; the
+    port's parseOnOff is silent there, so we stick to recognised
+    tokens.  Runtime consumer (autoExplain → MODE_Explain column
+    switch at shell.c.in:1572..1581) is a separate port task. }
+  script :=
+    '.explain auto'#10 +
+    '.show'#10 +
+    '.explain on'#10 +
+    '.show'#10 +
+    '.explain off'#10 +
+    '.show'#10 +
+    '.explain auto'#10 +
+    '.show'#10;
+  DiffMeta('explain-state', ':memory:', script);
 
   CleanupPaths;
 
