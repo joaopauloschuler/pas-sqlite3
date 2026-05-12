@@ -939,8 +939,15 @@ partial landings cannot silently no-op.
       added.  0x200 TREETRACE "After count-of-view optimization" arm lands at the
       tail under `{$IFDEF SQLITE_DEBUG}`.  Builds clean default + SQLITE_DEBUG=1;
       TestExplainParity 1026/1026, TestSQLCorpus rc=0, 92/92 5177/5177.
-    - [ ] **10.1.42.a.6.3** Port `optimizeAggregateUseOfIndexedExpr`
-      (select.c:6572) so the AggInfo-adjusted-for-indexed-exprs print can land.
+    - [X] **10.1.42.a.6.3** Port `optimizeAggregateUseOfIndexedExpr`
+      (select.c:6549..6586) landed at passqlite3codegen.pas next to havingToWhere
+      / countOfViewOptimization; wired in the SF_Aggregate+GROUP BY + WHERE arm
+      between sqlite3WhereBegin and assignAggregateRegisters (mirrors
+      select.c:8527..8529, gated on pParse^.pIdxEpr).  0x20 TREETRACE
+      "AggInfo (possibly) adjusted for Indexed Exprs" arm + per-IndexedExpr
+      data-cursor / index dump lands at the tail under `{$IFDEF SQLITE_DEBUG}`.
+      Builds clean default + SQLITE_DEBUG=1; TestExplainParity 1026/1026,
+      TestSQLCorpus rc=0, 92/92 5177/5177.
     - [ ] **10.1.42.a.6.4** Port `aggregateConvertIndexedExprRefToColumn`
       (select.c:8609) so the function-expr-converted print can land.
     - [ ] **10.1.42.a.6.5** Port the `select_end` AggInfo teardown

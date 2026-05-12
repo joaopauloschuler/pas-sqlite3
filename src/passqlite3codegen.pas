@@ -24915,6 +24915,50 @@ begin
   Result := 1;
 end;
 
+{ optimizeAggregateUseOfIndexedExpr — select.c:6549..6586.  An index on
+  expressions is being used in the inner loop of an aggregate query with
+  a GROUP BY clause.  Adjust the AggInfo so it can take advantage of the
+  index — possibly even using it as a covering index.  Faithful 1:1 port. }
+procedure optimizeAggregateUseOfIndexedExpr(pParse: PParse; pSelect: PSelect;
+                                            pAggI: PAggInfo; pNC: PNameContext);
+var
+  mx: i32;
+  jj: i32;
+  kk: i32;
+  {$IFDEF SQLITE_DEBUG}
+  pIEpr: PIndexedExpr;
+  {$ENDIF}
+begin
+  Assert(pAggI^.iFirstReg = 0);
+  Assert(pSelect <> nil);
+  Assert(pSelect^.pGroupBy <> nil);
+  pAggI^.nColumn := pAggI^.nAccumulator;
+  if pAggI^.nSortingColumn > 0 then  { ALWAYS }
+  begin
+    mx := pSelect^.pGroupBy^.nExpr - 1;
+    for jj := 0 to pAggI^.nColumn - 1 do
+    begin
+      kk := pAggI^.aCol[jj].iSorterColumn;
+      if kk > mx then mx := kk;
+    end;
+    pAggI^.nSortingColumn := u32(mx + 1);
+  end;
+  analyzeAggFuncArgs(pAggI, pNC);
+  {$IFDEF SQLITE_DEBUG}
+  if (sqlite3TreeTrace and $20) <> 0 then
+  begin
+    sqlite3DebugPrintf('AggInfo (possibly) adjusted for Indexed Exprs'#10, []);
+    pIEpr := PIndexedExpr(pParse^.pIdxEpr);
+    while pIEpr <> nil do
+    begin
+      sqlite3DebugPrintf('data-cursor=%d index={%d,%d}'#10,
+        [pIEpr^.iDataCur, pIEpr^.iIdxCur, pIEpr^.iIdxCol]);
+      pIEpr := pIEpr^.pIENext;
+    end;
+  end;
+  {$ENDIF}
+end;
+
 { assignAggregateRegisters — select.c:6643.  Allocate a contiguous block
   of registers spanning all aCol[] + aFunc[] entries; record the first
   register in pAggInfo^.iFirstReg.  After this call,
@@ -26462,6 +26506,10 @@ begin
         pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
                                     nil, p, WHERE_GROUPBY, 0);
         if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+        { 10.1.42.a.6.3 — adjust AggInfo for any indexed expressions that
+          the planner wired up.  Mirrors select.c:8527..8529. }
+        if pParse^.pIdxEpr <> nil then
+          optimizeAggregateUseOfIndexedExpr(pParse, p, pAggI2, @sNCAgg);
         {$IFDEF SQLITE_DEBUG}
         TreeTraceLine($2, 'WhereBegin returns');  { select.c:8532 }
         {$ENDIF}
