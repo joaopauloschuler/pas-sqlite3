@@ -14165,6 +14165,19 @@ begin
   if pPrs^.nErr <> 0 then
     Exit(pPrs^.rc);
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b — WHERETRACE(0x800) "BEGIN ...addBtreeIdx" (where.c:3250).
+    C oracle additionally prints nEq / nSkip / rRun.  We render the
+    same mask + format under the same gate. }
+  if (sqlite3WhereTrace and $800) <> 0 then
+  begin
+    if pSrc^.pSTab <> nil then
+      sqlite3DebugPrintf('BEGIN %s.addBtreeIdx(%s), nEq=%d, nSkip=%d, rRun=%d'#10,
+        [pSrc^.pSTab^.zName, pProbe^.zName,
+         pNew^.u.btree.nEq, pNew^.nSkip, pNew^.rRun]);
+  end;
+  {$ENDIF}
+
   Assert((pNew^.wsFlags and WHERE_VIRTUALTABLE) = 0);
   Assert((pNew^.wsFlags and WHERE_TOP_LIMIT) = 0);
   if (pNew^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
@@ -14483,6 +14496,15 @@ begin
     end;
   end;
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b — WHERETRACE(0x800) "END ...addBtreeIdx" (where.c:3650). }
+  if (sqlite3WhereTrace and $800) <> 0 then
+  begin
+    if pSrc^.pSTab <> nil then
+      sqlite3DebugPrintf('END %s.addBtreeIdx(%s), nEq=%d, rc=%d'#10,
+        [pSrc^.pSTab^.zName, pProbe^.zName, pNew^.u.btree.nEq, rc]);
+  end;
+  {$ENDIF}
   Result := rc;
 end;
 
@@ -15557,6 +15579,13 @@ begin
   pNew   := pBuilder^.pNew;
   pSrc   := @SrcListItems(pWInfo^.pTabList)[pNew^.iTab];
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b — WHERETRACE(0x800) "BEGIN ...addVirtual()" (where.c:4719). }
+  if (sqlite3WhereTrace and $800) <> 0 then
+    if pSrc^.pSTab <> nil then
+      sqlite3DebugPrintf('BEGIN %s.addVirtual()'#10, [pSrc^.pSTab^.zName]);
+  {$ENDIF}
+
   mNoOmit  := 0;
   pIdxInfo := allocateIndexInfo(pWInfo, pWC, mUnusable, pSrc, mNoOmit);
   if pIdxInfo = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
@@ -15641,6 +15670,13 @@ begin
   end;
 
   freeIndexInfo(pPrs^.db, pIdxInfo);
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b — WHERETRACE(0x800) "END ...addVirtual()" (where.c:4801). }
+  if (sqlite3WhereTrace and $800) <> 0 then
+    if pSrc^.pSTab <> nil then
+      sqlite3DebugPrintf('END %s.addVirtual(), rc=%d'#10,
+                         [pSrc^.pSTab^.zName, rc]);
+  {$ENDIF}
   Result := rc;
 end;
 
@@ -15700,6 +15736,12 @@ begin
     if ((pTerm^.eOperator and WO_OR) <> 0)
        and ((pTerm^.u.pOrInfo^.indexable and pNew^.maskSelf) <> 0) then
     begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b — WHERETRACE(0x400) "Begin processing OR-clause %p"
+        (where.c:4849). }
+      if (sqlite3WhereTrace and $400) <> 0 then
+        sqlite3DebugPrintf('Begin processing OR-clause %p'#10, [Pointer(pTerm)]);
+      {$ENDIF}
       pOrWC    := @pTerm^.u.pOrInfo^.wc;
       pOrWCEnd := @pOrWC^.a[pOrWC^.nTerm];
       once     := 1;
@@ -15786,10 +15828,26 @@ begin
         rc := whereLoopInsert(pBuilder, pNew);
         Inc(i);
       end;
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.b — WHERETRACE(0x400) "End processing OR-clause %p"
+        (where.c:4928). }
+      if (sqlite3WhereTrace and $400) <> 0 then
+        sqlite3DebugPrintf('End processing OR-clause %p'#10, [Pointer(pTerm)]);
+      {$ENDIF}
     end;
     Inc(pTerm);
     Inc(iTerm);
   end;
+  { 10.1.42.b deferred WHERETRACE sub-arms — the remaining ~25 callsites
+    in where.c (range-scan / STAT4 estimates at 2036/2215/2248/2313/2363;
+    subset cost adjustment at 2711/2720; "query planner search limit
+    reached" at 2840; OR/AND-vs-pseudo-index decisions at 3391..3402;
+    range/IN row-est analysis at 4203..4224; non-viable plan / prereqIn
+    diag at 4416/4531; VirtualOne all-usable / mPrev-mNext / all-disabled
+    at 4720..4794; solver progress at 5857/5988; omit unused FROM-clause
+    term at 6583; cost normalisation tracing at 6646/7091; DISTINCT
+    nRowOut reduction at 7118; "Optimizer Finished" at 7195) — to land
+    in follow-up commits as each pas counterpart is anchored. }
   Result := rc;
 end;
 

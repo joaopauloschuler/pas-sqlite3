@@ -421,11 +421,21 @@ partial landings cannot silently no-op.
     end compound-select, WHERE-clause push-down, all-FROM analysis,
     DISTINCT→GROUP BY, post-aggregate analysis, Finished with AggInfo) —
     full enumeration documented inline at the tail of sqlite3Select.
-  - [ ] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
-    wherecode.c → passqlite3codegen.pas.  Same pattern as 10.1.42.a but for
-    `WHERETRACE(` calls.  Larger surface (~30 callsites).  Subset-port: start
-    with the top-level whereLoopAddBtree / whereLoopAddVirtual / whereLoopAddOr
-    arms; gradually add the deeper sub-arms in follow-up commits.
+  - [~] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
+    wherecode.c → passqlite3codegen.pas.  First batch landed: BEGIN/END
+    `addBtreeIdx(%s)` in `whereLoopAddBtreeIndex` (mask 0x800), BEGIN/END
+    `addVirtual()` in `whereLoopAddVirtual` (0x800), Begin/End processing
+    OR-clause in `whereLoopAddOr` (0x400).  All gated by
+    `{$IFDEF SQLITE_DEBUG}`.  Smoke gate: `.wheretrace 0xffffffff` plus
+    `SELECT … WHERE a=1 OR b=2` over an indexed table emits the BEGIN/END
+    addBtreeIdx + OR-clause walk (verified against bin/passqlite3 built
+    with SQLITE_DEBUG=1).  Deferred sub-arms (~25 callsites in
+    range-scan/STAT4 cost estimation, subset cost adjustments, query
+    planner search-limit, OR/AND-vs-pseudo-index decisions, virtual-table
+    constraint enumeration, solver/optimizer progress, DISTINCT row-count
+    reduction, optimizer-finished marker) — enumerated inline at the
+    tail of `whereLoopAddOr`; land in follow-up commits as each pas
+    counterpart is confidently anchored.
   - [X] **10.1.42.c** sqlite3DebugPrintf — ported from printf.c:1514..1532 as
     `procedure sqlite3DebugPrintf(zFormat: PAnsiChar; const args: array of const)`
     in passqlite3printf.pas.  Renders via the existing sqlite3FormatStr core,
