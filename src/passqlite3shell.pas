@@ -3905,7 +3905,7 @@ begin
   if b then Result := 'on' else Result := 'off';
 end;
 
-procedure cmdShow(p: PShellState);
+function cmdShow(p: PShellState; nArg: SizeInt): i32;
 const
   azBool: array[0..3] of AnsiString = ('off', 'on', 'trigger', 'full');
 var
@@ -3913,6 +3913,13 @@ var
   i: SizeInt;
   widths: AnsiString;
 begin
+  Result := 0;
+  { shell.c.in:11271..11275 — `.show` takes no arguments. }
+  if nArg <> 0 then begin
+    shellEPutZ('Usage: .show'#10);
+    Result := 1;
+    Exit;
+  end;
   if p^.pAuxDb^.zDbFilename = nil then fn := '' else fn := AnsiString(p^.pAuxDb^.zDbFilename);
   shellSPutZ(Format('%12s: %s'#10, ['echo',         onOffStr((p^.mode.mFlags and MFLG_ECHO) <> 0)]));
   shellSPutZ(Format('%12s: %s'#10, ['eqp',          azBool[p^.mode.autoEQP and 3]]));
@@ -9410,7 +9417,7 @@ begin
   if zCmd = 'help'      then begin cmdHelp(args, nArg); Exit; end;
   if zCmd = 'stats'     then begin cmdStats(p, args, nArg); Exit; end;
   if zCmd = 'trace'     then begin cmdTrace(p, args, nArg); Exit; end;
-  if zCmd = 'show'      then begin cmdShow(p); Exit; end;
+  if zCmd = 'show'      then begin Result := cmdShow(p, nArg); Exit; end;
   if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;
   if zCmd = 'headers'   then begin cmdHeaders(p, args, nArg); Exit; end;
   if (zCmd = 'separator') or (zCmd = 'sep') then begin cmdSeparator(p, args, nArg); Exit; end;

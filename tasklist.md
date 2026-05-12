@@ -857,7 +857,10 @@ partial landings cannot silently no-op.
   - [ ] **10.1e.2** `.timer`
   - [ ] **10.1e.3** `.eqp`
   - [ ] **10.1e.4** `.explain`
-  - [ ] **10.1e.5** `.show`
+  - [X] **10.1e.5** `.show` — byte-parity gate landed in
+        src/tests/TestShellMeta.pas (show-default, show-tweaked covering
+        csv/headers/nullvalue/separator, show-usage for `nArg!=1`); fixed
+        latent miss: cmdShow now enforces `Usage: .show` per shell.c.in:11271..11275.
   - [X] **10.1e.6** `.help` — byte-parity gate landed in
         src/tests/TestShellMeta.pas (help section: `.help` + `.help schema`).
         Closure also pruned the `.session` block from azHelp (passqlite3shell.pas:3726)

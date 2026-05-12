@@ -11,7 +11,7 @@
     - timer             .timer                         (10.1e.2)  TODO
     - eqp               .eqp                           (10.1e.3)  TODO
     - explain           .explain                       (10.1e.4)  TODO
-    - show              .show                          (10.1e.5)  TODO
+    - show              .show                          (10.1e.5)  [COVERED]
     - shell-system      .shell / .system               (10.1e.7)  TODO
     - cd                .cd                            (10.1e.8)  TODO
     - log               .log                           (10.1e.9)  TODO
@@ -169,6 +169,27 @@ begin
     '.help'#10 +
     '.help schema'#10;
   DiffMeta('help', ':memory:', script);
+
+  { -------- show (10.1e.5) ---------------------------------------- }
+  { cmdShow emits a fixed-order table of shell settings (shell.c.in
+    cmdShow at 11267..11322).  Defaults exercise the simple branch;
+    forcing non-default mode/headers/nullvalue/separator covers the
+    cEscapeStr arm for nullvalue/colseparator/rowseparator and the
+    QRF_Yes headers path.  Passing an argument to `.show` must emit
+    `Usage: .show` and set the per-statement error counter. }
+  script := '.show'#10;
+  DiffMeta('show-default', ':memory:', script);
+
+  script :=
+    '.mode csv'#10 +
+    '.headers on'#10 +
+    '.nullvalue NULL'#10 +
+    '.separator |'#10 +
+    '.show'#10;
+  DiffMeta('show-tweaked', ':memory:', script);
+
+  script := '.show foo'#10;
+  DiffMeta('show-usage', ':memory:', script);
 
   CleanupPaths;
 
