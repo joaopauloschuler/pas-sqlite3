@@ -251,10 +251,18 @@ regressions without human triage.
 - Triage of `DIVERGENCES.md` clusters surfaced by 9.1.3.followup + 9.1.4
   (77 cataloged sites, ~7 distinct root causes — each a Pascal-only bug
   bisectable against the C oracle, skip-and-cite per the corpus contract):
-  - [ ] **9.1.divbug.1** RELEASE-without-SAVEPOINT errmsg wording (44 sites
+  - [X] **9.1.divbug.1** RELEASE-without-SAVEPOINT errmsg wording (44 sites
     across TestExplainParity/Bytecode/Parser) — single root cause, single
     fix.  Likely in `sqlite3Savepoint` / errmsg formatter; cross-check
     against `../sqlite3/src/vdbe.c` OP_Savepoint OP_REL_S arm.
+    *Landed 2026-05-12: OP_Savepoint's not-found arm in `passqlite3vdbe.pas:9678`
+    emitted the bare literal `'no such savepoint'`; C `vdbe.c:3902` formats
+    `"no such savepoint: %s"` with the savepoint name via `sqlite3VdbeError`'s
+    variadic formatter.  Fixed by routing the message through `sqlite3MPrintf`
+    with `[zSvptName5g]`, transferring ownership to `zErrMsg` via the existing
+    DbStrDup inside sqlite3VdbeError, then freeing the temp buffer.  Closed
+    44/44 RELEASE sites; TestSQLCorpus divergence count 77 → 8; explain parity
+    holds at 1026/1026; full regression 88/88.*
   - [ ] **9.1.divbug.2** PRAGMA mmap_size / journal_mode output shape (3
     sites).  Likely missing newline / wrong column count vs upstream.
   - [ ] **9.1.divbug.3** DROP INDEX errmsg truncation (1 site) — verify

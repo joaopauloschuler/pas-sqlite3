@@ -7486,6 +7486,7 @@ var
   pSvpt5g:     PSavepoint;    { OP_Savepoint: iterator / found savepoint }
   pNewSvpt5g:  PSavepoint;    { OP_Savepoint: newly-allocated savepoint }
   zSvptName5g: PAnsiChar;     { OP_Savepoint: savepoint name }
+  zSvptFmtMsg5g: PAnsiChar;   { OP_Savepoint: formatted "no such savepoint: <name>" }
   nSvptName5g: i32;           { OP_Savepoint: name length }
   iSvpt5g:     i32;           { OP_Savepoint: depth counter }
   isTxnSvpt5g: i32;           { OP_Savepoint: is this a transaction savepoint? }
@@ -9675,7 +9676,13 @@ begin
           pSvpt5g := pSvpt5g^.pNext;
         end;
         if pSvpt5g = nil then begin
-          sqlite3VdbeError(v, 'no such savepoint');
+          { C: sqlite3VdbeError(p, "no such savepoint: %s", zName) — vdbe.c:3902.
+            Pascal sqlite3VdbeError takes a pre-formatted string and DbStrDup's
+            it; format via sqlite3MPrintf into a temp buffer, then free. }
+          zSvptFmtMsg5g := PAnsiChar(sqlite3MPrintf(PTsqlite3(db),
+            'no such savepoint: %s', [zSvptName5g]));
+          sqlite3VdbeError(v, zSvptFmtMsg5g);
+          sqlite3DbFree(db, zSvptFmtMsg5g);
           rc := SQLITE_ERROR;
         end else if (db^.nVdbeWrite > 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
           sqlite3VdbeError(v,

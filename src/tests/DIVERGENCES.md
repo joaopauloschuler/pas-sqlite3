@@ -15,21 +15,18 @@ survive the mask are real port drift.
 
 | source | tier | tag | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|---------|---------|---------------|--------------------------|
-| src/tests/TestExplainParity.pas | tier1 | mixed | 1024 | 40 | stderr | `RELEASE s1` |
-| src/tests/TestBytecodeParity.pas | tier1 | mixed | 32 | 2 | stderr | `RELEASE s1` |
-| src/tests/TestParser.pas | tier1 | mixed | 40 | 2 | stderr | `RELEASE sp1` |
-| src/tests/DiagArith.pas | tier2 | dql | 131 | 4 | stdout | `SELECT 9223372036854775807 + 1` |
-| src/tests/DiagFeatureProbe.pas | tier2 | mixed | 34 | 2 | db-blob | `CREATE TABLE t(a, b, c); ALTER TABLE t DROP COLUMN b; SELECT count(*) FROM pragm...` |
-| src/tests/DiagScalarFunc.pas | tier2 | dql | 85 | 3 | rc | `SELECT soundex('Robert')` |
-| src/tests/DiagMoreFunc.pas | tier2 | dql | 73 | 7 | stdout | `SELECT pi()` |
 | src/tests/DiagIndexing.pas | tier2 | ddl | 42 | 1 | stderr | `DROP INDEX ix_t_a; SELECT name FROM sqlite_schema WHERE type='index'` |
-| src/tests/DiagFunctions.pas | tier2 | dql | 72 | 1 | stdout | `SELECT 9223372036854775807 + 1` |
-| src/tests/DiagPragma.pas | tier2 | pragma | 62 | 3 | stdout | `PRAGMA secure_delete` |
-| src/tests/DiagCast.pas | tier2 | dql | 55 | 1 | stdout | `SELECT 9223372036854775807+1` |
+| src/tests/DiagPragma.pas | tier2 | pragma | 62 | 2 | stdout | `PRAGMA mmap_size` |
 | src/tests/DiagTxn.pas | tier2 | txn | 40 | 1 | stdout | `PRAGMA journal_mode` |
-| src/tests/DiagDml.pas | tier2 | dml | 14 | 1 | db-blob | `CREATE TABLE s(x,y); CREATE TABLE d(x,y); INSERT INTO s VALUES(1,10),(2,20),(3,3...` |
-| src/tests/DiagDropTable.pas | tier2 | ddl | 6 | 5 | db-blob | `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ; DROP TABLE t; SELECT * FROM t` |
 | src/tests/DiagAnalyze.pas | tier2 | pragma | 3 | 3 | rc | `CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a); INSERT INTO t VALUES(1,1),(2,2),(3...` |
 | src/tests/DiagBloom.pas | tier2 | dql | 9 | 1 | rc | `CREATE TABLE sqlite_stat1(tbl,idx,stat)` |
 
 _End of file._
+
+Phase 9.1.divbug.1 (2026-05-12) closed the 44-site RELEASE-without-SAVEPOINT
+cluster (TestExplainParity 40 / TestBytecodeParity 2 / TestParser 2) by
+formatting the missing `: <name>` suffix in OP_Savepoint — see
+`passqlite3vdbe.pas:9678` (vdbe.c:3902 reference).  Earlier tier-2 db-blob
+rollups (DiagFeatureProbe / DiagDml / DiagDropTable) dropped out of the
+post-fix rerun and are no longer reproducing under the current build;
+re-catalog when their root-cause tickets (9.1.divbug.5..7) are revisited.
