@@ -4766,17 +4766,19 @@ end;
 
 procedure failIfSafeMode(p: PShellState; const zMsg: AnsiString); forward;
 
-procedure cmdShell(p: PShellState; const args: array of AnsiString; nArg: SizeInt;
-                   const zCmdName: AnsiString);
+function cmdShell(p: PShellState; const args: array of AnsiString; nArg: SizeInt;
+                   const zCmdName: AnsiString): i32;
 var
   zCmd, tok: AnsiString;
   i, x: i32;
 begin
+  Result := 0;
   { 10.1.34 — safe-mode gate (shell.c.in:11248):
       failIfSafeMode(p, "cannot run .%s in safe mode", azArg[0]); }
   failIfSafeMode(p, 'cannot run .' + zCmdName + ' in safe mode');
   if nArg < 1 then begin
     shellEPutZ('Usage: .system COMMAND'#10);
+    Result := 1;
     Exit;
   end;
   zCmd := '';
@@ -9439,7 +9441,7 @@ begin
   if zCmd = 'eqp'       then begin Result := cmdEqp(p, args, nArg); Exit; end;
   if zCmd = 'explain'   then begin cmdExplain(p, args, nArg); Exit; end;
   if (zCmd = 'shell') or (zCmd = 'system') then begin
-    cmdShell(p, args, nArg, zCmd); Exit;
+    Result := cmdShell(p, args, nArg, zCmd); Exit;
   end;
   if zCmd = 'cd'        then begin Result := cmdCd(p, args, nArg); Exit; end;
   if zCmd = 'log'       then begin cmdLog(args, nArg); Exit; end;

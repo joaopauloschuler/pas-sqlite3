@@ -12,7 +12,7 @@
     - eqp               .eqp                           (10.1e.3)  [COVERED]
     - explain           .explain                       (10.1e.4)  [COVERED]
     - show              .show                          (10.1e.5)  [COVERED]
-    - shell-system      .shell / .system               (10.1e.7)  TODO
+    - shell-system      .shell / .system               (10.1e.7)  [COVERED]
     - cd                .cd                            (10.1e.8)  [COVERED]
     - log               .log                           (10.1e.9)  TODO
     - trace             .trace                         (10.1e.10) TODO
@@ -237,6 +237,44 @@ begin
     '.explain auto'#10 +
     '.show'#10;
   DiffMeta('explain-state', ':memory:', script);
+
+  { -------- shell / system (10.1e.7) ------------------------------ }
+  { cmdShell (shell.c.in:11241..11264) routes through libc system().
+    Args are space-joined (quoted if a token contains whitespace) and
+    on non-zero exit a `System command returns N\n` breadcrumb lands
+    on stderr.  Missing-arg path emits `Usage: .system COMMAND\n` on
+    stderr with rc=1.  Safe-mode gate (failIfSafeMode) emits
+    `line N: cannot run .<name> in safe mode\n` with rc=1.
+
+    TODO 10.1.34 divergence (kept out of this gate): the port redirects
+    child stdout via POSIX fd-level dup2 so `.shell` output captured by
+    a preceding `.output FILE` lands in the file.  Upstream redirects
+    at FILE* level only and leaks `.shell` output to the terminal.
+    Cases below are deliberately stdout-direct so they byte-match.
+
+    TODO runner-shell wording (kept out): `.shell foo-nonexistent-...`
+    triggers a not-found message whose prefix is shell-specific
+    (`sh: 1:` vs `/bin/sh: 1:`); the exit-code propagation through
+    system() and the `System command returns 32512\n` breadcrumb are
+    in scope but the underlying message is not deterministic across
+    distros, so this arm is not gated. }
+  script := '.shell echo hi'#10;
+  DiffMeta('shell-echo', ':memory:', script);
+
+  script := '.system echo hi'#10;
+  DiffMeta('system-echo', ':memory:', script);
+
+  script := '.shell echo a b c'#10;
+  DiffMeta('shell-multiarg', ':memory:', script);
+
+  script := '.shell'#10;
+  DiffMeta('shell-usage', ':memory:', script);
+
+  script := '.system'#10;
+  DiffMeta('system-usage', ':memory:', script);
+
+  script := '.shell echo hi'#10;
+  DiffMeta('shell-safemode', '-safe :memory:', script);
 
   { -------- cd (10.1e.8) ------------------------------------------ }
   { `.cd DIRECTORY` calls chdir() after the failIfSafeMode gate
