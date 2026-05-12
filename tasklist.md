@@ -357,10 +357,15 @@ regressions without human triage.
   02 02); the .db-wal sidecar embeds a random salt so it cannot
   be made deterministic via the C shell — only the .db is committed.
 
-- [ ] **9.2.2** Read-only parity probe.  For each `*.db`, run a fixed
+- [~] **9.2.2** Read-only parity probe.  For each `*.db`, run a fixed
   query script (`*.queries.sql`) under both oracles, diff stdout +
   rc.  No writes — this gate is about read-side compatibility with
-  files the port did not author.
+  files the port did not author.  *Landed `bin/TestVectorReadOnly`
+  + per-vector `*.queries.sql` (11 vectors); the probe currently
+  catalogues 11/11 vectors as pas-skip (bucket-A: read-only schema
+  init returns SQLITE_READONLY; see `src/tests/vectors/DIVERGENCES.md`
+  + MANIFEST `pas-skip` block).  Gate exits rc=0 by skipping; will
+  begin gating once bucket-A is fixed under Phase 6/7.*
 
 - [ ] **9.2.3** Round-trip probe.  Open vector, run a fixed mutator
   script (`*.mutate.sql`: a handful of INSERT/UPDATE/DELETE inside
