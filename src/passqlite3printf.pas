@@ -112,6 +112,19 @@ function sqlite3VMPrintf(db: Psqlite3db; fmt: PAnsiChar;
 function sqlite3MAppendf(db: Psqlite3db; zOld: PAnsiChar; fmt: PAnsiChar;
   const args: array of const): PAnsiChar;
 
+{ 10.1.42.c — sqlite3DebugPrintf shim (port of printf.c:1514..1532,
+  prototype sqliteInt.h:4853 `void sqlite3DebugPrintf(const char*, ...)`).
+  Upstream is gated by `defined(SQLITE_DEBUG) || defined(SQLITE_HAVE_OS_TRACE)`;
+  the consumer-side TREETRACE/WHERETRACE arms (10.1.42.a/b) live under
+  `{$IFDEF SQLITE_DEBUG}`, mirroring that gate.  Renders via the shared
+  sqlite3FormatStr core, then writes to stdout and flushes — exactly
+  what `fprintf(stdout, "%s", zBuf); fflush(stdout);` does upstream.
+
+  No cdecl-variadic — the Pascal port's call sites use `array of const`
+  just like every other printf helper in this unit. }
+procedure sqlite3DebugPrintf(zFormat: PAnsiChar;
+  const args: array of const);
+
 { Core renderer: format `fmt` against `args`, return result as AnsiString.
   Used by every public entry above plus internal callers that prefer to
   stay in Pascal-string land. }
@@ -1492,6 +1505,23 @@ begin
   s := base + sqlite3FormatStr(fmt, args);
   if zOld <> nil then sqlite3DbFree(db, zOld);
   Result := strDupDb(db, s);
+end;
+
+{ 10.1.42.c — sqlite3DebugPrintf body.  printf.c:1514..1532 renders into
+  a stack StrAccum then flushes to stdout; we use the shared
+  sqlite3FormatStr path (same renderer) and Write+Flush.  Callable from
+  every unit that already imports passqlite3printf (codegen, where, ...),
+  so the future TREETRACE/WHERETRACE arms drop in with no cycle. }
+procedure sqlite3DebugPrintf(zFormat: PAnsiChar;
+  const args: array of const);
+var
+  s: AnsiString;
+begin
+  if zFormat = nil then Exit;
+  s := sqlite3FormatStr(zFormat, args);
+  if Length(s) > 0 then
+    System.Write(Output, s);
+  System.Flush(Output);
 end;
 
 { Hook installer — lets passqlite3util's cdecl sqlite3_mprintf /

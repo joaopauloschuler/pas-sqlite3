@@ -416,10 +416,13 @@ partial landings cannot silently no-op.
     `WHERETRACE(` calls.  Larger surface (~30 callsites).  Subset-port: start
     with the top-level whereLoopAddBtree / whereLoopAddVirtual / whereLoopAddOr
     arms; gradually add the deeper sub-arms in follow-up commits.
-  - [ ] **10.1.42.c** sqlite3DebugPrintf — confirm a `cdecl` printf-shim with
-    upstream signature already exists; if not, port from util.c.  Required by
-    both a/b.  (Likely already present from earlier debug work — verify before
-    porting.)
+  - [X] **10.1.42.c** sqlite3DebugPrintf — ported from printf.c:1514..1532 as
+    `procedure sqlite3DebugPrintf(zFormat: PAnsiChar; const args: array of const)`
+    in passqlite3printf.pas.  Renders via the existing sqlite3FormatStr core,
+    writes to stdout and flushes — same observable behaviour as upstream's
+    `fprintf(stdout, "%s", zBuf); fflush(stdout);`.  No earlier shim existed
+    (grep returned no Pascal-side definition).  Callable from every unit that
+    already imports passqlite3printf (codegen, where, ...).
   - [ ] **10.1.42.d** Build-flag gating.  Add `{$DEFINE SQLITE_DEBUG}` to a
     test-only build variant so a/b only emit under that flag.  Default builds
     must continue to compile the macro bodies out (or render them as silent
