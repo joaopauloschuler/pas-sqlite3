@@ -3801,7 +3801,7 @@ end;
   -1 (deferred — would require hwtime sampling around dispatch). }
 
 { vdbeapi.c:2623 — sqlite3_stmt_scanstatus_reset.  Zero per-op
-  nExec counters (and nCycle, deferred — field not yet on TVdbeOp). }
+  nExec and nCycle counters (Phase 10.1.39.d.1). }
 procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
 var
   p:  PVdbe;
@@ -3809,8 +3809,10 @@ var
 begin
   p := PVdbe(pStmt);
   if p = nil then Exit;
-  for ii := 0 to p^.nOp - 1 do
-    p^.aOp[ii].nExec := 0;
+  for ii := 0 to p^.nOp - 1 do begin
+    p^.aOp[ii].nExec  := 0;
+    p^.aOp[ii].nCycle := 0;
+  end;
 end;
 
 { vdbeapi.c:2457 — sqlite3_stmt_scanstatus_v2. }
@@ -3825,6 +3827,8 @@ var
   idx:   i32;
   x:     LogEst;
   rEst:  Double;
+  ncRes: i64;
+  ncII:  i32;
 begin
   p := PVdbe(pStmt);
   if (p = nil) or (pOut = nil)
@@ -3835,7 +3839,15 @@ begin
   aOp := p^.aOp;
   nOp := p^.nOp;
   if iScan < 0 then begin
-    { Aggregate-NCYCLE path: not supported (nCycle deferred). }
+    { vdbeapi.c:2485..2495 — iScan<0 aggregate NCYCLE arm: sum nCycle
+      across every opcode in the program. }
+    if iScanStatusOp = SQLITE_SCANSTAT_NCYCLE then begin
+      ncRes := 0;
+      for ncII := 0 to nOp - 1 do
+        ncRes := ncRes + i64(aOp[ncII].nCycle);
+      Pi64(pOut)^ := ncRes;
+      Result := 0; Exit;
+    end;
     Result := 1; Exit;
   end;
   pSc := nil;
@@ -3908,8 +3920,35 @@ begin
         Pi32(pOut)^ := -1;
     end;
     SQLITE_SCANSTAT_NCYCLE: begin
-      { Deferred — nCycle requires hwtime sampling in dispatch loop. }
-      Pi64(pOut)^ := -1;
+      { vdbeapi.c:2574..2606 — per-scan NCYCLE arm.  aAddrRange holds
+        up to 3 [start,end] pairs.  start>0 = inclusive VM-address range.
+        start<0 = "sum nCycle of all ops whose p1 == end AND opcode has
+        OPFLG_NCYCLE set" (matches the negative-start NCYCLE protocol the
+        Where producer stamps for cursor-id based scans). }
+      if pSc^.aAddrRange[0] = 0 then
+        ncRes := -1
+      else begin
+        ncRes := 0;
+        ncII := 0;
+        while ncII < Length(pSc^.aAddrRange) do begin
+          if pSc^.aAddrRange[ncII] = 0 then break;
+          if pSc^.aAddrRange[ncII] > 0 then begin
+            idx := pSc^.aAddrRange[ncII];
+            while idx <= pSc^.aAddrRange[ncII + 1] do begin
+              ncRes := ncRes + i64(aOp[idx].nCycle);
+              Inc(idx);
+            end;
+          end else begin
+            for idx := 0 to nOp - 1 do begin
+              if aOp[idx].p1 <> pSc^.aAddrRange[ncII + 1] then continue;
+              if (sqlite3OpcodeProperty[aOp[idx].opcode] and OPFLG_NCYCLE) = 0 then continue;
+              ncRes := ncRes + i64(aOp[idx].nCycle);
+            end;
+          end;
+          Inc(ncII, 2);
+        end;
+      end;
+      Pi64(pOut)^ := ncRes;
     end;
   else
     Result := 1; Exit;

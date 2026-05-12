@@ -94,6 +94,18 @@ if [ "${SQLITE_DEBUG:-0}" = "1" ]; then
   DEBUG_FLAGS="-dSQLITE_DEBUG"
   echo "SQLITE_DEBUG=1 — passing -dSQLITE_DEBUG to fpc (trace consumers enabled)."
 fi
+# 10.1.39.d — opt-in SQLITE_ENABLE_STMT_SCANSTATUS gate.  Wraps the
+# hwtime bracket around the VDBE dispatch loop (vdbe.pas:7627) and
+# enables SCANSTAT_NCYCLE reads.  Default-off because the bracket adds
+# two rdtsc calls per VDBE step.  Opt in with:
+#   SQLITE_ENABLE_STMT_SCANSTATUS=1 ./src/tests/build.sh
+# Upstream uses the value 2 to enable NCYCLE specifically; we treat
+# any truthy value the same way since the Pascal port doesn't split
+# the gate by value.
+if [ "${SQLITE_ENABLE_STMT_SCANSTATUS:-0}" != "0" ]; then
+  DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STMT_SCANSTATUS"
+  echo "SQLITE_ENABLE_STMT_SCANSTATUS=${SQLITE_ENABLE_STMT_SCANSTATUS} — passing -dSQLITE_ENABLE_STMT_SCANSTATUS to fpc (NCYCLE hwtime bracket enabled)."
+fi
 FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {

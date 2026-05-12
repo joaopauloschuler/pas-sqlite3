@@ -598,6 +598,21 @@ function  sqlite3OsCurrentTimeInt64(pVfs: Psqlite3_vfs;
 function  sqlite3OsCurrentTime(pVfs: Psqlite3_vfs;
                                pTimeOut: PDouble): cint;
 
+{ Phase 10.1.39.d.2 — sqlite3Hwtime (../sqlite3/src/hwtime.h).
+  High-performance cycle counter used by SQLITE_ENABLE_STMT_SCANSTATUS
+  (NCYCLE) and VDBE_PROFILE bracket around the dispatch loop.
+
+  x86_64: rdtsc (in-line asm)
+  aarch64: cntvct_el0 (in-line asm) — note hwtime.h uses cntvct_el0
+           even though the comment says PMCCNTR; we mirror C exactly.
+  fallback: monotonic clock (clock_gettime CLOCK_MONOTONIC) scaled to ns
+           — non-zero so consumers can still observe ordering.
+
+  FPC cannot inline a routine whose body contains an `asm` block, so
+  this is declared as a plain function (matches __inline__ semantics
+  closely enough — the call is one rdtsc instruction inside). }
+function  sqlite3Hwtime: u64;
+
 { ============================================================
   Section 13: VFS registration (os.c)
   ============================================================ }
@@ -1296,6 +1311,43 @@ function sqlite3OsCurrentTime(pVfs: Psqlite3_vfs; pTimeOut: PDouble): cint;
 begin
   Result := pVfs^.xCurrentTime(pVfs, pTimeOut);
 end;
+
+{ Phase 10.1.39.d.2 — sqlite3Hwtime.  Port of hwtime.h.
+
+  Returns a monotonically-increasing 64-bit counter.  On x86_64 this
+  is the TSC (rdtsc).  On aarch64 this is cntvct_el0.  On any other
+  architecture we fall back to clock_gettime(CLOCK_MONOTONIC) scaled
+  to nanoseconds — this is what the upstream "no asm" arm reduces to
+  in spirit, except hwtime.h there returns 0; we prefer a real value
+  so SCANSTAT_NCYCLE consumers see ordering even on exotic targets. }
+{$IFDEF CPUX86_64}
+function sqlite3Hwtime: u64; assembler; nostackframe;
+{ FPC's default x86_64 dialect is Intel syntax.  `rdtsc` puts the
+  low 32 bits in EAX and the high 32 bits in EDX; SysV/AMD64 returns
+  a 64-bit scalar in RAX.  Shift RDX up and OR into RAX. }
+asm
+  rdtsc
+  shl rdx, 32
+  or  rax, rdx
+end;
+{$ELSE}
+  {$IFDEF CPUAARCH64}
+function sqlite3Hwtime: u64; assembler; nostackframe;
+asm
+  mrs x0, cntvct_el0
+end;
+  {$ELSE}
+function sqlite3Hwtime: u64;
+var
+  ts: TTimeSpec;
+begin
+  if clock_gettime(CLOCK_MONOTONIC, @ts) = 0 then
+    Result := u64(ts.tv_sec) * u64(1000000000) + u64(ts.tv_nsec)
+  else
+    Result := 0;
+end;
+  {$ENDIF}
+{$ENDIF}
 
 { ============================================================
   Section 13: VFS registration  (os.c ~390)

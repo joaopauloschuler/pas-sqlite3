@@ -425,22 +425,29 @@ partial landings cannot silently no-op.
     as 10.1.39.e if needed.  TestShellMeta `.scanstats` arm stays shape-only
     (no SELECT runs in the script) so a byte-diff bump is not actionable in
     this subtask.
-  - [ ] **10.1.39.d** NCYCLE / hwtime sampling — deferred until a real consumer
-    appears; gated on `SQLITE_ENABLE_STMT_SCANSTATUS=2` equivalent and TVdbeOp
-    gaining an `nCycle` field.  Not blocking 10.1.39 closure.  Doable subtasks:
-    - [ ] **10.1.39.d.1** Add `nCycle: u64` field to TVdbeOp; verify all
-      TVdbeOp allocators / FillChar paths zero-init it (cross-check vdbe.c
-      around `pOp->nCycle` references).
-    - [ ] **10.1.39.d.2** Port `sqlite3Hwtime()` from `../sqlite3/src/hwtime.h`
-      (rdtsc on x86_64; PMCCNTR on aarch64 with fallback to monotonic clock).
-      Pascal location: passqlite3os.pas alongside the existing time helpers.
-    - [ ] **10.1.39.d.3** Bracket the dispatch loop in passqlite3vdbe.pas:7618
-      with `t0:=sqlite3Hwtime(); … pOp^.nCycle += sqlite3Hwtime()-t0;` under
-      `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}` (default-off — adds non-zero
-      per-op overhead in non-debug builds otherwise).
-    - [ ] **10.1.39.d.4** Wire SCANSTAT_NCYCLE reader arm in
-      passqlite3main.pas:3860 to sum `aOp[addrLoop..addrLoop+nOp].nCycle`
-      (matches vdbeapi.c:2530 NCYCLE arm).
+  - [X] **10.1.39.d** NCYCLE / hwtime sampling landed (d.1..d.4 all closed
+    in one chained commit).  build.sh gained a `SQLITE_ENABLE_STMT_SCANSTATUS`
+    env-var gate mirroring 10.1.42.d's `SQLITE_DEBUG=1` pattern; default
+    build leaves the bracket compiled out so per-op rdtsc overhead is zero.
+    - [X] **10.1.39.d.1** Added `nCycle: u64` to TVdbeOp (sizeof 32→40,
+      x86_64); zero-init covered in sqlite3VdbeAddOp3, sqlite3VdbeAddOp4Int,
+      sqlite3VdbeAddOpList and gVdbeOpDummy FillChar paths.  Also extended
+      sqlite3_stmt_scanstatus_reset to clear nCycle (vdbeapi.c:2629).
+    - [X] **10.1.39.d.2** Ported `sqlite3Hwtime` to passqlite3os.pas as
+      a CPUX86_64 `asm/rdtsc` assembler routine (Intel syntax, FPC default),
+      CPUAARCH64 `mrs cntvct_el0` arm, and a clock_gettime(CLOCK_MONOTONIC)
+      fallback for everything else.  Faithful 1:1 with `../sqlite3/src/hwtime.h`.
+    - [X] **10.1.39.d.3** Bracketed the dispatch loop in passqlite3vdbe.pas
+      under `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}` with a
+      `pCycleOp/t0Cycle` pair captured at top-of-iteration and credited at
+      the next iteration (or at `vdbe_return` on abort).  This pattern
+      avoids per-`continue` stamping at the cost of one extra check per
+      step — equivalent to the C `pnCycle` epilogue at vdbe.c:9249..9251.
+    - [X] **10.1.39.d.4** Wired SCANSTAT_NCYCLE in passqlite3main.pas:
+      iScan<0 aggregate arm sums `aOp[].nCycle` across the whole program
+      (vdbeapi.c:2485..2495); per-scan arm walks `pSc^.aAddrRange[]` with
+      both inclusive-range and negative-start (cursor-id, OPFLG_NCYCLE)
+      protocols (vdbeapi.c:2574..2606).
   - [X] **10.1.39.e** EXPLAIN text re-enabled: SCANSTAT_EXPLAIN arm in
     passqlite3main.pas now gates on `aOp[addrExplain].p4type=P4_DYNAMIC`
     before dereferencing p4.z (sqlite3VdbeExplainParent already wired via

@@ -845,9 +845,18 @@ type
     { Phase 8.2.1 — sqlite3_stmt_scanstatus() per-op execution counter.
       Mirrors u64 nExec in vdbe.h struct VdbeOp (gated on
       SQLITE_ENABLE_STMT_SCANSTATUS in C; unconditional here so
-      .scanstats works without a rebuild flag). nCycle is deferred
-      (requires hwtime sampling around dispatch). }
+      .scanstats works without a rebuild flag). }
     nExec:   u64;     { times this opcode has been executed }
+    { Phase 10.1.39.d.1 — sqlite3_stmt_scanstatus(SCANSTAT_NCYCLE)
+      per-op hardware-time counter.  Mirrors u64 nCycle in vdbe.h
+      struct VdbeOp (gated on SQLITE_ENABLE_STMT_SCANSTATUS in C).
+      The bracket that increments this is conditional on
+      {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS} around the dispatch
+      loop in vdbe.pas (vdbe.c:940..950 + vdbe.c:9246..9251).
+      Field is always present so the record layout/size stays stable
+      across debug/non-debug builds; in non-default builds it just
+      stays 0 and the SCANSTAT_NCYCLE reader returns sum-of-zeros. }
+    nCycle:  u64;     { hwtime cycles attributed to this opcode }
   end;
 
   { -----------------------------------------------------------------------
@@ -2306,6 +2315,7 @@ begin
   pOp^.p4.p   := nil;
   pOp^.p4type := P4_NOTUSED;
   pOp^.nExec  := 0;        { Phase 8.2.1 — scanstatus counter }
+  pOp^.nCycle := 0;        { Phase 10.1.39.d.1 — scanstatus NCYCLE }
   Result := i;
 end;
 
@@ -2329,6 +2339,7 @@ begin
   pOp^.p4.i   := p4;
   pOp^.p4type := P4_INT32;
   pOp^.nExec  := 0;        { Phase 8.2.1 — scanstatus counter }
+  pOp^.nCycle := 0;        { Phase 10.1.39.d.1 — scanstatus NCYCLE }
   Result := i;
 end;
 
@@ -2734,6 +2745,7 @@ begin
     pOut^.p4.p   := nil;
     pOut^.p5      := 0;
     pOut^.nExec   := 0;        { Phase 8.2.1 — scanstatus counter }
+    pOut^.nCycle  := 0;        { Phase 10.1.39.d.1 — scanstatus NCYCLE }
     Inc(pOut);
     Inc(pSrc);
   end;
@@ -7580,6 +7592,13 @@ var
   icnRoot:   i32;
   icnErr:    i32;
   icIdx:     i32;
+  {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+  { Phase 10.1.39.d.3 — hwtime cycle bracket around the dispatch loop.
+    pCycleOp pins the opcode being measured (in case the body mutates pOp
+    via jump arms); t0Cycle is the start TSC sample. }
+  pCycleOp: PVdbeOp;
+  t0Cycle:  u64;
+  {$ENDIF}
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -7612,13 +7631,35 @@ begin
   if db^.u1.isInterrupted <> 0 then goto abort_due_to_interrupt;
 
   { ── Main interpreter loop ── }
+  {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+  pCycleOp := nil;
+  t0Cycle  := 0;
+  {$ENDIF}
   repeat
+    {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+    { Phase 10.1.39.d.3 — close out the previous op's cycle window.
+      Mirrors vdbe.c:9249..9252 (the `if(pnCycle){ *pnCycle += sqlite3Hwtime(); }`
+      epilogue) — but since we accumulate at loop-top rather than loop-bottom
+      we can credit any continue/goto exit without per-continue stamping. }
+    if pCycleOp <> nil then begin
+      pCycleOp^.nCycle := pCycleOp^.nCycle + (sqlite3Hwtime - t0Cycle);
+      pCycleOp := nil;
+    end;
+    {$ENDIF}
     Inc(nVmStep);
 
     { Phase 8.2.1 — bump per-op execution counter for
       sqlite3_stmt_scanstatus() (vdbe.c:940 `pOp->nExec++`).  nCycle
-      hwtime sampling is deferred. }
+      hwtime sampling is bracketed below under SQLITE_ENABLE_STMT_SCANSTATUS. }
     Inc(pOp^.nExec);
+    {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+    { Phase 10.1.39.d.3 — start cycle window.  Mirrors vdbe.c:944..948
+      (`pnCycle = &pOp->nCycle; *pnCycle -= sqlite3Hwtime();`).  We stash
+      pOp itself rather than &pOp->nCycle because Pascal opcodes that
+      mutate pOp (jump arms) still need the *original* op to be debited. }
+    pCycleOp := pOp;
+    t0Cycle  := sqlite3Hwtime;
+    {$ENDIF}
 
     { Phase 7.4c — opcode-trace capture (mirrors C sqlite3VdbePrintOp call
       gated by db->flags & SQLITE_VdbeTrace at vdbe.c:954). }
@@ -11291,6 +11332,14 @@ begin
     sqlite3ResetOneSchema(db, i32(resetSchemaOnFault) - 1);
 
   vdbe_return:
+  {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
+  { Phase 10.1.39.d.3 — credit the last op on abnormal exit (mirrors
+    vdbe.c:9328..9332 the vdbe_return `if(pnCycle){ *pnCycle += sqlite3Hwtime(); }`). }
+  if pCycleOp <> nil then begin
+    pCycleOp^.nCycle := pCycleOp^.nCycle + (sqlite3Hwtime - t0Cycle);
+    pCycleOp := nil;
+  end;
+  {$ENDIF}
   Inc(v^.aCounter[SQLITE_STMTSTATUS_VM_STEP], i32(nVmStep));
   if v^.lockMask <> 0 then
     sqlite3VdbeLeave(v);
