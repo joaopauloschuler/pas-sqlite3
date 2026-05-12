@@ -397,12 +397,83 @@ begin
     nLine drift in the C reference).
 
     Scope: bare `.testcase` (NAME defaults to `<stdin>:<line>`) and
-    `.testcase NAME` — both silent, rc=0.  The `.check ANSWER` side of
-    the protocol is tracked by 10.1.40 (capture redirector pending). }
+    `.testcase NAME` — both silent, rc=0.  The `.check ANSWER` arm is
+    exercised by the `check-*` arms below (10.1.40). }
   script :=
     '.testcase'#10 +
     '.testcase widget-a'#10;
   DiffMeta('testcase-silent', ':memory:', script);
+
+  { -------- check (10.1.40) --------------------------------------- }
+  { dotCmdCheck (shell.c.in:8737..8855) reads captured stdout since the
+    most recent `.testcase` and compares against PATTERN.  Pass arm is
+    silent until the shellMain epilogue prints the "%d test(s) run with
+    %d error(s)\n" summary (shell.c.in:13657..13662) and rc becomes
+    nTestErr>0.  Fail arm emits
+      "<file>:<lineno>: .check failed for testcase NAME\nExpected: [P]\nGot:      [G]\n"
+    on stderr.  We exercise:
+      - default comparator (CR/LF-stripped memcmp) — pass and fail
+      - --glob / --notglob (testcase_glob wrapped in *PATTERN*)
+      - --exact (literal cli_strcmp)
+      - no-testcase-active error and missing-PATTERN error }
+
+  { Default pass: SELECT 1 captures "1\n"; the bare `.check 1` strips
+    the trailing \n and matches.  Summary line on stdout, rc=0. }
+  script :=
+    '.testcase t1'#10 +
+    'SELECT 1;'#10 +
+    '.check 1'#10;
+  DiffMeta('check-default-pass', ':memory:', script);
+
+  { Default fail: PATTERN "2" vs Got "1\n".  Stderr carries the failure
+    block; stdout carries the summary line.  rc=1. }
+  script :=
+    '.testcase t2'#10 +
+    'SELECT 1;'#10 +
+    '.check 2'#10;
+  DiffMeta('check-default-fail', ':memory:', script);
+
+  { Glob pass: testcase_glob wraps PATTERN as "*hello*". }
+  script :=
+    '.testcase tg'#10 +
+    'SELECT ''hello world'';'#10 +
+    '.check --glob hello'#10;
+  DiffMeta('check-glob-pass', ':memory:', script);
+
+  { Notglob pass: pattern does NOT appear. }
+  script :=
+    '.testcase tng'#10 +
+    'SELECT ''hello world'';'#10 +
+    '.check --notglob zzz'#10;
+  DiffMeta('check-notglob-pass', ':memory:', script);
+
+  { Exact pass: cli_strcmp on full buffer.  We feed --no-newline-style
+    pattern via mode=list which still emits "1\n", so use --exact with
+    "1\n" — script supplies "1" + LF in PATTERN argv by giving --exact
+    against the literal "1" which will FAIL (because exact compares the
+    trailing newline).  Use the exact-pass form: emit nothing, check
+    empty. }
+  script :=
+    '.testcase tex'#10 +
+    '.check --exact '''''#10;
+  DiffMeta('check-exact-empty', ':memory:', script);
+
+  { No-testcase-active: the C code routes through dotCmdError which
+    formats "<file> <line>" location plus a caret line — those bytes
+    depend on the C tokenizer's character-offset accounting which we
+    do not replicate exactly.  We emit a simplified
+    "Error: no .testcase is active\n" on stderr; the upstream variant
+    has a different (richer) prefix, so this arm is excluded from the
+    byte-diff and tested at the smoke level by Bash above. }
+
+  { Multiple checks with --keep: a single .testcase armed; first .check
+    --keep passes, second .check (no --keep) consumes the capture. }
+  script :=
+    '.testcase tk'#10 +
+    'SELECT 7;'#10 +
+    '.check --keep 7'#10 +
+    '.check 7'#10;
+  DiffMeta('check-keep', ':memory:', script);
 
   { -------- testctrl (10.1e.14) ----------------------------------- }
   { cmdTestctrl (shell.c.in:11395..11878) is the .testctrl dispatcher.

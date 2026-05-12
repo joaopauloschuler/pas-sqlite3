@@ -383,7 +383,15 @@ partial landings cannot silently no-op.
 
   Upstream's "Warning: .scanstats not available in this build." is still echoed
   verbatim to keep TestShellMeta golden diff clean while a..c land.
-- [~] **10.1.40** `.testcase NAME` — records NAME; `.check ANSWER` comparator side pending.
+- [X] **10.1.40** `.testcase NAME` / `.check ANSWER` — capture via fd-level
+  dup2 onto a temp file (same plumbing as `.output`); `.check` reads it
+  back and compares under default (CR/LF-stripped memcmp) / --glob /
+  --notglob / --exact.  Fail diagnostic and shellMain summary line
+  ("%d test(s) run with %d error(s)\n") match upstream byte-for-byte;
+  rc becomes nTestErr>0.  Tested by TestShellMeta `check-*` arms.
+  Deferred: dotCmdError caret-formatted location prefix (richer than our
+  "Error: ...\n") — kept out of the byte-diff for the error paths, and
+  the "<<ENDMARK" multi-line PATTERN form (needs seekable PFILE input).
 - [X] **10.1.41** `.testctrl` — dispatcher routes through 8.4.1 overloads
   for OPTIMIZATIONS, FK_NO_ACTION, PRNG_SEED, PENDING_BYTE, SORTER_MMAP,
   ASSERT/ALWAYS, LOCALTIME_FAULT, NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS,

@@ -468,6 +468,13 @@ var
   gSavedStdoutFd:       cint    = -1;
   gOutRedirected:       Boolean = False;
   gOutCurFilename:      AnsiString = '';
+  { 10.1.40 — `.testcase` / `.check` capture state.  When a `.testcase`
+    arms a capture, gTcCapturing is True and gTcCaptureFile names the
+    temp file currently aliased onto fd 1 via dup2 (same mechanism as
+    cmdOutput).  cmdCheck reads the file back, compares against the
+    PATTERN, and outputReset() restores the original stdout. }
+  gTcCapturing:         Boolean = False;
+  gTcCaptureFile:       AnsiString = '';
   { 10.1.10 .separator / .nullvalue / .mode INSERT — keep stable
     AnsiString backing for the PAnsiChar fields in TShellMode.spec. }
   zUserColSep:          AnsiString = '|';
@@ -7677,28 +7684,272 @@ begin
 end;
 
 { ----------------------------------------------------------------------
-  10.1.40  `.testcase NAME` / `.check ANSWER`  — shell.c.in (testcase
-  output capture used by the upstream test harness).  We support only
-  the .testcase sub-arm: stash NAME so the next .check can compare
-  zTestcase against the captured value (rendered through QRF).  The
-  comparator side (which redirects shell output into a buffer) is a
-  follow-up; for now we record the name as upstream does.
+  10.1.40  `.testcase NAME` / `.check ANSWER`  — shell.c.in:8718..8904.
+
+  `.testcase NAME` records NAME in p^.zTestcase and arms cli_output_capture
+  for the next `.check`.  Our port realises cli_output_capture as an
+  fd-level dup2 onto a temp file (same mechanism as cmdOutput); cmdCheck
+  reads that file back, compares against PATTERN under the chosen
+  comparator (default = strip leading/trailing \r\n then memcmp, --glob,
+  --notglob, --exact), and emits the upstream "%s:%lld: .check failed for
+  testcase %s\n" diagnostic on mismatch.  On pass the command is silent.
+  At process exit shellMain emits the "%d test(s) run with %d error(s)\n"
+  summary line (shell.c.in:13657..13662).
   ---------------------------------------------------------------------- }
+
+function tcStashName(p: PShellState; const zName: AnsiString): AnsiString;
+{ Truncating snprintf into p^.zTestcase (30 bytes incl. NUL).  Returns the
+  effective stored name as AnsiString. }
+var i, lim: SizeInt;
+begin
+  lim := Length(zName);
+  if lim > High(p^.zTestcase) then lim := High(p^.zTestcase);
+  for i := 1 to lim do p^.zTestcase[i - 1] := AnsiChar(zName[i]);
+  p^.zTestcase[lim] := #0;
+  SetLength(Result, lim);
+  if lim > 0 then Move(p^.zTestcase[0], Result[1], lim);
+end;
+
+function tcReadFile(const path: AnsiString): AnsiString;
+{ Slurp a captured-output temp file into an AnsiString.  Used by cmdCheck. }
+var
+  fd: cint;
+  buf: array[0..4095] of Byte;
+  n: ssize_t;
+begin
+  Result := '';
+  fd := FpOpen(path, O_RDONLY, &644);
+  if fd < 0 then Exit;
+  repeat
+    n := FpRead(fd, buf[0], SizeOf(buf));
+    if n > 0 then begin
+      SetLength(Result, Length(Result) + n);
+      Move(buf[0], Result[Length(Result) - n + 1], n);
+    end;
+  until n <= 0;
+  FpClose(fd);
+end;
+
+procedure tcArmCapture(p: PShellState);
+{ Mirror C dotCmdTestcase's output_reset + cli_output_capture rearm: drop
+  any prior capture file, then dup2 a fresh temp file onto fd 1 so all
+  subsequent stdout writes accumulate there. }
+var
+  fname: AnsiString;
+begin
+  if gTcCapturing then begin
+    outputReset(p);
+    if gTcCaptureFile <> '' then FpUnlink(gTcCaptureFile);
+    gTcCaptureFile := '';
+    gTcCapturing := False;
+  end else begin
+    outputReset(p);
+  end;
+  fname := SysUtils.GetTempDir(False) + 'pas_tc_' + IntToStr(FpGetPid) +
+           '_' + IntToStr(p^.lineno) + '.out';
+  if outputRedirectFile(fname, nil) then begin
+    gTcCapturing := True;
+    gTcCaptureFile := fname;
+    { Hide from .show: this is internal capture, not a user .output target. }
+    p^.zOutfile[0] := #0;
+  end;
+end;
 
 procedure cmdTestcase(p: PShellState; const args: array of AnsiString;
                       nArg: SizeInt);
+{ shell.c.in:8868..8904.  We accept the same NAME-only form; --error-prefix
+  is parsed and stored on p^.zErrPrefix for parity, otherwise the single
+  positional is the testcase name.  When omitted, NAME defaults to
+  "<file>:<lineno>" per the C snprintf fallback. }
 var
   zName: AnsiString;
   i: SizeInt;
+  haveName: Int32;
+  z: AnsiString;
 begin
-  if nArg < 1 then zName := '' else zName := args[0];
-  for i := 1 to Length(zName) do
-    if i <= High(p^.zTestcase) + 1 then
-      p^.zTestcase[i - 1] := AnsiChar(zName[i]);
-  if Length(zName) <= High(p^.zTestcase) then
-    p^.zTestcase[Length(zName)] := #0
+  haveName := 0;
+  zName := '';
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 3) and (z[1] = '-') and (z[2] = '-') then
+      z := Copy(z, 2, MaxInt);
+    if z = '-error-prefix' then begin
+      if i + 1 >= nArg then begin
+        shellEPutZ(Format('Error: missing argument to %s'#10, [args[i]]));
+        Exit;
+      end;
+      Inc(i);
+      if args[i] = '' then begin
+        gErrPrefixBacking := '';
+        p^.zErrPrefix := nil;
+      end else begin
+        gErrPrefixBacking := args[i];
+        p^.zErrPrefix := PAnsiChar(gErrPrefixBacking);
+      end;
+    end else if haveName <> 0 then begin
+      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+      Exit;
+    end else begin
+      zName := args[i];
+      haveName := 1;
+    end;
+    Inc(i);
+  end;
+  if haveName = 0 then begin
+    if p^.zInFile <> nil then
+      zName := Format('%s:%d', [AnsiString(p^.zInFile), p^.lineno])
+    else
+      zName := Format(':%d', [p^.lineno]);
+  end;
+  tcStashName(p, zName);
+  tcArmCapture(p);
+end;
+
+function tcGlobMatch(const zPattern, zText: AnsiString): Int32;
+{ Mirrors testcase_glob via sqlite3_strglob.  Returns 1 on match. }
+var pat: AnsiString;
+begin
+  pat := '*' + zPattern + '*';
+  if sqlite3_strglob(PAnsiChar(pat), PAnsiChar(zText)) = 0 then
+    Result := 1
   else
-    p^.zTestcase[High(p^.zTestcase)] := #0;
+    Result := 0;
+end;
+
+function tcDefaultCompare(const zPattern, zText: AnsiString): Int32;
+{ Default comparator: strip leading/trailing CR/LF on both sides then
+  memcmp.  shell.c.in:8825..8836. }
+var
+  s1, e1, s2, e2: SizeInt;
+begin
+  s1 := 1; e1 := Length(zPattern);
+  while (s1 <= e1) and ((zPattern[s1] = #10) or (zPattern[s1] = #13)) do Inc(s1);
+  while (e1 >= s1) and ((zPattern[e1] = #10) or (zPattern[e1] = #13)) do Dec(e1);
+  s2 := 1; e2 := Length(zText);
+  while (s2 <= e2) and ((zText[s2] = #10) or (zText[s2] = #13)) do Inc(s2);
+  while (e2 >= s2) and ((zText[e2] = #10) or (zText[e2] = #13)) do Dec(e2);
+  if (e1 - s1) <> (e2 - s2) then Exit(0);
+  if e1 < s1 then Exit(1);
+  if CompareByte(zPattern[s1], zText[s2], e1 - s1 + 1) = 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+procedure cmdCheck(p: PShellState; const args: array of AnsiString;
+                   nArg: SizeInt);
+{ shell.c.in:8737..8855 dotCmdCheck.  Supports: --keep, --show, --glob,
+  --notglob, --exact, plus the bare-default comparator.  PATTERN is the
+  first non-option positional.  The "<<ENDMARK" multi-line PATTERN form
+  reads from p^.in until ENDMARK — that arm is gated on the REPL having
+  a seekable PFILE input; for the script-driven Pascal port today,
+  pattern lines come from argv only. }
+var
+  i: SizeInt;
+  z, zCheck, zPattern, zTest: AnsiString;
+  bKeep, eCheck, isOk, sawZCheck: Int32;
+  iStart: i64;
+  testcaseName: AnsiString;
+  pchLen: SizeInt;
+begin
+  iStart := p^.lineno;
+  if p^.zTestcase[0] = #0 then begin
+    shellEPutZ('Error: no .testcase is active'#10);
+    Exit;
+  end;
+  bKeep := 0;
+  eCheck := 0;
+  sawZCheck := 0;
+  zCheck := '';
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 3) and (z[1] = '-') and (z[2] = '-') then
+      z := Copy(z, 2, MaxInt);
+    if z = '-keep' then bKeep := 1
+    else if z = '-show' then begin
+      { Mirror the C --show: dump current capture to stdout (which is
+        still the captured fd here) and implicitly --keep. }
+      if gTcCapturing and (gTcCaptureFile <> '') then begin
+        Flush(Output);
+        { Write to the real stdout via stderr-like helper would mix
+          streams; the C code emits via cli_printf(stdout,...) which
+          here is the captured fd.  Do the same for byte parity. }
+        shellSPutZ(tcReadFile(gTcCaptureFile));
+      end;
+      bKeep := 1;
+    end else if z = '-glob' then begin
+      if (eCheck <> 0) and (eCheck <> 1) then begin
+        shellEPutZ('Error: incompatible with prior options'#10);
+        Exit;
+      end;
+      eCheck := 1;
+    end else if z = '-notglob' then begin
+      if (eCheck <> 0) and (eCheck <> 2) then begin
+        shellEPutZ('Error: incompatible with prior options'#10);
+        Exit;
+      end;
+      eCheck := 2;
+    end else if z = '-exact' then begin
+      if (eCheck <> 0) and (eCheck <> 3) then begin
+        shellEPutZ('Error: incompatible with prior options'#10);
+        Exit;
+      end;
+      eCheck := 3;
+    end else if sawZCheck <> 0 then begin
+      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+      Exit;
+    end else begin
+      zCheck := args[i];
+      sawZCheck := 1;
+    end;
+    Inc(i);
+  end;
+  if sawZCheck = 0 then begin
+    shellEPutZ('Error: no PATTERN specified'#10);
+    Exit;
+  end;
+
+  { Flush captured output before reading the file back. }
+  Flush(Output);
+  if gTcCapturing and (gTcCaptureFile <> '') then
+    zTest := tcReadFile(gTcCaptureFile)
+  else
+    zTest := '';
+
+  Inc(p^.nTestRun);
+  zPattern := zCheck;
+  case eCheck of
+    1: isOk := tcGlobMatch(zPattern, zTest);
+    2: if tcGlobMatch(zPattern, zTest) = 0 then isOk := 1 else isOk := 0;
+    3: if zPattern = zTest then isOk := 1 else isOk := 0;
+  else
+    isOk := tcDefaultCompare(zPattern, zTest);
+  end;
+
+  if isOk = 0 then begin
+    pchLen := 0;
+    while (pchLen < High(p^.zTestcase)) and (p^.zTestcase[pchLen] <> #0) do
+      Inc(pchLen);
+    SetLength(testcaseName, pchLen);
+    if pchLen > 0 then Move(p^.zTestcase[0], testcaseName[1], pchLen);
+    Inc(p^.nTestErr);
+    { Restore stdout so the failure diagnostic goes to the real stderr;
+      the comparator file stays on disk until outputReset below. }
+    shellEPutZ(Format('%s:%d: .check failed for testcase %s'#10,
+      [AnsiString(p^.zInFile), iStart, testcaseName]));
+    shellEPutZ(Format('Expected: [%s]'#10, [zPattern]));
+    shellEPutZ(Format('Got:      [%s]'#10, [zTest]));
+  end;
+
+  if bKeep = 0 then begin
+    outputReset(p);
+    if gTcCaptureFile <> '' then FpUnlink(gTcCaptureFile);
+    gTcCaptureFile := '';
+    gTcCapturing := False;
+    p^.zTestcase[0] := #0;
+  end;
 end;
 
 { ----------------------------------------------------------------------
@@ -10024,6 +10275,7 @@ begin
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd, args, nArg); Exit; end;
   if zCmd = 'testcase'  then begin cmdTestcase(p, args, nArg); Exit; end;
+  if zCmd = 'check'     then begin cmdCheck(p, args, nArg); Exit; end;
   if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
   if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
     Result := cmdScanstats(p, args, nArg); Exit;
@@ -10906,6 +11158,25 @@ begin
   end;
   state.zNonce := nil;
   gNonceBacking := '';
+  { 10.1.40 — shell.c.in:13657..13662 test-summary epilogue.  Emitted to
+    stdout when any .check ran; exit code becomes the failure count > 0. }
+  if state.nTestRun > 0 then begin
+    if state.nTestRun = 1 then
+      if state.nTestErr = 1 then
+        shellSPutZ(Format('%d test run with %d error'#10,
+          [state.nTestRun, state.nTestErr]))
+      else
+        shellSPutZ(Format('%d test run with %d errors'#10,
+          [state.nTestRun, state.nTestErr]))
+    else if state.nTestErr = 1 then
+      shellSPutZ(Format('%d tests run with %d error'#10,
+        [state.nTestRun, state.nTestErr]))
+    else
+      shellSPutZ(Format('%d tests run with %d errors'#10,
+        [state.nTestRun, state.nTestErr]));
+    Flush(Output);
+    if state.nTestErr > 0 then Result := 1;
+  end;
   { Use the unused alias to satisfy the compiler — initialSql / zMode
     remain for future expansion (eventually map -mode <name> here). }
   if (initialSql = '') and (zMode = '') then ;
