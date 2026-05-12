@@ -488,16 +488,15 @@ partial landings cannot silently no-op.
       Both land when the surrounding optimizer arms land.
     - [~] **10.1.42.a.5** Outer-join simplification + FROM-subquery
       TREETRACE arms (VERIFIED C masks: 0x1000 FULL/LEFT/RIGHT
-      simplifies select.c:7737..7756; 0x800 omit FROM-subquery
-      ORDER BY :7832; 0x4000 WHERE push-down :8011 and Change-unused-
-      result-columns :8030; 0x8000 all-FROM analysis :8146; 0x20
-      Finished-with-AggInfo :8937).  All five arms are entirely
-      deferred — none of the host optimizer passes are ported yet:
-      - select.c:7708..7877 outer FROM-clause optimization loop
-        (JT_LEFT/RIGHT/LTORJ simplifier + IgnorableOrderby
-        FROM-subquery pOrderBy drop) is not ported; Pas's sqlite3Select
-        runs `existsToJoin` + `propagateConstants` then jumps straight
-        into the per-shape codegen, without the per-FROM-item walk.
+      simplifies select.c:7737..7756 — LANDED under 10.1.42.a.7;
+      0x800 omit FROM-subquery ORDER BY :7832; 0x4000 WHERE push-down
+      :8011 and Change-unused-result-columns :8030; 0x8000 all-FROM
+      analysis :8146; 0x20 Finished-with-AggInfo :8937).  Remaining
+      four arms deferred:
+      - select.c:7708..7877 outer FROM-clause optimization loop:
+        JT_LEFT/RIGHT/LTORJ simplifier portion is now ported (a.7);
+        the IgnorableOrderby FROM-subquery pOrderBy drop + the
+        flattenSubquery arm remain deferred.
       - pushDownWhereTerms (where.c) and
         disableUnusedSubqueryResultColumns (select.c) are not ported,
         so the 0x4000 push-down/null-out arms have no callsite to
@@ -599,9 +598,15 @@ partial landings cannot silently no-op.
     - [X] **10.1.42.a.6.4** Ported `aggregateConvertIndexedExprRefToColumn` + walker callback (select.c:6591..6623); wired after sqlite3WhereEnd (select.c:8600..8615, gated on pParse^.pIdxEpr). 0x20 TREETRACE arm.
     - [X] **10.1.42.a.6.5** Ported "Finished with AggInfo" 0x20 TREETRACE arm at sqlite3Select tail (select.c:8933..8945); pAggI2 pre-zeroed at entry, printAggInfo + aCol/aFunc self-asserts deferred (no host).
       (select.c:8937) so the "Finished with AggInfo" trailing print can land.
-    - [ ] **10.1.42.a.7** Port `simplifyOuterJoins` outer-join simplifier
-      loop (select.c:7737..7756) so the 0x1000 FULL/LEFT/RIGHT-JOIN
-      simplification TREETRACE arms (10.1.42.a.5 deferred) can land.
+    - [X] **10.1.42.a.7** Ported the outer-join strength-reduction inline
+      loop (select.c:7708..7770) + prerequisites `sqlite3ExprImpliesNonNullRow`
+      / `impliesNotNullRow` / `bothImplyNotNullRow` (expr.c:6857..7031) and
+      `unsetJoinExpr` (select.c:471..494).  All four 0x1000 TREETRACE arms
+      (FULL→RIGHT, LEFT→JOIN, FULL→LEFT, RIGHT→JOIN) now live under
+      `{$IFDEF SQLITE_DEBUG}`.  Wired in sqlite3Select between
+      linkWindowsForSelect and existsToJoin.  Added SQLITE_SimplifyJoin
+      (0x2000) constant.  flattenSubquery/ORDER-BY-drop arms of the FROM
+      loop remain deferred under 10.1.42.a.5 / 10.1.42.a.8.
     - [ ] **10.1.42.a.8** Port the omit-FROM-subquery-ORDER-BY arm
       (select.c:7832) so the 0x800 TREETRACE arm can land.
     - [ ] **10.1.42.a.9** Port `pushDownWhereTerms` +

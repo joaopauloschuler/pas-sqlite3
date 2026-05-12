@@ -1608,6 +1608,7 @@ const
   SQLITE_PropagateConst = u32($00008000);  { Constant propagation optimization (sqliteInt.h:1915) }
   SQLITE_CountOfView    = u32($00000200);  { count-of-view optimization (sqliteInt.h:1908) }
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
+  SQLITE_SimplifyJoin   = u32($00002000);  { Convert LEFT JOIN to JOIN (sqliteInt.h:1913) }
   SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
   SQLITE_Coroutines     = u32($02000000);  { Co-routines for subqueries (sqliteInt.h:1927) }
   SQLITE_BalancedMerge  = u32($00200000);  { Balance multi-way merges (sqliteInt.h:1922) }
@@ -6592,6 +6593,174 @@ begin
     end;
     TK_BITNOT, TK_NOT:
       Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
+  end;
+end;
+
+{ bothImplyNotNullRow — helper for impliesNotNullRow.  Faithful port of
+  expr.c:6857..6866.  Set pWalker^.eCode to one only if BOTH input
+  expressions separately have the implies-not-null-row property. }
+procedure bothImplyNotNullRow(pWalker: PWalker; pE1, pE2: PExpr);
+begin
+  if pWalker^.eCode = 0 then
+  begin
+    sqlite3WalkExpr(pWalker, pE1);
+    if pWalker^.eCode <> 0 then
+    begin
+      pWalker^.eCode := 0;
+      sqlite3WalkExpr(pWalker, pE2);
+    end;
+  end;
+end;
+
+{ impliesNotNullRow — Walker Expr callback for
+  sqlite3ExprImpliesNonNullRow.  Faithful port of expr.c:6868..6991.
+  If pExpr requires that the table at pWalker^.u.iCur have one or more
+  non-NULL columns, set pWalker^.eCode := 1 and abort.
+  pWalker^.mWFlags is non-zero if the inquiry is on behalf of a
+  RIGHT/FULL JOIN — affects EP_InnerON handling.
+  False positives are deadly; false negatives merely lose optimisations. }
+function impliesNotNullRow(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pLeft, pRight: PExpr;
+begin
+  if ExprHasProperty(pExpr, EP_OuterON) then
+  begin
+    Result := WRC_Prune;
+    Exit;
+  end;
+  if ExprHasProperty(pExpr, EP_InnerON) and (pWalker^.mWFlags <> 0) then
+  begin
+    { iCur used in an inner-join ON-clause to the left of a RIGHT JOIN —
+      does NOT mean the table must be non-null.  Conservative: prune. }
+    Result := WRC_Prune;
+    Exit;
+  end;
+  case pExpr^.op of
+    TK_ISNOT, TK_ISNULL, TK_NOTNULL, TK_IS,
+    TK_VECTOR, TK_FUNCTION, TK_TRUTH, TK_CASE:
+      Result := WRC_Prune;
+    TK_COLUMN:
+      begin
+        if pWalker^.u.iCur = pExpr^.iTable then
+        begin
+          pWalker^.eCode := 1;
+          Result := WRC_Abort;
+        end
+        else
+          Result := WRC_Prune;
+      end;
+    TK_OR, TK_AND:
+      begin
+        { Both sides of AND/OR must separately imply non-null-row. }
+        bothImplyNotNullRow(pWalker, pExpr^.pLeft, pExpr^.pRight);
+        Result := WRC_Prune;
+      end;
+    TK_IN:
+      begin
+        { "x NOT IN ()" and "x NOT IN (SELECT 1 WHERE false)" can be true;
+          otherwise NULL on LHS of IN ⇒ IN is NULL. }
+        if ExprUseXList(pExpr) and (pExpr^.x.pList <> nil)
+           and (pExpr^.x.pList^.nExpr > 0) then
+          sqlite3WalkExpr(pWalker, pExpr^.pLeft);
+        Result := WRC_Prune;
+      end;
+    TK_BETWEEN:
+      begin
+        { "x NOT BETWEEN y AND z": either x is non-null-row or both y,z are. }
+        Assert(ExprUseXList(pExpr));
+        Assert(pExpr^.x.pList^.nExpr = 2);
+        sqlite3WalkExpr(pWalker, pExpr^.pLeft);
+        bothImplyNotNullRow(pWalker,
+          ExprListItems(pExpr^.x.pList)[0].pExpr,
+          ExprListItems(pExpr^.x.pList)[1].pExpr);
+        Result := WRC_Prune;
+      end;
+    TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT_TK, TK_GE:
+      begin
+        pLeft  := pExpr^.pLeft;
+        pRight := pExpr^.pRight;
+        { Virtual tables allow `x=NULL` so x=y doesn't prove y non-null
+          when either side is a vtab column. }
+        if ((pLeft^.op = TK_COLUMN) and (pLeft^.y.pTab <> nil)
+            and (pLeft^.y.pTab^.eTabType = TABTYP_VTAB))
+           or ((pRight^.op = TK_COLUMN) and (pRight^.y.pTab <> nil)
+               and (pRight^.y.pTab^.eTabType = TABTYP_VTAB)) then
+        begin
+          Result := WRC_Prune;
+          Exit;
+        end;
+        Result := WRC_Continue;  { fall through to default — keep walking }
+      end;
+  else
+    Result := WRC_Continue;
+  end;
+end;
+
+{ sqlite3ExprImpliesNonNullRow — expr.c:6993..7031.  Return non-zero if
+  expression p can only be true if at least one column of table iTab is
+  non-null (i.e. p will always be NULL or false if every column of iTab
+  is NULL).  isRJ <> 0 when called on behalf of a RIGHT/FULL JOIN.
+  Used by the LEFT/RIGHT/FULL → JOIN strength-reduction optimisation in
+  sqlite3Select (select.c:7730..7768). }
+function sqlite3ExprImpliesNonNullRow(p: PExpr; iTab: i32; isRJ: i32): i32;
+var
+  w: TWalker;
+begin
+  p := sqlite3ExprSkipCollateAndLikely(p);
+  if p = nil then begin Result := 0; Exit; end;
+  if p^.op = TK_NOTNULL then
+    p := p^.pLeft
+  else
+    while p^.op = TK_AND do
+    begin
+      if sqlite3ExprImpliesNonNullRow(p^.pLeft, iTab, isRJ) <> 0 then
+      begin Result := 1; Exit; end;
+      p := p^.pRight;
+    end;
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback   := @impliesNotNullRow;
+  w.xSelectCallback := nil;
+  w.xSelectCallback2 := nil;
+  w.eCode           := 0;
+  if isRJ <> 0 then w.mWFlags := 1 else w.mWFlags := 0;
+  w.u.iCur          := iTab;
+  sqlite3WalkExpr(@w, p);
+  Result := i32(w.eCode);
+end;
+
+{ unsetJoinExpr — select.c:471..494.  Walk Expr tree p; for nodes
+  carrying EP_OuterON with w.iJoin = iTable (or any node when iTable<0),
+  clear EP_OuterON|EP_InnerON; for iTable>=0 re-add EP_InnerON.  TK_COLUMN
+  references to iTable also clear EP_CanBeNull unless nullable is set
+  (which happens when the table sits on the LHS of a RIGHT JOIN — see
+  forum thread b40696f50145d21c).  Recurses into TK_FUNCTION arg list,
+  pLeft, and iterates down pRight. }
+procedure unsetJoinExpr(p: PExpr; iTable: i32; nullable: i32);
+var
+  i: i32;
+  pList: PExprList;
+begin
+  while p <> nil do
+  begin
+    if (iTable < 0)
+       or (ExprHasProperty(p, EP_OuterON) and (p^.w.iJoin = iTable)) then
+    begin
+      ExprClearProperty(p, EP_OuterON or EP_InnerON);
+      if iTable >= 0 then ExprSetProperty(p, EP_InnerON);
+    end;
+    if (p^.op = TK_COLUMN) and (p^.iTable = iTable) and (nullable = 0) then
+      ExprClearProperty(p, EP_CanBeNull);
+    if p^.op = TK_FUNCTION then
+    begin
+      Assert(ExprUseXList(p));
+      Assert(p^.pLeft = nil);
+      pList := p^.x.pList;
+      if pList <> nil then
+        for i := 0 to pList^.nExpr - 1 do
+          unsetJoinExpr(ExprListItems(pList)[i].pExpr, iTable, nullable);
+    end;
+    unsetJoinExpr(p^.pLeft, iTable, nullable);
+    p := p^.pRight;
   end;
 end;
 
@@ -25776,6 +25945,112 @@ begin
     arm at the bail below was unreachable.  Walk the result-list (and a
     couple of common nested shapes) to wire up. }
   linkWindowsForSelect(pParse, p);
+
+  { 10.1.42.a.7 — Outer-join strength-reduction (select.c:7708..7770).
+    Walk the FROM clause and for each term whose LEFT/LTORJ side is
+    proven non-nullable by the WHERE clause, simplify
+       LEFT JOIN  -> JOIN
+      RIGHT JOIN  -> JOIN
+       FULL JOIN  -> RIGHT JOIN (then later -> LEFT JOIN if applicable)
+    via sqlite3ExprImpliesNonNullRow + unsetJoinExpr.  This is the inline
+    "outer FROM-clause optimization loop" arm — the surrounding
+    flattenSubquery / ORDER-BY-drop arms remain deferred under
+    10.1.42.a.5 / 10.1.42.a.8.  Only fires when p^.pPrior = nil (not a
+    compound) per C precondition. }
+  pTabList := p^.pSrc;
+  if (p^.pPrior = nil) and (pTabList <> nil) then
+  begin
+    i := 0;
+    while i < pTabList^.nSrc do
+    begin
+      pItem := @SrcListItems(pTabList)[i];
+      pTab  := pItem^.pSTab;
+      Assert(pTab <> nil);
+      if ((pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0)
+         and (sqlite3ExprImpliesNonNullRow(p^.pWhere, pItem^.iCursor,
+                i32(pItem^.fg.jointype and JT_LTORJ)) <> 0)
+         and OptimizationEnabled(pParse^.db, SQLITE_SimplifyJoin) then
+      begin
+        if (pItem^.fg.jointype and JT_LEFT) <> 0 then
+        begin
+          if (pItem^.fg.jointype and JT_RIGHT) <> 0 then
+          begin
+            {$IFDEF SQLITE_DEBUG}
+            { TREETRACE(0x1000) "FULL-JOIN simplifies to RIGHT-JOIN on
+              term %d" (select.c:7738..7739). }
+            if (sqlite3TreeTrace and $1000) <> 0 then
+              sqlite3DebugPrintf(
+                'FULL-JOIN simplifies to RIGHT-JOIN on term %d'#10, [i]);
+            {$ENDIF}
+            pItem^.fg.jointype := pItem^.fg.jointype and (not JT_LEFT);
+          end
+          else
+          begin
+            {$IFDEF SQLITE_DEBUG}
+            { TREETRACE(0x1000) "LEFT-JOIN simplifies to JOIN on
+              term %d" (select.c:7742..7743). }
+            if (sqlite3TreeTrace and $1000) <> 0 then
+              sqlite3DebugPrintf(
+                'LEFT-JOIN simplifies to JOIN on term %d'#10, [i]);
+            {$ENDIF}
+            pItem^.fg.jointype := pItem^.fg.jointype
+              and (not (JT_LEFT or JT_OUTER));
+            unsetJoinExpr(p^.pWhere, pItem^.iCursor, 0);
+          end;
+        end;
+        if (pItem^.fg.jointype and JT_LTORJ) <> 0 then
+        begin
+          jj := i + 1;
+          while jj < pTabList^.nSrc do
+          begin
+            if (SrcListItems(pTabList)[jj].fg.jointype and JT_RIGHT) <> 0 then
+            begin
+              if (SrcListItems(pTabList)[jj].fg.jointype and JT_LEFT) <> 0 then
+              begin
+                {$IFDEF SQLITE_DEBUG}
+                { TREETRACE(0x1000) "FULL-JOIN simplifies to LEFT-JOIN on
+                  term %d" (select.c:7753..7754). }
+                if (sqlite3TreeTrace and $1000) <> 0 then
+                  sqlite3DebugPrintf(
+                    'FULL-JOIN simplifies to LEFT-JOIN on term %d'#10, [jj]);
+                {$ENDIF}
+                SrcListItems(pTabList)[jj].fg.jointype :=
+                  SrcListItems(pTabList)[jj].fg.jointype and (not JT_RIGHT);
+              end
+              else
+              begin
+                {$IFDEF SQLITE_DEBUG}
+                { TREETRACE(0x1000) "RIGHT-JOIN simplifies to JOIN on
+                  term %d" (select.c:7757..7758). }
+                if (sqlite3TreeTrace and $1000) <> 0 then
+                  sqlite3DebugPrintf(
+                    'RIGHT-JOIN simplifies to JOIN on term %d'#10, [jj]);
+                {$ENDIF}
+                SrcListItems(pTabList)[jj].fg.jointype :=
+                  SrcListItems(pTabList)[jj].fg.jointype
+                  and (not (JT_RIGHT or JT_OUTER));
+                unsetJoinExpr(p^.pWhere,
+                  SrcListItems(pTabList)[jj].iCursor, 1);
+              end;
+            end;
+            Inc(jj);
+          end;
+          { Strip JT_LTORJ from this table and every prior table back to
+            the most recent JT_RIGHT (select.c:7764..7767). }
+          jj := pTabList^.nSrc - 1;
+          while jj >= 0 do
+          begin
+            SrcListItems(pTabList)[jj].fg.jointype :=
+              SrcListItems(pTabList)[jj].fg.jointype and (not JT_LTORJ);
+            if (SrcListItems(pTabList)[jj].fg.jointype and JT_RIGHT) <> 0 then
+              Break;
+            Dec(jj);
+          end;
+        end;
+      end;
+      Inc(i);
+    end;
+  end;
 
   { EXISTS-to-JOIN optimisation — select.c:7897..7902 (sub-progress 51).
     If the resolver flagged the SELECT as containing an EXISTS subquery,
