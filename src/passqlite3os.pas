@@ -2248,6 +2248,201 @@ begin
 end;
 
 { ============================================================
+  Section 14c.5: Overrideable system-call table  (os_unix.c §417..596)
+  Mirrors C `aSyscall[]`.  The pas port dispatches I/O through BaseUnix
+  wrappers (FpXxx) directly rather than through this table, but the
+  table is exposed via the v3 VFS slots xSetSystemCall/xGetSystemCall/
+  xNextSystemCall so that sqlite3-level callers (test_syscall, the
+  `.vfslist` shell builtin, etc.) see the same surface as upstream.
+  ============================================================ }
+
+type
+  Punix_syscall = ^unix_syscall;
+  unix_syscall = record
+    zName    : PChar;             { Name of the system call }
+    pCurrent : sqlite3_syscall_ptr; { Current value of the system call }
+    pDefault : sqlite3_syscall_ptr; { Default value }
+  end;
+
+{ libc bindings used purely as default pCurrent values for aSyscall[].
+  None of these are dispatched through the table at runtime; the table
+  exists to mirror the C ABI surface for v3 VFS introspection.        }
+function  c_posixOpen(zFile: PChar; flags, mode: cint): cint;
+  cdecl; external 'c' name 'open';
+function  c_close(fd: cint): cint;
+  cdecl; external 'c' name 'close';
+function  c_access(zPath: PChar; mode: cint): cint;
+  cdecl; external 'c' name 'access';
+function  c_getcwd(buf: PChar; size: csize_t): PChar;
+  cdecl; external 'c' name 'getcwd';
+function  c_stat(zPath: PChar; buf: Pointer): cint;
+  cdecl; external 'c' name 'stat';
+function  c_fstat(fd: cint; buf: Pointer): cint;
+  cdecl; external 'c' name 'fstat';
+function  c_ftruncate(fd: cint; len: i64): cint;
+  cdecl; external 'c' name 'ftruncate';
+function  c_fcntl(fd, cmd: cint): cint;
+  cdecl; varargs; external 'c' name 'fcntl';
+function  c_read(fd: cint; buf: Pointer; n: csize_t): cint;
+  cdecl; external 'c' name 'read';
+function  c_pread(fd: cint; buf: Pointer; n: csize_t; off: i64): cint;
+  cdecl; external 'c' name 'pread';
+function  c_write(fd: cint; buf: Pointer; n: csize_t): cint;
+  cdecl; external 'c' name 'write';
+function  c_pwrite(fd: cint; buf: Pointer; n: csize_t; off: i64): cint;
+  cdecl; external 'c' name 'pwrite';
+function  c_fchmod(fd: cint; mode: cint): cint;
+  cdecl; external 'c' name 'fchmod';
+function  c_fallocate(fd: cint; off, len: i64): cint;
+  cdecl; external 'c' name 'posix_fallocate';
+function  c_unlink(zPath: PChar): cint;
+  cdecl; external 'c' name 'unlink';
+function  c_mkdir(zPath: PChar; mode: cint): cint;
+  cdecl; external 'c' name 'mkdir';
+function  c_rmdir(zPath: PChar): cint;
+  cdecl; external 'c' name 'rmdir';
+function  c_fchown(fd: cint; uid, gid: cint): cint;
+  cdecl; external 'c' name 'fchown';
+function  c_geteuid: cint;
+  cdecl; external 'c' name 'geteuid';
+function  c_mmap(addr: Pointer; len: csize_t; prot, flags, fd: cint;
+                 off: i64): Pointer;
+  cdecl; external 'c' name 'mmap';
+function  c_munmap(addr: Pointer; len: csize_t): cint;
+  cdecl; external 'c' name 'munmap';
+function  c_readlink(zPath, buf: PChar; n: csize_t): cint;
+  cdecl; external 'c' name 'readlink';
+function  c_lstat(zPath: PChar; buf: Pointer): cint;
+  cdecl; external 'c' name 'lstat';
+
+{ os_unix.c ~415: openDirectory forward; pas wraps this inline elsewhere.
+  Provide a stub address so the "openDirectory" syscall slot is non-nil
+  and shows up in unixNextSystemCall enumeration. }
+function  pas_openDirectory(zPath: PChar; pFd: PcInt): cint; cdecl;
+begin
+  { Not dispatched at runtime — kept as a non-nil marker for aSyscall[]. }
+  if Assigned(pFd) then pFd^ := -1;
+  Result := 0;
+end;
+
+{ os_unix.c ~7100: unixGetpagesize stub for the table slot. }
+function  c_getpagesize_sysc: cint;
+  cdecl; external 'c' name 'getpagesize';
+function  pas_getpagesize: cint; cdecl;
+begin
+  Result := c_getpagesize_sysc;
+end;
+
+{ The table.  Order matches os_unix.c §427..596 exactly so any index-
+  based reference from a shared header stays in sync.                 }
+var
+  aSyscall : array[0..28] of unix_syscall = (
+    (zName: 'open';          pCurrent: sqlite3_syscall_ptr(@c_posixOpen);    pDefault: nil),
+    (zName: 'close';         pCurrent: sqlite3_syscall_ptr(@c_close);        pDefault: nil),
+    (zName: 'access';        pCurrent: sqlite3_syscall_ptr(@c_access);       pDefault: nil),
+    (zName: 'getcwd';        pCurrent: sqlite3_syscall_ptr(@c_getcwd);       pDefault: nil),
+    (zName: 'stat';          pCurrent: sqlite3_syscall_ptr(@c_stat);         pDefault: nil),
+    (zName: 'fstat';         pCurrent: sqlite3_syscall_ptr(@c_fstat);        pDefault: nil),
+    (zName: 'ftruncate';     pCurrent: sqlite3_syscall_ptr(@c_ftruncate);    pDefault: nil),
+    (zName: 'fcntl';         pCurrent: sqlite3_syscall_ptr(@c_fcntl);        pDefault: nil),
+    (zName: 'read';          pCurrent: sqlite3_syscall_ptr(@c_read);         pDefault: nil),
+    (zName: 'pread';         pCurrent: sqlite3_syscall_ptr(@c_pread);        pDefault: nil),
+    (zName: 'pread64';       pCurrent: nil;                                  pDefault: nil),
+    (zName: 'write';         pCurrent: sqlite3_syscall_ptr(@c_write);        pDefault: nil),
+    (zName: 'pwrite';        pCurrent: sqlite3_syscall_ptr(@c_pwrite);       pDefault: nil),
+    (zName: 'pwrite64';      pCurrent: nil;                                  pDefault: nil),
+    (zName: 'fchmod';        pCurrent: sqlite3_syscall_ptr(@c_fchmod);       pDefault: nil),
+    (zName: 'fallocate';     pCurrent: sqlite3_syscall_ptr(@c_fallocate);    pDefault: nil),
+    (zName: 'unlink';        pCurrent: sqlite3_syscall_ptr(@c_unlink);       pDefault: nil),
+    (zName: 'openDirectory'; pCurrent: sqlite3_syscall_ptr(@pas_openDirectory); pDefault: nil),
+    (zName: 'mkdir';         pCurrent: sqlite3_syscall_ptr(@c_mkdir);        pDefault: nil),
+    (zName: 'rmdir';         pCurrent: sqlite3_syscall_ptr(@c_rmdir);        pDefault: nil),
+    (zName: 'fchown';        pCurrent: sqlite3_syscall_ptr(@c_fchown);       pDefault: nil),
+    (zName: 'geteuid';       pCurrent: sqlite3_syscall_ptr(@c_geteuid);      pDefault: nil),
+    (zName: 'mmap';          pCurrent: sqlite3_syscall_ptr(@c_mmap);         pDefault: nil),
+    (zName: 'munmap';        pCurrent: sqlite3_syscall_ptr(@c_munmap);       pDefault: nil),
+    (zName: 'mremap';        pCurrent: nil;                                  pDefault: nil),
+    (zName: 'getpagesize';   pCurrent: sqlite3_syscall_ptr(@pas_getpagesize); pDefault: nil),
+    (zName: 'readlink';      pCurrent: sqlite3_syscall_ptr(@c_readlink);     pDefault: nil),
+    (zName: 'lstat';         pCurrent: sqlite3_syscall_ptr(@c_lstat);        pDefault: nil),
+    (zName: 'ioctl';         pCurrent: nil;                                  pDefault: nil)
+  );
+
+{ os_unix.c:731 — unixSetSystemCall.  Override or restore one slot
+  (or, when zName=NULL, reset every slot to its default). }
+function unixSetSystemCall(pNotUsed: Psqlite3_vfs; zName: PChar;
+                           pNewFunc: sqlite3_syscall_ptr): cint; cdecl;
+var
+  i  : cint;
+  rc : cint;
+begin
+  rc := SQLITE_NOTFOUND;
+  if zName = nil then
+  begin
+    rc := SQLITE_OK;
+    for i := 0 to High(aSyscall) do
+      if aSyscall[i].pDefault <> nil then
+        aSyscall[i].pCurrent := aSyscall[i].pDefault;
+  end
+  else
+  begin
+    for i := 0 to High(aSyscall) do
+      if StrComp(zName, aSyscall[i].zName) = 0 then
+      begin
+        if aSyscall[i].pDefault = nil then
+          aSyscall[i].pDefault := aSyscall[i].pCurrent;
+        rc := SQLITE_OK;
+        if pNewFunc = nil then pNewFunc := aSyscall[i].pDefault;
+        aSyscall[i].pCurrent := pNewFunc;
+        Break;
+      end;
+  end;
+  Result := rc;
+end;
+
+{ os_unix.c:774 — unixGetSystemCall.  Return current slot value, or NULL
+  if zName is unknown / the slot is undefined. }
+function unixGetSystemCall(pNotUsed: Psqlite3_vfs;
+                           zName: PChar): sqlite3_syscall_ptr; cdecl;
+var
+  i : cint;
+begin
+  for i := 0 to High(aSyscall) do
+    if StrComp(zName, aSyscall[i].zName) = 0 then
+    begin
+      Result := aSyscall[i].pCurrent;
+      Exit;
+    end;
+  Result := nil;
+end;
+
+{ os_unix.c:793 — unixNextSystemCall.  Enumerate the table, skipping
+  slots whose pCurrent is NULL.  zName=NULL means "first call". }
+function unixNextSystemCall(pNotUsed: Psqlite3_vfs;
+                            zName: PChar): PChar; cdecl;
+var
+  i : cint;
+begin
+  i := -1;
+  if zName <> nil then
+  begin
+    for i := 0 to High(aSyscall) - 1 do
+      if StrComp(zName, aSyscall[i].zName) = 0 then Break;
+  end;
+  Inc(i);
+  while i <= High(aSyscall) do
+  begin
+    if aSyscall[i].pCurrent <> nil then
+    begin
+      Result := aSyscall[i].zName;
+      Exit;
+    end;
+    Inc(i);
+  end;
+  Result := nil;
+end;
+
+{ ============================================================
   Section 14d: sqlite3_os_init / sqlite3_os_end  (os_unix.c ~8448)
   ============================================================ }
 
@@ -2256,7 +2451,7 @@ function sqlite3_os_init: cint;
 begin
   { Fill in the singleton unixVfsObj (declared in interface section) }
   FillChar(unixVfsObj, SizeOf(unixVfsObj), 0);
-  unixVfsObj.iVersion        := 2;    { v2: xCurrentTimeInt64 wired below }
+  unixVfsObj.iVersion        := 3;    { v3: xSetSystemCall et al. wired below }
   unixVfsObj.szOsFile        := SizeOf(unixFile);
   unixVfsObj.mxPathname      := MAX_PATHNAME;
   unixVfsObj.pNext           := nil;
@@ -2275,9 +2470,9 @@ begin
   unixVfsObj.xCurrentTime    := @unixCurrentTime;
   unixVfsObj.xGetLastError   := @unixGetLastError;
   unixVfsObj.xCurrentTimeInt64 := @unixCurrentTimeInt64;
-  unixVfsObj.xSetSystemCall  := nil;
-  unixVfsObj.xGetSystemCall  := nil;
-  unixVfsObj.xNextSystemCall := nil;
+  unixVfsObj.xSetSystemCall  := @unixSetSystemCall;
+  unixVfsObj.xGetSystemCall  := @unixGetSystemCall;
+  unixVfsObj.xNextSystemCall := @unixNextSystemCall;
 
   { Capture $SQLITE_TMPDIR / $TMPDIR for unixTempFileDir's fallback list. }
   unixTempFileInit;

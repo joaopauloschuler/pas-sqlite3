@@ -91,10 +91,9 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.22** Safe-mode error-prefix gap (`data.zErrPrefix = zErrCtx`) — argv-prefix swap ported to `processCommandLine`.
 - [X] **6.23** `sqlite3_open_v2` doesn't honor `file:` URI filenames — wired `sqlite3ParseUri` into `openDatabase`; CLI calls `sqlite3_config(SQLITE_CONFIG_URI, 1)`.
 - [X] **6.29 / 6.29.followup** `sum(b) OVER ()` / `avg(b) OVER ()` — colUsed propagation across window-rewrite boundary in sqlite3WindowRewrite.
+- [X] **6.30** unix VFS iVersion bumped to 3 — ported `aSyscall[]` table + `unixSetSystemCall`/`unixGetSystemCall`/`unixNextSystemCall` in `passqlite3os.pas`, wired into `unixVfsObj`.
 
 ### Open Bugs (re-opened 2026-05-11)
-
-- [ ] **6.30** unix VFS `iVersion = 2` vs upstream `3`. Surfaces in `.vfslist` success-path stdout (deferred from the 10.1f.15 byte-parity gate). Pas `sqlite3_vfs.iVersion` is initialised at `2` in the unix-VFS registration; C upstream `os_unix.c` sets it to `3` (adds `xSetSystemCall`/`xGetSystemCall`/`xNextSystemCall`). Fix: bump iVersion + port the three missing v3 method slots. Gate: extend TestShellMisc `.vfslist` arm to assert stdout parity, not just rc parity.
 
 - [ ] **6.31** Missing unix-VFS locking-style shims (`unix-excl`, `unix-dotfile`, `unix-none`, and the rest of the autolist at `os_unix.c:8200..8240`). Pas registers only the base `unix` VFS, so `.vfslist` shows one entry instead of upstream's full chain. Same root cause as 6.30. Fix: port the per-locking-style auto-registration block; each shim is a thin wrapper that overrides `xOpen` to force a fixed locking method. Gate: `.vfslist` stdout byte-parity.
 
