@@ -26418,6 +26418,14 @@ begin
     rcWin := sqlite3WindowRewrite(pParse, p);
     if rcWin <> SQLITE_OK then begin Result := rcWin; Exit; end;
     if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+    {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.a.4 — TREETRACE(0x40) "after window rewrite" (select.c:7691..7696).
+      Upstream gates on `(p->pWin && (sqlite3TreeTrace & 0x40)!=0)`; mirror
+      that here so the breadcrumb only fires when pWin is still attached
+      after the rewrite call (consistent with the C oracle). }
+    if (p^.pWin <> nil) and ((sqlite3TreeTrace and $40) <> 0) then
+      sqlite3DebugPrintf('after window rewrite:'#10, []);
+    {$ENDIF}
 
     { Subset gates — extend in later 6.26 sub-phases.
       SRT_EphemTab admitted so the recursive sqlite3Select call from the

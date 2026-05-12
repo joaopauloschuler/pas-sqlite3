@@ -524,9 +524,19 @@ partial landings cannot silently no-op.
       optimizeAggregateUseOfIndexedExpr /
       aggregateConvertIndexedExprRefToColumn / late select_end
       AggInfo teardown are ported yet.
-    - [ ] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
-      TREETRACE arms (mask 0x1000 / 0x8000): `dropping ORDER BY`,
-      `window rewrite`, `DISTINCT->GROUP BY`.
+    - [~] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
+      TREETRACE arms (mask 0x1000 / 0x8000 — VERIFIED divergent vs C:
+      upstream uses 0x800 for "dropping ORDER BY" select.c:7631, 0x40 for
+      "after window rewrite" select.c:7693, 0x20000 for "Transform
+      DISTINCT into GROUP BY" select.c:8192).  Landed: "after window
+      rewrite" (mask 0x40) at codegen.pas after the sqlite3WindowRewrite
+      call in the window-arm gate.  Deferred (no Pas host yet):
+      "dropping superfluous ORDER BY" (select.c:7631) — the
+      IgnorableDistinct(pDest) pOrderBy-drop arm has no Pas counterpart
+      (sqlite3SelectPrep runs unconditionally with pOrderBy attached);
+      "Transform DISTINCT into GROUP BY" (select.c:8192) — the SF_Distinct
+      → pGroupBy optimizer arm (post-FROM-clause analysis) is not ported.
+      Both land when the surrounding optimizer arms land.
     - [ ] **10.1.42.a.5** Outer-join simplification + FROM-subquery
       TREETRACE arms: FULL/LEFT/RIGHT-JOIN simplifies, omit
       FROM-subquery ORDER BY, WHERE push-down, all-FROM analysis,
