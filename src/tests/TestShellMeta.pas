@@ -487,6 +487,39 @@ begin
   script := '.testcase --error-prefix'#10;
   DiffMeta('dotcmd-error-caret-tc-missing', ':memory:', script);
 
+  { 10.1.40.b — `.check <<MARK` heredoc PATTERN.  shell.c.in:8790..8802:
+    when zCheck starts with `<<`, the actual pattern is read from the
+    REPL stream line-by-line until a line whose first nMark bytes match
+    the marker.  Multi-line PATTERN, default (CR/LF-stripped) compare. }
+  script :=
+    '.testcase th'#10 +
+    'SELECT 1 UNION ALL SELECT 2;'#10 +
+    '.check <<END'#10 +
+    '1'#10 +
+    '2'#10 +
+    'END'#10;
+  DiffMeta('check-heredoc-pass', ':memory:', script);
+
+  { Heredoc fail: pattern doesn't match captured output; failure
+    diagnostic emits the assembled multi-line PATTERN. }
+  script :=
+    '.testcase th2'#10 +
+    'SELECT 1;'#10 +
+    '.check <<END'#10 +
+    'nope'#10 +
+    'END'#10;
+  DiffMeta('check-heredoc-fail', ':memory:', script);
+
+  { Heredoc EOF without marker: silently treated as end-of-pattern
+    (upstream's while-loop just exits).  Pattern is what was buffered
+    before EOF; comparison proceeds normally. }
+  script :=
+    '.testcase th3'#10 +
+    'SELECT 1;'#10 +
+    '.check <<NEVER'#10 +
+    '1'#10;
+  DiffMeta('check-heredoc-eof', ':memory:', script);
+
   { Multiple checks with --keep: a single .testcase armed; first .check
     --keep passes, second .check (no --keep) consumes the capture. }
   script :=

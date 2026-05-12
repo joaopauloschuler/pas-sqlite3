@@ -7927,16 +7927,19 @@ function cmdCheck(p: PShellState; const args: array of AnsiString;
 { shell.c.in:8737..8855 dotCmdCheck.  Supports: --keep, --show, --glob,
   --notglob, --exact, plus the bare-default comparator.  PATTERN is the
   first non-option positional.  The "<<ENDMARK" multi-line PATTERN form
-  reads from p^.in until ENDMARK — that arm is gated on the REPL having
-  a seekable PFILE input; for the script-driven Pascal port today,
-  pattern lines come from argv only. }
+  (shell.c.in:8790..8802) reads subsequent REPL lines via oneInputLine
+  and appends each (with its consumed newline restored) until a line
+  whose first nCheck-2 bytes match the marker.  EOF without marker is
+  silently accepted, matching upstream. }
 var
   i: SizeInt;
-  z, zCheck, zPattern, zTest: AnsiString;
+  z, zCheck, zPattern, zTest, zHereLine: AnsiString;
   bKeep, eCheck, isOk, sawZCheck: Int32;
   iStart: i64;
   testcaseName: AnsiString;
-  pchLen: SizeInt;
+  pchLen, nMark: SizeInt;
+  zMark: AnsiString;
+  hereEof: Boolean;
 begin
   Result := 0;
   iStart := p^.lineno;
@@ -8011,7 +8014,30 @@ begin
     zTest := '';
 
   Inc(p^.nTestRun);
-  zPattern := zCheck;
+  { 10.1.40.b — `<<MARK` heredoc PATTERN form (shell.c.in:8790..8802).
+    When zCheck begins with `<<` and has more chars, the literal text
+    after `<<` is the marker (no whitespace stripping); read script
+    lines via oneInputLine, append each followed by '\n' (oneInputLine
+    strips the terminator), and stop when a line's first nMark bytes
+    match the marker — that line is consumed but NOT appended.  EOF
+    without marker is silently accepted (upstream just exits the
+    while-loop without diagnostic). }
+  if (Length(zCheck) >= 3) and (zCheck[1] = '<') and (zCheck[2] = '<') then begin
+    nMark := Length(zCheck) - 2;
+    zMark := Copy(zCheck, 3, nMark);
+    zPattern := '';
+    hereEof := False;
+    while True do begin
+      zHereLine := oneInputLine(p, False, hereEof);
+      if hereEof then Break;
+      Inc(p^.lineno);
+      if (Length(zHereLine) >= nMark)
+         and (CompareByte(zHereLine[1], zMark[1], nMark) = 0) then
+        Break;
+      zPattern := zPattern + zHereLine + #10;
+    end;
+  end else
+    zPattern := zCheck;
   case eCheck of
     1: isOk := tcGlobMatch(zPattern, zTest);
     2: if tcGlobMatch(zPattern, zTest) = 0 then isOk := 1 else isOk := 0;

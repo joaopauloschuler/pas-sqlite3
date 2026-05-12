@@ -451,12 +451,18 @@ partial landings cannot silently no-op.
     real stderr.  Extending the capture to fd 2 is left as separate
     follow-up (the shellDotError wiring is already correct for when
     that lands).
-  - [ ] **10.1.40.b** `<<ENDMARK` heredoc PATTERN form for `.check` —
-    upstream allows multi-line PATTERN delimited by `<<ENDMARK …
-    ENDMARK`.  Needs a seekable PFILE input replay (currently the
-    line-reader consumes the stream).  Approach: buffer subsequent
-    REPL lines until the marker line, then feed the joined text as
-    PATTERN.  Grep `<<` in shell.c.in for the upstream tokeniser.
+  - [X] **10.1.40.b** `<<MARK` heredoc PATTERN form for `.check`
+    landed in cmdCheck (shell.c.in:8790..8802).  When the parsed
+    PATTERN argv starts with `<<`, the trailing text is the marker;
+    subsequent REPL lines are pulled via oneInputLine, each appended
+    (with the consumed `\n` restored), until a line whose first
+    nMark bytes match the marker — that line is consumed but not
+    appended.  EOF without marker is silently accepted, mirroring
+    upstream's while-loop fallthrough.  TestShellMeta gained three
+    new arms: `check-heredoc-pass` (multi-line PATTERN, default
+    compare), `check-heredoc-fail` (PATTERN-vs-Got diagnostic),
+    `check-heredoc-eof` (EOF without marker is silent).  Each
+    byte-diffs against upstream sqlite3 :memory:.
 - [X] **10.1.41** `.testctrl` — dispatcher routes through 8.4.1 overloads
   for OPTIMIZATIONS, FK_NO_ACTION, PRNG_SEED, PENDING_BYTE, SORTER_MMAP,
   ASSERT/ALWAYS, LOCALTIME_FAULT, NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS,
