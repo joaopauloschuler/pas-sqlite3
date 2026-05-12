@@ -4720,10 +4720,12 @@ begin
   shellTimerBeginNs := 0;
 end;
 
-procedure cmdTimer(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+function cmdTimer(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 begin
+  Result := 0;
   if nArg < 1 then begin
     shellEPutZ('Usage: .timer on|off|once'#10);
+    Result := 1;
     Exit;
   end;
   if args[0] = 'once' then p^.enableTimer := 1
@@ -4831,10 +4833,12 @@ end;
   a stable view.  Actually wiring SQLITE_CONFIG_LOG is gated on the
   raw-varargs sqlite3_config port (out of phase-10 scope). }
 
-procedure cmdLog(const args: array of AnsiString; nArg: SizeInt);
+function cmdLog(const args: array of AnsiString; nArg: SizeInt): i32;
 begin
+  Result := 0;
   if nArg <> 1 then begin
     shellEPutZ('Usage: .log FILENAME'#10);
+    Result := 1;
     Exit;
   end;
   if args[0] = 'on' then zLogFile := 'stdout'
@@ -9463,14 +9467,14 @@ begin
   if zCmd = 'indexes'   then begin cmdIndexes(p, args, nArg); Exit; end;
   if zCmd = 'databases' then begin cmdDatabases(p); Exit; end;
   if zCmd = 'schema'    then begin cmdSchema(p, args, nArg); Exit; end;
-  if zCmd = 'timer'     then begin cmdTimer(p, args, nArg); Exit; end;
+  if zCmd = 'timer'     then begin Result := cmdTimer(p, args, nArg); Exit; end;
   if zCmd = 'eqp'       then begin Result := cmdEqp(p, args, nArg); Exit; end;
   if zCmd = 'explain'   then begin cmdExplain(p, args, nArg); Exit; end;
   if (zCmd = 'shell') or (zCmd = 'system') then begin
     Result := cmdShell(p, args, nArg, zCmd); Exit;
   end;
   if zCmd = 'cd'        then begin Result := cmdCd(p, args, nArg); Exit; end;
-  if zCmd = 'log'       then begin cmdLog(args, nArg); Exit; end;
+  if zCmd = 'log'       then begin Result := cmdLog(args, nArg); Exit; end;
   if zCmd = 'dbinfo'    then begin cmdDbinfo(p, args, nArg); Exit; end;
   if (zCmd = 'crlf') or (zCmd = 'crnl') then begin cmdCrnl(p, args, nArg); Exit; end;
   if zCmd = 'binary'    then begin cmdBinary; Result := 1; Exit; end;

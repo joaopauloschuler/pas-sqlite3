@@ -8,13 +8,13 @@
   Coverage (mirrors tasklist.md 10.1e.*):
     - help              .help / .help schema           (10.1e.6)  [COVERED]
     - stats             .stats                         (10.1e.1)  [COVERED]
-    - timer             .timer                         (10.1e.2)  TODO
+    - timer             .timer                         (10.1e.2)  [COVERED]
     - eqp               .eqp                           (10.1e.3)  [COVERED]
     - explain           .explain                       (10.1e.4)  [COVERED]
     - show              .show                          (10.1e.5)  [COVERED]
     - shell-system      .shell / .system               (10.1e.7)  [COVERED]
     - cd                .cd                            (10.1e.8)  [COVERED]
-    - log               .log                           (10.1e.9)  TODO
+    - log               .log                           (10.1e.9)  [COVERED]
     - trace             .trace                         (10.1e.10) [COVERED]
     - iotrace           .iotrace                       (10.1e.11) [COVERED]
     - scanstats         .scanstats                     (10.1e.12) [COVERED]
@@ -534,6 +534,61 @@ begin
 
   script := '.wheretrace'#10;
   DiffMeta('wheretrace-bare', ':memory:', script);
+
+  { -------- timer (10.1e.2) --------------------------------------- }
+  { cmdTimer (shell.c.in:11886..11901) accepts `.timer on|off|once`.
+    `once` sets enableTimer=1 (decays after the next BEGIN/END_TIMER
+    pair); other tokens route through booleanValue() and set
+    enableTimer to 0 or 2 (permanent).  The state itself produces no
+    stdout/stderr on success and is NOT echoed by `.show`, so the
+    gate-deterministic surface is the silent state-flip arms plus the
+    usage error (`Usage: .timer on|off|once\n` on stderr with rc=1).
+    Runtime consumers (begin_timer / end_timer at shell.c.in:1412..1551
+    emitting `Run Time: real %.6f user %.6f sys %.6f\n` after each SQL)
+    are non-deterministic by construction (wall-clock + getrusage) and
+    are deliberately excluded — we never execute SQL with the timer
+    armed in this gate.  Recognised-token-but-emits-stderr arms (`true`
+    / `false` route through booleanValue which emits
+    `ERROR: Not a boolean value: "X". Assuming "no".\n`) are also kept
+    out of the gate scope. }
+  script :=
+    '.timer on'#10 +
+    '.timer off'#10 +
+    '.timer once'#10 +
+    '.timer off'#10;
+  DiffMeta('timer-state', ':memory:', script);
+
+  script := '.timer'#10;
+  DiffMeta('timer-usage', ':memory:', script);
+
+  { -------- log (10.1e.9) ----------------------------------------- }
+  { cmdLog (shell.c.in:10091..10109) accepts `.log FILE|stdout|stderr|
+    on|off`.  `on` is rewritten to `stdout` before output_file_open;
+    `off` closes the current log sink.  In a non-debug runtime the
+    SQLITE_CONFIG_LOG wiring is NOT installed (gated on the raw-varargs
+    sqlite3_config port — see tasklist.md 8.1.1 / 10.1.36), so neither
+    upstream nor the port emits anything from the logger on a routine
+    `.log` invocation — both flip the destination state silently.
+    Scope here is the silent destination flip plus the usage error
+    (`Usage: .log FILENAME\n` on stderr with rc=1 on wrong nArg).
+    Safe-mode rewrite (`cannot set .log to anything other than "on" or
+    "off"`) and live logger output are out of scope. }
+  script :=
+    '.log stdout'#10 +
+    '.log stderr'#10 +
+    '.log off'#10 +
+    '.log on'#10 +
+    '.log off'#10;
+  DiffMeta('log-state', ':memory:', script);
+
+  script := '.log ' + workDir + '/log.out'#10 + '.log off'#10;
+  DiffMeta('log-file', ':memory:', script);
+
+  script := '.log'#10;
+  DiffMeta('log-usage', ':memory:', script);
+
+  script := '.log a b'#10;
+  DiffMeta('log-usage-multi', ':memory:', script);
 
   CleanupPaths;
 
