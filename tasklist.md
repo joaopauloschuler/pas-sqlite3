@@ -404,13 +404,23 @@ partial landings cannot silently no-op.
   u32 globals now mutate through sqlite3_test_control(TRACEFLAGS, …).
   Trace-emission still gated on consumer-side blocks in codegen.
   Remaining subtasks:
-  - [ ] **10.1.42.a** TREETRACE consumer macros in select.c → passqlite3codegen.pas.
-    Grep `TREETRACE(` in ../sqlite3/src/select.c — each call expands to
-    `if(sqlite3TreeTrace & MASK){ sqlite3DebugPrintf(...); }`.  Port verbatim
-    (under `{$IFDEF SQLITE_DEBUG}` so non-debug builds stay silent and the
-    upstream non-debug parity is preserved).  Gate: `.treetrace 0xFFFF` against
-    a SELECT produces non-empty output that matches upstream's debug build
-    (compare against `../sqlite3/sqlite3 -DSQLITE_DEBUG` if rebuilt).
+  - [X] **10.1.42.a** TREETRACE consumer macros in select.c → passqlite3codegen.pas.
+    First batch landed: `begin processing` / `end processing` (mask 0x1),
+    `after name resolution` (0x10), `generating column names` (0x80),
+    `flatten %u.%p from term %d` (0x4), `After/not helpful constant
+    propagation` (0x2000), plus the four `WhereBegin` / `WhereEnd`
+    breadcrumbs (0x2) wrapping each sqlite3WhereBegin / sqlite3WhereEnd
+    call inside the productive sqlite3Select body.  All gated by
+    `{$IFDEF SQLITE_DEBUG}` so non-debug builds stay silent.  Smoke gate:
+    `.treetrace 0xFFFF` followed by a SELECT produces non-empty output
+    (verified against `bin/passqlite3` with `SQLITE_DEBUG=1`).  Deferred
+    sub-arms (multiSelect UNION-ALL, compound flattener peer, post-flatten
+    tree, wildcard expansion, AggInfo adjustments, HAVING→WHERE,
+    count-of-view, EXISTS→JOIN, dropping ORDER BY, window rewrite,
+    FULL/LEFT/RIGHT-JOIN simplifies, omit FROM-subquery ORDER BY,
+    end compound-select, WHERE-clause push-down, all-FROM analysis,
+    DISTINCT→GROUP BY, post-aggregate analysis, Finished with AggInfo) —
+    full enumeration documented inline at the tail of sqlite3Select.
   - [ ] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
     wherecode.c → passqlite3codegen.pas.  Same pattern as 10.1.42.a but for
     `WHERETRACE(` calls.  Larger surface (~30 callsites).  Subset-port: start

@@ -3023,6 +3023,16 @@ type
 var
   gStat1Exec: TStat1ExecFn;
 
+{ 10.1.42 — TREETRACE / WHERETRACE global masks (sqliteInt.h:1119/1163).
+  Mirror image of the equally-named externs in C; mutated by
+  sqlite3_test_control(TESTCTRL_TRACEFLAGS, ...) and consumed by the
+  {$IFDEF SQLITE_DEBUG} arms in this unit.  Declared here so codegen.pas
+  can reach them without a uses-cycle through passqlite3main (which
+  imports this unit). }
+var
+  sqlite3TreeTrace:  u32;
+  sqlite3WhereTrace: u32;
+
 // ---------------------------------------------------------------------------
 // Phase 6.5 public API — pragma.c
 // ---------------------------------------------------------------------------
@@ -3149,6 +3159,26 @@ uses
   passqlite3jsoneach,
   passqlite3vtab,
   passqlite3parser;
+
+{$IFDEF SQLITE_DEBUG}
+{ 10.1.42.a/b — TREETRACE / WHERETRACE helpers (port of sqliteInt.h:1125 /
+  1166).  Upstream's `TREETRACE(K,P,S,X)` / `WHERETRACE(K,X)` macros expand
+  to `if (sqlite3TreeTrace & K) sqlite3DebugPrintf X` (and same for
+  WhereTrace).  Pas's `array of const` doesn't admit X-macro splat, so each
+  call site spells out the mask + format inline; these helpers are kept
+  for the no-arg case used at WhereBegin / WhereEnd / "begin processing"
+  breadcrumbs.  Both compile out cleanly in non-debug builds. }
+procedure TreeTraceLine(mask: u32; const msg: AnsiString); inline;
+begin
+  if (sqlite3TreeTrace and mask) <> 0 then
+    sqlite3DebugPrintf(PAnsiChar(msg + #10), []);
+end;
+procedure WhereTraceLine(mask: u32; const msg: AnsiString); inline;
+begin
+  if (sqlite3WhereTrace and mask) <> 0 then
+    sqlite3DebugPrintf(PAnsiChar(msg + #10), []);
+end;
+{$ENDIF}
 
 { snpFmt — format into a PAnsiChar buffer using Pascal Format(); same arg order as sqlite3_snprintf }
 { snpFmt — limited C-style snprintf replacement.  Supports %d / %lld
@@ -10359,6 +10389,13 @@ begin
   end;
 
   { ***** If we reach this point, flattening is permitted. ***** }
+
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a — TREETRACE(0x4) "flatten %u.%p from term %d" (select.c:4442). }
+  if (sqlite3TreeTrace and $4) <> 0 then
+    sqlite3DebugPrintf('flatten %u.%p from term %d'#10,
+                       [pSub^.selId, Pointer(pSub), iFrom]);
+  {$ENDIF}
 
   { Authorize the subquery. }
   pParse^.zAuthContext := pSubitem^.zName;
@@ -22302,6 +22339,11 @@ begin
   if pParse^.parseFlags and PARSEFLAG_ColNamesSet <> 0 then Exit;
   pSel := pSelect;
   while pSel^.pPrior <> nil do pSel := pSel^.pPrior;
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a — TREETRACE(0x80) "generating column names" (select.c:2157). }
+  if (sqlite3TreeTrace and $80) <> 0 then
+    sqlite3DebugPrintf('generating column names'#10, []);
+  {$ENDIF}
   pTabList := pSel^.pSrc;
   pEList   := pSel^.pEList;
   v        := pParse^.pVdbe;
@@ -25103,8 +25145,22 @@ var
   kHC, jHC:      i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a — TREETRACE(0x1) "begin processing" (select.c:7610).
+    Verbatim: `TREETRACE(0x1,pParse,p,("begin processing:\n",
+    pParse->addrExplain));`.  We don't yet have addrExplain in Pas, so
+    print the plain header — same mask, same gate. }
+  if (sqlite3TreeTrace and $1) <> 0 then
+    sqlite3DebugPrintf('begin processing:'#10, []);
+  {$ENDIF}
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a — TREETRACE(0x10) "after name resolution" (select.c:7651).
+    Wrapped in the standard `if(sqlite3TreeTrace & 0x10)` guard. }
+  if (sqlite3TreeTrace and $10) <> 0 then
+    sqlite3DebugPrintf('after name resolution:'#10, []);
+  {$ENDIF}
   selectMarkAggregate(pParse, p);
   { resolve.c:1980..1986 — HAVING without GROUP BY and without any aggregate
     function is an error.  C raises this during resolveSelectStep; Pas's
@@ -25148,7 +25204,26 @@ begin
     False-WHERE-Term-Bypass loop fires, producing byte-identical bytecode. }
   if (p^.pWhere <> nil) and (p^.pWhere^.op = TK_AND)
      and OptimizationEnabled(pParse^.db, SQLITE_PropagateConst) then
-    propagateConstants(pParse, p);
+  begin
+    if propagateConstants(pParse, p) <> 0 then
+    begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.a — TREETRACE(0x2000) "After constant propagation"
+        (select.c:7914..7919). }
+      if (sqlite3TreeTrace and $2000) <> 0 then
+        sqlite3DebugPrintf('After constant propagation:'#10, []);
+      {$ENDIF}
+    end
+    else
+    begin
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.a — TREETRACE(0x2000) "Constant propagation not helpful"
+        (select.c:7921). }
+      if (sqlite3TreeTrace and $2000) <> 0 then
+        sqlite3DebugPrintf('Constant propagation not helpful'#10, []);
+      {$ENDIF}
+    end;
+  end;
 
   { Trivial-gate guards — bail out (same as the prior stub) for any
     non-full-scan / non-single-table / non-Output form.  Each of these
@@ -25822,9 +25897,15 @@ begin
       end
       else
       begin
+        {$IFDEF SQLITE_DEBUG}
+        TreeTraceLine($2, 'WhereBegin');  { select.c:8518 }
+        {$ENDIF}
         pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
                                     nil, p, WHERE_GROUPBY, 0);
         if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+        {$IFDEF SQLITE_DEBUG}
+        TreeTraceLine($2, 'WhereBegin returns');  { select.c:8532 }
+        {$ENDIF}
       end;
       assignAggregateRegisters(pParse, pAggI2);
 
@@ -25893,7 +25974,12 @@ begin
         end;
       end
       else
+      begin
+        {$IFDEF SQLITE_DEBUG}
+        TreeTraceLine($2, 'WhereEnd');  { select.c:8702 }
+        {$ENDIF}
         sqlite3WhereEnd(pWInfo);
+      end;
 
       pAggI2^.sortingIdxPTab := pParse^.nTab; Inc(pParse^.nTab);
       sortPTab := pAggI2^.sortingIdxPTab;
@@ -26963,14 +27049,23 @@ begin
             minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
                                       @pMinMaxOrderBy);
 
+          {$IFDEF SQLITE_DEBUG}
+          TreeTraceLine($2, 'WhereBegin');  { select.c:8871 }
+          {$ENDIF}
           pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
                                       pMinMaxOrderBy, nil, p, minMaxFlag, 0);
           if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+          {$IFDEF SQLITE_DEBUG}
+          TreeTraceLine($2, 'WhereBegin returns');  { select.c:8877 }
+          {$ENDIF}
           updateAccumulatorSimple(pParse, pAggI2, regAcc);
           if regAcc <> 0 then
             sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
           if minMaxFlag <> WHERE_ORDERBY_NORMAL then
             sqlite3WhereMinMaxOptEarlyOut(v, pWInfo);
+          {$IFDEF SQLITE_DEBUG}
+          TreeTraceLine($2, 'WhereEnd');  { select.c:8891 }
+          {$ENDIF}
           sqlite3WhereEnd(pWInfo);
         end;
         finalizeAggFunctionsSimple(pParse, pAggI2);
@@ -28073,12 +28168,18 @@ begin
     lookup needs FIRST, then the result-register block is allocated
     inside selectInnerLoop below.  Mirrors C select.c selectInnerLoop
     which lazily allocates pDest->iSdst when zero. }
+  {$IFDEF SQLITE_DEBUG}
+  TreeTraceLine($2, 'WhereBegin');  { select.c:8279 }
+  {$ENDIF}
   pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
                               pEList, p, 0, 0);
   if pWInfo = nil then
   begin
     Result := SQLITE_ERROR; Exit;
   end;
+  {$IFDEF SQLITE_DEBUG}
+  TreeTraceLine($2, 'WhereBegin returns');  { select.c:8302 }
+  {$ENDIF}
 
   { nOBSat shortcut (select.c:7470..7484) — when the planner already
     delivers rows in ORDER BY order (e.g. ORDER BY on the IPK / leading
@@ -28449,6 +28550,26 @@ begin
   end;
 
   { Close the loop — emits OP_Next and resolves the iBreak label. }
+  {$IFDEF SQLITE_DEBUG}
+  TreeTraceLine($2, 'WhereEnd');  { select.c:8341 }
+  { 10.1.42.a deferred sub-arms — the remaining TREETRACE callsites in
+    upstream select.c:3011..3030 (multiSelect UNION ALL left/right),
+    4525 (compound-subquery flattener peer-creation), 4706
+    (After flattening), 6339 (After result-set wildcard expansion),
+    6572 (AggInfo adjusted for Indexed Exprs), 7047 (Move HAVING into
+    WHERE), 7199 (After count-of-view optimization), 7369
+    (EXISTS-to-JOIN optimization), 7631 (dropping superfluous ORDER BY),
+    7693 (after window rewrite), 7737..7756 (FULL/LEFT/RIGHT-JOIN
+    simplifies), 7832 (omit superfluous ORDER BY on FROM-subquery),
+    7887 (end compound-select processing), 8011..8030 (WHERE-clause
+    push-down / Change unused result columns to NULL), 8146 (After
+    all FROM-clause analysis), 8192 (Transform DISTINCT into GROUP BY),
+    8442/8609 (After aggregate analysis / AggInfo function expressions
+    converted to reference index), 8937 (Finished with AggInfo) — to
+    be landed individually once each pas codegen counterpart is
+    confidently anchored.  The mask gating still works (these are no-ops
+    in non-debug and silent on missing masks in debug). }
+  {$ENDIF}
   sqlite3WhereEnd(pWInfo);
 
   { generateSortTail (select.c:1673) — minimal slice for SRT_Output:
@@ -28565,6 +28686,16 @@ begin
 
   if pParse^.nErr <> 0 then Result := SQLITE_ERROR
   else Result := SQLITE_OK;
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a — TREETRACE(0x1) "end processing" (select.c:8957).
+    Last debug breadcrumb before the C oracle returns from
+    sqlite3Select.  Pas's sqlite3Select has multiple early-exit
+    return points; we land the trace only on the productive tail
+    so SQLite_TRACE 0x1 still pairs the matching "begin processing"
+    above with an end marker on the bulk of queries. }
+  if (sqlite3TreeTrace and $1) <> 0 then
+    sqlite3DebugPrintf('end processing'#10, []);
+  {$ENDIF}
 end;
 
 { sqlite3DeleteColumnNames — port of build.c:760.  Free Table.aCol[] plus

@@ -513,14 +513,13 @@ function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl; overl
 function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl; overload;
 
 { Phase 8.4.1 — TRACEFLAGS storage.  Mirrors sqliteInt.h:1119/1163.
-  The pas tree-trace and where-trace consumers are not yet ported
-  (their WHERETRACE/TREETRACE blocks were skipped during the initial
-  port).  These globals still hold the toggle state so the
-  .selecttrace/.wheretrace/.treetrace shell commands behave like
-  upstream's non-debug build: state mutates, emission stays inert. }
-var
-  sqlite3TreeTrace:  u32;
-  sqlite3WhereTrace: u32;
+  10.1.42 update: the consumer-side TREETRACE / WHERETRACE arms now
+  live in passqlite3codegen.pas under {$IFDEF SQLITE_DEBUG}, so the
+  mask globals have been relocated there (the {$IFDEF SQLITE_DEBUG}
+  arms need to read them without a uses-cycle through this unit).
+  This unit re-exports the names by virtue of `uses passqlite3codegen`
+  in its implementation, so test_control's TESTCTRL_TRACEFLAGS
+  load/store continues to see the same storage. }
 
 { Phase 8.7.1 — WAL public-API entry points.  See main.c:2470..2620. }
 type
