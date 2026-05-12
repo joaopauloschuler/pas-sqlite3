@@ -30875,12 +30875,12 @@ end;
 
   Views always return 0xffffffff (every column may be needed).  RETURNING
   triggers also return 0xffffffff.  For ordinary triggers the per-column
-  mask comes from the compiled TriggerPrg (getRowTrigger).  In the
-  current port getRowTrigger is not yet ported (depends on the full
-  codeRowTrigger / sqlite3CodeRowTrigger pipeline — Phase 6.23 follow-on),
-  so its branch is a placeholder returning nil; the result for ordinary
-  triggers is therefore mask=0.  This is identical to the previous stub
-  for that arm but now correctly covers the IsView and bReturning paths. }
+  mask comes from the compiled TriggerPrg (getRowTrigger), which is now
+  fully wired (trgGetRowTrigger → codeRowTrigger; trigger.c:1347 / 1231).
+  Cache hits reuse the per-(trigger,orconf) entry on pRoot^.pTriggerPrg;
+  misses compile a fresh sub-program and populate aColmask[0/1] from the
+  sub-Parse's oldmask/newmask, so ordinary triggers now contribute proper
+  column-aware bits to the caller's mask.  Task 6.28.7. }
 function trgGetRowTrigger(pParse: PParse; p: PTrigger; pTab: PTable2;
   orconf: i32): PTriggerPrg;
 var
@@ -34424,10 +34424,10 @@ generic_coro_done:
     { BEFORE / INSTEAD OF trigger fire (insert.c:1442..1499).
       Build the NEW.* pseudo-table at regCols..regCols+nCol (rowid at
       regCols, columns at regCols+1..), apply table affinity, then
-      dispatch via sqlite3CodeRowTrigger.  No-op today because
-      trgGetRowTrigger returns nil (codeRowTrigger / getRowTrigger
-      port pending — Phase 6.23), so the structural wiring lights up
-      automatically when that lands. }
+      dispatch via sqlite3CodeRowTrigger.  Now fully productive: the
+      trgGetRowTrigger / codeRowTrigger pipeline (trigger.c:1347 / 1231)
+      is wired, so this fires the compiled BEFORE-trigger sub-program
+      end-to-end.  Task 6.28.7. }
     if (tmask and TRIGGER_BEFORE) <> 0 then
     begin
       regCols := sqlite3GetTempRange(pParse, i32(pTab^.nCol) + 1);

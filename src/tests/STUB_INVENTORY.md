@@ -89,14 +89,17 @@ Prio  : high|med|low   (blocks open tasklist bullet?)
   fixture; med otherwise.
 - Size  : ~600 lines C — large.
 
-### 7. `getRowTrigger` mask helper
-- Pascal: `src/passqlite3codegen.pas:30703..30706`.
-- C ref : `trigger.c:1145..1206`.
-- Note  : Returns mask=0 so trigger-fire-mask culling never fires —
-  DiagTrig corpus passes only because triggers are exercised end-to-end
-  without the mask optimisation.
-- Prio  : med (correctness preserved; perf only).
-- Size  : ~60 lines C.
+### 7. `getRowTrigger` mask helper — CLOSED (task 6.28.7)
+- Pascal: `src/passqlite3codegen.pas:30884` (`trgGetRowTrigger`) +
+  `:30709` (`codeRowTrigger`).
+- C ref : `trigger.c:1347` / `trigger.c:1231`.
+- Verdict: audit found inventory entry stale — both `trgGetRowTrigger`
+  and `codeRowTrigger` were already 1:1 with C (cache lookup +
+  TriggerPrg/SubProgram allocation, sub-Parse, codeTriggerProgram,
+  aColmask[0/1] populated from sub-Parse oldmask/newmask).
+  `sqlite3TriggerColmask` (`:30905`) now picks up real per-column bits
+  for ordinary triggers (View/bReturning paths already correct).
+  Stale "not yet ported" comments removed.  Build 87/87.
 
 ## Medium priority — degrades coverage but not parity
 

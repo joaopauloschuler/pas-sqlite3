@@ -78,7 +78,7 @@ FPC porting traps that recur often enough to call out up-front:
   - [ ] **6.28.4** Complete `sqlite3AddColumn` STRICT-table arm (bug 6.29 trail) — partial port today; STRICT typing rejects unknown affinity. C source: `../sqlite3/src/build.c` (grep `STRICT`).
   - [ ] **6.28.5** Port `sqlite3LimitWhere` view-rewrite arm — currently bails on views. C source: `../sqlite3/src/delete.c` (grep `sqlite3LimitWhere`).
   - [ ] **6.28.6** Port `OP_IntegrityCk` body — high priority if 9.2.x reference vectors include a deliberately-corrupt vector. C source: `../sqlite3/src/vdbe.c` (grep `case OP_IntegrityCk`).
-  - [ ] **6.28.7** Wire `getRowTrigger` mask helper — currently returns 0, suppressing trigger-fire dispatch in row-update arms. C source: `../sqlite3/src/trigger.c` (grep `getRowTrigger`).
+  - [X] **6.28.7** Wire `getRowTrigger` mask helper — audit verdict: stub-was-real. `trgGetRowTrigger` (passqlite3codegen.pas:30884) + `codeRowTrigger` (:30709) are 1:1 with trigger.c:1347 / 1231; aColmask[0/1] populated from sub-Parse oldmask/newmask; `sqlite3TriggerColmask` picks up real per-column bits for ordinary triggers. Stale "not yet ported" comments scrubbed; STUB_INVENTORY #7 closed.
 
 ### Closed bugs (kept as ticked stubs)
 
