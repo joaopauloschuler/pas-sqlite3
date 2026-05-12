@@ -858,7 +858,13 @@ partial landings cannot silently no-op.
   - [ ] **10.1e.3** `.eqp`
   - [ ] **10.1e.4** `.explain`
   - [ ] **10.1e.5** `.show`
-  - [ ] **10.1e.6** `.help`
+  - [X] **10.1e.6** `.help` — byte-parity gate landed in
+        src/tests/TestShellMeta.pas (help section: `.help` + `.help schema`).
+        Closure also pruned the `.session` block from azHelp (passqlite3shell.pas:3726)
+        to mirror upstream's `#if defined(SQLITE_ENABLE_SESSION)` gate
+        (shell.c.in:3894..3908): the port's cmdSession is a "not compiled in"
+        stub, so azHelp must match the undefined-SESSION C build.  Array
+        bound shrunk from 0..264 to 0..251.  Re-add when 10.1.47 lands.
   - [ ] **10.1e.7** `.shell`/`.system`
   - [ ] **10.1e.8** `.cd`
   - [ ] **10.1e.9** `.log`
@@ -869,6 +875,13 @@ partial landings cannot silently no-op.
   - [ ] **10.1e.14** `.testctrl`
   - [ ] **10.1e.15** `.selecttrace`
   - [ ] **10.1e.16** `.wheretrace`
+  - [~] **10.1e.G** Gate: byte-parity harness landed at
+        src/tests/TestShellMeta.pas (analogous to 10.1d.G TestShellIO).
+        Pipes a fixed dot-command script into both bin/passqlite3 and
+        the upstream `sqlite3` binary and diffs stdout+stderr
+        byte-for-byte; skips with PASS if upstream missing.  Currently
+        covers only `.help` (10.1e.6); subsequent 10.1e.* arms will add
+        sections in-place.
 
 - [X] **10.1.28..10.1.33, 10.1.35, 10.1.37** `.stats`, `.timer`, `.eqp`, `.explain`, `.show`, `.help` (full azHelp[]), `.cd`, `.trace` landed.
 - [X] **10.1.34** `.shell`/`.system` — output capture into `.output` sink lands automatically because cmdOutput redirects at the POSIX-fd level (dup2 onto fd 1), so the child inherits the redirected stdout via fork/exec.  Closure: added `failIfSafeMode(p, 'cannot run .'+zCmdName+' in safe mode')` gate at cmdShell entry (shell.c.in:11248), threaded zCmdName through the dispatcher, and Flush(Output) before fpsystem so prior Pascal writes hit the active sink before the child writes to inherited fd 1.  Smoke: `.output /tmp/s1.out ; .shell echo hello` captures to file (port) — upstream actually leaks to terminal because upstream redirects at FILE* level only; safe-mode refusal byte-parity (`argv[3]: cannot run .shell in safe mode` exit 1); direct `.shell echo direct` byte-parity.  passqlite3shell.pas:4766..4798 + dispatcher:9426.

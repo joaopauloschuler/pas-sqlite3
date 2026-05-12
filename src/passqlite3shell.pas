@@ -3595,7 +3595,7 @@ end;
   ---------------------------------------------------------------------- }
 
 const
-  azHelp: array[0..264] of AnsiString = (
+  azHelp: array[0..251] of AnsiString = (
     '.archive ...             Manage SQL archives',
     '   Each command must have exactly one of the following options:',
     '     -c, --create               Create a new archive',
@@ -3723,19 +3723,11 @@ const
     '       --init               Create a new SELFTEST table',
     '       -v                   Verbose output',
     ',separator COL ?ROW?     Change the column and row separators',
-    '.session ?NAME? CMD ...  Create or control sessions',
-    '   Subcommands:',
-    '     attach TABLE             Attach TABLE',
-    '     changeset FILE           Write a changeset into FILE',
-    '     close                    Close one session',
-    '     enable ?BOOLEAN?         Set or query the enable bit',
-    '     filter GLOB...           Reject tables matching GLOBs',
-    '     indirect ?BOOLEAN?       Mark or query the indirect status',
-    '     isempty                  Query whether the session is empty',
-    '     list                     List currently open session names',
-    '     open DB NAME             Open a new session on DB',
-    '     patchset FILE            Write a patchset into FILE',
-    '   If ?NAME? is omitted, the first defined session is used.',
+    { Session-extension help block is gated on SQLITE_ENABLE_SESSION
+      upstream (shell.c.in:3894..3908).  The port's cmdSession is a
+      "not compiled in" stub (passqlite3shell.pas:cmdSession) so we
+      mirror the undefined-SESSION C build and omit the entries from
+      azHelp.  Restore when the session extension lands (10.1.47). }
     '.sha3sum ...             Compute a SHA3 hash of database content',
     '    Options:',
     '      --schema              Also hash the sqlite_schema table',
