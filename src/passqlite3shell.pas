@@ -4795,16 +4795,21 @@ end;
 
 { 10.1.35 — `.cd DIRECTORY`  (shell.c.in:9127..9145) }
 
-procedure cmdCd(const args: array of AnsiString; nArg: SizeInt);
+function cmdCd(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 var rc: i32;
 begin
+  Result := 0;
+  failIfSafeMode(p, 'cannot run .cd in safe mode');
   if nArg <> 1 then begin
     shellEPutZ('Usage: .cd DIRECTORY'#10);
+    Result := 1;
     Exit;
   end;
   rc := FpChdir(PAnsiChar(args[0]));
-  if rc <> 0 then
+  if rc <> 0 then begin
     shellEPutZ(Format('Cannot change to directory "%s"'#10, [args[0]]));
+    Result := 1;
+  end;
 end;
 
 { 10.1.36 — `.log FILENAME|on|off`  (shell.c.in:10091..10109).
@@ -9436,7 +9441,7 @@ begin
   if (zCmd = 'shell') or (zCmd = 'system') then begin
     cmdShell(p, args, nArg, zCmd); Exit;
   end;
-  if zCmd = 'cd'        then begin cmdCd(args, nArg); Exit; end;
+  if zCmd = 'cd'        then begin Result := cmdCd(p, args, nArg); Exit; end;
   if zCmd = 'log'       then begin cmdLog(args, nArg); Exit; end;
   if zCmd = 'dbinfo'    then begin cmdDbinfo(p, args, nArg); Exit; end;
   if (zCmd = 'crlf') or (zCmd = 'crnl') then begin cmdCrnl(p, args, nArg); Exit; end;

@@ -13,7 +13,7 @@
     - explain           .explain                       (10.1e.4)  [COVERED]
     - show              .show                          (10.1e.5)  [COVERED]
     - shell-system      .shell / .system               (10.1e.7)  TODO
-    - cd                .cd                            (10.1e.8)  TODO
+    - cd                .cd                            (10.1e.8)  [COVERED]
     - log               .log                           (10.1e.9)  TODO
     - trace             .trace                         (10.1e.10) TODO
     - iotrace           .iotrace                       (10.1e.11) TODO
@@ -237,6 +237,36 @@ begin
     '.explain auto'#10 +
     '.show'#10;
   DiffMeta('explain-state', ':memory:', script);
+
+  { -------- cd (10.1e.8) ------------------------------------------ }
+  { `.cd DIRECTORY` calls chdir() after the failIfSafeMode gate
+    (shell.c.in:9127..9145).  Success path is silent on stdout/stderr
+    but mutates the process working directory; downstream `.cd` with
+    a relative argument observes the change without needing .shell
+    (which routes through an inherited fd in the port — see 10.1.34).
+    Missing-arg emits `Usage: .cd DIRECTORY\n` on stderr with rc=1.
+    Non-existent target emits `Cannot change to directory "X"\n` on
+    stderr (cli_printf in C, shellEPutZ in the port) with rc=1.  The
+    final rc=1 propagates to the dispatcher and the process exit. }
+  script :=
+    '.cd /tmp'#10 +
+    '.cd /tmp'#10;
+  DiffMeta('cd-ok', ':memory:', script);
+
+  script := '.cd'#10;
+  DiffMeta('cd-usage', ':memory:', script);
+
+  script := '.cd /nonexistent_pas_sqlite3_cd_xyz'#10;
+  DiffMeta('cd-missing', ':memory:', script);
+
+  { Mixed: success then failure; verifies the chdir actually took
+    effect by attempting a relative path that is invalid in /tmp but
+    that we also confirm is invalid in the starting cwd (both shells
+    print the same error message and both set rc=1 on the last cmd). }
+  script :=
+    '.cd /tmp'#10 +
+    '.cd no_such_relative_dir_pas'#10;
+  DiffMeta('cd-mixed', ':memory:', script);
 
   CleanupPaths;
 

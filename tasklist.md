@@ -876,7 +876,7 @@ partial landings cannot silently no-op.
         stub, so azHelp must match the undefined-SESSION C build.  Array
         bound shrunk from 0..264 to 0..251.  Re-add when 10.1.47 lands.
   - [ ] **10.1e.7** `.shell`/`.system`
-  - [ ] **10.1e.8** `.cd`
+  - [X] **10.1e.8** `.cd` — byte-parity gate (cd-ok / cd-usage / cd-missing / cd-mixed); fixed cmdCd to return rc=1 on usage+chdir-failure and added failIfSafeMode gate so dispatcher/exit code matches C (shell.c.in:9127..9145).
   - [ ] **10.1e.9** `.log`
   - [ ] **10.1e.10** `.trace`
   - [ ] **10.1e.11** `.iotrace`
