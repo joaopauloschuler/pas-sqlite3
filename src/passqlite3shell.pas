@@ -6204,8 +6204,8 @@ end;
   is omitted in this initial cut — it adds a quality breadcrumb but is
   not part of the digest itself.
   ---------------------------------------------------------------------- }
-procedure cmdSha3sum(p: PShellState; const args: array of AnsiString;
-                     nArg: SizeInt);
+function cmdSha3sum(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt): i32;
 var
   zLike: AnsiString;
   bSchema, bSeparate, bDebug: i32;
@@ -6215,6 +6215,7 @@ var
   zArg, zSrcSql, zSql, sQuery, sSql, zSep, zTab: AnsiString;
   zPzTail: PAnsiChar;
 begin
+  Result := 0;
   if p^.db = nil then openDb(p, 0);
   zLike := '';
   bSchema := 0;
@@ -6233,12 +6234,15 @@ begin
         iSize := StrToInt(Copy(zArg, 6, 3))
       else if zArg = 'debug' then bDebug := 1
       else begin
-        shellEPutZ(Format('Unknown option "%s" on ".sha3sum"'#10, [args[i]]));
+        shellEPutZ(Format('Unknown option "%s" on "sha3sum"'#10, [args[i]]));
+        showHelp('sha3sum');
+        Result := 1;
         Exit;
       end;
     end
     else if zLike <> '' then begin
       shellEPutZ('Usage: .sha3sum ?OPTIONS? ?LIKE-PATTERN?'#10);
+      Result := 1;
       Exit;
     end
     else begin
@@ -6618,8 +6622,8 @@ const
     (zName: 'tempfilename';   code: SQLITE_FCNTL_TEMPFILENAME;        zUsage: '')
   );
 
-procedure cmdFilectrl(p: PShellState; const args: array of AnsiString;
-                      nArg: SizeInt);
+function cmdFilectrl(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
 var
   zCmd, zSchema: AnsiString;
   zCmdC: AnsiString;
@@ -6632,6 +6636,7 @@ var
   zRet: PAnsiChar;
   bShifted: Boolean;
 begin
+  Result := 0;
   openDb(p, 0);
   if nArg >= 1 then zCmd := args[0] else zCmd := 'help';
   zSchema := '';
@@ -6657,6 +6662,7 @@ begin
     for i := 0 to High(aFilectrl) do
       shellSPutZ(Format('  .filectrl %s %s'#10,
         [AnsiString(aFilectrl[i].zName), AnsiString(aFilectrl[i].zUsage)]));
+    Result := 1;
     Exit;
   end;
 
@@ -6673,6 +6679,7 @@ begin
       end else begin
         shellEPutZ(Format('Error: ambiguous file-control: "%s"'#10 +
           'Use ".filectrl --help" for help'#10, [zCmdC]));
+        Result := 1;
         Exit;
       end;
     end;
@@ -6691,74 +6698,81 @@ begin
   iRes := 0;
   isOk := 0;
 
+  { On bad nArg in any arm, fall through (isOk stays 0) so the post-case
+    Usage path fires with rc=1, matching C's `break` semantics. }
   case filectrl of
     SQLITE_FCNTL_SIZE_LIMIT: begin
       if bShifted then begin
-        if (nArg <> 3) and (nArg <> 4) then Exit;
-        if nArg = 4 then iLong := StrToInt64Def(args[3], 0) else iLong := -1;
+        if (nArg = 3) or (nArg = 4) then begin
+          if nArg = 4 then iLong := StrToInt64Def(args[3], 0) else iLong := -1;
+          iRes := iLong;
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                               SQLITE_FCNTL_SIZE_LIMIT, @iRes);
+          isOk := 1;
+        end;
       end else begin
-        if (nArg <> 1) and (nArg <> 2) then Exit;
-        if nArg = 2 then iLong := StrToInt64Def(args[1], 0) else iLong := -1;
+        if (nArg = 1) or (nArg = 2) then begin
+          if nArg = 2 then iLong := StrToInt64Def(args[1], 0) else iLong := -1;
+          iRes := iLong;
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                               SQLITE_FCNTL_SIZE_LIMIT, @iRes);
+          isOk := 1;
+        end;
       end;
-      iRes := iLong;
-      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
-                           SQLITE_FCNTL_SIZE_LIMIT, @iRes);
-      isOk := 1;
     end;
     SQLITE_FCNTL_LOCK_TIMEOUT,
     SQLITE_FCNTL_CHUNK_SIZE: begin
       if bShifted then begin
-        if nArg <> 4 then Exit;
-        iVal := StrToIntDef(args[3], 0);
+        if nArg = 4 then begin
+          iVal := StrToIntDef(args[3], 0);
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          isOk := 2;
+        end;
       end else begin
-        if nArg <> 2 then Exit;
-        iVal := StrToIntDef(args[1], 0);
+        if nArg = 2 then begin
+          iVal := StrToIntDef(args[1], 0);
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          isOk := 2;
+        end;
       end;
-      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
-                           filectrl, @iVal);
-      isOk := 2;
     end;
     SQLITE_FCNTL_PERSIST_WAL,
     SQLITE_FCNTL_POWERSAFE_OVERWRITE: begin
       if bShifted then begin
-        if (nArg <> 3) and (nArg <> 4) then Exit;
-        if nArg = 4 then iVal := parseOnOff(args[3], -1) else iVal := -1;
+        if (nArg = 3) or (nArg = 4) then begin
+          if nArg = 4 then iVal := parseOnOff(args[3], -1) else iVal := -1;
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          iRes := iVal;
+          isOk := 1;
+        end;
       end else begin
-        if (nArg <> 1) and (nArg <> 2) then Exit;
-        if nArg = 2 then iVal := parseOnOff(args[1], -1) else iVal := -1;
+        if (nArg = 1) or (nArg = 2) then begin
+          if nArg = 2 then iVal := parseOnOff(args[1], -1) else iVal := -1;
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          iRes := iVal;
+          isOk := 1;
+        end;
       end;
-      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
-                           filectrl, @iVal);
-      iRes := iVal;
-      isOk := 1;
     end;
     SQLITE_FCNTL_DATA_VERSION,
     SQLITE_FCNTL_HAS_MOVED: begin
-      if bShifted then begin
-        if nArg <> 3 then Exit;
-      end else begin
-        if nArg <> 1 then Exit;
+      if ((bShifted and (nArg = 3)) or ((not bShifted) and (nArg = 1))) then begin
+        iVal := 0;
+        sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+        iRes := iVal;
+        isOk := 1;
       end;
-      iVal := 0;
-      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
-                           filectrl, @iVal);
-      iRes := iVal;
-      isOk := 1;
     end;
     SQLITE_FCNTL_TEMPFILENAME: begin
-      if bShifted then begin
-        if nArg <> 3 then Exit;
-      end else begin
-        if nArg <> 1 then Exit;
+      if ((bShifted and (nArg = 3)) or ((not bShifted) and (nArg = 1))) then begin
+        zRet := nil;
+        sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @zRet);
+        if zRet <> nil then begin
+          WriteLn(AnsiString(zRet));
+          sqlite3_free(zRet);
+        end;
+        isOk := 2;
       end;
-      zRet := nil;
-      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
-                           filectrl, @zRet);
-      if zRet <> nil then begin
-        WriteLn(AnsiString(zRet));
-        sqlite3_free(zRet);
-      end;
-      isOk := 2;
     end;
     SQLITE_FCNTL_RESERVE_BYTES: begin
       if bShifted then begin
@@ -6779,10 +6793,11 @@ begin
     end;
   end;
 
-  if (isOk = 0) and (iCtrl >= 0) then
+  if (isOk = 0) and (iCtrl >= 0) then begin
     shellSPutZ(Format('Usage: .filectrl %s %s'#10,
-      [zCmdC, AnsiString(aFilectrl[iCtrl].zUsage)]))
-  else if isOk = 1 then
+      [zCmdC, AnsiString(aFilectrl[iCtrl].zUsage)]));
+    Result := 1;
+  end else if isOk = 1 then
     WriteLn(iRes);
 end;
 
@@ -9519,7 +9534,7 @@ begin
   if zCmd = 'vfsinfo'   then begin cmdVfsinfo(p, args, nArg); Exit; end;
   if zCmd = 'vfslist'   then begin cmdVfslist(p); Exit; end;
   if zCmd = 'vfsname'   then begin cmdVfsname(p, args, nArg); Exit; end;
-  if zCmd = 'filectrl'  then begin cmdFilectrl(p, args, nArg); Exit; end;
+  if zCmd = 'filectrl'  then begin Result := cmdFilectrl(p, args, nArg); Exit; end;
   if zCmd = 'testctrl'  then begin
     Result := cmdTestctrl(p, args, nArg); Exit;
   end;
@@ -9544,7 +9559,7 @@ begin
   end;
   if zCmd = 'dbtotxt' then begin cmdDbtotxt(p); Exit; end;
   if zCmd = 'dump' then begin cmdDump(p, args, nArg); Exit; end;
-  if zCmd = 'sha3sum' then begin cmdSha3sum(p, args, nArg); Exit; end;
+  if zCmd = 'sha3sum' then begin Result := cmdSha3sum(p, args, nArg); Exit; end;
   if (zCmd = 'archive') or (zCmd = 'ar') then begin
     cmdArchive(p, args, nArg); Exit;
   end;
