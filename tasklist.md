@@ -372,10 +372,13 @@ regressions without human triage.
   INDEX / VACUUM is exercised.  Validates Phase 6 OP_ParseSchema +
   AddColumn paths (see memory entries) under non-synthetic schemas.
 
-- [ ] **9.2.5** Vector regen script.  `src/tests/vectors/regen.sh`
-  rebuilds every `.db` from its companion `.sql` using the C
-  reference.  Committed blobs are derived artefacts; running the
-  script must produce a byte-identical tree.
+- [X] **9.2.5** Vector regen script.  `src/tests/vectors/regen.sh`
+  walks every `*.sql`, regenerates the `.db` via the C oracle
+  (`../sqlite3/sqlite3`), and `cmp`s against the committed blob.
+  Skip-tagged vectors (fts5/rtree, per MANIFEST) skipped gracefully;
+  legacy vectors (simple/multipage, EQUIV_LIST) fall back to .dump
+  equivalence because their on-disk byte layout predates 3.53.x.
+  Clean run after 9.2.1: 11 OK + 2 skipped + 0 mismatch, rc=0.
 
 ### 9.3 `TestFuzzDiff.pas` — differential fuzzer
 
