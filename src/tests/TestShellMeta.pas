@@ -7,7 +7,7 @@
 
   Coverage (mirrors tasklist.md 10.1e.*):
     - help              .help / .help schema           (10.1e.6)  [COVERED]
-    - stats             .stats                         (10.1e.1)  TODO
+    - stats             .stats                         (10.1e.1)  [COVERED]
     - timer             .timer                         (10.1e.2)  TODO
     - eqp               .eqp                           (10.1e.3)  [COVERED]
     - explain           .explain                       (10.1e.4)  [COVERED]
@@ -169,6 +169,33 @@ begin
     '.help'#10 +
     '.help schema'#10;
   DiffMeta('help', ':memory:', script);
+
+  { -------- stats (10.1e.1) --------------------------------------- }
+  { cmdStats (shell.c.in:11324..11339) accepts `.stats on|off|stmt|vmstep`
+    and flips ShellState.statsOn (stmt=2, vmstep=3, else booleanValue).
+    Bare `.stats` invokes display_stats() which emits memory/lookaside
+    counters that are NOT deterministic across binaries — deliberately
+    excluded from this gate.  We exercise only the state-flip arms and
+    round-trip through `.show` (which renders the stats slot via the
+    same azBool-style switch at shell.c.in:11308..11314), plus the
+    usage-error path (`Usage: .stats ?on|off|stmt|vmstep?\n` on stderr
+    with rc=1).  Runtime consumer (display_stats after each SQL when
+    statsOn != 0) is the 10.1.28 port body and not exercised here. }
+  script :=
+    '.stats on'#10 +
+    '.show'#10 +
+    '.stats stmt'#10 +
+    '.show'#10 +
+    '.stats vmstep'#10 +
+    '.show'#10 +
+    '.stats off'#10 +
+    '.show'#10;
+  DiffMeta('stats-state', ':memory:', script);
+
+  { Usage error path: more than one argument routes through the
+    Usage branch at shell.c.in:11335..11338 with rc=1. }
+  script := '.stats on extra'#10;
+  DiffMeta('stats-usage', ':memory:', script);
 
   { -------- show (10.1e.5) ---------------------------------------- }
   { cmdShow emits a fixed-order table of shell settings (shell.c.in

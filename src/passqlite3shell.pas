@@ -3417,34 +3417,28 @@ begin
   zFmt := '';   { silence "unused" }
 end;
 
-procedure cmdStats(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-{ shell.c.in:10597..10620 .stats arm.  Bare `.stats` toggles the
-  always-on counter display in upstream — but since the legacy bare-arg
-  toggle is the source of long-standing parity drift, we expose only the
-  documented sub-commands here. }
+function cmdStats(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
+{ shell.c.in:11324..11339 .stats arm.  Bare `.stats` invokes
+  display_stats() — emits memory/lookaside counters.  One arg flips
+  ShellState.statsOn (stmt=2, vmstep=3, else booleanValue).  Anything
+  else: usage on stderr with rc=1. }
 var
   s: AnsiString;
 begin
+  Result := 0;
   if nArg = 0 then begin
-    case p^.statsOn of
-      0: shellSPutZ('off'#10);
-      1: shellSPutZ('on'#10);
-      2: shellSPutZ('stmt'#10);
-      3: shellSPutZ('vmstep'#10);
-    else
-      shellSPutZ('on'#10);
-    end;
+    displayStats(p, 0);
     Exit;
   end;
-  s := args[0];
-  if      s = 'off'    then p^.statsOn := 0
-  else if s = 'on'     then p^.statsOn := 1
-  else if s = 'stmt'   then p^.statsOn := 2
-  else if s = 'vmstep' then p^.statsOn := 3
-  else begin
-    shellEPutZ('Usage: .stats off|on|stmt|vmstep'#10);
+  if nArg = 1 then begin
+    s := args[0];
+    if      s = 'stmt'   then p^.statsOn := 2
+    else if s = 'vmstep' then p^.statsOn := 3
+    else                      p^.statsOn := u32(parseOnOff(s, 0));
     Exit;
   end;
+  shellEPutZ('Usage: .stats ?on|off|stmt|vmstep?'#10);
+  Result := 1;
 end;
 
 { ----------------------------------------------------------------------
@@ -9424,7 +9418,7 @@ begin
 
   if (zCmd = 'quit') or (zCmd = 'exit') then begin Result := 2; Exit; end;
   if zCmd = 'help'      then begin cmdHelp(args, nArg); Exit; end;
-  if zCmd = 'stats'     then begin cmdStats(p, args, nArg); Exit; end;
+  if zCmd = 'stats'     then begin Result := cmdStats(p, args, nArg); Exit; end;
   if zCmd = 'trace'     then begin cmdTrace(p, args, nArg); Exit; end;
   if zCmd = 'show'      then begin Result := cmdShow(p, nArg); Exit; end;
   if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;

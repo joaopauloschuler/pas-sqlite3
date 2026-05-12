@@ -853,7 +853,7 @@ partial landings cannot silently no-op.
 ### 10.1e Meta / diagnostic dot-commands
 
 - [ ] **10.1e** Gate: `tests/cli/10e_meta/`.
-  - [ ] **10.1e.1** `.stats`
+  - [X] **10.1e.1** `.stats` — byte-parity gate (stats-state / stats-usage); deterministic state-flip arms only (`.stats on|off|stmt|vmstep` round-tripped via `.show`) plus usage-error path.  Bare `.stats` (display_stats counter dump) deliberately out of scope — memory/lookaside hi-water values are not deterministic across binaries.  Fixed cmdStats to call display_stats on bare arg, route 1-arg through booleanValue (parseOnOff), and return rc=1 on usage error with `Usage: .stats ?on|off|stmt|vmstep?\n` to match C (shell.c.in:11324..11339).
   - [ ] **10.1e.2** `.timer`
   - [X] **10.1e.3** `.eqp` — byte-parity gate landed in
         src/tests/TestShellMeta.pas (eqp-state round-trips on/full/
