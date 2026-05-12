@@ -6823,7 +6823,7 @@ const
   SQLITE_TESTCTRL_INTERNAL_FUNCTIONS   = 17;
   SQLITE_TESTCTRL_JSON_SELFCHECK       = 14;
 
-  aTestctrl: array[0..18] of TTestctrlEntry = (
+  aTestctrl: array[0..19] of TTestctrlEntry = (
     (zName: 'always';              code: SQLITE_TESTCTRL_ALWAYS;              unSafe: 1; zUsage: 'BOOLEAN'),
     (zName: 'assert';              code: SQLITE_TESTCTRL_ASSERT;              unSafe: 1; zUsage: 'BOOLEAN'),
     (zName: 'bitvec_test';         code: SQLITE_TESTCTRL_BITVEC_TEST;         unSafe: 1; zUsage: 'SIZE INT-ARRAY'),
@@ -6833,6 +6833,7 @@ const
     (zName: 'fk_no_action';        code: SQLITE_TESTCTRL_FK_NO_ACTION;        unSafe: 0; zUsage: 'BOOLEAN'),
     (zName: 'imposter';            code: SQLITE_TESTCTRL_IMPOSTER;            unSafe: 1; zUsage: 'SCHEMA ON/OFF ROOTPAGE'),
     (zName: 'internal_functions';  code: SQLITE_TESTCTRL_INTERNAL_FUNCTIONS;  unSafe: 0; zUsage: ''),
+    (zName: 'json_selfcheck';      code: SQLITE_TESTCTRL_JSON_SELFCHECK;      unSafe: 0; zUsage: 'BOOLEAN'),
     (zName: 'localtime_fault';     code: SQLITE_TESTCTRL_LOCALTIME_FAULT;     unSafe: 0; zUsage: 'BOOLEAN'),
     (zName: 'never_corrupt';       code: SQLITE_TESTCTRL_NEVER_CORRUPT;       unSafe: 1; zUsage: 'BOOLEAN'),
     (zName: 'optimizations';       code: SQLITE_TESTCTRL_OPTIMIZATIONS;       unSafe: 0; zUsage: 'DISABLE-MASK ...'),
@@ -6845,8 +6846,8 @@ const
     (zName: 'tune';                code: SQLITE_TESTCTRL_TUNE;                unSafe: 1; zUsage: 'ID VALUE')
   );
 
-procedure cmdTestctrl(p: PShellState; const args: array of AnsiString;
-                      nArg: SizeInt);
+function cmdTestctrl(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
 var
   zCmd, zCmdC: AnsiString;
   i, n2, iCtrl: SizeInt;
@@ -6855,6 +6856,7 @@ var
   rc2: i32;
   isTestingMode: Boolean;
 begin
+  Result := 0;
   openDb(p, 0);
   if nArg >= 1 then zCmd := args[0] else zCmd := 'help';
 
@@ -6873,6 +6875,10 @@ begin
       shellSPutZ(Format('  .testctrl %s %s'#10,
         [AnsiString(aTestctrl[i].zName), AnsiString(aTestctrl[i].zUsage)]));
     end;
+    { shell.c.in:11451 — `rc = 1; goto meta_command_exit;` after the
+      help dump; surface that to the dispatcher so the per-statement
+      error counter ticks (and the process exits non-zero on EOF). }
+    Result := 1;
     Exit;
   end;
 
@@ -6891,6 +6897,8 @@ begin
       end else begin
         shellEPutZ(Format('Error: ambiguous test-control: "%s"'#10 +
           'Use ".testctrl --help" for help'#10, [zCmdC]));
+        { shell.c.in:11467 — ambiguous → rc=1; goto meta_command_exit. }
+        Result := 1;
         Exit;
       end;
     end;
@@ -6898,6 +6906,8 @@ begin
   if testctrl < 0 then begin
     shellEPutZ(Format('Error: unknown test-control: %s'#10 +
       'Use ".testctrl --help" for help'#10, [zCmdC]));
+    { shell.c.in:11472..11475 — unknown leaves rc untouched (no
+      `rc=1; goto`); the per-statement error counter does NOT tick. }
     Exit;
   end;
 
@@ -6924,10 +6934,12 @@ begin
     isOk := 3;
   end;
 
-  if (isOk = 0) and (iCtrl >= 0) then
+  if (isOk = 0) and (iCtrl >= 0) then begin
     shellSPutZ(Format('Usage: .testctrl %s %s'#10,
-      [zCmdC, AnsiString(aTestctrl[iCtrl].zUsage)]))
-  else if isOk = 1 then
+      [zCmdC, AnsiString(aTestctrl[iCtrl].zUsage)]));
+    { shell.c.in:11869..11872 — isOk==0 + iCtrl>=0 sets rc=1. }
+    Result := 1;
+  end else if isOk = 1 then
     WriteLn(rc2);
 end;
 
@@ -9476,7 +9488,9 @@ begin
   if zCmd = 'vfslist'   then begin cmdVfslist(p); Exit; end;
   if zCmd = 'vfsname'   then begin cmdVfsname(p, args, nArg); Exit; end;
   if zCmd = 'filectrl'  then begin cmdFilectrl(p, args, nArg); Exit; end;
-  if zCmd = 'testctrl'  then begin cmdTestctrl(p, args, nArg); Exit; end;
+  if zCmd = 'testctrl'  then begin
+    Result := cmdTestctrl(p, args, nArg); Exit;
+  end;
   if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
   if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
   if zCmd = 'expert'    then begin cmdExpert(p, args, nArg); Result := 1; Exit; end;

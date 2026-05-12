@@ -18,8 +18,8 @@
     - trace             .trace                         (10.1e.10) [COVERED]
     - iotrace           .iotrace                       (10.1e.11) TODO
     - scanstats         .scanstats                     (10.1e.12) TODO
-    - testcase          .testcase                      (10.1e.13) TODO
-    - testctrl          .testctrl                      (10.1e.14) TODO
+    - testcase          .testcase                      (10.1e.13) [COVERED]
+    - testctrl          .testctrl                      (10.1e.14) [COVERED]
     - selecttrace       .selecttrace                   (10.1e.15) TODO
     - wheretrace        .wheretrace                    (10.1e.16) TODO
 
@@ -384,6 +384,75 @@ begin
     and rc-bumps the per-statement error counter. }
   script := '.trace --bogus'#10;
   DiffMeta('trace-unknown', ':memory:', script);
+
+  { -------- testcase (10.1e.13) ----------------------------------- }
+  { dotCmdTestcase (shell.c.in:8868..8904) stashes the supplied NAME in
+    ShellState.zTestcase (or builds `<file>:<lineno>` when NAME is
+    omitted) and arms cli_output_capture for a subsequent `.check`.
+    It emits nothing on stdout/stderr and returns rc=0 in both arms;
+    the unknown-option / missing-arg error paths route through
+    dotCmdError (`shell.c.in:8879/8886`) which prefix the per-shell
+    diagnostic line — kept out of this gate because the prefix is not
+    byte-deterministic across binaries (depends on capture-state and
+    nLine drift in the C reference).
+
+    Scope: bare `.testcase` (NAME defaults to `<stdin>:<line>`) and
+    `.testcase NAME` — both silent, rc=0.  The `.check ANSWER` side of
+    the protocol is tracked by 10.1.40 (capture redirector pending). }
+  script :=
+    '.testcase'#10 +
+    '.testcase widget-a'#10;
+  DiffMeta('testcase-silent', ':memory:', script);
+
+  { -------- testctrl (10.1e.14) ----------------------------------- }
+  { cmdTestctrl (shell.c.in:11395..11878) is the .testctrl dispatcher.
+    A 19/20-entry table maps subcommand names to numeric sub-opcodes
+    routed into sqlite3_test_control(); the optional `-` / `--` prefix
+    on the verb is stripped before lookup, and a unique-prefix match
+    is honoured.  Output shape depends on the per-arm `isOk` value:
+      isOk==0 & iCtrl>=0 → `Usage: .testctrl NAME USAGE\n` + rc=1
+      isOk==1            → `%d\n` (rc2 from sqlite3_test_control)
+      isOk==2            → `0x%08x\n`
+      isOk==3            → silent
+    Bare `.testctrl` falls through to the help path (`zCmd="help"`)
+    which lists every safe sub-control and sets rc=1.  An unknown verb
+    emits `Error: unknown test-control: X\n` on stderr WITHOUT setting
+    rc=1 (C lets the error fall through to the bottom of the switch
+    with rc=0).  Ambiguous matches set rc=1.
+
+    Scope of this gate (byte-deterministic across binaries):
+      - `.testctrl byteorder` — emits SQLITE_BYTEORDER*100 + LE*10 + BE
+        (123410 on x86_64 little-endian) followed by a newline; tests
+        the isOk==1 render and the port's compile-time encoding in
+        sqlite3_test_control(BYTEORDER) (passqlite3main.pas:4313..).
+      - `.testctrl prng_save` / `.testctrl prng_restore` — invoke the
+        randomness state ops; silent (isOk==3), rc=0.
+      - `.testctrl` (bare) — help dump + rc=1 (errCnt ticks).
+      - `.testctrl unknown_op_xyz` — `Error: unknown ...` + rc=0.
+    Out of scope (intentionally not byte-deterministic):
+      - `.testctrl --help` text varies with SHFLG_TestingMode and any
+        --unsafe-testing-mode CLI flag — handled by .testctrl bare.
+      - Sub-controls that touch the varargs cdecl boundary
+        (Phase 8.4.1) such as optimizations / json_selfcheck — the
+        port's wrapper does not consume the variadic tail yet, so the
+        underlying sqlite3_test_control() side-effect can diverge.
+      - `prng_reset` (alias for randomness(0,nil) in some C builds) is
+        not in the upstream aCtrl[] table, so it lands in the unknown
+        arm — already covered by the unknown_op arm. }
+
+  script := '.testctrl byteorder'#10;
+  DiffMeta('testctrl-byteorder', ':memory:', script);
+
+  script :=
+    '.testctrl prng_save'#10 +
+    '.testctrl prng_restore'#10;
+  DiffMeta('testctrl-prng', ':memory:', script);
+
+  script := '.testctrl'#10;
+  DiffMeta('testctrl-help', ':memory:', script);
+
+  script := '.testctrl no_such_op_xyz'#10;
+  DiffMeta('testctrl-unknown', ':memory:', script);
 
   CleanupPaths;
 

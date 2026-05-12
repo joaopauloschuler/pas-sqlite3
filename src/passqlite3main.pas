@@ -4311,9 +4311,18 @@ begin
     SQLITE_TESTCTRL_PRNG_RESTORE_OP: sqlite3PrngRestoreState;
     SQLITE_TESTCTRL_PRNG_RESET_OP:   sqlite3_randomness(0, nil);
     SQLITE_TESTCTRL_BYTEORDER_OP: begin
-      { main.c:4502 — return non-zero on big-endian platform.  FPC on
-        x86_64 is little-endian; report 0. }
-      Result := 0;
+      { main.c (TESTCTRL_BYTEORDER, sqlite3.c:191530..191532):
+          rc = SQLITE_BYTEORDER*100 + SQLITE_LITTLEENDIAN*10 + SQLITE_BIGENDIAN
+        SQLite encodes byte order at compile-time when the macro is set,
+        so this is a 6-digit answer on x86_64 builds (1234 / little-endian
+        / not big-endian → 123410) and 432101 on big-endian builds.  FPC
+        on x86_64 → 123410; bump to compile-time {$IFDEF ENDIAN_BIG} for
+        portability when a big-endian target appears. }
+      {$IFDEF ENDIAN_BIG}
+      Result := 4321 * 100 + 0 * 10 + 1;   { 432101 }
+      {$ELSE}
+      Result := 1234 * 100 + 1 * 10 + 0;   { 123410 }
+      {$ENDIF}
     end;
     SQLITE_TESTCTRL_ISINIT_OP: begin
       { main.c:4582 — 0 if sqlite3_initialize has succeeded, SQLITE_ERROR
