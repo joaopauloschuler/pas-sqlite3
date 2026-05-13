@@ -3936,6 +3936,161 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ ===========================================================================
+  modifyPagePointer / relocatePage — auto-vacuum page-relocation core
+  btree.c lines 3862..4012
+
+  modifyPagePointer: Somewhere on pPage is a pointer to page iFrom.  Modify
+  this pointer so that it points to iTo.  Parameter eType describes the type
+  of pointer to be modified (PTRMAP_BTREE / PTRMAP_OVERFLOW1 / PTRMAP_OVERFLOW2).
+
+  relocatePage: Move the open database page pDbPage to location iFreePage in
+  the database.  The pDbPage reference remains valid.
+
+  Both are `static SQLITE_NOINLINE` in C; we mirror that by keeping them
+  unit-local (no interface-section declaration).
+  =========================================================================== }
+
+{ modifyPagePointer — btree.c:3876..3928 }
+function modifyPagePointer(pPage: PMemPage; iFrom, iTo: Pgno; eType: u8): i32;
+var
+  i, nCell, rc: i32;
+  pCell: Pu8;
+  info: TCellInfo;
+begin
+  { btree.c:3877..3878 — invariants }
+  Assert(sqlite3PagerIswriteable(pPage^.pDbPage) <> 0);
+  if eType = PTRMAP_OVERFLOW2 then begin
+    { btree.c:3879..3884 — pointer always at first 4 bytes of overflow page }
+    if get4byte(pPage^.aData) <> iFrom then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    put4byte(pPage^.aData, iTo);
+  end else begin
+    { btree.c:3885..3925 — search cells for the pointer }
+    if pPage^.isInit <> 0 then rc := SQLITE_OK
+    else rc := btreeInitPage(pPage);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    nCell := pPage^.nCell;
+
+    i := 0;
+    while i < nCell do begin
+      pCell := findCell(pPage, i);
+      if eType = PTRMAP_OVERFLOW1 then begin
+        { btree.c:3896..3907 }
+        pPage^.xParseCell(pPage, pCell, @info);
+        if info.nLocal < info.nPayload then begin
+          if (pCell + info.nSize) > (pPage^.aData + pPage^.pBt^.usableSize) then begin
+            Result := SQLITE_CORRUPT_BKPT;
+            Exit;
+          end;
+          if iFrom = get4byte(pCell + info.nSize - 4) then begin
+            put4byte(pCell + info.nSize - 4, iTo);
+            Break;
+          end;
+        end;
+      end else begin
+        { btree.c:3908..3916 — PTRMAP_BTREE: pointer is first 4 bytes of cell }
+        if (pCell + 4) > (pPage^.aData + pPage^.pBt^.usableSize) then begin
+          Result := SQLITE_CORRUPT_BKPT;
+          Exit;
+        end;
+        if get4byte(pCell) = iFrom then begin
+          put4byte(pCell, iTo);
+          Break;
+        end;
+      end;
+      Inc(i);
+    end;
+
+    { btree.c:3919..3925 — pointer not in any cell; must be the rightmost-child
+      pointer in the page header (PTRMAP_BTREE only). }
+    if i = nCell then begin
+      if (eType <> PTRMAP_BTREE) or
+         (get4byte(pPage^.aData + pPage^.hdrOffset + 8) <> iFrom) then begin
+        Result := SQLITE_CORRUPT_BKPT;
+        Exit;
+      end;
+      put4byte(pPage^.aData + pPage^.hdrOffset + 8, iTo);
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ relocatePage — btree.c:3940..4012 }
+function relocatePage(pBt: PBtShared; pDbPage: PMemPage; eType: u8;
+                      iPtrPage, iFreePage: Pgno; isCommit: i32): i32;
+var
+  pPtrPage: PMemPage;          { btree.c:3948 — page containing pointer to pDbPage }
+  iDbPage: Pgno;
+  pPgr: PPager;                { FPC: `pPager: PPager` collides; use pPgr }
+  rc: i32;
+  nextOvfl: Pgno;
+begin
+  iDbPage := pDbPage^.pgno;
+  pPgr := pBt^.pPager;
+
+  { btree.c:3953..3956 — invariants }
+  Assert((eType = PTRMAP_OVERFLOW2) or (eType = PTRMAP_OVERFLOW1) or
+         (eType = PTRMAP_BTREE) or (eType = PTRMAP_ROOTPAGE));
+  Assert(pDbPage^.pBt = pBt);
+  if iDbPage < 3 then begin
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+
+  { btree.c:3959..3965 — move the page via pager }
+  rc := sqlite3PagerMovepage(pPgr, pDbPage^.pDbPage, iFreePage, isCommit);
+  if rc <> SQLITE_OK then begin
+    Result := rc;
+    Exit;
+  end;
+  pDbPage^.pgno := iFreePage;
+
+  { btree.c:3968..3989 — fix ptrmap entries for pages reachable from pDbPage }
+  if (eType = PTRMAP_BTREE) or (eType = PTRMAP_ROOTPAGE) then begin
+    rc := setChildPtrmaps(pDbPage);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+  end else begin
+    nextOvfl := get4byte(pDbPage^.aData);
+    if nextOvfl <> 0 then begin
+      ptrmapPut(pBt, nextOvfl, PTRMAP_OVERFLOW2, iFreePage, @rc);
+      if rc <> SQLITE_OK then begin
+        Result := rc;
+        Exit;
+      end;
+    end;
+  end;
+
+  { btree.c:3991..4010 — fix the database pointer on iPtrPage that pointed
+    at iDbPage so it points at iFreePage; also update ptrmap for iPtrPage. }
+  if eType <> PTRMAP_ROOTPAGE then begin
+    rc := btreeGetPage(pBt, iPtrPage, pPtrPage, 0);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    rc := sqlite3PagerWrite(pPtrPage^.pDbPage);
+    if rc <> SQLITE_OK then begin
+      releasePage(pPtrPage);
+      Result := rc;
+      Exit;
+    end;
+    rc := modifyPagePointer(pPtrPage, iDbPage, iFreePage, eType);
+    releasePage(pPtrPage);
+    if rc = SQLITE_OK then
+      ptrmapPut(pBt, iFreePage, eType, iPtrPage, @rc);
+  end;
+  Result := rc;
+end;
+
 { ---------------------------------------------------------------------------
   btreeSetHasContent / btreeGetHasContent / btreeClearHasContent
   btree.c lines 651-685
