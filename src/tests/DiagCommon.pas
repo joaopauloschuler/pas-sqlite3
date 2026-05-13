@@ -23,13 +23,20 @@
                                      PasRun1 / CRun1 / Probe shape used by
                                      DiagScalarFunc, DiagCast, DiagFunctions,
                                      DiagLikeGlob, DiagMoreFunc.
+    ProbeRows(lbl, seed, sql)     -- seeded multi-row probe.  Optionally
+                                     runs `seed` via sqlite3_exec, then
+                                     prepares `sql` and concatenates every
+                                     SQLITE_ROW as `[col0,col1,...]`
+                                     joined with `;`.  Compares prepRc,
+                                     stepRc, and the concatenated rows.
+                                     Matches the original PasRunSeed /
+                                     CRunSeed / Probe shape used by
+                                     DiagWindow / DiagIndexing /
+                                     DiagPredicates.
 
   Future additions (intentionally not in v1):
     ProbeOneText(lbl, sql)        -- text-only variant for DiagPrintfFmt.
     ProbeOneNoInt(lbl, sql)       -- text + type variant for DiagArith.
-    ProbeRows(lbl, seed, sql)     -- seeded multi-row variant for
-                                     DiagWindow / DiagIndexing /
-                                     DiagPredicates.
 }
 unit DiagCommon;
 
@@ -44,6 +51,7 @@ var
   diverged: i32 = 0;
 
 procedure ProbeOne(const lbl, sql: AnsiString);
+procedure ProbeRows(const lbl, seed, sql: AnsiString);
 
 function DiagExitCode: Integer;
 
@@ -128,6 +136,110 @@ begin
             ' type=', pType, ' int=', pInt, ' txt="', pTxt, '"');
     WriteLn('   C  : prep=', cPrep, ' step=', cStep,
             ' type=', cType, ' int=', cInt, ' txt="', cTxt, '"');
+  end;
+end;
+
+procedure PasRunSeed(const seed, sql: AnsiString;
+                     out prepRc, stepRc: i32;
+                     out concat: AnsiString);
+var
+  db: PTsqlite3;
+  pStmt: PVdbe;
+  rcs, ncols, i: i32;
+  zT: PAnsiChar;
+  s: AnsiString;
+begin
+  prepRc := -1; stepRc := -1; concat := '';
+  db := nil;
+  if sqlite3_open(':memory:', @db) <> 0 then Exit;
+  if seed <> '' then
+    sqlite3_exec(db, PAnsiChar(seed), nil, nil, nil{%H-});
+  pStmt := nil;
+  prepRc := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, nil);
+  if pStmt <> nil then begin
+    repeat
+      rcs := sqlite3_step(pStmt);
+      stepRc := rcs;
+      if rcs = SQLITE_ROW then begin
+        ncols := sqlite3_column_count(pStmt);
+        s := '[';
+        for i := 0 to ncols - 1 do begin
+          if i > 0 then s := s + ',';
+          zT := PAnsiChar(sqlite3_column_text(pStmt, i));
+          if zT = nil then s := s + 'null'
+          else s := s + AnsiString(zT);
+        end;
+        s := s + ']';
+        if concat <> '' then concat := concat + ';';
+        concat := concat + s;
+      end;
+    until rcs <> SQLITE_ROW;
+    sqlite3_finalize(pStmt);
+  end;
+  sqlite3_close(db);
+end;
+
+procedure CRunSeed(const seed, sql: AnsiString;
+                   out prepRc, stepRc: i32;
+                   out concat: AnsiString);
+var
+  db: Pcsq_db;
+  pStmt: Pcsq_stmt;
+  pTail: PChar;
+  rcs, ncols, i: Int32;
+  zT: PChar;
+  s: AnsiString;
+  pErr: PChar;
+begin
+  prepRc := -1; stepRc := -1; concat := '';
+  db := nil;
+  if csq_open(':memory:', db) <> 0 then Exit;
+  pErr := nil;
+  if seed <> '' then
+    csq_exec(db, PAnsiChar(seed), nil, nil, pErr);
+  pStmt := nil; pTail := nil;
+  prepRc := csq_prepare_v2(db, PAnsiChar(sql), -1, pStmt, pTail);
+  if pStmt <> nil then begin
+    repeat
+      rcs := csq_step(pStmt);
+      stepRc := rcs;
+      if rcs = SQLITE_ROW then begin
+        ncols := csq_column_count(pStmt);
+        s := '[';
+        for i := 0 to ncols - 1 do begin
+          if i > 0 then s := s + ',';
+          zT := csq_column_text(pStmt, i);
+          if zT = nil then s := s + 'null'
+          else s := s + AnsiString(zT);
+        end;
+        s := s + ']';
+        if concat <> '' then concat := concat + ';';
+        concat := concat + s;
+      end;
+    until rcs <> SQLITE_ROW;
+    csq_finalize(pStmt);
+  end;
+  csq_close(db);
+end;
+
+procedure ProbeRows(const lbl, seed, sql: AnsiString);
+var
+  pPrep, pStep, cPrep, cStep: i32;
+  pCat, cCat: AnsiString;
+  ok: Boolean;
+begin
+  PasRunSeed(seed, sql, pPrep, pStep, pCat);
+  CRunSeed  (seed, sql, cPrep, cStep, cCat);
+  ok := (pPrep = cPrep) and (pStep = cStep) and (pCat = cCat);
+  if ok then
+    WriteLn('PASS    ', lbl)
+  else
+  begin
+    Inc(diverged);
+    WriteLn('DIVERGE ', lbl);
+    WriteLn('   sql  =', sql);
+    WriteLn('   Pas: prep=', pPrep, ' step=', pStep, ' rows="', pCat, '"');
+    WriteLn('   C  : prep=', cPrep, ' step=', cStep, ' rows="', cCat, '"');
   end;
 end;
 
