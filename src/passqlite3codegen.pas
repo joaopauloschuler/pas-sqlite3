@@ -26463,6 +26463,23 @@ begin
     pTabList := p^.pSrc;
   end;
 
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.a.10 — Snapshot the SELECT tree after all FROM-clause analysis
+    is complete.  Mirrors select.c:8144..8149:
+        #if TREETRACE_ENABLED
+        if( sqlite3TreeTrace & 0x8000 ){
+          TREETRACE(0x8000,pParse,p,("After all FROM-clause analysis:\n"));
+          sqlite3TreeViewSelect(0, p, 0);
+        }
+        #endif
+    Mask 0x8000 confirmed against sqliteInt.h TREETRACE_ENABLED block. }
+  if (sqlite3TreeTrace and $8000) <> 0 then
+  begin
+    sqlite3DebugPrintf('After all FROM-clause analysis:'#10, []);
+    sqlite3TreeViewSelect(nil, p, 0);
+  end;
+  {$ENDIF}
+
   { 10.1.42.a.12 — Transform DISTINCT into GROUP BY when the result-set
     matches the ORDER BY (select.c:8151..8196, tag-select-0500).
         SELECT DISTINCT xyz FROM ... ORDER BY xyz
@@ -29920,8 +29937,7 @@ begin
             no FROM-clause optimisation loop)
       7887  end compound-select processing        — deferred (no host)
       8011/8030 WHERE-clause push-down (0x4000)    — LANDED (a.9)
-      8146  After all FROM-clause analysis (0x8000) — deferred (a.5,
-            no Pas counterpart to the post-FROM-loop snapshot point)
+      8146  After all FROM-clause analysis (0x8000) — LANDED (a.10)
       8192  Transform DISTINCT into GROUP BY (0x20000) — LANDED (a.12)
       8442  After aggregate analysis                — LANDED (a.3)
       8609  AggInfo function exprs -> indexed ref   — deferred (a.6.4)

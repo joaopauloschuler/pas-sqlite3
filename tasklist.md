@@ -497,8 +497,8 @@ partial landings cannot silently no-op.
       - pushDownWhereTerms + disableUnusedSubqueryResultColumns +
         their 0x4000 TREETRACE arms — LANDED under 10.1.42.a.9.
       - select.c:8136..8149 (the post-FROM-loop snapshot, mask 0x8000)
-        has no Pas anchor — the snapshot point doesn't exist because
-        the loop it terminates doesn't exist.
+        — LANDED under 10.1.42.a.10 after count-of-view / pre DISTINCT→
+        GROUP BY transform.
       - "Finished with AggInfo" (select.c:8937, mask 0x20) lives in
         the late select_end AggInfo teardown that's already listed
         deferred under 10.1.42.a.6 (a.6.5).
@@ -622,8 +622,11 @@ partial landings cannot silently no-op.
       SQLITE_NullUnusedCols ($04000000) constants.  Restriction (6c) for
       partition-less window functions is conservatively bailed (no
       pushDownWindowCheck helper port).  TestExplainParity 1026/1026.
-    - [ ] **10.1.42.a.10** Port the all-FROM-clause final analysis loop
-      (select.c:8146) so the 0x8000 TREETRACE arm can land.
+    - [X] **10.1.42.a.10** Ported the all-FROM-clause final analysis
+      snapshot (select.c:8144..8149, mask 0x8000) post count-of-view /
+      pre DISTINCT→GROUP BY transform; wrapped under `{$IFDEF
+      SQLITE_DEBUG}` and prints via sqlite3TreeViewSelect.
+      TestExplainParity 1026/1026.
     - [X] **10.1.42.a.11** Ported the top-level superfluous-ORDER-BY drop
       (select.c:7625..7644, IgnorableDistinct, mask 0x800) post `begin
       processing` / pre `sqlite3SelectPrep`; clears p^.pOrderBy via
