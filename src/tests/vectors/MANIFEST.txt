@@ -95,7 +95,7 @@ they are tracked as bucket-F / bucket-G / bucket-H below.
   pas-skip incrvacuum.db       bucket-I (round-trip mutator cell-layout drift; bucket-F lifted by 9.2.divbug.F)
   pas-skip view-cte.db         bucket-B (script-trailing VACUUM still EAccessViolations — 9.2.divbug.B; rename arm of bucket-C cleared in 9.2.divbug.C)
   pas-skip utf16.db            bucket-K (hex(label) of UTF-16-stored text returns byte-swapped pairs; bucket-G PRAGMA encoding lifted by 9.2.divbug.G)
-  pas-skip withoutrowid.db     bucket-D (CREATE INDEX on WITHOUT ROWID byte divergence in 9.2.4 schema-change; bucket-H lifted by 9.2.divbug.H — RO/RW probes now byte-identical)
+  pas-skip withoutrowid.db     bucket-B (trailing VACUUM EAccessViolation in 9.2.4 schema-change script; bucket-D lifted by 9.2.divbug.D — CREATE INDEX on WITHOUT ROWID now byte-identical; bucket-H lifted by 9.2.divbug.H — RO/RW probes now byte-identical)
   pas-skip wal.db              bucket-I (round-trip cell-layout drift at byte 8201 — WAL mutator)
   pas-skip multipage.db        bucket-I (round-trip cell-layout drift at byte 12290 — multipage mutator)
   pas-skip generated-column.db bucket-I (round-trip cell-layout drift at byte 4103 — generated-column mutator)

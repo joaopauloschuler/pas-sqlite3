@@ -153,15 +153,25 @@ Affected vector:
 
 * `view-cte.db` — bucket C (also bucket-A, bucket-B via VACUUM)
 
-## Bucket D — CREATE INDEX on WITHOUT ROWID table — page byte divergence (9.2.4)
+## Bucket D — CREATE INDEX on WITHOUT ROWID table — page byte divergence (9.2.4) [FIXED 9.2.divbug.D]
 
-Symptom: `CREATE INDEX idx_c ON t(c);` against the `withoutrowid.db`
-vector produces a byte-different `.db` blob between the C oracle and
-the Pascal port (both rc=0, no error).  Diff first surfaces inside the
-new index b-tree page payload (cell-pointer ordering / payload
-prefix), strongly suggesting a key-encoding divergence specific to
-WITHOUT ROWID indexes (where the index entries carry the full
-composite primary key, not a 64-bit rowid suffix).
+**Fixed**: `sqlite3CreateIndex` (passqlite3codegen.pas) skipped C
+build.c:4278..4292's `pPk` arm — the explicit "append the WITHOUT
+ROWID table's declared PRIMARY KEY columns as the implicit index-key
+suffix" loop.  Only the `pPk==nil` (rowid) tail was wired; in the
+WITHOUT ROWID case the PK-suffix `aiColumn[]`, `azColl[]`,
+`aSortOrder[]` slots stayed zero-initialised, so every index cell
+encoded `(c, a-col-from-table[0], a-col-from-table[0])` instead of
+`(c, a, b)`.  Surfaced as a five-byte cell-length drift inside index
+page 3 of `withoutrowid.db` at byte 8199.
+
+Faithful port: added the missing `else if pPk <> nil` arm that walks
+`pPk^.aiColumn[0..nKeyCol-1]` copying each into `pIndex[i++]`, with
+an inline `isDupColumn` (build.c:2274) check that decrements
+`nColumn` when a PK column already appears in the user-specified key
+prefix.  C reference: `../sqlite3/src/build.c:4278`.
+
+Original symptom (kept for historical context):
 
 Reproducer:
 

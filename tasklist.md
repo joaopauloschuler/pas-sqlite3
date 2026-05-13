@@ -301,11 +301,18 @@ regressions without human triage.
     allocated Expr (parse.y:1166 tokenExpr) so renameColumnExprCb can
     locate the source slice for renameEditSql to rewrite.  view-cte
     vector now reaches the trailing VACUUM (bucket-B) cleanly.
-  - [ ] **9.2.divbug.D** `CREATE INDEX` on a WITHOUT ROWID table
-    produces byte-different b-tree page payload vs the C oracle (1
-    site: withoutrowid vector).  Cross-check
-    `../sqlite3/src/build.c sqlite3CreateIndex` + `btree.c` cell
-    packing for index-on-WITHOUT-ROWID-with-PK-suffix.
+  - [X] **9.2.divbug.D** `CREATE INDEX` on a WITHOUT ROWID table
+    produces byte-different b-tree page payload vs the C oracle.
+    FIXED: Pas `sqlite3CreateIndex` skipped C build.c:4278..4292's
+    `pPk` arm that copies the WITHOUT ROWID table's PRIMARY KEY
+    columns into the index-key suffix.  Only the `pPk==nil` (rowid)
+    tail was wired, so WITHOUT-ROWID indexes left the PK-suffix
+    `aiColumn[]`/`azColl[]`/`aSortOrder[]` slots zero-init and every
+    cell encoded `(c, table[0], table[0])` instead of `(c, a, b)`.
+    Faithful port adds the missing arm with inline `isDupColumn`
+    (build.c:2274) so duplicate PK columns shrink `nColumn` rather
+    than double-encoding.  withoutrowid vector still pas-skips for
+    bucket-B (trailing VACUUM EAccessViolation), now retagged.
   - [X] **9.2.divbug.E** `ALTER TABLE … RENAME COLUMN` on a table
     referenced by a partial index produces byte-different
     `sqlite_master` row (1 site: partial-index vector).  FIXED: Pas

@@ -40443,6 +40443,8 @@ var
   pColExpr:    PExpr;
   pCollSeq:    PTCollSeq;
   zCollName:   PAnsiChar;
+  jj:          i32;
+  isDup:       Boolean;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -40653,13 +40655,52 @@ begin
       (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + i)^ := 0;
   end;
-  { Append rowid (or pPk key cols — pPk path deferred) as the implicit tail. }
+  { Append rowid (or pPk key cols) as the implicit tail.  WITHOUT ROWID
+    tables: copy each pPk key column (skipping duplicates already in
+    pIndex's key prefix per build.c isDupColumn at 4282).  Without this
+    the PK-suffix slots stay zero-init and every index cell carries
+    column-0 of the table instead of the real PK columns — surfaces as
+    byte-different b-tree pages on CREATE INDEX (9.2.divbug.D). }
   if pPk = nil then
   begin
     n := i32(pList^.nExpr);
     (pIndex^.aiColumn + n)^ := i16(XN_ROWID);
     (PPAnsiChar(pIndex^.azColl) + n)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + n)^ := 0;
+  end
+  else
+  begin
+    { build.c:4278..4292.  i starts at pList^.nExpr (the first PK-suffix
+      slot) and advances only for non-duplicate PK columns; duplicates
+      shrink nColumn instead. }
+    i := i32(pList^.nExpr);
+    for n := 0 to i32(pPk^.nKeyCol) - 1 do
+    begin
+      { isDupColumn: scan the key prefix [0..nKeyCol) for an entry with
+        the same aiColumn AND same collation as pPk->aiColumn[n]. }
+      isDup := False;
+      for jj := 0 to i32(pIndex^.nKeyCol) - 1 do
+      begin
+        if ((pIndex^.aiColumn + jj)^ = (pPk^.aiColumn + n)^)
+           and ((PPAnsiChar(pIndex^.azColl) + jj)^ <> nil)
+           and ((PPAnsiChar(pPk^.azColl) + n)^ <> nil)
+           and (sqlite3StrICmp((PPAnsiChar(pIndex^.azColl) + jj)^,
+                               (PPAnsiChar(pPk^.azColl) + n)^) = 0) then
+        begin
+          isDup := True;
+          Break;
+        end;
+      end;
+      if isDup then
+        pIndex^.nColumn := pIndex^.nColumn - 1
+      else
+      begin
+        (pIndex^.aiColumn + i)^ := (pPk^.aiColumn + n)^;
+        (PPAnsiChar(pIndex^.azColl) + i)^ := (PPAnsiChar(pPk^.azColl) + n)^;
+        (pIndex^.aSortOrder + i)^ := (pPk^.aSortOrder + n)^;
+        Inc(i);
+      end;
+    end;
   end;
 
   { Populate colNotIdxed bitmask (build.c around 4283).  Bit i set iff
