@@ -428,7 +428,7 @@ regressions without human triage.
 
 ### 9.3 `TestFuzzDiff.pas` — differential fuzzer
 
-- [ ] **9.3.1** In-process harness.  `TestFuzzDiff.pas` reads a single
+- [X] **9.3.1** In-process harness.  `TestFuzzDiff.pas` reads a single
   `dbsqlfuzz`-format input (db prefix + SQL tail per upstream
   `test/fuzzcheck.c` — read its `ossfuzz_set_data` / db-prefix parser
   for the exact frame layout before implementing), runs it under both
@@ -437,6 +437,22 @@ regressions without human triage.
   plumbing rather than re-implementing).  Apply the existing
   `ApplyHeaderMask` from 9.1.4 to the db-blob channel.  No AFL yet —
   just the one-shot driver that AFL will later call.
+
+  *Landed:* `src/tests/TestFuzzDiff.pas` is a one-shot CLI
+  `bin/TestFuzzDiff <input.dbsqlfuzz>`.  `DecodeDatabase` ports
+  `fuzzcheck.c:decodeDatabase` (+ `isOffset`) faithfully: hex-pair
+  text decode, `[NNNN]` half-byte cursor jump, `\n--\n` db/SQL split,
+  4 KiB-aligned `mx` rounding.  CorpusOracle.pas was extended with
+  `RunCOracleSeeded` / `RunPasOracleSeeded` (same signature as the
+  bare entry points but skip the workdir wipe so the harness can
+  plant a non-empty `test.db` first).  Four-channel compare contract:
+  stdout, stderr, rc, db-blob — db-blob fed through
+  `ApplyHeaderMask` (9.1.4) before diff.  Exit codes: 0 = identical,
+  1 = usage/IO, 2 = divergence, 3 = malformed frame.  Smoke gate on
+  hand-built `\n--\nSELECT 1;` and `\n--\nCREATE TABLE t(x); INSERT
+  ...; SELECT * FROM t;` both PASS (db_bytes=0 / sql_bytes=10 and
+  =69; all four channels byte-identical).  Seed-corpus sweep is
+  9.3.2; AFL wiring is 9.3.3.
 
 - [ ] **9.3.2** Seed corpus import.  Pull the upstream `dbsqlfuzz`
   seed set from `../sqlite3/test/fuzzdata*.db` (8 seed files as of
