@@ -434,4 +434,41 @@ Affected vector: `utf16.db` — bucket-M (also bucket-K for the RO
 hex(label) byte-swap, unrelated).  Tagged `pas-skip` for the
 round-trip probe in `MANIFEST.txt`.
 
+## Bucket N — Freeblock / dead-cell ghost on DELETE+UPDATE — CLOSED
+
+Symptom (was): `utf16.db` post-mutator (DELETE id=2 + UPDATE id=1) had a
+ghost of the deleted UTF-16LE row payload (`1d 63 00 61 00 66 00 e9 00 0d`,
+the size-prefixed `caf<é>` cell header) at bytes 0x1fe9..0x1ff0, while the
+C oracle had zeros at the same offsets.  Active cells were byte-identical.
+
+Root cause: NOT a code defect in the Pas port — a measurement artefact.
+`btree.c:1992..1996` (`freeSpace`) zero-fills reclaimed freeblock payload
+only when `BTS_FAST_SECURE` is set (i.e. `pBt->btsFlags & (BTS_SECURE_DELETE
+| BTS_OVERWRITE)`), and that bit is only set at open time if upstream is
+compiled with `-DSQLITE_SECURE_DELETE` or `-DSQLITE_FAST_SECURE_DELETE`
+(see `btree.c:2695..2699`).  Upstream's plain `./configure && make`
+defines neither, so the in-tree `../sqlite3/libsqlite3.so` leaves the
+freeblock bytes in place — exactly matching the Pas port's `passqlite3btree.pas:1346..1350`,
+which already gates `FillChar` on the same `BTS_FAST_SECURE` flag and
+therefore stays inert under the project's default build.
+
+The earlier audit that flagged this bucket ran `bin/TestVectorRoundTrip`
+without `LD_LIBRARY_PATH=src`, so the binary loaded
+`/lib/x86_64-linux-gnu/libsqlite3.so.0`, which on this distro IS built
+with `SECURE_DELETE` (verified via `PRAGMA compile_options`).  The system
+oracle therefore zeroed the freeblock while the project's in-tree oracle
+left the ghost intact — same code, different compile flag.  Once the
+regression harness's `LD_LIBRARY_PATH=src/` (set in
+`src/tests/run_regression.sh:15`) is honoured, both oracles produce
+identical bytes and `utf16.db` round-trips byte-for-byte.
+
+Verification: `LD_LIBRARY_PATH=src bin/TestVectorRoundTrip` reports
+`gated=9 ok=9 diverged=0 skipped=2` (utf16.db lifted from skip → OK).
+Both `cmp` on the raw `.db` blobs and the test's post-mask diff agree.
+
+Affected vector: `utf16.db` — lifted from `pas-skip` to fully gated.
+No code change required.  No collateral effect on bucket-L
+(autovacuum.db / incrvacuum.db) because those still diverge on
+page-count / ptrmap drift, not freeblock contents.
+
 _End of file._
