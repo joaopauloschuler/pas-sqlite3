@@ -1360,7 +1360,16 @@ type
     nLTerm:      u16;        { 2 bytes @ 52 }
     nSkip:       u16;        { 2 bytes @ 54 }
     nLSlot:      u16;        { 2 bytes @ 56 }
-    _pad58:      array[0..5] of u8; { 6 bytes @ 58 (pad to 64 for pointer) }
+    { 6 bytes @ 58: carved into debug-only cId/rStarDelta fields kept inside
+      pre-existing padding so SizeOf(TWhereLoop)=104 stays locked (TestWhereBasic
+      T15 + TestWhereStructs WhereLoop.aLTerm@64).  C upstream gates these by
+      SQLITE_DEBUG (cId) and WHERETRACE_ENABLED (rStarDelta) — see
+      whereInt.h:129..173.  Holding them unconditionally costs zero in non-DEBUG
+      builds (they sit in the same padding the layout already reserves). }
+    cId:         AnsiChar;   { 1 byte  @ 58 — debug-print symbolic ID }
+    _pad59:      u8;         { 1 byte  @ 59 }
+    rStarDelta:  i16;        { 2 bytes @ 60 — debug-print star cost delta (LogEst) }
+    _pad62:      u16;        { 2 bytes @ 62 (keep aLTerm 8-byte aligned) }
     aLTerm:      PPWhereTerm; { 8 bytes @ 64 }
     pNextLoop:   PWhereLoop;  { 8 bytes @ 72 }
     aLTermSpace: array[0..2] of PWhereTerm; { 24 bytes @ 80 }
@@ -3035,6 +3044,15 @@ var
 var
   sqlite3TreeTrace:  u32;
   sqlite3WhereTrace: u32;
+  {$IFDEF SQLITE_DEBUG}
+  { 10.1.42.b.8 — substitute for WhereInfo.rTotalCost (which is gated by
+    WHERETRACE_ENABLED in C upstream — whereInt.h:498..500).  Adding the
+    field to TWhereInfo would shift iTop@72 and break TestWhereStructs;
+    instead wherePathSolver stashes the chosen path's rCost here on each
+    completion and the "Solution cost=" print site reads it back.  Debug-
+    only and single-threaded by the harness (no concurrency hazard). }
+  sqlite3WhereDbgRTotalCost: i16;
+  {$ENDIF}
 
 // ---------------------------------------------------------------------------
 // Phase 6.5 public API — pragma.c
@@ -3180,6 +3198,212 @@ procedure WhereTraceLine(mask: u32; const msg: AnsiString); inline;
 begin
   if (sqlite3WhereTrace and mask) <> 0 then
     sqlite3DebugPrintf(PAnsiChar(msg + #10), []);
+end;
+
+{ ---------------------------------------------------------------------------
+  10.1.42.b.8 — WHERE-clause / where-loop / where-path debug printers.
+  1:1 port of where.c:2375..2520 (sqlite3WhereTermPrint /
+  sqlite3WhereClausePrint / sqlite3WhereLoopPrint) and where.c:5512..5519
+  (wherePathName).  Gated by SQLITE_DEBUG so non-debug builds drop the
+  whole block.
+
+  Notes on layout drift vs C:
+   * C's WhereLoop.cId / rStarDelta and WhereTerm.iTerm are SQLITE_DEBUG
+     fields.  In the Pascal port cId/rStarDelta sit in the previously
+     unused _pad58..63 region of TWhereLoop so SizeOf stays at 104
+     (TestWhereBasic T15 + TestWhereStructs lock that).  WhereTerm.iTerm
+     is *not* held — the C helper caches MAX(caller_iTerm, pTerm->iTerm)
+     so the same term keeps its highest seen ordinal across reprints,
+     but Pascal callers never reuse stale ordinals so the sticky cache
+     is purely cosmetic; we always print the caller-supplied iTerm.
+  =========================================================================== }
+
+procedure sqlite3WhereTermPrint(pTerm: PWhereTerm; iTerm: i32);
+var
+  zType: AnsiString;
+  zLeft: AnsiString;
+begin
+  if pTerm = nil then
+  begin
+    sqlite3DebugPrintf('TERM-%-3d NULL'#10, [iTerm]);
+    Exit;
+  end;
+  zType := '....';
+  if (pTerm^.wtFlags and TERM_VIRTUAL) <> 0 then zType[1] := 'V';
+  if (pTerm^.eOperator and WO_EQUIV)  <> 0 then zType[2] := 'E';
+  if ExprHasProperty(pTerm^.pExpr, EP_OuterON) then zType[3] := 'L';
+  if (pTerm^.wtFlags and TERM_CODED)  <> 0 then zType[4] := 'C';
+  if (pTerm^.eOperator and WO_SINGLE) <> 0 then
+  begin
+    Assert((pTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+    zLeft := sqlite3FormatStr('left={%d:%d}',
+               [pTerm^.leftCursor, pTerm^.u.leftColumn]);
+  end
+  else if ((pTerm^.eOperator and WO_OR) <> 0) and (pTerm^.u.pOrInfo <> nil) then
+    zLeft := sqlite3FormatStr('indexable=0x%llx',
+               [u64(pTerm^.u.pOrInfo^.indexable)])
+  else
+    zLeft := sqlite3FormatStr('left=%d', [pTerm^.leftCursor]);
+  sqlite3DebugPrintf(
+     'TERM-%-3d %p %s %-12s op=%03x wtFlags=%04x',
+     [iTerm, Pointer(pTerm), PAnsiChar(zType), PAnsiChar(zLeft),
+      pTerm^.eOperator, pTerm^.wtFlags]);
+  if (sqlite3WhereTrace and $10000) <> 0 then
+    sqlite3DebugPrintf(' prob=%-3d prereq=%llx,%llx',
+      [pTerm^.truthProb, u64(pTerm^.prereqAll), u64(pTerm^.prereqRight)]);
+  if ((pTerm^.eOperator and (WO_OR or WO_AND)) = 0)
+     and (pTerm^.u.iField <> 0) then
+    sqlite3DebugPrintf(' iField=%d', [pTerm^.u.iField]);
+  if pTerm^.iParent >= 0 then
+    sqlite3DebugPrintf(' iParent=%d', [pTerm^.iParent]);
+  sqlite3DebugPrintf(#10, []);
+  sqlite3TreeViewExpr(nil, pTerm^.pExpr, 0);
+end;
+
+{ Show the complete content of a WhereClause.  where.c:2425..2430. }
+procedure sqlite3WhereClausePrint(pWC: PWhereClause);
+var
+  i: i32;
+  pTerm: PWhereTerm;
+begin
+  for i := 0 to pWC^.nTerm - 1 do
+  begin
+    pTerm := PWhereTerm(PByte(pWC^.a) + SizeInt(i) * SizeOf(TWhereTerm));
+    sqlite3WhereTermPrint(pTerm, i);
+  end;
+end;
+
+{ Print a WhereLoop object for debugging.  where.c:2449..2511. }
+procedure sqlite3WhereLoopPrint(p: PWhereLoop; pWC: PWhereClause);
+var
+  pWInfo: PWhereInfo;
+  nb: i32;
+  pItem: PSrcItem;
+  pTab: PTable2;
+  mAll: Bitmask;
+  zName: PAnsiChar;
+  iScan: i32;
+  i: i32;
+  vbuf: AnsiString;
+begin
+  if pWC <> nil then
+  begin
+    pWInfo := pWC^.pWInfo;
+    nb := 1 + (pWInfo^.pTabList^.nSrc + 3) div 4;
+    pItem := SrcListItems(pWInfo^.pTabList);
+    Inc(pItem, p^.iTab);
+    pTab := pItem^.pSTab;
+    mAll := (Bitmask(1) shl (nb * 4)) - 1;
+    sqlite3DebugPrintf('%c%2d.%0*llx.%0*llx',
+      [p^.cId, p^.iTab, nb, u64(p^.maskSelf), nb, u64(p^.prereq and mAll)]);
+    if pItem^.zAlias <> nil then
+      sqlite3DebugPrintf(' %12s', [pItem^.zAlias])
+    else
+      sqlite3DebugPrintf(' %12s', [PAnsiChar(pTab^.zName)]);
+  end
+  else
+  begin
+    pWInfo := nil;
+    sqlite3DebugPrintf('%c%2d.%03llx.%03llx %c%d',
+      [p^.cId, p^.iTab, u64(p^.maskSelf), u64(p^.prereq and $fff),
+       p^.cId, p^.iTab]);
+  end;
+  if (p^.wsFlags and WHERE_VIRTUALTABLE) = 0 then
+  begin
+    if (p^.u.btree.pIndex <> nil)
+       and (p^.u.btree.pIndex^.zName <> nil) then
+    begin
+      zName := p^.u.btree.pIndex^.zName;
+      if (StrLComp(zName, 'sqlite_autoindex_', 17) = 0) then
+      begin
+        iScan := sqlite3Strlen30(zName) - 1;
+        while (iScan >= 0) and (zName[iScan] <> '_') do Dec(iScan);
+        Inc(zName, iScan);
+      end;
+      sqlite3DebugPrintf('.%-16s %2d', [zName, p^.u.btree.nEq]);
+    end
+    else
+      sqlite3DebugPrintf('%20s', [PAnsiChar('')]);
+  end
+  else
+  begin
+    if p^.u.vtab.idxStr <> nil then
+      vbuf := sqlite3FormatStr('(%d,"%s",%#x)',
+                [p^.u.vtab.idxNum, p^.u.vtab.idxStr, p^.u.vtab.omitMask])
+    else
+      vbuf := sqlite3FormatStr('(%d,%x)',
+                [p^.u.vtab.idxNum, p^.u.vtab.omitMask]);
+    sqlite3DebugPrintf(' %-19s', [PAnsiChar(vbuf)]);
+  end;
+  if (p^.wsFlags and WHERE_SKIPSCAN) <> 0 then
+    sqlite3DebugPrintf(' f %06x %d-%d',
+      [p^.wsFlags, p^.nLTerm, p^.nSkip])
+  else
+    sqlite3DebugPrintf(' f %06x N %d', [p^.wsFlags, p^.nLTerm]);
+  { bStarUsed lives in bitwiseFlags bit 5 (see record comment). }
+  if (pWInfo <> nil)
+     and ((pWInfo^.bitwiseFlags and (u8(1) shl 5)) <> 0)
+     and (p^.rStarDelta <> 0) then
+    sqlite3DebugPrintf(' cost %d,%d,%d delta=%d'#10,
+      [p^.rSetup, p^.rRun, p^.nOut, p^.rStarDelta])
+  else
+    sqlite3DebugPrintf(' cost %d,%d,%d'#10,
+      [p^.rSetup, p^.rRun, p^.nOut]);
+  if (p^.nLTerm <> 0) and ((sqlite3WhereTrace and $4000) <> 0) then
+  begin
+    for i := 0 to p^.nLTerm - 1 do
+      sqlite3WhereTermPrint(PPWhereTerm(p^.aLTerm)[i], i);
+  end;
+end;
+
+{ For debugging only — render a wherePath as a sequence of cId letters.
+  where.c:5512..5519.  Returns a pointer into a 65-byte static buffer
+  (single-threaded debug use only, mirroring upstream). }
+var
+  wherePathNameBuf: array[0..64] of AnsiChar;
+function wherePathName(pPath: PWherePath; nLoop: i32;
+                       pLast: PWhereLoop): PAnsiChar;
+var
+  i: i32;
+  aLoops: PPWhereLoop;
+begin
+  aLoops := pPath^.aLoop;
+  for i := 0 to nLoop - 1 do
+    wherePathNameBuf[i] := aLoops[i]^.cId;
+  if pLast <> nil then
+  begin
+    wherePathNameBuf[nLoop] := pLast^.cId;
+    Inc(nLoop);
+  end;
+  wherePathNameBuf[nLoop] := #0;
+  Result := @wherePathNameBuf[0];
+end;
+
+{ Show all WhereLoops in pWInfo, stamping each cId for stable printing.
+  where.c:6469..6488.  Used by WHERETRACE_ALL_LOOPS macro expansion. }
+procedure showAllWhereLoops(pWInfo: PWhereInfo; pWC: PWhereClause);
+const
+  zLabel: array[0..62] of AnsiChar = (
+    '0','1','2','3','4','5','6','7','8','9',
+    'a','b','c','d','e','f','g','h','i','j','k','l','m',
+    'n','o','p','q','r','s','t','u','v','w','y','x','z',
+    'A','B','C','D','E','F','G','H','I','J','K','L','M',
+    'N','O','P','Q','R','S','T','U','V','W','Y','X','Z',
+    #0);
+var
+  p: PWhereLoop;
+  i: i32;
+begin
+  if sqlite3WhereTrace = 0 then Exit;
+  p := pWInfo^.pLoops;
+  i := 0;
+  while p <> nil do
+  begin
+    p^.cId := zLabel[i mod 62];
+    sqlite3WhereLoopPrint(p, pWC);
+    p := p^.pNextLoop;
+    Inc(i);
+  end;
 end;
 {$ENDIF}
 
@@ -16394,17 +16618,16 @@ begin
         { 10.1.42.b.5 — WHERETRACE(0x400) "OR-term %d of %p has %d subterms"
           (where.c:4866..4867).  Mask 0x400 verified against sqliteInt.h:1191
           (OR optimization) and matches tasklist hint.  Per-subterm breadcrumb
-          inside the deeper OR-clause arm.
-
-          TODO 10.1.42.b.5: the companion `if (sqlite3WhereTrace & 0x20000)
-          sqlite3WhereClausePrint(sSubBuild.pWC)` at where.c:4868..4870 is
-          deferred — sqlite3WhereClausePrint is not yet ported in
-          passqlite3codegen.pas.  Mask 0x20000 (WHERE-clause dump). }
+          inside the deeper OR-clause arm.  Re-enabled in 10.1.42.b.8 once
+          sqlite3WhereClausePrint landed — the mask-0x20000 dump follows
+          immediately, matching where.c:4868..4870. }
         if (sqlite3WhereTrace and $400) <> 0 then
           sqlite3DebugPrintf('OR-term %d of %p has %d subterms:'#10,
             [i32((PtrUInt(pOrTerm) - PtrUInt(pOrWC^.a))
                   div PtrUInt(SizeOf(TWhereTerm))),
              Pointer(pTerm), sSubBuild.pWC^.nTerm]);
+        if (sqlite3WhereTrace and $20000) <> 0 then
+          sqlite3WhereClausePrint(sSubBuild.pWC);
         {$ENDIF}
         if pItem^.pSTab^.eTabType = TABTYP_VTAB then
           rc := whereLoopAddVirtual(@sSubBuild, mPrereq, mUnusable)
@@ -17261,6 +17484,10 @@ var
   bMatch:    Boolean;
   pPSel:     PSelect;
   m_:        Bitmask;
+  {$IFDEF SQLITE_DEBUG}
+  dbgRMin, dbgRFloor: i16;
+  dbgNDone, dbgNProgress: i32;
+  {$ENDIF}
 begin
   pPrs := pWInfo^.pParse;
   nLoop  := i32(pWInfo^.nLevel);
@@ -17424,6 +17651,14 @@ begin
              and ((rCost > mxCost) or ((rCost = mxCost) and (rUnsort >= mxUnsort)))
           then
           begin
+            {$IFDEF SQLITE_DEBUG}
+            { 10.1.42.b.4 — WHERETRACE(0x004) "Skip" (where.c:6033..6037).
+              Re-enabled in 10.1.42.b.8 once wherePathName landed. }
+            if (sqlite3WhereTrace and $004) <> 0 then
+              sqlite3DebugPrintf('Skip   %s cost=%-3d,%3d,%3d order=%c'#10,
+                [wherePathName(pFrom, iLoop, pWLoop), rCost, nOut, rUnsort,
+                 i32(IfThen(isOrdered >= 0, isOrdered + Ord('0'), Ord('?')))]);
+            {$ENDIF}
             { Candidate is no better than the existing mxChoice paths. }
             pWLoop := pWLoop^.pNextLoop;
             Continue;
@@ -17436,6 +17671,13 @@ begin
           else
             jj := mxI;
           pTo := @aTo[jj];
+          {$IFDEF SQLITE_DEBUG}
+          { 10.1.42.b.4 — WHERETRACE(0x004) "New" (where.c:6052..6056). }
+          if (sqlite3WhereTrace and $004) <> 0 then
+            sqlite3DebugPrintf('New    %s cost=%-3d,%3d,%3d order=%c'#10,
+              [wherePathName(pFrom, iLoop, pWLoop), rCost, nOut, rUnsort,
+               i32(IfThen(isOrdered >= 0, isOrdered + Ord('0'), Ord('?')))]);
+          {$ENDIF}
         end
         else
         begin
@@ -17450,9 +17692,39 @@ begin
                  and (whereLoopIsNoBetter(pWLoop, pTo^.aLoop[iLoop]) <> 0))
           then
           begin
+            {$IFDEF SQLITE_DEBUG}
+            { 10.1.42.b.4 — WHERETRACE(0x004) "Skip ... vs"
+              (where.c:6074..6082). }
+            if (sqlite3WhereTrace and $004) <> 0 then
+            begin
+              sqlite3DebugPrintf('Skip   %s cost=%-3d,%3d,%3d order=%c',
+                [wherePathName(pFrom, iLoop, pWLoop), rCost, nOut, rUnsort,
+                 i32(IfThen(isOrdered >= 0, isOrdered + Ord('0'), Ord('?')))]);
+              sqlite3DebugPrintf('   vs %s cost=%-3d,%3d,%3d order=%c'#10,
+                [wherePathName(pTo, iLoop + 1, nil),
+                 pTo^.rCost, pTo^.nRow, pTo^.rUnsort,
+                 i32(IfThen(pTo^.isOrdered >= 0,
+                            pTo^.isOrdered + Ord('0'), Ord('?')))]);
+            end;
+            {$ENDIF}
             pWLoop := pWLoop^.pNextLoop;
             Continue;
           end;
+          {$IFDEF SQLITE_DEBUG}
+          { 10.1.42.b.4 — WHERETRACE(0x004) "Update ... was"
+            (where.c:6092..6100). }
+          if (sqlite3WhereTrace and $004) <> 0 then
+          begin
+            sqlite3DebugPrintf('Update %s cost=%-3d,%3d,%3d order=%c',
+              [wherePathName(pFrom, iLoop, pWLoop), rCost, nOut, rUnsort,
+               i32(IfThen(isOrdered >= 0, isOrdered + Ord('0'), Ord('?')))]);
+            sqlite3DebugPrintf('  was %s cost=%-3d,%3d,%3d order=%c'#10,
+              [wherePathName(pTo, iLoop + 1, nil),
+               pTo^.rCost, pTo^.nRow, pTo^.rUnsort,
+               i32(IfThen(pTo^.isOrdered >= 0,
+                          pTo^.isOrdered + Ord('0'), Ord('?')))]);
+          end;
+          {$ENDIF}
         end;
 
         { pWLoop is a winner — install it into pTo. }
@@ -17492,10 +17764,47 @@ begin
       Inc(pFrom);
     end;
 
-    { TODO 10.1.42.b.4: WHERETRACE(0x004) Skip/New/Update/vs candidate prints
-      (where.c:6032..6101) and WHERETRACE(0x002) "---- after round %d" summary
-      (where.c:6129..6157) both depend on wherePathName(), which is not yet
-      ported in passqlite3codegen.pas.  Defer until wherePathName lands. }
+    {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.b.4 — WHERETRACE(0x002) "---- after round %d" summary
+      (where.c:6129..6157).  Re-enabled in 10.1.42.b.8 once wherePathName
+      landed.  Prints the candidate paths surviving the current round in
+      ascending-rCost waves until every path has been emitted. }
+    if (sqlite3WhereTrace and $02) <> 0 then
+    begin
+      sqlite3DebugPrintf('---- after round %d ----'#10, [iLoop]);
+      dbgRFloor := 0;
+      dbgNDone := 0;
+      repeat
+        dbgNProgress := 0;
+        dbgRMin := i16($7fff);
+        for ii := 0 to nTo - 1 do
+        begin
+          pTo := @aTo[ii];
+          if (pTo^.rCost > dbgRFloor) and (pTo^.rCost < dbgRMin) then
+            dbgRMin := pTo^.rCost;
+        end;
+        for ii := 0 to nTo - 1 do
+        begin
+          pTo := @aTo[ii];
+          if pTo^.rCost = dbgRMin then
+          begin
+            sqlite3DebugPrintf(' %s cost=%-3d nrow=%-3d order=%c',
+              [wherePathName(pTo, iLoop + 1, nil),
+               pTo^.rCost, pTo^.nRow,
+               i32(IfThen(pTo^.isOrdered >= 0,
+                          pTo^.isOrdered + Ord('0'), Ord('?')))]);
+            if pTo^.isOrdered > 0 then
+              sqlite3DebugPrintf(' rev=0x%llx'#10, [u64(pTo^.revLoop)])
+            else
+              sqlite3DebugPrintf(#10, []);
+            Inc(dbgNDone);
+            Inc(dbgNProgress);
+          end;
+        end;
+        dbgRFloor := dbgRMin;
+      until (dbgNDone >= nTo) or (dbgNProgress = 0);
+    end;
+    {$ENDIF}
 
     { Swap aFrom and aTo for next generation. }
     pSwap := aTo;
@@ -17603,6 +17912,11 @@ begin
   end;
 
   pWInfo^.nRowOut := pFrom^.nRow;
+  {$IFDEF SQLITE_DEBUG}
+  { where.c:6251 — pWInfo->rTotalCost = pFrom->rCost.  Pascal stashes the
+    LogEst into the unit-level shadow described at sqlite3WhereDbgRTotalCost. }
+  sqlite3WhereDbgRTotalCost := pFrom^.rCost;
+  {$ENDIF}
 
   sqlite3DbFree(pPrs^.db, pSpace);
   Result := SQLITE_OK;
@@ -18417,6 +18731,13 @@ begin
       pWInfo^.eDistinct := WHERE_DISTINCT_UNIQUE;
     if scan.iEquiv > 1 then
       pLoop^.wsFlags := pLoop^.wsFlags or WHERE_TRANSCONS;
+    {$IFDEF SQLITE_DEBUG}
+    { where.c:6429..6431 — short-cut path stamps cId='0' so subsequent
+      sqlite3WhereLoopPrint output is well-defined.  Kept inside the
+      shortcut success branch (Exit(1) below); WHERETRACE(0x02) message
+      moved into sqlite3WhereBegin once helpers are available. }
+    pLoop^.cId := '0';
+    {$ENDIF}
     Exit(1);
   end;
 
@@ -19166,6 +19487,10 @@ begin
   sWLB.pNew   := PWhereLoop(PByte(pWInfo) + nByteWInfo);
   Assert((PtrUInt(sWLB.pNew) and 7) = 0); { EIGHT_BYTE_ALIGNMENT }
   whereLoopInit(sWLB.pNew);
+  {$IFDEF SQLITE_DEBUG}
+  { where.c:6932..6934 — template-loop debug symbol. }
+  sWLB.pNew^.cId := '*';
+  {$ENDIF}
 
   { Split the WHERE clause into separate AND-connected subexpressions
     (where.c:6936..6937). }
@@ -19332,6 +19657,14 @@ begin
       Exit(nil);
     end;
 
+    {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.b.8 — WHERETRACE_ALL_LOOPS (where.c:7103, expanded from
+      sqliteInt.h:1188 macro to showAllWhereLoops in DEBUG builds).
+      Stamps p^.cId for stable subsequent prints and dumps every candidate
+      WhereLoop.  Compiled out without SQLITE_DEBUG. }
+    showAllWhereLoops(pWInfo, sWLB.pWC);
+    {$ENDIF}
+
     { where.c:7105 — choose the best join order. }
     rc := wherePathSolver(pWInfo, 0);
     if db^.mallocFailed <> 0 then
@@ -19376,6 +19709,29 @@ begin
       Exit(nil);
     end;
 
+    {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.b.6 — WHERETRACE "---- Solution cost=%d, nRow=%d ..." summary
+      (where.c:7132..7157).  Re-enabled in 10.1.42.b.8 once
+      sqlite3WhereLoopPrint landed.  Mask is "any-trace" (sqlite3WhereTrace!=0)
+      to mirror upstream. }
+    if sqlite3WhereTrace <> 0 then
+    begin
+      sqlite3DebugPrintf('---- Solution cost=%d, nRow=%d',
+        [sqlite3WhereDbgRTotalCost, pWInfo^.nRowOut]);
+      if pWInfo^.nOBSat > 0 then
+        sqlite3DebugPrintf(' ORDERBY=%d,0x%llx',
+          [pWInfo^.nOBSat, u64(pWInfo^.revMask)]);
+      case pWInfo^.eDistinct of
+        WHERE_DISTINCT_UNIQUE:    sqlite3DebugPrintf('  DISTINCT=unique', []);
+        WHERE_DISTINCT_ORDERED:   sqlite3DebugPrintf('  DISTINCT=ordered', []);
+        WHERE_DISTINCT_UNORDERED: sqlite3DebugPrintf('  DISTINCT=unordered', []);
+      end;
+      sqlite3DebugPrintf(#10, []);
+      for ii := 0 to pWInfo^.nLevel - 1 do
+        sqlite3WhereLoopPrint(whereInfoLevels(pWInfo)[ii].pWLoop, sWLB.pWC);
+    end;
+    {$ENDIF}
+
     { where.c:7184..7188 — Bloom-filter eligibility pass.  Only meaningful
       for joins of 2+ tables and only when the optimisation is enabled.
       Sets WHERE_BLOOMFILTER on inner EQ-search loops whose target table is
@@ -19387,18 +19743,16 @@ begin
       whereCheckIfBloomFilterIsUseful(pWInfo);
 
     {$IFDEF SQLITE_DEBUG}
+    { 10.1.42.b.6 — WHERETRACE(0x4000) "---- WHERE clause at end of analysis:"
+      + sqlite3WhereClausePrint dump (where.c:7190..7194).  Re-enabled in
+      10.1.42.b.8. }
+    if (sqlite3WhereTrace and $4000) <> 0 then
+    begin
+      sqlite3DebugPrintf('---- WHERE clause at end of analysis:'#10, []);
+      sqlite3WhereClausePrint(sWLB.pWC);
+    end;
     { 10.1.42.b.6 — WHERETRACE(0xffffffff) "*** Optimizer Finished ***"
-      (where.c:7195).  Mask 0xffffffff (any-trace) verified against
-      where.c:7195 — tasklist hint said 0x1; the actual upstream literal
-      is 0xffffffff (matched by `if sqlite3WhereTrace <> 0`).
-
-      TODO 10.1.42.b.6: the immediately-preceding "---- Solution cost=%d,
-      nRow=%d ... DISTINCT=..." summary block at where.c:7132..7157 and
-      the mask-0x4000 "---- WHERE clause at end of analysis:" dump at
-      where.c:7190..7194 both depend on host helpers
-      (sqlite3WhereLoopPrint, sqlite3WhereClausePrint) that are not yet
-      ported in passqlite3codegen.pas.  Defer those two until the
-      printers land. }
+      (where.c:7195). }
     if sqlite3WhereTrace <> 0 then
       sqlite3DebugPrintf('*** Optimizer Finished ***'#10, []);
     {$ENDIF}

@@ -676,17 +676,17 @@ partial landings cannot silently no-op.
       port.  Will fold them in once the STAT4 family is ported.
     - [X] **10.1.42.b.2** Subset-cost adjustment in `whereLoopAdjustCost` (mask 0x80, where.c:2711/2720) + 4 covering-index decision arms in `whereLoopAddBtree` (mask 0x200, where.c:4203/4210/4216/4224).
     - [X] **10.1.42.b.3** Virtual-table constraint enumeration — 5 arms in `whereLoopAddVirtual` (mask 0x800, where.c:4720..4794) + 2 in `whereLoopAddVirtualOne` (mask 0xffffffff, where.c:4416/4531).
-    - [~] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
+    - [X] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
       `wherePathSolver` (mask **0x002 / 0x004**, NOT 0x80 — verified against
       sqliteInt.h:1181 / where.c:5857 / :5988 / :6032 / :6129).  Landed the
       two mask-0x002 arms: "---- begin solver" (where.c:5857) and the
       sort-cost increase line (where.c:5988..5991).  The four mask-0x004
       candidate prints (Skip / New / Update / `vs`) at where.c:6032..6101
       and the mask-0x002 "---- after round %d" summary at where.c:6129
-      are deferred behind a `TODO 10.1.42.b.4` marker in
+      were deferred behind a `TODO 10.1.42.b.4` marker in
       passqlite3codegen.pas — they consume `wherePathName(WherePath*,iLoop,
-      WhereLoop*)` which is not yet ported.  Land once wherePathName drops.
-    - [~] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
+      WhereLoop*)`.  Re-enabled in 10.1.42.b.8 once wherePathName landed.
+    - [X] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
       in `whereLoopAddOr` (mask **0x400** verified, matches tasklist hint
       and sqliteInt.h:1191 — OR optimization).  Landed the per-subterm
       breadcrumb at where.c:4866..4867: `"OR-term %d of %p has %d
@@ -698,10 +698,10 @@ partial landings cannot silently no-op.
       index 0x400 arms exist in this function.  The 0x40 (IN-operator)
       and 0x80 (cost-adjustment) arms live in `whereLoopAddBtreeIndex`,
       not `whereLoopAddOr`, and are tracked separately under earlier
-      10.1.42.b sub-tasks.  Also deferred behind a `TODO 10.1.42.b.5`
-      marker: the companion mask-0x20000 sub-arm `sqlite3WhereClausePrint
-      (sSubBuild.pWC)` at where.c:4868..4870 — host helper not yet ported.
-    - [~] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
+      10.1.42.b sub-tasks.  The companion mask-0x20000 sub-arm
+      `sqlite3WhereClausePrint(sSubBuild.pWC)` at where.c:4868..4870 was
+      re-enabled in 10.1.42.b.8 once the host helper landed.
+    - [X] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
       trailing WHERETRACE in `sqlite3WhereBegin` epilogue.  Mask divergence
       vs tasklist hint: tasklist suggested 0x1 (code generation per
       sqliteInt.h:1180); the actual upstream literals are
@@ -712,12 +712,9 @@ partial landings cannot silently no-op.
       block also carries the `nRowOut -= 30` body that the WHERETRACE
       bracket calls out (tag-20250414a).  Build green pre/post both
       ways: -30 nRowOut shift does not change any TestExplainParity or
-      TestWhereCorpus row.  Deferred behind `TODO 10.1.42.b.6`:
-        * "---- Solution cost=%d, nRow=%d ... DISTINCT=..." summary
-          block at where.c:7132..7157 (consumes sqlite3WhereLoopPrint).
-        * mask-0x4000 "---- WHERE clause at end of analysis:" dump at
-          where.c:7190..7194 (consumes sqlite3WhereClausePrint).
-      Land both once their host printers drop.
+      TestWhereCorpus row.  The two trailing arms (Solution cost / WHERE
+      clause at end of analysis) were re-enabled in 10.1.42.b.8 once
+      sqlite3WhereLoopPrint + sqlite3WhereClausePrint landed.
     - [ ] **10.1.42.b.7** Port the STAT4 cost-estimator helpers that
       gate the 4 deferred 10.1.42.b.1 arms: `whereRangeSkipScanEst`
       (where.c:2036), `whereEqualScanEst` (:2215 / :2313),
@@ -726,16 +723,36 @@ partial landings cannot silently no-op.
       against whereInt.h, NOT 0x10 as tasklist initially suggested).
       Treat as 3 independent micro-tasks; drop the WHERETRACE call at
       each host function as it lands.
-    - [ ] **10.1.42.b.8** Port the WHERE-clause / where-loop / path
-      debug-printer helpers that gate ~7 deferred WHERETRACE arms
-      across 10.1.42.b.4/5/6: `wherePathName` (where.c — grep for the
-      definition, prints `wherePath` letters), `sqlite3WhereLoopPrint`
-      (where.c), `sqlite3WhereClausePrint` (where.c).  All three are
-      `#ifdef WHERETRACE_ENABLED` helpers in C.  Port under
-      `{$IFDEF SQLITE_DEBUG}` into passqlite3codegen.pas.  High
-      leverage: lands `Skip/New/Update/vs` rows in solver progress,
-      `Solution cost=` summary, `OR-term sub-WHERE-clause` print,
-      `WHERE clause at end of analysis` print.
+    - [X] **10.1.42.b.8** Ported `wherePathName`, `sqlite3WhereTermPrint`,
+      `sqlite3WhereClausePrint`, `sqlite3WhereLoopPrint`, and the helper
+      `showAllWhereLoops` from where.c:2375..2520 / 5512..5519 / 6469..6488
+      into passqlite3codegen.pas under `{$IFDEF SQLITE_DEBUG}`.  Added
+      debug-only `cId` + `rStarDelta` fields to TWhereLoop (carved from the
+      pre-existing _pad58..63 region so SizeOf stays at 104 — TestWhereBasic
+      T15 + TestWhereStructs WhereLoop.aLTerm@64 untouched).  Stamped cId
+      in whereShortCut (where.c:6430), the template-loop init
+      (where.c:6933) and showAllWhereLoops (where.c:6480), and seeded an
+      `sqlite3WhereDbgRTotalCost` unit shadow (TWhereInfo.rTotalCost is
+      WHERETRACE-only in C and adding the field would shift TWhereInfo
+      offsets).  Re-enabled the seven deferred WHERETRACE arms:
+        * mask-0x004 Skip / New / Update / Skip-vs / Update-was prints in
+          wherePathSolver (where.c:6032..6101) — closes 10.1.42.b.4.
+        * mask-0x002 "---- after round %d" summary
+          (where.c:6129..6157) — closes 10.1.42.b.4.
+        * mask-0x20000 `sqlite3WhereClausePrint(sSubBuild.pWC)` inside
+          whereLoopAddOr (where.c:4868..4870) — closes 10.1.42.b.5.
+        * mask-any "---- Solution cost=%d, nRow=%d ... DISTINCT=..."
+          summary block + per-level WhereLoopPrint
+          (where.c:7132..7157) — closes 10.1.42.b.6.
+        * mask-0x4000 "---- WHERE clause at end of analysis:" dump
+          (where.c:7190..7194) — closes 10.1.42.b.6.
+        * WHERETRACE_ALL_LOOPS macro expansion after whereLoopAddAll
+          (where.c:7103) — fresh helper landed.
+      Build green both ways (default + SQLITE_DEBUG=1, 5177 assertions).
+      Smoke test under SQLITE_DEBUG with `WhereTrace=0x0FFFF` on a
+      2-table EQ-join shape produced the expected Skip/New/Update/vs
+      progression and matched the C oracle's format (verified by hand
+      against the WHERETRACE_ENABLED build of /tmp/where_c_smoke).
     - [X] **10.1.42.a.6.1** Ported `havingToWhere` + `havingToWhereExprCb` (select.c:7047) with prerequisite `sqlite3ExprIsConstantOrGroupBy` pair; wired in SF_Aggregate+GROUP-BY path (select.c:8422..8431). 0x100 TREETRACE arm at tail.
     - [X] **10.1.42.a.6.2** Ported `countOfViewOptimization` (select.c:7128..7204); wired after propagateConstants (select.c:7924..7930). 0x200 TREETRACE arm. SQLITE_CountOfView constant added.
     - [X] **10.1.42.a.6.3** Ported `optimizeAggregateUseOfIndexedExpr` (select.c:6549..6586); wired between sqlite3WhereBegin and assignAggregateRegisters (select.c:8527..8529, gated on pParse^.pIdxEpr). 0x20 TREETRACE arm.
