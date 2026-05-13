@@ -265,11 +265,30 @@ regressions without human triage.
     `bin/TestVectorRoundTrip` both byte-identical on withoutrowid.db
     (130 / 8192 bytes).  Schema-change still pas-skips on bucket-D
     (adjacent CREATE INDEX byte divergence, unrelated codegen).
-  - [ ] **9.2.divbug.I** Round-trip mutator produces byte-different
-    `.db` blob — leaf-cell area divergence (3 sites: wal/multipage/
-    generated-column).  Likely surface: cell-packing / freeblock /
-    freelist ordering mismatch.  C ref:
-    `../sqlite3/src/btree.c dropCell / insertCell / allocateSpace`.
+  - [X] **9.2.divbug.I** Round-trip mutator produces byte-different
+    `.db` blob — leaf-cell area divergence (4 sites: wal / multipage /
+    generated-column / triggers).  Root cause was TWO bugs masquerading
+    as cell-packing drift:
+    (1) Generated-column STORED expressions referencing the IPK column
+    (`d INTEGER AS (a*b) STORED` where `a` is INTEGER PRIMARY KEY) read
+    from the SoftNull'd row-storage slot for `a` instead of the rowid
+    register, so `d` persisted NULL.  C's resolve.c lookupName maps
+    iPKey column refs to iColumn=-1; the Pascal resolver leaves the
+    raw column index in place.  Fixed by extending the iSelfTab<0 arm
+    in codegen.pas:5689 to alias `iColumn == y.pTab^.iPKey` to the
+    rowid register (same slot the existing iColumn<0 case already
+    returns).  Faithful surface for expr.c:5026..5074.
+    (2) printf('%.*c', N, 'X') in both `sqlite3VXPrintf` and the
+    `printfFunc` scalar ignored precision and emitted one character.
+    C's printf.c:769..790 etCHARX arm treats precision >1 as a repeat
+    count.  WAL / multipage / triggers mutators build 1000-byte rows
+    via `printf('%.*c',1000,...)`; without the repeat fix Pas stored
+    1-byte rows and the cell-content area diverged by 1000+ bytes
+    per page.  Fixed in printf.pas:1255 and codegen.pas:50334.
+    All four vectors now round-trip byte-identical against upstream
+    `../sqlite3/sqlite3` (the same libsqlite3.so the probe links
+    against).  `bin/TestVectorRoundTrip` gated=5 ok=5 diverged=0;
+    RO probe gated=5 ok=5; schema-change probe gated=4 ok=4.
   - [X] **9.2.divbug.J** Round-trip mutator on triggers.db crashes
     with EAccessViolation when the BEFORE/AFTER row triggers fire.
     FIXED: `sqlite3VdbeClearObject` released `aMem`/`aVar`/`pVList`/`pFree`

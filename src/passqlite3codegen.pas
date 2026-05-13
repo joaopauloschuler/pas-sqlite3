@@ -5686,8 +5686,18 @@ begin
           else if (pExpr^.iTable < 0) and (pParse^.iSelfTab < 0)
                   and (pExpr^.y.pTab <> nil) then
           begin
-            { iCol = -1 → rowid, return the register just below the row block. }
-            if pExpr^.iColumn < 0 then begin
+            { iCol = -1 → rowid, return the register just below the row block.
+              IPK column references also alias to the rowid register: in the
+              row-unpacked block the IPK slot is SoftNull'd (insert.c
+              xferOptimization / sqlite3GenerateConstraintChecks) so the real
+              integer value lives in the rowid register below the block.
+              9.2.divbug.I — generated-column STORED expressions like
+              `(a*b)` where a is INTEGER PRIMARY KEY were reading the
+              NULL'd IPK slot instead of the rowid register and persisting
+              NULL into column d. }
+            if (pExpr^.iColumn < 0)
+               or ((pExpr^.iColumn >= 0)
+                   and (i32(pExpr^.y.pTab^.iPKey) = i32(pExpr^.iColumn))) then begin
               Result := -1 - pParse^.iSelfTab;
               done := True;
             end else begin
@@ -50324,20 +50334,30 @@ begin
       'c': begin
         { %c — first UTF-8 character of textified arg per printf.c:752..761
           (bArgList branch).  Function-call printf walks PrintfArguments,
-          which always takes the etCHARX branch through getTextArg. }
+          which always takes the etCHARX branch through getTextArg.
+          9.2.divbug.I — precision >1 acts as a repeat count (printf.c:769..790),
+          so printf('%.*c', 1000, 'A') yields 1000 A's.  Without this the
+          WAL / multipage / triggers vectors (which build 1000-byte rows
+          via printf('%.*c',1000,...)) stored 1-byte rows and the
+          round-trip mutator probe diverged by ~4000 bytes per page. }
         Inc(p);
+        s := '';
         if pVal <> nil then begin
           zStr := sqlite3_value_text(Psqlite3_value(pVal));
           if (zStr <> nil) and (zStr^ <> #0) then begin
-            result_ := result_ + zStr^;
+            s := s + zStr^;
             if (Byte(zStr^) and $C0) = $C0 then begin
               Inc(zStr); i := 1;
               while (i < 4) and ((Byte(zStr^) and $C0) = $80) do begin
-                result_ := result_ + zStr^; Inc(zStr); Inc(i);
+                s := s + zStr^; Inc(zStr); Inc(i);
               end;
             end;
           end;
         end;
+        if metaHavePrec and (metaPrec > 1) and (Length(s) > 0) then begin
+          for i := 1 to metaPrec do result_ := result_ + s;
+        end else
+          result_ := result_ + s;
       end;
       'q': begin
         { %q — double internal single-quotes; do NOT add outer quotes.
