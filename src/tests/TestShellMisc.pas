@@ -38,49 +38,12 @@ program TestShellMisc;
 
 uses
   SysUtils, BaseUnix, Unix,
-  passqlite3types, passqlite3util;
+  passqlite3types, passqlite3util,
+  TestShellCommon;
 
 var
   failCount: i32 = 0;
   passCount: i32 = 0;
-
-function readAll(const path: AnsiString): AnsiString;
-var
-  f: file of Byte;
-  n: SizeInt;
-  buf: array[0..4095] of Byte;
-  i: SizeInt;
-begin
-  Result := '';
-  AssignFile(f, path); {$I-} Reset(f); {$I+}
-  if IOResult <> 0 then Exit;
-  while not Eof(f) do begin
-    BlockRead(f, buf[0], SizeOf(buf), n);
-    if n <= 0 then Break;
-    i := Length(Result);
-    SetLength(Result, i + n);
-    Move(buf[0], Result[i + 1], n);
-  end;
-  CloseFile(f);
-end;
-
-function findUpstreamSqlite3: AnsiString;
-var
-  z: AnsiString;
-  candidates: array[0..3] of AnsiString;
-  i: SizeInt;
-begin
-  z := GetEnvironmentVariable('UPSTREAM_SQLITE3');
-  if (z <> '') and FileExists(z) then begin Result := z; Exit; end;
-  candidates[0] := '/home/bpsa/app/sqlite3/sqlite3';
-  candidates[1] := ExtractFilePath(ExpandFileName(ParamStr(0))) +
-                   '../../sqlite3/sqlite3';
-  candidates[2] := '/usr/local/bin/sqlite3';
-  candidates[3] := '/usr/bin/sqlite3';
-  for i := 0 to High(candidates) do
-    if FileExists(candidates[i]) then begin Result := candidates[i]; Exit; end;
-  Result := '';
-end;
 
 var
   upstream: AnsiString;
@@ -130,8 +93,8 @@ begin
          '" >"' + actOut + '" 2>&1';
   rcAct := fpsystem(cmd);
 
-  eOut := readAll(expOut);
-  aOut := readAll(actOut);
+  eOut := ShellReadAll(expOut);
+  aOut := ShellReadAll(actOut);
   ok := (rcExp = rcAct) and (eOut = aOut);
   if ok then begin
     WriteLn('PASS    ', name, ' (rc=', rcAct,
@@ -277,7 +240,7 @@ begin
 end;
 
 begin
-  upstream := findUpstreamSqlite3;
+  upstream := FindUpstreamSqlite3;
   InitPaths;
   if upstream = '' then begin
     WriteLn('SKIP    crnl/binary/connection/unmodule/vfs*: ',

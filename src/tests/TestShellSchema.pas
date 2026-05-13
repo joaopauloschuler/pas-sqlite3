@@ -27,94 +27,16 @@ program TestShellSchema;
 
 uses
   SysUtils, BaseUnix, Unix,
-  passqlite3types, passqlite3util;
+  passqlite3types, passqlite3util,
+  TestShellCommon;
 
 var
   failCount: i32 = 0;
   passCount: i32 = 0;
 
-function readAll(const path: AnsiString): AnsiString;
-var
-  f: file of Byte;
-  n: SizeInt;
-  buf: array[0..4095] of Byte;
-  i: SizeInt;
-begin
-  Result := '';
-  AssignFile(f, path); {$I-} Reset(f); {$I+}
-  if IOResult <> 0 then Exit;
-  while not Eof(f) do begin
-    BlockRead(f, buf[0], SizeOf(buf), n);
-    if n <= 0 then Break;
-    i := Length(Result);
-    SetLength(Result, i + n);
-    Move(buf[0], Result[i + 1], n);
-  end;
-  CloseFile(f);
-end;
-
-function findUpstreamSqlite3: AnsiString;
-var
-  z: AnsiString;
-  candidates: array[0..3] of AnsiString;
-  i: SizeInt;
-begin
-  z := GetEnvironmentVariable('UPSTREAM_SQLITE3');
-  if (z <> '') and FileExists(z) then begin Result := z; Exit; end;
-  candidates[0] := '/home/bpsa/app/sqlite3/sqlite3';
-  candidates[1] := ExtractFilePath(ExpandFileName(ParamStr(0))) +
-                   '../../sqlite3/sqlite3';
-  candidates[2] := '/usr/local/bin/sqlite3';
-  candidates[3] := '/usr/bin/sqlite3';
-  for i := 0 to High(candidates) do
-    if FileExists(candidates[i]) then begin Result := candidates[i]; Exit; end;
-  Result := '';
-end;
-
 procedure DiffCase(const name, sql: AnsiString; upstream: AnsiString);
-var
-  sqlPath, expPath, actPath, cmd, exeDir, binPath, libDir: AnsiString;
-  f: TextFile;
-  rcExp, rcAct: i32;
-  expBody, actBody: AnsiString;
 begin
-  sqlPath := SysUtils.GetTempDir(False) + 'pas_schema_in_'  +
-             IntToStr(GetProcessID) + '.sql';
-  expPath := SysUtils.GetTempDir(False) + 'pas_schema_exp_' +
-             IntToStr(GetProcessID) + '.txt';
-  actPath := SysUtils.GetTempDir(False) + 'pas_schema_act_' +
-             IntToStr(GetProcessID) + '.txt';
-  AssignFile(f, sqlPath); Rewrite(f); Write(f, sql); CloseFile(f);
-
-  exeDir  := ExtractFilePath(ExpandFileName(ParamStr(0)));
-  binPath := exeDir + 'passqlite3';
-  libDir  := ExtractFilePath(ExcludeTrailingPathDelimiter(exeDir)) + 'src';
-
-  cmd := '"' + upstream + '" :memory: <"' + sqlPath +
-         '" >"' + expPath + '" 2>&1';
-  rcExp := fpsystem(cmd);
-
-  cmd := 'LD_LIBRARY_PATH="' + libDir + '" "' + binPath +
-         '" :memory: <"' + sqlPath + '" >"' + actPath + '" 2>&1';
-  rcAct := fpsystem(cmd);
-
-  expBody := readAll(expPath);
-  actBody := readAll(actPath);
-  SysUtils.DeleteFile(sqlPath);
-  SysUtils.DeleteFile(expPath);
-  SysUtils.DeleteFile(actPath);
-
-  if (rcExp = rcAct) and (expBody = actBody) then begin
-    WriteLn('PASS    ', name, ' (rc=', rcAct, ')');
-    Inc(passCount);
-  end else begin
-    WriteLn('FAIL    ', name, ' (rcExp=', rcExp, ' rcAct=', rcAct, ')');
-    WriteLn('  expected (', Length(expBody), ' bytes):');
-    WriteLn('  |', expBody, '|');
-    WriteLn('  actual   (', Length(actBody), ' bytes):');
-    WriteLn('  |', actBody, '|');
-    Inc(failCount);
-  end;
+  ShellDiffCase('pas_schema_', name, sql, upstream, passCount, failCount);
 end;
 
 const
@@ -214,7 +136,7 @@ var
   upstream: AnsiString;
 
 begin
-  upstream := findUpstreamSqlite3;
+  upstream := FindUpstreamSqlite3;
   if upstream = '' then begin
     WriteLn('SKIP    TestShellSchema: no upstream sqlite3 binary found');
     WriteLn('        Set UPSTREAM_SQLITE3=/path/to/sqlite3 to enable.');

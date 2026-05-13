@@ -32,60 +32,13 @@ program TestShellIO;
 
 uses
   SysUtils, BaseUnix, Unix,
-  passqlite3types, passqlite3util;
+  passqlite3types, passqlite3util,
+  TestShellCommon;
 
 var
   failCount: i32 = 0;
   passCount: i32 = 0;
   skipCount: i32 = 0;
-
-function readAll(const path: AnsiString): AnsiString;
-var
-  f: file of Byte;
-  n: SizeInt;
-  buf: array[0..4095] of Byte;
-  i: SizeInt;
-begin
-  Result := '';
-  AssignFile(f, path); {$I-} Reset(f); {$I+}
-  if IOResult <> 0 then Exit;
-  while not Eof(f) do begin
-    BlockRead(f, buf[0], SizeOf(buf), n);
-    if n <= 0 then Break;
-    i := Length(Result);
-    SetLength(Result, i + n);
-    Move(buf[0], Result[i + 1], n);
-  end;
-  CloseFile(f);
-end;
-
-procedure writeFileBytes(const path, body: AnsiString);
-var
-  f: file of Byte;
-begin
-  AssignFile(f, path); Rewrite(f);
-  if Length(body) > 0 then
-    BlockWrite(f, body[1], Length(body));
-  CloseFile(f);
-end;
-
-function findUpstreamSqlite3: AnsiString;
-var
-  z: AnsiString;
-  candidates: array[0..3] of AnsiString;
-  i: SizeInt;
-begin
-  z := GetEnvironmentVariable('UPSTREAM_SQLITE3');
-  if (z <> '') and FileExists(z) then begin Result := z; Exit; end;
-  candidates[0] := '/home/bpsa/app/sqlite3/sqlite3';
-  candidates[1] := ExtractFilePath(ExpandFileName(ParamStr(0))) +
-                   '../../sqlite3/sqlite3';
-  candidates[2] := '/usr/local/bin/sqlite3';
-  candidates[3] := '/usr/bin/sqlite3';
-  for i := 0 to High(candidates) do
-    if FileExists(candidates[i]) then begin Result := candidates[i]; Exit; end;
-  Result := '';
-end;
 
 var
   upstream: AnsiString;
@@ -130,7 +83,7 @@ begin
   actFile := workDir + '/' + name + '.act.bin';
   hasFile := persistedPath <> '';
 
-  writeFileBytes(sqlPath, script);
+  ShellWriteFileBytes(sqlPath, script);
 
   if freshFiles <> '' then fpsystem(freshFiles);
   cmd := '"' + upstream + '" ' + argTail +
@@ -146,11 +99,11 @@ begin
   if hasFile and FileExists(persistedPath) then
     fpsystem('cp "' + persistedPath + '" "' + actFile + '"');
 
-  eOut := readAll(expOut);
-  aOut := readAll(actOut);
+  eOut := ShellReadAll(expOut);
+  aOut := ShellReadAll(actOut);
   if hasFile then begin
-    eFile := readAll(expFile);
-    aFile := readAll(actFile);
+    eFile := ShellReadAll(expFile);
+    aFile := ShellReadAll(actFile);
   end else begin
     eFile := ''; aFile := '';
   end;
@@ -178,7 +131,7 @@ end;
 
 procedure WriteCsvFile(const path: AnsiString);
 begin
-  writeFileBytes(path,
+  ShellWriteFileBytes(path,
     '1,foo'#10 +
     '2,bar'#10 +
     '3,baz'#10);
@@ -187,7 +140,7 @@ end;
 procedure WriteAsciiFile(const path: AnsiString);
 begin
   { ascii mode: 0x1F = field sep, 0x1E = row sep }
-  writeFileBytes(path,
+  ShellWriteFileBytes(path,
     '1'#$1F'foo'#$1E +
     '2'#$1F'bar'#$1E +
     '3'#$1F'baz'#$1E);
@@ -195,7 +148,7 @@ end;
 
 procedure WriteSqlFile(const path: AnsiString);
 begin
-  writeFileBytes(path,
+  ShellWriteFileBytes(path,
     'CREATE TABLE r(x);'#10 +
     'INSERT INTO r VALUES(42);'#10 +
     'INSERT INTO r VALUES(43);'#10 +
@@ -224,7 +177,7 @@ begin
   Result := False;
   if fpsystem('command -v zip >/dev/null 2>&1') <> 0 then Exit;
   entry := workDir + '/zentry.txt';
-  writeFileBytes(entry, 'hello-zip'#10);
+  ShellWriteFileBytes(entry, 'hello-zip'#10);
   fpsystem('rm -f "' + zipPath + '"');
   cmd := '(cd "' + workDir + '" && zip -q "' + zipPath + '" zentry.txt)';
   rc := fpsystem(cmd);
@@ -242,7 +195,7 @@ begin
   BuildSeedDb(seedDb);
   cmd := '"' + upstream + '" "' + seedDb + '" .dbtotxt >"' + dumpPath + '"';
   fpsystem(cmd);
-  Result := readAll(dumpPath);
+  Result := ShellReadAll(dumpPath);
 end;
 
 var
@@ -251,7 +204,7 @@ var
   haveZip: Boolean;
 
 begin
-  upstream := findUpstreamSqlite3;
+  upstream := FindUpstreamSqlite3;
   if upstream = '' then begin
     WriteLn('SKIP    TestShellIO: no upstream sqlite3 binary found');
     WriteLn('        Set UPSTREAM_SQLITE3=/path/to/sqlite3 to enable.');
