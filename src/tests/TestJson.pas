@@ -1330,6 +1330,8 @@ begin
   ctx.pOut  := @pOut;
   ctx.pVdbe := @vm;
   ctx.iOp   := 0;
+  ctx.enc   := SQLITE_UTF8;  { mirrors C OP_Function init (vdbe.c:8865);
+    setResultStrOrError now honours pCtx^.enc per bucket-K fix. }
   { vm.db = nil; sqlite3DbFree degrades to sqlite3_free → safe. }
 end;
 

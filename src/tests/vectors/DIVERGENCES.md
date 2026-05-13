@@ -264,6 +264,34 @@ inside `hex()` / `sqlite3_column_text` UTF-16 handling).
 
 Affected vector: `utf16.db`.
 
+## Bucket K — UTF-16 RO `hex(<text>)` byte-swapped (9.2.2) — CLOSED
+
+Symptom (was): on `utf16.db` (PRAGMA encoding=UTF-16le), `SELECT
+hex(label)` returned hex digits that the harness re-decoded as UTF-16
+glyphs (e.g. row 1 `ascii` → `ㄶ〰㌷〰㌶〰㤶〰㤶〰`).  C oracle:
+`61007300630069006900`.
+
+Root cause: Pas `sqlite3_result_text` (+ the `_text64`,
+`_text16{,le,be}`, `_blob`, `_blob64` siblings) bypassed C's helper
+`setResultStrOrError` (vdbeapi.c:387..427).  The C helper, after
+`sqlite3VdbeMemSetStr(pOut, ..., enc, ...)`, calls
+`sqlite3VdbeChangeEncoding(pOut, pCtx->enc)` to land the result in the
+function-context encoding.  Pas omitted that second step, so hex
+digits (tagged SQLITE_UTF8) sat in the result Mem of a UTF-16
+database; `sqlite3_column_text` then handed back raw ASCII bytes
+wearing a UTF-16 label.
+
+Fix: port `setResultStrOrError` faithfully in `passqlite3vdbe.pas`
+and route every text/blob result setter through it.  Closes
+9.2.divbug.K.  `hex(label)` on `utf16.db` now byte-matches the C
+oracle for ASCII, BMP and non-BMP (`3DD800DE` for U+1F600).
+Synthetic JSON-aggregate unit tests (TestJson SetupCtx) updated to
+seed `ctx.enc := SQLITE_UTF8`, mirroring the runtime OP_Function
+init at `vdbe.c:8865`.
+
+Affected vector: `utf16.db` (still pas-skips for bucket-M, the
+INSERT-side enc bypass — separate bug).
+
 ## Bucket H — WITHOUT ROWID RO sweep aborts with "disk image malformed" (9.2.2) — CLOSED
 
 Symptom (was): SELECT against `withoutrowid.db` opened read-only emits

@@ -348,16 +348,24 @@ regressions without human triage.
     partial-index vector is byte-identical post-RENAME COLUMN; the
     schema-script still pas-skips for bucket-B (trailing VACUUM
     EAccessViolation, unrelated).
-  - [ ] **9.2.divbug.K** UTF-16 RO `hex(<text>)` returns byte-swapped
-    pairs — `utf16.db`.  PRAGMA encoding=UTF-16le; selecting
-    `hex(label)` returns the raw byte pairs reversed vs the C oracle.
-    9.2.divbug.G ported the UTF-16 OP_String8 conversion arm for the
-    SELECT/PRAGMA read path, but the `hex()` builtin reads the raw
-    UTF-8 bytes the string was first materialised as.  Likely surface:
-    `hexFunc` / `sqlite3_value_blob` enc-aware conversion.  C ref:
-    `../sqlite3/src/func.c hexFunc` + `vdbemem.c
-    sqlite3VdbeChangeEncoding`.  Surfaced by 9.2.divbug.G's RO probe;
-    sibling bug to bucket-M (the INSERT-side enc bypass).
+  - [X] **9.2.divbug.K** UTF-16 RO `hex(<text>)` returns byte-swapped
+    pairs — `utf16.db`.  FIXED: Pas `sqlite3_result_text` (+ `_text64`,
+    `_text16{,le,be}`, `_blob`, `_blob64`) called `sqlite3VdbeMemSetStr`
+    but never reproduced the post-set `sqlite3VdbeChangeEncoding(pOut,
+    pCtx->enc)` call from C `setResultStrOrError` (vdbeapi.c:423).  In
+    a UTF-16 database `pCtx^.enc = SQLITE_UTF16LE`, so the hex digits
+    emitted by `hexFunc` stayed tagged SQLITE_UTF8 in `pCtx^.pOut`;
+    `sqlite3_column_text` then handed those raw ASCII bytes back wearing
+    the UTF-16 label, and the harness re-decoded them as UTF-16 (each
+    pair of hex digits surfaced as one CJK glyph).  Fix: ported
+    `setResultStrOrError` faithfully and routed every text/blob result
+    setter through it (passqlite3vdbe.pas).  Cite: vdbeapi.c:387..427.
+    `hex(label)` on `utf16.db` now byte-matches the C oracle
+    (`61007300630069006900` etc.).  Synthetic JSON-aggregate tests
+    (TestJson SetupCtx) updated to seed `ctx.enc := SQLITE_UTF8`,
+    mirroring the C OP_Function init (vdbe.c:8865).  bucket-M (INSERT
+    round-trip enc bypass) still gates the vector under pas-skip; K
+    no longer cited.
   - [ ] **9.2.divbug.L** Auto-vacuum round-trip page-count drift —
     `autovacuum.db` (auto_vacuum=FULL, delete at COMMIT triggers
     freelist truncation) and `incrvacuum.db` (auto_vacuum=INCREMENTAL

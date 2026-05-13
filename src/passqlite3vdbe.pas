@@ -1698,6 +1698,8 @@ function sqlite3_bind_parameter_index(pStmt: PVdbe; zName: PAnsiChar): i32;
 function sqlite3VdbeParameterIndex(p: PVdbe; zName: PAnsiChar; nName: i32): i32;
 
 { --- vdbeapi.c — sqlite3_result_* context-result setters (Phase 6.6) --- }
+procedure setResultStrOrError(pCtx: Psqlite3_context; z: PAnsiChar;
+                              n: i32; enc: u8; xDel: TxDelProc);
 procedure sqlite3_result_null(pCtx: Psqlite3_context);
 procedure sqlite3_result_int(pCtx: Psqlite3_context; iVal: i32);
 procedure sqlite3_result_int64(pCtx: Psqlite3_context; iVal: i64);
@@ -4790,7 +4792,7 @@ begin
     sqlite3_result_error_toobig(pCtx);
     Exit;
   end;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, i64(n), enc, xDel);
+  setResultStrOrError(pCtx, z, i32(n), enc, xDel);
 end;
 
 { --- sqlite3VdbeCreate / sqlite3VdbeDelete --- }
@@ -5852,18 +5854,43 @@ begin
   sqlite3VdbeMemSetDouble(pCtx^.pOut, rVal);
 end;
 
+{ vdbeapi.c:387 — setResultStrOrError.  After setting the result text on
+  the function's pOut Mem, convert it to pCtx->enc so downstream column
+  output sees bytes in the requested encoding.  Fixes bucket-K: hex()
+  over a UTF-16 text value previously left the hex digits tagged
+  SQLITE_UTF8 inside a UTF-16 database, and column_text returned the
+  raw ASCII bytes wearing a UTF-16 label. }
+procedure setResultStrOrError(pCtx: Psqlite3_context; z: PAnsiChar;
+                              n: i32; enc: u8; xDel: TxDelProc);
+var
+  pOut: PMem;
+  rc:   i32;
+begin
+  pOut := pCtx^.pOut;
+  rc := sqlite3VdbeMemSetStr(pOut, z, n, enc, xDel);
+  if rc <> 0 then
+  begin
+    if rc = SQLITE_TOOBIG then sqlite3_result_error_toobig(pCtx)
+    else sqlite3_result_error_nomem(pCtx);
+    Exit;
+  end;
+  sqlite3VdbeChangeEncoding(pOut, pCtx^.enc);
+  if sqlite3VdbeMemTooBig(pOut) <> 0 then
+    sqlite3_result_error_toobig(pCtx);
+end;
+
 procedure sqlite3_result_text(pCtx: Psqlite3_context; z: PAnsiChar;
   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, SQLITE_UTF8, xDel);
+  setResultStrOrError(pCtx, z, n, SQLITE_UTF8, xDel);
 end;
 
 procedure sqlite3_result_blob(pCtx: Psqlite3_context; z: Pointer;
   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, 0, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n, 0, xDel);
 end;
 
 { vdbeapi.c:880 — wide-length blob result.  Mirrors sqlite3_result_blob
@@ -5878,7 +5905,7 @@ begin
     sqlite3_result_error_toobig(pCtx);
     Exit;
   end;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, i64(n), 0, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), i32(n), 0, xDel);
 end;
 
 procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
@@ -5908,8 +5935,8 @@ procedure sqlite3_result_text16(pCtx: Psqlite3_context; z: Pointer;
                                 n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
-                       SQLITE_UTF16NATIVE, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n and (not 1),
+                      SQLITE_UTF16NATIVE, xDel);
 end;
 
 { vdbeapi.c:625 — sqlite3_result_text16be. }
@@ -5917,8 +5944,8 @@ procedure sqlite3_result_text16be(pCtx: Psqlite3_context; z: Pointer;
                                   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
-                       SQLITE_UTF16BE, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n and (not 1),
+                      SQLITE_UTF16BE, xDel);
 end;
 
 { vdbeapi.c:634 — sqlite3_result_text16le. }
@@ -5926,8 +5953,8 @@ procedure sqlite3_result_text16le(pCtx: Psqlite3_context; z: Pointer;
                                   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
-                       SQLITE_UTF16LE, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n and (not 1),
+                      SQLITE_UTF16LE, xDel);
 end;
 
 { vdbeapi.c:503 — sqlite3_result_error16.  UTF-16 error string. }
