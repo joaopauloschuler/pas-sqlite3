@@ -17,3 +17,6 @@ backup
 :memory:
 :memory:*
 .claude
+# SQLite WAL/SHM sidecars
+*.db-shm
+*.db-wal
