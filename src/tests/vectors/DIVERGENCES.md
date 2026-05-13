@@ -250,19 +250,25 @@ inside `hex()` / `sqlite3_column_text` UTF-16 handling).
 
 Affected vector: `utf16.db`.
 
-## Bucket H — WITHOUT ROWID RO sweep aborts with "disk image malformed" (9.2.2)
+## Bucket H — WITHOUT ROWID RO sweep aborts with "disk image malformed" (9.2.2) — CLOSED
 
-Symptom: SELECT against `withoutrowid.db` opened read-only emits the
-first 5 rows then errors `database disk image is malformed` (rc=11
+Symptom (was): SELECT against `withoutrowid.db` opened read-only emits
+the first 5 rows then errors `database disk image is malformed` (rc=11
 SQLITE_CORRUPT) while C reads all rows cleanly.  Surfaced once
 bucket-A was lifted.
 
-Likely root cause: WITHOUT ROWID page-key decoding bug in the read
-cursor — likely the same family as bucket-D (CREATE INDEX byte
-divergence on WITHOUT ROWID).  Reference: `../sqlite3/src/btree.c`
-WITHOUT ROWID cell-key decoding.
+Root cause: the simple-`count(*)` codegen fast path in
+`sqlite3Select` (codegen.pas, near OP_Count emission) emitted
+`OpenRead iCsr, pTab^.tnum` with no P4 KeyInfo for every table.  For a
+WITHOUT ROWID table, `pTab^.tnum` IS the PRIMARY KEY index b-tree
+(mxRecord-keyed cells), not an intkey table.  The cursor opened
+without P4_KEYINFO walked the page as intkey cells, parsed garbage
+offsets, and aborted with SQLITE_CORRUPT.  C `select.c:8793..8814`
+forces `pBest := sqlite3PrimaryKeyIndex(pTab)` and attaches
+`P4_KEYINFO` for WITHOUT ROWID; the Pas fast path now ports that arm.
+Closes 9.2.divbug.H.
 
-Affected vector: `withoutrowid.db`.
+Affected vector: `withoutrowid.db` (now byte-identical, 130 bytes).
 
 ## Bucket I — Round-trip cell-layout drift (9.2.3)
 

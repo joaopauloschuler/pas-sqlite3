@@ -252,12 +252,19 @@ regressions without human triage.
     PRAGMA encoding now returns `UTF-16le` correctly; utf16.db still
     pas-skips on a separate `hex(<utf16-text>)` byte-order bug (now
     tracked as bucket-K, unrelated).
-  - [ ] **9.2.divbug.H** WITHOUT ROWID RO sweep emits first 5 rows
-    then errors `database disk image is malformed` (rc=11) (1 site:
-    withoutrowid.db).  Likely surface: page-key decode in read cursor.
-    Adjacent to bucket-D (CREATE INDEX byte divergence on WITHOUT
-    ROWID).  C ref: `../sqlite3/src/btree.c` cell-key decode for
-    WITHOUT ROWID indexes.
+  - [X] **9.2.divbug.H** WITHOUT ROWID RO sweep emits first 5 rows
+    then errors `database disk image is malformed` (rc=11) — fixed.
+    Root cause: the simple-`count(*)` codegen fast path in
+    `sqlite3Select` opened `pTab^.tnum` with no P4_KEYINFO; for a
+    WITHOUT ROWID table that root IS the PK index (mxRecord-keyed),
+    and a table-cursor without KeyInfo decoded the cells as intkey
+    and aborted with SQLITE_CORRUPT.  Ported select.c:8793..8814:
+    when `not HasRowid(pTab)` force `pBest := sqlite3PrimaryKeyIndex`
+    and attach `sqlite3KeyInfoOfIndex` via `sqlite3VdbeChangeP4(...,
+    P4_KEYINFO)`.  Verified: `bin/TestVectorReadOnly` /
+    `bin/TestVectorRoundTrip` both byte-identical on withoutrowid.db
+    (130 / 8192 bytes).  Schema-change still pas-skips on bucket-D
+    (adjacent CREATE INDEX byte divergence, unrelated codegen).
   - [ ] **9.2.divbug.I** Round-trip mutator produces byte-different
     `.db` blob — leaf-cell area divergence (3 sites: wal/multipage/
     generated-column).  Likely surface: cell-packing / freeblock /

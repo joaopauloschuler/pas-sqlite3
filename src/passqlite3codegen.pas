@@ -26139,6 +26139,18 @@ var
   pModFunc:      passqlite3vtab.PSqlite3Module;
   kHC, jHC:      i32;
   pSubFC:        PSelect;  { 10.1.42.a.8 — FROM-clause subquery select }
+  { 9.2.divbug.H — simple-count(*) WITHOUT ROWID arm.  For a
+    WITHOUT ROWID table the row payload lives in the PRIMARY KEY index
+    btree (an mxRecord-keyed b-tree), not the table root.  C
+    select.c:8793 forces pBest := sqlite3PrimaryKeyIndex(pTab) in that
+    case, opens the *index* root with a KeyInfo, and OP_Counts there.
+    Without these the Pas fast path opens the table root (which is
+    actually the PK index for WITHOUT ROWID) as a table-cursor — the
+    cursor walks the page as if cells held intkey rows, parses garbage
+    offsets, and aborts with "database disk image is malformed". }
+  pBestCnt:     PIndex2;
+  iRootCnt:     i32;
+  pKeyInfoCnt:  PKeyInfo2;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   { 10.1.42.a.6.5 — Pre-zero the local AggInfo handle so the select_end tail
@@ -27848,7 +27860,28 @@ begin
         sqlite3CodeVerifySchema(pParse, iDb);
         iCsr := pParse^.nTab;
         Inc(pParse^.nTab);
-        sqlite3VdbeAddOp4Int(v, OP_OpenRead, iCsr, i32(pTab^.tnum), iDb, 1);
+        { 9.2.divbug.H — port of select.c:8793..8814.  For WITHOUT ROWID
+          tables the table-root pTab^.tnum IS the PRIMARY KEY index
+          b-tree; OpenRead must carry P4_KEYINFO so the cursor decodes
+          mxRecord-keyed cells (btreeParseCellPtrIndex) instead of
+          intkey-keyed cells (btreeParseCellPtr).  KeyInfo lookup is
+          deferred until after we have iCsr so the explain output
+          matches C bytecode order. }
+        pBestCnt    := nil;
+        iRootCnt    := i32(pTab^.tnum);
+        pKeyInfoCnt := nil;
+        if not HasRowid(pTab) then
+        begin
+          pBestCnt := sqlite3PrimaryKeyIndex(pTab);
+          if pBestCnt <> nil then
+          begin
+            iRootCnt    := i32(pBestCnt^.tnum);
+            pKeyInfoCnt := sqlite3KeyInfoOfIndex(pParse, pBestCnt);
+          end;
+        end;
+        sqlite3VdbeAddOp4Int(v, OP_OpenRead, iCsr, iRootCnt, iDb, 1);
+        if pKeyInfoCnt <> nil then
+          sqlite3VdbeChangeP4(v, -1, PAnsiChar(pKeyInfoCnt), P4_KEYINFO);
         Inc(pParse^.nMem);
         regAgg := pParse^.nMem;
         Inc(pParse^.nMem);
