@@ -1595,6 +1595,7 @@ const
   SQLITE_WindowFunc     = u32($00000002);  { use xInverse for window functions (sqliteInt.h:1900) }
   SQLITE_CoverIdxScan   = u32($00000020);  { covering-index scan opt (sqliteInt.h:1904) }
   SQLITE_DistinctOpt    = u32($00000010);
+  SQLITE_GroupByOrder   = u32($00000004);  { GROUP BY cover of ORDER BY (sqliteInt.h:1901) }
   SQLITE_OrderByIdxJoin = u32($00000040);  { ORDER BY of joins via index (sqliteInt.h:1905) }
   SQLITE_OmitNoopJoin   = u32($00000100);
   SQLITE_Stat4          = u32($00000800);
@@ -26178,6 +26179,53 @@ begin
     pTabList := p^.pSrc;
   end;
 
+  { 10.1.42.a.12 — Transform DISTINCT into GROUP BY when the result-set
+    matches the ORDER BY (select.c:8151..8196, tag-select-0500).
+        SELECT DISTINCT xyz FROM ... ORDER BY xyz
+          -->
+        SELECT xyz FROM ... GROUP BY xyz ORDER BY xyz
+    Preconditions (verbatim):
+      (selFlags & (SF_Distinct|SF_Aggregate)) == SF_Distinct
+      sqlite3CopySortOrder(pEList, sSort.pOrderBy)   { copies DESC flags
+                                                       only when nExpr matches }
+      sqlite3ExprListCompare(pEList, sSort.pOrderBy, -1) == 0
+      OptimizationEnabled(SQLITE_GroupByOrder)
+      p->pWin == 0                                   { OMIT_WINDOWFUNC gate }
+    Action: clear SF_Distinct; pGroupBy := ExprListDup(pEList); seed
+    iOrderByCol = i+1 on each new GROUP BY slot; set SF_Aggregate.
+    sSort.pOrderBy is Pas's `p^.pOrderBy` (no separate sSort tracker yet). }
+  if ((p^.selFlags and (SF_Distinct or SF_Aggregate)) = SF_Distinct)
+     and (p^.pEList <> nil) and (p^.pOrderBy <> nil)
+     and (p^.pEList^.nExpr = p^.pOrderBy^.nExpr)
+     and OptimizationEnabled(pParse^.db, SQLITE_GroupByOrder)
+     and (p^.pWin = nil) then
+  begin
+    { Inline sqlite3CopySortOrder (select.c:7516..7529): copy DESC bits
+      from pOrderBy onto pEList. nExpr-match already gated above. }
+    for i := 0 to p^.pEList^.nExpr - 1 do
+    begin
+      sfA := ExprListItems(p^.pOrderBy)[i].fg.sortFlags and KEYINFO_ORDER_DESC;
+      ExprListItems(p^.pEList)[i].fg.sortFlags := sfA;
+    end;
+    if sqlite3ExprListCompare(p^.pEList, p^.pOrderBy, -1) = 0 then
+    begin
+      p^.selFlags := p^.selFlags and (not u32(SF_Distinct));
+      p^.pGroupBy := sqlite3ExprListDup(pParse^.db, p^.pEList, 0);
+      if p^.pGroupBy <> nil then
+      begin
+        for i := 0 to p^.pGroupBy^.nExpr - 1 do
+          ExprListItems(p^.pGroupBy)[i].u.x.iOrderByCol := u16(i + 1);
+      end;
+      p^.selFlags := p^.selFlags or SF_Aggregate;
+      {$IFDEF SQLITE_DEBUG}
+      { 10.1.42.a.12 — TREETRACE(0x20000) "Transform DISTINCT into GROUP BY"
+        (select.c:8190..8195). }
+      if (sqlite3TreeTrace and $20000) <> 0 then
+        sqlite3DebugPrintf('Transform DISTINCT into GROUP BY:'#10, []);
+      {$ENDIF}
+    end;
+  end;
+
   { Trivial-gate guards — bail out (same as the prior stub) for any
     non-full-scan / non-single-table / non-Output form.  Each of these
     will be lifted as the corresponding shape lands under 11g.2.f. }
@@ -29592,8 +29640,7 @@ begin
             not ported)
       8146  After all FROM-clause analysis (0x8000) — deferred (a.5,
             no Pas counterpart to the post-FROM-loop snapshot point)
-      8192  Transform DISTINCT into GROUP BY (0x20000) — deferred (a.4,
-            no Pas optimiser arm)
+      8192  Transform DISTINCT into GROUP BY (0x20000) — LANDED (a.12)
       8442  After aggregate analysis                — LANDED (a.3)
       8609  AggInfo function exprs -> indexed ref   — deferred (a.6.4)
       8937  Finished with AggInfo (0x20)            — LANDED (a.6.5,

@@ -473,19 +473,16 @@ partial landings cannot silently no-op.
       optimizeAggregateUseOfIndexedExpr /
       aggregateConvertIndexedExprRefToColumn / late select_end
       AggInfo teardown are ported yet.
-    - [~] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
-      TREETRACE arms (mask 0x1000 / 0x8000 — VERIFIED divergent vs C:
-      upstream uses 0x800 for "dropping ORDER BY" select.c:7631, 0x40 for
-      "after window rewrite" select.c:7693, 0x20000 for "Transform
-      DISTINCT into GROUP BY" select.c:8192).  Landed: "after window
-      rewrite" (mask 0x40) at codegen.pas after the sqlite3WindowRewrite
-      call in the window-arm gate.  Also landed under 10.1.42.a.11:
-      "dropping superfluous ORDER BY" (select.c:7631, 0x800) — the
-      IgnorableDistinct(pDest) pOrderBy-drop arm now fires post `begin
-      processing` / pre `sqlite3SelectPrep`.  Still deferred:
-      "Transform DISTINCT into GROUP BY" (select.c:8192) — the SF_Distinct
-      → pGroupBy optimizer arm (post-FROM-clause analysis) is not ported.
-      Both land when the surrounding optimizer arms land.
+    - [X] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
+      TREETRACE arms (VERIFIED C masks: 0x800 "dropping ORDER BY"
+      select.c:7631, 0x40 "after window rewrite" select.c:7693, 0x20000
+      "Transform DISTINCT into GROUP BY" select.c:8192).  All three
+      landed: "after window rewrite" (mask 0x40) at codegen.pas after
+      the sqlite3WindowRewrite call in the window-arm gate; "dropping
+      superfluous ORDER BY" (mask 0x800) under 10.1.42.a.11 post `begin
+      processing` / pre `sqlite3SelectPrep`; "Transform DISTINCT into
+      GROUP BY" (mask 0x20000) under 10.1.42.a.12 post FROM-clause
+      analyses / pre trivial-gate guards.
     - [~] **10.1.42.a.5** Outer-join simplification + FROM-subquery
       TREETRACE arms (VERIFIED C masks: 0x1000 FULL/LEFT/RIGHT
       simplifies select.c:7737..7756 — LANDED under 10.1.42.a.7;
@@ -627,8 +624,16 @@ partial landings cannot silently no-op.
       processing` / pre `sqlite3SelectPrep`; clears p^.pOrderBy via
       sqlite3ParserAddCleanup(@sqlite3ExprListDeleteGeneric, ...) and masks
       off SF_Distinct, with 0x800 TREETRACE `dropping superfluous ORDER BY`.
-    - [ ] **10.1.42.a.12** Port the DISTINCT→GROUP BY transform
-      (select.c:8192, mask 0x20000) so the deferred 10.1.42.a.4 arm can land.
+    - [X] **10.1.42.a.12** Ported the DISTINCT→GROUP BY transform
+      (select.c:8151..8196, mask 0x20000) post FROM-clause analyses
+      (count-of-view) / pre trivial-gate guards.  Gates exactly on
+      `(selFlags & (SF_Distinct|SF_Aggregate)) == SF_Distinct`,
+      inline sqlite3CopySortOrder over pEList/pOrderBy with matching
+      nExpr, sqlite3ExprListCompare = 0, SQLITE_GroupByOrder enabled,
+      and pWin = nil.  On hit: clear SF_Distinct, pGroupBy :=
+      sqlite3ExprListDup(pEList), seed each new slot's iOrderByCol = i+1,
+      set SF_Aggregate.  0x20000 TREETRACE prints `Transform DISTINCT
+      into GROUP BY:`.  Closes the last deferred sub-arm of 10.1.42.a.4.
   - [X] **10.1.42.c** `sqlite3DebugPrintf` ported (printf.c:1514..1532) into passqlite3printf.pas; routes through sqlite3FormatStr → stdout+fflush.
   - [X] **10.1.42.d** Build-flag gating: `src/tests/build.sh` honours `SQLITE_DEBUG=1` env var (forwards `-dSQLITE_DEBUG` to fpc); default leaves `{$IFDEF SQLITE_DEBUG}` blocks compiled out. Gate documented in `src/passqlite3.inc`.
 
