@@ -20,151 +20,87 @@
 }
 {$I ../passqlite3.inc}
 program DiagDate;
-uses SysUtils, passqlite3types, passqlite3util, passqlite3vdbe,
-     passqlite3codegen, passqlite3main, csqlite3;
-var diverged: i32 = 0;
 
-procedure PasRun1(const sql: AnsiString; out prepRc, stepRc: i32;
-                  out asInt: Int64; out asText: AnsiString; out colType: i32);
-var db: PTsqlite3; pStmt: PVdbe; rcs: i32; zT: PAnsiChar;
-begin
-  prepRc := -1; stepRc := -1; asInt := 0; asText := ''; colType := -1;
-  db := nil;
-  if sqlite3_open(':memory:', @db) <> 0 then Exit;
-  pStmt := nil;
-  prepRc := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, nil);
-  if pStmt <> nil then begin
-    rcs := sqlite3_step(pStmt);
-    stepRc := rcs;
-    if rcs = SQLITE_ROW then begin
-      colType := sqlite3_column_type(pStmt, 0);
-      asInt := sqlite3_column_int64(pStmt, 0);
-      zT := PAnsiChar(sqlite3_column_text(pStmt, 0));
-      if zT <> nil then asText := AnsiString(zT);
-    end;
-    sqlite3_finalize(pStmt);
-  end;
-  sqlite3_close(db);
-end;
-
-procedure CRun1(const sql: AnsiString; out prepRc, stepRc: i32;
-                out asInt: Int64; out asText: AnsiString; out colType: i32);
-var db: Pcsq_db; pStmt: Pcsq_stmt; pTail: PChar; rcs: Int32; zT: PChar;
-begin
-  prepRc := -1; stepRc := -1; asInt := 0; asText := ''; colType := -1;
-  db := nil;
-  if csq_open(':memory:', db) <> 0 then Exit;
-  pStmt := nil; pTail := nil;
-  prepRc := csq_prepare_v2(db, PAnsiChar(sql), -1, pStmt, pTail);
-  if pStmt <> nil then begin
-    rcs := csq_step(pStmt);
-    stepRc := rcs;
-    if rcs = SQLITE_ROW then begin
-      colType := csq_column_type(pStmt, 0);
-      asInt := csq_column_int64(pStmt, 0);
-      zT := csq_column_text(pStmt, 0);
-      if zT <> nil then asText := AnsiString(zT);
-    end;
-    csq_finalize(pStmt);
-  end;
-  csq_close(db);
-end;
-
-procedure Probe(const lbl, sql: AnsiString);
-var pPrep,pStep,pType,cPrep,cStep,cType: i32;
-    pInt,cInt: Int64; pTxt,cTxt: AnsiString; ok: Boolean;
-begin
-  PasRun1(sql, pPrep, pStep, pInt, pTxt, pType);
-  CRun1  (sql, cPrep, cStep, cInt, cTxt, cType);
-  ok := (pPrep = cPrep) and (pStep = cStep) and (pType = cType)
-        and (pInt = cInt) and (pTxt = cTxt);
-  if ok then WriteLn('PASS    ', lbl)
-  else begin
-    Inc(diverged);
-    WriteLn('DIVERGE ', lbl);
-    WriteLn('   sql  =', sql);
-    WriteLn('   Pas: prep=', pPrep, ' step=', pStep, ' type=', pType, ' int=', pInt, ' txt="', pTxt, '"');
-    WriteLn('   C  : prep=', cPrep, ' step=', cStep, ' type=', cType, ' int=', cInt, ' txt="', cTxt, '"');
-  end;
-end;
+uses
+  DiagCommon;
 
 begin
   // Date / time
-  Probe('date literal',     'SELECT date(''2024-01-15'')');
-  Probe('time literal',     'SELECT time(''13:45:00'')');
-  Probe('datetime literal', 'SELECT datetime(''2024-01-15 13:45:00'')');
-  Probe('strftime ymd',     'SELECT strftime(''%Y-%m-%d'',''2024-06-30'')');
-  Probe('julianday epoch',  'SELECT julianday(''2000-01-01 12:00:00'')');
-  Probe('date plus days',   'SELECT date(''2024-01-15'',''+5 days'')');
-  Probe('date minus mo',    'SELECT date(''2024-03-15'',''-1 month'')');
-  Probe('date start mo',    'SELECT date(''2024-03-15'',''start of month'')');
-  Probe('strftime weekday', 'SELECT strftime(''%w'',''2024-01-15'')');
-  Probe('strftime %u Sat',  'SELECT strftime(''%u'',''2024-06-15'')');
-  Probe('strftime %u Sun',  'SELECT strftime(''%u'',''2024-06-16'')');
-  Probe('strftime %u Mon',  'SELECT strftime(''%u'',''2024-06-17'')');
-  Probe('unixepoch',        'SELECT unixepoch(''2024-01-01'')');
-  Probe('time HM',          'SELECT time(''13:45'')');
-  Probe('tz +01:30',        'SELECT datetime(''2024-06-15 12:00:00+01:30'')');
-  Probe('tz -05:00',        'SELECT datetime(''2024-06-15 12:00:00-05:00'')');
-  Probe('tz Z',             'SELECT datetime(''2024-06-15T12:00:00Z'')');
-  Probe('tz time-only',     'SELECT time(''12:00:00+02:00'')');
-  Probe('tz date rollover', 'SELECT date(''2024-06-15T23:00:00-05:00'')');
+  ProbeOne('date literal',     'SELECT date(''2024-01-15'')');
+  ProbeOne('time literal',     'SELECT time(''13:45:00'')');
+  ProbeOne('datetime literal', 'SELECT datetime(''2024-01-15 13:45:00'')');
+  ProbeOne('strftime ymd',     'SELECT strftime(''%Y-%m-%d'',''2024-06-30'')');
+  ProbeOne('julianday epoch',  'SELECT julianday(''2000-01-01 12:00:00'')');
+  ProbeOne('date plus days',   'SELECT date(''2024-01-15'',''+5 days'')');
+  ProbeOne('date minus mo',    'SELECT date(''2024-03-15'',''-1 month'')');
+  ProbeOne('date start mo',    'SELECT date(''2024-03-15'',''start of month'')');
+  ProbeOne('strftime weekday', 'SELECT strftime(''%w'',''2024-01-15'')');
+  ProbeOne('strftime %u Sat',  'SELECT strftime(''%u'',''2024-06-15'')');
+  ProbeOne('strftime %u Sun',  'SELECT strftime(''%u'',''2024-06-16'')');
+  ProbeOne('strftime %u Mon',  'SELECT strftime(''%u'',''2024-06-17'')');
+  ProbeOne('unixepoch',        'SELECT unixepoch(''2024-01-01'')');
+  ProbeOne('time HM',          'SELECT time(''13:45'')');
+  ProbeOne('tz +01:30',        'SELECT datetime(''2024-06-15 12:00:00+01:30'')');
+  ProbeOne('tz -05:00',        'SELECT datetime(''2024-06-15 12:00:00-05:00'')');
+  ProbeOne('tz Z',             'SELECT datetime(''2024-06-15T12:00:00Z'')');
+  ProbeOne('tz time-only',     'SELECT time(''12:00:00+02:00'')');
+  ProbeOne('tz date rollover', 'SELECT date(''2024-06-15T23:00:00-05:00'')');
 
   // localtime / utc modifiers (10.1.bug.106).  Round-trip is identity;
   // use the round-trip form so the test is timezone-independent.
-  Probe('utc/local roundtrip',
+  ProbeOne('utc/local roundtrip',
         'SELECT datetime(''2024-06-15 12:00:00'',''utc'',''localtime'')');
-  Probe('local/utc roundtrip',
+  ProbeOne('local/utc roundtrip',
         'SELECT datetime(''2024-06-15 12:00:00'',''localtime'',''utc'')');
-  Probe('localtime not null',
+  ProbeOne('localtime not null',
         'SELECT datetime(''2024-06-15 12:00:00'',''localtime'') IS NOT NULL');
-  Probe('utc not null',
+  ProbeOne('utc not null',
         'SELECT datetime(''2024-06-15 12:00:00'',''utc'') IS NOT NULL');
-  Probe('time localtime',
+  ProbeOne('time localtime',
         'SELECT time(''2024-06-15 12:00:00'',''utc'',''localtime'')');
 
   // Numeric / scalar variants
-  Probe('round 0',          'SELECT round(3.5)');
-  Probe('round 2',          'SELECT round(3.14159, 2)');
-  Probe('round neg',        'SELECT round(-2.5)');
-  Probe('sign pos',         'SELECT sign(5)');
-  Probe('sign neg',         'SELECT sign(-3.14)');
-  Probe('sign zero',        'SELECT sign(0)');
-  Probe('iif true',         'SELECT iif(1, ''a'', ''b'')');
-  Probe('iif false',        'SELECT iif(0, ''a'', ''b'')');
-  Probe('format like %d',   'SELECT format(''%d'', 42)');
-  Probe('quote text',       'SELECT quote(''it''''s'')');
-  Probe('quote null',       'SELECT quote(NULL)');
-  Probe('quote blob',       'SELECT quote(X''ff'')');
-  Probe('quote int',        'SELECT quote(123)');
-  Probe('quote real',       'SELECT quote(1.5)');
+  ProbeOne('round 0',          'SELECT round(3.5)');
+  ProbeOne('round 2',          'SELECT round(3.14159, 2)');
+  ProbeOne('round neg',        'SELECT round(-2.5)');
+  ProbeOne('sign pos',         'SELECT sign(5)');
+  ProbeOne('sign neg',         'SELECT sign(-3.14)');
+  ProbeOne('sign zero',        'SELECT sign(0)');
+  ProbeOne('iif true',         'SELECT iif(1, ''a'', ''b'')');
+  ProbeOne('iif false',        'SELECT iif(0, ''a'', ''b'')');
+  ProbeOne('format like %d',   'SELECT format(''%d'', 42)');
+  ProbeOne('quote text',       'SELECT quote(''it''''s'')');
+  ProbeOne('quote null',       'SELECT quote(NULL)');
+  ProbeOne('quote blob',       'SELECT quote(X''ff'')');
+  ProbeOne('quote int',        'SELECT quote(123)');
+  ProbeOne('quote real',       'SELECT quote(1.5)');
 
   // last_insert_rowid / changes (no setup, expect 0)
-  Probe('last_insert_rowid', 'SELECT last_insert_rowid()');
-  Probe('changes',           'SELECT changes()');
-  Probe('total_changes',     'SELECT total_changes()');
+  ProbeOne('last_insert_rowid', 'SELECT last_insert_rowid()');
+  ProbeOne('changes',           'SELECT changes()');
+  ProbeOne('total_changes',     'SELECT total_changes()');
 
   // sqlite_version etc
-  Probe('typeof sqlite_ver', 'SELECT typeof(sqlite_version())');
-  Probe('typeof sqlite_src', 'SELECT typeof(sqlite_source_id())');
+  ProbeOne('typeof sqlite_ver', 'SELECT typeof(sqlite_version())');
+  ProbeOne('typeof sqlite_src', 'SELECT typeof(sqlite_source_id())');
 
   // soundex / etc.
-  Probe('like escape',       'SELECT ''100%'' LIKE ''100\%'' ESCAPE ''\''');
-  Probe('like _',            'SELECT ''abc'' LIKE ''a_c''');
-  Probe('glob ?',            'SELECT ''abc'' GLOB ''a?c''');
-  Probe('glob []',           'SELECT ''abc'' GLOB ''[ab]bc''');
+  ProbeOne('like escape',       'SELECT ''100%'' LIKE ''100\%'' ESCAPE ''\''');
+  ProbeOne('like _',            'SELECT ''abc'' LIKE ''a_c''');
+  ProbeOne('glob ?',            'SELECT ''abc'' GLOB ''a?c''');
+  ProbeOne('glob []',           'SELECT ''abc'' GLOB ''[ab]bc''');
 
   // String comparisons
-  Probe('cmp text',          'SELECT ''b''>''a''');
-  Probe('cmp num text',      'SELECT 1>''a''');
-  Probe('coalesce of types', 'SELECT typeof(coalesce(NULL, 1.5))');
-  Probe('null is null',      'SELECT NULL IS NULL');
-  Probe('null = null',       'SELECT NULL = NULL');
+  ProbeOne('cmp text',          'SELECT ''b''>''a''');
+  ProbeOne('cmp num text',      'SELECT 1>''a''');
+  ProbeOne('coalesce of types', 'SELECT typeof(coalesce(NULL, 1.5))');
+  ProbeOne('null is null',      'SELECT NULL IS NULL');
+  ProbeOne('null = null',       'SELECT NULL = NULL');
 
   // Arithmetic with text
-  Probe('text*int',          'SELECT ''3''*2');
-  Probe('empty text+int',    'SELECT ''''+5');
-  Probe('text float coerce', 'SELECT ''1.5''+0');
+  ProbeOne('text*int',          'SELECT ''3''*2');
+  ProbeOne('empty text+int',    'SELECT ''''+5');
+  ProbeOne('text float coerce', 'SELECT ''1.5''+0');
 
   WriteLn;
   WriteLn('Total divergences: ', diverged);
