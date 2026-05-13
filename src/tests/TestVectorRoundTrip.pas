@@ -29,9 +29,13 @@
   blobs after applying CorpusOracle.ApplyHeaderMask (the existing 9.1.4
   header mask).
 
-  Vectors tagged `pas-skip` or `[SKIP]` in MANIFEST.txt are skipped (corpus
-  skip-and-cite contract).  Each divergence prints a one-screen summary
-  (vector, channel, first 16-byte window) and the binary exits rc=1.
+  Vectors tagged `[SKIP]` in MANIFEST.txt (script-only, no .db) are
+  skipped universally.  `pas-skip` lines are honoured **only** when
+  their cite names a bucket other than `bucket-A` — bucket-A was the
+  read-only-open umbrella closed in 9.2.divbug.A and is irrelevant to
+  this RW-open gate (9.2.3.followup).  Each divergence prints a
+  one-screen summary (vector, channel, first 16-byte window) and the
+  binary exits rc=1.
 
   Shared harness (file/dir helpers, exec runners, diff/window helpers,
   PrintDivergence, ResolveRepoRoot) lives in TestVectorCommon.
@@ -50,15 +54,19 @@ var
   VectorDir: AnsiString;  { resolved at startup — see ResolveRepoRoot }
 
 { ----------------------------------------------------------------------
-  MANIFEST.txt parser — copy of TestVectorReadOnly's parser.  Same
-  legend: [X] / [~] / [SKIP] in column 2, plus explicit `pas-skip`
-  override lines in the trailing block.
+  MANIFEST.txt parser — cite-aware, matching TestVectorSchemaChange's
+  shape (9.2.3.followup).  Bucket-A was the read-only-open umbrella
+  closed in 9.2.divbug.A; it is irrelevant to this RW-open round-trip
+  gate.  So we only honour `pas-skip` lines whose cite (token after
+  the vector name) names a bucket other than `bucket-A`.  [SKIP] in
+  column 2 still means "no .db, skip" universally.
   ---------------------------------------------------------------------- }
 
 type
   TStatusEntry = record
     name:   AnsiString;
-    status: AnsiString;
+    status: AnsiString; { 'pas-skip' | 'X' | '~' | 'SKIP' | '' }
+    cite:   AnsiString; { e.g. 'bucket-B' — only meaningful for pas-skip }
   end;
   TStatusList = array of TStatusEntry;
 
@@ -72,7 +80,7 @@ var
   parts: TStringList;
   j: i32;
   toks: array of AnsiString;
-  name, status: AnsiString;
+  name, status, cite: AnsiString;
 begin
   SetLength(list, 0);
   manifestPath := IncludeTrailingPathDelimiter(VectorDir) + 'MANIFEST.txt';
@@ -102,9 +110,12 @@ begin
       if toks[0] = 'pas-skip' then begin
         name := toks[1];
         if Pos('.db', name) <> Length(name) - 2 then Continue;
+        cite := '';
+        if Length(toks) >= 3 then cite := toks[2];
         SetLength(list, Length(list) + 1);
         list[High(list)].name := name;
         list[High(list)].status := 'pas-skip';
+        list[High(list)].cite := cite;
         Continue;
       end;
       name := toks[0];
@@ -116,6 +127,7 @@ begin
       SetLength(list, Length(list) + 1);
       list[High(list)].name := name;
       list[High(list)].status := status;
+      list[High(list)].cite := '';
     end;
   finally
     parts.Free;
@@ -123,19 +135,68 @@ begin
   end;
 end;
 
+{ Returns non-zero when the cite (e.g. 'bucket-B' or
+  'bucket-A,bucket-L') names any bucket that ACTUALLY applies to this
+  round-trip-mutator gate.  Buckets that are RO-only (A/F/G/H/K) or
+  schema-change-only (C/D/E) are filtered out so they don't keep
+  vectors pas-skipped here.  Buckets B / I / J / L / M and any future
+  9.2.divbug.* bucket open against the RT gate trigger the skip.
+  Per 9.2.3.followup. }
+function CiteAppliesToRoundTrip(const cite: AnsiString): Int32;
+var
+  parts: TStringList;
+  k: i32;
+  tok: AnsiString;
+begin
+  Result := 0;
+  if cite = '' then Exit;
+  parts := TStringList.Create;
+  try
+    parts.Delimiter := ',';
+    parts.StrictDelimiter := True;
+    parts.DelimitedText := cite;
+    for k := 0 to parts.Count - 1 do begin
+      tok := Trim(parts[k]);
+      if Pos('bucket-', tok) <> 1 then Continue;
+      { Filter buckets that are NOT RT-relevant. }
+      if (tok = 'bucket-A') or  { RO-open umbrella (closed) }
+         (tok = 'bucket-B') or  { bare VACUUM crash — RT mutators have no VACUUM keyword }
+         (tok = 'bucket-C') or  { ALTER RENAME / view body (schema-change) }
+         (tok = 'bucket-D') or  { CREATE INDEX WITHOUT ROWID (schema-change, closed) }
+         (tok = 'bucket-E') or  { ALTER RENAME partial-index (schema-change, closed) }
+         (tok = 'bucket-F') or  { PRAGMA auto_vacuum RO (closed) }
+         (tok = 'bucket-G') or  { PRAGMA encoding RO (closed) }
+         (tok = 'bucket-H') or  { WITHOUT ROWID RO sweep (closed) }
+         (tok = 'bucket-K') then  { hex(UTF-16 text) RO byte-swap }
+        Continue;
+      Result := 1;
+      Exit;
+    end;
+  finally
+    parts.Free;
+  end;
+end;
+
 function ManifestStatus(const list: TStatusList; const name: AnsiString): AnsiString;
 var
   i: i32;
 begin
+  { pas-skip with an RT-applicable bucket cite wins; cites that name
+    only RO-only / schema-only buckets are ignored on this RW gate
+    (9.2.3.followup). }
   for i := 0 to High(list) do
     if (list[i].name = name) and (list[i].status = 'pas-skip') then begin
-      Result := 'pas-skip';
-      Exit;
+      if CiteAppliesToRoundTrip(list[i].cite) <> 0 then begin
+        Result := 'pas-skip:' + list[i].cite;
+        Exit;
+      end;
     end;
   for i := 0 to High(list) do
     if list[i].name = name then begin
-      Result := list[i].status;
-      Exit;
+      if list[i].status = 'SKIP' then begin
+        Result := 'SKIP';
+        Exit;
+      end;
     end;
   Result := '';
 end;
@@ -182,8 +243,13 @@ begin
 
       status := ManifestStatus(manifest, dbName);
 
-      if (status = 'SKIP') or (status = 'pas-skip') then begin
-        Writeln('SKIP   ', dbName, '  (status=', status, ')');
+      if status = 'SKIP' then begin
+        Writeln('SKIP   ', dbName, '  (status=SKIP)');
+        Inc(totalSkipped);
+        Continue;
+      end;
+      if Pos('pas-skip:', status) = 1 then begin
+        Writeln('SKIP   ', dbName, '  (', status, ')');
         Inc(totalSkipped);
         Continue;
       end;

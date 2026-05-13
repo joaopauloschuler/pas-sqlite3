@@ -71,19 +71,23 @@ fully wired — once Bucket A is fixed, drop the `pas-skip` tag here and
 in MANIFEST and re-run `bin/TestVectorReadOnly` to gate against the
 full corpus.
 
-### 9.2.3 follow-up note (round-trip mutator probe)
+### 9.2.3 follow-up note (round-trip mutator probe) — RESOLVED 9.2.3.followup
 
-`bin/TestVectorRoundTrip` (Phase 9.2.3) honours the same `pas-skip`
-override block.  Although the round-trip probe opens the seed `.db`
-via `sqlite3_open` (RW path, not the read-only path that bucket-A
-specifically surfaces), the same eleven vectors are gated out at the
-manifest stage so the gate exits rc=0 today.  Once bucket A is fixed
-in Phase 6/7 the `pas-skip` tags can be dropped wholesale and both
-9.2.2 + 9.2.3 will begin actually exercising the full vector set.
-The 9.2.3 gate did not surface any *new* divergence buckets above and
-beyond bucket A — every gated `<name>.mutate.sql` runs cleanly under
-the C oracle (verified out-of-band with `../sqlite3/sqlite3` before
-landing the test), so no further bucket entries are added here.
+`bin/TestVectorRoundTrip` (Phase 9.2.3) previously inherited the
+bucket-A `pas-skip` block wholesale even though bucket-A is an
+RO-open bug and round-trip opens RW.  9.2.3.followup teaches the
+round-trip parser a cite-aware filter (mirrors
+`TestVectorSchemaChange`): pas-skip entries are honoured only when
+their cite names a bucket that actually applies to the RT gate.
+Buckets A / B (bare VACUUM; no RT mutator uses it) / C / D / E / F /
+G / H / K are filtered out; buckets I / J / L / M (RT-relevant) still
+skip.  Effect: 3 vectors (`partial-index`, `view-cte`,
+`withoutrowid`) that previously pas-skipped now run and pass
+byte-identically.  Three new RT-only divergences surfaced and are
+bucketed below as bucket-L (auto-vacuum page-count drift on
+autovacuum + incrvacuum) and bucket-M (UTF-16 INSERT stores raw
+UTF-8 on utf16.db).  Round-trip probe today: gated=8 ok=5
+diverged=0 skipped=3 rc=0.
 
 ## Bucket B — VACUUM raises EAccessViolation on the Pascal port (9.2.4)
 
@@ -314,5 +318,92 @@ now mirrors that gate (9.2.divbug.J).
 Affected vector: `triggers.db` — now runs cleanly; remaining db-blob
 divergence at byte 8185 is reclassified as bucket-I (cell-layout
 drift).
+
+## Bucket L — Auto-vacuum round-trip page-count drift (9.2.3.followup)
+
+Symptom: round-trip mutator against the `autovacuum.db` and
+`incrvacuum.db` vectors leaves a byte-different `.db` blob versus the
+C oracle, both rc=0.  Neither mutator script contains a bare `VACUUM;`
+keyword — the divergence is in the auto-vacuum-at-COMMIT (autovacuum,
+FULL) and explicit `PRAGMA incremental_vacuum(1)` (incrvacuum) code
+paths.  Surfaced once the bucket-A umbrella was lifted from the
+round-trip gate (9.2.3.followup).
+
+Reproducer (after lifting the pas-skip in the round-trip parser):
+
+```
+gated=11 ok=8 diverged=3 skipped=0
+---- DIVERGENCE ----
+  vector  : autovacuum.db
+  channel : db-blob (post-mask)
+  C  len  : 20480
+  Pas len : 24576
+  first diff at byte (1-based) : 32
+  C  hex window : 05 00 00 00 00 00 00 00 ...
+  Pas hex window: 06 00 00 00 06 00 00 00 ...
+---- DIVERGENCE ----
+  vector  : incrvacuum.db
+  channel : stdout (1 byte '\n' missing on Pas side)
+  channel : db-blob (post-mask)
+  C  len  : 24576
+  Pas len : 28672
+  first diff at byte (1-based) : 32
+  C  hex window : 06 00 00 00 06 00 00 00 01 00 00 00 ...
+  Pas hex window: 07 00 00 00 06 00 00 00 02 00 00 00 ...
+```
+
+Likely root cause (cross-link to **6.28**): the unported
+`incrVacuumStep` / `relocatePage` / `modifyPagePointer` arms — the
+same root cause behind bucket-B's bare-VACUUM crash, but here they
+silently produce a different (still-internally-consistent) layout
+because the auto-vacuum path takes a less aggressive branch.  Page-1
+header bytes 32..35 (number of free pages) and 36..39 (freelist trunk
+page number) diverge, indicating the freelist coalescing / truncation
+arm does not run on the Pas side.  C reference:
+`../sqlite3/src/btree.c (autoVacuumCommit, incrVacuumStep, relocatePage)`.
+
+Affected vectors:
+
+* `autovacuum.db`  — bucket-L (also bucket-A umbrella historically, bucket-B for the schema-change probe's trailing VACUUM)
+* `incrvacuum.db`  — bucket-L (also bucket-A umbrella historically)
+
+Tagged `pas-skip` with cite `bucket-L` for the round-trip probe in
+`MANIFEST.txt`.  Closing 6.28 / `incrVacuumStep` closes this bucket
+together with bucket-B.
+
+## Bucket M — UTF-16 round-trip INSERT stores raw UTF-8 bytes (9.2.3.followup)
+
+Symptom: round-trip mutator against `utf16.db` writes `INSERT INTO t
+VALUES(5, 'plain');` and similar UTF-8 string literals; the resulting
+cell-area bytes on the Pas side carry the raw UTF-8 (`c3 a9` for the
+non-ASCII `'café'`) where the C oracle writes the converted UTF-16LE
+(`e9 00`).  Both rc=0, blob diverges starting at byte 8126 (inside
+the cell-content area of page 2).  Surfaced once the bucket-A umbrella
+was lifted from the round-trip gate (9.2.3.followup).
+
+Reproducer:
+
+```
+---- DIVERGENCE ----
+  vector  : utf16.db
+  channel : db-blob (post-mask)
+  C  len  : 8192   Pas len : 8192
+  first diff at byte (1-based) : 8126
+  C  hex window : e9 00 2d 00 78 00 0d 05 03 00 21 70 00 6c 00 61
+  Pas hex window: c3 a9 2d 00 78 00 0d 05 03 00 21 70 00 6c 00 61
+```
+
+Likely root cause: 9.2.divbug.G ported the `OP_String8` conversion arm
+so SELECT and PRAGMA reads emit converted bytes, but the
+INSERT / `OP_MakeRecord` write path probably consults a different
+arm — `sqlite3VdbeMemSetStr` / `sqlite3VdbeChangeEncoding` invocation
+sites need an audit for the UTF-8 → UTF-16 conversion before the
+record blob is serialised into the b-tree cell.  C reference:
+`../sqlite3/src/vdbemem.c (sqlite3VdbeChangeEncoding)` and
+`../sqlite3/src/vdbeaux.c (sqlite3VdbeMakeRecord)`.
+
+Affected vector: `utf16.db` — bucket-M (also bucket-K for the RO
+hex(label) byte-swap, unrelated).  Tagged `pas-skip` for the
+round-trip probe in `MANIFEST.txt`.
 
 _End of file._

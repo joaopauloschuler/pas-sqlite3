@@ -205,7 +205,7 @@ regressions without human triage.
 
 - [~] **9.2.2** Read-only parity probe — `bin/TestVectorReadOnly` + per-vector `*.queries.sql` (11 vectors). Bucket-A FIXED in 9.2.divbug.A (btreeBeginTrans wrflag gate); the unioned pas-skip list now covers bucket-F (autovacuum/incrvacuum), bucket-G (utf16), bucket-H (withoutrowid), bucket-I (wal/multipage/generated-column round-trip drift) and bucket-J (triggers round-trip crash) plus bucket-C/E for view-cte/partial-index — but those buckets affect 9.2.3/9.2.4 only.  RO probe today: gated=1 ok=1 diverged=0 skipped=10 rc=0; the actual fix lifted SQLITE_READONLY for every vector and the remaining skips are pre-existing non-RO bugs surfaced after bucket-A was lifted.
 
-- [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. Today: gated=1 ok=1 diverged=0 skipped=10 rc=0 (bucket-A umbrella lifted; the 3 round-trip cell-layout divergences it was masking are now triaged under bucket-I, and the triggers round-trip crash under bucket-J).
+- [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. Today (post-9.2.3.followup, cite-aware RT filter): gated=8 ok=8 diverged=0 skipped=3 rc=0.  Remaining skips: autovacuum (bucket-L, also bucket-B for schema-change), incrvacuum (bucket-L), utf16 (bucket-M, also bucket-K for RO).  Bucket-A umbrella lifted; bucket-I (4-vector RT cell-layout drift) closed; bucket-J (triggers RT crash) closed.
 
 - [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). 9.2.divbug.C closed (view-cte rename arm), 9.2.divbug.E closed (partial-index RENAME COLUMN aColExpr pin), but both view-cte and partial-index still hit bucket-B at the trailing VACUUM so they stay pas-skip. Today: gated=1 ok=1 diverged=0 skipped=7 rc=0.
 
@@ -345,15 +345,48 @@ regressions without human triage.
     partial-index vector is byte-identical post-RENAME COLUMN; the
     schema-script still pas-skips for bucket-B (trailing VACUUM
     EAccessViolation, unrelated).
+  - [ ] **9.2.divbug.L** Auto-vacuum round-trip page-count drift —
+    `autovacuum.db` (auto_vacuum=FULL, delete at COMMIT triggers
+    freelist truncation) and `incrvacuum.db` (auto_vacuum=INCREMENTAL
+    + explicit `PRAGMA incremental_vacuum(1)`).  Both vectors
+    round-trip to a larger Pas blob than C with diverging page-1
+    header bytes 32..39 (free-page count + freelist trunk).  Neither
+    mutator script contains a bare `VACUUM;` keyword.  Cross-link to
+    **6.28** — the unported `incrVacuumStep` / `relocatePage` /
+    `modifyPagePointer` arms are almost certainly the root cause; the
+    auto-vacuum-at-COMMIT path falls into a less aggressive branch
+    where bucket-B's bare VACUUM crashes outright.  C reference:
+    `../sqlite3/src/btree.c (autoVacuumCommit, incrVacuumStep,
+    relocatePage)`.  Surfaced by 9.2.3.followup once the bucket-A
+    umbrella was lifted from the round-trip gate.  See bucket-L in
+    `src/tests/vectors/DIVERGENCES.md`.
+  - [ ] **9.2.divbug.M** UTF-16 INSERT round-trip stores raw UTF-8
+    bytes — `utf16.db` (PRAGMA encoding='UTF-16le' at create) mutator
+    inserts plain UTF-8 string literals; resulting cell-area bytes on
+    the Pas side carry the unconverted UTF-8 (`c3 a9` for `é`) where
+    the C oracle stores the converted UTF-16LE (`e9 00`).  9.2.divbug.G
+    ported the `OP_String8` conversion arm for SELECT/PRAGMA read
+    paths, but the INSERT / `OP_MakeRecord` write path bypasses it.
+    Audit needed: `sqlite3VdbeMemSetStr` / `sqlite3VdbeChangeEncoding`
+    invocation sites in the cell-serialise codegen — C reference
+    `../sqlite3/src/vdbemem.c (sqlite3VdbeChangeEncoding)` plus
+    `../sqlite3/src/vdbeaux.c (sqlite3VdbeMakeRecord)`.  Surfaced by
+    9.2.3.followup; tagged `pas-skip` with cite `bucket-M` in
+    MANIFEST.  See bucket-M in `src/tests/vectors/DIVERGENCES.md`.
 
-- [ ] **9.2.3.followup** `bin/TestVectorRoundTrip` currently inherits
-  the bucket-A `pas-skip` block from MANIFEST and therefore skips all
-  11 vectors — but bucket-A is a *read-only* open bug; round-trip
-  opens RW and could exercise these vectors for real.  Fix the gate
-  to consult only buckets that actually apply to RW round-trip
-  (drop the bucket-A inheritance for this specific binary), re-run,
-  and triage whatever new buckets surface into 9.2.divbug.* slots
-  above.  Without this, 9.2.3 is a silent no-op gate.
+- [X] **9.2.3.followup** Round-trip parser now cite-aware (mirrors
+  TestVectorSchemaChange's filter): only `pas-skip` cites that name
+  an RT-relevant bucket trigger a skip.  Bucket-A (RO umbrella) plus
+  bucket-B/C/D/E/F/G/H/K (schema-change-only or RO-only) are filtered
+  out.  Result: 3 vectors previously masked behind bucket-A
+  (`partial-index`, `view-cte`, `withoutrowid`) now run and pass
+  byte-identically; 3 new RT-only divergences surfaced and were
+  triaged into bucket-L (auto-vacuum page-count drift, hits
+  autovacuum + incrvacuum — cross-link to 6.28's incrVacuumStep) and
+  bucket-M (UTF-16 INSERT stores raw UTF-8 bytes, utf16.db).  Probe
+  today: gated=8 ok=8 diverged=0 skipped=3 rc=0 (RO gated=5 ok=5;
+  schema-change gated=4 ok=4 — both still rc=0).  See
+  `src/tests/vectors/DIVERGENCES.md` bucket-L / bucket-M.
 
 - [ ] **9.1.6.followup** Categorize the 47 cold opcodes currently
   allow-listed in `src/tests/corpus/COVERAGE_GAPS.md` into either
