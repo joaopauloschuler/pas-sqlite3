@@ -324,6 +324,82 @@ acceptance gate for this section.
   job (not per-commit — the Tcl suite is ~hours).  PR gate stays
   on 9.1 / 9.2 / 9.3.1's seed-set sweep.
 
+#### 9.4 sub-tasks (breakdown 2026-05-13 — execute serially)
+
+- [ ] **9.4.1.a** Inventory script — land `src/tests/tcl/inventory.sh`
+  that walks `../sqlite3/test/*.test`, greps each file for
+  `sqlite3_test_control` / `db_test_init` / `register_dbstat_vtab`
+  /etc. (full tag list: tcl-internal markers, tcl-perf markers),
+  emits `src/tests/tcl/MANIFEST.txt` one line per file: `<tag>\t<path>`.
+  Run it and commit MANIFEST.txt with current snapshot counts.
+- [ ] **9.4.2.0** Plan doc — land `src/tests/tcl/PLAN.md` summarising
+  the FPC↔Tcl bridge approach, list of Tcl C ABI symbols needed
+  (Tcl_CreateInterp, Tcl_Eval, Tcl_CreateObjCommand, Tcl_GetStringResult,
+  Tcl_DeleteInterp, Tcl_NewStringObj, Tcl_SetObjResult, Tcl_GetString,
+  Tcl_ListObjAppendElement, Tcl_NewListObj, Tcl_PkgProvide,
+  Tcl_FindExecutable), and the staged plan 9.4.2.a..9.4.2.g below.
+- [ ] **9.4.2.a** Bridge unit — land `src/tests/tcl/PasTclBridge.pas`
+  with cdecl externs for the symbols listed in 9.4.2.0 PLAN
+  (link via `-k-ltcl8.6` or `-k-ltcl`).  Land smoke gate
+  `src/tests/TestTclBridgeSmoke.pas` that creates a Tcl interp,
+  evals `expr 2+2`, asserts result == "4", deletes interp. Gate:
+  `bin/TestTclBridgeSmoke` rc=0. C ref: `tclsqlite.c:4276` (Tclsqlite3_Init
+  shape) — this task is only the bare bridge, no sqlite3 command yet.
+- [ ] **9.4.2.b** `Sqlite3_Init` exporter — port the minimal
+  `tclsqlite.c:Sqlite3_Init` (registers the `sqlite3` Tcl object
+  command and calls `Tcl_PkgProvide`).  Body still routes through
+  `DbMain` (constructor) and `DbObjCmd` (per-instance dispatcher),
+  both of which are stubs at this stage that return TCL_ERROR with
+  "not implemented".  Build as `bin/libpassqlite3tcl.so` so
+  `load ./bin/libpassqlite3tcl.so Sqlite3` works in tclsh.
+  Smoke gate `bin/TestTclSqliteInit` confirms the load+package-require
+  cycle.
+- [ ] **9.4.2.c** `sqlite3 db1 :memory:` constructor — implement `DbMain`
+  arm that calls `sqlite3_open_v2` against passqlite3 and stores
+  the resulting handle on a `SqliteDb*`-equivalent struct attached
+  to the Tcl object command.  Implement `db close` arm of DbObjCmd
+  (only).  Smoke gate `bin/TestTclSqliteOpen` evals
+  `sqlite3 db1 :memory:; db1 close` and asserts no error.
+  C ref: `tclsqlite.c:DbMain` (4253..), `DbObjCmd close` (2480..).
+- [ ] **9.4.2.d** `db eval $sql` — minimum arm of DbObjCmd that
+  prepares/steps/finalises and returns rows as a flat Tcl list
+  (no column-name binding, no var-bind callback, no script-body
+  arg).  Smoke: `sqlite3 db1 :memory:; db1 eval {create table t(x);
+  insert into t values (1),(2),(3); select x from t}` returns
+  `1 2 3`.  C ref: `tclsqlite.c:dbEvalStep` (1766..) +
+  `DbObjCmd eval` arm (2700..).
+- [ ] **9.4.2.e** `db version`, `db changes`, `db last_insert_rowid`,
+  `db errorcode`, `db nullvalue ?value?` — trivial passthroughs to
+  sqlite3_libversion / sqlite3_changes / sqlite3_last_insert_rowid /
+  sqlite3_errcode plus the `zNull` field on SqliteDb.  Smoke gate
+  `bin/TestTclSqliteMeta`.  C ref: respective arms of DbObjCmd.
+- [ ] **9.4.2.f** `db function NAME ?-argcount N? proc` — register a
+  scalar UDF via sqlite3_create_function with a Tcl trampoline
+  (DbSqlFunc).  Required by ~30% of tcl-feature tests including
+  the simplest ones in tester.tcl bootstrap.  C ref:
+  `tclsqlite.c:DbSqlFunc` (~1118) + `function` arm of DbObjCmd
+  (~2730).
+- [ ] **9.4.2.g** `tester_min.tcl` — land `src/tests/tcl/tester_min.tcl`
+  that re-exports just `do_test`, `do_execsql_test`, `execsql`,
+  `expected`, `set_test_counter`, `finalize_testing`, and the global
+  `db` handle — enough to source a hand-picked simple `.test` file.
+  Body adapted from `../sqlite3/test/tester.tcl:703..` and `941..`.
+  Smoke gate `bin/TestTclTesterMin` sources tester_min.tcl + runs
+  `do_test foo-1.0 {expr 1+1} 2`.
+- [ ] **9.4.3.a** Driver skeleton `src/tests/TclTestDriver.pas` —
+  read `src/tests/tcl/MANIFEST.txt`, for each `tcl-feature` entry
+  fork `tclsh` with `-c "load .../libpassqlite3tcl.so Sqlite3;
+  source .../tester_min.tcl; source <path>"`, capture rc + timing,
+  emit `PASS|FAIL|SKIP <path> <assertions> <duration>` to stdout.
+  Land `bin/TclTestDriver` (no gate yet — gate comes in 9.4.4.a).
+- [ ] **9.4.4.a** First 10-test sweep — pick 10 simplest
+  `tcl-feature` tests (e.g. `select1.test`, `expr1.test`, `where1.test`
+  prefixes), run via TclTestDriver, classify into PASS / FAIL /
+  SKIP, populate `src/tests/tcl/SKIP.md` (with citations to existing
+  Phase-6/7/8 bullets) and `src/tests/tcl/DIVERGENCES.md` (new
+  `9.4.divbug.*` bucket per cluster).  Goal: bootstrap the
+  triage convention.  No CI wiring yet.
+
 ---
 
 ## Phase 10 — CLI tool (`shell.c`, ~12k lines → `passqlite3shell.pas`)
