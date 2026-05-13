@@ -46990,6 +46990,13 @@ var
   pCollIc:    PAnsiChar;
   a1Ic:       i32;
   iColIc:     i32;
+  { 6.28.6.c.2 — locals for the vtab xIntegrity second-pass dispatch
+    (pragma.c:2163..2193, gated by #ifndef SQLITE_OMIT_VIRTUALTABLE). }
+  pVTabIc:    passqlite3vtab.PSqlite3Vtab;
+  pVtbModIc:  passqlite3vtab.PSqlite3Module;
+  pVtbEntryIc: passqlite3vtab.PVtabModule;
+  azVArgIc:   ^PAnsiChar;
+  zModVIc:    PAnsiChar;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
@@ -47770,8 +47777,9 @@ begin
         row walk with NOT NULL / STRICT type / non-STRICT type / CHECK
         constraint checks, plus per-index validation and UNIQUE duplicate
         detection.  FK referential walk (pragma.c:2156..2194) and vtab
-        xIntegrity dispatch (pragma.c:2199..2227) are deferred — those
-        passes are independent of the table loop and live below.
+        xIntegrity dispatch (pragma.c:2163..2193) lives in a second
+        pass over tblHash below; its emission is independent of this
+        per-table walk.
 
         Notes on register layout (same as C):
           reg[2] = "wrong # of entries in index "          — loaded per-arm
@@ -48163,11 +48171,68 @@ begin
         xIc := xIc^.next;
       end;
 
-      { FK referential-integrity walk (pragma.c:2156..2194) and vtab
-        xIntegrity dispatch (pragma.c:2199..2227) are deferred — split
-        out under 6.28.6.c.  Their omission only suppresses error rows
-        for FK orphans and vtab-internal corruption; non-FK / non-vtab
-        databases see complete integrity reporting.  TODO(6.28.6.c). }
+      { 6.28.6.c.2 — vtab xIntegrity second-pass dispatch.  Faithful port
+        of pragma.c:2163..2193 (under #ifndef SQLITE_OMIT_VIRTUALTABLE).
+        Walks the same tblHash a second time; for each IsVirtual(pTab)
+        with an iVersion>=4 module that wired xIntegrity, emits an
+        OP_VCheck whose body (vdbe.c:8409) invokes
+        pModule^.xIntegrity(pVTab, zSchema, zTabName, isQuick, &zErr)
+        and stores any returned error string in reg 3.  An OP_IsNull
+        skip + ResultRow/IfPos/Halt mirrors integrityCheckResultRow
+        (pragma.c:385).  Pas IsVirtual := (eTabType = TABTYP_VTAB);
+        IsOrdinaryTable := (eTabType = TABTYP_NORM). }
+      xIc := pTblsIc^.first;
+      while xIc <> nil do
+      begin
+        pTabIc := PTable2(xIc^.data);
+        if pTabIc = nil then begin xIc := xIc^.next; Continue; end;
+        { tableSkipIntegrityCheck (pragma.c:402) with pObjTab=NULL —
+          TF_Imposter ($00020000) is the only skip predicate here. }
+        if (pTabIc^.tabFlags and u32($00020000)) <> 0 then
+        begin xIc := xIc^.next; Continue; end;
+        if pTabIc^.eTabType = TABTYP_NORM then
+        begin xIc := xIc^.next; Continue; end;          { IsOrdinaryTable }
+        if pTabIc^.eTabType <> TABTYP_VTAB then
+        begin xIc := xIc^.next; Continue; end;          { !IsVirtual }
+        { pragma.c:2174..2177 — if columns not yet parsed, ensure the
+          module is registered (otherwise sqlite3ViewGetColumnNames will
+          fail and we skip the table). }
+        if pTabIc^.nCol <= 0 then
+        begin
+          azVArgIc := pTabIc^.u.vtab.azArg;
+          if azVArgIc = nil then begin xIc := xIc^.next; Continue; end;
+          zModVIc := azVArgIc[0];
+          if zModVIc = nil then begin xIc := xIc^.next; Continue; end;
+          pVtbEntryIc := passqlite3vtab.PVtabModule(
+            passqlite3util.sqlite3HashFind(@db^.aModule, PChar(zModVIc)));
+          if pVtbEntryIc = nil then begin xIc := xIc^.next; Continue; end;
+        end;
+        sqlite3ViewGetColumnNames(pParse, pTabIc);
+        if pTabIc^.u.vtab.p = nil then
+        begin xIc := xIc^.next; Continue; end;
+        pVTabIc := passqlite3vtab.PVTable(pTabIc^.u.vtab.p)^.pVtab;
+        if pVTabIc = nil then begin xIc := xIc^.next; Continue; end;  { NEVER }
+        pVtbModIc := pVTabIc^.pModule;
+        if pVtbModIc = nil then begin xIc := xIc^.next; Continue; end; { NEVER }
+        if pVtbModIc^.iVersion < 4 then
+        begin xIc := xIc^.next; Continue; end;
+        if pVtbModIc^.xIntegrity = nil then
+        begin xIc := xIc^.next; Continue; end;
+        { pragma.c:2185..2190 — emit OP_VCheck with p1=iDb, p2=err reg
+          (3), p3=isQuick, p4=pTab(P4_TABLEREF, bumping nTabRef so the
+          opcode can resolve pVtab at run time).  Skip the result-row
+          emission when the error register stayed NULL. }
+        sqlite3VdbeAddOp3(v, OP_VCheck, iDbIc, 3, isQuickIc);
+        Inc(pTabIc^.nTabRef);
+        sqlite3VdbeAppendP4(v, Pointer(pTabIc), P4_TABLEREF);
+        a1Ic := sqlite3VdbeAddOp1(v, OP_IsNull, 3);
+        { integrityCheckResultRow inline (pragma.c:385). }
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+        sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+        sqlite3VdbeAddOp0(v, OP_Halt);
+        sqlite3VdbeJumpHere(v, a1Ic);
+        xIc := xIc^.next;
+      end;
     end;
 
     { pragma.c:2195..2217 — endCode trailer.  When reg 1 was fully
