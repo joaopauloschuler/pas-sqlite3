@@ -207,7 +207,7 @@ regressions without human triage.
 
 - [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. Today: gated=1 ok=1 diverged=0 skipped=10 rc=0 (bucket-A umbrella lifted; the 3 round-trip cell-layout divergences it was masking are now triaged under bucket-I, and the triggers round-trip crash under bucket-J).
 
-- [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). Today: gated=4 ok=4 diverged=0 skipped=4 rc=0; the 4 OK vectors (simple/multipage/generated-column/triggers) exercise AddColumn + OP_ParseSchema byte-identically against C.
+- [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). 9.2.divbug.C closed (view-cte rename arm), but view-cte still hits bucket-B at the trailing VACUUM so it stays pas-skip. Today: gated=1 ok=1 diverged=0 skipped=7 rc=0.
 
 - [X] **9.2.5** Vector regen script — `src/tests/vectors/regen.sh` walks every `*.sql`, regenerates via C oracle, `cmp`s against committed blob. Skip-tagged (fts5/rtree) skipped; legacy simple/multipage fall back to .dump equivalence (EQUIV_LIST, 3.45.x vintage). Clean run: 11 OK + 2 skipped + 0 mismatch, rc=0.
 
@@ -257,12 +257,21 @@ regressions without human triage.
     unported `incrVacuumStep` / `relocatePage` / `modifyPagePointer`
     arms enumerated in **6.28** (gated on productive ptrmap).  Cross-
     link: closing 6.28's incremental-vacuum step closes this bucket.
-  - [ ] **9.2.divbug.C** `ALTER TABLE … RENAME COLUMN/TABLE` on tables
+  - [X] **9.2.divbug.C** `ALTER TABLE … RENAME COLUMN/TABLE` on tables
     with a dependent VIEW or CTAS-derived table raises
-    `EAccessViolation` in `renameColumnFunc` → `renameTokenFind` NULL
-    deref (1 site: view-cte vector).  Cross-check against
-    `../sqlite3/src/alter.c renameTokenFind` and the
-    `addcolumn_renametokenmap` memory note.
+    `EAccessViolation`.  Root cause: `sqlite3CreateView` always reduced
+    the stored view body (`EXPRDUP_REDUCE`); when `renameTableTest` /
+    `renameColumnFunc` later ran `sqlite3SelectPrep` on it, the resolver
+    wrote `iColumn`/`iTable`/`y.pTab` past the end of EP_TokenOnly/EP_Reduced
+    allocations and trashed the heap.  Fix: under IN_RENAME_OBJECT keep
+    the FULL-size pSelect (build.c:3041..3046) and call
+    `sqlite3RenameExprlistUnmap` on pCNames in the failure cleanup;
+    also gate `ResolveExpr`'s pLeft/pRight recursion behind
+    `EP_TokenOnly|EP_Leaf` (walker.c:71); finally wire the parser
+    `expr ::= ID` rule to call `sqlite3RenameTokenMap` on the freshly
+    allocated Expr (parse.y:1166 tokenExpr) so renameColumnExprCb can
+    locate the source slice for renameEditSql to rewrite.  view-cte
+    vector now reaches the trailing VACUUM (bucket-B) cleanly.
   - [ ] **9.2.divbug.D** `CREATE INDEX` on a WITHOUT ROWID table
     produces byte-different b-tree page payload vs the C oracle (1
     site: withoutrowid vector).  Cross-check

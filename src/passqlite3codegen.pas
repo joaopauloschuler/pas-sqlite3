@@ -9126,8 +9126,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         Exit;
       end;
     end;
-    ResolveExpr(pE^.pLeft);
-    ResolveExpr(pE^.pRight);
+    { walker.c:71 — only descend into pLeft / pRight when the Expr is a full
+      allocation.  Reduced (EP_TokenOnly) or leaf (EP_Leaf) nodes do not
+      have pLeft / pRight fields physically present; reading them walks past
+      the end of the allocation and (in PARSE_MODE_RENAME, where renamed
+      schema is re-parsed via reduced-Expr allocations for views/triggers)
+      surfaces as an EAccessViolation when the resolver chases a bogus
+      pLeft into unmapped memory. }
+    if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
+    begin
+      ResolveExpr(pE^.pLeft);
+      ResolveExpr(pE^.pRight);
+    end;
     { resolve.c:1334 — walk pE^.y.pWin^.pFilter inside the TK_AGG_FUNCTION arm.
       Without this, column refs inside a FILTER (WHERE …) clause stay as TK_ID
       and never become TK_COLUMN, so the FILTER predicate cannot fire at
@@ -39599,7 +39609,21 @@ begin
 
   if pSelect <> nil then
     pSelect^.selFlags := pSelect^.selFlags or SF_View;
-  p^.u.view_pSelect := sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
+  { build.c:3041..3046 — under PARSE_MODE_RENAME the resolver later runs
+    sqlite3SelectPrep on this stored body (renameTableTest, renameColumnFunc,
+    renameQuotefixFunc).  lookupName asserts !ExprHasProperty(pExpr,
+    EP_TokenOnly|EP_Reduced) (resolve.c:303), so the IN_RENAME_OBJECT arm
+    must hand off the FULL-size pSelect rather than an EXPRDUP_REDUCE copy.
+    Without this, the resolver writes pExpr->iColumn / iTable / y.pTab past
+    the end of a reduced/token-only allocation, corrupting the heap and
+    surfacing as an EAccessViolation downstream (9.2.divbug.C). }
+  if InRenameObject(pParse) then
+  begin
+    p^.u.view_pSelect := pSelect;
+    pSelect := nil;
+  end
+  else
+    p^.u.view_pSelect := sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
   p^.pCheck := sqlite3ExprListDup(db, pCNames, EXPRDUP_REDUCE);
   p^.eTabType := TABTYP_VIEW;
   if db^.mallocFailed <> 0 then goto create_view_fail;
@@ -39620,6 +39644,12 @@ begin
 
 create_view_fail:
   sqlite3SelectDelete(db, pSelect);
+  { build.c:3072..3074 — pCNames was stored on the view by reference under
+    IN_RENAME_OBJECT (via the ExprListDup above keeping its RenameToken
+    map entries); the rename pipeline unmaps them here so renameParseCleanup
+    does not chase stale token pointers. }
+  if InRenameObject(pParse) then
+    sqlite3RenameExprlistUnmap(pParse, pCNames);
   sqlite3ExprListDelete(db, pCNames);
 end;
 

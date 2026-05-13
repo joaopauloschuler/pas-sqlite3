@@ -2669,6 +2669,7 @@ var
   temp3_182:   PExpr;
   temp4_182:   PExpr;
   tok_180_z:   PAnsiChar;
+  tok_180_full: TToken;
   tok_181_z0:  PAnsiChar;
   tok_181_z1:  PAnsiChar;
   tok_182_z0:  PAnsiChar;
@@ -3443,11 +3444,21 @@ begin
            is a union — capture token z BEFORE assigning yy454, otherwise
            yy0.z is overwritten by the Expr pointer. }
          tok_180_z := yymsp[0].minor.yy0.z;
+         tok_180_full := yymsp[0].minor.yy0;
          yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[0].minor.yy0, 1);
+           @tok_180_full, 1);
          if yymsp[0].minor.yy454 <> nil then
            PExpr(yymsp[0].minor.yy454)^.w.iOfst :=
              i32(PtrUInt(tok_180_z) - PtrUInt(pPse^.zTail));
+         { parse.y:1166 — under IN_RENAME_OBJECT register the Expr pointer
+           with the originating token span, so renameColumnExprCb's
+           renameTokenFind locates the source slice for renameEditSql to
+           rewrite. tok_180_full snapshot is required: yymsp[0].minor is a
+           union — yy454 above overwrote yy0 in place, so @yymsp[0].minor.yy0
+           would alias the Expr pointer here. }
+         if InRenameObject(pPse) and (yymsp[0].minor.yy454 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(yymsp[0].minor.yy454),
+             @tok_180_full);
        end;
     181: { expr ::= nm DOT nm }
        begin
