@@ -6609,6 +6609,7 @@ procedure btreeEndTransaction(p: PBtree);
 var pBt: PBtShared;
 begin
   pBt := p^.pBt;
+  pBt^.bDoTruncate := 0;   { btree.c:4342 — clear at every txn end. }
   { No shared-cache table-lock lists to clear (SQLITE_OMIT_SHARED_CACHE) }
   if p^.inTrans <> TRANS_NONE then begin
     Dec(pBt^.nTransaction);
@@ -6729,6 +6730,10 @@ begin
   end;
 end;
 
+{ autoVacuumCommit — forward; implemented after PTRMAP_ISPAGE /
+  incrVacuumStep / finalDbSize (all inline or below in same unit). }
+function autoVacuumCommit(p: PBtree): i32; forward;
+
 { btree.c lines 4309-4328: sqlite3BtreeCommitPhaseOne }
 function sqlite3BtreeCommitPhaseOne(p: PBtree; zSuperJrnl: PChar): i32;
 var rc: i32;
@@ -6736,7 +6741,16 @@ begin
   rc := SQLITE_OK;
   if p^.inTrans = TRANS_WRITE then begin
     sqlite3BtreeEnter(p);
-    { no autovacuum in this port }
+    if p^.pBt^.autoVacuum <> 0 then begin
+      rc := autoVacuumCommit(p);
+      if rc <> SQLITE_OK then begin
+        sqlite3BtreeLeave(p);
+        Result := rc;
+        Exit;
+      end;
+    end;
+    if p^.pBt^.bDoTruncate <> 0 then
+      sqlite3PagerTruncateImage(p^.pBt^.pPager, p^.pBt^.nPage);
     rc := sqlite3PagerCommitPhaseOne(p^.pBt^.pPager, zSuperJrnl, 0);
     sqlite3BtreeLeave(p);
   end;
@@ -7809,6 +7823,94 @@ begin
   while (nFin = PENDING_BYTE_PAGE(pBt)) do
     Dec(nFin);
   Result := nFin;
+end;
+
+{ btree.c lines 4194-4277: autoVacuumCommit (forward-declared earlier).
+  Called from sqlite3BtreeCommitPhaseOne when pBt->autoVacuum is set.
+  When !incrVacuum, computes how many trailing pages can be returned to
+  the OS, runs incrVacuumStep over that range, updates the page-1
+  header (size-after-truncate at offset 28, freelist trunk/count at
+  offsets 32/36) and arms pBt^.bDoTruncate so commit-phase-one calls
+  sqlite3PagerTruncateImage. }
+type
+  TxAutovacPagesProc = function(pArg: Pointer; zSchema: PAnsiChar;
+                                nDbPage: u32; nFreePage: u32;
+                                nBytePerPage: u32): u32; cdecl;
+
+function autoVacuumCommit(p: PBtree): i32;
+var
+  rc    : i32;
+  pPgr  : PPager;
+  pBt   : PBtShared;
+  db    : PTsqlite3;
+  nFin  : Pgno;
+  nFree : Pgno;
+  nVac  : Pgno;
+  iFree : Pgno;
+  nOrig : Pgno;
+  iDb   : i32;
+  xCb   : TxAutovacPagesProc;
+begin
+  rc    := SQLITE_OK;
+  pBt   := p^.pBt;
+  pPgr  := pBt^.pPager;
+
+  invalidateAllOverflowCache(pBt);
+  Assert(pBt^.autoVacuum <> 0);
+  if pBt^.incrVacuum = 0 then begin
+    nOrig := btreePagecount(pBt);
+    if PTRMAP_ISPAGE(pBt, nOrig) or (nOrig = PENDING_BYTE_PAGE(pBt)) then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+
+    nFree := get4byte(pBt^.pPage1^.aData + 36);
+    db    := PTsqlite3(p^.db);
+    if (db <> nil) and (db^.xAutovacPages <> nil) then begin
+      iDb := 0;
+      while iDb < db^.nDb do begin
+        if PBtree(db^.aDb[iDb].pBt) = p then break;
+        Inc(iDb);
+      end;
+      xCb := TxAutovacPagesProc(db^.xAutovacPages);
+      nVac := Pgno(xCb(db^.pAutovacPagesArg,
+                       db^.aDb[iDb].zDbSName,
+                       u32(nOrig), u32(nFree), u32(pBt^.pageSize)));
+      if nVac > nFree then nVac := nFree;
+      if nVac = 0 then begin
+        Result := SQLITE_OK;
+        Exit;
+      end;
+    end else begin
+      nVac := nFree;
+    end;
+    nFin := finalDbSize(pBt, nOrig, nVac);
+    if nFin > nOrig then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    if nFin < nOrig then
+      rc := saveAllCursors(pBt, 0, nil);
+    iFree := nOrig;
+    while (iFree > nFin) and (rc = SQLITE_OK) do begin
+      rc := incrVacuumStep(pBt, nFin, iFree, Ord(nVac = nFree));
+      Dec(iFree);
+    end;
+    if ((rc = SQLITE_DONE) or (rc = SQLITE_OK)) and (nFree > 0) then begin
+      rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+      if nVac = nFree then begin
+        put4byte(pBt^.pPage1^.aData + 32, 0);
+        put4byte(pBt^.pPage1^.aData + 36, 0);
+      end;
+      put4byte(pBt^.pPage1^.aData + 28, u32(nFin));
+      pBt^.bDoTruncate := 1;
+      pBt^.nPage := nFin;
+    end;
+    if rc <> SQLITE_OK then
+      sqlite3PagerRollback(pPgr);
+  end;
+
+  Result := rc;
 end;
 
 { btree.c:4161 — perform a single unit of work towards an incremental

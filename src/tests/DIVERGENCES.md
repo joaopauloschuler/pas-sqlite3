@@ -15,5 +15,13 @@ survive the mask are real port drift.
 
 | source | tier | tag | status | cite | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|--------|------|---------|---------|---------------|--------------------------|
+| src/tests/DiagArith.pas | tier2 | dql | pas-strict | - | 131 | 4 | stdout | `SELECT 9223372036854775807 + 1` |
+| src/tests/DiagFeatureProbe.pas | tier2 | mixed | pas-strict | - | 34 | 2 | db-blob | `CREATE TABLE t(a, b, c); ALTER TABLE t DROP COLUMN b; SELECT count(*) FROM pragm...` |
+| src/tests/DiagScalarFunc.pas | tier2 | dql | pas-strict | - | 85 | 3 | rc | `SELECT soundex('Robert')` |
+| src/tests/DiagMoreFunc.pas | tier2 | dql | pas-strict | - | 73 | 7 | stdout | `SELECT pi()` |
+| src/tests/DiagFunctions.pas | tier2 | dql | pas-strict | - | 72 | 1 | stdout | `SELECT 9223372036854775807 + 1` |
+| src/tests/DiagCast.pas | tier2 | dql | pas-strict | - | 55 | 1 | stdout | `SELECT 9223372036854775807+1` |
+| src/tests/DiagDml.pas | tier2 | dml | pas-strict | - | 14 | 1 | db-blob | `CREATE TABLE s(x,y); CREATE TABLE d(x,y); INSERT INTO s VALUES(1,10),(2,20),(3,3...` |
+| src/tests/DiagDropTable.pas | tier2 | ddl | pas-strict | - | 6 | 5 | db-blob | `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ; DROP TABLE t; SELECT * FROM t` |
 
 _End of file._
