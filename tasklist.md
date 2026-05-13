@@ -479,10 +479,10 @@ partial landings cannot silently no-op.
       "after window rewrite" select.c:7693, 0x20000 for "Transform
       DISTINCT into GROUP BY" select.c:8192).  Landed: "after window
       rewrite" (mask 0x40) at codegen.pas after the sqlite3WindowRewrite
-      call in the window-arm gate.  Deferred (no Pas host yet):
-      "dropping superfluous ORDER BY" (select.c:7631) — the
-      IgnorableDistinct(pDest) pOrderBy-drop arm has no Pas counterpart
-      (sqlite3SelectPrep runs unconditionally with pOrderBy attached);
+      call in the window-arm gate.  Also landed under 10.1.42.a.11:
+      "dropping superfluous ORDER BY" (select.c:7631, 0x800) — the
+      IgnorableDistinct(pDest) pOrderBy-drop arm now fires post `begin
+      processing` / pre `sqlite3SelectPrep`.  Still deferred:
       "Transform DISTINCT into GROUP BY" (select.c:8192) — the SF_Distinct
       → pGroupBy optimizer arm (post-FROM-clause analysis) is not ported.
       Both land when the surrounding optimizer arms land.
@@ -622,9 +622,11 @@ partial landings cannot silently no-op.
       0x4000 WHERE-clause push-down and unused-col NULL TREETRACE arms can land.
     - [ ] **10.1.42.a.10** Port the all-FROM-clause final analysis loop
       (select.c:8146) so the 0x8000 TREETRACE arm can land.
-    - [ ] **10.1.42.a.11** Port the optimizer arm that drops superfluous
-      ORDER BY (select.c:7631, mask 0x800) so the deferred 10.1.42.a.4
-      arm can land.
+    - [X] **10.1.42.a.11** Ported the top-level superfluous-ORDER-BY drop
+      (select.c:7625..7644, IgnorableDistinct, mask 0x800) post `begin
+      processing` / pre `sqlite3SelectPrep`; clears p^.pOrderBy via
+      sqlite3ParserAddCleanup(@sqlite3ExprListDeleteGeneric, ...) and masks
+      off SF_Distinct, with 0x800 TREETRACE `dropping superfluous ORDER BY`.
     - [ ] **10.1.42.a.12** Port the DISTINCT→GROUP BY transform
       (select.c:8192, mask 0x20000) so the deferred 10.1.42.a.4 arm can land.
   - [X] **10.1.42.c** `sqlite3DebugPrintf` ported (printf.c:1514..1532) into passqlite3printf.pas; routes through sqlite3FormatStr → stdout+fflush.

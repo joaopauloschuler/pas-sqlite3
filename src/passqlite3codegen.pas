@@ -25917,6 +25917,36 @@ begin
   if (sqlite3TreeTrace and $1) <> 0 then
     sqlite3DebugPrintf('begin processing:'#10, []);
   {$ENDIF}
+  { 10.1.42.a.11 — Drop top-level superfluous ORDER BY when the destination
+    can ignore order (select.c:7625..7644).
+       if( IgnorableDistinct(pDest) ){
+         ...
+         if( p->pOrderBy ){
+           TREETRACE(0x800,...);
+           sqlite3ParserAddCleanup(pParse, sqlite3ExprListDeleteGeneric,
+                                   p->pOrderBy);
+           p->pOrderBy = 0;
+         }
+         p->selFlags &= ~(u32)SF_Distinct;
+       }
+    IgnorableDistinct(X) := X^.eDest <= SRT_DistQueue (sqliteInt.h:3734). }
+  if (pDest <> nil) and (pDest^.eDest <= SRT_DistQueue) then
+  begin
+    Assert((pDest^.eDest = SRT_Exists)    or (pDest^.eDest = SRT_Discard) or
+           (pDest^.eDest = SRT_DistQueue) or (pDest^.eDest = SRT_DistFifo),
+           'IgnorableDistinct invariant');
+    if p^.pOrderBy <> nil then
+    begin
+      {$IFDEF SQLITE_DEBUG}
+      if (sqlite3TreeTrace and $800) <> 0 then
+        sqlite3DebugPrintf('dropping superfluous ORDER BY:'#10, []);
+      {$ENDIF}
+      sqlite3ParserAddCleanup(pParse,
+        @sqlite3ExprListDeleteGeneric, p^.pOrderBy);
+      p^.pOrderBy := nil;
+    end;
+    p^.selFlags := p^.selFlags and (not u32(SF_Distinct));
+  end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
   {$IFDEF SQLITE_DEBUG}
@@ -29550,7 +29580,7 @@ begin
       7047  Move HAVING into WHERE                 — deferred (no host)
       7199  After count-of-view optimization       — deferred (no host)
       7369  EXISTS-to-JOIN optimization            — LANDED (a.3)
-      7631  dropping superfluous ORDER BY (0x800)  — deferred (no host)
+      7631  dropping superfluous ORDER BY (0x800)  — LANDED (a.11)
       7693  after window rewrite (0x40)            — LANDED (a.4)
       7737..7756 FULL/LEFT/RIGHT-JOIN simpl (0x1000) — deferred (a.5,
             no outer-join simplifier loop in Pas's sqlite3Select)
