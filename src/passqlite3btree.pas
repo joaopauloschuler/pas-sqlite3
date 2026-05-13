@@ -3889,20 +3889,129 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  Auto-vacuum stubs — ISAUTOVACUUM is always false in this port
+  Auto-vacuum / pointer-map core (btree.c:1036..1148)
+
+  ptrmapPageno   — btree.c:1036..1048 — pointer-map page index for `pgno`.
+  ptrmapPut      — btree.c:1060..1110 — write/refresh a ptrmap entry.
+  ptrmapGet      — btree.c:1119..1148 — read a ptrmap entry.
   --------------------------------------------------------------------------- }
 
-procedure ptrmapPut(pBt: PBtShared; key: Pgno; eType: u8; parent: Pgno;
-                    pRC: Pi32);
+{ ptrmapPageno — btree.c:1036..1048.  Return the page number of the
+  pointer-map page containing the entry for input page `pg`.  Returns 0
+  for pg<2 (no ptrmap entry for the header page or page 0). }
+function ptrmapPageno(pBt: PBtShared; pg: Pgno): Pgno;
+var
+  nPagesPerMapPage: i32;
+  iPtrMap, ret: Pgno;
 begin
-  { auto-vacuum not supported in this port }
+  if pg < 2 then begin
+    Result := 0;
+    Exit;
+  end;
+  nPagesPerMapPage := i32(pBt^.usableSize div 5) + 1;
+  iPtrMap := (pg - 2) div Pgno(nPagesPerMapPage);
+  ret := iPtrMap * Pgno(nPagesPerMapPage) + 2;
+  if ret = PENDING_BYTE_PAGE(pBt) then
+    Inc(ret);
+  Result := ret;
 end;
 
+{ PTRMAP_PTROFFSET — btree.c #define: 5*(key-ptrmap-2).  Returns -1 when
+  `key` itself happens to be a ptrmap page (caller treats as corruption). }
+function PTRMAP_PTROFFSET(iPtrmap, key: Pgno): i32; inline;
+begin
+  if key = iPtrmap then Result := -1
+  else Result := i32((key - iPtrmap - 1)) * 5;
+end;
+
+{ ptrmapPut — btree.c:1060..1110 }
+procedure ptrmapPut(pBt: PBtShared; key: Pgno; eType: u8; parent: Pgno;
+                    pRC: Pi32);
+var
+  pDbPg  : PDbPage;       { btree.c:1061 — the pointer map page }
+  pPtrmap: Pu8;            { btree.c:1062 — pointer map data }
+  iPtrmap: Pgno;           { btree.c:1063 — pointer map page number }
+  offset: i32;             { btree.c:1064 — offset in pointer map page }
+  rc: i32;                 { btree.c:1065 — return code from subfunctions }
+begin
+  if pRC^ <> SQLITE_OK then Exit;
+
+  Assert(pBt^.autoVacuum <> 0);
+  if key = 0 then begin
+    pRC^ := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+  iPtrmap := ptrmapPageno(pBt, key);
+  rc := sqlite3PagerGet(pBt^.pPager, iPtrmap, @pDbPg, 0);
+  if rc <> SQLITE_OK then begin
+    pRC^ := rc;
+    Exit;
+  end;
+  if PChar(sqlite3PagerGetExtra(pDbPg))[0] <> #0 then begin
+    { btree.c:1084..1090 — first byte of extra data is MemPage.isInit; if
+      it is set, the page is also being used as a btree page. }
+    pRC^ := SQLITE_CORRUPT_BKPT;
+    sqlite3PagerUnref(pDbPg);
+    Exit;
+  end;
+  offset := PTRMAP_PTROFFSET(iPtrmap, key);
+  if offset < 0 then begin
+    pRC^ := SQLITE_CORRUPT_BKPT;
+    sqlite3PagerUnref(pDbPg);
+    Exit;
+  end;
+  Assert(offset <= i32(pBt^.usableSize) - 5);
+  pPtrmap := Pu8(sqlite3PagerGetData(pDbPg));
+
+  if (eType <> pPtrmap[offset]) or
+     (get4byte(@pPtrmap[offset+1]) <> parent) then
+  begin
+    rc := sqlite3PagerWrite(pDbPg);
+    pRC^ := rc;
+    if rc = SQLITE_OK then begin
+      pPtrmap[offset] := eType;
+      put4byte(@pPtrmap[offset+1], parent);
+    end;
+  end;
+
+  sqlite3PagerUnref(pDbPg);
+end;
+
+{ ptrmapGet — btree.c:1119..1148 }
 function ptrmapGet(pBt: PBtShared; key: Pgno; out pEType: u8;
                    out pPgno: Pgno): i32;
+var
+  pDbPg  : PDbPage;        { btree.c:1120 }
+  iPtrmap: Pgno;           { btree.c:1121 (i32 in C, but holds a Pgno) }
+  pPtrmap: Pu8;            { btree.c:1122 }
+  offset : i32;            { btree.c:1123 }
+  rc     : i32;
 begin
   pEType := 0;
   pPgno  := 0;
+  iPtrmap := ptrmapPageno(pBt, key);
+  rc := sqlite3PagerGet(pBt^.pPager, iPtrmap, @pDbPg, 0);
+  if rc <> 0 then begin
+    Result := rc;
+    Exit;
+  end;
+  pPtrmap := Pu8(sqlite3PagerGetData(pDbPg));
+
+  offset := PTRMAP_PTROFFSET(iPtrmap, key);
+  if offset < 0 then begin
+    sqlite3PagerUnref(pDbPg);
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+  Assert(offset <= i32(pBt^.usableSize) - 5);
+  pEType := pPtrmap[offset];
+  pPgno  := get4byte(@pPtrmap[offset+1]);
+
+  sqlite3PagerUnref(pDbPg);
+  if (pEType < 1) or (pEType > 5) then begin
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
   Result := SQLITE_OK;
 end;
 
@@ -3931,9 +4040,46 @@ begin
   end;
 end;
 
+{ setChildPtrmaps — btree.c:3831..3860.
+  Set the pointer-map entries for all children of page pPage.  Also, if
+  pPage contains cells that point to overflow pages, set the pointer map
+  entries for the overflow pages as well. }
 function setChildPtrmaps(pPage: PMemPage): i32;
+var
+  i, nCell, rc: i32;
+  pBt: PBtShared;
+  pg: Pgno;
+  pCell: Pu8;
+  childPgno: Pgno;
 begin
-  Result := SQLITE_OK;
+  pBt := pPage^.pBt;
+  pg  := pPage^.pgno;
+
+  if pPage^.isInit <> 0 then rc := SQLITE_OK
+  else rc := btreeInitPage(pPage);
+  if rc <> SQLITE_OK then begin
+    Result := rc;
+    Exit;
+  end;
+  nCell := pPage^.nCell;
+
+  for i := 0 to nCell - 1 do begin
+    pCell := findCell(pPage, i);
+
+    ptrmapPutOvflPtr(pPage, pPage, pCell, @rc);
+
+    if pPage^.leaf = 0 then begin
+      childPgno := get4byte(pCell);
+      ptrmapPut(pBt, childPgno, PTRMAP_BTREE, pg, @rc);
+    end;
+  end;
+
+  if pPage^.leaf = 0 then begin
+    childPgno := get4byte(@pPage^.aData[pPage^.hdrOffset + 8]);
+    ptrmapPut(pBt, childPgno, PTRMAP_BTREE, pg, @rc);
+  end;
+
+  Result := rc;
 end;
 
 { ===========================================================================
@@ -7522,6 +7668,126 @@ begin
   Result := rc;
 end;
 
+{ PTRMAP_ISPAGE — btreeInt.h:628.  True iff `pg` is itself a ptrmap page. }
+function PTRMAP_ISPAGE(pBt: PBtShared; pg: Pgno): Boolean; inline;
+begin
+  Result := ptrmapPageno(pBt, pg) = pg;
+end;
+
+{ incrVacuumStep — btree.c:4034..4128.
+  Perform one step of an incremental vacuum.  Moves the page at `iLastPg`
+  off the tail of the file if possible, freeing it for truncation.
+  Returns SQLITE_DONE when there is no productive work; SQLITE_OK if more
+  work remains; or an error code on failure.
+
+  Cite: btree.c:4034..4128 (caller bCommit==1 means auto-vacuum-at-commit,
+  bCommit==0 means PRAGMA incremental_vacuum). }
+function incrVacuumStep(pBt: PBtShared; nFin: Pgno; iLastPg: Pgno;
+                        bCommit: i32): i32;
+var
+  nFreeList: Pgno;          { btree.c:4035 }
+  rc       : i32;
+  eType    : u8;
+  iPtrPage : Pgno;
+  iFreePg  : Pgno;
+  pFreePg  : PMemPage;
+  pLastPg  : PMemPage;
+  eMode    : u8;
+  iNear    : Pgno;
+  dbSize   : Pgno;
+begin
+  Assert(iLastPg > nFin);
+
+  if (not PTRMAP_ISPAGE(pBt, iLastPg)) and
+     (iLastPg <> PENDING_BYTE_PAGE(pBt)) then
+  begin
+    nFreeList := get4byte(@pBt^.pPage1^.aData[36]);
+    if nFreeList = 0 then begin
+      Result := SQLITE_DONE;
+      Exit;
+    end;
+
+    rc := ptrmapGet(pBt, iLastPg, eType, iPtrPage);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    if eType = PTRMAP_ROOTPAGE then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+
+    if eType = PTRMAP_FREEPAGE then begin
+      if bCommit = 0 then begin
+        { btree.c:4058..4073 — remove the page from the free-list.  Not
+          required when bCommit is non-zero (free-list is truncated to
+          zero after this function returns in that case). }
+        rc := allocateBtreePage(pBt, pFreePg, iFreePg, iLastPg,
+                                BTALLOC_EXACT);
+        if rc <> SQLITE_OK then begin
+          Result := rc;
+          Exit;
+        end;
+        Assert(iFreePg = iLastPg);
+        releasePage(pFreePg);
+      end;
+    end else begin
+      { btree.c:4074..4117 — relocate pLastPg to a free page near the
+        beginning of the file. }
+      eMode := BTALLOC_ANY;
+      iNear := 0;
+
+      rc := btreeGetPage(pBt, iLastPg, pLastPg, 0);
+      if rc <> SQLITE_OK then begin
+        Result := rc;
+        Exit;
+      end;
+
+      { btree.c:4085..4095 — if bCommit, loop until a free page below
+        nFin is found; otherwise the loop runs once. }
+      if bCommit = 0 then begin
+        eMode := BTALLOC_LE;
+        iNear := nFin;
+      end;
+      repeat
+        dbSize := btreePagecount(pBt);
+        rc := allocateBtreePage(pBt, pFreePg, iFreePg, iNear, eMode);
+        if rc <> SQLITE_OK then begin
+          releasePage(pLastPg);
+          Result := rc;
+          Exit;
+        end;
+        releasePage(pFreePg);
+        if iFreePg > dbSize then begin
+          releasePage(pLastPg);
+          Result := SQLITE_CORRUPT_BKPT;
+          Exit;
+        end;
+      until (bCommit = 0) or (iFreePg <= nFin);
+      Assert(iFreePg < iLastPg);
+
+      rc := relocatePage(pBt, pLastPg, eType, iPtrPage, iFreePg, bCommit);
+      releasePage(pLastPg);
+      if rc <> SQLITE_OK then begin
+        Result := rc;
+        Exit;
+      end;
+    end;
+  end;
+
+  if bCommit = 0 then begin
+    { btree.c:4120..4126 — step iLastPg back past PENDING_BYTE_PAGE and
+      any ptrmap pages, then schedule truncation. }
+    repeat
+      Dec(iLastPg);
+    until (iLastPg <> PENDING_BYTE_PAGE(pBt)) and
+          (not PTRMAP_ISPAGE(pBt, iLastPg));
+    pBt^.bDoTruncate := 1;
+    pBt^.nPage := iLastPg;
+  end;
+  Result := SQLITE_OK;
+end;
+
 { btree.c:4135 — given an auto-vacuum DB of nOrig pages with nFree free
   pages, return the expected size in pages following an auto-vacuum. }
 function finalDbSize(pBt: PBtShared; nOrig: Pgno; nFree: Pgno): Pgno;
@@ -7548,9 +7814,7 @@ end;
 { btree.c:4161 — perform a single unit of work towards an incremental
   vacuum.  A write-transaction must be open.  Returns SQLITE_DONE if
   the vacuum is complete, SQLITE_OK if more work remains, or an error
-  code.  Auto-vacuum is not productive in this port — pBt^.autoVacuum
-  is always 0 with the default build, so this routine always returns
-  SQLITE_DONE.  Faithful 1:1 with the upstream entry. }
+  code.  Faithful 1:1 with btree.c:4161..4202. }
 function sqlite3BtreeIncrVacuum(p: PBtree): i32;
 var
   pBt   : PBtShared;
@@ -7578,11 +7842,7 @@ begin
       if rc = SQLITE_OK then
       begin
         invalidateAllOverflowCache(pBt);
-        { incrVacuumStep is not productively ported (ptrmap is stubbed —
-          this branch is unreachable in the default build because
-          autoVacuum=0 above).  Return SQLITE_DONE for safety so an
-          unexpected autoVacuum=1 caller does not corrupt the file. }
-        rc := SQLITE_DONE;
+        rc := incrVacuumStep(pBt, nFin, nOrig, 0);
       end;
       if rc = SQLITE_OK then
       begin
