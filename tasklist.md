@@ -263,11 +263,17 @@ regressions without human triage.
     generated-column).  Likely surface: cell-packing / freeblock /
     freelist ordering mismatch.  C ref:
     `../sqlite3/src/btree.c dropCell / insertCell / allocateSpace`.
-  - [ ] **9.2.divbug.J** Round-trip mutator on triggers.db crashes
-    with EAccessViolation when the BEFORE/AFTER row triggers fire (1
-    site).  Likely surface: NULL deref in `codeRowTrigger` /
-    NEW-OLD column reference codegen.  C ref:
-    `../sqlite3/src/trigger.c codeRowTrigger`.
+  - [X] **9.2.divbug.J** Round-trip mutator on triggers.db crashes
+    with EAccessViolation when the BEFORE/AFTER row triggers fire.
+    FIXED: `sqlite3VdbeClearObject` released `aMem`/`aVar`/`pVList`/`pFree`
+    unconditionally, but trigger sub-vdbes (`codeRowTrigger`) never
+    transit `VdbeMakeReady` and are deleted while still in
+    `VDBE_INIT_STATE`, so those fields hold raw-malloc garbage
+    (`VdbeCreate` only zeroes from `aOp` onwards — vdbeaux.c:30).
+    Gated the release block on `eVdbeState != VDBE_INIT_STATE` to
+    mirror vdbeaux.c:3747..3751.  triggers.db now runs cleanly; its
+    remaining db-blob divergence (byte 8185) is bucket-I cell-layout
+    drift, re-classified in MANIFEST.
   - [ ] **9.2.divbug.B** Bare `VACUUM;` raises `EAccessViolation` on
     the Pascal port (1 site: autovacuum vector).  Almost certainly the
     unported `incrVacuumStep` / `relocatePage` / `modifyPagePointer`

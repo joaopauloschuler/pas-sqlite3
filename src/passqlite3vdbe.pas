@@ -4853,26 +4853,35 @@ begin
     vdbeReleaseColNames(p^.aColName, i32(p^.nResAlloc) * COLNAME_N);
     sqlite3DbFree(db, p^.aColName);
   end;
-  { Free aMem registers }
-  if p^.aMem <> nil then begin
-    for i := 0 to p^.nMem - 1 do begin
-      if (p^.aMem[i].flags and (MEM_Dyn or MEM_Agg)) <> 0 then
-        sqlite3VdbeMemRelease(@p^.aMem[i]);
+  { Gate aMem / aVar / pVList / pFree release on eVdbeState != INIT.
+    Trigger sub-vdbes (codeRowTrigger) are created via VdbeCreate, never
+    transit VdbeMakeReady, and are deleted while still in VDBE_INIT_STATE.
+    Their nVar/aVar/aMem/pVList/pFree fields are raw-malloc garbage in
+    that case (VdbeCreate only zeroes from aOp onwards — see vdbeaux.c:30
+    and the comment in TVdbe at the "Zero-initialised boundary" line).
+    C mirrors this gate at vdbeaux.c:3747..3751 (9.2.divbug.J). }
+  if p^.eVdbeState <> VDBE_INIT_STATE then begin
+    { Free aMem registers }
+    if p^.aMem <> nil then begin
+      for i := 0 to p^.nMem - 1 do begin
+        if (p^.aMem[i].flags and (MEM_Dyn or MEM_Agg)) <> 0 then
+          sqlite3VdbeMemRelease(@p^.aMem[i]);
+      end;
     end;
+    if p^.pVList <> nil then begin
+      sqlite3DbNNFreeNN(db, p^.pVList);
+      p^.pVList := nil;
+    end;
+    { Release any bound parameter Mem cells.  Mirrors vdbeaux.c:3748 —
+      releaseMemArray(p->aVar, p->nVar).  Required so bind-pointer /
+      bind-text/blob destructors fire on finalize. }
+    if (p^.aVar <> nil) and (p^.nVar > 0) then begin
+      for i := 0 to p^.nVar - 1 do
+        sqlite3VdbeMemRelease(p^.aVar + i);
+    end;
+    if p^.pFree <> nil then
+      sqlite3DbFree(db, p^.pFree);
   end;
-  if p^.pVList <> nil then begin
-    sqlite3DbNNFreeNN(db, p^.pVList);
-    p^.pVList := nil;
-  end;
-  { Release any bound parameter Mem cells.  Mirrors vdbeaux.c:3748 —
-    releaseMemArray(p->aVar, p->nVar).  Required so bind-pointer /
-    bind-text/blob destructors fire on finalize. }
-  if (p^.aVar <> nil) and (p^.nVar > 0) then begin
-    for i := 0 to p^.nVar - 1 do
-      sqlite3VdbeMemRelease(p^.aVar + i);
-  end;
-  if p^.pFree <> nil then
-    sqlite3DbFree(db, p^.pFree);
   sqlite3DbFree(db, p^.zErrMsg);
   sqlite3DbFree(db, p^.zSql);
   sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);

@@ -280,17 +280,23 @@ ordering mismatch.  Reference: `../sqlite3/src/btree.c` `dropCell`,
 
 Affected vectors: `wal.db`, `multipage.db`, `generated-column.db`.
 
-## Bucket J — Round-trip trigger-fire EAccessViolation (9.2.3)
+## Bucket J — Round-trip trigger-fire EAccessViolation (9.2.3) — CLOSED
 
-Symptom: round-trip mutator against `triggers.db` (which fires BEFORE
-/ AFTER row triggers) crashes the Pas port with `EAccessViolation`.
-Surfaced once bucket-A was lifted from the round-trip gate.
+Symptom (historic): round-trip mutator against `triggers.db` crashed
+the Pas port with `EAccessViolation` inside `sqlite3VdbeMemRelease`
+during sub-vdbe teardown.
 
-Likely root cause: NULL deref inside the codegen for a trigger that
-refers to NEW/OLD column references on a WITHOUT ROWID-style or
-generated-column path.  Reference: `../sqlite3/src/trigger.c`
-`codeRowTrigger`.
+Root cause: `sqlite3VdbeClearObject` (passqlite3vdbe.pas) released
+`aMem`/`aVar`/`pVList`/`pFree` unconditionally, but trigger sub-vdbes
+created by `codeRowTrigger` never transit `VdbeMakeReady` and are
+deleted while still in `VDBE_INIT_STATE`.  Those fields therefore held
+raw-malloc garbage (`VdbeCreate` only zeroes from `aOp` onwards —
+vdbeaux.c:30).  C gates the release on
+`eVdbeState != VDBE_INIT_STATE` at vdbeaux.c:3747..3751; the Pas port
+now mirrors that gate (9.2.divbug.J).
 
-Affected vector: `triggers.db`.
+Affected vector: `triggers.db` — now runs cleanly; remaining db-blob
+divergence at byte 8185 is reclassified as bucket-I (cell-layout
+drift).
 
 _End of file._
