@@ -86,6 +86,9 @@ FPC porting traps that recur often enough to call out up-front:
   - [X] **6.28.6** `OP_IntegrityCk` body + `sqlite3BtreeIntegrityCheck` — stub-was-real.
   - [~] **6.28.6.b** Higher-level `PRAGMA integrity_check` walk arms — pragma.c:1792..2194.  Landed: index-row-count cross-check, full row walk (NOT NULL + STRICT exact-type + non-STRICT TEXT/numeric checks + WITHOUT-ROWID key-order check), CHECK constraint arm, per-index validation (missing/imprecise-float/rowid-position/collation-mismatch), UNIQUE duplicate detection.  Deferred to **6.28.6.c**: FK referential walk (pragma.c:2156..2194) + vtab xIntegrity dispatch (pragma.c:2199..2227).  Clean DBs and non-FK/non-vtab corruption now report through the real walk.
   - [X] **6.28.6.a** PRAGMA integrity_check/quick_check wired to emit real OP_IntegrityCk plan (per-attached-db root-page enumeration; pragma.c:1695..1820 + 2195..2217).
+  - [ ] **6.28.6.c** FK referential walk + vtab xIntegrity dispatch — the two arms 6.28.6.b deferred.  Doable subtasks:
+    - [ ] **6.28.6.c.1** FK referential walk (pragma.c:2156..2194) — per-table fkParent/fkChild walker that emits the OP_FkCounter / OP_Found probes against each parent table; mirrors `sqlite3FkCheck` shape but in standalone integrity-check codegen (no statement-level FK accumulator).  Complexity: M.
+    - [ ] **6.28.6.c.2** vtab `xIntegrity` dispatch (pragma.c:2199..2227) — per-table arm that calls the module's `xIntegrity(pVTab, zSchema, zTabName, mFlags, &zErr)` and emits OP_VFilter against the result.  Complexity: S.  Cross-link: needs the vtab `xIntegrity` method slot in the Pas TVTable record (audit first; may already exist from 6.13.B work).
   - [X] **6.28.7** `getRowTrigger` / `codeRowTrigger` / `sqlite3TriggerColmask` — stub-was-real (1:1 with trigger.c:1347 / 1231).
   - [X] **6.28.8** Audit pass on high-priority STUB_INVENTORY entries (#1/#2/#5/#6 CLOSED was-real, #4 DRIFTED-S done in 6.28.4).
   - [X] **6.28.9** Medium-priority audit pass — 5 stub-was-real, 1 DRIFTED-XL (#13 sorter PMA-spill deferred to 5.7.b).
@@ -345,6 +348,16 @@ regressions without human triage.
     partial-index vector is byte-identical post-RENAME COLUMN; the
     schema-script still pas-skips for bucket-B (trailing VACUUM
     EAccessViolation, unrelated).
+  - [ ] **9.2.divbug.K** UTF-16 RO `hex(<text>)` returns byte-swapped
+    pairs — `utf16.db`.  PRAGMA encoding=UTF-16le; selecting
+    `hex(label)` returns the raw byte pairs reversed vs the C oracle.
+    9.2.divbug.G ported the UTF-16 OP_String8 conversion arm for the
+    SELECT/PRAGMA read path, but the `hex()` builtin reads the raw
+    UTF-8 bytes the string was first materialised as.  Likely surface:
+    `hexFunc` / `sqlite3_value_blob` enc-aware conversion.  C ref:
+    `../sqlite3/src/func.c hexFunc` + `vdbemem.c
+    sqlite3VdbeChangeEncoding`.  Surfaced by 9.2.divbug.G's RO probe;
+    sibling bug to bucket-M (the INSERT-side enc bypass).
   - [ ] **9.2.divbug.L** Auto-vacuum round-trip page-count drift —
     `autovacuum.db` (auto_vacuum=FULL, delete at COMMIT triggers
     freelist truncation) and `incrvacuum.db` (auto_vacuum=INCREMENTAL
@@ -360,6 +373,9 @@ regressions without human triage.
     relocatePage)`.  Surfaced by 9.2.3.followup once the bucket-A
     umbrella was lifted from the round-trip gate.  See bucket-L in
     `src/tests/vectors/DIVERGENCES.md`.
+  - [ ] **9.2.divbug.L.1** Port `incrVacuumStep` (btree.c) — page-relocation core; pre-req for both bucket-L and the bare-`VACUUM;` bucket-B (9.2.divbug.B).  Complexity: L.
+  - [ ] **9.2.divbug.L.2** Port `relocatePage` + `modifyPagePointer` (btree.c) — ptrmap walker dependencies for L.1.  Complexity: M.  Cross-link: STUB_INVENTORY ptrmap entry.
+  - [ ] **9.2.divbug.L.3** Wire `autoVacuumCommit` body — once L.1/L.2 land, the auto-vacuum-at-COMMIT path falls into place; bucket-L should close.  Complexity: S.
   - [ ] **9.2.divbug.M** UTF-16 INSERT round-trip stores raw UTF-8
     bytes — `utf16.db` (PRAGMA encoding='UTF-16le' at create) mutator
     inserts plain UTF-8 string literals; resulting cell-area bytes on
