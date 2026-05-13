@@ -33,6 +33,16 @@
                                      CRunSeed / Probe shape used by
                                      DiagWindow / DiagIndexing /
                                      DiagPredicates.
+    ProbeSetupCheck(lbl, setup, check)
+                                  -- single-row probe with a setup script.
+                                     The Pas side splits `setup` on `;` and
+                                     prepares/steps/finalises each statement
+                                     individually (matches DiagOps/DiagPragma
+                                     original semantics); the C side runs
+                                     `setup` through csq_exec.  Then prepares
+                                     `check`, compares prepRc, column-0 int,
+                                     and column-0 text.  Used by DiagOps and
+                                     DiagPragma.
 
   Future additions (intentionally not in v1):
     ProbeOneText(lbl, sql)        -- text-only variant for DiagPrintfFmt.
@@ -52,6 +62,7 @@ var
 
 procedure ProbeOne(const lbl, sql: AnsiString);
 procedure ProbeRows(const lbl, seed, sql: AnsiString);
+procedure ProbeSetupCheck(const lbl, setup, check: AnsiString);
 
 function DiagExitCode: Integer;
 
@@ -240,6 +251,98 @@ begin
     WriteLn('   sql  =', sql);
     WriteLn('   Pas: prep=', pPrep, ' step=', pStep, ' rows="', pCat, '"');
     WriteLn('   C  : prep=', cPrep, ' step=', cStep, ' rows="', cCat, '"');
+  end;
+end;
+
+procedure PasRunSetupCheck(const setup, check: AnsiString;
+                           out checkPrep, val: i32; out txt: AnsiString);
+var
+  db: PTsqlite3;
+  pStmt: PVdbe;
+  rcs: i32;
+  s, stmt2: AnsiString;
+  p: i32;
+  pTxt: PAnsiChar;
+begin
+  checkPrep := -1; val := -99999; txt := '';
+  db := nil;
+  if sqlite3_open(':memory:', @db) <> 0 then Exit;
+  if setup <> '' then begin
+    s := setup;
+    while s <> '' do begin
+      p := Pos(';', s);
+      if p = 0 then begin stmt2 := s; s := ''; end
+      else begin stmt2 := Copy(s, 1, p - 1); s := Copy(s, p + 1, MaxInt); end;
+      stmt2 := Trim(stmt2);
+      if stmt2 = '' then continue;
+      pStmt := nil;
+      if (sqlite3_prepare_v2(db, PAnsiChar(stmt2), -1, @pStmt, nil) = 0)
+        and (pStmt <> nil) then begin
+        repeat rcs := sqlite3_step(pStmt) until rcs <> SQLITE_ROW;
+        sqlite3_finalize(pStmt);
+      end;
+    end;
+  end;
+  pStmt := nil;
+  checkPrep := sqlite3_prepare_v2(db, PAnsiChar(check), -1, @pStmt, nil);
+  if (checkPrep = 0) and (pStmt <> nil) then begin
+    if sqlite3_step(pStmt) = SQLITE_ROW then begin
+      val := sqlite3_column_int(pStmt, 0);
+      pTxt := PAnsiChar(sqlite3_column_text(pStmt, 0));
+      if pTxt <> nil then txt := AnsiString(pTxt);
+    end;
+    sqlite3_finalize(pStmt);
+  end;
+  sqlite3_close(db);
+end;
+
+procedure CRunSetupCheck(const setup, check: AnsiString;
+                         out checkPrep, val: i32; out txt: AnsiString);
+var
+  db: Pcsq_db;
+  pStmt: Pcsq_stmt;
+  pTail, pErr: PChar;
+  pTxt: PAnsiChar;
+begin
+  checkPrep := -1; val := -99999; txt := '';
+  db := nil;
+  if csq_open(':memory:', db) <> 0 then Exit;
+  if setup <> '' then begin
+    pErr := nil;
+    csq_exec(db, PAnsiChar(setup), nil, nil, pErr);
+  end;
+  pStmt := nil; pTail := nil;
+  checkPrep := csq_prepare_v2(db, PAnsiChar(check), -1, pStmt, pTail);
+  if (checkPrep = 0) and (pStmt <> nil) then begin
+    if csq_step(pStmt) = SQLITE_ROW then begin
+      val := csq_column_int(pStmt, 0);
+      pTxt := PAnsiChar(csq_column_text(pStmt, 0));
+      if pTxt <> nil then txt := AnsiString(pTxt);
+    end;
+    csq_finalize(pStmt);
+  end;
+  csq_close(db);
+end;
+
+procedure ProbeSetupCheck(const lbl, setup, check: AnsiString);
+var
+  pPrep, pVal: i32;
+  cPrep, cVal: i32;
+  pTxt, cTxt: AnsiString;
+  ok: Boolean;
+begin
+  PasRunSetupCheck(setup, check, pPrep, pVal, pTxt);
+  CRunSetupCheck  (setup, check, cPrep, cVal, cTxt);
+  ok := (pPrep = cPrep) and (pVal = cVal) and (pTxt = cTxt);
+  if ok then
+    WriteLn('PASS    ', lbl)
+  else
+  begin
+    Inc(diverged);
+    WriteLn('DIVERGE ', lbl);
+    WriteLn('   check=', check);
+    WriteLn('   Pas: prep=', pPrep, ' val=', pVal, ' txt="', pTxt, '"');
+    WriteLn('   C  : prep=', cPrep, ' val=', cVal, ' txt="', cTxt, '"');
   end;
 end;
 
