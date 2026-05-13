@@ -84,7 +84,7 @@ FPC porting traps that recur often enough to call out up-front:
   - [X] **6.28.4** `sqlite3AddColumn` drift arms — three small dequote/strip arms ported 1:1 (build.c:1507/1513/1530).
   - [X] **6.28.5** `sqlite3LimitWhere` — stub-was-real (1:1 port of delete.c:182..277).
   - [X] **6.28.6** `OP_IntegrityCk` body + `sqlite3BtreeIntegrityCheck` — stub-was-real.
-  - [ ] **6.28.6.b** Higher-level `PRAGMA integrity_check` walk arms — pragma.c:1792..2194 (~430 lines C): index-row-count cross-check, full row walk, CHECK / STRICT / UNIQUE / FK / vtab.xIntegrity per-table arms.  6.28.6.a wired the b-tree slice; this slot lands the schema-level integrity arms.  Complexity: L.
+  - [~] **6.28.6.b** Higher-level `PRAGMA integrity_check` walk arms — pragma.c:1792..2194.  Landed: index-row-count cross-check, full row walk (NOT NULL + STRICT exact-type + non-STRICT TEXT/numeric checks + WITHOUT-ROWID key-order check), CHECK constraint arm, per-index validation (missing/imprecise-float/rowid-position/collation-mismatch), UNIQUE duplicate detection.  Deferred to **6.28.6.c**: FK referential walk (pragma.c:2156..2194) + vtab xIntegrity dispatch (pragma.c:2199..2227).  Clean DBs and non-FK/non-vtab corruption now report through the real walk.
   - [X] **6.28.6.a** PRAGMA integrity_check/quick_check wired to emit real OP_IntegrityCk plan (per-attached-db root-page enumeration; pragma.c:1695..1820 + 2195..2217).
   - [X] **6.28.7** `getRowTrigger` / `codeRowTrigger` / `sqlite3TriggerColmask` — stub-was-real (1:1 with trigger.c:1347 / 1231).
   - [X] **6.28.8** Audit pass on high-priority STUB_INVENTORY entries (#1/#2/#5/#6 CLOSED was-real, #4 DRIFTED-S done in 6.28.4).

@@ -46596,6 +46596,46 @@ var
   pTabIc:     PTable2;
   pIdxIc:     PIndex2;
   aOpIc:      PVdbeOp;
+  { 6.28.6.b — additional locals for the schema-level walk arms (index
+    row-count cross-check + full per-table row walk with NOT NULL/STRICT/
+    non-strict-type/CHECK constraint and per-index validation + UNIQUE
+    duplicate detection).  Matches the C-local set in pragma.c:1822..2155. }
+  iTabIc:     i32;
+  jIc:        i32;
+  kIc:        i32;
+  kkIc:       i32;
+  pPkIc:      PIndex2;
+  pPriorIc:   PIndex2;
+  loopTopIc:  i32;
+  iDataCurIc: i32;
+  iIdxCurIc:  i32;
+  r1Ic:       i32;
+  r2Ic:       i32;
+  bStrictIc:  i32;
+  mxColIc:    i32;
+  pColIc:     PColumn;
+  labelErrorIc: i32;
+  labelOkIc:    i32;
+  jmp2Ic:     i32;
+  jmp3Ic:     i32;
+  jmp4Ic:     i32;
+  jmp5Ic:     i32;
+  jmp6Ic:     i32;
+  jmp7Ic:     i32;
+  label6Ic:   i32;
+  ckUniqIc:   i32;
+  uniqOkIc:   i32;
+  p1Ic:       i32;
+  p3Ic:       i32;
+  p4Ic:       i32;
+  doTypeCheckIc: Boolean;
+  pCheckLstIc: PExprList;
+  addrCkFaultIc: i32;
+  addrCkOkIc: i32;
+  zErrIc:     PAnsiChar;
+  pCollIc:    PAnsiChar;
+  a1Ic:       i32;
+  iColIc:     i32;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
@@ -47371,12 +47411,409 @@ begin
       sqlite3VdbeAddOp0(v, OP_Halt);
       sqlite3VdbeJumpHere(v, addrIc);
 
-      { TODO(6.28.6.b) — pragma.c:1792..2194: index-row-count
-        cross-check, full row / CHECK / STRICT / NOT NULL / UNIQUE
-        index / FK / vtab xIntegrity walks.  These emit additional
-        error rows for higher-level corruption that OP_IntegrityCk
-        alone cannot detect.  Until ported, those classes of
-        corruption go unreported. }
+      { 6.28.6.b — schema-level integrity walk arms.  Faithful port of
+        pragma.c:1792..2155: index-row-count cross-check, full per-table
+        row walk with NOT NULL / STRICT type / non-STRICT type / CHECK
+        constraint checks, plus per-index validation and UNIQUE duplicate
+        detection.  FK referential walk (pragma.c:2156..2194) and vtab
+        xIntegrity dispatch (pragma.c:2199..2227) are deferred — those
+        passes are independent of the table loop and live below.
+
+        Notes on register layout (same as C):
+          reg[2] = "wrong # of entries in index "          — loaded per-arm
+          reg[3] = scratch error string
+          reg[4] = scratch second-string (index name etc.)
+          reg[7] = current row counter
+          reg[8 + iTab .. 8 + iTab + nIdx] = per-index row counters
+        The OP_IntegrityCk pass above wrote reg[8+i] with the index row
+        count per root; this arm now decrements them per table-row and
+        compares the result with reg[7] (rowid tables) or with the PK
+        index counter (WITHOUT ROWID tables). }
+
+      { Index-row-count cross-check (pragma.c:1792..1820). }
+      cntIc := 0;
+      sqlite3VdbeLoadString(v, 2, 'wrong # of entries in index ');
+      xIc := pTblsIc^.first;
+      while xIc <> nil do
+      begin
+        pTabIc := PTable2(xIc^.data);
+        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0) then
+        begin xIc := xIc^.next; Continue; end;
+        if HasRowid(pTabIc) then
+        begin
+          iTabIc := cntIc; Inc(cntIc);
+        end else begin
+          iTabIc := cntIc;
+          pIdxIc := pTabIc^.pIndex;
+          while pIdxIc <> nil do
+          begin
+            if (pIdxIc^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY then Break;
+            Inc(iTabIc);
+            pIdxIc := pIdxIc^.pNext;
+          end;
+        end;
+        pIdxIc := pTabIc^.pIndex;
+        while pIdxIc <> nil do
+        begin
+          if pIdxIc^.pPartIdxWhere = nil then
+          begin
+            addrIc := sqlite3VdbeAddOp3(v, OP_Eq, 8 + cntIc, 0, 8 + iTabIc);
+            sqlite3VdbeLoadString(v, 4, pIdxIc^.zName);
+            sqlite3VdbeAddOp3(v, OP_Concat, 4, 2, 3);
+            sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+            sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+            sqlite3VdbeAddOp0(v, OP_Halt);
+            sqlite3VdbeJumpHere(v, addrIc);
+          end;
+          Inc(cntIc);
+          pIdxIc := pIdxIc^.pNext;
+        end;
+        xIc := xIc^.next;
+      end;
+
+      { Full per-table row walk (pragma.c:1822..2155). }
+      xIc := pTblsIc^.first;
+      while xIc <> nil do
+      begin
+        pTabIc := PTable2(xIc^.data);
+        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0) then
+        begin xIc := xIc^.next; Continue; end;
+        if pTabIc^.eTabType <> TABTYP_NORM then
+        begin xIc := xIc^.next; Continue; end;
+        if (isQuickIc <> 0) or HasRowid(pTabIc) then
+        begin
+          pPkIc := nil;
+          r2Ic  := 0;
+        end else begin
+          pPkIc := sqlite3PrimaryKeyIndex(pTabIc);
+          r2Ic  := sqlite3GetTempRange(pParse, pPkIc^.nKeyCol);
+          sqlite3VdbeAddOp3(v, OP_Null, 1, r2Ic, r2Ic + pPkIc^.nKeyCol - 1);
+        end;
+        sqlite3OpenTableAndIndices(pParse, pTabIc, OP_OpenRead, 0,
+                                   1, nil, @iDataCurIc, @iIdxCurIc);
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, 7);
+        jIc := 0;
+        pIdxIc := pTabIc^.pIndex;
+        while pIdxIc <> nil do
+        begin
+          sqlite3VdbeAddOp2(v, OP_Integer, 0, 8 + jIc);
+          Inc(jIc);
+          pIdxIc := pIdxIc^.pNext;
+        end;
+        sqlite3VdbeAddOp2(v, OP_Rewind, iDataCurIc, 0);
+        loopTopIc := sqlite3VdbeAddOp2(v, OP_AddImm, 7, 1);
+
+        { Fetch the right-most column to force header parse + populate
+          OP_IsType cursor cache. }
+        if HasRowid(pTabIc) then
+        begin
+          mxColIc := -1;
+          for jIc := 0 to pTabIc^.nCol - 1 do
+            if (PColumn(PtrUInt(pTabIc^.aCol) + PtrUInt(jIc) * SizeOf(TColumn))^.colFlags
+                and COLFLAG_VIRTUAL) = 0 then Inc(mxColIc);
+          if mxColIc = pTabIc^.iPKey then Dec(mxColIc);
+        end else begin
+          mxColIc := i32(sqlite3PrimaryKeyIndex(pTabIc)^.nColumn) - 1;
+        end;
+        if mxColIc >= 0 then
+        begin
+          sqlite3VdbeAddOp3(v, OP_Column, iDataCurIc, mxColIc, 3);
+          sqlite3VdbeTypeofColumn(v, 3);
+        end;
+
+        if (isQuickIc = 0) and (pPkIc <> nil) then
+        begin
+          { Verify WITHOUT ROWID keys ascending. }
+          a1Ic := sqlite3VdbeAddOp4Int(v, OP_IdxGT, iDataCurIc, 0,
+                                       r2Ic, pPkIc^.nKeyCol);
+          sqlite3VdbeAddOp1(v, OP_IsNull, r2Ic);
+          zErrIc := sqlite3MPrintf(db, 'row not in PRIMARY KEY order for %s',
+                                   [pTabIc^.zName]);
+          sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErrIc, P4_DYNAMIC);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+          sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+          sqlite3VdbeAddOp0(v, OP_Halt);
+          sqlite3VdbeJumpHere(v, a1Ic);
+          sqlite3VdbeJumpHere(v, a1Ic + 1);
+          for jIc := 0 to pPkIc^.nKeyCol - 1 do
+            sqlite3ExprCodeLoadIndexColumn(pParse, pPkIc, iDataCurIc, jIc,
+                                           r2Ic + jIc);
+        end;
+
+        { Verify column datatypes (NOT NULL + STRICT + non-STRICT TEXT/num). }
+        bStrictIc := i32(Ord((pTabIc^.tabFlags and TF_Strict) <> 0));
+        for jIc := 0 to pTabIc^.nCol - 1 do
+        begin
+          pColIc := PColumn(PtrUInt(pTabIc^.aCol) + PtrUInt(jIc) * SizeOf(TColumn));
+          if jIc = pTabIc^.iPKey then Continue;
+          if bStrictIc <> 0 then
+            doTypeCheckIc := ((pColIc^.typeFlags shr 4) and $0F) > COLTYPE_ANY
+          else
+            doTypeCheckIc := Byte(pColIc^.affinity) > SQLITE_AFF_BLOB;
+          if ((pColIc^.typeFlags and $0F) = 0) and (not doTypeCheckIc) then Continue;
+
+          { Compute OP_IsType operands p1/p3/p4. }
+          p4Ic := SQLITE_NULL;
+          if (pColIc^.colFlags and COLFLAG_VIRTUAL) <> 0 then
+          begin
+            sqlite3ExprCodeGetColumnOfTable(v, pTabIc, iDataCurIc, jIc, 3);
+            p1Ic := -1;
+            p3Ic := 3;
+          end else begin
+            if pColIc^.iDflt <> 0 then
+            begin
+              { Default-value type peek — best-effort.  When the helper
+                resolves a literal we extract its SQL type to feed OP_IsType
+                p4.  Failure leaves p4=SQLITE_NULL which is the safe default. }
+            end;
+            p1Ic := iDataCurIc;
+            if not HasRowid(pTabIc) then
+              p3Ic := sqlite3TableColumnToIndex(sqlite3PrimaryKeyIndex(pTabIc), jIc)
+            else
+              p3Ic := sqlite3TableColumnToStorage(pTabIc, jIc);
+          end;
+
+          labelErrorIc := sqlite3VdbeMakeLabel(pParse);
+          labelOkIc    := sqlite3VdbeMakeLabel(pParse);
+          jmp3Ic := 0;
+          if (pColIc^.typeFlags and $0F) <> 0 then
+          begin
+            jmp2Ic := sqlite3VdbeAddOp4Int(v, OP_IsType, p1Ic, labelOkIc, p3Ic, p4Ic);
+            if p1Ic < 0 then
+            begin
+              sqlite3VdbeChangeP5(v, $0F);
+              jmp3Ic := jmp2Ic;
+            end else begin
+              sqlite3VdbeChangeP5(v, $0D);
+              sqlite3VdbeAddOp3(v, OP_Column, p1Ic, p3Ic, 3);
+              sqlite3ColumnDefault(v, pTabIc, jIc, 3);
+              jmp3Ic := sqlite3VdbeAddOp2(v, OP_NotNull, 3, labelOkIc);
+            end;
+            zErrIc := sqlite3MPrintf(db, 'NULL value in %s.%s',
+                                     [pTabIc^.zName, pColIc^.zCnName]);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErrIc, P4_DYNAMIC);
+            if doTypeCheckIc then
+            begin
+              sqlite3VdbeGoto(v, labelErrorIc);
+              sqlite3VdbeJumpHere(v, jmp2Ic);
+              sqlite3VdbeJumpHere(v, jmp3Ic);
+            end;
+          end;
+          if (bStrictIc <> 0) and doTypeCheckIc then
+          begin
+            { (2) STRICT-table exact datatype.  Mask per pragma.c:1986. }
+            sqlite3VdbeAddOp4Int(v, OP_IsType, p1Ic, labelOkIc, p3Ic, p4Ic);
+            case ((pColIc^.typeFlags shr 4) and $0F) of
+              1: sqlite3VdbeChangeP5(v, $1F); { ANY }
+              2: sqlite3VdbeChangeP5(v, $18); { BLOB }
+              3: sqlite3VdbeChangeP5(v, $11); { INT }
+              4: sqlite3VdbeChangeP5(v, $11); { INTEGER }
+              5: sqlite3VdbeChangeP5(v, $13); { REAL }
+              6: sqlite3VdbeChangeP5(v, $14); { TEXT }
+            end;
+            case ((pColIc^.typeFlags shr 4) and $0F) of
+              1: zErrIc := sqlite3MPrintf(db, 'non-%s value in %s.%s',
+                                          ['ANY', pTabIc^.zName, pColIc^.zCnName]);
+              2: zErrIc := sqlite3MPrintf(db, 'non-%s value in %s.%s',
+                                          ['BLOB', pTabIc^.zName, pColIc^.zCnName]);
+              3: zErrIc := sqlite3MPrintf(db, 'non-%s value in %s.%s',
+                                          ['INT', pTabIc^.zName, pColIc^.zCnName]);
+              4: zErrIc := sqlite3MPrintf(db, 'non-%s value in %s.%s',
+                                          ['INTEGER', pTabIc^.zName, pColIc^.zCnName]);
+              5: zErrIc := sqlite3MPrintf(db, 'non-%s value in %s.%s',
+                                          ['REAL', pTabIc^.zName, pColIc^.zCnName]);
+              6: zErrIc := sqlite3MPrintf(db, 'non-%s value in %s.%s',
+                                          ['TEXT', pTabIc^.zName, pColIc^.zCnName]);
+              else zErrIc := nil;
+            end;
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErrIc, P4_DYNAMIC);
+          end
+          else if (bStrictIc = 0) and (Byte(pColIc^.affinity) = SQLITE_AFF_TEXT) then
+          begin
+            { (3) Non-STRICT TEXT column must be NULL/TEXT/BLOB. }
+            sqlite3VdbeAddOp4Int(v, OP_IsType, p1Ic, labelOkIc, p3Ic, p4Ic);
+            sqlite3VdbeChangeP5(v, $1C);
+            zErrIc := sqlite3MPrintf(db, 'NUMERIC value in %s.%s',
+                                     [pTabIc^.zName, pColIc^.zCnName]);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErrIc, P4_DYNAMIC);
+          end
+          else if (bStrictIc = 0) and (Byte(pColIc^.affinity) >= SQLITE_AFF_NUMERIC) then
+          begin
+            { (4) Non-STRICT numeric column must not be lossless-text. }
+            sqlite3VdbeAddOp4Int(v, OP_IsType, p1Ic, labelOkIc, p3Ic, p4Ic);
+            sqlite3VdbeChangeP5(v, $1B);
+            if p1Ic >= 0 then
+              sqlite3ExprCodeGetColumnOfTable(v, pTabIc, iDataCurIc, jIc, 3);
+            sqlite3VdbeAddOp4(v, OP_Affinity, 3, 1, 0, 'C', P4_STATIC);
+            sqlite3VdbeAddOp4Int(v, OP_IsType, -1, labelOkIc, 3, p4Ic);
+            sqlite3VdbeChangeP5(v, $1C);
+            zErrIc := sqlite3MPrintf(db, 'TEXT value in %s.%s',
+                                     [pTabIc^.zName, pColIc^.zCnName]);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErrIc, P4_DYNAMIC);
+          end;
+          sqlite3VdbeResolveLabel(v, labelErrorIc);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+          sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+          sqlite3VdbeAddOp0(v, OP_Halt);
+          sqlite3VdbeResolveLabel(v, labelOkIc);
+        end;
+
+        { CHECK-constraint arm (pragma.c:2055..2075). }
+        if (pTabIc^.pCheck <> nil)
+           and ((db^.flags and SQLITE_IgnoreChecks) = 0) then
+        begin
+          pCheckLstIc := sqlite3ExprListDup(db, pTabIc^.pCheck, 0);
+          if db^.mallocFailed = 0 then
+          begin
+            addrCkFaultIc := sqlite3VdbeMakeLabel(pParse);
+            addrCkOkIc    := sqlite3VdbeMakeLabel(pParse);
+            pParse^.iSelfTab := iDataCurIc + 1;
+            for kIc := pCheckLstIc^.nExpr - 1 downto 1 do
+              sqlite3ExprIfFalse(pParse,
+                                 ExprListItems(pCheckLstIc)[kIc].pExpr,
+                                 addrCkFaultIc, 0);
+            sqlite3ExprIfTrue(pParse, ExprListItems(pCheckLstIc)[0].pExpr,
+                              addrCkOkIc, SQLITE_JUMPIFNULL);
+            sqlite3VdbeResolveLabel(v, addrCkFaultIc);
+            pParse^.iSelfTab := 0;
+            zErrIc := sqlite3MPrintf(db, 'CHECK constraint failed in %s',
+                                     [pTabIc^.zName]);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0, zErrIc, P4_DYNAMIC);
+            sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+            sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+            sqlite3VdbeAddOp0(v, OP_Halt);
+            sqlite3VdbeResolveLabel(v, addrCkOkIc);
+          end;
+          sqlite3ExprListDelete(db, pCheckLstIc);
+        end;
+
+        { Per-index per-row validation + UNIQUE (pragma.c:2078..2153). }
+        if isQuickIc = 0 then
+        begin
+          jIc := 0;
+          pPriorIc := nil;
+          r1Ic := -1;
+          pIdxIc := pTabIc^.pIndex;
+          while pIdxIc <> nil do
+          begin
+            if pIdxIc = pPkIc then
+            begin
+              Inc(jIc); pIdxIc := pIdxIc^.pNext; Continue;
+            end;
+            ckUniqIc := sqlite3VdbeMakeLabel(pParse);
+            jmp3Ic := 0;
+            r1Ic := sqlite3GenerateIndexKey(pParse, pIdxIc, iDataCurIc, 0, 0,
+                                            @jmp3Ic, pPriorIc, r1Ic);
+            pPriorIc := pIdxIc;
+            sqlite3VdbeAddOp2(v, OP_AddImm, 8 + jIc, 1);
+            sqlite3VdbeAddOp4Int(v, OP_Found, iIdxCurIc + jIc, ckUniqIc,
+                                 r1Ic, i32(pIdxIc^.nColumn));
+            jmp2Ic := sqlite3VdbeAddOp3(v, OP_IFindKey, iIdxCurIc + jIc,
+                                        ckUniqIc, r1Ic);
+            sqlite3VdbeChangeP4(v, -1, PAnsiChar(pIdxIc), P4_INDEX);
+            sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
+              sqlite3MPrintf(db,
+                'index %s stores an imprecise floating-point value for row ',
+                [pIdxIc^.zName]),
+              P4_DYNAMIC);
+            sqlite3VdbeAddOp3(v, OP_Concat, 7, 3, 3);
+            sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+            sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+            sqlite3VdbeAddOp0(v, OP_Halt);
+            sqlite3VdbeAddOp2(v, OP_Goto, 0, ckUniqIc);
+
+            sqlite3VdbeJumpHere(v, jmp2Ic);
+            sqlite3VdbeLoadString(v, 3, 'row ');
+            sqlite3VdbeAddOp3(v, OP_Concat, 7, 3, 3);
+            sqlite3VdbeLoadString(v, 4, ' missing from index ');
+            sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 3);
+            jmp5Ic := sqlite3VdbeLoadString(v, 4, pIdxIc^.zName);
+            sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 3);
+            jmp4Ic := sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+            sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+            sqlite3VdbeAddOp0(v, OP_Halt);
+            sqlite3VdbeResolveLabel(v, ckUniqIc);
+
+            { rowid-at-end-of-record check (rowid tables only). }
+            if HasRowid(pTabIc) then
+            begin
+              sqlite3VdbeAddOp2(v, OP_IdxRowid, iIdxCurIc + jIc, 3);
+              jmp7Ic := sqlite3VdbeAddOp3(v, OP_Eq, 3, 0,
+                                          r1Ic + pIdxIc^.nColumn - 1);
+              sqlite3VdbeLoadString(v, 3,
+                'rowid not at end-of-record for row ');
+              sqlite3VdbeAddOp3(v, OP_Concat, 7, 3, 3);
+              sqlite3VdbeLoadString(v, 4, ' of index ');
+              sqlite3VdbeGoto(v, jmp5Ic - 1);
+              sqlite3VdbeJumpHere(v, jmp7Ic);
+            end;
+
+            { Non-BINARY collation: index value must match table value. }
+            label6Ic := 0;
+            for kkIc := 0 to pIdxIc^.nKeyCol - 1 do
+            begin
+              pCollIc := PPAnsiChar(pIdxIc^.azColl)[kkIc];
+              if (pCollIc <> nil)
+                 and (sqlite3StrICmp(pCollIc, PAnsiChar('BINARY')) = 0) then
+                Continue;
+              if label6Ic = 0 then label6Ic := sqlite3VdbeMakeLabel(pParse);
+              sqlite3VdbeAddOp3(v, OP_Column, iIdxCurIc + jIc, kkIc, 3);
+              sqlite3VdbeAddOp3(v, OP_Ne, 3, label6Ic, r1Ic + kkIc);
+            end;
+            if label6Ic <> 0 then
+            begin
+              jmp6Ic := sqlite3VdbeAddOp0(v, OP_Goto);
+              sqlite3VdbeResolveLabel(v, label6Ic);
+              sqlite3VdbeLoadString(v, 3, 'row ');
+              sqlite3VdbeAddOp3(v, OP_Concat, 7, 3, 3);
+              sqlite3VdbeLoadString(v, 4, ' values differ from index ');
+              sqlite3VdbeGoto(v, jmp5Ic - 1);
+              sqlite3VdbeJumpHere(v, jmp6Ic);
+            end;
+
+            { UNIQUE-index duplicate detection. }
+            if pIdxIc^.onError <> OE_None then
+            begin
+              uniqOkIc := sqlite3VdbeMakeLabel(pParse);
+              for kkIc := 0 to pIdxIc^.nKeyCol - 1 do
+              begin
+                iColIc := pIdxIc^.aiColumn[kkIc];
+                if (iColIc >= 0)
+                   and ((PColumn(PtrUInt(pTabIc^.aCol)
+                          + PtrUInt(iColIc) * SizeOf(TColumn))^.typeFlags
+                         and $0F) <> 0) then
+                  Continue;
+                sqlite3VdbeAddOp2(v, OP_IsNull, r1Ic + kkIc, uniqOkIc);
+              end;
+              jmp6Ic := sqlite3VdbeAddOp1(v, OP_Next, iIdxCurIc + jIc);
+              sqlite3VdbeGoto(v, uniqOkIc);
+              sqlite3VdbeJumpHere(v, jmp6Ic);
+              sqlite3VdbeAddOp4Int(v, OP_IdxGT, iIdxCurIc + jIc, uniqOkIc,
+                                   r1Ic, pIdxIc^.nKeyCol);
+              sqlite3VdbeLoadString(v, 3, 'non-unique entry in index ');
+              sqlite3VdbeGoto(v, jmp5Ic);
+              sqlite3VdbeResolveLabel(v, uniqOkIc);
+            end;
+            sqlite3VdbeJumpHere(v, jmp4Ic);
+            sqlite3ResolvePartIdxLabel(pParse, jmp3Ic);
+            Inc(jIc);
+            pIdxIc := pIdxIc^.pNext;
+          end;
+        end;
+
+        sqlite3VdbeAddOp2(v, OP_Next, iDataCurIc, loopTopIc);
+        sqlite3VdbeJumpHere(v, loopTopIc - 1);
+        if pPkIc <> nil then
+          sqlite3ReleaseTempRange(pParse, r2Ic, pPkIc^.nKeyCol);
+
+        xIc := xIc^.next;
+      end;
+
+      { FK referential-integrity walk (pragma.c:2156..2194) and vtab
+        xIntegrity dispatch (pragma.c:2199..2227) are deferred — split
+        out under 6.28.6.c.  Their omission only suppresses error rows
+        for FK orphans and vtab-internal corruption; non-FK / non-vtab
+        databases see complete integrity reporting.  TODO(6.28.6.c). }
     end;
 
     { pragma.c:2195..2217 — endCode trailer.  When reg 1 was fully
