@@ -35,9 +35,9 @@
   in MANIFEST.txt are skipped (corpus skip-and-cite contract).
 
   First divergence prints a one-screen summary (vector, channel, first
-  16-byte window) and exits non-zero.  Re-uses CorpusOracle.pas's
-  FormatRow + ApplyHeaderMask plumbing rather than re-implementing the
-  row-printing contract.
+  16-byte window) and exits non-zero.  Row-printing, exec runners, diff
+  windows, and ResolveRepoRoot all come from TestVectorCommon (the same
+  shared harness used by TestVectorRoundTrip / TestVectorSchemaChange).
 }
 program TestVectorReadOnly;
 
@@ -47,155 +47,11 @@ uses
   passqlite3types,
   passqlite3util,
   passqlite3os,
-  passqlite3main;
+  passqlite3main,
+  TestVectorCommon;
 
 var
   VectorDir: AnsiString;  { resolved at startup — see ResolveRepoRoot }
-
-type
-  PSinkBuf = ^AnsiString;
-
-{ ----------------------------------------------------------------------
-  Row-printing callback — mirrors CorpusOracle.FormatRow exactly.
-
-  Upstream `.mode list` default formatting:
-    * column values joined by '|'
-    * NULL printed as an empty field (sqlite3_exec callback contract:
-      argv[i] == NULL means SQL NULL)
-    * single '\n' (LF) terminator after each row
-    * no header line (.headers OFF is the default)
-  ---------------------------------------------------------------------- }
-
-function FormatRow(nCol: i32; argv: PPAnsiChar): AnsiString;
-var
-  i: i32;
-  pp: PPAnsiChar;
-  cell: PAnsiChar;
-begin
-  Result := '';
-  pp := argv;
-  for i := 0 to nCol - 1 do begin
-    if i > 0 then Result := Result + '|';
-    cell := pp^;
-    if cell <> nil then
-      Result := Result + AnsiString(cell);
-    Inc(pp);
-  end;
-  Result := Result + #10;
-end;
-
-function CRowCb(pArg: Pointer; argc: i32;
-                argv: PPChar; colNames: PPChar): i32; cdecl;
-begin
-  PSinkBuf(pArg)^ := PSinkBuf(pArg)^ + FormatRow(argc, PPAnsiChar(argv));
-  Result := 0;
-end;
-
-function PasRowCb(pArg: Pointer; nCol: i32;
-                  argv: PPAnsiChar; colv: PPAnsiChar): i32; cdecl;
-begin
-  PSinkBuf(pArg)^ := PSinkBuf(pArg)^ + FormatRow(nCol, argv);
-  Result := 0;
-end;
-
-{ ----------------------------------------------------------------------
-  Read-only execution helpers.  Both open the existing .db file via
-  *_open_v2(SQLITE_OPEN_READONLY), run the script, capture rc + stdout
-  + stderr, close.
-  ---------------------------------------------------------------------- }
-
-procedure RunCReadOnly(const dbPath, zSql: AnsiString;
-                      out outStdout, outStderr: AnsiString;
-                      out outRc: i32);
-var
-  db    : Pcsq_db;
-  pzErr : PChar;
-  rc    : i32;
-  sink  : AnsiString;
-begin
-  outStdout := '';
-  outStderr := '';
-  outRc     := SQLITE_OK;
-  db    := nil;
-  pzErr := nil;
-
-  rc := csq_open_v2(PChar(dbPath), db, SQLITE_OPEN_READONLY, nil);
-  if rc <> SQLITE_OK then begin
-    outRc := rc;
-    if db <> nil then begin
-      outStderr := AnsiString(csq_errmsg(db));
-      csq_close(db);
-    end;
-    Exit;
-  end;
-
-  sink := '';
-  rc := csq_exec(db, PChar(zSql), @CRowCb, @sink, pzErr);
-  outStdout := sink;
-  outRc := rc;
-  if pzErr <> nil then begin
-    outStderr := AnsiString(pzErr);
-    csq_free(pzErr);
-  end else if (rc <> SQLITE_OK) and (db <> nil) then
-    outStderr := AnsiString(csq_errmsg(db));
-  csq_close(db);
-end;
-
-procedure RunPasReadOnly(const dbPath, zSql: AnsiString;
-                        out outStdout, outStderr: AnsiString;
-                        out outRc: i32);
-var
-  db    : PTsqlite3;
-  pzErr : PAnsiChar;
-  rc    : i32;
-  sink  : AnsiString;
-begin
-  outStdout := '';
-  outStderr := '';
-  outRc     := SQLITE_OK;
-  db    := nil;
-  pzErr := nil;
-
-  rc := sqlite3_open_v2(PAnsiChar(dbPath), @db, SQLITE_OPEN_READONLY, nil);
-  if rc <> SQLITE_OK then begin
-    outRc := rc;
-    if db <> nil then begin
-      outStderr := AnsiString(sqlite3_errmsg(db));
-      sqlite3_close(db);
-    end;
-    Exit;
-  end;
-
-  sink := '';
-  rc := sqlite3_exec(db, PAnsiChar(zSql), @PasRowCb, @sink, @pzErr);
-  outStdout := sink;
-  outRc := rc;
-  if pzErr <> nil then begin
-    outStderr := AnsiString(pzErr);
-    sqlite3_free(pzErr);
-  end else if (rc <> SQLITE_OK) and (db <> nil) then
-    outStderr := AnsiString(sqlite3_errmsg(db));
-  sqlite3_close(db);
-end;
-
-{ ----------------------------------------------------------------------
-  File / directory helpers.
-  ---------------------------------------------------------------------- }
-
-function ReadFileText(const path: AnsiString): AnsiString;
-var
-  st: TFileStream;
-begin
-  Result := '';
-  if not FileExists(path) then Exit;
-  st := TFileStream.Create(path, fmOpenRead or fmShareDenyNone);
-  try
-    SetLength(Result, st.Size);
-    if st.Size > 0 then st.ReadBuffer(Result[1], st.Size);
-  finally
-    st.Free;
-  end;
-end;
 
 { ----------------------------------------------------------------------
   MANIFEST.txt parser — reads the status tag for each vector.  Per
@@ -298,90 +154,6 @@ begin
 end;
 
 { ----------------------------------------------------------------------
-  Diff helpers.
-  ---------------------------------------------------------------------- }
-
-function FirstDiff(const a, b: AnsiString): i32;
-var
-  i, n: i32;
-begin
-  if Length(a) < Length(b) then n := Length(a) else n := Length(b);
-  for i := 1 to n do
-    if a[i] <> b[i] then begin
-      Result := i;
-      Exit;
-    end;
-  if Length(a) <> Length(b) then Result := n + 1
-  else Result := 0;
-end;
-
-function HexWindow(const s: AnsiString; pos1: i32; n: i32): AnsiString;
-var
-  i, lo, hi: i32;
-  b: byte;
-begin
-  Result := '';
-  if pos1 < 1 then pos1 := 1;
-  lo := pos1;
-  hi := pos1 + n - 1;
-  if hi > Length(s) then hi := Length(s);
-  for i := lo to hi do begin
-    b := Byte(s[i]);
-    if Result <> '' then Result := Result + ' ';
-    Result := Result + LowerCase(IntToHex(b, 2));
-  end;
-end;
-
-function PrintableWindow(const s: AnsiString; pos1: i32; n: i32): AnsiString;
-var
-  i, lo, hi: i32;
-  c: AnsiChar;
-begin
-  Result := '';
-  if pos1 < 1 then pos1 := 1;
-  lo := pos1;
-  hi := pos1 + n - 1;
-  if hi > Length(s) then hi := Length(s);
-  for i := lo to hi do begin
-    c := s[i];
-    if (c >= ' ') and (c < #127) then Result := Result + c
-    else Result := Result + '.';
-  end;
-end;
-
-procedure PrintDivergence(const vector, channel: AnsiString;
-                          const cBlob, pBlob: AnsiString);
-var
-  diffPos: i32;
-begin
-  diffPos := FirstDiff(cBlob, pBlob);
-  Writeln('---- DIVERGENCE ----');
-  Writeln('  vector  : ', vector);
-  Writeln('  channel : ', channel);
-  Writeln('  C  len  : ', Length(cBlob));
-  Writeln('  Pas len : ', Length(pBlob));
-  Writeln('  first diff at byte (1-based) : ', diffPos);
-  Writeln('  C  hex window : ', HexWindow(cBlob, diffPos, 16));
-  Writeln('  C  asc window : "', PrintableWindow(cBlob, diffPos, 16), '"');
-  Writeln('  Pas hex window: ', HexWindow(pBlob, diffPos, 16));
-  Writeln('  Pas asc window: "', PrintableWindow(pBlob, diffPos, 16), '"');
-  Writeln('--------------------');
-end;
-
-function ResolveRepoRoot: AnsiString;
-var
-  binPath, binDir: AnsiString;
-begin
-  binPath := ExpandFileName(ParamStr(0));
-  binDir := ExtractFilePath(binPath);
-  { bin/TestVectorReadOnly → <repo>/bin → <repo> }
-  Result := ExtractFilePath(ExcludeTrailingPathDelimiter(binDir));
-  if (Length(Result) = 0) or (not DirectoryExists(Result + 'src/tests')) then
-    Result := GetCurrentDir + PathDelim;
-  Result := IncludeTrailingPathDelimiter(Result);
-end;
-
-{ ----------------------------------------------------------------------
   Walk every *.queries.sql under src/tests/vectors/.
   ---------------------------------------------------------------------- }
 
@@ -448,11 +220,11 @@ begin
         Inc(divergedThisVector);
       end;
       if cOut <> pOut then begin
-        PrintDivergence(dbName, 'stdout', cOut, pOut);
+        PrintDivergenceRO(dbName, 'stdout', cOut, pOut);
         Inc(divergedThisVector);
       end;
       if cErr <> pErr then begin
-        PrintDivergence(dbName, 'stderr', cErr, pErr);
+        PrintDivergenceRO(dbName, 'stderr', cErr, pErr);
         Inc(divergedThisVector);
       end;
 

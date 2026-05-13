@@ -73,6 +73,17 @@ procedure RunPasExec(const seedPath, workDir, zSql: AnsiString;
                      out outStdout, outStderr: AnsiString;
                      out outRc: i32; out outDbBlob: AnsiString);
 
+{ Read-only runners.  Open the existing dbPath via *_open_v2 with
+  SQLITE_OPEN_READONLY, exec the script, capture rc + stdout + stderr,
+  close.  No workdir copy, no blob readback — the gate is read-side
+  output parity, not file mutation parity (used by TestVectorReadOnly). }
+procedure RunCReadOnly(const dbPath, zSql: AnsiString;
+                       out outStdout, outStderr: AnsiString;
+                       out outRc: i32);
+procedure RunPasReadOnly(const dbPath, zSql: AnsiString;
+                         out outStdout, outStderr: AnsiString;
+                         out outRc: i32);
+
 { Diff / window helpers. }
 function FirstDiff(const a, b: AnsiString): i32;
 function HexWindow(const s: AnsiString; pos1: i32; n: i32): AnsiString;
@@ -84,6 +95,11 @@ function PrintableWindow(const s: AnsiString; pos1: i32; n: i32): AnsiString;
 procedure PrintDivergence(const vector, mutator, channel: AnsiString;
                           const cBlob, pBlob: AnsiString;
                           const mutatorLabel: AnsiString);
+
+{ Read-only variant — no mutator/script line.  Used by TestVectorReadOnly
+  which gates queries.sql vectors that have no per-vector mutator. }
+procedure PrintDivergenceRO(const vector, channel: AnsiString;
+                            const cBlob, pBlob: AnsiString);
 
 function ResolveRepoRoot: AnsiString;
 
@@ -214,6 +230,80 @@ begin
   outDbBlob := ReadFileText(dbPath);
 end;
 
+procedure RunCReadOnly(const dbPath, zSql: AnsiString;
+                       out outStdout, outStderr: AnsiString;
+                       out outRc: i32);
+var
+  db    : Pcsq_db;
+  pzErr : PChar;
+  rc    : i32;
+  sink  : AnsiString;
+begin
+  outStdout := '';
+  outStderr := '';
+  outRc     := SQLITE_OK;
+  db    := nil;
+  pzErr := nil;
+
+  rc := csq_open_v2(PChar(dbPath), db, SQLITE_OPEN_READONLY, nil);
+  if rc <> SQLITE_OK then begin
+    outRc := rc;
+    if db <> nil then begin
+      outStderr := AnsiString(csq_errmsg(db));
+      csq_close(db);
+    end;
+    Exit;
+  end;
+
+  sink := '';
+  rc := csq_exec(db, PChar(zSql), @CRowCb, @sink, pzErr);
+  outStdout := sink;
+  outRc := rc;
+  if pzErr <> nil then begin
+    outStderr := AnsiString(pzErr);
+    csq_free(pzErr);
+  end else if (rc <> SQLITE_OK) and (db <> nil) then
+    outStderr := AnsiString(csq_errmsg(db));
+  csq_close(db);
+end;
+
+procedure RunPasReadOnly(const dbPath, zSql: AnsiString;
+                         out outStdout, outStderr: AnsiString;
+                         out outRc: i32);
+var
+  db    : PTsqlite3;
+  pzErr : PAnsiChar;
+  rc    : i32;
+  sink  : AnsiString;
+begin
+  outStdout := '';
+  outStderr := '';
+  outRc     := SQLITE_OK;
+  db    := nil;
+  pzErr := nil;
+
+  rc := sqlite3_open_v2(PAnsiChar(dbPath), @db, SQLITE_OPEN_READONLY, nil);
+  if rc <> SQLITE_OK then begin
+    outRc := rc;
+    if db <> nil then begin
+      outStderr := AnsiString(sqlite3_errmsg(db));
+      sqlite3_close(db);
+    end;
+    Exit;
+  end;
+
+  sink := '';
+  rc := sqlite3_exec(db, PAnsiChar(zSql), @PasRowCb, @sink, @pzErr);
+  outStdout := sink;
+  outRc := rc;
+  if pzErr <> nil then begin
+    outStderr := AnsiString(pzErr);
+    sqlite3_free(pzErr);
+  end else if (rc <> SQLITE_OK) and (db <> nil) then
+    outStderr := AnsiString(sqlite3_errmsg(db));
+  sqlite3_close(db);
+end;
+
 procedure RunPasExec(const seedPath, workDir, zSql: AnsiString;
                      out outStdout, outStderr: AnsiString;
                      out outRc: i32; out outDbBlob: AnsiString);
@@ -319,6 +409,25 @@ begin
   Writeln('---- DIVERGENCE ----');
   Writeln('  vector  : ', vector);
   Writeln('  ', mutatorLabel, ' : ', mutator);
+  Writeln('  channel : ', channel);
+  Writeln('  C  len  : ', Length(cBlob));
+  Writeln('  Pas len : ', Length(pBlob));
+  Writeln('  first diff at byte (1-based) : ', diffPos);
+  Writeln('  C  hex window : ', HexWindow(cBlob, diffPos, 16));
+  Writeln('  C  asc window : "', PrintableWindow(cBlob, diffPos, 16), '"');
+  Writeln('  Pas hex window: ', HexWindow(pBlob, diffPos, 16));
+  Writeln('  Pas asc window: "', PrintableWindow(pBlob, diffPos, 16), '"');
+  Writeln('--------------------');
+end;
+
+procedure PrintDivergenceRO(const vector, channel: AnsiString;
+                            const cBlob, pBlob: AnsiString);
+var
+  diffPos: i32;
+begin
+  diffPos := FirstDiff(cBlob, pBlob);
+  Writeln('---- DIVERGENCE ----');
+  Writeln('  vector  : ', vector);
   Writeln('  channel : ', channel);
   Writeln('  C  len  : ', Length(cBlob));
   Writeln('  Pas len : ', Length(pBlob));
