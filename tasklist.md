@@ -494,10 +494,8 @@ partial landings cannot silently no-op.
         JT_LEFT/RIGHT/LTORJ simplifier portion is now ported (a.7);
         the IgnorableOrderby FROM-subquery pOrderBy drop + the
         flattenSubquery arm remain deferred.
-      - pushDownWhereTerms (where.c) and
-        disableUnusedSubqueryResultColumns (select.c) are not ported,
-        so the 0x4000 push-down/null-out arms have no callsite to
-        attach to.
+      - pushDownWhereTerms + disableUnusedSubqueryResultColumns +
+        their 0x4000 TREETRACE arms — LANDED under 10.1.42.a.9.
       - select.c:8136..8149 (the post-FROM-loop snapshot, mask 0x8000)
         has no Pas anchor — the snapshot point doesn't exist because
         the loop it terminates doesn't exist.
@@ -614,9 +612,16 @@ partial landings cannot silently no-op.
       sqlite3ParserAddCleanup(@sqlite3ExprListDeleteGeneric, pOrderBy).
       Note: this is the FROM-subquery arm — the top-level `IgnorableOrderby`
       drop (select.c:7631, also 0x800) remains under 10.1.42.a.11.
-    - [ ] **10.1.42.a.9** Port `pushDownWhereTerms` +
-      `disableUnusedSubqueryResultColumns` (select.c:8011/8030) so the
-      0x4000 WHERE-clause push-down and unused-col NULL TREETRACE arms can land.
+    - [X] **10.1.42.a.9** Ported `pushDownWhereTerms` (select.c:5125..5286)
+      and `disableUnusedSubqueryResultColumns` (select.c:5296..5358); wired
+      into the FROM-loop body in sqlite3Select right after the omit-ORDER-BY
+      arm.  Both 0x4000 TREETRACE arms (`After WHERE-clause push-down into
+      subquery N` and `Change unused result columns to NULL for subquery N`)
+      land under `{$IFDEF SQLITE_DEBUG}` plus the `WHERE-clause push-down
+      not possible` else arm.  Adds SQLITE_PushDown ($1000) and
+      SQLITE_NullUnusedCols ($04000000) constants.  Restriction (6c) for
+      partition-less window functions is conservatively bailed (no
+      pushDownWindowCheck helper port).  TestExplainParity 1026/1026.
     - [ ] **10.1.42.a.10** Port the all-FROM-clause final analysis loop
       (select.c:8146) so the 0x8000 TREETRACE arm can land.
     - [X] **10.1.42.a.11** Ported the top-level superfluous-ORDER-BY drop

@@ -1611,6 +1611,8 @@ const
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
   SQLITE_SimplifyJoin   = u32($00002000);  { Convert LEFT JOIN to JOIN (sqliteInt.h:1913) }
   SQLITE_OmitOrderBy    = u32($00040000);  { Omit pointless ORDER BY (sqliteInt.h:1918) }
+  SQLITE_PushDown       = u32($00001000);  { WHERE-clause push-down opt (sqliteInt.h:1912) }
+  SQLITE_NullUnusedCols = u32($04000000);  { NULL unused columns in subqueries (sqliteInt.h:1928) }
   SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
   SQLITE_Coroutines     = u32($02000000);  { Co-routines for subqueries (sqliteInt.h:1927) }
   SQLITE_BalancedMerge  = u32($00200000);  { Balance multi-way merges (sqliteInt.h:1922) }
@@ -10439,6 +10441,231 @@ begin
     end;
   end;
   Result := 0;
+end;
+
+{ pushDownWhereTerms — port of select.c:5125..5286.  Try to copy constant
+  WHERE-clause terms from the outer query down into the WHERE/HAVING of the
+  FROM-clause subquery pSubq.  Returns the number of terms successfully
+  pushed (0 = nothing changed).  Restrictions (1)..(12) from the C comment
+  block are enforced via the gates below; restriction (6c) for window
+  functions is conservatively approximated by bailing whenever the
+  subquery has any window function with PARTITION BY (the optimistic
+  pushDownWindowCheck arm of C is not ported — we only allow window-free
+  or "PARTITION BY present" cases via the restriction (6a) check). }
+function pushDownWhereTerms(pParse: PParse; pSubq: PSelect; pWhere: PExpr;
+                            pSrcList: PSrcList; iSrc: i32): i32;
+var
+  pNew:        PExpr;
+  pSrc:        PSrcItem;
+  nChng:       i32;
+  pSel:        PSelect;
+  notUnionAll: i32;
+  op:          u8;
+  ii:          i32;
+  pList:       PExprList;
+  pColl:       Pointer;
+  x:           TSubstContext;
+begin
+  nChng := 0;
+  pSrc := @SrcListItems(pSrcList)[iSrc];
+  if pWhere = nil then begin Result := 0; Exit; end;
+  if (pSubq^.selFlags and (SF_Recursive or SF_MultiPart)) <> 0 then
+  begin
+    Result := 0; Exit;        { restrictions (2) and (11) }
+  end;
+  if (pSrc^.fg.jointype and (JT_LTORJ or JT_RIGHT)) <> 0 then
+  begin
+    Result := 0; Exit;        { restriction (10) }
+  end;
+
+  if pSubq^.pPrior <> nil then
+  begin
+    notUnionAll := 0;
+    pSel := pSubq;
+    while pSel <> nil do
+    begin
+      op := pSel^.op;
+      Assert((op = TK_ALL) or (op = TK_SELECT)
+          or (op = TK_UNION) or (op = TK_INTERSECT) or (op = TK_EXCEPT));
+      if (op <> TK_ALL) and (op <> TK_SELECT) then
+        notUnionAll := 1;
+      if pSel^.pWin <> nil then begin Result := 0; Exit; end;  { restriction (6b) }
+      pSel := pSel^.pPrior;
+    end;
+    if notUnionAll <> 0 then
+    begin
+      { Compound mixes UNION/INTERSECT/EXCEPT: all result columns of all arms
+        must use BINARY collation (restriction (8)). }
+      pSel := pSubq;
+      while pSel <> nil do
+      begin
+        pList := pSel^.pEList;
+        Assert(pList <> nil);
+        for ii := 0 to pList^.nExpr - 1 do
+        begin
+          pColl := sqlite3ExprCollSeq(pParse, ExprListItems(pList)[ii].pExpr);
+          if sqlite3IsBinary(pColl) = 0 then
+          begin
+            Result := 0; Exit;       { restriction (8) }
+          end;
+        end;
+        pSel := pSel^.pPrior;
+      end;
+    end;
+  end
+  else
+  begin
+    { Non-compound subquery: skip push-down when there is a window function
+      without a PARTITION BY (the optimistic pushDownWindowCheck arm of C
+      isn't ported, so we approximate restriction (6c) by bailing on any
+      partition-less window). }
+    if (pSubq^.pWin <> nil) and (pSubq^.pWin^.pPartition = nil) then
+    begin
+      Result := 0; Exit;
+    end;
+  end;
+
+  if pSubq^.pLimit <> nil then
+  begin
+    Result := 0; Exit;        { restriction (3) }
+  end;
+  while pWhere^.op = TK_AND do
+  begin
+    nChng := nChng + pushDownWhereTerms(pParse, pSubq, pWhere^.pRight,
+                                        pSrcList, iSrc);
+    pWhere := pWhere^.pLeft;
+  end;
+
+  { The restrictions (9a/9b/9c)/(4)/(5)/(12) are now subsumed by
+    sqlite3ExprIsSingleTableConstraint with bAllowSubq=1 — same as the
+    `#if 0` block in C. }
+
+  if sqlite3ExprIsSingleTableConstraint(pWhere, pSrcList, iSrc, 1) <> 0 then
+  begin
+    Inc(nChng);
+    pSubq^.selFlags := pSubq^.selFlags or SF_PushDown;
+    while pSubq <> nil do
+    begin
+      pNew := sqlite3ExprDup(pParse^.db, pWhere, 0);
+      unsetJoinExpr(pNew, -1, 1);
+      x.pParse      := pParse;
+      x.iTable      := pSrc^.iCursor;
+      x.iNewTable   := pSrc^.iCursor;
+      x.isOuterJoin := 0;
+      x.nSelDepth   := 0;
+      x.pEList      := pSubq^.pEList;
+      x.pCList      := findLeftmostExprlist(pSubq);
+      pNew := substExpr(@x, pNew);
+      Assert((pNew <> nil) or (pParse^.nErr <> 0));
+      if (pParse^.nErr = 0) and (pNew^.op = TK_IN)
+         and ExprUseXSelect(pNew) then
+      begin
+        Assert(pNew^.x.pSelect <> nil);
+        pNew^.x.pSelect^.selFlags := pNew^.x.pSelect^.selFlags or SF_ClonedRhsIn;
+        Assert(pWhere <> nil);
+        Assert(pWhere^.op = TK_IN);
+        Assert(ExprUseXSelect(pWhere));
+        Assert(pWhere^.x.pSelect <> nil);
+        pWhere^.x.pSelect^.selFlags := pWhere^.x.pSelect^.selFlags or SF_ClonedRhsIn;
+      end;
+      if (pSubq^.selFlags and SF_Aggregate) <> 0 then
+        pSubq^.pHaving := sqlite3ExprAnd(pParse, pSubq^.pHaving, pNew)
+      else
+        pSubq^.pWhere  := sqlite3ExprAnd(pParse, pSubq^.pWhere, pNew);
+      pSubq := pSubq^.pPrior;
+    end;
+  end;
+  Result := nChng;
+end;
+
+{ disableUnusedSubqueryResultColumns — port of select.c:5296..5358.
+  Walk a FROM-clause subquery's result columns; any column that no caller
+  references (per pItem^.colUsed plus ORDER-BY references) is rewritten to
+  a TK_NULL literal, sparing the inner planner from computing it. }
+function disableUnusedSubqueryResultColumns(pItem: PSrcItem): i32;
+var
+  nCol:    i32;
+  pSub:    PSelect;
+  pX:      PSelect;
+  pTab:    PTable2;
+  j:       i32;
+  iCol:    u16;
+  nChng:   i32;
+  colUsed: Bitmask;
+  m:       Bitmask;
+  pList:   PExprList;
+  pY:      PExpr;
+begin
+  Assert(pItem <> nil);
+  if ((pItem^.fg.fgBits and SRCITEM_FG_IS_CORRELATED) <> 0)
+     or ((pItem^.fg.fgBits2 and u8($02)) <> 0) then  { isCte = fgBits2 bit 1 }
+  begin
+    Result := 0; Exit;
+  end;
+  Assert(pItem^.pSTab <> nil);
+  pTab := pItem^.pSTab;
+  Assert(SrcItemIsSubquery(pItem^.fg));
+  pSub := pItem^.u4.pSubq^.pSelect;
+  Assert(pSub^.pEList^.nExpr = pTab^.nCol);
+  pX := pSub;
+  while pX <> nil do
+  begin
+    if (pX^.selFlags and (SF_Distinct or SF_Aggregate)) <> 0 then
+    begin
+      Result := 0; Exit;
+    end;
+    if (pX^.pPrior <> nil) and (pX^.op <> TK_ALL) then
+    begin
+      { Compound UNION/INTERSECT/EXCEPT subqueries are not eligible (only
+        UNION ALL is). }
+      Result := 0; Exit;
+    end;
+    if pX^.pWin <> nil then
+    begin
+      { Window subqueries are not eligible. }
+      Result := 0; Exit;
+    end;
+    pX := pX^.pPrior;
+  end;
+  colUsed := pItem^.colUsed;
+  if pSub^.pOrderBy <> nil then
+  begin
+    pList := pSub^.pOrderBy;
+    for j := 0 to pList^.nExpr - 1 do
+    begin
+      iCol := ExprListItems(pList)[j].u.x.iOrderByCol;
+      if iCol > 0 then
+      begin
+        Dec(iCol);
+        if iCol >= u16(BMS) - 1 then
+          colUsed := colUsed or (Bitmask(1) shl (BMS - 1))
+        else
+          colUsed := colUsed or (Bitmask(1) shl iCol);
+      end;
+    end;
+  end;
+  nCol := pTab^.nCol;
+  nChng := 0;
+  for j := 0 to nCol - 1 do
+  begin
+    if j < BMS - 1 then m := Bitmask(1) shl j
+                   else m := TOPBIT;
+    if (m and colUsed) <> 0 then continue;
+    pX := pSub;
+    while pX <> nil do
+    begin
+      pY := ExprListItems(pX^.pEList)[j].pExpr;
+      if pY^.op <> TK_NULL then
+      begin
+        pY^.op := TK_NULL;
+        ExprClearProperty(pY, EP_Skip or EP_Unlikely);
+        pX^.selFlags := pX^.selFlags or SF_PushDown;
+        Inc(nChng);
+      end;
+      pX := pX^.pPrior;
+    end;
+  end;
+  Result := nChng;
 end;
 
 { ----------------------------------------------------------------------------
@@ -26120,6 +26347,63 @@ begin
         pSubFC^.pOrderBy := nil;
       end;
 
+      { 10.1.42.a.9 — Predicate push-down + unused result-column null-out.
+        Mirrors select.c:8000..8036 (tag-select-0420 / tag-select-0440).
+        Only meaningful when the i-th FROM item is a subquery.  C runs
+        these after flattenSubquery's per-item codegen pass — Pas runs
+        flattenSubquery later (in the per-item codegen path), so this
+        loop applies the optimisations to the raw subquery WHERE/EList
+        before the flatten attempt sees them. }
+      if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
+        pSubFC := pItem^.u4.pSubq^.pSelect
+      else
+        pSubFC := nil;
+      if (pSubFC <> nil)
+         { CTE eligibility gate (select.c:8005..8006). }
+         and (((pItem^.fg.fgBits2 and u8($02)) = 0)
+              or ((pItem^.u2.pCteUse <> nil)
+                  and (pItem^.u2.pCteUse^.eM10d <> u8(0))  { M10d_Yes }
+                  and (pItem^.u2.pCteUse^.nUse < 2)))
+         and OptimizationEnabled(pParse^.db, SQLITE_PushDown) then
+      begin
+        if pushDownWhereTerms(pParse, pSubFC, p^.pWhere, pTabList, i) <> 0 then
+        begin
+          {$IFDEF SQLITE_DEBUG}
+          { TREETRACE(0x4000) "After WHERE-clause push-down into subquery %d"
+            (select.c:8011..8013). }
+          if (sqlite3TreeTrace and $4000) <> 0 then
+            sqlite3DebugPrintf(
+              'After WHERE-clause push-down into subquery %d:'#10,
+              [pSubFC^.selId]);
+          {$ENDIF}
+          Assert((pItem^.u4.pSubq^.pSelect <> nil)
+                 and ((pSubFC^.selFlags and SF_PushDown) <> 0));
+        end
+        else
+        begin
+          {$IFDEF SQLITE_DEBUG}
+          if (sqlite3TreeTrace and $4000) <> 0 then
+            sqlite3DebugPrintf('WHERE-clause push-down not possible'#10, []);
+          {$ENDIF}
+        end;
+      end;
+
+      { Null-out unused subquery result columns — select.c:8021..8036
+        (tag-select-0440).  Gated on SQLITE_NullUnusedCols. }
+      if (pSubFC <> nil)
+         and OptimizationEnabled(pParse^.db, SQLITE_NullUnusedCols)
+         and (disableUnusedSubqueryResultColumns(pItem) <> 0) then
+      begin
+        {$IFDEF SQLITE_DEBUG}
+        { TREETRACE(0x4000) "Change unused result columns to NULL for
+          subquery %d" (select.c:8030..8033). }
+        if (sqlite3TreeTrace and $4000) <> 0 then
+          sqlite3DebugPrintf(
+            'Change unused result columns to NULL for subquery %d:'#10,
+            [pSubFC^.selId]);
+        {$ENDIF}
+      end;
+
       Inc(i);
     end;
   end;
@@ -29635,9 +29919,7 @@ begin
       7832  omit FROM-subquery ORDER BY (0x800)    — deferred (a.5,
             no FROM-clause optimisation loop)
       7887  end compound-select processing        — deferred (no host)
-      8011/8030 WHERE-clause push-down (0x4000)    — deferred (a.5,
-            pushDownWhereTerms / disableUnusedSubqueryResultColumns
-            not ported)
+      8011/8030 WHERE-clause push-down (0x4000)    — LANDED (a.9)
       8146  After all FROM-clause analysis (0x8000) — deferred (a.5,
             no Pas counterpart to the post-FROM-loop snapshot point)
       8192  Transform DISTINCT into GROUP BY (0x20000) — LANDED (a.12)
