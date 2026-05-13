@@ -203,9 +203,9 @@ regressions without human triage.
 
 - [X] **9.2.1** Vector inventory — 9 new `.sql`+`.db` pairs under `src/tests/vectors/` (autovacuum, incrvacuum, utf16, withoutrowid, generated-column, triggers, view-cte, partial-index, wal); fts5+rtree `.sql`-only [SKIP]; legacy simple/multipage tagged [~] (3.45.x vintage, EQUIV_LIST in regen.sh). wal.db carries journal_mode=WAL in header bytes 18..19; .db-wal sidecar non-deterministic (random salt) and not committed. See `src/tests/vectors/MANIFEST.txt`.
 
-- [~] **9.2.2** Read-only parity probe — `bin/TestVectorReadOnly` + per-vector `*.queries.sql` (11 vectors). All 11 currently pas-skip via bucket-A (read-only open trips SQLITE_READONLY on first SELECT — see 9.2.divbug.A). Gate rc=0 by skipping; will begin actually gating once bucket-A is fixed.
+- [~] **9.2.2** Read-only parity probe — `bin/TestVectorReadOnly` + per-vector `*.queries.sql` (11 vectors). Bucket-A FIXED in 9.2.divbug.A (btreeBeginTrans wrflag gate); the unioned pas-skip list now covers bucket-F (autovacuum/incrvacuum), bucket-G (utf16), bucket-H (withoutrowid), bucket-I (wal/multipage/generated-column round-trip drift) and bucket-J (triggers round-trip crash) plus bucket-C/E for view-cte/partial-index — but those buckets affect 9.2.3/9.2.4 only.  RO probe today: gated=1 ok=1 diverged=0 skipped=10 rc=0; the actual fix lifted SQLITE_READONLY for every vector and the remaining skips are pre-existing non-RO bugs surfaced after bucket-A was lifted.
 
-- [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. All 11 currently skipped via inherited bucket-A block (note: bucket-A is readonly-only — round-trip opens RW; see 9.2.3.followup below to drop the inheritance and re-triage).
+- [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. Today: gated=1 ok=1 diverged=0 skipped=10 rc=0 (bucket-A umbrella lifted; the 3 round-trip cell-layout divergences it was masking are now triaged under bucket-I, and the triggers round-trip crash under bucket-J).
 
 - [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). Today: gated=4 ok=4 diverged=0 skipped=4 rc=0; the 4 OK vectors (simple/multipage/generated-column/triggers) exercise AddColumn + OP_ParseSchema byte-identically against C.
 
@@ -215,15 +215,43 @@ regressions without human triage.
   9.2.2 / 9.2.3 / 9.2.4 (5 buckets, each a Pascal-only port bug
   bisectable against the C oracle — skip-and-cite per the corpus
   contract; mirrors the `9.1.divbug.*` pattern):
-  - [ ] **9.2.divbug.A** Read-only open writes the schema cookie /
-    trips `SQLITE_READONLY` on first SELECT (11 sites — every gated
-    vector under `bin/TestVectorReadOnly`).  Likely surface: schema-
-    init / write-cookie path firing under `SQLITE_OPEN_READONLY`.
-    Cross-check against `passqlite3codegen.pas:44225..44232` (existing
-    comment block names a related write-cookie / readonly-schema-init
-    issue) and `../sqlite3/src/main.c sqlite3_open_v2` /
-    `prepare.c sqlite3InitOne`.  Closes both 9.2.2 and 9.2.3 gates
-    when fixed.
+  - [X] **9.2.divbug.A** Read-only open trips `SQLITE_READONLY` on
+    first SELECT.  Root cause: `btreeBeginTrans`
+    (`passqlite3btree.pas:6341`) gated SQLITE_READONLY on `BTS_READ_ONLY`
+    alone, omitting the `wrflag <> 0` conjunct present in
+    `../sqlite3/src/btree.c:3622`.  Fix: add the `wrflag` conjunct so
+    read transactions on read-only btrees succeed.  Lifting the
+    bucket-A umbrella surfaced bucket-F (PRAGMA auto_vacuum RO returns
+    0 instead of 1/2), bucket-G (PRAGMA encoding RO garbled), bucket-H
+    (WITHOUT ROWID RO sweep aborts mid-schema), bucket-I (round-trip
+    cell-layout drift on wal/multipage/generated-column) and bucket-J
+    (round-trip trigger-fire EAccessViolation), all triaged below.
+  - [ ] **9.2.divbug.F** PRAGMA auto_vacuum returns 0 on RO-open while
+    C oracle returns 1/2 (sites: autovacuum.db, incrvacuum.db).  Likely
+    surface: `pBt^.autoVacuum` not populated from page-1 header bytes
+    36..39 under the readonly lockBtree arm.  C ref:
+    `../sqlite3/src/btree.c lockBtree`.
+  - [ ] **9.2.divbug.G** PRAGMA encoding returns garbled UTF-8 of the
+    UTF-16 cookie on RO-open (1 site: utf16.db).  Likely surface:
+    `sqlite3InitOne` text-encoding arm not propagating cookie encoding
+    into `db^.enc` under the RO path.  C ref:
+    `../sqlite3/src/prepare.c sqlite3InitOne`.
+  - [ ] **9.2.divbug.H** WITHOUT ROWID RO sweep emits first 5 rows
+    then errors `database disk image is malformed` (rc=11) (1 site:
+    withoutrowid.db).  Likely surface: page-key decode in read cursor.
+    Adjacent to bucket-D (CREATE INDEX byte divergence on WITHOUT
+    ROWID).  C ref: `../sqlite3/src/btree.c` cell-key decode for
+    WITHOUT ROWID indexes.
+  - [ ] **9.2.divbug.I** Round-trip mutator produces byte-different
+    `.db` blob — leaf-cell area divergence (3 sites: wal/multipage/
+    generated-column).  Likely surface: cell-packing / freeblock /
+    freelist ordering mismatch.  C ref:
+    `../sqlite3/src/btree.c dropCell / insertCell / allocateSpace`.
+  - [ ] **9.2.divbug.J** Round-trip mutator on triggers.db crashes
+    with EAccessViolation when the BEFORE/AFTER row triggers fire (1
+    site).  Likely surface: NULL deref in `codeRowTrigger` /
+    NEW-OLD column reference codegen.  C ref:
+    `../sqlite3/src/trigger.c codeRowTrigger`.
   - [ ] **9.2.divbug.B** Bare `VACUUM;` raises `EAccessViolation` on
     the Pascal port (1 site: autovacuum vector).  Almost certainly the
     unported `incrVacuumStep` / `relocatePage` / `modifyPagePointer`

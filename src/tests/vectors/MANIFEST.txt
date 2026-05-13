@@ -85,21 +85,22 @@ Vectors listed below are tagged `pas-skip` for the 9.2.x parity probes
 `bin/TestVectorReadOnly`) skip these so the binary still exits rc=0;
 each line cites the divergence bucket in `DIVERGENCES.md`.
 
-Bucket A (read-only schema-init) gates 9.2.2 / 9.2.3 only.  9.2.4
-opens RW so it does not inherit bucket-A; 9.2.4-specific buckets are
-B/C/D/E below and gate 9.2.4 alone.
+Bucket A (read-only schema-init) was fixed in 9.2.divbug.A: btreeBeginTrans
+no longer short-circuits SQLITE_READONLY when wrflag=0 (faithful port of
+btree.c:3622).  See DIVERGENCES.md.  Removing the bucket-A umbrella
+surfaced four read-only divergences the umbrella was previously hiding;
+they are tracked as bucket-F / bucket-G / bucket-H below.
 
-  pas-skip simple.db           bucket-A (read-only schema-init)
-  pas-skip multipage.db        bucket-A
-  pas-skip wal.db              bucket-A
-  pas-skip autovacuum.db       bucket-A,bucket-B (VACUUM EAccessViolation)
-  pas-skip incrvacuum.db       bucket-A
-  pas-skip utf16.db            bucket-A
-  pas-skip withoutrowid.db     bucket-A,bucket-D (CREATE INDEX byte layout on WITHOUT ROWID)
-  pas-skip generated-column.db bucket-A
-  pas-skip triggers.db         bucket-A
-  pas-skip view-cte.db         bucket-A,bucket-C (ALTER RENAME with dependent VIEW/CTAS — EAccessViolation)
-  pas-skip partial-index.db    bucket-A,bucket-E (ALTER RENAME COLUMN on table with partial index)
+  pas-skip autovacuum.db       bucket-B,bucket-F (PRAGMA auto_vacuum RO returns 0 instead of 1)
+  pas-skip incrvacuum.db       bucket-F (PRAGMA auto_vacuum RO returns 0 instead of 2)
+  pas-skip utf16.db            bucket-G (PRAGMA encoding RO returns garbled UTF-8 of UTF-16 text)
+  pas-skip withoutrowid.db     bucket-D,bucket-H (WITHOUT ROWID read-side aborts mid-schema with "database disk image is malformed")
+  pas-skip wal.db              bucket-I (round-trip cell-layout drift at byte 8201 — WAL mutator)
+  pas-skip multipage.db        bucket-I (round-trip cell-layout drift at byte 12290 — multipage mutator)
+  pas-skip generated-column.db bucket-I (round-trip cell-layout drift at byte 4103 — generated-column mutator)
+  pas-skip view-cte.db         bucket-C (ALTER RENAME with dependent VIEW/CTAS — EAccessViolation under 9.2.4)
+  pas-skip partial-index.db    bucket-E (ALTER RENAME COLUMN on table with partial index — 9.2.4)
+  pas-skip triggers.db         bucket-J (round-trip mutator EAccessViolation — trigger fire under RW)
 
 Reproducibility gate
 --------------------

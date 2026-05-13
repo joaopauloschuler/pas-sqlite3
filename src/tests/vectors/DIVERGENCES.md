@@ -10,12 +10,21 @@ and the Phase 9.1.5 / 9.1.6 follow-up tickets) we **do not chase
 divergences inside a 9.2.x ticket**.  Real fixes are picked up under the
 relevant Phase 6 / 7 ticket once the bucket has been triaged.
 
-## Bucket A — read-only open returns SQLITE_READONLY (9.2.2 / 9.2.3)
+## Bucket A — read-only open returns SQLITE_READONLY (9.2.2 / 9.2.3) [FIXED 9.2.divbug.A]
 
-Symptom: opening any committed `.db` vector with
-`sqlite3_open_v2(..., SQLITE_OPEN_READONLY, nil)` and running a plain
-`SELECT` errors with rc=8 (`SQLITE_READONLY`) and stderr
-`attempt to write a readonly database`.  The same `.db` opened in
+**Fixed**: `btreeBeginTrans` (passqlite3btree.pas) gated SQLITE_READONLY on
+`(pBt^.btsFlags and BTS_READ_ONLY) <> 0` alone, missing the `wrflag <> 0`
+conjunct present in C (`../sqlite3/src/btree.c:3622`).  Every read-side
+SELECT's OP_Transaction prologue tripped through that arm even though
+wrflag was 0.  Faithful port: `if BTS_READ_ONLY and wrflag <> 0 then
+rc := SQLITE_READONLY`.  Closes 9.2.divbug.A.  Buckets F/G/H/I/J below
+were previously hidden behind the bucket-A umbrella and have been
+re-triaged into their own slots.
+
+Original symptom (kept for historical context): opening any committed
+`.db` vector with `sqlite3_open_v2(..., SQLITE_OPEN_READONLY, nil)` and
+running a plain `SELECT` errored with rc=8 (`SQLITE_READONLY`) and
+stderr `attempt to write a readonly database`.  The same `.db` opened in
 the default RW mode (via `bin/passqlite3 file "SELECT ..."`) returns
 the expected rows.  C oracle reads byte-identically in both modes.
 
@@ -207,5 +216,79 @@ reference: `../sqlite3/src/alter.c (renameColumnFunc, renameColumnIdxNames)`.
 Affected vector:
 
 * `partial-index.db` — bucket E (also bucket-A, bucket-B via VACUUM)
+
+## Bucket F — PRAGMA auto_vacuum returns 0 on RO-open (9.2.2)
+
+Symptom: `PRAGMA auto_vacuum;` on an auto-vacuum / incremental-vacuum
+`.db` opened read-only returns `0` from the Pas port and `1` (FULL) /
+`2` (INCREMENTAL) from the C oracle.  Surfaced once bucket-A was lifted.
+
+Reproducer:
+```bash
+LD_LIBRARY_PATH=src ./bin/passqlite3 -readonly src/tests/vectors/autovacuum.db "PRAGMA auto_vacuum;"
+```
+
+Likely root cause: the PRAGMA auto_vacuum reader path consults
+`pBt^.autoVacuum`, but the Pas `lockBtree` arm that parses page-1 doesn't
+populate that field from header bytes 36..39 the way C does.  Reference:
+`../sqlite3/src/btree.c lockBtree` (sets `pBt->autoVacuum = get4byte(...)`).
+
+Affected vectors: `autovacuum.db`, `incrvacuum.db`.
+
+## Bucket G — PRAGMA encoding returns garbled UTF-8 on RO-open (9.2.2)
+
+Symptom: `PRAGMA encoding;` against `utf16.db` opened read-only returns
+the UTF-16 bytes mis-decoded into UTF-8 (e.g. `e5 91 95 e2 b5 86`) while
+the C oracle returns `UTF-16le`.  Surfaced once bucket-A was lifted.
+
+Likely root cause: the PRAGMA encoding reader emits a static string per
+`db^.enc`, but `sqlite3InitOne` may not be propagating the cookie's
+encoding into `db^.enc` correctly under the readonly schema-init path.
+Reference: `../sqlite3/src/prepare.c sqlite3InitOne` text-encoding arm.
+
+Affected vector: `utf16.db`.
+
+## Bucket H — WITHOUT ROWID RO sweep aborts with "disk image malformed" (9.2.2)
+
+Symptom: SELECT against `withoutrowid.db` opened read-only emits the
+first 5 rows then errors `database disk image is malformed` (rc=11
+SQLITE_CORRUPT) while C reads all rows cleanly.  Surfaced once
+bucket-A was lifted.
+
+Likely root cause: WITHOUT ROWID page-key decoding bug in the read
+cursor — likely the same family as bucket-D (CREATE INDEX byte
+divergence on WITHOUT ROWID).  Reference: `../sqlite3/src/btree.c`
+WITHOUT ROWID cell-key decoding.
+
+Affected vector: `withoutrowid.db`.
+
+## Bucket I — Round-trip cell-layout drift (9.2.3)
+
+Symptom: round-trip mutator (`*.mutate.sql`) against a WAL / multipage /
+generated-column vector produces a byte-different `.db` blob from the
+C oracle, both rc=0, first diff inside a leaf cell area.  Surfaced once
+bucket-A was lifted from the round-trip gate.
+
+Reproducer (wal.db): `cp src/tests/vectors/wal.db /tmp/p.db; ./bin/passqlite3 /tmp/p.db "<wal.mutate.sql>"; cmp` against the same script under the C oracle.
+
+Likely root cause: cell-packing / freeblock-coalescing divergence at the
+b-tree leaf level — likely tied to a small fill-pattern or freelist
+ordering mismatch.  Reference: `../sqlite3/src/btree.c` `dropCell`,
+`insertCell`, `allocateSpace`.
+
+Affected vectors: `wal.db`, `multipage.db`, `generated-column.db`.
+
+## Bucket J — Round-trip trigger-fire EAccessViolation (9.2.3)
+
+Symptom: round-trip mutator against `triggers.db` (which fires BEFORE
+/ AFTER row triggers) crashes the Pas port with `EAccessViolation`.
+Surfaced once bucket-A was lifted from the round-trip gate.
+
+Likely root cause: NULL deref inside the codegen for a trigger that
+refers to NEW/OLD column references on a WITHOUT ROWID-style or
+generated-column path.  Reference: `../sqlite3/src/trigger.c`
+`codeRowTrigger`.
+
+Affected vector: `triggers.db`.
 
 _End of file._

@@ -6338,7 +6338,12 @@ begin
     goto trans_begun;
   end;
 
-  if (pBt^.btsFlags and BTS_READ_ONLY) <> 0 then begin
+  { btree.c:3621..3625 — write transactions are not possible on a
+    read-only database; reads ARE allowed.  Bug 9.2.divbug.A: the
+    previous Pas arm omitted the `wrflag` conjunct, so every read-only
+    open also tripped SQLITE_READONLY on the first SELECT's
+    OP_Transaction prologue. }
+  if ((pBt^.btsFlags and BTS_READ_ONLY) <> 0) and (wrflag <> 0) then begin
     rc := SQLITE_READONLY;
     goto trans_begun;
   end;
