@@ -237,11 +237,21 @@ regressions without human triage.
     `sqlite3ReadSchema` then `sqlite3BtreeGetAutoVacuum(pBt)`, mirroring
     `pragma.c:801`.  incrvacuum.db now passes TestVectorReadOnly;
     autovacuum.db still pas-skips on bucket-B (script-trailing VACUUM).
-  - [ ] **9.2.divbug.G** PRAGMA encoding returns garbled UTF-8 of the
-    UTF-16 cookie on RO-open (1 site: utf16.db).  Likely surface:
-    `sqlite3InitOne` text-encoding arm not propagating cookie encoding
-    into `db^.enc` under the RO path.  C ref:
-    `../sqlite3/src/prepare.c sqlite3InitOne`.
+  - [X] **9.2.divbug.G** PRAGMA encoding returns garbled UTF-8 of the
+    UTF-16 cookie on RO-open (1 site: utf16.db).  Two root causes:
+    (a) `passqlite3codegen.pas` `sqlite3Pragma` encoding read arm
+    hard-wired `'UTF-8'` regardless of `db^.enc`; (b) `OP_String8` in
+    `passqlite3vdbe.pas` tagged the literal UTF-8 bytes with
+    `pOut^.enc := enc` (db's enc) without converting them, so when
+    db^.enc=UTF-16LE every string literal carried mis-tagged bytes and
+    column_text returned garbled output.  Fix: (a) make the encoding
+    arm read `db^.enc` and emit `UTF-16le` / `UTF-16be` / `UTF-8`;
+    (b) port the `vdbe.c:1419..1436` arm — when `enc != SQLITE_UTF8`,
+    `sqlite3VdbeMemSetStr(SQLITE_UTF8) + sqlite3VdbeChangeEncoding(enc)`
+    then rewrite `pOp^.p4.z` to the converted buffer (P4_DYNAMIC).
+    PRAGMA encoding now returns `UTF-16le` correctly; utf16.db still
+    pas-skips on a separate `hex(<utf16-text>)` byte-order bug (now
+    tracked as bucket-K, unrelated).
   - [ ] **9.2.divbug.H** WITHOUT ROWID RO sweep emits first 5 rows
     then errors `database disk image is malformed` (rc=11) (1 site:
     withoutrowid.db).  Likely surface: page-key decode in read cursor.

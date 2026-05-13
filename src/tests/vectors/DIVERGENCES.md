@@ -229,16 +229,24 @@ EAccessViolation, unrelated).
 
 Affected vectors: `autovacuum.db`, `incrvacuum.db`.
 
-## Bucket G — PRAGMA encoding returns garbled UTF-8 on RO-open (9.2.2)
+## Bucket G — PRAGMA encoding returns garbled UTF-8 on RO-open (9.2.2) [FIXED 9.2.divbug.G]
 
-Symptom: `PRAGMA encoding;` against `utf16.db` opened read-only returns
-the UTF-16 bytes mis-decoded into UTF-8 (e.g. `e5 91 95 e2 b5 86`) while
-the C oracle returns `UTF-16le`.  Surfaced once bucket-A was lifted.
-
-Likely root cause: the PRAGMA encoding reader emits a static string per
-`db^.enc`, but `sqlite3InitOne` may not be propagating the cookie's
-encoding into `db^.enc` correctly under the readonly schema-init path.
-Reference: `../sqlite3/src/prepare.c sqlite3InitOne` text-encoding arm.
+**Fixed**: two root causes contributed.  (a)
+`passqlite3codegen.pas` `sqlite3Pragma` encoding read arm hard-wired
+`sqlite3VdbeLoadString(v, 1, 'UTF-8')` regardless of `db^.enc`.
+(b) `passqlite3vdbe.pas` `OP_String8` tagged the literal UTF-8 bytes
+with `pOut^.enc := enc` (db's encoding) without ever converting the
+bytes, so when `db^.enc = SQLITE_UTF16LE` every string literal carried
+mis-tagged bytes and `sqlite3_column_text` returned the raw UTF-8
+bytes wearing a UTF-16 label.  Faithful ports: (a) make the encoding
+arm read `db^.enc` and emit `UTF-16le` / `UTF-16be` / `UTF-8`; (b)
+port the `vdbe.c:1419..1436` conversion arm — when `enc != SQLITE_UTF8`,
+`sqlite3VdbeMemSetStr(SQLITE_UTF8) + sqlite3VdbeChangeEncoding(enc)`
+then rewrite `pOp^.p4.z` to the converted buffer (`P4_DYNAMIC`).
+Closes 9.2.divbug.G.  `PRAGMA encoding` now returns `UTF-16le` on
+utf16.db.  The vector still pas-skips because `hex(<utf16-text>)`
+returns byte-swapped pairs (now tracked as bucket-K — separate bug
+inside `hex()` / `sqlite3_column_text` UTF-16 handling).
 
 Affected vector: `utf16.db`.
 

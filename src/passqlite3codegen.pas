@@ -46946,10 +46946,18 @@ begin
   end;
 
   if SameText(zName, 'encoding') and (pValue = nil) then begin
-    { PragTyp_ENCODING read arm (pragma.c:2261).  The Pas port runs UTF-8
-      only today, so emit the literal name unconditionally. }
+    { PragTyp_ENCODING read arm (pragma.c:2261).  Emits the name matching
+      db^.enc — sqlite3InitOne propagates the cookie meta[4] into db^.enc
+      on schema-load (also on the read-only open path), so reading it here
+      returns the correct UTF-16le/be label for UTF-16 databases.
+      9.2.divbug.G. }
     if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
-    sqlite3VdbeLoadString(v, 1, 'UTF-8');
+    case db^.enc of
+      SQLITE_UTF16LE: sqlite3VdbeLoadString(v, 1, 'UTF-16le');
+      SQLITE_UTF16BE: sqlite3VdbeLoadString(v, 1, 'UTF-16be');
+    else
+      sqlite3VdbeLoadString(v, 1, 'UTF-8');
+    end;
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     Exit;
   end;

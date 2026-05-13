@@ -7845,11 +7845,31 @@ begin
       P4.z = string literal, P1 = byte length, P2 = output register, enc = P4 enc.
       OP_String8 converts itself to OP_String on first execution. }
     OP_String8: begin
+      Assert(pOp^.p4.z <> nil);
+      pOut := out2Prerelease(v, pOp);
       pOp^.p1 := sqlite3Strlen30(PChar(pOp^.p4.z));
+      { vdbe.c:1419..1436 — when db's enc is UTF-16 we must convert the
+        literal UTF-8 bytes to native encoding once, then rewrite p4.z to
+        point at the converted buffer so subsequent OP_String fires reuse
+        it as MEM_Static.  Required so column_text sees the bytes in
+        db^.enc (otherwise UTF-8 bytes carry an enc=UTF-16 tag and
+        column_text returns garbled output).  9.2.divbug.G. }
+      if enc <> SQLITE_UTF8 then begin
+        rc := sqlite3VdbeMemSetStr(pOut, pOp^.p4.z, -1, SQLITE_UTF8, SQLITE_STATIC);
+        if rc <> SQLITE_OK then goto too_big;
+        if sqlite3VdbeChangeEncoding(pOut, enc) <> SQLITE_OK then goto no_mem;
+        Assert(pOut^.szMalloc > 0);
+        pOut^.szMalloc := 0;
+        pOut^.flags := pOut^.flags or MEM_Static;
+        if pOp^.p4type = P4_DYNAMIC then
+          sqlite3DbFree(db, pOp^.p4.z);
+        pOp^.p4type := P4_DYNAMIC;
+        pOp^.p4.z := pOut^.z;
+        pOp^.p1 := pOut^.n;
+      end;
       if pOp^.p1 > db^.aLimit[0] { SQLITE_LIMIT_LENGTH } then goto too_big;
       pOp^.opcode := OP_String;
       { fall through to OP_String }
-      pOut := out2Prerelease(v, pOp);
       pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
       pOut^.z     := pOp^.p4.z;
       pOut^.n     := pOp^.p1;
