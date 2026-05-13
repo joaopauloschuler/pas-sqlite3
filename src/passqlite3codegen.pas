@@ -1609,6 +1609,7 @@ const
   SQLITE_CountOfView    = u32($00000200);  { count-of-view optimization (sqliteInt.h:1908) }
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
   SQLITE_SimplifyJoin   = u32($00002000);  { Convert LEFT JOIN to JOIN (sqliteInt.h:1913) }
+  SQLITE_OmitOrderBy    = u32($00040000);  { Omit pointless ORDER BY (sqliteInt.h:1918) }
   SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
   SQLITE_Coroutines     = u32($02000000);  { Co-routines for subqueries (sqliteInt.h:1927) }
   SQLITE_BalancedMerge  = u32($00200000);  { Balance multi-way merges (sqliteInt.h:1922) }
@@ -25899,6 +25900,7 @@ var
   pVTab2:        passqlite3vtab.PVTable;
   pModFunc:      passqlite3vtab.PSqlite3Module;
   kHC, jHC:      i32;
+  pSubFC:        PSelect;  { 10.1.42.a.8 — FROM-clause subquery select }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   { 10.1.42.a.6.5 — Pre-zero the local AggInfo handle so the select_end tail
@@ -26048,6 +26050,45 @@ begin
           end;
         end;
       end;
+
+      { 10.1.42.a.8 — Omit a FROM-clause subquery's superfluous ORDER BY
+        (select.c:7822..7838, tag-select-0230).  Only meaningful when the
+        i-th FROM item is itself a subquery; mirror C's "no further action
+        if not a subquery" gate (select.c:7772) plus the MATERIALIZED-CTE
+        fence (7784) and SF_Aggregate skip (7795).  Conditions (1)..(6)
+        from the C comment block are encoded directly in the predicate. }
+      if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
+        pSubFC := pItem^.u4.pSubq^.pSelect
+      else
+        pSubFC := nil;
+      if (pSubFC <> nil)
+         { MATERIALIZED CTE optimisation fence (select.c:7784). }
+         and not (((pItem^.fg.fgBits2 and u8($02)) <> 0)
+                  and (pItem^.u2.pCteUse <> nil)
+                  and (pItem^.u2.pCteUse^.eM10d = u8(0))) { passqlite3parser.M10d_Yes }
+         { Aggregate sub-SELECT skip (select.c:7795). }
+         and ((pSubFC^.selFlags and SF_Aggregate) = 0)
+         { ORDER BY drop preconditions (select.c:7826..7832). }
+         and (pSubFC^.pOrderBy <> nil)
+         and ((p^.pOrderBy <> nil) or (pTabList^.nSrc > 1))   { (5) }
+         and (pSubFC^.pLimit = nil)                            { (1) }
+         and ((pSubFC^.selFlags and (SF_OrderByReqd or SF_Recursive)) = 0) { (2)(6) }
+         and ((p^.selFlags and SF_OrderByReqd) = 0)            { (3)(4) }
+         and OptimizationEnabled(pParse^.db, SQLITE_OmitOrderBy) then
+      begin
+        {$IFDEF SQLITE_DEBUG}
+        { TREETRACE(0x800) "omit superfluous ORDER BY on %r FROM-clause
+          subquery" (select.c:7833..7834). }
+        if (sqlite3TreeTrace and $800) <> 0 then
+          sqlite3DebugPrintf(
+            'omit superfluous ORDER BY on %d FROM-clause subquery'#10,
+            [i + 1]);
+        {$ENDIF}
+        sqlite3ParserAddCleanup(pParse,
+          @sqlite3ExprListDeleteGeneric, pSubFC^.pOrderBy);
+        pSubFC^.pOrderBy := nil;
+      end;
+
       Inc(i);
     end;
   end;

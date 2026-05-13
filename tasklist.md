@@ -606,9 +606,17 @@ partial landings cannot silently no-op.
       `{$IFDEF SQLITE_DEBUG}`.  Wired in sqlite3Select between
       linkWindowsForSelect and existsToJoin.  Added SQLITE_SimplifyJoin
       (0x2000) constant.  flattenSubquery/ORDER-BY-drop arms of the FROM
-      loop remain deferred under 10.1.42.a.5 / 10.1.42.a.8.
-    - [ ] **10.1.42.a.8** Port the omit-FROM-subquery-ORDER-BY arm
-      (select.c:7832) so the 0x800 TREETRACE arm can land.
+      loop remain deferred under 10.1.42.a.5 (flattenSubquery itself);
+      ORDER-BY-drop landed under 10.1.42.a.8.
+    - [X] **10.1.42.a.8** Ported the FROM-clause subquery superfluous-ORDER-BY
+      drop (select.c:7822..7838, tag-select-0230) inside the outer FROM-loop
+      from 10.1.42.a.7.  Honours all six C conditions plus the MATERIALIZED
+      CTE fence and SF_Aggregate skip.  Adds SQLITE_OmitOrderBy (0x40000)
+      constant; 0x800 TREETRACE arm prints `omit superfluous ORDER BY on N
+      FROM-clause subquery` under `{$IFDEF SQLITE_DEBUG}`.  Drops via
+      sqlite3ParserAddCleanup(@sqlite3ExprListDeleteGeneric, pOrderBy).
+      Note: this is the FROM-subquery arm — the top-level `IgnorableOrderby`
+      drop (select.c:7631, also 0x800) remains under 10.1.42.a.11.
     - [ ] **10.1.42.a.9** Port `pushDownWhereTerms` +
       `disableUnusedSubqueryResultColumns` (select.c:8011/8030) so the
       0x4000 WHERE-clause push-down and unused-col NULL TREETRACE arms can land.
