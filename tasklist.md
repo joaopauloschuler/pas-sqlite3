@@ -1093,3 +1093,140 @@ the port unless a user requests them after Phases 0–9 are green:
     iterations → instant crash. In C, `for(i=0; i<N; i++)` skips cleanly.
     **Rule**: always guard with `if N > 0 then` before such a loop, or rewrite
     as `i := 0; while i < N do begin ... Inc(i); end`.
+
+---
+
+## Finding code duplication (port-introduced vs. upstream)
+
+Goal: identify Pascal blocks that repeat without an equivalent repetition in
+the upstream C reference. The faithful-port rule means any duplication present
+in C is allowed (it lives there for a reason), but duplication that exists
+*only* in the Pascal tree is a refactor candidate.
+
+Tooling: `jscpd` (Node-based, token-aware, supports Pascal and C). Requires
+`node` + `npm`; no install needed if invoked via `npx`.
+
+### Step 1 — generate JSON reports for both trees
+
+Run from any directory; outputs land in `/tmp/jscpd-out/`.
+
+```
+npx --yes jscpd /home/bpsa/app/pas-sqlite3/src \
+  --pattern "**/*.pas" \
+  --min-tokens 50 --reporters json --output /tmp/jscpd-out/pas
+
+npx --yes jscpd /home/bpsa/app/sqlite3 \
+  --pattern "{src,ext}/**/*.{c,h}" \
+  --ignore "**/sqlite3.c,**/sqlite3.h,**/tsrc/**,**/parse.c,**/opcodes.c,**/fts5.c,**/fts5parse.c,**/keywordhash.h" \
+  --min-tokens 50 --reporters json --output /tmp/jscpd-out/c
+```
+
+Notes on the C invocation:
+- The amalgamation (`sqlite3.c/h`, `tsrc/`) is excluded — it is a concatenation
+  of the split sources and inflates duplication artificially.
+- Lemon/awk-generated files (`parse.c`, `opcodes.c`, `fts5.c`, `fts5parse.c`,
+  `keywordhash.h`) are excluded — their repetition is mechanical, not human.
+- `--min-tokens 50` matches roughly 6–10 lines of body code; raise it to 80–100
+  to focus only on substantial clones.
+
+### Step 2 — cross-reference Pascal clones against C
+
+A Pascal file `passqlite3<stem>.pas` is considered to have a C analogue at
+`<stem>.c` or `<stem>.h`. A Pascal clone pair `(A.pas, B.pas)` has a "C
+analogue" if the corresponding C files also clone with each other (or, for
+intra-file clones, if the same C file clones against itself).
+
+Script (paste into `python3 -`):
+
+```python
+import json, os, re
+from collections import defaultdict
+
+c = json.load(open('/tmp/jscpd-out/c/jscpd-report.json'))
+p = json.load(open('/tmp/jscpd-out/pas/jscpd-report.json'))
+
+c_pairs = defaultdict(set)
+for d in c['duplicates']:
+    a = os.path.basename(d['firstFile']['name'])
+    b = os.path.basename(d['secondFile']['name'])
+    c_pairs[a].add(b); c_pairs[b].add(a)
+
+def pas_to_c(n):
+    m = re.match(r'passqlite3(.+)\.pas$', n)
+    return {m.group(1)+'.c', m.group(1)+'.h'} if m else set()
+
+def is_test(path): return '/tests/' in path
+
+tests_only=[]; port_only=[]; cross=[]
+for d in p['duplicates']:
+    fa, fb = d['firstFile']['name'], d['secondFile']['name']
+    a, b   = os.path.basename(fa), os.path.basename(fb)
+    ln     = d['lines']
+    ta, tb = is_test(fa), is_test(fb)
+    if ta and tb:        tests_only.append((ln,a,b)); continue
+    if ta or tb:         cross.append((ln,a,b));      continue
+    ca, cb = pas_to_c(a), pas_to_c(b)
+    hit = any(y in c_pairs.get(x,set()) for x in ca for y in cb)
+    if not hit: port_only.append((ln,a,b))
+
+for lst in (tests_only, port_only, cross): lst.sort(reverse=True)
+print("test<->test :", len(tests_only), "clones,", sum(x[0] for x in tests_only), "lines")
+print("port<->port :", len(port_only),  "clones,", sum(x[0] for x in port_only),  "lines  (no C analogue)")
+print("test<->port :", len(cross),      "clones,", sum(x[0] for x in cross),      "lines")
+print("\nTop 20 port<->port (port-introduced):")
+for ln,a,b in port_only[:20]: print(f"  {ln:3}  {a} <-> {b}")
+print("\nTop 20 test<->test (refactor candidates):")
+for ln,a,b in tests_only[:20]: print(f"  {ln:3}  {a} <-> {b}")
+```
+
+### Step 3 — interpret the output
+
+Three buckets, each with a different meaning:
+
+1. **`port <-> port` with no C analogue** — genuine port-introduced
+   duplication. Open the listed line ranges (`jscpd` JSON has `firstFile.start`
+   / `firstFile.end`) and check the corresponding C function. Common causes:
+   - C used a macro that the Pascal port inlined two or three times.
+   - C used a `static inline` helper that the port copy-pasted instead of
+     hoisting into a top-level routine.
+   Fix by extracting a shared procedure inside the same unit, mirroring the C
+   macro/helper.
+
+2. **`test <-> test`** — the test harness has no upstream counterpart, so any
+   clone here is by definition port-only. These are the biggest deletion wins.
+   Look for families that share boilerplate (open `:memory:`, prep, step,
+   compare against `csq_*`); collapse them into a common unit under
+   `src/tests/` (e.g. a `DiagCommon.pas` exposing `ProbeOne` / `ProbeRows`).
+
+3. **`test <-> port`** — should be empty. If non-empty, a test is probably
+   inlining production code rather than calling it; fix the test.
+
+### Step 4 — don't refactor blindly
+
+Before extracting a helper:
+
+- Confirm the upstream C really has no equivalent repetition. Sometimes the C
+  source uses a macro that `jscpd` did not flag because it expands at compile
+  time; a Pascal extraction is still correct, but the framing changes from
+  "port-introduced" to "missing macro analogue."
+- Avoid eliminating duplication that exists because the two Pascal sites are
+  intentionally allowed to diverge later (e.g. an extension VFS that may grow
+  features the core VFS will not). When in doubt, leave a `// see also <other
+  site>` comment instead of extracting.
+- Never refactor across the port↔test boundary: tests must stay independent of
+  internal helpers to remain a useful oracle.
+
+### Current snapshot (informational, recompute before acting)
+
+At the time this section was written:
+
+| Bucket                              | Clones | Dup lines |
+| ----------------------------------- | -----: | --------: |
+| Pascal total (`src/**/*.pas`)       |    319 |     6 143 |
+| C total (split sources, no amalg.)  |    166 |       — (2.73% of 83k) |
+| Pascal `test <-> test`              |    256 |     5 725 |
+| Pascal `port <-> port` (no C analog)|     22 |       259 |
+| Pascal `test <-> port`              |      0 |         0 |
+
+Headline: ~96% of Pascal's excess duplication lives in the test harness; core
+port code only carries ~259 unjustified duplicated lines out of 67 k.
