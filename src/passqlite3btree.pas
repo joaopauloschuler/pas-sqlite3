@@ -6486,15 +6486,20 @@ begin
   if sqlite3PagerIsreadonly(pBt^.pPager) <> 0 then
     pBt^.btsFlags := pBt^.btsFlags or BTS_READ_ONLY;
 
-  { Determine page size from header bytes 16-17 }
+  { Determine page size from header bytes 16-17.  btree.c:2703..2730 — only
+    pin BTS_PAGESIZE_FIXED (and pull nReserve from byte 20) when the header
+    carries a valid page size.  An empty/new DB (header zeros) must remain
+    pageSize=0 / unfixed so VACUUM's later sqlite3BtreeSetPageSize(pTemp,...)
+    is allowed to install the source's page size. }
   iPageSize := (u32(zDbHdr[16]) shl 8) or (u32(zDbHdr[17]) shl 16);
-  if ((iPageSize - 1) and iPageSize) <> 0 then iPageSize := 0;
-  if (iPageSize > SQLITE_MAX_PAGE_SIZE) or (iPageSize <= 256) then
+  if (iPageSize < 512) or (iPageSize > SQLITE_MAX_PAGE_SIZE)
+     or (((iPageSize - 1) and iPageSize) <> 0) then begin
     iPageSize := 0;
-  if iPageSize = 0 then iPageSize := SQLITE_DEFAULT_PAGE_SIZE;
-
-  nReserve := i32(zDbHdr[20]);
-  pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+    nReserve  := 0;
+  end else begin
+    nReserve := i32(zDbHdr[20]);
+    pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+  end;
   rc := sqlite3PagerSetPagesize(pBt^.pPager, @iPageSize, nReserve);
   if rc <> SQLITE_OK then goto btree_open_out;
   pBt^.pageSize   := iPageSize;

@@ -308,6 +308,24 @@ regressions without human triage.
     unported `incrVacuumStep` / `relocatePage` / `modifyPagePointer`
     arms enumerated in **6.28** (gated on productive ptrmap).  Cross-
     link: closing 6.28's incremental-vacuum step closes this bucket.
+    Partial progress: the AV *inside* `runVacuumImpl`
+    (passqlite3main.pas:5242) is now eliminated — fixed in
+    `sqlite3BtreeOpen` (passqlite3btree.pas:6497) which was setting
+    `BTS_PAGESIZE_FIXED` unconditionally on every open.  Mirroring
+    btree.c:2703..2730 (set the flag *only* when the file header
+    carries a valid page size; for an empty new file the flag must
+    stay clear so VACUUM's later
+    `sqlite3BtreeSetPageSize(pTemp, nextPagesize=0, …)` is allowed)
+    lets `runVacuumImpl` proceed through schema mirror + CopyFile +
+    Commit.  Remaining issue (separate bullet candidate): on the
+    autovacuum vector `sqlite3BtreeCommit(pTemp)` →
+    `autoVacuumCommit` returns `SQLITE_CORRUPT_BKPT` because pTemp
+    ends up with only 2 pages (header + ptrmap) — the schema-mirror
+    inserts under `DBFLAG_Vacuum` aren't materialising in pTemp.
+    The downstream EAV post-return (after `sqlite3ResetAllSchemas-
+    OfConnection`) is a tertiary cleanup-on-CORRUPT issue and out of
+    scope for this bullet.  Bucket-B stays open until those two
+    follow-ups land.
   - [X] **9.2.divbug.C** `ALTER TABLE … RENAME COLUMN/TABLE` on tables
     with a dependent VIEW or CTAS-derived table raises
     `EAccessViolation`.  Root cause: `sqlite3CreateView` always reduced
