@@ -388,14 +388,30 @@ regressions without human triage.
   schema-change gated=4 ok=4 — both still rc=0).  See
   `src/tests/vectors/DIVERGENCES.md` bucket-L / bucket-M.
 
-- [ ] **9.1.6.followup** Categorize the 47 cold opcodes currently
+- [X] **9.1.6.followup** Categorize the 47 cold opcodes currently
   allow-listed in `src/tests/corpus/COVERAGE_GAPS.md` into either
   (a) gated on an unported feature → cite the Phase 6/7/8 bullet
   (e.g. FTS5, R-tree, STAT4, PMA disk-spill 5.7.b) and keep
   allow-listed; or (b) reachable from current `passqlite3codegen.pas`
   paths → land a targeted `.sql` driver and drop from the allow-list.
   Goal: shrink the allow-list to (a)-only so it stops being a silent
-  escape hatch for new gaps.
+  escape hatch for new gaps.  Split: 45 (a) gated + 2 (b) driven
+  hot (`OP_IsTrue` via `v IS TRUE`/`v IS FALSE` in result list →
+  cv17; `OP_MemMax` via `INTEGER PRIMARY KEY AUTOINCREMENT` INSERT
+  → cv17).  Four additional REAL-cold opcodes surfaced during
+  triage and were closed in the same pass: `OP_String` (cv14
+  multi-row string-literal SELECT), `OP_RealAffinity` (cv15 REAL
+  column read), `OP_Pagecount` and `OP_MaxPgcnt` (cv16 PRAGMA
+  page_count / max_page_count).  Coverage drivers grew 14 → 18.
+  Every (a) row in `COVERAGE_GAPS.md` now carries a per-opcode
+  citation (CoverageGapReason in TestSQLCorpus.pas) pointing at
+  the gating Phase bullet (6.8 vtab, 6.28 vacuum, 6.28.6.b
+  integrity walk, 10.1.42.b.7 STAT4, planner-shape heuristic,
+  shared-cache / cursor-hints build-disabled, etc.).  Coverage
+  report now also runs even on pre-existing strict divergences
+  (ReportCoverage moved above the strict-gate Halt) so the
+  coverage gate keeps surfacing new gaps when other buckets are
+  open.  Final: 147 hot / 45 cold-allow / 0 cold-real.
 
 ### 9.3 `TestFuzzDiff.pas` — differential fuzzer
 

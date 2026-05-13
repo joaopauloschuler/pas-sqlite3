@@ -522,7 +522,13 @@ end;
     ElseEq                  -> idx 12 (CASE compound)
     SeekScan, SeekHit       -> idx 13 (multi-col indexed range) }
 const
-  N_COVERAGE_SCRIPTS = 14;
+  { 9.1.6.followup drivers:
+      14: SELECT row over string literal -> OP_String8 rewrites to OP_String
+          on first row, subsequent rows hit OP_String.
+      15: REAL column INSERT/SELECT -> OP_RealAffinity on read-out.
+      16: PRAGMA page_count / max_page_count -> OP_Pagecount, OP_MaxPgcnt.
+      17: AUTOINCREMENT INSERT -> OP_MemMax, plus `x IS TRUE` -> OP_IsTrue. }
+  N_COVERAGE_SCRIPTS = 18;
   COVERAGE_SCRIPTS: array[0..N_COVERAGE_SCRIPTS - 1] of AnsiString = (
     'SELECT 1 WHERE 1=1 OR 0=1; SELECT 1 WHERE TRUE;',
     'CREATE TABLE cv1(a INTEGER PRIMARY KEY, b); ' +
@@ -572,7 +578,28 @@ const
     'CREATE TABLE cv13(a, b, c); ' +
       'CREATE INDEX cv13_ab ON cv13(a,b); ' +
       'INSERT INTO cv13 VALUES(1,10,100),(1,20,200),(2,10,300),(2,20,400); ' +
-      'SELECT c FROM cv13 WHERE a=1 AND b BETWEEN 5 AND 25 ORDER BY b;'
+      'SELECT c FROM cv13 WHERE a=1 AND b BETWEEN 5 AND 25 ORDER BY b;',
+    { cv14 — OP_String: SELECT with a string literal across many rows.
+      First row's OP_String8 rewrites itself to OP_String; subsequent rows
+      then hit the OP_String dispatch arm directly. }
+    'CREATE TABLE cv14(x); ' +
+      'INSERT INTO cv14 VALUES(1),(2),(3),(4),(5); ' +
+      'SELECT ''hello'' FROM cv14;',
+    { cv15 — OP_RealAffinity: REAL column read-out emits trailing
+      OP_RealAffinity on the gathered record (codegen.pas:33100 +
+      :31801). }
+    'CREATE TABLE cv15(r REAL); ' +
+      'INSERT INTO cv15 VALUES(1.5),(2.25),(3.125); ' +
+      'SELECT r FROM cv15 ORDER BY r;',
+    { cv16 — OP_Pagecount + OP_MaxPgcnt: PRAGMA page_count emits
+      OP_Pagecount (codegen.pas:47177); PRAGMA max_page_count emits
+      OP_MaxPgcnt (codegen.pas:47167). }
+    'PRAGMA page_count; PRAGMA max_page_count;',
+    { cv17 — OP_MemMax via AUTOINCREMENT (codegen.pas:35705) +
+      OP_IsTrue via `x IS TRUE` (codegen.pas:5511). }
+    'CREATE TABLE cv17(id INTEGER PRIMARY KEY AUTOINCREMENT, v); ' +
+      'INSERT INTO cv17(v) VALUES(1),(2),(3); ' +
+      'SELECT id, v IS TRUE, v IS FALSE FROM cv17 ORDER BY id;'
   );
 
 procedure RunCoverageScripts;
@@ -605,6 +632,77 @@ begin
       Inc(gTotalErr);
   end;
   WriteLn('  drove ', drove, '/', N_COVERAGE_SCRIPTS, ' coverage scripts cleanly.');
+end;
+
+function CoverageGapReason(op: i32): AnsiString;
+begin
+  { 9.1.6.followup — per-opcode citation.  Each entry pins the gating
+    Phase 6/7/8/10 bullet (or planner-shape heuristic) so the auditor
+    can reach the emit path without re-deriving it. }
+  case op of
+    OP_VFilter,    OP_VUpdate,    OP_VBegin,   OP_VCreate,
+    OP_VDestroy,   OP_VOpen,      OP_VCheck,   OP_VInitIn,
+    OP_VColumn,    OP_VRename,    OP_VNext:
+      Result := '(a) vtab partial port — Phase 6.8.0..6.8.6 wired vtab emit but the corpus does not CREATE VIRTUAL TABLE; eponymous-vtab arms covered by TestVtab.';
+    OP_Vacuum, OP_IncrVacuum:
+      Result := '(a) VACUUM gated on Phase 6.28 incrVacuumStep / relocatePage; corpus runs in-memory and DiagVacuum is the dedicated probe.';
+    OP_Checkpoint, OP_JournalMode:
+      Result := '(a) WAL paths — corpus uses journal_mode=delete; WAL exercise lives in 9.2.1 wal.db vector and TestWalCompat.';
+    OP_IntegrityCk, OP_LoadAnalysis:
+      Result := '(a) integrity_check / ANALYZE walk arms — Phase 6.28.6.b open (~430 lines, schema-level integrity arms).';
+    OP_Abortable, OP_CursorLock, OP_CursorUnlock:
+      Result := '(a) debug/diagnostic emit (SQLITE_DEBUG / shared-cache); not enabled in this build.';
+    OP_FilterAdd, OP_Filter:
+      Result := '(a) bloom-filter planner hint — emit gated on star-join shape heuristic; partial port under Phase 6.13.B, exercised by DiagBloom.pas.';
+    OP_IsType:
+      Result := '(a) typeof() fast-path; emit gated on ON-conflict edge that no corpus row reaches.';
+    OP_AggStep1, OP_PureFunc:
+      Result := '(a) specialised aggregate / pure-function fast-path; planner heuristic.';
+    OP_IfNoHope, OP_IfNotOpen, OP_IfSizeBetween, OP_SequenceTest, OP_ColumnsUsed:
+      Result := '(a) planner micro-optimisation; emit gated on planner shape not reached by corpus.';
+    OP_SeekGT, OP_IdxLT, OP_IdxGE:
+      Result := '(a) DESC range scan — driver hits SeekLT/LE/Prev but planner picks different ops for ">" + DESC; planner-shape gated.';
+    OP_IfEmpty:
+      Result := '(a) CTAS empty-result-check heuristic in sqlite3WhereBegin; no corpus shape triggers it.';
+    OP_Or:
+      Result := '(a) logical OR folded by sqlite3ExprIfTrue into branches; OP_Or only emitted on RHS-subquery OR (codegen.pas:5949).';
+    OP_IFindKey:
+      Result := '(a) incremental hash key probe; emitted only by integrity-check tail — gated on Phase 6.28.6.b.';
+    OP_RowSetTest:
+      Result := '(a) multi-IN-set dedup; emit gated on set-cardinality heuristic.';
+    OP_ElseEq:
+      Result := '(a) compound CASE WHEN + IN(...) special path in sqlite3ExprCodeIN; specific shape gating.';
+    OP_SoftNull:
+      Result := '(a) ON CONFLICT IGNORE + partial-index emit (codegen.pas:35574); specific NOT NULL + IGNORE row needed.';
+    OP_Variable:
+      Result := '(a) sqlite3_bind_*; corpus uses sqlite3_exec with no parameters — gated on prepared-stmt binding spine, not codegen.';
+    OP_FkCheck:
+      Result := '(a) deferred FK check (codegen.pas:32180/41635); emit on PRAGMA defer_foreign_keys=ON + COMMIT path.';
+    OP_Permutation:
+      Result := '(a) compound SELECT sort-key permutation (codegen.pas:22707); emit only when ORDER BY refs >1 SELECT result alias.';
+    OP_Offset:
+      Result := '(a) sqlite_offset() builtin; SQLITE_ENABLE_OFFSET_SQL_FUNC arm of index-rewrite tail is deferred (codegen.pas:20312).';
+    OP_TypeCheck:
+      Result := '(a) STRICT-table column-type guard; emit gated on specific affinity-mismatch shape.';
+    OP_ReopenIdx:
+      Result := '(a) cursor-reuse coalesce of consecutive OpenRead; emit gated on OR-disjunct shared-cursor shape (codegen.pas:19509/20137).';
+    OP_SeekScan, OP_SeekHit:
+      Result := '(a) multi-column index seek-then-scan optimisation; STAT4-driven heuristic — Phase 10.1.42.b.7 open.';
+    OP_RowCell:
+      Result := '(a) WITHOUT ROWID UPDATE-of-PK cell-rewrite (codegen.pas:36080/36127); gated on WITHOUT ROWID + UPDATE-of-PK shape.';
+    OP_SorterCompare, OP_FinishSeek:
+      Result := '(a) sorter-driven UPDATE / deferred-seek finalize; emit gated on UPDATE-with-ORDER-BY-LIMIT + ephemeral-sorter shape.';
+    OP_SqlExec:
+      Result := '(a) nested SQL — emitted only by sqlite3_dbpage / sqlite3_recover paths; corpus uses neither.';
+    OP_TableLock:
+      Result := '(a) shared-cache TABLE LOCK emit; shared-cache not enabled in this build.';
+    OP_ClrSubtype, OP_GetSubtype, OP_SetSubtype:
+      Result := '(a) JSON subtype propagation across nested function calls; emit gated on json1 ops in non-result position.';
+    OP_CursorHint:
+      Result := '(a) gated on SQLITE_ENABLE_CURSOR_HINTS; not enabled in this build.';
+  else
+    Result := '(a) allow-listed cold — see IsCoverageGap for gating comment.';
+  end;
 end;
 
 function IsCoverageGap(op: i32): Int32;
@@ -656,13 +754,12 @@ begin
     OP_SoftNull:
       Result := 1; { ON CONFLICT IGNORE / partial-index emit; needs specific NOT NULL + ON CONFLICT IGNORE row. }
     OP_Variable:
-      Result := 1; { sqlite3_bind_*; corpus uses sqlite3_exec with no parameters. }
+      Result := 1; { sqlite3_bind_*; corpus uses sqlite3_exec with no parameters. (a) — gated on prepared-stmt binding API, not on sqlite3_exec spine. }
     OP_FkCheck:
       Result := 1; { FK deferred check emit; reached only by deferred FK + commit, not the immediate FK driver. }
     OP_Permutation:
       Result := 1; { compound SELECT sort-key permutation; only emitted when ORDER BY refs >1 SELECT result alias. }
-    OP_IsTrue:
-      Result := 1; { TRUE/FALSE keyword in WHERE; folded to constant by sqlite3ExprFold before emit. }
+    { OP_IsTrue dropped 9.1.6.followup — cv17 drives `(v=2) IS TRUE`. }
     OP_Offset:
       Result := 1; { sqlite_offset(); only emitted by the sqlite_offset() builtin, not LIMIT OFFSET (OffsetLimit). }
     OP_TypeCheck:
@@ -677,8 +774,8 @@ begin
       Result := 1; { sorter-driven UPDATE / deferred-seek finalize; emit gated on specific UPDATE-with-ORDER-BY-LIMIT shape. }
     OP_SqlExec:
       Result := 1; { OP_SqlExec runs nested SQL — emitted only by sqlite3_dbpage / sqlite3_recover paths. }
-    OP_MemMax:
-      Result := 1; { MAX() running aggregate fast-path; emit gated on planner picking the MAX-optimisation shape. }
+    { OP_MemMax dropped 9.1.6.followup — cv17 drives AUTOINCREMENT INSERT
+      (codegen.pas:35705 autoIncStep emits OP_MemMax on regAutoinc). }
     OP_TableLock:
       Result := 1; { shared-cache TABLE LOCK emit; corpus uses default (shared-cache off). }
     OP_ClrSubtype, OP_GetSubtype, OP_SetSubtype:
@@ -703,13 +800,21 @@ begin
   try
     md.Add('# COVERAGE_GAPS.md');
     md.Add('');
-    md.Add('Generated by `bin/TestSQLCorpus --coverage` (Phase 9.1.6).');
-    md.Add('Each row is an opcode in `passqlite3vdbe.pas` that the corpus');
-    md.Add('does not exercise *and* that is allow-listed by `IsCoverageGap`');
-    md.Add('in `src/tests/TestSQLCorpus.pas` because the emit-side path is');
-    md.Add('gated on an unported or planner-shape-specific feature.  When');
-    md.Add('the gating bullet closes, drop the opcode from `IsCoverageGap`');
-    md.Add('and add a targeted script to the corpus.');
+    md.Add('Generated by `bin/TestSQLCorpus --coverage` (Phase 9.1.6 +');
+    md.Add('9.1.6.followup categorization).  Each row is an opcode in');
+    md.Add('`passqlite3vdbe.pas` that the corpus does not exercise *and*');
+    md.Add('that is allow-listed by `IsCoverageGap` in');
+    md.Add('`src/tests/TestSQLCorpus.pas`.');
+    md.Add('');
+    md.Add('Every row is tagged **(a) gated on an unported feature or');
+    md.Add('planner-shape heuristic** — the reason column cites the');
+    md.Add('Phase 6/7/8/10 bullet that gates the emit path.  When that');
+    md.Add('bullet closes, drop the opcode from `IsCoverageGap` and add');
+    md.Add('a targeted .sql to the inline coverage-driver set in');
+    md.Add('`TestSQLCorpus.pas`.  The (b) "reachable-now" entries from');
+    md.Add('the previous list (IsTrue, MemMax, plus the four real-cold');
+    md.Add('opcodes String / RealAffinity / Pagecount / MaxPgcnt) have');
+    md.Add('been driven hot by new cv14..cv17 scripts.');
     md.Add('');
     md.Add('Cold opcodes that are NOT in the allow-list fail the gate (rc=1)');
     md.Add('— those are real corpus gaps and must be closed with a script.');
@@ -725,7 +830,7 @@ begin
         if IsCoverageGap(i) <> 0 then begin
           Inc(nGap);
           md.Add('| ' + IntToStr(i) + ' | ' + AnsiString(name) +
-                 ' | allow-listed cold (see IsCoverageGap) |');
+                 ' | ' + CoverageGapReason(i) + ' |');
         end else begin
           Inc(nRealCold);
           WriteLn('  COLD opcode #', i, ' (', AnsiString(name),
@@ -836,6 +941,9 @@ begin
   end;
 
   WriteLn;
+  if bCoverage <> 0 then
+    ReportCoverage(gRepoRoot + 'src/tests/corpus/COVERAGE_GAPS.md');
+
   if gStrictDiverge > 0 then begin
     WriteLn('TestSQLCorpus: FAIL (rc=1; ', gStrictDiverge,
             ' pas-strict divergence(s) — 9.1.5 CI gate.');
@@ -843,9 +951,6 @@ begin
     WriteLn('  see src/tests/corpus/STATUS.txt for the per-row tagging.');
     Halt(1);
   end;
-
-  if bCoverage <> 0 then
-    ReportCoverage(gRepoRoot + 'src/tests/corpus/COVERAGE_GAPS.md');
 
   WriteLn('TestSQLCorpus: OK (rc=0; pas-strict gate clean, soft/skip catalogued).');
   Halt(0);
