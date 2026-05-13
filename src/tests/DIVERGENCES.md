@@ -24,4 +24,39 @@ survive the mask are real port drift.
 | src/tests/DiagDml.pas | tier2 | dml | pas-strict | - | 14 | 1 | db-blob | `CREATE TABLE s(x,y); CREATE TABLE d(x,y); INSERT INTO s VALUES(1,10),(2,20),(3,3...` |
 | src/tests/DiagDropTable.pas | tier2 | ddl | pas-strict | - | 6 | 5 | db-blob | `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ; DROP TABLE t; SELECT * FROM t` |
 
+## TestFuzzDiff seed corpus sweep (Phase 9.3.2)
+
+`bin/TestFuzzDiff` (the one-shot dbsqlfuzz differential driver
+from 9.3.1) was run against each upstream seed archive copied
+into `src/tests/fuzz/seeds/` from `../sqlite3/test/fuzzdata*.db`
+(8 files, ~62 MiB total).  Each archive is itself an SQLite
+database wrapping a fuzz-case row table; the one-shot driver
+treats each file as a single dbsqlfuzz text frame and decodes
+the hex / `[NNNN]` / `\n--\n` structure.  Four-channel diff
+(stdout, stderr, rc, db-blob — db-blob through 9.1.4
+`ApplyHeaderMask`).
+
+| seed         | file size | db_bytes | sql_bytes  | rc | divergence  |
+|--------------|-----------|----------|------------|----|-------------|
+| fuzzdata1.db |   4.4 MiB |     4096 |  4,393,210 |  0 | none (PASS) |
+| fuzzdata2.db |  17.0 MiB |    28672 | 13,717,693 |  0 | none (PASS) |
+| fuzzdata3.db |  11.8 MiB |   122880 |  8,775,972 |  0 | none (PASS) |
+| fuzzdata4.db |   2.0 MiB |     4096 |  2,008,526 |  0 | none (PASS) |
+| fuzzdata5.db |   7.2 MiB |   278528 |          0 |  0 | none (PASS) |
+| fuzzdata6.db |   1.8 MiB |   118784 |          0 |  0 | none (PASS) |
+| fuzzdata7.db |  16.8 MiB |   458752 |          0 |  0 | none (PASS) |
+| fuzzdata8.db |   4.2 MiB |    28672 |  4,242,686 |  0 | none (PASS) |
+
+Result: **8/8 PASS, 0 divergences, 0 buckets** — no
+`9.3.divbug.*` follow-up bullets created.  Re-run command:
+`for f in src/tests/fuzz/seeds/fuzzdata*.db; do bin/TestFuzzDiff "$f"; done`.
+
+Note: multi-frame archive splitting (decoding the archive's
+case-row table back into individual dbsqlfuzz frames, à la
+`fuzzcheck.c:readtestcase`) is out of scope for the one-shot
+driver — it belongs in 9.3.3 (AFL wiring) or a dedicated
+sweep harness.  The current pass means the *outer-frame*
+parser path and both oracles agree on these inputs; it does
+*not* certify every embedded case.
+
 _End of file._

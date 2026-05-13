@@ -454,7 +454,7 @@ regressions without human triage.
   =69; all four channels byte-identical).  Seed-corpus sweep is
   9.3.2; AFL wiring is 9.3.3.
 
-- [ ] **9.3.2** Seed corpus import.  Pull the upstream `dbsqlfuzz`
+- [X] **9.3.2** Seed corpus import.  Pull the upstream `dbsqlfuzz`
   seed set from `../sqlite3/test/fuzzdata*.db` (8 seed files as of
   2026-05-12) into `src/tests/fuzz/seeds/`.  Run the one-shot driver
   across every seed.  Any divergence is catalogued in
@@ -463,6 +463,23 @@ regressions without human triage.
   task; just surface and bucket each cluster.  Each cluster then
   becomes a `9.3.divbug.N` follow-up bullet (mirroring the
   `9.1.divbug.*` pattern).
+
+  *Landed:* 8 seeds imported into `src/tests/fuzz/seeds/`
+  (`fuzzdata1.db` .. `fuzzdata8.db`, total ~62 MiB, copied verbatim
+  from `../sqlite3/test/`).  Sweep results: **8/8 PASS, 0
+  divergences, 0 buckets**.  Each archive is itself an SQLite db
+  (header `SQLite format 3`) wrapping a fuzz-case row table; the
+  one-shot driver treats each file as a single dbsqlfuzz frame and
+  decodes the hex/`[NNNN]`/`\n--\n` structure.  Frame-decode summary:
+  seeds 1/2/3/4/8 yielded non-empty SQL tails (sql_bytes 2.0M..13.7M);
+  seeds 5/6/7 decoded to db-only frames (sql_bytes=0) — both oracles
+  agree byte-for-byte on all four channels in every case.  No
+  `9.3.divbug.*` follow-up bullets created (none warranted).  Per-
+  seed run log appended to `src/tests/DIVERGENCES.md` under a new
+  *TestFuzzDiff seed corpus sweep* section.  Multi-frame archive
+  splitting (one row per fuzz case rather than treating the whole
+  archive as one frame) is out of scope for the one-shot driver;
+  belongs in 9.3.3 (AFL wiring) or a dedicated harness.
 
 - [ ] **9.3.3** AFL wiring.  `src/tests/fuzz/afl-driver.pas` wraps
   9.3.1 for `afl-fuzz` (read input from stdin, write to a tmp file,
