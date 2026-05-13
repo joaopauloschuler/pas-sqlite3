@@ -384,19 +384,8 @@ regressions without human triage.
   - [ ] **9.2.divbug.L.1** Port `incrVacuumStep` (btree.c) — page-relocation core; pre-req for both bucket-L and the bare-`VACUUM;` bucket-B (9.2.divbug.B).  Complexity: L.
   - [ ] **9.2.divbug.L.2** Port `relocatePage` + `modifyPagePointer` (btree.c) — ptrmap walker dependencies for L.1.  Complexity: M.  Cross-link: STUB_INVENTORY ptrmap entry.
   - [ ] **9.2.divbug.L.3** Wire `autoVacuumCommit` body — once L.1/L.2 land, the auto-vacuum-at-COMMIT path falls into place; bucket-L should close.  Complexity: S.
-  - [ ] **9.2.divbug.M** UTF-16 INSERT round-trip stores raw UTF-8
-    bytes — `utf16.db` (PRAGMA encoding='UTF-16le' at create) mutator
-    inserts plain UTF-8 string literals; resulting cell-area bytes on
-    the Pas side carry the unconverted UTF-8 (`c3 a9` for `é`) where
-    the C oracle stores the converted UTF-16LE (`e9 00`).  9.2.divbug.G
-    ported the `OP_String8` conversion arm for SELECT/PRAGMA read
-    paths, but the INSERT / `OP_MakeRecord` write path bypasses it.
-    Audit needed: `sqlite3VdbeMemSetStr` / `sqlite3VdbeChangeEncoding`
-    invocation sites in the cell-serialise codegen — C reference
-    `../sqlite3/src/vdbemem.c (sqlite3VdbeChangeEncoding)` plus
-    `../sqlite3/src/vdbeaux.c (sqlite3VdbeMakeRecord)`.  Surfaced by
-    9.2.3.followup; tagged `pas-skip` with cite `bucket-M` in
-    MANIFEST.  See bucket-M in `src/tests/vectors/DIVERGENCES.md`.
+  - [X] **9.2.divbug.M** ~~UTF-16 INSERT raw-UTF-8~~ CLOSED 2026-05-13 — no longer reproducible after **9.2.divbug.K** (commit 6fd9ec2 routed all `sqlite3_result_text*`/`_blob*` setters through `setResultStrOrError`, which now calls `sqlite3VdbeChangeEncoding(pOut, pCtx^.enc)` per vdbeapi.c:387..427). Verified: active cells in utf16.db cell-content area are byte-identical to C oracle (`café-x` → `63 00 61 00 66 00 e9 00 2d 00 78 00`); file-header enc tag = UTF-16LE. Residual round-trip divergence on utf16.db is unrelated and re-filed as **9.2.divbug.N**.
+  - [ ] **9.2.divbug.N** Freeblock / dead-cell zeroing on DELETE + UPDATE — `utf16.db` (and likely other vectors with mid-table DELETE followed by UPDATE).  At offsets where C has zeroed the reclaimed cell payload, Pas retains a ghost copy of the prior (deleted) row.  Surfaced by 9.2.divbug.M's audit after the text-encoding bypass closed: bytes 0x1fe9..0x1ff0 of `utf16.db` carry `1d 63 00 61 00 66 00 e9 00 0d` on Pas vs zeros on C.  C reference: `../sqlite3/src/btree.c freeSpace` / `dropCell` / `defragmentPage` — verify the Pas counterparts zero-fill reclaimed freeblock payload as C does.  Complexity: S/M.  Update MANIFEST cite from bucket-M → bucket-N once a fix lands.
 
 - [X] **9.2.3.followup** Round-trip parser now cite-aware (mirrors
   TestVectorSchemaChange's filter): only `pas-skip` cites that name
