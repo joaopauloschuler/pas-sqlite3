@@ -213,21 +213,19 @@ Affected vector:
 * `partial-index.db` — bucket E lifted; vector still pas-skips for
   bucket-B (trailing `VACUUM` EAccessViolation, unrelated).
 
-## Bucket F — PRAGMA auto_vacuum returns 0 on RO-open (9.2.2)
+## Bucket F — PRAGMA auto_vacuum returns 0 on RO-open (9.2.2) [FIXED 9.2.divbug.F]
 
-Symptom: `PRAGMA auto_vacuum;` on an auto-vacuum / incremental-vacuum
-`.db` opened read-only returns `0` from the Pas port and `1` (FULL) /
-`2` (INCREMENTAL) from the C oracle.  Surfaced once bucket-A was lifted.
-
-Reproducer:
-```bash
-LD_LIBRARY_PATH=src ./bin/passqlite3 -readonly src/tests/vectors/autovacuum.db "PRAGMA auto_vacuum;"
-```
-
-Likely root cause: the PRAGMA auto_vacuum reader path consults
-`pBt^.autoVacuum`, but the Pas `lockBtree` arm that parses page-1 doesn't
-populate that field from header bytes 36..39 the way C does.  Reference:
-`../sqlite3/src/btree.c lockBtree` (sets `pBt->autoVacuum = get4byte(...)`).
+**Fixed**: `passqlite3codegen.pas` `sqlite3Pragma` stubbed
+`auto_vacuum` to a constant `OP_Integer 0` (in the "constant-default
+integer pragmas" fallback block) and never consulted the btree layer,
+so even though `lockBtree` correctly populated `pBt^.autoVacuum` from
+page-1 header bytes 36..39, the pragma codegen ignored that state.
+Faithful port: drop `auto_vacuum` from the constant-stub table and
+add a proper read arm that runs `sqlite3ReadSchema` then
+`sqlite3BtreeGetAutoVacuum(pBt)`, mirroring `pragma.c:801`.  Closes
+9.2.divbug.F.  incrvacuum.db now passes `TestVectorReadOnly`;
+autovacuum.db still pas-skips on bucket-B (script-trailing VACUUM
+EAccessViolation, unrelated).
 
 Affected vectors: `autovacuum.db`, `incrvacuum.db`.
 

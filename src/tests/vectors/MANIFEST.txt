@@ -91,8 +91,7 @@ btree.c:3622).  See DIVERGENCES.md.  Removing the bucket-A umbrella
 surfaced four read-only divergences the umbrella was previously hiding;
 they are tracked as bucket-F / bucket-G / bucket-H below.
 
-  pas-skip autovacuum.db       bucket-B,bucket-F (PRAGMA auto_vacuum RO returns 0 instead of 1)
-  pas-skip incrvacuum.db       bucket-F (PRAGMA auto_vacuum RO returns 0 instead of 2)
+  pas-skip autovacuum.db       bucket-B (script-trailing VACUUM EAccessViolation; bucket-F lifted by 9.2.divbug.F)
   pas-skip view-cte.db         bucket-B (script-trailing VACUUM still EAccessViolations — 9.2.divbug.B; rename arm of bucket-C cleared in 9.2.divbug.C)
   pas-skip utf16.db            bucket-G (PRAGMA encoding RO returns garbled UTF-8 of UTF-16 text)
   pas-skip withoutrowid.db     bucket-D,bucket-H (WITHOUT ROWID read-side aborts mid-schema with "database disk image is malformed")

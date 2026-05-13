@@ -226,11 +226,17 @@ regressions without human triage.
     (WITHOUT ROWID RO sweep aborts mid-schema), bucket-I (round-trip
     cell-layout drift on wal/multipage/generated-column) and bucket-J
     (round-trip trigger-fire EAccessViolation), all triaged below.
-  - [ ] **9.2.divbug.F** PRAGMA auto_vacuum returns 0 on RO-open while
-    C oracle returns 1/2 (sites: autovacuum.db, incrvacuum.db).  Likely
-    surface: `pBt^.autoVacuum` not populated from page-1 header bytes
-    36..39 under the readonly lockBtree arm.  C ref:
-    `../sqlite3/src/btree.c lockBtree`.
+  - [X] **9.2.divbug.F** PRAGMA auto_vacuum returns 0 on RO-open while
+    C oracle returns 1/2 (sites: autovacuum.db, incrvacuum.db).  Root
+    cause: `passqlite3codegen.pas` `sqlite3Pragma` stubbed auto_vacuum
+    to a constant `OP_Integer 0` (the "constant-default integer pragmas"
+    fallback) and never called into the btree layer, so even though
+    `lockBtree` populated `pBt^.autoVacuum` from header bytes 36..39
+    correctly, the pragma codegen ignored it.  Fix: drop auto_vacuum
+    from the constant-stub table and add a proper read arm that runs
+    `sqlite3ReadSchema` then `sqlite3BtreeGetAutoVacuum(pBt)`, mirroring
+    `pragma.c:801`.  incrvacuum.db now passes TestVectorReadOnly;
+    autovacuum.db still pas-skips on bucket-B (script-trailing VACUUM).
   - [ ] **9.2.divbug.G** PRAGMA encoding returns garbled UTF-8 of the
     UTF-16 cookie on RO-open (1 site: utf16.db).  Likely surface:
     `sqlite3InitOne` text-encoding arm not propagating cookie encoding

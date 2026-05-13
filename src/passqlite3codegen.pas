@@ -46954,6 +46954,23 @@ begin
     Exit;
   end;
 
+  { PragTyp_AUTO_VACUUM read arm (pragma.c:801).  Calls into the btree
+    layer which reads pBt^.autoVacuum / pBt^.incrVacuum (populated from
+    page-1 header meta[4]/meta[7] in lockBtree).  Returns 0=NONE,
+    1=FULL, 2=INCREMENTAL.  9.2.divbug.F. }
+  if SameText(zName, 'auto_vacuum') and (pValue = nil) then begin
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
+    pBtArg := PBtree(db^.aDb[iDb].pBt);
+    if pBtArg <> nil then
+      iVal := sqlite3BtreeGetAutoVacuum(pBtArg)
+    else
+      iVal := 0;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
   { PragTyp_PAGE_SIZE read arm (pragma.c:598).  Page size is fixed at
     open time so capture at codegen via sqlite3BtreeGetPageSize. }
   if SameText(zName, 'page_size') and (pValue = nil) then begin
@@ -47034,7 +47051,6 @@ begin
     else if SameText(zName, 'analysis_limit')     then iVal := 0
     else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
     else if SameText(zName, 'journal_size_limit') then iVal := -1
-    else if SameText(zName, 'auto_vacuum')        then iVal := 0
     else if SameText(zName, 'freelist_count')     then iVal := 0
     else if SameText(zName, 'schema_version')     then iVal := 0
     { pragma.c:951..978 PragTyp_MMAP_SIZE — when SQLITE_MAX_MMAP_SIZE<=0
