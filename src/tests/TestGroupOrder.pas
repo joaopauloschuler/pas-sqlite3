@@ -32,87 +32,22 @@
     - DiagGroupOrder: GROUP BY ... ORDER BY {ASC,DESC}
 
   This binary makes them part of the formal regression gate.
+
+  RunDdl/CollectRows/Expect hoisted to TestRowJoinCommon (shared with
+  TestJoinNatural — jscpd 55-line clone).  ExpectError stays inline (no
+  second consumer).
 }
 program TestGroupOrder;
 
 uses
   SysUtils,
   passqlite3types, passqlite3util, passqlite3vdbe,
-  passqlite3codegen, passqlite3main;
+  passqlite3codegen, passqlite3main,
+  TestRowJoinCommon;
 
 var
   db: PTsqlite3;
   failures: i32 = 0;
-
-procedure RunDdl(const sql: AnsiString);
-var
-  pStmt: PVdbe;
-  pTail: PAnsiChar;
-  rcs: i32;
-begin
-  pStmt := nil;
-  pTail := nil;
-  rcs := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, @pTail);
-  if pStmt <> nil then begin
-    repeat rcs := sqlite3_step(pStmt) until rcs <> SQLITE_ROW;
-    sqlite3_finalize(pStmt);
-  end;
-end;
-
-{ Collect every result row as 'col0|col1|...;col0|col1|...' (text values). }
-function CollectRows(const sql: AnsiString): AnsiString;
-var
-  pStmt: PVdbe;
-  pTail: PAnsiChar;
-  rcs, nCol, i: i32;
-  row, cell: AnsiString;
-  pText: PAnsiChar;
-begin
-  Result := '';
-  pStmt := nil;
-  pTail := nil;
-  rcs := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, @pTail);
-  if pStmt = nil then begin
-    Result := '<prepare-failed rc=' + IntToStr(rcs) + '>';
-    Exit;
-  end;
-  while True do begin
-    rcs := sqlite3_step(pStmt);
-    if rcs = SQLITE_ROW then begin
-      nCol := sqlite3_column_count(pStmt);
-      row := '';
-      for i := 0 to nCol - 1 do begin
-        pText := PAnsiChar(sqlite3_column_text(pStmt, i));
-        if pText = nil then cell := 'NULL' else cell := AnsiString(pText);
-        if i = 0 then row := cell else row := row + '|' + cell;
-      end;
-      if Result <> '' then Result := Result + ';';
-      Result := Result + row;
-    end else if rcs = SQLITE_DONE then
-      break
-    else begin
-      Result := '<step-failed rc=' + IntToStr(rcs) + '>';
-      break;
-    end;
-  end;
-  sqlite3_finalize(pStmt);
-end;
-
-procedure Expect(const label_, sql, want: AnsiString);
-var
-  got: AnsiString;
-begin
-  got := CollectRows(sql);
-  if got = want then
-    WriteLn('PASS  ', label_, ' -> ', got)
-  else begin
-    WriteLn('FAIL  ', label_);
-    WriteLn('      sql:  ', sql);
-    WriteLn('      want: [', want, ']');
-    WriteLn('      got:  [', got, ']');
-    Inc(failures);
-  end;
-end;
 
 { ExpectError: prepare or step must fail (rc <> OK and <> ROW/DONE). }
 procedure ExpectError(const label_, sql: AnsiString);
@@ -149,49 +84,49 @@ begin
     Halt(2);
   end;
 
-  RunDdl('CREATE TABLE g(grp TEXT, val INTEGER)');
-  RunDdl('INSERT INTO g VALUES (''a'',1),(''a'',2),(''b'',10),(''b'',20),(''c'',100)');
+  RjRunDdl(db, 'CREATE TABLE g(grp TEXT, val INTEGER)');
+  RjRunDdl(db, 'INSERT INTO g VALUES (''a'',1),(''a'',2),(''b'',10),(''b'',20),(''c'',100)');
 
   { --- GROUP BY + ORDER BY (DiagGroupOrder cases) --- }
-  Expect('T1  GROUP BY grp ORDER BY grp ASC',
-         'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY grp ASC',
-         'a|3;b|30;c|100');
+  RjExpect(db, 'T1  GROUP BY grp ORDER BY grp ASC',
+           'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY grp ASC',
+           'a|3;b|30;c|100', failures);
 
-  Expect('T2  GROUP BY grp ORDER BY grp DESC',
-         'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY grp DESC',
-         'c|100;b|30;a|3');
+  RjExpect(db, 'T2  GROUP BY grp ORDER BY grp DESC',
+           'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY grp DESC',
+           'c|100;b|30;a|3', failures);
 
-  Expect('T3  GROUP BY grp ORDER BY sum(val) DESC',
-         'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY sum(val) DESC',
-         'c|100;b|30;a|3');
+  RjExpect(db, 'T3  GROUP BY grp ORDER BY sum(val) DESC',
+           'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY sum(val) DESC',
+           'c|100;b|30;a|3', failures);
 
-  Expect('T4  GROUP BY grp ORDER BY 2 ASC (positional)',
-         'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY 2 ASC',
-         'a|3;b|30;c|100');
+  RjExpect(db, 'T4  GROUP BY grp ORDER BY 2 ASC (positional)',
+           'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY 2 ASC',
+           'a|3;b|30;c|100', failures);
 
   { --- bug.73: aggregate w/o GROUP BY + ORDER BY --- }
-  Expect('T5  SELECT count(*)/sum(val) FROM g ORDER BY 1',
-         'SELECT count(*), sum(val) FROM g ORDER BY 1',
-         '5|133');
+  RjExpect(db, 'T5  SELECT count(*)/sum(val) FROM g ORDER BY 1',
+           'SELECT count(*), sum(val) FROM g ORDER BY 1',
+           '5|133', failures);
 
   { --- bug.52: HAVING in non-GROUP-BY aggregate query --- }
-  Expect('T6  HAVING on non-GROUP-BY aggregate (true)',
-         'SELECT sum(val) FROM g HAVING sum(val) > 100',
-         '133');
+  RjExpect(db, 'T6  HAVING on non-GROUP-BY aggregate (true)',
+           'SELECT sum(val) FROM g HAVING sum(val) > 100',
+           '133', failures);
 
-  Expect('T7  HAVING on non-GROUP-BY aggregate (false → no rows)',
-         'SELECT sum(val) FROM g HAVING sum(val) > 1000',
-         '');
+  RjExpect(db, 'T7  HAVING on non-GROUP-BY aggregate (false → no rows)',
+           'SELECT sum(val) FROM g HAVING sum(val) > 1000',
+           '', failures);
 
   { --- HAVING with GROUP BY (sanity) --- }
-  Expect('T8  GROUP BY ... HAVING count(*) >= 2',
-         'SELECT grp, count(*) FROM g GROUP BY grp HAVING count(*) >= 2 ORDER BY grp',
-         'a|2;b|2');
+  RjExpect(db, 'T8  GROUP BY ... HAVING count(*) >= 2',
+           'SELECT grp, count(*) FROM g GROUP BY grp HAVING count(*) >= 2 ORDER BY grp',
+           'a|2;b|2', failures);
 
   { --- bug.51: HAVING by SELECT-list column alias --- }
-  Expect('T9  HAVING references SELECT-list alias',
-         'SELECT grp AS x, sum(val) AS s FROM g GROUP BY x HAVING s >= 30 ORDER BY x',
-         'b|30;c|100');
+  RjExpect(db, 'T9  HAVING references SELECT-list alias',
+           'SELECT grp AS x, sum(val) AS s FROM g GROUP BY x HAVING s >= 30 ORDER BY x',
+           'b|30;c|100', failures);
 
   { --- bug.74: HAVING on non-aggregate must error --- }
   ExpectError('T10 HAVING on non-aggregate, no GROUP BY',
