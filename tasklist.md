@@ -699,14 +699,7 @@ partial landings cannot silently no-op.
         deferred under 10.1.42.a.6 (a.6.5).
       Land in lock-step with the host ports under 10.1.42.a.6 / future
       optimizer-pass batches.
-    - [ ] **10.1.42.a.6** Port the host optimizer helpers gating the
-      remaining 10.1.42.a.3 sub-arms: `havingToWhere` (select.c:7047),
-      `countOfViewOptimization` (:7199), `optimizeAggregateUseOfIndexedExpr`
-      (:6572), `aggregateConvertIndexedExprRefToColumn` (:8609), and the
-      `select_end` AggInfo teardown print (:8937).  Each is a host function
-      not yet ported; once any one lands, drop its `{$IFDEF SQLITE_DEBUG}`
-      TREETRACE arm at the same call site.  Treat as 5 independent
-      micro-tasks (a.6.1..a.6.5) when work begins — file as needed.
+    - [X] **10.1.42.a.6** All five sub-arms (a.6.1..a.6.5) landed — see ticked entries below.  Closed 2026-05-13 after a.6.5.
   - [~] **10.1.42.b** WHERETRACE first batch landed in where*.c → passqlite3codegen.pas: BEGIN/END `addBtreeIdx(%s)` in `whereLoopAddBtreeIndex` (0x800), BEGIN/END `addVirtual()` in `whereLoopAddVirtual` (0x800), Begin/End OR-clause in `whereLoopAddOr` (0x400). Gated by `{$IFDEF SQLITE_DEBUG}`. Follow-up subtasks below:
     - [~] **10.1.42.b.1** Range-scan cost-estimate WHERETRACE arms in
       `whereRangeScanEst` / `whereRangeSkipScanEst` (target tasklist mask
@@ -769,6 +762,24 @@ partial landings cannot silently no-op.
       against whereInt.h, NOT 0x10 as tasklist initially suggested).
       Treat as 3 independent micro-tasks; drop the WHERETRACE call at
       each host function as it lands.
+      **BLOCKED 2026-05-13** on prerequisite **10.1.42.b.7.prereq** —
+      the three helpers consume `sqlite3Stat4ProbeSetValue` (where.c:2002, 2169, 2306)
+      and `sqlite3Stat4ValueFromExpr` (where.c:2006, 2186) which are
+      unported in passqlite3.  Audit found zero references to either symbol
+      in `src/*.pas`; only `sqlite3Stat4Column` (vdbe.pas:13356) and
+      `sqlite3Stat4ProbeFree` (vdbe.pas:13409) exist as Phase-6 stubs.
+      `SQLITE_ENABLE_STAT4` is not set in `src/passqlite3.inc` /
+      `src/tests/build.sh`; pas-sqlite3 is a default non-STAT4 build.
+    - [ ] **10.1.42.b.7.prereq** Port `sqlite3Stat4ProbeSetValue` and
+      `sqlite3Stat4ValueFromExpr` (consumers of `IndexSample` /
+      `sqlite3VdbeRecordCompare`) plus any sample-vector machinery they
+      depend on (`sqlite3Stat4Init`, `analyzeOneTable` STAT4 arm, etc.).
+      C ref: `../sqlite3/src/analyze.c` (STAT4 sample collection) +
+      `../sqlite3/src/vdbeapi.c` (`sqlite3Stat4ProbeSetValue`).  Once
+      landed, gate the new helpers + 10.1.42.b.7 behind
+      `{$IFDEF SQLITE_ENABLE_STAT4}` and add the env-var wiring in
+      `build.sh` (mirror the `SQLITE_ENABLE_STMT_SCANSTATUS` pattern).
+      Complexity: L.
     - [X] **10.1.42.b.8** Ported `wherePathName`, `sqlite3WhereTermPrint`,
       `sqlite3WhereClausePrint`, `sqlite3WhereLoopPrint`, and the helper
       `showAllWhereLoops` from where.c:2375..2520 / 5512..5519 / 6469..6488
