@@ -40564,9 +40564,30 @@ begin
   pIndex^.nColumn := u16(i32(pList^.nExpr) + nExtraCol);
   if onError <> OE_None then
     pIndex^.idxFlags := pIndex^.idxFlags or u32($08);  { uniqNotNull = bit 3 }
+  { build.c:4209 — under IN_RENAME_OBJECT the per-column pExpr list is
+    pinned on pIndex^.aColExpr so renameColumnFunc's walker can visit the
+    TK_ID column-name tokens that reference the renamed column.  Without
+    this pin the partial-index DDL rewrite never finds the indexed-column
+    span and emits stale `ON t(val)` text. }
+  if InRenameObject(pParse) then begin
+    pIndex^.aColExpr := pList;
+  end;
   for i := 0 to i32(pList^.nExpr) - 1 do
   begin
     n := -1;
+    pColExpr  := PExprListItem(PByte(ExprListItems(pList))
+                   + i * SizeOf(TExprListItem))^.pExpr;
+    { build.c:4216..4219 — convert TK_STRING to TK_ID, then resolve
+      column references.  Under IN_RENAME_OBJECT this rewrites simple
+      column references from TK_ID to TK_COLUMN so renameColumnExprCb
+      (TK_COLUMN gate) can match the indexed-column span.  Restricted to
+      rename mode here because the legacy zToken-based aiColumn lookup
+      below still relies on the pre-resolve identifier text. }
+    if InRenameObject(pParse) then begin
+      sqlite3StringToId(pColExpr);
+      if sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil) <> 0 then
+        goto exit_create_index;
+    end;
     { 10.1.bug.108: peel any TK_COLLATE wrapper to expose the underlying
       column expression, and capture the wrapper's zToken as the index
       column's collation name.  Mirrors build.c:4253..4276 (TK_COLLATE
@@ -40709,6 +40730,9 @@ begin
   else if InRenameObject(pParse) then begin
     pParse^.pNewIndex := pIndex;
     pIndex            := nil;
+    { ownership of pList was transferred to pIndex^.aColExpr above;
+      null it here so the exit_create_index cleanup does not double-free. }
+    pList             := nil;
   end;
 
 exit_create_index:
@@ -43435,7 +43459,7 @@ begin
   end
   else if (pExpr^.op = TK_COLUMN)
      and (pExpr^.iColumn = p^.iCol)
-     and ((pExpr^.flags and EP_xIsSelect) = 0)  { ExprUseYTab }
+     and ((pExpr^.flags and (EP_WinFunc or EP_Subrtn)) = 0)  { ExprUseYTab }
      and (p^.pTab = pExpr^.y.pTab) then
   begin
     renameTokenFind(pWalker^.pParse, p, Pointer(pExpr));

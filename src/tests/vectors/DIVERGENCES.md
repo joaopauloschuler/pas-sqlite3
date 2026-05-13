@@ -185,37 +185,33 @@ Affected vector:
 
 * `withoutrowid.db` — bucket D (also bucket-A, bucket-B via VACUUM)
 
-## Bucket E — ALTER RENAME COLUMN on table with partial index (9.2.4)
+## Bucket E — ALTER RENAME COLUMN on table with partial index (9.2.4) — CLOSED 9.2.divbug.E
 
-Symptom: `ALTER TABLE t RENAME COLUMN val TO amount;` against
-`partial-index.db` produces a byte-different `.db` blob (both rc=0).
-The partial index `idx_active_val ON t(val) WHERE status='active'`
-references the renamed column directly; `alter.c` `renameColumnFunc`
-must rewrite the index DDL to `ON t(amount) WHERE status='active'`.
-The Pascal port writes a different sqlite_master payload (the new
-DDL string differs from the C oracle's, possibly in whitespace or
-quoting).
+Was: `ALTER TABLE t RENAME COLUMN val TO amount;` against
+`partial-index.db` produced a byte-different `.db` blob (both rc=0)
+because the rewritten sqlite_master row still read `ON t(val)`.
 
-Reproducer:
+Root cause: Pas `sqlite3CreateIndex` skipped C build.c:4209's
+`IN_RENAME_OBJECT` arm — `pIndex->aColExpr = pList; pList = 0;` plus
+the per-column `sqlite3StringToId` / `sqlite3ResolveSelfReference`
+calls that promote TK_ID column-name expressions to TK_COLUMN.
+Without the aColExpr pin, `renameColumnFunc`'s `else if
+sParse.pNewIndex` arm (alter.c:1639-1641) walked a NULL `aColExpr`
+and never tagged the indexed-column token span, so renameEditSql
+emitted the original column name verbatim.
 
-```bash
-cp src/tests/vectors/partial-index.db /tmp/c.db
-cp src/tests/vectors/partial-index.db /tmp/p.db
-/home/bpsa/app/sqlite3/sqlite3 /tmp/c.db "ALTER TABLE t RENAME COLUMN val TO amount;"
-LD_LIBRARY_PATH=src ./bin/passqlite3 /tmp/p.db "ALTER TABLE t RENAME COLUMN val TO amount;"
-cmp /tmp/c.db /tmp/p.db
-# differ at byte ~102 (inside sqlite_master row for idx_active_val)
-```
-
-Likely root cause: the `addcolumn_renametokenmap` fix (memory entry)
-covers the AddColumn path; the parallel index-DDL rewrite for partial
-indexes may be missing a similar `RenameTokenMap` call, so the
-re-emitted DDL doesn't preserve the original tokenisation.  C
-reference: `../sqlite3/src/alter.c (renameColumnFunc, renameColumnIdxNames)`.
+Fix landed in `src/passqlite3codegen.pas`: added the rename-mode
+aColExpr pin before the per-column loop, mirrored the StringToId +
+ResolveSelfReference calls inside the loop (gated on
+`InRenameObject`), and nulled `pList` in the post-loop
+`InRenameObject` branch so exit_create_index doesn't double-free.
+Also corrected the `ExprUseYTab` mask in `renameColumnExprCb` from
+`EP_xIsSelect` to `EP_WinFunc|EP_Subrtn`.
 
 Affected vector:
 
-* `partial-index.db` — bucket E (also bucket-A, bucket-B via VACUUM)
+* `partial-index.db` — bucket E lifted; vector still pas-skips for
+  bucket-B (trailing `VACUUM` EAccessViolation, unrelated).
 
 ## Bucket F — PRAGMA auto_vacuum returns 0 on RO-open (9.2.2)
 

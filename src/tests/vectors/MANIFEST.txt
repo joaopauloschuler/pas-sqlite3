@@ -99,7 +99,7 @@ they are tracked as bucket-F / bucket-G / bucket-H below.
   pas-skip wal.db              bucket-I (round-trip cell-layout drift at byte 8201 — WAL mutator)
   pas-skip multipage.db        bucket-I (round-trip cell-layout drift at byte 12290 — multipage mutator)
   pas-skip generated-column.db bucket-I (round-trip cell-layout drift at byte 4103 — generated-column mutator)
-  pas-skip partial-index.db    bucket-E (ALTER RENAME COLUMN on table with partial index — 9.2.4)
+  pas-skip partial-index.db    bucket-B (script-trailing VACUUM EAccessViolation; bucket-E lifted by 9.2.divbug.E)
   pas-skip triggers.db         bucket-J (round-trip mutator EAccessViolation — trigger fire under RW)
 
 Reproducibility gate

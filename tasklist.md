@@ -207,7 +207,7 @@ regressions without human triage.
 
 - [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. Today: gated=1 ok=1 diverged=0 skipped=10 rc=0 (bucket-A umbrella lifted; the 3 round-trip cell-layout divergences it was masking are now triaged under bucket-I, and the triggers round-trip crash under bucket-J).
 
-- [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). 9.2.divbug.C closed (view-cte rename arm), but view-cte still hits bucket-B at the trailing VACUUM so it stays pas-skip. Today: gated=1 ok=1 diverged=0 skipped=7 rc=0.
+- [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). 9.2.divbug.C closed (view-cte rename arm), 9.2.divbug.E closed (partial-index RENAME COLUMN aColExpr pin), but both view-cte and partial-index still hit bucket-B at the trailing VACUUM so they stay pas-skip. Today: gated=1 ok=1 diverged=0 skipped=7 rc=0.
 
 - [X] **9.2.5** Vector regen script — `src/tests/vectors/regen.sh` walks every `*.sql`, regenerates via C oracle, `cmp`s against committed blob. Skip-tagged (fts5/rtree) skipped; legacy simple/multipage fall back to .dump equivalence (EQUIV_LIST, 3.45.x vintage). Clean run: 11 OK + 2 skipped + 0 mismatch, rc=0.
 
@@ -277,11 +277,19 @@ regressions without human triage.
     site: withoutrowid vector).  Cross-check
     `../sqlite3/src/build.c sqlite3CreateIndex` + `btree.c` cell
     packing for index-on-WITHOUT-ROWID-with-PK-suffix.
-  - [ ] **9.2.divbug.E** `ALTER TABLE … RENAME COLUMN` on a table
+  - [X] **9.2.divbug.E** `ALTER TABLE … RENAME COLUMN` on a table
     referenced by a partial index produces byte-different
-    `sqlite_master` row (1 site: partial-index vector).  Cross-check
-    `../sqlite3/src/alter.c sqlite3AlterRenameColumn` for the partial-
-    index DDL rewrite arm.
+    `sqlite_master` row (1 site: partial-index vector).  FIXED: Pas
+    `sqlite3CreateIndex` lacked C build.c:4209 `IN_RENAME_OBJECT` arm
+    that pins `pIndex^.aColExpr := pList` and the per-column
+    `sqlite3StringToId`/`sqlite3ResolveSelfReference` calls that
+    rewrite TK_ID → TK_COLUMN.  Without the pin renameColumnFunc's
+    `else if sParse.pNewIndex` walker (alter.c:1639) walked an empty
+    aColExpr and never tagged the indexed-column span, so
+    renameEditSql emitted stale `ON t(val)` text. After fix the
+    partial-index vector is byte-identical post-RENAME COLUMN; the
+    schema-script still pas-skips for bucket-B (trailing VACUUM
+    EAccessViolation, unrelated).
 
 - [ ] **9.2.3.followup** `bin/TestVectorRoundTrip` currently inherits
   the bucket-A `pas-skip` block from MANIFEST and therefore skips all
