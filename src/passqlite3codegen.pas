@@ -9495,6 +9495,24 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
             Exit;
           end;
+          { 9.4.divbug.19 — qualified rowid alias (Tab.rowid / sp.oid).
+            Mirror lookupName at resolve.c:471..503 + 623..638: the table
+            matched by name/alias but no real column did; if zCol is one of
+            {rowid, oid, _rowid_} and pTab has a VisibleRowid, bind to
+            iColumn=-1 against this source.  WITHOUT-ROWID tables fall
+            through to the "no such column" error, matching C. }
+          if (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
+             and HasRowid(pItem^.pSTab) then
+          begin
+            pE^.op      := TK_COLUMN;
+            pE^.iTable  := pItem^.iCursor;
+            pE^.iColumn := i16(-1);
+            pE^.y.pTab  := pItem^.pSTab;
+            pE^.pLeft   := nil;
+            pE^.pRight  := nil;
+            pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            Exit;
+          end;
         end;
       end;
       { Unresolved TK_DOT — mirror resolve.c lookupName cnt==0 tail:
