@@ -103,14 +103,23 @@ end;
 {----------------------------------------------------------------------------
   BuildScript — emit the multi-line tclsh script body.
   testAbsPath is absolute path to the .test file.
+  tmpDir, when non-empty, is the isolated per-test working directory the
+  interpreter cd's into before sourcing the .test file (9.4.7.f).
 ----------------------------------------------------------------------------}
-function BuildScript(const testAbsPath: string): string;
+function BuildScript(const testAbsPath: string; const tmpDir: string): string;
 var sb: TStringList;
 begin
   sb := TStringList.Create;
   try
     sb.Add('load {' + gSoPath + '} Sqlite3');
     sb.Add('package require sqlite3');
+    { 9.4.7.f: cd into the per-test tmpdir so any test.db / -journal / -wal
+      the test leaks lands in a throwaway directory the driver deletes
+      afterwards — tests can no longer cross-pollinate each other.
+      ::testdir stays absolute (set below) so $::testdir/wal_common.tcl
+      etc. still resolve from inside the tmpdir. }
+    if tmpDir <> '' then
+      sb.Add('cd {' + tmpDir + '}');
     { 9.4.3.c: ::testdir is pinned to the *absolute* src/tests/tcl path so
       .test files can `source $::testdir/wal_common.tcl` etc. regardless of
       the interpreter's current working directory (which 9.4.7.f changes to
@@ -164,6 +173,54 @@ begin
 end;
 
 {----------------------------------------------------------------------------
+  9.4.7.f: per-test isolation helpers.
+
+  Each test runs in its own freshly-created tmpdir so a leaked test.db /
+  test.db-journal / WAL file from one .test cannot cross-pollinate the
+  next.  The tmpdir is removed (recursively) when the test finishes.
+----------------------------------------------------------------------------}
+function MakeTestTmpDir(const testAbsPath: string): string;
+var
+  base, tag: string;
+  attempt  : Integer;
+begin
+  base := GetTempDir(False);
+  if base = '' then base := '/tmp';
+  base := IncludeTrailingPathDelimiter(base);
+  tag  := ChangeFileExt(ExtractFileName(testAbsPath), '');
+  attempt := 0;
+  repeat
+    Result := base + 'pastcl_' + tag + '_'
+              + IntToStr(GetProcessID) + '_'
+              + IntToStr(GetTickCount64) + '_' + IntToStr(attempt);
+    Inc(attempt);
+  until (not DirectoryExists(Result)) or (attempt > 1000);
+  if not CreateDir(Result) then
+    Result := '';   { caller falls back to the .test file's own dir }
+end;
+
+procedure RemoveDirRecursive(const dir: string);
+var
+  info : TSearchRec;
+  full : string;
+begin
+  if (dir = '') or (not DirectoryExists(dir)) then Exit;
+  if FindFirst(IncludeTrailingPathDelimiter(dir) + '*', faAnyFile, info) = 0 then
+  begin
+    repeat
+      if (info.Name = '.') or (info.Name = '..') then Continue;
+      full := IncludeTrailingPathDelimiter(dir) + info.Name;
+      if (info.Attr and faDirectory) <> 0 then
+        RemoveDirRecursive(full)
+      else
+        DeleteFile(full);
+    until FindNext(info) <> 0;
+    FindClose(info);
+  end;
+  RemoveDir(dir);
+end;
+
+{----------------------------------------------------------------------------
   RunOne — spawn tclsh, feed script via stdin, capture stdout/stderr,
   enforce timeout.  Returns exit code (or -1 on spawn fail, -2 on timeout).
 ----------------------------------------------------------------------------}
@@ -177,18 +234,25 @@ var
   startTick  : QWord;
   endTick    : QWord;
   cwd        : string;
+  tmpDir     : string;
 begin
   sOut := '';
   sErr := '';
   durationMs := 0;
-  script := BuildScript(testAbsPath);
+
+  { 9.4.7.f: spin up an isolated working directory for this test. }
+  tmpDir := MakeTestTmpDir(testAbsPath);
+  script := BuildScript(testAbsPath, tmpDir);
 
   p := TProcess.Create(nil);
   try
     p.Executable := '/usr/bin/tclsh';
     { read script from stdin (single dash) }
     p.Parameters.Add('-');
-    cwd := ExtractFileDir(testAbsPath);
+    if tmpDir <> '' then
+      cwd := tmpDir
+    else
+      cwd := ExtractFileDir(testAbsPath);   { fallback if tmpdir create failed }
     if cwd <> '' then p.CurrentDirectory := cwd;
     p.Options := [poUsePipes];
     p.ShowWindow := swoHIDE;
@@ -248,6 +312,11 @@ begin
     Result := p.ExitStatus;
   finally
     p.Free;
+    { 9.4.7.f: tear down the per-test tmpdir (and any test.db / journals
+      / WAL files the test left behind).  Done in finally so it also
+      runs on the timeout and spawn-fail early-exit paths. }
+    if tmpDir <> '' then
+      RemoveDirRecursive(tmpDir);
   end;
 end;
 
