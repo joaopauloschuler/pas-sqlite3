@@ -34,7 +34,7 @@ FPC_CMD=(fpc
   -FU"$BIN_DIR"
   -FE"$BIN_DIR"
   -o"$BIN_DIR/libpassqlite3tcl.so"
-  -k-ltcl8.6 -k-ldl
+  -k-ltcl8.6 -k-ldl -k-lm -k-lz
   "$TCL_DIR/libpassqlite3tcl.lpr")
 
 echo "+ ${FPC_CMD[*]}"

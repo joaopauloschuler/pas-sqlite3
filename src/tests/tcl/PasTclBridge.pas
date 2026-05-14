@@ -83,6 +83,12 @@ function Tcl_CreateObjCommand(interp: PTclInterp; cmdName: PChar;
   proc: TTclObjCmdProc; clientData: TClientData;
   deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
 
+{ Command teardown.  tclsqlite.c:2744 (Tcl_DeleteCommand by name in
+  the DB_CLOSE arm of DbObjCmd); token form is the modern API.  Both
+  end up firing the registered TTclCmdDeleteProc (i.e. DbDeleteCmd). }
+function Tcl_DeleteCommand(interp: PTclInterp; cmdName: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_DeleteCommandFromToken(interp: PTclInterp; cmd: Pointer): cint; cdecl; external 'tcl8.6';
+
 { Result accessors.  tclsqlite.c:874 (GetObjResult), :1451 (SetObjResult),
   :688 (GetStringResult), :1339 (AppendResult). }
 function  Tcl_GetObjResult(interp: PTclInterp): PTclObj; cdecl; external 'tcl8.6';
