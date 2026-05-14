@@ -35466,6 +35466,62 @@ function autoIncBegin(pParse: PParse; iDb: i32; pTab: PTable2): i32; forward;
 function xferOptimization(pParse: PParse; pTab: PTable2; pSelect: PSelect;
   onError: i32; iDbDest: i32): i32; forward;
 
+{ readsTable — port of insert.c:232.  Returns True if the VDBE program
+  generated so far contains an OP_OpenRead (or OP_VOpen) that reads pTab
+  or one of its indices.  Used to decide whether `INSERT INTO t SELECT
+  ... FROM t` must funnel through an intermediate ephemeral table to
+  avoid the read cursor chasing rows the INSERT is appending. }
+function readsTable(pParse: PParse; iDb: i32; pTab: PTable2): Boolean;
+var
+  v:     PVdbe;
+  i:     i32;
+  iEnd:  i32;
+  pOp:   PVdbeOp;
+  pIndex: PIndex2;
+  tnum:  Pgno;
+  pVTab: PVTable;
+begin
+  Result := False;
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+  iEnd := sqlite3VdbeCurrentAddr(v);
+  if pTab^.eTabType = TABTYP_VTAB then
+    pVTab := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))
+  else
+    pVTab := nil;
+  i := 1;
+  while i < iEnd do
+  begin
+    pOp := sqlite3VdbeGetOp(v, i);
+    if (pOp^.opcode = OP_OpenRead) and (pOp^.p3 = iDb) then
+    begin
+      tnum := Pgno(pOp^.p2);
+      if tnum = pTab^.tnum then
+      begin
+        Result := True;
+        Exit;
+      end;
+      pIndex := pTab^.pIndex;
+      while pIndex <> nil do
+      begin
+        if tnum = pIndex^.tnum then
+        begin
+          Result := True;
+          Exit;
+        end;
+        pIndex := pIndex^.pNext;
+      end;
+    end;
+    if (pOp^.opcode = OP_VOpen) and (pVTab <> nil)
+       and (pOp^.p4.pVtab = pVTab) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Inc(i);
+  end;
+end;
+
 { sqlite3Insert — port of insert.c:894 (structural skeleton).
 
   This step (Phase 6.9-bis step 11c) lays down the C-shaped prologue of
@@ -35546,6 +35602,11 @@ var
   addrTopCoro:    i32;
   rcSel:          i32;
   destCoro:       TSelectDest;
+  useTempTable:   Boolean;
+  srcTab:         i32;
+  regRec:         i32;
+  regTempRowid:   i32;
+  addrL:          i32;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -35577,6 +35638,8 @@ begin
   pSubqCoro     := nil;
   pCoroItem     := nil;
   ipkInSelect   := False;
+  useTempTable  := False;
+  srcTab        := -1;
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto insert_cleanup;
@@ -35814,6 +35877,39 @@ generic_coro_done:
   else
     nColumn := 0;
 
+  { useTempTable decision + template-4 drain loop — port of insert.c:1158..1198.
+    A temp table must be used if the table being updated is also one of the
+    tables read by the SELECT (self-referential INSERT … SELECT … FROM same
+    table), or if there are row triggers.  Without this, the coroutine's read
+    cursor chases the very rows the INSERT appends → infinite loop. }
+  if useCoroutine then
+  begin
+    if (pTrg <> nil) or readsTable(pParse, iDb, pTab) then
+      useTempTable := True;
+    if useTempTable then
+    begin
+      { Drain the coroutine into a transient table srcTab:
+          B: open temp table
+          L: yield X, goto M at EOF
+             insert row from R..R+n into temp table
+             goto L
+          M: ... }
+      srcTab := pParse^.nTab;
+      Inc(pParse^.nTab);
+      regRec := sqlite3GetTempReg(pParse);
+      regTempRowid := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral, srcTab, nColumn);
+      addrL := sqlite3VdbeAddOp1(v, OP_Yield, regYield);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regFromSelect, nColumn, regRec);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, srcTab, regTempRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, srcTab, regRec, regTempRowid);
+      sqlite3VdbeGoto(v, addrL);
+      sqlite3VdbeJumpHere(v, addrL);
+      sqlite3ReleaseTempReg(pParse, regRec);
+      sqlite3ReleaseTempReg(pParse, regTempRowid);
+    end;
+  end;
+
   { Resolve names in the VALUES expression list (insert.c:1203..1212).
     Required so NEW.x / OLD.x trigger refs in trigger sub-INSERTs bind to
     TK_TRIGGER against pParse^.pTriggerTab. }
@@ -35980,7 +36076,25 @@ generic_coro_done:
     as the loop top, and (if IPK column present) pre-load regRowid from
     the coroutine's IPK slot — the rowid arm then skips the SCopy.
     Yield drops to addrInsTop+1 on coroutine exhaustion (loop exit). }
-  if useCoroutine then
+  if useTempTable then
+  begin
+    { Template-4 main loop top — port of insert.c:1322..1333.
+      Rewind srcTab; loop body reads each row via OP_Column srcTab. }
+    nRows := 1;
+    addrInsTop := sqlite3VdbeAddOp1(v, OP_Rewind, srcTab);
+    addrCont   := sqlite3VdbeCurrentAddr(v);
+    ipkInSelect := False;
+    if pTab^.iPKey >= 0 then
+    begin
+      { insert.c:1508..1509 — IPK value comes from the srcTab column.
+        Pre-load regRowid here (equivalent to C's read in the rowid
+        section: regRowid is not clobbered by the column loop, which
+        only SoftNulls regData+iPKey). }
+      sqlite3VdbeAddOp3(v, OP_Column, srcTab, i32(pTab^.iPKey), regRowid);
+      ipkInSelect := True;
+    end;
+  end
+  else if useCoroutine then
   begin
     nRows := 1;
     sqlite3VdbeReleaseRegisters(pParse, regData, i32(pTab^.nCol), 0, 0);
@@ -36030,6 +36144,31 @@ generic_coro_done:
 
     for i := 0 to i32(pTab^.nCol) - 1 do
     begin
+      if useTempTable then
+      begin
+        { Template-4 column extraction — port of insert.c:1363..1424.
+          IPK column gets a SoftNull placeholder (real value already
+          loaded into regRowid at loop top); every other column is
+          read from the srcTab cursor.  A column not named in the
+          IDLIST falls back to its default value. }
+        if i = i32(pTab^.iPKey) then
+        begin
+          sqlite3VdbeAddOp1(v, OP_SoftNull, regData + i);
+          Continue;
+        end;
+        if pColumn <> nil then
+        begin
+          k := (aTabColMap + i)^;
+          if k = 0 then
+            sqlite3ExprCodeFactorable(pParse,
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+          else
+            sqlite3VdbeAddOp3(v, OP_Column, srcTab, k - 1, regData + i);
+        end
+        else
+          sqlite3VdbeAddOp3(v, OP_Column, srcTab, i, regData + i);
+        Continue;
+      end;
       if useCoroutine then
       begin
         { Coroutine streams values into regFromSelect..; copy into regData+i
@@ -36229,7 +36368,14 @@ generic_coro_done:
     OP_ReleaseReg (our framing emits sqlite3VdbeReleaseRegisters just
     before the Yield), set p5=1 on the Goto so the runtime knows the
     register-release covers the loop body's working set. }
-  if useCoroutine then
+  if useTempTable then
+  begin
+    { Template-4 main loop bottom — port of insert.c:1614..1617. }
+    sqlite3VdbeAddOp2(v, OP_Next, srcTab, addrCont);
+    sqlite3VdbeJumpHere(v, addrInsTop);
+    sqlite3VdbeAddOp1(v, OP_Close, srcTab);
+  end
+  else if useCoroutine then
   begin
     sqlite3VdbeGoto(v, addrCont);
     if (addrCont > 0)

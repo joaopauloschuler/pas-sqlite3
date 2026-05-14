@@ -799,7 +799,7 @@ acceptance gate for this section.
   matching upstream `tclsqlite.c:dbEvalStep` line 1812.
   `bin/TestTclSqliteFunction` now reports
   `PASS: tcl_err -> rc=1 msg=[boom]` (was `[boomboom]`).
-- [ ] **9.4.divbug.7** `insert.test` hangs (tclsh wedges past 60s)
+- [X] **9.4.divbug.7** `insert.test` hangs (tclsh wedges past 60s)
   shortly after `insert-1.3`.  9.4.4.a saw it crash here; 9.4.4.b
   re-sweep promoted the symptom to a hang.  Likely an infinite
   loop in INSERT codegen / VDBE step for the larger-table variant

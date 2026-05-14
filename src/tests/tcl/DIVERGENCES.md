@@ -136,20 +136,26 @@ Fix (single commit, 9.4.divbug.5):
     `db^.aDb[0].pSchema^.enc`, call `sqlite3SetTextEncoding`.
 Result: numcast-{utf8,utf16le,utf16be}.* → 51/51 Ok (was 1/51).
 
-## 9.4.divbug.7 — `insert.test` wedges past `insert-1.3`
+## 9.4.divbug.7 — `insert.test` wedges past `insert-1.3` — FIXED (9.4.divbug.7)
 
 Affects: 1 test (`../sqlite3/test/insert.test`).
-Symptom: tclsh consumes the source script through `insert-1.2` (PASS)
-and then hangs.  9.4.4.b driver kills the process after the 60s
-ceiling; 9.4.4.a recorded a SIGSEGV at the same boundary.  The
-transition from crash → hang suggests the segfaulting cleanup path
-got partially fixed (probably by 9.4.divbug.6) and now exposes an
-infinite loop one frame deeper.
-Likely cause: INSERT codegen / VDBE row-step on the multi-VALUES /
-"big" INSERT exercised by `insert-1.3` enters a loop in
-`sqlite3VdbeExec` (or `sqlite3BtreeInsert`) when row count crosses
-the page-split boundary.
-Surfaced by: 9.4.4.b re-sweep.
+Symptom: tclsh consumed the source script through `insert-5.1` (PASS)
+and then hung at `insert-5.2` — `INSERT INTO t4 SELECT x+1 FROM t4`.
+(9.4.4.b's "past insert-1.3" was just the last PASS the driver
+printed before the wedge; the actual hang is at insert-5.2.)
+Root cause: `sqlite3Insert`'s generic SELECT-as-source coroutine arm
+never ported C's `readsTable` / `useTempTable` logic (insert.c:1158
+..1198 / template 4).  For a self-referential `INSERT … SELECT …
+FROM <same table>`, the coroutine's read cursor over the table
+chased the very rows OP_Insert kept appending → infinite loop.
+Fix: ported `readsTable` (scans the VDBE program for an OP_OpenRead
+/ OP_VOpen on the destination table or its indices) and the
+template-4 path — when `readsTable` (or a row trigger) is true,
+drain the coroutine into an ephemeral `srcTab` first, then run the
+main insert loop as `OP_Rewind` / `OP_Column srcTab` / `OP_Next` /
+`OP_Close`.  insert-5.2 / 5.3 now PASS and the file runs to
+completion.  (Pre-existing unrelated FAILs insert-4.3 / 4.6 remain.)
+Surfaced by: 9.4.4.b re-sweep.  Fixed by: 9.4.divbug.7.
 
 ## 9.4.divbug.8 — `index.test` segfaults at `index-3.3`
 
