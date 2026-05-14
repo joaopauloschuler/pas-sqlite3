@@ -6915,8 +6915,13 @@ begin
     Result := CORRUPT_PAGE(pPage); Exit;
   end;
 
-  { Determine if cursor position must be preserved }
-  bPreserve := flags and BTREE_SAVEPOSITION;
+  { Determine if cursor position must be preserved.
+    btree.c:9885 — `bPreserve = (flags & BTREE_SAVEPOSITION)!=0;` is a
+    *boolean* 0/1, NOT the raw masked bit.  The final arm tests
+    `bPreserve > 1`, so on the saveCursorKey path bPreserve must stay 1;
+    masking alone leaves it at BTREE_SAVEPOSITION (=2) and wrongly takes
+    the CURSOR_SKIPNEXT arm even when a rebalance occurs (9.4.divbug.8). }
+  bPreserve := u8(ord((flags and BTREE_SAVEPOSITION) <> 0));
   if bPreserve <> 0 then begin
     if (pPage^.leaf = 0) or
        (i32(pPage^.nFree) + i32(pPage^.xCellSize(pPage, pCell)) + 2 >

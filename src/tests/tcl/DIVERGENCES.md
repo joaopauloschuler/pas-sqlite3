@@ -157,16 +157,30 @@ main insert loop as `OP_Rewind` / `OP_Column srcTab` / `OP_Next` /
 completion.  (Pre-existing unrelated FAILs insert-4.3 / 4.6 remain.)
 Surfaced by: 9.4.4.b re-sweep.  Fixed by: 9.4.divbug.7.
 
-## 9.4.divbug.8 — `index.test` segfaults at `index-3.3`
+## 9.4.divbug.8 — `index.test` segfaults at `index-3.3` — FIXED
 
 Affects: 1 test (`../sqlite3/test/index.test`).
-Symptom: after passing `index-3.1`, `3.2.1..3` the process SIGSEGVs
-during `index-3.3`, which exercises CREATE INDEX with an explicit
-DESC column on a table that has a previously-created index of the
-same name.  Stderr last line: `index-3.3...` (no Ok / no diff).
-Likely cause: index-conflict diagnostic path frees an Index struct
-before reading its name; possibly the same root as divbug.3 (schema
-write path) but on the *error* arm.
+Symptom: after passing `index-3.1`, `3.2.1..3` the process SIGSEGVd
+during `index-3.3`.  `index-3.3` is actually `DROP TABLE test1`
+after 99 indexes were created on `test1` — *not* a name-conflict
+path as first hypothesised.  The crash needs enough indexes (~77+)
+that `sqlite_master` spans multiple b-tree pages so that the
+schema-row DELETE loop triggers a page rebalance.
+Root cause: `sqlite3BtreeDelete` (passqlite3btree.pas) ported C's
+`bPreserve = (flags & BTREE_SAVEPOSITION)!=0;` as a plain mask:
+`bPreserve := flags and BTREE_SAVEPOSITION`.  Since
+`BTREE_SAVEPOSITION = $02`, that yields `2`, not the boolean `1`.
+On the `saveCursorKey` (will-rebalance) path C keeps `bPreserve == 1`;
+the stale `2` made the final `if bPreserve > 1` arm wrongly take the
+`CURSOR_SKIPNEXT` branch instead of `moveToRoot` + `CURSOR_REQUIRESEEK`.
+After `balance()` merged the leaf away, the cursor was left
+`CURSOR_SKIPNEXT` on a now-empty page; the next `OP_Column` fetched
+a NULL payload (`payloadSize=0`, `aRow=nil`) and dereferenced it.
+Fix: `bPreserve := u8(ord((flags and BTREE_SAVEPOSITION) <> 0));`.
+Verified: `DROP TABLE` after 99 indexes now succeeds, all indexes
+removed, `PRAGMA integrity_check` = ok; engine regression suite
+99/100 (only the pre-existing `TestFuzzDiff` differential fuzzer
+still fails, unrelated).
 Surfaced by: 9.4.4.b re-sweep (was masked by divbug.3 hard-stop in
 9.4.4.a).
 

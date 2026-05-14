@@ -804,10 +804,16 @@ acceptance gate for this section.
   re-sweep promoted the symptom to a hang.  Likely an infinite
   loop in INSERT codegen / VDBE step for the larger-table variant
   the sub-test exercises.  See `src/tests/tcl/DIVERGENCES.md`.
-- [ ] **9.4.divbug.8** `index.test` segfaults at `index-3.3` — a
-  CREATE INDEX on a multi-column table where the index name
-  duplicates an existing one.  Surfaced by 9.4.4.b after helpers
-  unblocked sub-tests past divbug.3.  See DIVERGENCES.md.
+- [X] **9.4.divbug.8** `index.test` segfaults at `index-3.3` — the
+  sub-test is `DROP TABLE test1` after 99 indexes were created.
+  Root cause: `sqlite3BtreeDelete` set `bPreserve := flags and
+  BTREE_SAVEPOSITION` (= 2) instead of C's boolean
+  `(flags & BTREE_SAVEPOSITION)!=0` (= 1).  On the saveCursorKey
+  rebalance path the stale `2` made the final `bPreserve > 1` arm
+  wrongly take the CURSOR_SKIPNEXT branch (instead of moveToRoot +
+  CURSOR_REQUIRESEEK), leaving the schema-table cursor on a
+  balanced-away page → OP_Column fetched a NULL payload → SIGSEGV.
+  Fixed by coercing bPreserve to a 0/1 boolean.  See DIVERGENCES.md.
 - [ ] **9.4.divbug.9** `lastinsert.test` segfaults right after
   `lastinsert-1.1` (the `1.1w` variant uses a 64-bit rowid).
   Likely overflow in `sqlite3_last_insert_rowid` path or a stale
