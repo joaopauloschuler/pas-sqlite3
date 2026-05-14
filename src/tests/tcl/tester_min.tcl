@@ -436,6 +436,53 @@ proc working_64bit_int {} {
   return 1
 }
 
+# permutation — upstream tester.tcl:2329..2333.  Returns the name of the
+# active permutation, or "" for the baseline run.  The full permutation
+# matrix (permutations.test re-runs every test under ~30 build-flag
+# combinations: memsubsys1, wal, journaltest, inmemory_journal, ...) is
+# DEFERRED to 9.4.7.e.  For the full-corpus first cut we run ONLY the
+# baseline permutation, so `::G(perm:name)` is never set and this always
+# returns "".  Test arms gated on `[permutation]=="wal"` etc. therefore
+# take their baseline branch.  C ref: tester.tcl:2329..2333.
+proc permutation {} {
+  set perm ""
+  catch {set perm $::G(perm:name)}
+  set perm
+}
+
+# permutations.test skip-shim — 9.4.2.g.8.
+#
+# tester.tcl's permutation machinery lives in test/permutations.test:
+# `test_suite`, `test_set`, and the `run_tests` runner build a matrix
+# that re-executes the whole corpus under each build-flag permutation.
+# pas-sqlite3 is not ready to drive that matrix yet, so we stub the
+# entry points to no-ops that quietly accept (and discard) any
+# permutation definition.  Net effect: sourcing permutations.test, or a
+# .test file that calls these, does not error — but only the baseline
+# permutation ever actually runs (driven directly by the test driver).
+# The real matrix is deferred to 9.4.7.e.  C ref: test/permutations.test:1..400.
+proc test_suite {name args} {
+  # Record the spec so `[info exists ::testspec($name)]` style probes do
+  # not fault, but never act on it — no permutation is launched.
+  set ::testspec($name) $args
+  if {![info exists ::testsuitelist]} { set ::testsuitelist [list] }
+  lappend ::testsuitelist $name
+}
+proc test_set {args} {
+  # Upstream returns the include/exclude-resolved file list; the matrix
+  # runner is stubbed out, so an empty list is sufficient and harmless.
+  return [list]
+}
+proc run_tests {name args} {
+  # Baseline-only: a named permutation run is a no-op.  The baseline
+  # corpus is executed directly by the driver, not through here.
+  if {$name ne ""} {
+    puts "permutation \"$name\" skipped (9.4.2.g.8: matrix deferred to 9.4.7.e)"
+  }
+  return
+}
+proc run_test_suite {name} { run_tests $name }
+
 # presql — upstream tester.tcl:2334..2338.  Returns the SQL string the
 # active permutation wants prepended to every fresh `sqlite3` handle
 # (e.g. `PRAGMA journal_mode=wal`).  pas-sqlite3 has no permutation
