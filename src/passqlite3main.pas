@@ -4108,9 +4108,8 @@ begin
 end;
 
 { status.c:203 — sqlite3_db_status64.  Query per-connection status counters.
-  Verbs SCHEMA_USED and STMT_USED require the pnBytesFreed accounting plumbing
-  (drives sqlite3DbFree to count rather than free); not yet wired in this
-  port, so they fall through to SQLITE_ERROR. }
+  Verbs SCHEMA_USED and STMT_USED use the pnBytesFreed accounting plumbing
+  (drives sqlite3DbFree to count rather than free). }
 function sqlite3_db_status64(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi64;
                              resetFlag: i32): i32; cdecl;
 var
@@ -4124,6 +4123,9 @@ var
   nByte: i32;
   nRet: u64;
   opLocal: i32;
+  pSchema: passqlite3util.PSchema;
+  pElem: PHashElem;
+  pVm, pVmNext: PVdbe;
 begin
   if (sqlite3SafetyCheckOk(db) = 0) or (pCurrent = nil) or (pHighwtr = nil) then
   begin
@@ -4228,6 +4230,69 @@ begin
           pCurrent^ := 1
         else
           pCurrent^ := 0;
+      end;
+    SQLITE_DBSTATUS_SCHEMA_USED:
+      begin
+        { status.c:285 — accurate estimate of memory used to store the
+          schema for all databases.  Drive sqlite3DbFree to count rather
+          than free via db^.pnBytesFreed. }
+        nByte := 0;
+        sqlite3BtreeEnterAll(db);
+        db^.pnBytesFreed := Pi32(@nByte);
+        db^.lookaside.pEnd := db^.lookaside.pStart;
+        for i := 0 to db^.nDb - 1 do
+        begin
+          pSchema := db^.aDb[i].pSchema;
+          if pSchema <> nil then
+          begin
+            nByte := nByte + sqlite3GlobalConfig.m.xRoundup(SizeOf(THashElem)) * i32(
+                pSchema^.tblHash.count
+              + pSchema^.trigHash.count
+              + pSchema^.idxHash.count
+              + pSchema^.fkeyHash.count);
+            nByte := nByte + i32(sqlite3_msize(pSchema^.tblHash.ht));
+            nByte := nByte + i32(sqlite3_msize(pSchema^.trigHash.ht));
+            nByte := nByte + i32(sqlite3_msize(pSchema^.idxHash.ht));
+            nByte := nByte + i32(sqlite3_msize(pSchema^.fkeyHash.ht));
+
+            pElem := pSchema^.trigHash.first;
+            while pElem <> nil do
+            begin
+              sqlite3DeleteTrigger(db, PTrigger(pElem^.data));
+              pElem := PHashElem(pElem^.next);
+            end;
+            pElem := pSchema^.tblHash.first;
+            while pElem <> nil do
+            begin
+              sqlite3DeleteTable(db, PTable2(pElem^.data));
+              pElem := PHashElem(pElem^.next);
+            end;
+          end;
+        end;
+        db^.pnBytesFreed := nil;
+        db^.lookaside.pEnd := db^.lookaside.pTrueEnd;
+        sqlite3BtreeLeaveAll(db);
+        pHighwtr^ := 0;
+        pCurrent^ := nByte;
+      end;
+    SQLITE_DBSTATUS_STMT_USED:
+      begin
+        { status.c:325 — accurate estimate of memory used to store all
+          prepared statements. }
+        nByte := 0;
+        db^.pnBytesFreed := Pi32(@nByte);
+        db^.lookaside.pEnd := db^.lookaside.pStart;
+        pVm := PVdbe(db^.pVdbe);
+        while pVm <> nil do
+        begin
+          pVmNext := pVm^.pVNext;
+          sqlite3VdbeDelete(pVm);
+          pVm := pVmNext;
+        end;
+        db^.lookaside.pEnd := db^.lookaside.pTrueEnd;
+        db^.pnBytesFreed := nil;
+        pHighwtr^ := 0;
+        pCurrent^ := nByte;
       end;
   else
     rc := SQLITE_ERROR;

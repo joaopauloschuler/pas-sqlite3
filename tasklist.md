@@ -618,7 +618,7 @@ acceptance gate for this section.
     of the dbstat eponymous vtab.  Engine likely already ported
     under 10.1.7x.  Add Tcl bridge call.  C ref:
     `../sqlite3/src/dbstat.c`.
-  - [ ] **9.4.6.c** `sqlite3_db_status` / `sqlite3_stmt_status` /
+  - [X] **9.4.6.c** `sqlite3_db_status` / `sqlite3_stmt_status` /
     `sqlite3_status64` audit — extend export coverage so every
     `_STATUS_*` opcode used by tests works.  C ref:
     `../sqlite3/src/status.c`.

@@ -100,6 +100,11 @@ type
                              cache.  This minimal bridge has no stmt cache,
                              so `db cache size N` just stores N here and
                              `db cache flush` is a no-op (9.4.2.o). }
+    nStep:         cint;   { tclsqlite.c:223 — SQLITE_STMTSTATUS_FULLSCAN_STEP
+                             for the most recent statement (9.4.6.c). }
+    nSort:         cint;   { tclsqlite.c:223 — SQLITE_STMTSTATUS_SORT. }
+    nIndex:        cint;   { tclsqlite.c:223 — SQLITE_STMTSTATUS_AUTOINDEX. }
+    nVMStep:       cint;   { tclsqlite.c:224 — SQLITE_STMTSTATUS_VM_STEP. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -444,6 +449,13 @@ begin
         end;
       end;
     until rcStep <> SQLITE_ROW;
+
+    { tclsqlite.c:1790..1793 — snapshot per-stmt counters for `db status`
+      before the statement is finalised (9.4.6.c). }
+    pDb^.nStep   := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1);
+    pDb^.nSort   := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_SORT, 1);
+    pDb^.nIndex  := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_AUTOINDEX, 1);
+    pDb^.nVMStep := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, 1);
 
     sqlite3_finalize(pStmt);
 
@@ -2315,6 +2327,8 @@ var
   zSub:  PAnsiChar;
   zSelf: PAnsiChar;
   iBool: cint;
+  zStatOp:  PAnsiChar;
+  iStatVal: cint;
 begin
   if objc < 2 then
   begin
@@ -2562,6 +2576,38 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'cache') = 0) then
   begin
     Result := DbCacheArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { status — tclsqlite.c:3766 (DB_STATUS).  Return a per-statement counter
+    captured for the most recent `db eval` (9.4.6.c). }
+  if (zSub <> nil) and (StrComp(zSub, 'status') = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('(step|sort|autoindex|vmstep)'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    zStatOp := Tcl_GetString(ObjvAt(objv, 2));
+    if StrComp(zStatOp, 'step') = 0 then
+      iStatVal := PSqliteDb(clientData)^.nStep
+    else if StrComp(zStatOp, 'sort') = 0 then
+      iStatVal := PSqliteDb(clientData)^.nSort
+    else if StrComp(zStatOp, 'autoindex') = 0 then
+      iStatVal := PSqliteDb(clientData)^.nIndex
+    else if StrComp(zStatOp, 'vmstep') = 0 then
+      iStatVal := PSqliteDb(clientData)^.nVMStep
+    else
+    begin
+      Tcl_AppendResult(interp,
+        PChar('bad argument: should be autoindex, step, sort or vmstep'),
+        Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(iStatVal));
+    Result := TCL_OK;
     Exit;
   end;
 
