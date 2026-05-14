@@ -285,24 +285,25 @@ function sqlite3_get_table(db: PTsqlite3; zSql: PAnsiChar;
 procedure sqlite3_free_table(azResult: PPAnsiChar);
 
 { ----------------------------------------------------------------------
-  Phase 8.8 — sqlite3_unlock_notify (notify.c).
+  Phase 8.8 / 9.4.6.k — sqlite3_unlock_notify (notify.c).
 
-  Upstream's notify.c is wrapped in `#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY`,
-  and our build configuration leaves that macro off (see passqlite3util's
-  Tsqlite3 record: pBlockingConnection / pUnlockConnection / xUnlockNotify
-  fields are intentionally omitted).  In that build mode the C library
-  does not emit notify.c at all; SQLite consumers that need the symbol
-  must compile with the macro on.
+  Upstream's notify.c is wrapped in `#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY`.
+  This port mirrors that:
 
-  We expose the symbol anyway as a tiny shim because: (1) the unlock-
-  notify semantics on a single connection / no-shared-cache port are
-  trivial — there can never be a blocking peer connection in this
-  environment, so the callback is always safe to fire immediately;
-  (2) consumers that always link `sqlite3_unlock_notify` (e.g. a Pascal
-  wrapper that mirrors the public API verbatim) keep working without
-  conditional compilation on their side.  This matches the documented
-  fast-path in notify.c:167 ("0==db->pBlockingConnection → invoke the
-  notify callback immediately").
+    * When SQLITE_ENABLE_UNLOCK_NOTIFY is defined, the full notify.c is
+      ported below — sqlite3ConnectionBlocked / sqlite3ConnectionUnlocked /
+      sqlite3ConnectionClosed, the blocked-connections list and the
+      deadlock-detection logic.  The Tsqlite3 record then carries the
+      pBlockingConnection / pUnlockConnection / xUnlockNotify / pUnlockArg /
+      pNextBlocked fields (see passqlite3util).
+
+    * When the macro is OFF (the default build), we still expose
+      sqlite3_unlock_notify as a tiny shim so consumers that mirror the
+      public API verbatim keep linking.  On a single-connection /
+      no-shared-cache port there can never be a blocking peer, so the
+      callback is always safe to fire immediately — this matches the
+      documented fast-path in notify.c:167 ("0==db->pBlockingConnection →
+      invoke the notify callback immediately").
   ---------------------------------------------------------------------- }
 type
   Tsqlite3_unlock_notify_cb = procedure(apArg: PPointer; nArg: i32); cdecl;
@@ -310,6 +311,13 @@ type
 function sqlite3_unlock_notify(db: PTsqlite3;
                                xNotify: Tsqlite3_unlock_notify_cb;
                                pArg: Pointer): i32;
+
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+{ notify.c internal entry points — called from prepare/step and close. }
+procedure sqlite3ConnectionBlocked(db: PTsqlite3; pBlocker: PTsqlite3);
+procedure sqlite3ConnectionUnlocked(db: PTsqlite3);
+procedure sqlite3ConnectionClosed(db: PTsqlite3);
+{$ENDIF}
 
 { ----------------------------------------------------------------------
   Phase 8.9 — loadext.c (sqlite3_load_extension family).
@@ -2538,10 +2546,225 @@ begin
   end;
 end;
 
-{ Phase 8.8 — sqlite3_unlock_notify shim.
+{ ----------------------------------------------------------------------
+  Phase 9.4.6.k — faithful port of notify.c.
+
+  notify.c is wrapped in `#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY`.  When the
+  macro is OFF we fall through to the degenerate shim further below.
+  ---------------------------------------------------------------------- }
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+
+{ Head of a linked list of all sqlite3 objects created by this process
+  for which either sqlite3.pBlockingConnection or sqlite3.pUnlockConnection
+  is not NULL.  May only be accessed while the STATIC_MAIN mutex is held. }
+var
+  sqlite3BlockedList: PTsqlite3 = nil;
+
+{ Remove connection db from the blocked connections list.  If connection
+  db is not currently a part of the list, this function is a no-op. }
+procedure removeFromBlockedList(db: PTsqlite3);
+var
+  pp: PPTsqlite3;
+begin
+  pp := @sqlite3BlockedList;
+  while pp^ <> nil do begin
+    if pp^ = db then begin
+      pp^ := pp^^.pNextBlocked;
+      Break;
+    end;
+    pp := @pp^^.pNextBlocked;
+  end;
+end;
+
+{ Add connection db to the blocked connections list.  It is assumed
+  that it is not already a part of the list. }
+procedure addToBlockedList(db: PTsqlite3);
+var
+  pp: PPTsqlite3;
+begin
+  pp := @sqlite3BlockedList;
+  while (pp^ <> nil) and (pp^^.xUnlockNotify <> db^.xUnlockNotify) do
+    pp := @pp^^.pNextBlocked;
+  db^.pNextBlocked := pp^;
+  pp^ := db;
+end;
+
+{ Obtain the STATIC_MAIN mutex. }
+procedure enterMutex;
+begin
+  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
+end;
+
+{ Release the STATIC_MAIN mutex. }
+procedure leaveMutex;
+begin
+  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
+end;
+
+{ Register an unlock-notify callback.  Faithful port of notify.c:148. }
+function sqlite3_unlock_notify(db: PTsqlite3;
+                               xNotify: Tsqlite3_unlock_notify_cb;
+                               pArg: Pointer): i32;
+var
+  rc: i32;
+  p: PTsqlite3;
+  arg: Pointer;
+begin
+  rc := SQLITE_OK;
+
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  enterMutex;
+
+  if not Assigned(xNotify) then begin
+    removeFromBlockedList(db);
+    db^.pBlockingConnection := nil;
+    db^.pUnlockConnection := nil;
+    db^.xUnlockNotify := nil;
+    db^.pUnlockArg := nil;
+  end else if db^.pBlockingConnection = nil then begin
+    { The blocking transaction has been concluded.  Or there never was a
+      blocking transaction.  In either case, invoke the notify callback
+      immediately. }
+    arg := pArg;
+    xNotify(@arg, 1);
+  end else begin
+    p := db^.pBlockingConnection;
+    while (p <> nil) and (p <> db) do
+      p := p^.pUnlockConnection;
+    if p <> nil then begin
+      rc := SQLITE_LOCKED;              { Deadlock detected. }
+    end else begin
+      db^.pUnlockConnection := db^.pBlockingConnection;
+      db^.xUnlockNotify := Pointer(xNotify);
+      db^.pUnlockArg := pArg;
+      removeFromBlockedList(db);
+      addToBlockedList(db);
+    end;
+  end;
+
+  leaveMutex;
+  if rc <> 0 then
+    sqlite3ErrorWithMsg(db, rc, 'database is deadlocked')
+  else
+    sqlite3ErrorWithMsg(db, rc, nil);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ Called while stepping or preparing a statement associated with
+  connection db.  The operation will return SQLITE_LOCKED because it
+  requires a lock that will not be available until connection pBlocker
+  concludes its current transaction.  Port of notify.c:201. }
+procedure sqlite3ConnectionBlocked(db: PTsqlite3; pBlocker: PTsqlite3);
+begin
+  enterMutex;
+  if (db^.pBlockingConnection = nil) and (db^.pUnlockConnection = nil) then
+    addToBlockedList(db);
+  db^.pBlockingConnection := pBlocker;
+  leaveMutex;
+end;
+
+{ Called when the transaction opened by database db has just finished.
+  Locks held by db have been released.  Port of notify.c:229. }
+procedure sqlite3ConnectionUnlocked(db: PTsqlite3);
+var
+  xUnlockNotify: Tsqlite3_unlock_notify_cb;
+  nArg: i32;
+  pp: PPTsqlite3;
+  p: PTsqlite3;
+  aArg: PPointer;
+  aDyn: PPointer;
+  aStatic: array[0..15] of Pointer;
+  pNew: PPointer;
+begin
+  xUnlockNotify := nil;
+  nArg := 0;
+  aDyn := nil;
+  aArg := @aStatic[0];
+  enterMutex;                          { Enter STATIC_MAIN mutex }
+
+  { This loop runs once for each entry in the blocked-connections list. }
+  pp := @sqlite3BlockedList;
+  while pp^ <> nil do begin
+    p := pp^;
+
+    { Step 1. }
+    if p^.pBlockingConnection = db then
+      p^.pBlockingConnection := nil;
+
+    { Step 2. }
+    if p^.pUnlockConnection = db then begin
+      if (Pointer(p^.xUnlockNotify) <> Pointer(xUnlockNotify))
+         and (nArg <> 0) then begin
+        xUnlockNotify(aArg, nArg);
+        nArg := 0;
+      end;
+
+      sqlite3BeginBenignMalloc;
+      if ((aDyn = nil) and (nArg = Length(aStatic)))
+         or ((aDyn <> nil)
+             and (nArg = i32(sqlite3MallocSize(aDyn) div SizeOf(Pointer)))) then
+      begin
+        { The aArg[] array needs to grow. }
+        pNew := PPointer(sqlite3Malloc(nArg * SizeOf(Pointer) * 2));
+        if pNew <> nil then begin
+          Move(aArg^, pNew^, nArg * SizeOf(Pointer));
+          sqlite3_free(aDyn);
+          aDyn := pNew;
+          aArg := pNew;
+        end else begin
+          { Allocation failed: flush what we have accumulated so far and
+            keep going with the static array. }
+          xUnlockNotify(aArg, nArg);
+          nArg := 0;
+        end;
+      end;
+      sqlite3EndBenignMalloc;
+
+      aArg[nArg] := p^.pUnlockArg;
+      Inc(nArg);
+      xUnlockNotify := Tsqlite3_unlock_notify_cb(p^.xUnlockNotify);
+      p^.pUnlockConnection := nil;
+      p^.xUnlockNotify := nil;
+      p^.pUnlockArg := nil;
+    end;
+
+    { Step 3. }
+    if (p^.pBlockingConnection = nil) and (p^.pUnlockConnection = nil) then begin
+      { Remove connection p from the blocked connections list. }
+      pp^ := p^.pNextBlocked;
+      p^.pNextBlocked := nil;
+    end else begin
+      pp := @p^.pNextBlocked;
+    end;
+  end;
+
+  if nArg <> 0 then
+    xUnlockNotify(aArg, nArg);
+  sqlite3_free(aDyn);
+  leaveMutex;                          { Leave STATIC_MAIN mutex }
+end;
+
+{ Called when the database connection passed as an argument is being
+  closed.  The connection is removed from the blocked list.
+  Port of notify.c:328. }
+procedure sqlite3ConnectionClosed(db: PTsqlite3);
+begin
+  sqlite3ConnectionUnlocked(db);
+  enterMutex;
+  removeFromBlockedList(db);
+  leaveMutex;
+end;
+
+{$ELSE}
+
+{ Phase 8.8 — sqlite3_unlock_notify shim (SQLITE_ENABLE_UNLOCK_NOTIFY off).
 
   Mirrors notify.c:148 in the trivial degenerate case enforced by our
-  build configuration:
+  default build configuration:
     * No shared-cache → the port never sets pBlockingConnection on any
       connection.  The C path at notify.c:167 (`0==db->pBlockingConnection`)
       is therefore the only branch reachable here, which fires xNotify
@@ -2564,6 +2787,8 @@ begin
   end;
   Result := SQLITE_OK;
 end;
+
+{$ENDIF}
 
 { ----------------------------------------------------------------------
   Phase 8.9 — loadext.c shims and faithful auto-extension list.

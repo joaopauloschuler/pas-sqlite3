@@ -447,7 +447,7 @@ type
       NOT SQLITE_OMIT_AUTHORIZATION (xAuth present)
       SQLITE_ENABLE_PREUPDATE_HOOK gates the pPreUpdate* block (opt-in)
       NOT SQLITE_ENABLE_SETLK_TIMEOUT (setlkTimeout NOT present)
-      NOT SQLITE_ENABLE_UNLOCK_NOTIFY (pBlockingConnection NOT present) }
+      SQLITE_ENABLE_UNLOCK_NOTIFY gates the pBlockingConnection block (opt-in) }
   PTsqlite3 = ^Tsqlite3;
   Tsqlite3 = record
     pVfs           : Pointer;          { sqlite3_vfs* }
@@ -550,6 +550,15 @@ type
     pnBytesFreed   : Pi32;
     pDbData        : PDbClientData;
     nSpill         : u64;
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+    { The following variables are all protected by the STATIC_MAIN mutex,
+      not by sqlite3.mutex.  They are used by code in notify.c. }
+    pBlockingConnection : PTsqlite3;    { Connection that caused SQLITE_LOCKED }
+    pUnlockConnection   : PTsqlite3;    { Connection to watch for unlock }
+    pUnlockArg          : Pointer;      { Argument to xUnlockNotify }
+    xUnlockNotify       : Pointer;      { Unlock notify callback }
+    pNextBlocked        : PTsqlite3;    { Next in list of all blocked connections }
+{$ENDIF}
   end;
 
 { ============================================================
