@@ -4760,8 +4760,8 @@ begin
     pAd := PAuxData(sqlite3DbMallocZero(pVm^.db, SizeOf(TAuxData)));
     if pAd = nil then
     begin
+      { failed: — vdbeapi.c sqlite3_set_auxdata }
       if Assigned(xDelete) then xDelete(pAux);
-      if pCtx^.isError = 0 then pCtx^.isError := SQLITE_NOMEM;
       Exit;
     end;
     pAd^.iAuxOp   := pCtx^.iOp;
@@ -6063,15 +6063,16 @@ begin
   if pCtx = nil then begin Result := nil; Exit; end;
   pAggMem := pCtx^.pMem;
   if (pAggMem^.flags and MEM_Agg) = 0 then begin
-    if nByte = 0 then begin Result := nil; Exit; end;
-    sqlite3VdbeMemClearAndResize(pAggMem, nByte);
-    if pAggMem^.szMalloc > 0 then begin
-      FillChar(pAggMem^.z^, nByte, 0);
-      pAggMem^.flags     := MEM_Agg or MEM_Dyn;
-      pAggMem^.u.pDef    := pCtx^.pFunc;   { vdbeaux.c sqlite3_aggregate_context — needed by MemFinalize }
+    { createAggContext — vdbeapi.c }
+    if nByte <= 0 then begin
+      sqlite3VdbeMemSetNull(pAggMem);
+      pAggMem^.z := nil;
     end else begin
-      sqlite3OomFault(pAggMem^.db);
-      Result := nil; Exit;
+      sqlite3VdbeMemClearAndResize(pAggMem, nByte);
+      pAggMem^.flags  := MEM_Agg;
+      pAggMem^.u.pDef := pCtx^.pFunc;
+      if pAggMem^.z <> nil then
+        FillChar(pAggMem^.z^, nByte, 0);
     end;
   end;
   Result := pAggMem^.z;

@@ -639,7 +639,7 @@ acceptance gate for this section.
     `sqlite3_hard_heap_limit64` / `sqlite3_db_release_memory` /
     `sqlite3_release_memory` — memory-pressure entry points.
     C ref: `../sqlite3/src/malloc.c`.
-  - [ ] **9.4.6.i** `sqlite3_user_data` / `sqlite3_aggregate_context`
+  - [X] **9.4.6.i** `sqlite3_user_data` / `sqlite3_aggregate_context`
     / `sqlite3_get_auxdata` / `sqlite3_set_auxdata` — UDF helpers.
     Many already exported; audit + close gaps.  C ref:
     `../sqlite3/src/vdbeapi.c`.
