@@ -283,10 +283,22 @@ acceptance gate for this section.
 
 ### 9.4 SQLite Tcl test suite as alternate target
 
+> Reorganised 2026-05-13: each umbrella bullet (9.4.1 .. 9.4.5) is
+> immediately followed by its decomposed sub-arms; trailing
+> `9.4.divbug.N` cluster bullets sit at the end in numeric order
+> (matching `src/tests/tcl/DIVERGENCES.md`).
+
 - [X] **9.4.1** Inventory.  Walk `../sqlite3/test/*.test` and tag each
   file `tcl-feature` (uses only public API — candidate), `tcl-internal`
   (touches `sqlite3_test_control` / private symbols — skip), or
   `tcl-perf` (defer to Phase 11).  Land `src/tests/tcl/MANIFEST.txt`.
+  - [X] **9.4.1.a** Inventory script — `src/tests/tcl/inventory.sh`
+    walks `../sqlite3/test/*.test`, greps each file for
+    `sqlite3_test_control` / `db_test_init` / `register_dbstat_vtab`
+    /etc. (full tag list: tcl-internal markers, tcl-perf markers),
+    emits `src/tests/tcl/MANIFEST.txt` one line per file:
+    `<tag>\t<path>`.  Snapshot: 946 tcl-feature / 225 tcl-internal /
+    17 tcl-perf (total 1188).
 
 - [~] **9.4.2** Tcl binding shim.  Reuse / port the minimum of
   `../sqlite3/src/tclsqlite.c` (~6000 C lines total, but only a
@@ -302,6 +314,69 @@ acceptance gate for this section.
   every `.test` file loads via `source $testdir/tester.tcl`, and it
   pulls in `do_test` / `do_execsql_test` / `expected` / etc.  Without
   tester.tcl no `.test` file runs.
+  - [X] **9.4.2.0** Plan doc — `src/tests/tcl/PLAN.md` summarises
+    the FPC↔Tcl bridge approach, list of Tcl C ABI symbols needed
+    (Tcl_CreateInterp, Tcl_Eval, Tcl_CreateObjCommand, Tcl_GetStringResult,
+    Tcl_DeleteInterp, Tcl_NewStringObj, Tcl_SetObjResult, Tcl_GetString,
+    Tcl_ListObjAppendElement, Tcl_NewListObj, Tcl_PkgProvide,
+    Tcl_FindExecutable), and the staged plan 9.4.2.a..9.4.2.g.
+  - [X] **9.4.2.a** Bridge unit — `src/tests/tcl/PasTclBridge.pas`
+    with cdecl externs for the symbols listed in 9.4.2.0 PLAN
+    (link via `-k-ltcl8.6` or `-k-ltcl`).  Smoke gate
+    `src/tests/TestTclBridgeSmoke.pas` creates a Tcl interp,
+    evals `expr 2+2`, asserts result == "4", deletes interp.
+    C ref: `tclsqlite.c:4276` (Tclsqlite3_Init shape) — this task
+    is only the bare bridge, no sqlite3 command yet.
+  - [X] **9.4.2.b** `Sqlite3_Init` exporter — minimal port of
+    `tclsqlite.c:Sqlite3_Init` (registers the `sqlite3` Tcl object
+    command and calls `Tcl_PkgProvide`).  Body still routes through
+    `DbMain` (constructor) and `DbObjCmd` (per-instance dispatcher),
+    both of which were stubs at this stage that returned TCL_ERROR with
+    "not implemented".  Built as `bin/libpassqlite3tcl.so` so
+    `load ./bin/libpassqlite3tcl.so Sqlite3` works in tclsh.
+    Smoke gate `bin/TestTclSqliteInit` confirms the load+package-require
+    cycle.
+  - [X] **9.4.2.c** `sqlite3 db1 :memory:` constructor — implemented
+    `DbMain` arm that calls `sqlite3_open_v2` against passqlite3 and
+    stores the resulting handle on a `SqliteDb*`-equivalent struct
+    attached to the Tcl object command.  `db close` arm of DbObjCmd
+    (only).  Smoke gate `bin/TestTclSqliteOpen` evals
+    `sqlite3 db1 :memory:; db1 close` and asserts no error.
+    C ref: `tclsqlite.c:DbMain` (4253..), `DbObjCmd close` (2480..).
+  - [X] **9.4.2.d** `db eval $sql` — minimum arm of DbObjCmd that
+    prepares/steps/finalises and returns rows as a flat Tcl list
+    (no column-name binding, no var-bind callback, no script-body
+    arg).  Smoke: `sqlite3 db1 :memory:; db1 eval {create table t(x);
+    insert into t values (1),(2),(3); select x from t}` returns
+    `1 2 3`.  C ref: `tclsqlite.c:dbEvalStep` (1766..) +
+    `DbObjCmd eval` arm (2700..).
+  - [X] **9.4.2.e** `db version`, `db changes`, `db last_insert_rowid`,
+    `db errorcode`, `db nullvalue ?value?` — trivial passthroughs to
+    sqlite3_libversion / sqlite3_changes / sqlite3_last_insert_rowid /
+    sqlite3_errcode plus the `zNull` field on SqliteDb.  Smoke gate
+    `bin/TestTclSqliteMeta`.  C ref: respective arms of DbObjCmd.
+  - [X] **9.4.2.f** `db function NAME ?-argcount N? proc` — registered
+    a scalar UDF via sqlite3_create_function_v2 with a Tcl trampoline
+    (DbSqlFunc).  Required by ~30% of tcl-feature tests including
+    the simplest ones in tester.tcl bootstrap.  C ref:
+    `tclsqlite.c:DbSqlFunc` (~1118) + `function` arm of DbObjCmd
+    (~2730).
+  - [~] **9.4.2.g** `tester_min.tcl` — `src/tests/tcl/tester_min.tcl`
+    re-exports just `do_test`, `do_execsql_test`, `execsql`,
+    `expected`, `set_test_counter`, `finalize_testing`, and the global
+    `db` handle — enough to source a hand-picked simple `.test` file.
+    Body adapted from `../sqlite3/test/tester.tcl:703..` and `941..`.
+    Smoke gate `bin/TestTclTesterMin` sources tester_min.tcl + runs
+    `do_test foo-1.0 {expr 1+1} 2`.  Remaining helpers tracked in
+    9.4.2.g.1.
+  - [ ] **9.4.2.g.1** Grow `tester_min.tcl` with the helpers identified
+    by 9.4.4.a as the top blockers (see `src/tests/tcl/SKIP.md` for
+    the prioritised list).  Suggested landing order:
+    `ifcapable` → `catchsql` → `do_catchsql_test` → `integrity_check`
+    → `finish_test` → `forcedelete` → `working_64bit_int`.
+    Each helper is a ~10–30 line port from `../sqlite3/test/tester.tcl`.
+    Landing the first 5 should convert most current FAILs in the
+    10-test sweep into either PASS or surface-able divbug entries.
 
 - [~] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
   `tclsh` against each manifest entry with the port's shim
@@ -313,117 +388,43 @@ acceptance gate for this section.
   surface into `src/tests/tcl/DIVERGENCES.md` rather than blocking
   the driver — each cluster becomes a `9.4.divbug.N` follow-up
   bullet for triage.
+  - [X] **9.4.3.a** Driver skeleton `src/tests/TclTestDriver.pas` —
+    reads `src/tests/tcl/MANIFEST.txt`, for each `tcl-feature` entry
+    forks `tclsh` with `-c "load .../libpassqlite3tcl.so Sqlite3;
+    source .../tester_min.tcl; source <path>"`, captures rc + timing,
+    emits `PASS|FAIL|SKIP <path> <assertions> <duration>` to stdout.
+    `bin/TclTestDriver` lands (no gate yet — gate comes in 9.4.4.a).
 
 - [~] **9.4.4** Skip-list curation.  Tests that depend on
   `sqlite3_test_control`, `PRAGMA legacy_*`, or other internal
   knobs land in `src/tests/tcl/SKIP.md` with a citation to the
   Phase 6/7/8 bullet that gates them.  Empty skip-list is the
   long-term goal; closed bullets prune entries here.
+  - [X] **9.4.4.a** First 10-test sweep — 10 simplest tcl-feature
+    tests run via TclTestDriver, classified into PASS / FAIL /
+    SKIP; populated `src/tests/tcl/SKIP.md` (with citations to existing
+    Phase-6/7/8 bullets) and `src/tests/tcl/DIVERGENCES.md` (new
+    `9.4.divbug.*` bucket per cluster).  Triage convention bootstrapped.
+  - [ ] **9.4.4.b** Re-run the 10-test sweep after 9.4.2.g.1 lands;
+    refresh PASS/FAIL/SKIP counts in `src/tests/tcl/DIVERGENCES.md`
+    and prune SKIP.md entries that are now PASS.
+  - [ ] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
+    (ranked by filesize / probable simplicity).  Continue
+    skip-and-cite convention.
 
 - [ ] **9.4.5** Linux-only nightly.  Wire into CI as a *nightly*
   job (not per-commit — the Tcl suite is ~hours).  PR gate stays
   on 9.1 / 9.2 / 9.3.1's seed-set sweep.
 
-#### 9.4 sub-tasks (breakdown 2026-05-13 — execute serially)
+#### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
 
-- [X] **9.4.1.a** Inventory script — land `src/tests/tcl/inventory.sh`
-  that walks `../sqlite3/test/*.test`, greps each file for
-  `sqlite3_test_control` / `db_test_init` / `register_dbstat_vtab`
-  /etc. (full tag list: tcl-internal markers, tcl-perf markers),
-  emits `src/tests/tcl/MANIFEST.txt` one line per file: `<tag>\t<path>`.
-  Run it and commit MANIFEST.txt with current snapshot counts.
-- [X] **9.4.2.0** Plan doc — land `src/tests/tcl/PLAN.md` summarising
-  the FPC↔Tcl bridge approach, list of Tcl C ABI symbols needed
-  (Tcl_CreateInterp, Tcl_Eval, Tcl_CreateObjCommand, Tcl_GetStringResult,
-  Tcl_DeleteInterp, Tcl_NewStringObj, Tcl_SetObjResult, Tcl_GetString,
-  Tcl_ListObjAppendElement, Tcl_NewListObj, Tcl_PkgProvide,
-  Tcl_FindExecutable), and the staged plan 9.4.2.a..9.4.2.g below.
-- [X] **9.4.2.a** Bridge unit — land `src/tests/tcl/PasTclBridge.pas`
-  with cdecl externs for the symbols listed in 9.4.2.0 PLAN
-  (link via `-k-ltcl8.6` or `-k-ltcl`).  Land smoke gate
-  `src/tests/TestTclBridgeSmoke.pas` that creates a Tcl interp,
-  evals `expr 2+2`, asserts result == "4", deletes interp. Gate:
-  `bin/TestTclBridgeSmoke` rc=0. C ref: `tclsqlite.c:4276` (Tclsqlite3_Init
-  shape) — this task is only the bare bridge, no sqlite3 command yet.
-- [X] **9.4.2.b** `Sqlite3_Init` exporter — port the minimal
-  `tclsqlite.c:Sqlite3_Init` (registers the `sqlite3` Tcl object
-  command and calls `Tcl_PkgProvide`).  Body still routes through
-  `DbMain` (constructor) and `DbObjCmd` (per-instance dispatcher),
-  both of which are stubs at this stage that return TCL_ERROR with
-  "not implemented".  Build as `bin/libpassqlite3tcl.so` so
-  `load ./bin/libpassqlite3tcl.so Sqlite3` works in tclsh.
-  Smoke gate `bin/TestTclSqliteInit` confirms the load+package-require
-  cycle.
-- [X] **9.4.2.c** `sqlite3 db1 :memory:` constructor — implement `DbMain`
-  arm that calls `sqlite3_open_v2` against passqlite3 and stores
-  the resulting handle on a `SqliteDb*`-equivalent struct attached
-  to the Tcl object command.  Implement `db close` arm of DbObjCmd
-  (only).  Smoke gate `bin/TestTclSqliteOpen` evals
-  `sqlite3 db1 :memory:; db1 close` and asserts no error.
-  C ref: `tclsqlite.c:DbMain` (4253..), `DbObjCmd close` (2480..).
-- [X] **9.4.2.d** `db eval $sql` — minimum arm of DbObjCmd that
-  prepares/steps/finalises and returns rows as a flat Tcl list
-  (no column-name binding, no var-bind callback, no script-body
-  arg).  Smoke: `sqlite3 db1 :memory:; db1 eval {create table t(x);
-  insert into t values (1),(2),(3); select x from t}` returns
-  `1 2 3`.  C ref: `tclsqlite.c:dbEvalStep` (1766..) +
-  `DbObjCmd eval` arm (2700..).
-- [X] **9.4.2.e** `db version`, `db changes`, `db last_insert_rowid`,
-  `db errorcode`, `db nullvalue ?value?` — trivial passthroughs to
-  sqlite3_libversion / sqlite3_changes / sqlite3_last_insert_rowid /
-  sqlite3_errcode plus the `zNull` field on SqliteDb.  Smoke gate
-  `bin/TestTclSqliteMeta`.  C ref: respective arms of DbObjCmd.
-- [X] **9.4.2.f** `db function NAME ?-argcount N? proc` — register a
-  scalar UDF via sqlite3_create_function with a Tcl trampoline
-  (DbSqlFunc).  Required by ~30% of tcl-feature tests including
-  the simplest ones in tester.tcl bootstrap.  C ref:
-  `tclsqlite.c:DbSqlFunc` (~1118) + `function` arm of DbObjCmd
-  (~2730).
-- [~] **9.4.2.g** `tester_min.tcl` — land `src/tests/tcl/tester_min.tcl`
-  that re-exports just `do_test`, `do_execsql_test`, `execsql`,
-  `expected`, `set_test_counter`, `finalize_testing`, and the global
-  `db` handle — enough to source a hand-picked simple `.test` file.
-  Body adapted from `../sqlite3/test/tester.tcl:703..` and `941..`.
-  Smoke gate `bin/TestTclTesterMin` sources tester_min.tcl + runs
-  `do_test foo-1.0 {expr 1+1} 2`.
-- [X] **9.4.3.a** Driver skeleton `src/tests/TclTestDriver.pas` —
-  read `src/tests/tcl/MANIFEST.txt`, for each `tcl-feature` entry
-  fork `tclsh` with `-c "load .../libpassqlite3tcl.so Sqlite3;
-  source .../tester_min.tcl; source <path>"`, capture rc + timing,
-  emit `PASS|FAIL|SKIP <path> <assertions> <duration>` to stdout.
-  Land `bin/TclTestDriver` (no gate yet — gate comes in 9.4.4.a).
-- [X] **9.4.4.a** First 10-test sweep — pick 10 simplest
-  `tcl-feature` tests (e.g. `select1.test`, `expr1.test`, `where1.test`
-  prefixes), run via TclTestDriver, classify into PASS / FAIL /
-  SKIP, populate `src/tests/tcl/SKIP.md` (with citations to existing
-  Phase-6/7/8 bullets) and `src/tests/tcl/DIVERGENCES.md` (new
-  `9.4.divbug.*` bucket per cluster).  Goal: bootstrap the
-  triage convention.  No CI wiring yet.
-
-#### 9.4 follow-ups surfaced by the bootstrap sweep (2026-05-13)
-
-- [ ] **9.4.2.g.1** Grow `tester_min.tcl` with the helpers identified
-  by 9.4.4.a as the top blockers (see `src/tests/tcl/SKIP.md` for
-  the prioritised list).  Suggested landing order:
-  `ifcapable` → `catchsql` → `do_catchsql_test` → `integrity_check`
-  → `finish_test` → `forcedelete` → `working_64bit_int`.
-  Each helper is a ~10–30 line port from `../sqlite3/test/tester.tcl`.
-  Landing the first 5 should convert most current FAILs in the
-  10-test sweep into either PASS or surface-able divbug entries.
-- [ ] **9.4.4.b** Re-run the 10-test sweep after 9.4.2.g.1 lands;
-  refresh PASS/FAIL/SKIP counts in `src/tests/tcl/DIVERGENCES.md`
-  and prune SKIP.md entries that are now PASS.
-- [ ] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
-  (ranked by filesize / probable simplicity).  Continue
-  skip-and-cite convention.
 - [ ] **9.4.divbug.1** `select1.test select1-4.4` (`ORDER BY min(f1)`)
   triggers a Pascal-side AV/segfault.  C oracle returns
   `misuse of aggregate function`.  Likely path: codegen for the
   ORDER-BY-on-aggregate-misuse arm needs a guard before the
   aggregate context is consumed by the sorter.  C ref:
   `../sqlite3/src/select.c` (aggregate-misuse diagnostic arm) +
-  `resolve.c` (ResolveOuterRefs).  See
-  `src/tests/tcl/DIVERGENCES.md`.
+  `resolve.c` (ResolveOuterRefs).
 - [ ] **9.4.divbug.2** SQL error messages drop their format-arg
   tails: `misuse of aggregate function` should read
   `misuse of aggregate function min()`; `table has wrong number
@@ -432,7 +433,28 @@ acceptance gate for this section.
   through `sqlite3VMPrintf` and `%s` / `%d` substitutions are
   swallowed.  Audit all `sqlite3ErrorMsg` call sites in `src/*.pas`
   against `../sqlite3/src/parse.y` / `resolve.c` shaped error texts.
-- [ ] **9.4.divbug.3** Doubled error string in `db1 eval`'s error
+- [ ] **9.4.divbug.3** Schema introspection result columns reordered
+  / missing — `index.test` sub-tests `index-1.1c` / `index-1.1d`:
+  upstream `SELECT name, sql, tbl_name, type FROM sqlite_master`
+  diverges from pas-sqlite3 row order/content.  Likely codegen
+  column-order or sqlite_master row population delta.  C ref:
+  `../sqlite3/src/build.c` (CREATE INDEX row insert) +
+  `select.c` (sqlite_master read path).
+- [ ] **9.4.divbug.4** `OP_VerifyFormat` / aggregate setup yields
+  spurious `out of memory` — `update.test` sub-test `update-10.1`
+  reports `error: out of memory` instead of running, with no
+  actual allocation pressure.  Likely an `sqlite3OomFault` flag
+  set by an early-return path in aggregate setup.  C ref:
+  `../sqlite3/src/vdbe.c` (OP_VerifyFormat) +
+  `select.c` (aggregate prologue).
+- [ ] **9.4.divbug.5** UTF-16 `CAST(x AS NUMERIC)` returns empty
+  on input the C oracle parses correctly — `numcast.test` sub-tests
+  `numcast-utf16le.*` / `numcast-utf16be.*`.  Counterpart of
+  `feedback_result_text_change_encoding.md` on the *input* side:
+  `sqlite3_value_text` consumers in the CAST opcode probably
+  miss a `sqlite3VdbeChangeEncoding` before parse.  C ref:
+  `vdbe.c:OP_Cast`, `vdbemem.c:sqlite3VdbeMemCast`.
+- [ ] **9.4.divbug.6** Doubled error string in `db1 eval`'s error
   return — surfaced by 9.4.2.f gate `tcl_err()` returning
   `boomboom` instead of `boom`.  Root cause: `DbEvalArm`
   (PasTclSqlite.pas) appends `sqlite3_errmsg(db)` on top of the
@@ -441,13 +463,8 @@ acceptance gate for this section.
   propagates verbatim).  Fix: in the error branch of `DbEvalArm`,
   set the Tcl result via `Tcl_SetObjResult` from `sqlite3_errmsg`
   rather than `Tcl_AppendResult`.  C ref: `tclsqlite.c:dbEvalStep`
-  error tail.
-- [ ] **9.4.divbug.5** UTF-16 `CAST(x AS NUMERIC)` returns empty
-  on input the C oracle parses correctly.  Counterpart of
-  `feedback_result_text_change_encoding.md` on the *input* side:
-  `sqlite3_value_text` consumers in the CAST opcode probably
-  miss a `sqlite3VdbeChangeEncoding` before parse.  C ref:
-  `vdbe.c:OP_Cast`, `vdbemem.c:sqlite3VdbeMemCast`.
+  error tail.  Bridge-local bug — not present in DIVERGENCES.md
+  (surfaced by the 9.4.2.f smoke gate, not the corpus sweep).
 
 ---
 
