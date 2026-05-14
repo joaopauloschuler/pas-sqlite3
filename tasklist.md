@@ -608,7 +608,7 @@ acceptance gate for this section.
   Each bullet here adds the engine port + Tcl shim required by some
   number of `.test` files.  Audit current `src/*.pas` first — many
   of these already exist with partial coverage.
-  - [ ] **9.4.6.a** `sqlite3_compileoption_used` /
+  - [X] **9.4.6.a** `sqlite3_compileoption_used` /
     `sqlite3_compileoption_get` — backend for `ifcapable` (9.4.2.g.1).
     Probably already partly exported; audit + ensure every
     `SQLITE_OMIT_*` / `SQLITE_ENABLE_*` compile-time symbol on the
@@ -677,7 +677,7 @@ acceptance gate for this section.
   require a *different* build of libpassqlite3 than the default.
   Each profile lives as its own `bin/libpassqlite3tcl-<profile>.so`
   and the driver picks one via `--build`.
-  - [ ] **9.4.7.a** Compile-flag introspection finishing — for
+  - [X] **9.4.7.a** Compile-flag introspection finishing — for
     `ifcapable` to work, every `SQLITE_OMIT_*` / `SQLITE_ENABLE_*`
     symbol on the Pascal side must report through
     `sqlite3_compileoption_used`.  Walk `src/passqlite3.inc` to

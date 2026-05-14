@@ -47397,11 +47397,12 @@ const
     'NO ACTION', nil, nil, nil, nil, nil, nil,
     'RESTRICT', 'SET NULL', 'SET DEFAULT', 'CASCADE');
   { Mirror of sqlite3azCompileOpt in passqlite3main.pas — kept local
-    here because codegen cannot use passqlite3main (circular).  Reflects
-    the build configuration declared in passqlite3.inc. }
+    here because codegen cannot use passqlite3main (circular).  Honest
+    to this port's actual default build config; keep in lockstep with
+    sqlite3azCompileOpt / azCompileOpt2. }
   azBuildOpts: array[0..4] of PAnsiChar = (
     'COMPILER=fpc',
-    'OMIT_AUTOINIT',
+    'ENABLE_MATH_FUNCTIONS',
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
     'THREADSAFE=1'
@@ -50287,11 +50288,13 @@ end;
 
 { Build-time compile-option list mirroring sqlite3azCompileOpt in
   passqlite3main.pas — kept local because codegen cannot use that unit
-  (circular).  Update both sites in lockstep. }
+  (circular).  Honest to this port's actual default build config (see
+  the lockstep note in passqlite3main.pas).  Update both sites
+  together. }
 const
   azCompileOpt2: array[0..4] of PAnsiChar = (
     'COMPILER=fpc',
-    'OMIT_AUTOINIT',
+    'ENABLE_MATH_FUNCTIONS',
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
     'THREADSAFE=1'

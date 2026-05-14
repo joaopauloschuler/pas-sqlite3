@@ -3045,14 +3045,28 @@ begin
 end;
 
 { ctime.c:55..808 — names of compile-time options used to build the
-  library.  Pas-port subset reflecting the actual build configuration
-  declared in passqlite3.inc: THREADSAFE=1 (serialized), MATH_FUNCTIONS
-  enabled, deprecated/load-extension/autoinit omitted.  Names match the
-  upstream convention with the SQLITE_ prefix stripped. }
+  library.  Pas-port registry: honest to this port's actual default
+  build configuration (src/tests/build.sh without opt-in env vars,
+  per passqlite3.inc).  Names follow the upstream convention: stored
+  WITHOUT the SQLITE_ prefix, sorted A-Z, with "=VALUE" suffixes for
+  options whose value is meaningful.
+
+  Default build facts:
+    - THREADSAFE=1            mutex layer ported, serialized
+    - ENABLE_MATH_FUNCTIONS   math funcs ported in unconditionally
+    - OMIT_DEPRECATED         deprecated APIs not ported
+    - OMIT_LOAD_EXTENSION     run-time extension loading not ported
+    - COMPILER=fpc            Free Pascal Compiler build
+
+  Opt-in symbols (SQLITE_DEBUG, SQLITE_ENABLE_STMT_SCANSTATUS) are off
+  in the default build, so they are not listed here.
+
+  IMPORTANT: keep this list in lockstep with azCompileOpt2 in
+  passqlite3codegen.pas (codegen cannot `uses passqlite3main`). }
 const
   sqlite3azCompileOpt: array[0..4] of PAnsiChar = (
     'COMPILER=fpc',
-    'OMIT_AUTOINIT',
+    'ENABLE_MATH_FUNCTIONS',
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
     'THREADSAFE=1'
