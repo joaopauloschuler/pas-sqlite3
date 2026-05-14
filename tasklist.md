@@ -514,7 +514,7 @@ acceptance gate for this section.
     no `DbFuncStep`/`DbFuncFinal` exist.  Nothing C-faithful to port
     for an aggregate `db function` form.  C ref: `tclsqlite.c:1013..1163`
     (tclSqlFunc), `:3386..3460` (DB_FUNCTION arm).
-  - [ ] **9.4.2.t** `db nullvalue` follow-ups + `db errorcode`
+  - [X] **9.4.2.t** `db nullvalue` follow-ups + `db errorcode`
     extended-code arm (sqlite3_extended_errcode).  Coupled with
     9.4.6.j.
   - [ ] **9.4.2.u** `db preupdate_hook` (`-DSQLITE_ENABLE_PREUPDATE_HOOK`
