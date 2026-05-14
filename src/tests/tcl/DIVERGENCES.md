@@ -595,3 +595,28 @@ non-engine FAILs above:
 
 `hex2real` does not exist in upstream C — only `real2hex` is real;
 the tasklist mention of `hex2real` was spurious.
+
+### 9.4.6.l.5 follow-up — `register_async_vtab` investigated → drop the bullet
+
+Investigated whether `register_async_vtab` (from `test_async.c`) can be
+ported. Findings:
+
+- `test_async.c` / any `test_async*` file does **not** exist anywhere
+  under `../sqlite3/` — checked `src/`, `test/`, `ext/`. The only
+  `*async*` file is `ext/wasm/api/sqlite3-opfs-async-proxy.c-pp.js`
+  (unrelated OPFS WASM proxy).
+- Grepping the entire `../sqlite3/` tree for `register_async_vtab`,
+  `register_async`, `test_async`, `asyncvfs` → **zero hits**.
+- No `.test` file calls `register_async_vtab`. The three test files
+  containing the substring `async` (`lock2.test`, `trans.test`,
+  `walblock.test`) only use the Tcl-core `flush_async_queue` event-loop
+  command / a prose comment — nothing to do with the async VFS vtab.
+- `src/tests/tcl/MANIFEST.txt` has no `async` reference; no tcl-feature
+  test we run is gated on `register_async_vtab`.
+
+Conclusion: the upstream async VFS (`test_async.c`) was removed from
+SQLite long ago (asynchronous I/O was deprecated). There is no source
+to port and nothing references the symbol. **Recommendation: drop the
+9.4.6.l.5 bullet from tasklist.md** — it is dead weight, not a porting
+gap. If a future SQLite version ever reintroduces it, the bullet can be
+re-added once `test_async.c` is present in `../sqlite3/src/`.
