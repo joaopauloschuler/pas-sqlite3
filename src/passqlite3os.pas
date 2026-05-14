@@ -767,6 +767,12 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+{ posix_fallocate(3): pre-allocate disk space for an open file.
+  Returns 0 on success or an error number directly (NOT -1/errno).
+  Used early by fcntlSizeHint; the matching binding in the later
+  syscall-table extern block (~line 2397) is the same symbol. }
+function c_fallocate(fd: cint; off, len: i64): cint; cdecl;
+  external 'c' name 'posix_fallocate';
 function c_getenv(name: PAnsiChar): PAnsiChar; cdecl;
   external 'c' name 'getenv';
 
@@ -1855,6 +1861,45 @@ begin
     pf^.ctrlFlags := pf^.ctrlFlags or mask;
 end;
 
+{ os_unix.c ~4049: fcntlSizeHint — handle SQLITE_FCNTL_SIZE_HINT.
+  Enlarge the database file to nByte bytes (rounded up to the next
+  chunk-size).  If the file is already nByte or larger, this is a no-op.
+
+  pas-sqlite3 builds on Linux against glibc, which provides
+  posix_fallocate(), so this is the C HAVE_POSIX_FALLOCATE arm — the
+  fake-it #else block (single-byte writes per block) is not ported
+  because it is unreachable on the target platform.  The
+  SQLITE_MAX_MMAP_SIZE>0 tail arm is likewise omitted: this port treats
+  SQLITE_MAX_MMAP_SIZE as 0 (see unit head, ~line 47).  C ref:
+  os_unix.c:4049..4112. }
+function fcntlSizeHint(pf: PunixFile; nByte: i64): cint;
+var
+  buf   : Stat;       { holds the fstat() return values }
+  nSize : i64;        { required file size              }
+  err   : cint;       { posix_fallocate() return value   }
+begin
+  if pf^.szChunk > 0 then begin
+    if FpFStat(pf^.h, buf) <> 0 then begin
+      Result := SQLITE_IOERR_FSTAT;
+      Exit;
+    end;
+    nSize := ((nByte + pf^.szChunk - 1) div pf^.szChunk) * pf^.szChunk;
+    if nSize > i64(buf.st_size) then begin
+      { posix_fallocate() "returns zero on success, or an error number
+        on failure" — c_fallocate is bound directly to it, so the
+        return value IS the errno (not -1/errno). }
+      repeat
+        err := c_fallocate(pf^.h, buf.st_size, nSize - buf.st_size);
+      until err <> ESysEINTR;
+      if (err <> 0) and (err <> ESysEINVAL) then begin
+        Result := SQLITE_IOERR_WRITE;
+        Exit;
+      end;
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
 { os_unix.c ~4050: unixFileControl_impl — handle FCNTL opcodes }
 function unixFileControl_impl(pFile: Psqlite3_file; op: cint;
                               pArg: Pointer): cint; cdecl;
@@ -1874,9 +1919,10 @@ begin
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_SIZE_HINT: begin
-      { os_unix.c routes this through fcntlSizeHint to pre-grow the file;
-        the Pascal port treats it as an advisory no-op. }
-      Result := SQLITE_OK;
+      { os_unix.c:4176 — pre-grow the file via fcntlSizeHint.  C wraps
+        the call in SimulateIOErrorBenign(1/0); this port has no
+        I/O-error simulation layer, so the call stands alone. }
+      Result := fcntlSizeHint(pf, Pi64(pArg)^);
     end;
     SQLITE_FCNTL_CHUNK_SIZE: begin
       pf^.szChunk := PcInt(pArg)^;
@@ -2394,8 +2440,7 @@ function  c_pwrite(fd: cint; buf: Pointer; n: csize_t; off: i64): cint;
   cdecl; external 'c' name 'pwrite';
 function  c_fchmod(fd: cint; mode: cint): cint;
   cdecl; external 'c' name 'fchmod';
-function  c_fallocate(fd: cint; off, len: i64): cint;
-  cdecl; external 'c' name 'posix_fallocate';
+{ c_fallocate declared earlier (near c_fsync) for fcntlSizeHint. }
 function  c_unlink(zPath: PChar): cint;
   cdecl; external 'c' name 'unlink';
 function  c_mkdir(zPath: PChar; mode: cint): cint;
