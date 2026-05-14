@@ -621,6 +621,16 @@ var
   sqlite3_temp_directory: PAnsiChar = nil;
   sqlite3_data_directory: PAnsiChar = nil;
 
+  { main.c:138 — sqlite3IoTrace global I/O-trace hook.  Upstream this is a
+    printf-like `void (*)(const char*, ...)` defined only under
+    SQLITE_ENABLE_IOTRACE; the shell references it via `extern`.  This port
+    does not compile SQLITE_ENABLE_IOTRACE, so the IOTRACE() call sites in
+    pager/vdbe stay faithful no-ops, but the hook variable is provided
+    unconditionally (initialised to nil) so `.iotrace`-style tooling has a
+    well-defined symbol to install a sink into.  Pascal cannot express a
+    C varargs callback, so the exposed type takes the pre-rendered string. }
+  sqlite3IoTrace: procedure(zMsg: PAnsiChar); cdecl = nil;
+
 { ============================================================
   Exported function declarations
   ============================================================ }

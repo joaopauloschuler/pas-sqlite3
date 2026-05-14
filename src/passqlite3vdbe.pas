@@ -4247,13 +4247,41 @@ begin
     Write('SQL: [', z, ']'#10);
 end;
 
-{ vdbeaux.c:2520..2543 — SQLITE_ENABLE_IOTRACE-gated.  This port does not
-  wire SQLITE_ENABLE_IOTRACE (no sqlite3IoTrace dispatch installed), so
-  the body is a faithful no-op matching the !ENABLE_IOTRACE branch. }
+{ vdbeaux.c:2519 — sqlite3VdbeIOTraceSql.  Upstream is SQLITE_ENABLE_IOTRACE-
+  gated; this port does not compile that macro, but the sqlite3IoTrace hook
+  variable now exists unconditionally, so dispatch faithfully whenever a sink
+  has been installed.  When sqlite3IoTrace is nil (the default) this is the
+  same no-op as the !ENABLE_IOTRACE branch.  Whitespace is collapsed into
+  single spaces exactly as the C loop does. }
 procedure sqlite3VdbeIOTraceSql(p: PVdbe);
+var
+  pOp: PVdbeOp;
+  z:   array[0..999] of AnsiChar;
+  i, j, nCopy: i32;
 begin
-  { sqlite3IoTrace is unset in this build; nothing to emit. }
-  if p = nil then Exit;
+  if not Assigned(sqlite3IoTrace) then Exit;
+  if (p = nil) or (p^.nOp < 1) then Exit;
+  pOp := @p^.aOp[0];
+  if (pOp^.opcode = OP_Init) and (pOp^.p4.z <> nil) then begin
+    { C: sqlite3_snprintf(sizeof(z), z, "%s", pOp->p4.z) — a bounded copy. }
+    nCopy := strlen(pOp^.p4.z);
+    if nCopy > SizeOf(z) - 1 then nCopy := SizeOf(z) - 1;
+    if nCopy > 0 then Move(pOp^.p4.z^, z[0], nCopy);
+    z[nCopy] := #0;
+    i := 0;
+    while (z[i] <> #0) and (sqlite3Isspace(u8(z[i])) <> 0) do Inc(i);
+    j := 0;
+    while z[i] <> #0 do begin
+      if sqlite3Isspace(u8(z[i])) <> 0 then begin
+        if z[i - 1] <> ' ' then begin z[j] := ' '; Inc(j); end;
+      end else begin
+        z[j] := z[i]; Inc(j);
+      end;
+      Inc(i);
+    end;
+    z[j] := #0;
+    sqlite3IoTrace(@z[0]);
+  end;
 end;
 
 { --- VdbeHalt, VdbeReset, VdbeFinalize --- }
