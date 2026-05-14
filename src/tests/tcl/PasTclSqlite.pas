@@ -47,6 +47,8 @@ type
                              refcount-incremented for our duration }
     eType:    cint;        { tclsqlite.c:153 — declared -returntype, or
                              SQLITE_NULL meaning "auto-detect" }
+    useEvalObjv: cint;     { tclsqlite.c:153 — True if it is safe to use
+                             Tcl_EvalObjv on the script (no $ [ ; chars) }
     pNext:    PSqlFunc;    { tclsqlite.c:156 — next on the per-db chain }
   end;
 
@@ -540,6 +542,29 @@ begin
   Result := TCL_OK;
 end;
 
+{ SafeToUseEvalObjv — Pas port of safeToUseEvalObjv (tclsqlite.c:528).
+  Looks at the script prefix; if it contains no '$', '[' or ';' then the
+  faster Tcl_EvalObjv() path is safe.  Otherwise the script must go
+  through Tcl_EvalObjEx() with a valid string representation. }
+function SafeToUseEvalObjv(pCmd: PTclObj): cint;
+var
+  z: PAnsiChar;
+  n: cint;
+begin
+  z := Tcl_GetStringFromObj(pCmd, @n);
+  while n > 0 do
+  begin
+    Dec(n);
+    if (z^ = '$') or (z^ = '[') or (z^ = ';') then
+    begin
+      Result := 0;
+      Exit;
+    end;
+    Inc(z);
+  end;
+  Result := 1;
+end;
+
 { DbSqlFunc — sqlite3 xFunc trampoline.  Pas port of tclSqlFunc
   (tclsqlite.c:1015..1166), collapsed to the minimum the smoke gate
   needs.  Strategy:
@@ -568,6 +593,7 @@ var
   i:      cint;
   pVal:   Psqlite3_value;
   pArg:   PTclObj;
+  pCmd:   PTclObj;
   pRes:   PTclObj;
   zRes:   PAnsiChar;
   nRes:   cint;
@@ -600,12 +626,20 @@ begin
   end
   else
   begin
-    { Build objv = [pScript, arg0, arg1, ...].  Use heap so we don't
-      blow a Pascal stack-array bound; free unconditionally below. }
-    objc := argc + 1;
-    GetMem(objv, objc * SizeOf(PTclObj));
-    objv[0] := pFn^.pScript;
-    Tcl_IncrRefCount(pFn^.pScript);
+    { argc>0 — make a "shallow" copy of the script list object, lappend
+      the args, then evaluate the copy.  Mirrors tclSqlFunc (C:1037..
+      1097): the outer list Tcl_Obj is duplicated but the element
+      Tcl_Objs are shared, so first-element command-name shimmering is
+      preserved across invocations.  This also makes script bodies that
+      are NOT a bare command name (e.g. an apply-lambda or a multi-word
+      script) work — they used to fail under the old Tcl_EvalObjv path. }
+    if Tcl_ListObjGetElements(pFn^.interp, pFn^.pScript, @objc, @objv) <> TCL_OK then
+    begin
+      sqlite3_result_error(pCtx, Tcl_GetStringResult(pFn^.interp), -1);
+      Exit;
+    end;
+    pCmd := Tcl_NewListObj(objc, objv);
+    Tcl_IncrRefCount(pCmd);
 
     pIn := argv;
     for i := 0 to argc - 1 do
@@ -646,18 +680,21 @@ begin
               pArg := Tcl_NewStringObj(zText, nText);
           end;
       end;
-      Tcl_IncrRefCount(pArg);
-      objv[i + 1] := pArg;
+      if Tcl_ListObjAppendElement(pFn^.interp, pCmd, pArg) <> TCL_OK then
+      begin
+        Tcl_DecrRefCount(pCmd);
+        sqlite3_result_error(pCtx, Tcl_GetStringResult(pFn^.interp), -1);
+        Exit;
+      end;
       pIn := PPointer(PtrUInt(pIn) + SizeOf(Pointer));
     end;
 
-    rc := Tcl_EvalObjv(pFn^.interp, objc, objv, 0);
-
-    { Decref the arg Tcl_Objs we created (slot 0 = pScript). }
-    Tcl_DecrRefCount(pFn^.pScript);
-    for i := 1 to objc - 1 do
-      Tcl_DecrRefCount(objv[i]);
-    FreeMem(objv);
+    if pFn^.useEvalObjv = 0 then
+      { Tcl_EvalObjEx() would auto-route a string-rep-less list through
+        Tcl_EvalObjv(); force a valid string rep so it doesn't.  C:1090. }
+      Tcl_GetString(pCmd);
+    rc := Tcl_EvalObjEx(pFn^.interp, pCmd, TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(pCmd);
   end;
 
   { Result routing — see C:1100..1147 minus the type-detection arm. }
@@ -899,6 +936,7 @@ begin
   pFn^.interp  := interp;
   pFn^.pScript := pScript;
   pFn^.eType   := eType;
+  pFn^.useEvalObjv := SafeToUseEvalObjv(pScript);
   Tcl_IncrRefCount(pScript);
   pFn^.pNext   := pDb^.pFunc;
   pDb^.pFunc   := pFn;
