@@ -25,6 +25,7 @@ uses
   TestModuleTclvar,
   TestModuleTest1,
   TestModuleFunc,
+  TestModuleMalloc,
   PasTclSqlite;
 
 exports
