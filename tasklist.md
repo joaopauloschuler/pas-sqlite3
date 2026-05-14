@@ -430,7 +430,7 @@ acceptance gate for this section.
     `do_test_with_ansi_output` (tester.tcl:815..819) is a Windows-only
     slave-interp gate; pas-sqlite3 targets Linux so it remains
     deliberately unported.
-  - [ ] **9.4.2.g.8** `permutations.tcl` skip-shim — tester.tcl's
+  - [X] **9.4.2.g.8** `permutations.tcl` skip-shim — tester.tcl's
     permutation matrix re-runs each test under ~30 build-flag
     combinations.  For full-corpus first cut, land a stub that
     runs *only* the baseline permutation; full matrix gated under
@@ -463,6 +463,10 @@ acceptance gate for this section.
     `bc_common.tcl`, `fts3_common.tcl`, `pg_common.tcl`,
     `thread_common.tcl` (need testvfs / testfixture / sqlthread /
     sqlite3_memdebug_* / Pgtcl — unported).
+  - [ ] **9.4.2.g.14** `tester_min.tcl` config vars — add
+    `set ::AUTOVACUUM 0` and the other build-config globals upstream
+    tests read (e.g. `insert.test` reads `$AUTOVACUUM`).  Surfaced
+    by the 9.4.4.c sweep.  C ref: `tester.tcl` config-var block.
   - [X] **9.4.2.h** `db eval` 3-arg form (`db eval $sql arrayName
     { script }`) — per-row callback with column-name `Tcl_TraceVar`
     binding into the named array.  Used by ~30% of tcl-feature tests.
@@ -500,17 +504,17 @@ acceptance gate for this section.
     `db enable_load_extension` / `db config` / `db timeout` /
     `db copy` — the remaining ~10 trivial-passthrough arms.
     C ref: respective `tclsqlite.c` arms.
-  - [ ] **9.4.2.p** `db incrblob` — incremental blob I/O subcommand.
+  - [X] **9.4.2.p** `db incrblob` — incremental blob I/O subcommand.
     Engine port in 9.4.6.g (sqlite3_blob_open/read/write/close).
     Tcl shim creates a child object command `dbX_blobN` with
     read/write/seek/tell/close methods.  C ref:
     `tclsqlite.c:2520..2645` (DbIncrblobHandler) +
     `3290..3330` (dispatch).
-  - [ ] **9.4.2.q** `db backup` / `db restore` — sqlite3_backup_*
+  - [X] **9.4.2.q** `db backup` / `db restore` — sqlite3_backup_*
     family (engine already ported under 10.1.43..45).  Tcl shim is
     a 1-arg form (`db backup file.db` / `db restore file.db`).
     C ref: `tclsqlite.c:3340..3410` + `3420..3470`.
-  - [ ] **9.4.2.r** `db serialize` / `db deserialize` —
+  - [X] **9.4.2.r** `db serialize` / `db deserialize` —
     sqlite3_serialize / _deserialize.  Engine `_deserialize` already
     ported under 10.1.102; `_serialize` audit + Tcl shim.  C ref:
     `tclsqlite.c:3490..3550`.
@@ -522,7 +526,7 @@ acceptance gate for this section.
     no `DbFuncStep`/`DbFuncFinal` exist.  Nothing C-faithful to port
     for an aggregate `db function` form.  C ref: `tclsqlite.c:1013..1163`
     (tclSqlFunc), `:3386..3460` (DB_FUNCTION arm).
-  - [ ] **9.4.2.s.1** `DbSqlFunc` script-body forms — the ported
+  - [X] **9.4.2.s.1** `DbSqlFunc` script-body forms — the ported
     `tclSqlFunc` always dispatches the callback via `Tcl_EvalObjv`
     when argc>0, so a `db function` whose proc body is anything but
     a bare command name (e.g. `{apply {{x} ...}}` or a multi-word
@@ -532,10 +536,20 @@ acceptance gate for this section.
   - [X] **9.4.2.t** `db nullvalue` follow-ups + `db errorcode`
     extended-code arm (sqlite3_extended_errcode).  Coupled with
     9.4.6.j.
-  - [ ] **9.4.2.u** `db preupdate_hook` (`-DSQLITE_ENABLE_PREUPDATE_HOOK`
+  - [X] **9.4.2.u** `db preupdate_hook` (`-DSQLITE_ENABLE_PREUPDATE_HOOK`
     build only).  Used by ~10 tests.  Gate on env-var build flag in
     `build_tcl_lib.sh`.  C ref: `tclsqlite.c:880..980` (DbPreUpdateHook).
-  - [ ] **9.4.2.v** `db unlock_notify` (`-DSQLITE_ENABLE_UNLOCK_NOTIFY`
+    Done: engine plumbing (`sqlite3VdbePreUpdateHook` + OP_Insert/
+    OP_Delete call sites + 6 public `sqlite3_preupdate_*`) and the
+    Tcl shim, both behind `{$ifdef SQLITE_ENABLE_PREUPDATE_HOOK}`;
+    `PREUPDATE=1` env toggle in `build_tcl_lib.sh`.  Compiles flag
+    on/off; NOT yet runtime-exercised — see 9.4.2.u.1.
+  - [ ] **9.4.2.u.1** Runtime-exercise the preupdate hook — port a
+    `preupdate.test`-style test (or a `Diag*`/`Test*` unit) that
+    builds with `PREUPDATE=1` and fires the hook on INSERT/UPDATE/
+    DELETE, asserting `preupdate old/new/count/depth`.  C ref:
+    `../sqlite3/test/preupdate.test`.
+  - [X] **9.4.2.v** `db unlock_notify` (`-DSQLITE_ENABLE_UNLOCK_NOTIFY`
     build only).  Engine port in 9.4.6.k.  Tcl shim is a 1-arg
     callback registration.  C ref: `tclsqlite.c:2820..2870`.
   - [X] **9.4.2.w** Bridge symbol-table audit — re-grep `tclsqlite.c`
@@ -547,11 +561,21 @@ acceptance gate for this section.
     `Tcl_AppendResult`; refcount macros bound via `Tcl_Db*RefCount`).
     Unported-arm symbols (NRE, channels-create, dict, GetVersion,
     InitStubs, etc.) correctly left undeclared.
-  - [ ] **9.4.2.x** NRE (Non-Recursive Eval) support — `db eval`
+  - [~] **9.4.2.x** NRE (Non-Recursive Eval) support — `db eval`
     with a script body and `db transaction` need
     `Tcl_NRCreateCommand` + `Tcl_NREvalObj` arms to interrupt
     cleanly across nested `vwait`.  Optional for first cut; many
     tests pass without it.  C ref: `tclsqlite.c:1888..1915`
+    Done: command-dispatch NRE trampoline (`Tcl_NRCreateCommand` +
+    `DbObjCmdNRE` + `DbUseNre` version probe) + the NRE externs in
+    `PasTclBridge.pas`.  Non-NRE paths left intact.
+  - [ ] **9.4.2.x.1** NRE continuations — convert `DbEvalArm` and
+    `DbTransactionArm` script bodies from the recursive
+    `Tcl_EvalObjEx` path to genuine `Tcl_NRAddCallback` /
+    `Tcl_NREvalObj` continuations (`DbEvalNextCmd` / `DbTransPostCmd`
+    as `TTclNRPostProc`s).  Requires first rewriting the Pascal eval
+    loop into the `DbEvalContext` continuation machinery.  C ref:
+    `tclsqlite.c` `DbEvalNextCmd` / `DbTransPostCmd`.
     (DbUseNre, DbEvalNextCmd).
 
 - [~] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
@@ -570,7 +594,7 @@ acceptance gate for this section.
     source .../tester_min.tcl; source <path>"`, captures rc + timing,
     emits `PASS|FAIL|SKIP <path> <assertions> <duration>` to stdout.
     `bin/TclTestDriver` lands (no gate yet — gate comes in 9.4.4.a).
-  - [ ] **9.4.3.b** Fix the driver polling race — `TclTestDriver`
+  - [X] **9.4.3.b** Fix the driver polling race — `TclTestDriver`
     under-reports per-test duration (noted in the 9.4.4.b sweep,
     which fell back to direct `tclsh + tester_min` invocations with
     a `timeout` wrapper).  Audit the child-process wait/poll loop in
@@ -578,7 +602,7 @@ acceptance gate for this section.
     `WaitOnExit` + a wall-clock delta captured around it.  Also
     rebuild `bin/TclTestDriver` (the binary was stale after the
     9.4.divbug.3 `:memory:`→`./test.db` edit landed in the source).
-  - [ ] **9.4.3.c** Per-test `testdir` wiring — confirm the driver
+  - [X] **9.4.3.c** Per-test `testdir` wiring — confirm the driver
     sets `::testdir` to `src/tests/tcl` so the `*_common.tcl` shims
     copied under 9.4.2.g.13 (`wal_common.tcl`, `fuzz_common.tcl`)
     resolve, and upstream `source $testdir/<x>_common.tcl` lines
@@ -605,7 +629,7 @@ acceptance gate for this section.
     update / boundary1 now run further (helpers landed) but still
     fail on existing divbug.2/3/4 + missing `db one` / `reset_db`
     sub-commands.
-  - [ ] **9.4.4.b.2** Re-sweep the same 10 tests after the
+  - [X] **9.4.4.b.2** Re-sweep the same 10 tests after the
     2026-05-14 landing wave: divbug.1/3/4/7/8/9/10 all FIXED, plus
     14 bridge arms (`db eval` 3-arg, function/typed-argv,
     trace/profile, authorizer, busy/progress/interrupt, the four
@@ -617,7 +641,7 @@ acceptance gate for this section.
     `9.4.divbug.N`.  Prerequisite for 9.4.4.c being meaningful.
     Use direct `tclsh + tester_min` with a `timeout` wrapper until
     9.4.3.b fixes the driver.
-  - [ ] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
+  - [X] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
     (ranked by filesize / probable simplicity).  Continue
     skip-and-cite convention.  Triage new divbug.* clusters.
     Do this only after 9.4.4.b.2 confirms the 10-test baseline.
@@ -661,7 +685,7 @@ acceptance gate for this section.
     `SQLITE_OMIT_*` / `SQLITE_ENABLE_*` compile-time symbol on the
     Pascal side reports correctly via the runtime API.  C ref:
     `../sqlite3/src/main.c:sqlite3_compileoption_*`.
-  - [ ] **9.4.6.b** `register_dbstat_vtab` — Tcl-side registration
+  - [X] **9.4.6.b** `register_dbstat_vtab` — Tcl-side registration
     of the dbstat eponymous vtab.  Engine likely already ported
     under 10.1.7x.  Add Tcl bridge call.  C ref:
     `../sqlite3/src/dbstat.c`.
@@ -678,11 +702,11 @@ acceptance gate for this section.
   - [X] **9.4.6.f** `sqlite3_create_collation` /
     `sqlite3_create_collation_v2` — engine surface audit
     (`8.x.colneed` already partial).  Pairs with 9.4.2.m.
-  - [ ] **9.4.6.g** `sqlite3_blob_open` / `_read` / `_write` /
+  - [X] **9.4.6.g** `sqlite3_blob_open` / `_read` / `_write` /
     `_close` / `_bytes` / `_reopen` — incrblob engine port.
     Substantial: ~800 lines from `../sqlite3/src/vdbeblob.c`.
     Pairs with 9.4.2.p.
-  - [ ] **9.4.6.h** `sqlite3_soft_heap_limit64` /
+  - [X] **9.4.6.h** `sqlite3_soft_heap_limit64` /
     `sqlite3_hard_heap_limit64` / `sqlite3_db_release_memory` /
     `sqlite3_release_memory` — memory-pressure entry points.
     C ref: `../sqlite3/src/malloc.c`.
@@ -694,31 +718,54 @@ acceptance gate for this section.
     `sqlite3_extended_errcode` — extended-rc plumbing audit; some
     error tests assert on the extended (3-byte) form.  C ref:
     `../sqlite3/src/main.c:sqlite3_extended_*`.
-  - [ ] **9.4.6.k** `sqlite3_unlock_notify` — engine port.
+  - [X] **9.4.6.k** `sqlite3_unlock_notify` — engine port.
     Gated on `SQLITE_ENABLE_UNLOCK_NOTIFY` build flag.  Pairs
     with 9.4.2.v.  C ref: `../sqlite3/src/notify.c`.
-  - [ ] **9.4.6.l** Test-only modules — `register_async_vtab`,
-    `register_tcl_module`, `register_echo_module`,
-    `register_wholenumber_module` (latter already done in 10.1.69).
-    Ports from `../sqlite3/src/test_*.c` (test_async.c,
-    test_tclvar.c, test_thread.c, test_md5.c, test_func.c).
-    Each is a self-contained Tcl-registered virtual table or UDF
-    used to instrument specific behaviours.  Land as
-    `src/tests/tcl/testmodules/` unit per file.  Estimate ~10
-    modules × ~300 lines = ~3k Pascal lines.
-  - [ ] **9.4.6.m** `sqlite3_log` (already wired in 10.1.36) +
+  - [~] **9.4.6.l** Test-only modules — landed as
+    `src/tests/tcl/testmodules/` unit per file.
+    Done: `register_tcl_module` (test_tclvar.c → `TestModuleTclvar.pas`),
+    `Md5_Register` + md5/md5file Tcl cmds (test_md5.c →
+    `TestModuleMd5.pas`).  `register_wholenumber_module` already
+    done in 10.1.69.  Remaining sub-tasks below.
+    - [ ] **9.4.6.l.1** `register_echo_module` — the echo virtual
+      table.  ~1453 lines of C (full read/write proxy vtab:
+      xCreate/xConnect/xBestIndex/xFilter/xUpdate/xFindFunction/
+      xRename/savepoints).  Dedicated large port.  C ref:
+      `../sqlite3/src/test8.c`.
+    - [ ] **9.4.6.l.4** `registerTestFunction` — the test scalar
+      UDFs.  Blocked: (a) `test_extract`/`test_decode` need
+      `sqlite3VdbeSerialGet` exported from the engine interface;
+      (b) the mechanism relies on `sqlite3_auto_extension` actually
+      being *invoked* on db-open — this port's auto-extension list
+      is a registry that is never run.  Prereq: wire auto-extension
+      invocation on connection open + export `sqlite3VdbeSerialGet`.
+      C ref: `../sqlite3/src/test_func.c`.
+    - [ ] **9.4.6.l.5** `register_async_vtab` — `test_async.c` does
+      NOT exist in `../sqlite3/src/`.  Needs the upstream source
+      sourced before this can be ported, or drop the bullet.
+  - [X] **9.4.6.m** `sqlite3_log` (already wired in 10.1.36) +
     `sqlite3_io_trace` — Tcl bindings + assert hooks.
   - [ ] **9.4.6.n** `sqlite3_memdebug_*` set — `_settitle`,
     `_malloc_failed`, `_backtrace`, `_pending_byte`.  Gated on
     memdebug build (9.4.7.b).  Pairs with `do_malloc_test`
     (9.4.2.g.9).
-  - [ ] **9.4.6.o** File-control opcodes — PERSIST_WAL, LOCKSTATE,
+  - [X] **9.4.6.o** File-control opcodes — PERSIST_WAL, LOCKSTATE,
     CHUNK_SIZE, SIZE_LIMIT, POWERSAFE_OVERWRITE, ZIPVFS, BUSYHANDLER,
     TEMPFILENAME, MMAP_SIZE.  Many already partly wired via Phase
     10.1f.8 (.filectrl).  Audit + close gaps.  C ref:
     `../sqlite3/src/os_unix.c:unixFileControl`.
   - [X] **9.4.6.p** `sqlite3_busy_timeout` / `sqlite3_busy_handler` —
     audit; pair with 9.4.2.k.
+  - [ ] **9.4.6.q** Unported test-only Tcl commands surfaced by the
+    9.4.4.c 50-test sweep — `sqlite3_connection_pointer`,
+    `sqlite3_db_config`, `faultsim_save_and_close`,
+    `load_static_extension`, `atomic_batch_write`, and the
+    `real2hex` / `hex2real` SQL functions.  C ref:
+    `../sqlite3/src/test1.c` + `test_func.c`.
+  - [ ] **9.4.6.r** Faithful `fcntlSizeHint` port — the unix VFS
+    currently treats `SQLITE_FCNTL_SIZE_HINT` as an advisory no-op;
+    C routes it through `fcntlSizeHint` to pre-grow the file via
+    ftruncate/fallocate.  C ref: `../sqlite3/src/os_unix.c`.
 
 - [~] **9.4.7** Build-matrix / harness infrastructure.  Many tests
   require a *different* build of libpassqlite3 than the default.
@@ -757,7 +804,7 @@ acceptance gate for this section.
     a build matrix generator script that emits one .so per
     permutation + driver flag `--permutation NAME` to pick.
     C ref: `../sqlite3/test/permutations.tcl`.
-  - [ ] **9.4.7.f** Per-test isolation — currently `TclTestDriver`
+  - [X] **9.4.7.f** Per-test isolation — currently `TclTestDriver`
     runs every test against the same CWD.  Refactor to:
     (1) create a tmpdir per test, (2) `cd` tclsh there before
     sourcing, (3) cleanup on exit.  Prevents test cross-pollution
@@ -765,7 +812,7 @@ acceptance gate for this section.
   - [ ] **9.4.7.g** Driver concurrency — `--jobs N` flag spawns
     N tclsh processes in parallel; aggregates results.  Mirrors
     upstream's `make -j` testing.
-  - [ ] **9.4.7.h** `tclsqlite3_Init` package-config — drop our
+  - [X] **9.4.7.h** `tclsqlite3_Init` package-config — drop our
     `Sqlite3_Init` so `package require sqlite3` works without
     the explicit `load` line.  Generate a Tcl `pkgIndex.tcl`
     pointing at `libpassqlite3tcl.so` and install into
@@ -777,11 +824,11 @@ acceptance gate for this section.
     no-op stubs.  Gate this profile behind its own .so.
 
 - [~] **9.4.8** Full-corpus parity gate.
-  - [ ] **9.4.8.a** Per-test status tags — adopt the pas-strict /
+  - [X] **9.4.8.a** Per-test status tags — adopt the pas-strict /
     pas-soft / pas-skip convention from 9.1.5.  Land
     `src/tests/tcl/STATUS.txt` with one line per MANIFEST entry:
     `<status>\t<path>\t<cite>`.
-  - [ ] **9.4.8.b** STATUS.txt seeded from current sweeps —
+  - [X] **9.4.8.b** STATUS.txt seeded from current sweeps —
     populate after 9.4.4.g lands.  Default: every test that
     PASSes is pas-strict; FAIL with citation is pas-soft;
     SKIP is pas-skip with mandatory cite.
@@ -876,6 +923,26 @@ acceptance gate for this section.
   rowid-alias branch (C insert.c:1097).  Table stayed empty so every
   downstream query returned `{}`.  Fixed by porting the `ipkColumn`
   rowid-alias arm.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.11** Compound `SELECT ... ORDER BY` asserts on
+  `iOrderByCol<=0` (surfaced by the 9.4.4.c 50-test sweep).  See
+  DIVERGENCES.md.
+- [ ] **9.4.divbug.12** `update.test` sub-test `update-17.10`
+  segfaults — UPDATE with ORDER BY / FROM.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.13** `boundary1.test` scan row-ordering residue
+  of divbug.10 — WhereCode scan direction.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.14** Truncated SQL error messages (sibling of
+  divbug.2) — format-string args still dropped on some
+  `sqlite3ErrorMsg` paths.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.15** `no such function` not raised at prepare
+  time (deferred to runtime).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.16** `affinity3.test` segfaults — affinity
+  propagation crash.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.17** Nested aggregate produces row-wise result
+  + segfault — AggInfo nesting.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.18** WITHOUT ROWID virtual-table `xUpdate`
+  codegen mis-handles DELETE (no-op) and UPDATE (segfault) —
+  surfaced porting `register_tcl_module` (9.4.6.l).  Engine-side
+  codegen bug.  See DIVERGENCES.md.
 
 ---
 
