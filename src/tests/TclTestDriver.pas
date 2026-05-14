@@ -92,6 +92,18 @@ begin
     sb.Add('package require sqlite3');
     sb.Add('set ::testdir ' + gTclDir);
     sb.Add('source $::testdir/tester_min.tcl');
+    { 9.4.4.a: monkey-patch [source] so upstream .test files that begin with
+      `source $testdir/tester.tcl` transparently re-route to our tester_min
+      shim.  Without this, every upstream .test fails at the first line. }
+    sb.Add('set ::pas_shim_dir ' + gTclDir);
+    sb.Add('rename source __orig_source');
+    sb.Add('proc source {path args} {');
+    sb.Add('  set tail [file tail $path]');
+    sb.Add('  if {$tail eq "tester.tcl"} {');
+    sb.Add('    return [uplevel 1 [list __orig_source $::pas_shim_dir/tester_min.tcl]]');
+    sb.Add('  }');
+    sb.Add('  return [uplevel 1 __orig_source [list $path] $args]');
+    sb.Add('}');
     sb.Add('sqlite3 db :memory:');
     sb.Add('if {[catch {source ' + testAbsPath + '} __err __opts]} {');
     sb.Add('  puts stderr "SOURCE-ERROR: $__err"');
