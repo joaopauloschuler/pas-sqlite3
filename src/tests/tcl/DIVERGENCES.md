@@ -83,14 +83,25 @@ tester.tcl:550..557 — forcedelete the test.db family, `sqlite3 db
 Remaining index.test failures (index-2.1b/2.2 error-text, index-3.3
 crash) are unrelated — see divbug.8.
 
-## 9.4.divbug.4 — `OP_VerifyFormat` / aggregate setup yields `out of memory`
+## 9.4.divbug.4 — auto-index name collision yields `out of memory` — FIXED
 
-Affects: 1 test (`../sqlite3/test/update.test`, sub-test `update-10.1`).
-Symptom: `do_test update-10.1` reports `error: out of memory` instead
-of running.  No actual allocation pressure (heap idle).
-Likely cause: error-code path in update.test setup misroutes
-`SQLITE_ERROR` (or similar) to `SQLITE_NOMEM`, surfacing the
-generic "out of memory" string via `sqlite3_errmsg`.
+Affects (was): 1 test (`../sqlite3/test/update.test`, sub-test
+`update-10.1`).
+Symptom (was): `do_test update-10.1` reported `error: out of memory`
+instead of running.  No actual allocation pressure (heap idle).
+Actual root cause: nothing to do with `OP_VerifyFormat` or the
+aggregate prologue.  `sqlite3CreateIndex`'s auto-name path
+(passqlite3codegen.pas, build.c:4097..4101) hardcoded the implicit
+index name as `sqlite_autoindex_<tab>_1` instead of walking
+`pTab^.pIndex` and counting.  A `CREATE TABLE` carrying two implicit
+UNIQUE indexes (e.g. `b UNIQUE` plus `UNIQUE(c,d)`) therefore minted
+two indexes with the identical name `sqlite_autoindex_t1_1`; the
+schema-hash collision was reported back as `SQLITE_NOMEM`, surfacing
+the generic "out of memory" string via `sqlite3_errmsg`.
+Fix (9.4.divbug.4): port the C `for(pLoop=pTab->pIndex,n=1; pLoop;
+pLoop=pLoop->pNext,n++){}` count loop so each implicit index gets a
+distinct `sqlite_autoindex_<tab>_<n>` name.  `update-10.1` now runs
+and returns `1 2 3 4 5 6 2 3 4 4 6 7`.
 
 ## 9.4.divbug.5 — UTF-16 numcast (`numcast-utf16*`) returns empty string — FIXED
 

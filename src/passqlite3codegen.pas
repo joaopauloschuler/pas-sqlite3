@@ -40901,6 +40901,7 @@ var
   pTab:        PTable2;
   pIndex:      PIndex2;
   pPk:         PIndex2;
+  pLoop:       PIndex2;
   zName:       PAnsiChar;
   zExtra:      PAnsiChar;
   zStmt:       PAnsiChar;
@@ -41011,12 +41012,17 @@ begin
       end;
     end;
   end else begin
-    { Auto-name path (PRIMARY KEY / UNIQUE constraint).  Real formula
-      walks pTab^.pIndex and counts; placeholder name is fine here
-      because the implicit-index codegen depends on AddColumn /
-      AddPrimaryKey which are stubs. }
+    { Auto-name path (PRIMARY KEY / UNIQUE constraint).  build.c:4097..
+      walks pTab^.pIndex counting from 1 so each implicit index gets a
+      distinct sqlite_autoindex_<tab>_<n> name. }
+    pLoop := pTab^.pIndex;
+    n := 1;
+    while pLoop <> nil do begin
+      pLoop := pLoop^.pNext;
+      Inc(n);
+    end;
     zName := sqlite3MPrintf(db, 'sqlite_autoindex_%s_%d',
-                             [pTab^.zName, 1]);
+                             [pTab^.zName, n]);
     if zName = nil then goto exit_create_index;
   end;
 

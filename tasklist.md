@@ -773,13 +773,13 @@ acceptance gate for this section.
   `tester_min.tcl` (forcedelete test.db family + `sqlite3 db
   ./test.db`), call it at shim load, and drop the driver's
   `:memory:` open.  index-1.1c/1.1d/1.2 now PASS.
-- [ ] **9.4.divbug.4** `OP_VerifyFormat` / aggregate setup yields
-  spurious `out of memory` — `update.test` sub-test `update-10.1`
-  reports `error: out of memory` instead of running, with no
-  actual allocation pressure.  Likely an `sqlite3OomFault` flag
-  set by an early-return path in aggregate setup.  C ref:
-  `../sqlite3/src/vdbe.c` (OP_VerifyFormat) +
-  `select.c` (aggregate prologue).
+- [X] **9.4.divbug.4** `update.test` sub-test `update-10.1` reported
+  spurious `out of memory`.  Real root cause: `sqlite3CreateIndex`
+  auto-name path hardcoded `sqlite_autoindex_<tab>_1` instead of
+  counting `pTab^.pIndex` (build.c:4097..4101).  A table with two
+  implicit UNIQUE indexes got two identically-named auto-indexes,
+  and the schema-hash collision surfaced as NOMEM.  Fixed by porting
+  the C `for(pLoop=pTab->pIndex,n=1; ...)` count loop.
 - [X] **9.4.divbug.5** `numcast.test` 0/51 → 51/51 Ok.  Root cause was
   *not* engine-side: `sqlite3VdbeMemCast` / `MemRealValueRC` slow path
   already handle UTF-16LE/BE.  Two bridge-side bugs: (a) `DbEvalArm` in
