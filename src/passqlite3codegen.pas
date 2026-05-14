@@ -2969,6 +2969,54 @@ function  sqlite3BtreeHoldsAllMutexes(db: PTsqlite3): i32;
 procedure sqlite3OomFaultGeneric(db: PTsqlite3);
 function  sqlite3VdbeDb(v: PVdbe): PTsqlite3;
 function  sqlite3VdbePrepareFlags(v: PVdbe): u8;
+
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+{ ---------------------------------------------------------------------------
+  Phase 9.4 — pre-update hook engine (gated on SQLITE_ENABLE_PREUPDATE_HOOK).
+  Faithful port of struct PreUpdate (vdbeInt.h:543), sqlite3VdbePreUpdateHook
+  (vdbeaux.c) and the sqlite3_preupdate_* accessors (vdbeapi.c:2209..2453).
+  Implemented here because the body touches Table/Index/KeyInfo types only
+  visible to this unit.  The public sqlite3_preupdate_* exports in
+  passqlite3main.pas delegate to the *Impl helpers below.
+  --------------------------------------------------------------------------- }
+type
+  { SZ_KEYINFO(0) = SizeOf(TKeyInfo) = 32 (offsetof aColl). }
+  TPreUpdateKeyInfoSpace = record
+    keyinfoSpace: array[0..SizeOf(TKeyInfo)-1] of u8;
+  end;
+
+  PPreUpdate = ^TPreUpdate;
+  TPreUpdate = record
+    v:           PVdbe;             { Vdbe pre-update hook is invoked by }
+    pCsr:        PVdbeCursor;       { Cursor to read old values from }
+    op:          i32;              { One of SQLITE_INSERT, UPDATE, DELETE }
+    aRecord:     Pu8;              { old.* database record }
+    pKeyinfo:    PKeyInfo2;         { Key information }
+    pUnpacked:   PUnpackedRecord;   { Unpacked version of aRecord[] }
+    pNewUnpacked:PUnpackedRecord;   { Unpacked version of new.* record }
+    iNewReg:     i32;              { Register for new.* values }
+    iBlobWrite:  i32;              { Value returned by preupdate_blobwrite() }
+    iKey1:       i64;              { First key value passed to hook }
+    iKey2:       i64;              { Second key value passed to hook }
+    oldipk:      TMem;             { Memory cell holding "old" IPK value }
+    aNew:        PMem;             { Array of new.* values }
+    pTab:        PTable2;          { Schema object being updated }
+    pPk:         PIndex2;          { PK index if pTab is WITHOUT ROWID }
+    apDflt:      PPointer;         { Array of default values, if required }
+    uKey:        TPreUpdateKeyInfoSpace;
+  end;
+
+procedure sqlite3VdbePreUpdateHook(v: PVdbe; pCsr: PVdbeCursor; op: i32;
+  zDb: PAnsiChar; pTab: PTable2; iKey1: i64; iReg: i32; iBlobWrite: i32);
+
+function  sqlite3PreupdateOldImpl(db: PTsqlite3; iIdx: i32;
+  ppValue: PPointer): i32;
+function  sqlite3PreupdateNewImpl(db: PTsqlite3; iIdx: i32;
+  ppValue: PPointer): i32;
+function  sqlite3PreupdateCountImpl(db: PTsqlite3): i32;
+function  sqlite3PreupdateDepthImpl(db: PTsqlite3): i32;
+function  sqlite3PreupdateBlobwriteImpl(db: PTsqlite3): i32;
+{$ENDIF}
 function  sqlite3VdbeResetStepResult(v: PVdbe): i32;
 function  sqlite3_stmt_isexplain(pStmt: Pointer): i32;
 
@@ -60133,6 +60181,348 @@ begin
   sqlite3VdbeAddOp2(v, OP_VCreate, iDb, iReg);
 end;
 
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+{ ===========================================================================
+  Pre-update hook engine — port of vdbeapi.c:2188..2453 + vdbeaux.c
+  sqlite3VdbePreUpdateHook.  Gated on SQLITE_ENABLE_PREUPDATE_HOOK.
+  =========================================================================== }
+
+{ vdbeapi.c:2188 vdbeUnpackRecord — allocate + populate an UnpackedRecord
+  from the serialized record in nKey/pKey. }
+function preupdateUnpackRecord(pKeyInfo: PKeyInfo2; nKey: i32;
+  pKey: Pointer): PUnpackedRecord;
+var
+  pRet: PUnpackedRecord;
+begin
+  pRet := PUnpackedRecord(sqlite3VdbeAllocUnpackedRecord(PKeyInfo(pKeyInfo)));
+  if pRet <> nil then
+  begin
+    FillChar(pRet^.aMem^, SizeOf(TMem) * (i32(pKeyInfo^.nKeyField) + 1), 0);
+    sqlite3VdbeRecordUnpack(PKeyInfo(pKeyInfo), nKey, pKey, pRet);
+  end;
+  Result := pRet;
+end;
+
+{ vdbeaux.c vdbeFreeUnpacked — release the embedded Mem cells and free p. }
+procedure preupdateFreeUnpacked(db: PTsqlite3; nField: i32;
+  p: PUnpackedRecord);
+var
+  i:    i32;
+  pMem: PMem;
+begin
+  if p <> nil then
+  begin
+    for i := 0 to nField - 1 do
+    begin
+      pMem := PMem(PtrUInt(p^.aMem) + PtrUInt(i) * SizeOf(TMem));
+      if pMem^.zMalloc <> nil then sqlite3VdbeMemReleaseMalloc(pMem);
+    end;
+    sqlite3DbNNFreeNN(db, p);
+  end;
+end;
+
+{ vdbeaux.c sqlite3VdbePreUpdateHook — set up the PreUpdate context, fire the
+  registered callback, then tear the context down. }
+procedure sqlite3VdbePreUpdateHook(v: PVdbe; pCsr: PVdbeCursor; op: i32;
+  zDb: PAnsiChar; pTab: PTable2; iKey1: i64; iReg: i32; iBlobWrite: i32);
+var
+  db:        PTsqlite3;
+  iKey2:     i64;
+  preupdate: TPreUpdate;
+  zTbl:      PAnsiChar;
+  i:         i32;
+  xCb:       procedure(pArg: Pointer; db: PTsqlite3; op: i32;
+                       zDb, zTbl: PAnsiChar; k1, k2: i64); cdecl;
+begin
+  db   := v^.db;
+  zTbl := pTab^.zName;
+
+  FillChar(preupdate, SizeOf(TPreUpdate), 0);
+  iKey2 := 0;
+  if not HasRowid(pTab) then
+  begin
+    iKey1 := 0;
+    iKey2 := 0;
+    preupdate.pPk := sqlite3PrimaryKeyIndex(pTab);
+  end else
+  begin
+    if op = SQLITE_UPDATE then
+      iKey2 := PMem(PtrUInt(v^.aMem) + PtrUInt(iReg) * SizeOf(TMem))^.u.i
+    else
+      iKey2 := iKey1;
+  end;
+
+  preupdate.v          := v;
+  preupdate.pCsr       := pCsr;
+  preupdate.op         := op;
+  preupdate.iNewReg    := iReg;
+  preupdate.pKeyinfo   := PKeyInfo2(@preupdate.uKey);
+  preupdate.pKeyinfo^.db         := db;
+  preupdate.pKeyinfo^.enc        := db^.enc;
+  preupdate.pKeyinfo^.nKeyField  := u16(pTab^.nCol);
+  preupdate.pKeyinfo^.aSortFlags := nil; { .aColl / .nAllField uninit }
+  preupdate.iKey1      := iKey1;
+  preupdate.iKey2      := iKey2;
+  preupdate.pTab       := pTab;
+  preupdate.iBlobWrite := iBlobWrite;
+
+  db^.pPreUpdate := @preupdate;
+  xCb := db^.xPreUpdateCallback;
+  if Assigned(xCb) then
+    xCb(db^.pPreUpdateArg, db, op, zDb, zTbl, iKey1, iKey2);
+  db^.pPreUpdate := nil;
+
+  sqlite3DbFree(db, preupdate.aRecord);
+  preupdateFreeUnpacked(db, i32(preupdate.pKeyinfo^.nKeyField) + 1,
+    preupdate.pUnpacked);
+  preupdateFreeUnpacked(db, i32(preupdate.pKeyinfo^.nKeyField) + 1,
+    preupdate.pNewUnpacked);
+  sqlite3VdbeMemRelease(@preupdate.oldipk);
+  if preupdate.aNew <> nil then
+  begin
+    for i := 0 to i32(pCsr^.nField) - 1 do
+      sqlite3VdbeMemRelease(PMem(PtrUInt(preupdate.aNew) +
+        PtrUInt(i) * SizeOf(TMem)));
+    sqlite3DbNNFreeNN(db, preupdate.aNew);
+  end;
+  if preupdate.apDflt <> nil then
+  begin
+    for i := 0 to i32(pTab^.nCol) - 1 do
+      sqlite3ValueFree(Psqlite3_value(
+        PPointer(PtrUInt(preupdate.apDflt) + PtrUInt(i) * SizeOf(Pointer))^));
+    sqlite3DbFree(db, preupdate.apDflt);
+  end;
+end;
+
+{ vdbeapi.c:2209 sqlite3_preupdate_old (body, sans API-armor — caller
+  does the armor checks). }
+function sqlite3PreupdateOldImpl(db: PTsqlite3; iIdx: i32;
+  ppValue: PPointer): i32;
+var
+  p:      PPreUpdate;
+  pMem:   PMem;
+  rc:     i32;
+  iStore: i32;
+  nRec:   u32;
+  aRec:   Pu8;
+  pCol:   PColumn;
+  pDflt:  PExpr;
+  pVal:   Psqlite3_value;
+label preupdate_old_out;
+begin
+  rc     := SQLITE_OK;
+  iStore := 0;
+  p := PPreUpdate(db^.pPreUpdate);
+  if (p = nil) or (p^.op = SQLITE_INSERT) then
+  begin
+    rc := SQLITE_MISUSE;
+    goto preupdate_old_out;
+  end;
+  if p^.pPk <> nil then
+    iStore := sqlite3TableColumnToIndex(p^.pPk, i16(iIdx))
+  else if iIdx >= i32(p^.pTab^.nCol) then
+  begin
+    rc := SQLITE_MISUSE;
+    goto preupdate_old_out;
+  end else
+    iStore := sqlite3TableColumnToStorage(p^.pTab, i16(iIdx));
+
+  if (iStore >= i32(p^.pCsr^.nField)) or (iStore < 0) then
+  begin
+    rc := SQLITE_RANGE;
+    goto preupdate_old_out;
+  end;
+
+  if iIdx = i32(p^.pTab^.iPKey) then
+  begin
+    pMem := @p^.oldipk;
+    ppValue^ := pMem;
+    sqlite3VdbeMemSetInt64(pMem, p^.iKey1);
+  end else
+  begin
+    if p^.pUnpacked = nil then
+    begin
+      nRec := sqlite3BtreePayloadSize(p^.pCsr^.uc.pCursor);
+      aRec := Pu8(sqlite3DbMallocRaw(db, nRec));
+      if aRec = nil then goto preupdate_old_out;
+      rc := sqlite3BtreePayload(p^.pCsr^.uc.pCursor, 0, nRec, aRec);
+      if rc = SQLITE_OK then
+      begin
+        p^.pUnpacked := preupdateUnpackRecord(p^.pKeyinfo, i32(nRec), aRec);
+        if p^.pUnpacked = nil then rc := SQLITE_NOMEM;
+      end;
+      if rc <> SQLITE_OK then
+      begin
+        sqlite3DbFree(db, aRec);
+        goto preupdate_old_out;
+      end;
+      p^.aRecord := aRec;
+    end;
+
+    pMem := PMem(PtrUInt(p^.pUnpacked^.aMem) + PtrUInt(iStore) * SizeOf(TMem));
+    ppValue^ := pMem;
+    if iStore >= i32(p^.pUnpacked^.nField) then
+    begin
+      { Column added by ALTER TABLE ADD COLUMN — return its default value. }
+      pCol := PColumn(PtrUInt(p^.pTab^.aCol) + PtrUInt(iIdx) * SizeOf(TColumn));
+      if pCol^.iDflt > 0 then
+      begin
+        if p^.apDflt = nil then
+        begin
+          p^.apDflt := PPointer(sqlite3DbMallocZero(db,
+            u64(SizeOf(Pointer)) * u64(p^.pTab^.nCol)));
+          if p^.apDflt = nil then goto preupdate_old_out;
+        end;
+        if PPointer(PtrUInt(p^.apDflt) + PtrUInt(iIdx) * SizeOf(Pointer))^ = nil then
+        begin
+          pVal  := nil;
+          pDflt := PExprListItem(PtrUInt(@p^.pTab^.u.tab.pDfltList^) +
+            SizeOf(TExprList) +
+            PtrUInt(pCol^.iDflt - 1) * SizeOf(TExprListItem))^.pExpr;
+          rc := sqlite3ValueFromExpr(db, pDflt, db^.enc,
+            u8(pCol^.affinity), pVal);
+          if (rc = SQLITE_OK) and (pVal = nil) then
+            rc := SQLITE_CORRUPT;
+          PPointer(PtrUInt(p^.apDflt) + PtrUInt(iIdx) * SizeOf(Pointer))^ := pVal;
+        end;
+        ppValue^ := PPointer(PtrUInt(p^.apDflt) +
+          PtrUInt(iIdx) * SizeOf(Pointer))^;
+      end else
+        ppValue^ := columnNullValue;
+    end else if u8(PColumn(PtrUInt(p^.pTab^.aCol) +
+      PtrUInt(iIdx) * SizeOf(TColumn))^.affinity) = SQLITE_AFF_REAL then
+    begin
+      if (pMem^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+        sqlite3VdbeMemRealify(pMem);
+    end;
+  end;
+
+preupdate_old_out:
+  sqlite3Error(db, rc);
+  Result := sqlite3ApiExit(db, rc);
+end;
+
+{ vdbeapi.c:2314 sqlite3_preupdate_count. }
+function sqlite3PreupdateCountImpl(db: PTsqlite3): i32;
+var
+  p: PPreUpdate;
+begin
+  p := PPreUpdate(db^.pPreUpdate);
+  if p <> nil then Result := i32(p^.pKeyinfo^.nKeyField)
+  else Result := 0;
+end;
+
+{ vdbeapi.c:2337 sqlite3_preupdate_depth. }
+function sqlite3PreupdateDepthImpl(db: PTsqlite3): i32;
+var
+  p: PPreUpdate;
+begin
+  p := PPreUpdate(db^.pPreUpdate);
+  if p <> nil then Result := p^.v^.nFrame
+  else Result := 0;
+end;
+
+{ vdbeapi.c:2353 sqlite3_preupdate_blobwrite. }
+function sqlite3PreupdateBlobwriteImpl(db: PTsqlite3): i32;
+var
+  p: PPreUpdate;
+begin
+  p := PPreUpdate(db^.pPreUpdate);
+  if p <> nil then Result := p^.iBlobWrite
+  else Result := -1;
+end;
+
+{ vdbeapi.c:2369 sqlite3_preupdate_new (body, sans API-armor). }
+function sqlite3PreupdateNewImpl(db: PTsqlite3; iIdx: i32;
+  ppValue: PPointer): i32;
+var
+  p:       PPreUpdate;
+  rc:      i32;
+  pMem:    PMem;
+  iStore:  i32;
+  pUnpack: PUnpackedRecord;
+  pData:   PMem;
+label preupdate_new_out;
+begin
+  rc     := SQLITE_OK;
+  iStore := 0;
+  p := PPreUpdate(db^.pPreUpdate);
+  if (p = nil) or (p^.op = SQLITE_DELETE) then
+  begin
+    rc := SQLITE_MISUSE;
+    goto preupdate_new_out;
+  end;
+  if (p^.pPk <> nil) and (p^.op <> SQLITE_UPDATE) then
+    iStore := sqlite3TableColumnToIndex(p^.pPk, i16(iIdx))
+  else if iIdx >= i32(p^.pTab^.nCol) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end else
+    iStore := sqlite3TableColumnToStorage(p^.pTab, i16(iIdx));
+
+  if (iStore >= i32(p^.pCsr^.nField)) or (iStore < 0) then
+  begin
+    rc := SQLITE_RANGE;
+    goto preupdate_new_out;
+  end;
+
+  if p^.op = SQLITE_INSERT then
+  begin
+    { Memory cell p->iNewReg holds the serialized record being inserted. }
+    pUnpack := p^.pNewUnpacked;
+    if pUnpack = nil then
+    begin
+      pData := PMem(PtrUInt(p^.v^.aMem) + PtrUInt(p^.iNewReg) * SizeOf(TMem));
+      rc := sqlite3VdbeMemExpandBlob(pData);
+      if rc <> SQLITE_OK then goto preupdate_new_out;
+      pUnpack := preupdateUnpackRecord(p^.pKeyinfo, pData^.n, pData^.z);
+      if pUnpack = nil then
+      begin
+        rc := SQLITE_NOMEM;
+        goto preupdate_new_out;
+      end;
+      p^.pNewUnpacked := pUnpack;
+    end;
+    pMem := PMem(PtrUInt(pUnpack^.aMem) + PtrUInt(iStore) * SizeOf(TMem));
+    if iIdx = i32(p^.pTab^.iPKey) then
+      sqlite3VdbeMemSetInt64(pMem, p^.iKey2)
+    else if iStore >= i32(pUnpack^.nField) then
+      pMem := columnNullValue;
+  end else
+  begin
+    { UPDATE: cell (p->iNewReg+1+iStore) holds the required value. }
+    if p^.aNew = nil then
+    begin
+      p^.aNew := PMem(sqlite3DbMallocZero(db,
+        u64(SizeOf(TMem)) * u64(p^.pCsr^.nField)));
+      if p^.aNew = nil then
+      begin
+        rc := SQLITE_NOMEM;
+        goto preupdate_new_out;
+      end;
+    end;
+    pMem := PMem(PtrUInt(p^.aNew) + PtrUInt(iStore) * SizeOf(TMem));
+    if pMem^.flags = 0 then
+    begin
+      if iIdx = i32(p^.pTab^.iPKey) then
+        sqlite3VdbeMemSetInt64(pMem, p^.iKey2)
+      else
+      begin
+        rc := sqlite3VdbeMemCopy(pMem, PMem(PtrUInt(p^.v^.aMem) +
+          PtrUInt(p^.iNewReg + 1 + iStore) * SizeOf(TMem)));
+        if rc <> SQLITE_OK then goto preupdate_new_out;
+      end;
+    end;
+  end;
+  ppValue^ := pMem;
+
+preupdate_new_out:
+  sqlite3Error(db, rc);
+  Result := sqlite3ApiExit(db, rc);
+end;
+{$ENDIF}
+
 initialization
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
@@ -60154,6 +60544,10 @@ initialization
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
   passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  passqlite3vdbe.gVdbePreUpdateHook      :=
+    passqlite3vdbe.TVdbePreUpdateHookFn(@sqlite3VdbePreUpdateHook);
+{$ENDIF}
 
   { vdbeaux.c sqlite3VdbeFindIndexKey hook — wires OP_IFindKey and the
     OP_IdxDelete EIIB-fallback path through to the body above. }

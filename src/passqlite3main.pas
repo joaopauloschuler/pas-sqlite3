@@ -5209,9 +5209,19 @@ begin
 {$IFDEF SQLITE_ENABLE_API_ARMOR}
   if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
 {$ENDIF}
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  { main.c:4001 sqlite3_preupdate_hook — register the callback and return
+    the previous registration argument. }
+  sqlite3_mutex_enter(db^.mutex);
+  Result := db^.pPreUpdateArg;
+  db^.xPreUpdateCallback := xPreUpdate;
+  db^.pPreUpdateArg      := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+{$ELSE}
   { No callback storage in db (PreUpdate fields are gated out at compile
-    time in our build), so the previous registration is always nil. }
+    time in this build), so the previous registration is always nil. }
   Result := nil;
+{$ENDIF}
 end;
 
 function sqlite3_preupdate_old(db: PTsqlite3; iIdx: i32;
@@ -5222,8 +5232,12 @@ begin
     Result := SQLITE_MISUSE; Exit;
   end;
 {$ENDIF}
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  Result := sqlite3PreupdateOldImpl(db, iIdx, ppValue);
+{$ELSE}
   if ppValue <> nil then ppValue^ := nil;
   Result := SQLITE_MISUSE;
+{$ENDIF}
 end;
 
 function sqlite3_preupdate_new(db: PTsqlite3; iIdx: i32;
@@ -5234,23 +5248,48 @@ begin
     Result := SQLITE_MISUSE; Exit;
   end;
 {$ENDIF}
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  Result := sqlite3PreupdateNewImpl(db, iIdx, ppValue);
+{$ELSE}
   if ppValue <> nil then ppValue^ := nil;
   Result := SQLITE_MISUSE;
+{$ENDIF}
 end;
 
 function sqlite3_preupdate_count(db: PTsqlite3): i32; cdecl;
 begin
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if db = nil then begin Result := 0; Exit; end;
+{$ENDIF}
+  Result := sqlite3PreupdateCountImpl(db);
+{$ELSE}
   Result := 0;
+{$ENDIF}
 end;
 
 function sqlite3_preupdate_depth(db: PTsqlite3): i32; cdecl;
 begin
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if db = nil then begin Result := 0; Exit; end;
+{$ENDIF}
+  Result := sqlite3PreupdateDepthImpl(db);
+{$ELSE}
   Result := 0;
+{$ENDIF}
 end;
 
 function sqlite3_preupdate_blobwrite(db: PTsqlite3): i32; cdecl;
 begin
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if db = nil then begin Result := -1; Exit; end;
+{$ENDIF}
+  Result := sqlite3PreupdateBlobwriteImpl(db);
+{$ELSE}
   Result := -1;
+{$ENDIF}
 end;
 
 { OP_SqlExec hook (vdbe.c:7064).  Trampoline that adapts sqlite3_exec to

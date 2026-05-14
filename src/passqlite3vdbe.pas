@@ -1606,6 +1606,15 @@ var
                                                 the synthesised "PRAGMA name(arg)"
                                                 statement.  Codegen cannot import
                                                 main directly (circular). }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+type
+  TVdbePreUpdateHookFn = procedure(v: Pointer; pCsr: PVdbeCursor; op: i32;
+    zDb: PAnsiChar; pTab: Pointer; iKey1: i64; iReg: i32; iBlobWrite: i32);
+var
+  { wired by passqlite3codegen at init — invokes the pre-update callback.
+    Codegen owns the body (needs Table/Index/KeyInfo layouts). }
+  gVdbePreUpdateHook:      TVdbePreUpdateHookFn;
+{$ENDIF}
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -8954,8 +8963,15 @@ begin
       xPay.nKey := pIn3^.u.i;
 
       { vdbe.c:5778..5784 — derive zDb/pTab for the update hook when P4
-        is a Table* and an update hook is installed. }
+        is a Table* and an update hook is installed.  With the pre-update
+        hook compiled in, HAS_UPDATE_HOOK(db) also covers xPreUpdateCallback. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      if (pOp^.p4type = P4_TABLE)
+         and ((db^.xUpdateCallback <> nil)
+              or (db^.xPreUpdateCallback <> nil)) then begin
+{$ELSE}
       if (pOp^.p4type = P4_TABLE) and (db^.xUpdateCallback <> nil) then begin
+{$ENDIF}
         zHookDb  := PDb(PtrUInt(db^.aDb) +
                         PtrUInt(pCur^.iDb) * SizeOf(TDb))^.zDbSName;
         pHookTab := PTableHookFields(pOp^.p4.pTab);
@@ -8963,6 +8979,26 @@ begin
         zHookDb  := nil;
         pHookTab := nil;
       end;
+
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      { vdbe.c:5786..5799 — invoke the pre-update hook (INSERT) before the
+        row is written.  ISNOOP rows fall through without inserting. }
+      if pHookTab <> nil then begin
+        if (db^.xPreUpdateCallback <> nil)
+           and ((pOp^.p5 and OPFLAG_ISUPDATE) = 0)
+           and Assigned(gVdbePreUpdateHook) then
+          gVdbePreUpdateHook(v, pCur, SQLITE_INSERT, zHookDb,
+            pOp^.p4.pTab, xPay.nKey, pOp^.p2, -1);
+        if (db^.xUpdateCallback = nil)
+           or (PTableHookFields(pOp^.p4.pTab)^.aCol = nil) then begin
+          { Prevent the post-update hook from running when it should not. }
+          pHookTab := nil;
+        end;
+      end;
+      { ISNOOP rows (vdbe.c:5798) skip the insert entirely — the pre-update
+        hook above is the only side-effect. }
+      if (pOp^.p5 and OPFLAG_ISNOOP) = 0 then begin
+{$ENDIF}
 
       if (pOp^.p5 and OPFLAG_NCHANGE) <> 0 then begin
         Inc(v^.nChange);
@@ -8997,6 +9033,9 @@ begin
           TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
             SQLITE_INSERT_AUTH, zHookDb, pHookTab^.zName, xPay.nKey);
       end;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      end;  { OPFLAG_ISNOOP guard }
+{$ENDIF}
     end;
 
     { ────── OP_Delete ────── (vdbe.c:5903) }
@@ -9008,7 +9047,13 @@ begin
       { vdbe.c:5937..5950 — derive zDb/pTab for the update hook; if the
         cursor was last moved with Next/Prev (SAVEPOSITION) capture the
         current rowid into movetoTarget so it can be passed to the hook. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      if (pOp^.p4type = P4_TABLE)
+         and ((db^.xUpdateCallback <> nil)
+              or (db^.xPreUpdateCallback <> nil)) then begin
+{$ELSE}
       if (pOp^.p4type = P4_TABLE) and (db^.xUpdateCallback <> nil) then begin
+{$ENDIF}
         zHookDb  := PDb(PtrUInt(db^.aDb) +
                         PtrUInt(pCur^.iDb) * SizeOf(TDb))^.zDbSName;
         pHookTab := PTableHookFields(pOp^.p4.pTab);
@@ -9018,6 +9063,22 @@ begin
         zHookDb  := nil;
         pHookTab := nil;
       end;
+
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      { vdbe.c:5952..5969 — invoke the pre-update hook (DELETE or, for an
+        UPDATE that deletes the old row first, UPDATE) before the row is
+        removed.  ISNOOP rows skip the actual delete. }
+      if (db^.xPreUpdateCallback <> nil) and (pHookTab <> nil)
+         and Assigned(gVdbePreUpdateHook) then begin
+        if (opflags and OPFLAG_ISUPDATE) <> 0 then
+          gVdbePreUpdateHook(v, pCur, SQLITE_UPDATE, zHookDb,
+            pOp^.p4.pTab, pCur^.movetoTarget, pOp^.p3, -1)
+        else
+          gVdbePreUpdateHook(v, pCur, SQLITE_DELETE, zHookDb,
+            pOp^.p4.pTab, pCur^.movetoTarget, pOp^.p3, -1);
+      end;
+      if (opflags and OPFLAG_ISNOOP) = 0 then begin
+{$ENDIF}
 
       rc := sqlite3BtreeDelete(pCur^.uc.pCursor, u8(pOp^.p5));
       pCur^.cacheStatus := CACHE_STALE;
@@ -9030,11 +9091,14 @@ begin
       if (opflags and OPFLAG_NCHANGE) <> 0 then begin
         Inc(v^.nChange);
         { TF_WithoutRowid = $00000080 (sqliteInt.h); HasRowid == not set. }
-        if (pHookTab <> nil) and
+        if (pHookTab <> nil) and (db^.xUpdateCallback <> nil) and
            ((pHookTab^.tabFlags and u32($00000080)) = 0) then
           TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
             SQLITE_DELETE_AUTH, zHookDb, pHookTab^.zName, pCur^.movetoTarget);
       end;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      end;  { OPFLAG_ISNOOP guard }
+{$ENDIF}
     end;
 
     { ────── OP_ResetCount ────── (vdbe.c:6011) }

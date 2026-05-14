@@ -445,7 +445,7 @@ type
       NOT SQLITE_OMIT_WAL (xWalCallback present)
       NOT SQLITE_OMIT_PROGRESS_CALLBACK (xProgress present)
       NOT SQLITE_OMIT_AUTHORIZATION (xAuth present)
-      NOT SQLITE_ENABLE_PREUPDATE_HOOK (pPreUpdate NOT present)
+      SQLITE_ENABLE_PREUPDATE_HOOK gates the pPreUpdate* block (opt-in)
       NOT SQLITE_ENABLE_SETLK_TIMEOUT (setlkTimeout NOT present)
       NOT SQLITE_ENABLE_UNLOCK_NOTIFY (pBlockingConnection NOT present) }
   PTsqlite3 = ^Tsqlite3;
@@ -509,6 +509,11 @@ type
     xAutovacDestr  : procedure(p: Pointer); cdecl;
     xAutovacPages  : Pointer;
     pParse         : Pointer;          { PParse — opaque }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+    pPreUpdateArg     : Pointer;        { First argument to xPreUpdateCallback }
+    xPreUpdateCallback: Pointer;        { Registered via sqlite3_preupdate_hook }
+    pPreUpdate        : Pointer;        { PPreUpdate — context for active hook }
+{$ENDIF}
     xWalCallback   : Pointer;
     pWalArg        : Pointer;
     xCollNeeded    : Pointer;
