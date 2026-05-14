@@ -620,3 +620,166 @@ to port and nothing references the symbol. **Recommendation: drop the
 9.4.6.l.5 bullet from tasklist.md** — it is dead weight, not a porting
 gap. If a future SQLite version ever reintroduces it, the bullet can be
 re-added once `test_async.c` is present in `../sqlite3/src/`.
+
+## 9.4.divbug.19 — table-qualified `rowid` alias not resolved
+
+Affects: 2 tests (`../sqlite3/test/boundary3.test`,
+`../sqlite3/test/autoindex5.test`).
+Symptom: a qualified rowid reference such as `t1.rowid` / `sp.rowid`
+in a multi-table query raises `no such column: t1.rowid`.  An
+unqualified `rowid` in the same position resolves fine, and
+`boundary1`/`boundary2` (single-table, unqualified rowid) pass.
+boundary3 fails ~1896/1819 sub-tests this way; autoindex5 errors at
+`autoindex5-1.1` (`no such column: sp.rowid`) and then SIGSEGVs
+further in (a downstream nil-deref once the schema is half-built).
+Likely cause: the resolver's `TK_DOT` (`zTab.zCol`) arm in
+`lookupName` does not port the `sqlite3IsRowid(zCol)` rowid-alias
+branch (resolve.c ~243) for the *qualified* case — it only special-
+cases the bare-identifier path.  A `Tab.rowid` term therefore falls
+through to the ordinary column lookup, which fails.
+Surfaced by: 9.4.4.d sweep.
+
+## 9.4.divbug.20 — BETWEEN-on-indexed-column planner picks `nosort` / drops rows
+
+Affects: 1 test (`../sqlite3/test/between.test`, 13/22 sub-tests).
+Symptom: `between-1.x` EXPLAIN-style assertions expect `sort t1 i1w`
+(index scan that still needs a sort) but our build returns
+`nosort t1 *` — it claims the scan satisfied the ORDER BY when it did
+not.  Worse, `between-3.2` returns `[]` where upstream returns
+`[4 4 {} {}]` — i.e. the BETWEEN range scan also drops matching rows.
+Likely cause: the WHERE planner mis-handles a `BETWEEN` constraint
+lowered onto an indexed column — it both over-claims `nOBSat` (the
+divbug.13 family, but for the BETWEEN→two-term rewrite path) and the
+range-pair bounds appear to exclude valid rows.  Two related symptoms
+under one BETWEEN-codegen root.
+Surfaced by: 9.4.4.d sweep.
+
+## 9.4.divbug.21 — cross-connection EXCLUSIVE lock not detected
+
+Affects: 1 test (`../sqlite3/test/busy.test`).
+Symptom: with `db2` holding `BEGIN EXCLUSIVE` on `test.db`, a
+`BEGIN IMMEDIATE` on a second connection `db` is expected to fail
+`1 {database is locked}` (after the busy-handler is invoked with
+`{0 1 2 3}`); our build returns `0 {}` — the second connection
+acquires the write lock anyway and the busy-handler never fires.
+Likely cause: the file-locking layer (pager / unix-VFS lock byte
+range, or `btreeBeginTrans` write-lock acquisition) does not honour
+another process's EXCLUSIVE lock, so `SQLITE_BUSY` is never returned
+and `sqlite3_busy_handler` is never reached.  Note `db busy` itself
+is correctly wired (`DbBusyArm` / `sqlite3_busy_handler`) — the gap
+is in lock detection, not the Tcl shim.
+Surfaced by: 9.4.4.d sweep.
+
+## 9.4.divbug.22 — large row payload / 64KB page_size overflow handling segfaults
+
+Affects: 2 tests (`../sqlite3/test/bigrow.test`,
+`../sqlite3/test/btree01.test`).
+Symptom: `bigrow-1.2` (`INSERT` of a single ~65519-byte string
+column) SIGSEGVs; `btree01-1.1` (`PRAGMA page_size=65536` then
+`INSERT … zeroblob(6500)` ×30 + `UPDATE … zeroblob(64000)`) also
+SIGSEGVs.  Both exercise payloads that span overflow pages and/or a
+maximal 64 KiB page size.
+Likely cause: an overflow-page chain bug in the b-tree layer —
+either `accessPayload` / `fillInCell` mis-sizes the overflow chain at
+the 64 KiB page-size boundary, or a `u16` cell-size field overflows
+when `page_size == 65536` (the only power-of-two page size that does
+not fit a `u16`).  Needs Phase 7/8 b-tree follow-up.
+Surfaced by: 9.4.4.d sweep.
+
+## 9.4.divbug.23 — co-routine materialisation of correlated subquery not chosen (EXPLAIN QUERY PLAN drift)
+
+Affects: 1 test (`../sqlite3/test/autoindex3.test`, `autoindex3-310`).
+Symptom: upstream's EQP for the query is a `CO-ROUTINE children`
+with a `SETUP`/`SEARCH t2 USING INDEX x1` body; our build emits a
+flat `SEARCH t2 … |--SCAN children `--SEARCH t2 …` plan — the
+correlated subquery is re-scanned inline instead of being
+materialised once into a co-routine.
+Likely cause: the planner's co-routine / materialise decision for a
+correlated FROM-subquery (`sqlite3Select` `SRT_Coroutine` selection,
+select.c ~6500) is not ported / not triggered for this shape.  This
+is a plan-shape divergence; the query still returns correct rows, so
+the impact is limited to EQP-asserting tests.
+Surfaced by: 9.4.4.d sweep.
+
+## 9.4.divbug.24 — AUTOINCREMENT / `sqlite_sequence` double-create + segfault
+
+Affects: 1 test (`../sqlite3/test/aggnested.test`, `aggnested-3.x`).
+Symptom: `aggnested-3.0`/`3.1` error `table sqlite_sequence already
+exists`; `aggnested-3.2`/`3.3` return row-wise instead of folded
+results (`[0 1 0 1 0 1]` vs `[1 0]`); `aggnested-3.11` SIGSEGVs.
+This is the residual cluster divbug.17 explicitly deferred ("aggnested
+-3.x failures remain but are an unrelated `sqlite_sequence`/
+AUTOINCREMENT issue") — now assigned its own bucket.
+Likely cause: the `sqlite_sequence` shadow table for AUTOINCREMENT is
+being CREATE'd a second time instead of reused (the
+`OP_OpenWrite sqlite_sequence` / `autoIncBegin` path does not detect
+the existing table), and an aggregate-over-AUTOINCREMENT shape both
+mis-folds and eventually nil-derefs.
+Surfaced by: 9.4.4.d sweep (deferred from divbug.17).
+
+## Run summary (9.4.4.d sweep)
+
+Broadened the sweep to the **first 100 tcl-feature tests** in
+MANIFEST.txt order, run under `bin/TclTestDriver --limit 100` (engine
++ tcl lib rebuilt fresh; both clean — engine regression 99/1, the 1
+being the pre-existing arg-less `TestFuzzDiff`).
+
+PASS / FAIL / SKIP / CRASH = **72 / 28 / 0 / 0** (100 total, 21.6 s).
+The driver counts a crashed/non-zero-exit run as FAIL; 3 of the 28
+FAILs are in-process SIGSEGVs (bigrow, btree01, autoindex5) — broken
+out as CRASH below.
+
+Delta on the first-50 subset vs 9.4.4.c's **41 / 9 / 0**:
+now **43 / 7 / 0** — `atof2` and `atomic` flipped FAIL→PASS (the
+9.4.6.q `load_static_extension` / `atomic_batch_write` landings); the
+other 7 first-50 FAILs are unchanged buckets.
+
+The 28 FAILs (7 in first-50, 21 in 51-100):
+
+| Test               | Verdict | Bucket / cause                                  |
+|--------------------|---------|-------------------------------------------------|
+| affinity3.test     | FAIL    | divbug.16 fixed; residual CTAS unsupported      |
+| aggerror.test      | FAIL    | `sqlite3_create_aggregate` unported + divbug.14 |
+| aggfault.test      | FAIL    | `do_faultsim_test` (full malloc-fault) unported |
+| aggnested.test     | CRASH   | new **divbug.24** (sqlite_sequence + segfault)  |
+| aggorderby.test    | FAIL    | divbug.14 + non-aggregate ORDER BY not raised   |
+| all.test           | FAIL    | sources `permutations.test` (absent)            |
+| atof1.test         | FAIL    | `autoinstall_test_functions` harness gap        |
+| autoindex3.test    | FAIL    | new **divbug.23** (EQP co-routine drift)        |
+| autoindex5.test    | CRASH   | new **divbug.19** (`sp.rowid`) + segfault       |
+| avtrans.test       | FAIL    | `wal_set/check_journal_mode` unported           |
+| backup.test        | FAIL    | `do_not_use_codec` unported                     |
+| backup2.test       | FAIL    | `do_not_use_codec` unported                     |
+| backup4.test       | FAIL    | `do_not_use_codec` unported                     |
+| backup5.test       | FAIL    | `sqlite3_prepare_v2`/`sqlite3_backup` unported  |
+| backup_ioerr.test  | FAIL    | `randstr` SQL func + `sqlite_pending_byte`      |
+| badutf.test        | FAIL    | `sqlite3_exec` (test1.c) unported               |
+| badutf2.test       | FAIL    | `sqlite3_exec`/`sqlite3_prepare_v2` unported    |
+| between.test       | FAIL    | new **divbug.20** (BETWEEN planner / dropped)   |
+| bigrow.test        | CRASH   | new **divbug.22** (large payload segfault)      |
+| bind.test          | FAIL    | `sqlite3_prepare` (test1.c) unported            |
+| bind2.test         | FAIL    | `sqlite3_prepare` (test1.c) unported            |
+| bindxfer.test      | FAIL    | `sqlite3_prepare`/`sqlite3_transfer_bindings`   |
+| boundary3.test     | FAIL    | new **divbug.19** (`t1.rowid` not resolved)     |
+| btree01.test       | CRASH   | new **divbug.22** (64KB page_size segfault)     |
+| btree02.test       | FAIL    | `eval` SQL extension (`db enable_load_extension`)|
+| busy.test          | FAIL    | new **divbug.21** (cross-conn EXCLUSIVE lock)   |
+| cacheflush.test    | FAIL    | `test_set_config_pagecache` unported            |
+| capi2.test         | FAIL    | `sqlite3_prepare` (test1.c stmt API) unported   |
+
+New engine divergences assigned: **divbug.19** (qualified rowid
+alias), **.20** (BETWEEN planner), **.21** (cross-connection lock),
+**.22** (large payload / 64KB page segfault), **.23** (EQP co-routine
+drift), **.24** (sqlite_sequence double-create + segfault).
+
+The remaining 15 FAILs are unported test-only Tcl commands / SQL
+functions or a missing harness file (`permutations.test`) — port-side
+follow-ups, not engine bugs.  The dominant cluster is the **test1.c
+prepared-statement C-API subset** (`sqlite3_prepare`,
+`sqlite3_prepare_v2`, `sqlite3_exec`, `sqlite3_backup`,
+`sqlite3_errmsg`, `sqlite3_transfer_bindings`) — porting that one
+group would unblock bind/bind2/bindxfer/capi2/badutf/badutf2/backup5
+(7 tests).  Other harness gaps: `do_not_use_codec`,
+`wal_set/check_journal_mode`, `randstr` SQL func, `eval` SQL
+extension, `test_set_config_pagecache`, `sqlite3_create_aggregate`,
+`autoinstall_test_functions`, `do_faultsim_test`.
