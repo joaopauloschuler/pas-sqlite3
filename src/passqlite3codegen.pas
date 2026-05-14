@@ -13616,6 +13616,18 @@ begin
 
   { isAuxiliaryVtabOperator / WO_AUX vtab path (whereexpr.c:1531..1567)
     deferred — vtab corpus is not exercised today. }
+
+  { whereexpr.c:1566..1570 — prevent ON-clause terms of a LEFT JOIN from
+    being used to drive an index for tables to the left of the join.
+    extraRight carries the cursor mask of every table left of the join's
+    iJoin cursor (set in the EP_OuterON arm above to x-1); folding it into
+    prereqRight makes whereLoopAddBtreeIndex's `prereqRight & maskSelf`
+    guard reject the term for those outer tables.  Without this the
+    synthesized BETWEEN >=/<= children of an ON-clause BETWEEN were used
+    to range-scan the left table's index, dropping its unmatched rows
+    (9.4.divbug.20). }
+  pTerm := @pWC^.a[idxTerm];
+  pTerm^.prereqRight := pTerm^.prereqRight or extraRight;
 end;
 
 procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
