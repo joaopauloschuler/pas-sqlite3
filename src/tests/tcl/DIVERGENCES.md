@@ -24,19 +24,28 @@ Note that **9.4.divbug.2** — truncated diagnostic text — also fires on
 the same code path (`select1-2.20`), suggesting both symptoms are two
 faces of the same bug.
 
-## 9.4.divbug.2 — Truncated SQL error messages drop the function name
+## 9.4.divbug.2 — Truncated SQL error messages drop the function name — FIXED
 
 Affects: 2+ tests (`../sqlite3/test/select1.test`,
 `../sqlite3/test/insert.test`, likely more).
 Symptom: upstream emits e.g.
-`misuse of aggregate function min()` / `table test1 has 3 columns but 2
+`misuse of aggregate: min()` / `table test1 has 3 columns but 2
 values were supplied`; our build emits the prefix-only forms
 `misuse of aggregate function` / `table has wrong number of values for
 INSERT`.  The name / count tail is dropped.
-Likely cause: the `sqlite3ErrorMsg` / `errorOut` ports in
-passqlite3parse / passqlite3resolve don't pass the `%s` / `%d`
-format arguments through `sqlite3VMPrintf`; the format string is being
-emitted verbatim instead of formatted.
+Root cause: the codegen TK_AGG_FUNCTION misuse arm
+(`passqlite3codegen.pas:6271`) hardcoded the format string with no
+`%s` / no args.  The INSERT IDLIST-mismatch arm
+(`passqlite3codegen.pas:35750`) used a bespoke literal instead of the
+upstream `"%d values for %d columns"` (insert.c:1257), and the
+no-IDLIST `nColumn != pTab->nCol-nHidden` count check
+(insert.c:1244..1254) wasn't ported at all — the path either fell
+through to a later AV (no IDLIST) or hit the bespoke literal (IDLIST).
+Fix: route both arms through `sqlite3MPrintf` with the upstream format
+strings (`'misuse of aggregate: %s()'` keyed off `pExpr^.u.zToken`,
+`'%d values for %d columns'`, and the now-ported
+`'table %S has %d columns but %d values were supplied'` using `%S` on
+`@SrcListItems(pTabList)[0]`).
 
 ## 9.4.divbug.3 — Schema introspection result columns reordered / missing
 

@@ -755,7 +755,7 @@ acceptance gate for this section.
   aggregate context is consumed by the sorter.  C ref:
   `../sqlite3/src/select.c` (aggregate-misuse diagnostic arm) +
   `resolve.c` (ResolveOuterRefs).
-- [ ] **9.4.divbug.2** SQL error messages drop their format-arg
+- [X] **9.4.divbug.2** SQL error messages drop their format-arg
   tails: `misuse of aggregate function` should read
   `misuse of aggregate function min()`; `table has wrong number
   of values for INSERT` should carry the column counts.  Likely

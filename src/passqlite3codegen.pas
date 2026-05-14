@@ -6271,8 +6271,17 @@ begin
         if (pExpr^.pAggInfo = nil) or (pExpr^.iAgg < 0)
            or (pExpr^.iAgg >= pExpr^.pAggInfo^.nFunc) then
         begin
-          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
-            'misuse of aggregate function', []));
+          { expr.c:5320 — "misuse of aggregate: %#T()" with pExpr.
+            %#T reads pExpr^.u.zToken (function name).  Synthesise the
+            same text via %s since the Pas %T port doesn't carry the
+            alt-form Expr-deref branch yet.  EP_IntValue guard mirrors
+            the assert above the C call. }
+          if ExprHasProperty(pExpr, EP_IntValue) or (pExpr^.u.zToken = nil) then
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              'misuse of aggregate: ()', []))
+          else
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              'misuse of aggregate: %s()', [pExpr^.u.zToken]));
           sqlite3VdbeAddOp2(v, OP_Null, 0, target);
           done := True;
         end
@@ -35736,12 +35745,23 @@ generic_coro_done:
     aTabColMap[i] = (1-based) index into pColumn for table column i, or 0
     if column i is not named in the IDLIST (default value path).  IPK alias
     and generated-column arms are deferred until the IPK INSERT path lands. }
+  { No-IDLIST count mismatch — port of insert.c:1244..1254.  Skip the
+    NOINSERT-flag tally (no TF_HasGenerated / TF_HasHidden support yet);
+    nHidden is therefore 0 and the check reduces to nColumn vs nCol. }
+  if (pColumn = nil) and (nColumn > 0) and (nColumn <> i32(pTab^.nCol)) then
+  begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'table %S has %d columns but %d values were supplied',
+      [@SrcListItems(pTabList)[0], i32(pTab^.nCol), nColumn]));
+    goto insert_cleanup;
+  end;
   if pColumn <> nil then
   begin
     if nColumn <> pColumn^.nId then
     begin
-      sqlite3ErrorMsg(pParse,
-        PAnsiChar('table has wrong number of values for INSERT'));
+      { insert.c:1256..1259 — IDLIST length mismatch. }
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        '%d values for %d columns', [nColumn, pColumn^.nId]));
       goto insert_cleanup;
     end;
     aTabColMap := Pi32(sqlite3DbMallocZero(db,
