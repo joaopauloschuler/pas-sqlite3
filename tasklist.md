@@ -643,7 +643,7 @@ acceptance gate for this section.
     / `sqlite3_get_auxdata` / `sqlite3_set_auxdata` — UDF helpers.
     Many already exported; audit + close gaps.  C ref:
     `../sqlite3/src/vdbeapi.c`.
-  - [ ] **9.4.6.j** `sqlite3_extended_result_codes` /
+  - [X] **9.4.6.j** `sqlite3_extended_result_codes` /
     `sqlite3_extended_errcode` — extended-rc plumbing audit; some
     error tests assert on the extended (3-byte) form.  C ref:
     `../sqlite3/src/main.c:sqlite3_extended_*`.
