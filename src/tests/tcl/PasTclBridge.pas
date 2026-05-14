@@ -142,6 +142,11 @@ function Tcl_UnsetVar2(interp: PTclInterp; part1, part2: PChar; flags: cint): ci
 { Reset the interpreter result.  tclsqlite.c:2003 (DbEvalNextCmd cleanup). }
 procedure Tcl_ResetResult(interp: PTclInterp); cdecl; external 'tcl8.6';
 
+{ Report a background error — used by hook trampolines when an evaled
+  callback script fails.  tclsqlite.c:851, :880 (DbRollbackHandler /
+  DbWalHandler). }
+procedure Tcl_BackgroundError(interp: PTclInterp); cdecl; external 'tcl8.6';
+
 { Tcl_Obj -> primitive accessors.  tclsqlite.c:874, :1138, :1146. }
 function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): cint; cdecl; external 'tcl8.6';
 function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';

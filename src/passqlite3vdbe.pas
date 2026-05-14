@@ -643,6 +643,23 @@ type
   PCollSeq  = Pointer;  { CollSeq  — opaque alias for OP_CollSeq param compat }
   PTable    = Pointer;  { Table    — Phase 6 (build.c) }
   PIndex    = Pointer;  { Index    — Phase 6 }
+
+  { Minimal field overlay for struct Table — only the members the
+    update-hook arms of OP_Insert / OP_Delete need (zName@0, aCol@8,
+    tabFlags@48).  Full layout lives in passqlite3codegen.TTable, which
+    this unit deliberately does not see; the offsets below mirror it. }
+  PTableHookFields = ^TTableHookFields;
+  TTableHookFields = record
+    zName:    PAnsiChar;            { @0  }
+    aCol:     Pointer;              { @8  }
+    pad0:     array[0..31] of Byte; { @16 — pIndex..nTabRef }
+    tabFlags: u32;                  { @48 }
+  end;
+
+  { Post-update hook callback — sqlite3.xUpdateCallback.
+    void(*)(void*,int,const char*,const char*,sqlite3_int64). }
+  TUpdateCallbackFn = procedure(pArg: Pointer; op: i32;
+    zDb, zTbl: PAnsiChar; rowid: i64); cdecl;
   PExpr     = Pointer;  { Expr     — Phase 6 (expr.c) }
   PParse    = Pointer;  { Parse    — Phase 7 (tokenize.c / parse.y) }
   PVList    = Pointer;  { VList (int array) — Phase 6 }
@@ -7524,6 +7541,8 @@ var
   seekRes: i32;           { OP_Insert: prior seek result }
   xPay:    TBtreePayload; { OP_Insert/IdxInsert: payload descriptor }
   opflags: i32;           { OP_Delete: opcode flags from P2 }
+  zHookDb:  PAnsiChar;        { OP_Insert/Delete: db name for update hook }
+  pHookTab: PTableHookFields; { OP_Insert/Delete: table for update hook }
   vRow:    i64;           { OP_NewRowid/OP_Rowid: rowid value }
   cntNR:   i32;           { OP_NewRowid: retry counter }
   nEntry:  i64;           { OP_Count: entry count }
@@ -8869,6 +8888,18 @@ begin
       sqlite3VdbeIncrWriteCounter(v, pCur);
       pIn3 := @aMem[pOp^.p3];  { key register }
       xPay.nKey := pIn3^.u.i;
+
+      { vdbe.c:5778..5784 — derive zDb/pTab for the update hook when P4
+        is a Table* and an update hook is installed. }
+      if (pOp^.p4type = P4_TABLE) and (db^.xUpdateCallback <> nil) then begin
+        zHookDb  := PDb(PtrUInt(db^.aDb) +
+                        PtrUInt(pCur^.iDb) * SizeOf(TDb))^.zDbSName;
+        pHookTab := PTableHookFields(pOp^.p4.pTab);
+      end else begin
+        zHookDb  := nil;
+        pHookTab := nil;
+      end;
+
       if (pOp^.p5 and OPFLAG_NCHANGE) <> 0 then begin
         Inc(v^.nChange);
         if (pOp^.p5 and OPFLAG_LASTROWID) <> 0 then
@@ -8891,6 +8922,17 @@ begin
       pCur^.cacheStatus    := CACHE_STALE;
       Inc(colCacheCtr);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+
+      { vdbe.c:5824..5831 — invoke the update hook after a successful
+        insert.  ISUPDATE distinguishes UPDATE from INSERT. }
+      if (pHookTab <> nil) and (pHookTab^.aCol <> nil) then begin
+        if (pOp^.p5 and OPFLAG_ISUPDATE) <> 0 then
+          TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
+            SQLITE_UPDATE_AUTH, zHookDb, pHookTab^.zName, xPay.nKey)
+        else
+          TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
+            SQLITE_INSERT_AUTH, zHookDb, pHookTab^.zName, xPay.nKey);
+      end;
     end;
 
     { ────── OP_Delete ────── (vdbe.c:5903) }
@@ -8898,13 +8940,37 @@ begin
       opflags := pOp^.p2;
       pCur := v^.apCsr[pOp^.p1];
       sqlite3VdbeIncrWriteCounter(v, pCur);
+
+      { vdbe.c:5937..5950 — derive zDb/pTab for the update hook; if the
+        cursor was last moved with Next/Prev (SAVEPOSITION) capture the
+        current rowid into movetoTarget so it can be passed to the hook. }
+      if (pOp^.p4type = P4_TABLE) and (db^.xUpdateCallback <> nil) then begin
+        zHookDb  := PDb(PtrUInt(db^.aDb) +
+                        PtrUInt(pCur^.iDb) * SizeOf(TDb))^.zDbSName;
+        pHookTab := PTableHookFields(pOp^.p4.pTab);
+        if ((pOp^.p5 and OPFLAG_SAVEPOSITION) <> 0) and (pCur^.isTable <> 0) then
+          pCur^.movetoTarget := sqlite3BtreeIntegerKey(pCur^.uc.pCursor);
+      end else begin
+        zHookDb  := nil;
+        pHookTab := nil;
+      end;
+
       rc := sqlite3BtreeDelete(pCur^.uc.pCursor, u8(pOp^.p5));
       pCur^.cacheStatus := CACHE_STALE;
       Inc(colCacheCtr);
       pCur^.seekResult := 0;
       if rc <> SQLITE_OK then goto abort_due_to_error;
-      if (opflags and OPFLAG_NCHANGE) <> 0 then
+
+      { vdbe.c:5993..6000 — invoke the update hook after a successful
+        delete (rowid tables only). }
+      if (opflags and OPFLAG_NCHANGE) <> 0 then begin
         Inc(v^.nChange);
+        { TF_WithoutRowid = $00000080 (sqliteInt.h); HasRowid == not set. }
+        if (pHookTab <> nil) and
+           ((pHookTab^.tabFlags and u32($00000080)) = 0) then
+          TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
+            SQLITE_DELETE_AUTH, zHookDb, pHookTab^.zName, pCur^.movetoTarget);
+      end;
     end;
 
     { ────── OP_ResetCount ────── (vdbe.c:6011) }

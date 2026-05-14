@@ -72,6 +72,11 @@ type
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
     zProgress: PAnsiChar;  { tclsqlite.c:204 — `progress` callback script,
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
+    zCommit:   PAnsiChar;  { tclsqlite.c:200 — `commit_hook` callback script,
+                             Tcl_Alloc'd; freed in DbDeleteCmd. }
+    pUpdateHook:   PTclObj; { tclsqlite.c:222 — `update_hook` script Tcl_Obj. }
+    pRollbackHook: PTclObj; { tclsqlite.c:223 — `rollback_hook` script Tcl_Obj. }
+    pWalHook:      PTclObj; { tclsqlite.c:224 — `wal_hook` script Tcl_Obj. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -154,6 +159,27 @@ begin
   begin
     Tcl_Free(pDb^.zProgress);
     pDb^.zProgress := nil;
+  end;
+  { Free change-notification hook scripts — tclsqlite.c:646..651. }
+  if pDb^.zCommit <> nil then
+  begin
+    Tcl_Free(pDb^.zCommit);
+    pDb^.zCommit := nil;
+  end;
+  if pDb^.pUpdateHook <> nil then
+  begin
+    Tcl_DecrRefCount(pDb^.pUpdateHook);
+    pDb^.pUpdateHook := nil;
+  end;
+  if pDb^.pRollbackHook <> nil then
+  begin
+    Tcl_DecrRefCount(pDb^.pRollbackHook);
+    pDb^.pRollbackHook := nil;
+  end;
+  if pDb^.pWalHook <> nil then
+  begin
+    Tcl_DecrRefCount(pDb^.pWalHook);
+    pDb^.pWalHook := nil;
   end;
   Dispose(pDb);
 end;
@@ -1285,6 +1311,199 @@ begin
   Result := TCL_OK;
 end;
 
+{ ---- 9.4.2.l: change-notification hooks ---------------------------- }
+
+{ DbCommitHandler — sqlite3_commit_hook trampoline.  tclsqlite.c:834..843.
+  Evals pDb^.zCommit; a TCL error or a non-zero integer result aborts
+  (rolls back) the transaction by returning 1.
+  Signature: int (*)(void*). }
+function DbCommitHandler(cd: Pointer): cint; cdecl;
+var
+  pDb: PSqliteDb;
+  rc:  cint;
+begin
+  pDb := PSqliteDb(cd);
+  rc  := Tcl_Eval(pDb^.interp, pDb^.zCommit);
+  if (rc <> TCL_OK) or
+     (StrToIntDef(string(Tcl_GetStringResult(pDb^.interp)), 0) <> 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ DbRollbackHandler — sqlite3_rollback_hook trampoline.  tclsqlite.c:845..852.
+  Evals pDb^.pRollbackHook; result ignored, errors reported as background.
+  Signature: void (*)(void*). }
+procedure DbRollbackHandler(clientData: Pointer); cdecl;
+var
+  pDb: PSqliteDb;
+begin
+  pDb := PSqliteDb(clientData);
+  if Tcl_EvalObjEx(pDb^.interp, pDb^.pRollbackHook, 0) <> TCL_OK then
+    Tcl_BackgroundError(pDb^.interp);
+end;
+
+{ DbWalHandler — sqlite3_wal_hook trampoline.  tclsqlite.c:856..882.
+  Appends (zDb, nEntry) to a duplicate of pDb^.pWalHook, evals it, and
+  returns the integer result to sqlite3.
+  Signature: int (*)(void*, sqlite3*, const char*, int). }
+function DbWalHandler(clientData: Pointer; db: PTsqlite3;
+  zDb: PAnsiChar; nEntry: cint): cint; cdecl;
+var
+  pDb:    PSqliteDb;
+  interp: PTclInterp;
+  p:      PTclObj;
+  ret:    cint;
+begin
+  pDb    := PSqliteDb(clientData);
+  interp := pDb^.interp;
+  ret    := SQLITE_OK;
+  p := Tcl_DuplicateObj(pDb^.pWalHook);
+  Tcl_IncrRefCount(p);
+  Tcl_ListObjAppendElement(interp, p, Tcl_NewStringObj(zDb, -1));
+  Tcl_ListObjAppendElement(interp, p, Tcl_NewIntObj(nEntry));
+  if (Tcl_EvalObjEx(interp, p, 0) <> TCL_OK) or
+     (Tcl_GetIntFromObj(interp, Tcl_GetObjResult(interp), @ret) <> TCL_OK) then
+    Tcl_BackgroundError(interp);
+  Tcl_DecrRefCount(p);
+  Result := ret;
+end;
+
+{ DbUpdateHandler — sqlite3_update_hook trampoline.  tclsqlite.c:946..971.
+  Appends (op-as-string, zDb, zTbl, rowid) to a duplicate of
+  pDb^.pUpdateHook and evals it.
+  Signature: void (*)(void*, int, const char*, const char*, sqlite3_int64). }
+procedure DbUpdateHandler(p: Pointer; op: cint;
+  zDb, zTbl: PAnsiChar; rowid: Int64); cdecl;
+const
+  azStr: array[0..2] of PAnsiChar = ('DELETE', 'INSERT', 'UPDATE');
+var
+  pDb:  PSqliteDb;
+  pCmd: PTclObj;
+begin
+  pDb  := PSqliteDb(p);
+  pCmd := Tcl_DuplicateObj(pDb^.pUpdateHook);
+  Tcl_IncrRefCount(pCmd);
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewStringObj(azStr[(op - 1) div 9], -1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewStringObj(zDb, -1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewStringObj(zTbl, -1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewWideIntObj(rowid));
+  Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+  Tcl_DecrRefCount(pCmd);
+end;
+
+{ DbCommitHookArm — `db commit_hook ?CALLBACK?`  tclsqlite.c:2807..2839. }
+function DbCommitHookArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:     PSqliteDb;
+  zCommit: PAnsiChar;
+  len:     cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zCommit <> nil then
+      Tcl_AppendResult(interp, pDb^.zCommit, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zCommit <> nil then
+      Tcl_Free(pDb^.zCommit);
+    zCommit := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zCommit <> nil) and (len > 0) then
+    begin
+      pDb^.zCommit := Tcl_Alloc(len + 1);
+      Move(zCommit^, pDb^.zCommit^, len + 1);
+    end
+    else
+      pDb^.zCommit := nil;
+    if pDb^.zCommit <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_commit_hook(pDb^.db, @DbCommitHandler, pDb);
+    end
+    else
+      sqlite3_commit_hook(pDb^.db, nil, nil);
+  end;
+  Result := TCL_OK;
+end;
+
+{ DbHookCmd — shared helper for update_hook / rollback_hook / wal_hook.
+  tclsqlite.c:2016..2046.  Reports the prior script, stores the new one
+  (if non-empty), then (re)registers all three sqlite3 hooks. }
+procedure DbHookCmd(interp: PTclInterp; pDb: PSqliteDb;
+  pArg: PTclObj; ppHook: PPTclObj);
+var
+  db: PTsqlite3;
+begin
+  db := pDb^.db;
+  if ppHook^ <> nil then
+  begin
+    Tcl_SetObjResult(interp, ppHook^);
+    if pArg <> nil then
+    begin
+      Tcl_DecrRefCount(ppHook^);
+      ppHook^ := nil;
+    end;
+  end;
+  if pArg <> nil then
+  begin
+    if Tcl_GetString(pArg)[0] <> #0 then
+    begin
+      ppHook^ := pArg;
+      Tcl_IncrRefCount(ppHook^);
+    end;
+  end;
+
+  if pDb^.pUpdateHook <> nil then
+    sqlite3_update_hook(db, @DbUpdateHandler, pDb)
+  else
+    sqlite3_update_hook(db, nil, nil);
+  if pDb^.pRollbackHook <> nil then
+    sqlite3_rollback_hook(db, @DbRollbackHandler, pDb)
+  else
+    sqlite3_rollback_hook(db, nil, nil);
+  if pDb^.pWalHook <> nil then
+    sqlite3_wal_hook(db, @DbWalHandler, pDb)
+  else
+    sqlite3_wal_hook(db, nil, nil);
+end;
+
+{ DbHookArm — `db wal_hook|update_hook|rollback_hook ?SCRIPT?`
+  tclsqlite.c:4133..4154.  `which`: 0=wal 1=update 2=rollback. }
+function DbHookArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj; which: cint): cint; cdecl;
+var
+  pDb:    PSqliteDb;
+  ppHook: PPTclObj;
+begin
+  pDb := PSqliteDb(clientData);
+  case which of
+    0: ppHook := @pDb^.pWalHook;
+    1: ppHook := @pDb^.pUpdateHook;
+  else ppHook := @pDb^.pRollbackHook;
+  end;
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?SCRIPT?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  pDb^.interp := interp;
+  if objc = 3 then
+    DbHookCmd(interp, pDb, ObjvAt(objv, 2), ppHook)
+  else
+    DbHookCmd(interp, pDb, nil, ppHook);
+  Result := TCL_OK;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -1445,6 +1664,37 @@ begin
     Exit;
   end;
 
+  { commit_hook — tclsqlite.c:2807 (DB_COMMIT_HOOK).  sqlite3_commit_hook
+    shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'commit_hook') = 0) then
+  begin
+    Result := DbCommitHookArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { update_hook — tclsqlite.c:4139 (DB_UPDATE_HOOK).  sqlite3_update_hook
+    shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'update_hook') = 0) then
+  begin
+    Result := DbHookArm(clientData, interp, objc, objv, 1);
+    Exit;
+  end;
+
+  { rollback_hook — tclsqlite.c:4140 (DB_ROLLBACK_HOOK).
+    sqlite3_rollback_hook shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'rollback_hook') = 0) then
+  begin
+    Result := DbHookArm(clientData, interp, objc, objv, 2);
+    Exit;
+  end;
+
+  { wal_hook — tclsqlite.c:4138 (DB_WAL_HOOK).  sqlite3_wal_hook shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'wal_hook') = 0) then
+  begin
+    Result := DbHookArm(clientData, interp, objc, objv, 0);
+    Exit;
+  end;
+
   Tcl_AppendResult(interp,
     PChar('unknown subcommand "'),
     zSub,
@@ -1505,6 +1755,12 @@ begin
   pDb^.zTraceV2 := nil;
   pDb^.zProfile := nil;
   pDb^.zAuth    := nil;
+  pDb^.zBusy        := nil;
+  pDb^.zProgress    := nil;
+  pDb^.zCommit      := nil;
+  pDb^.pUpdateHook  := nil;
+  pDb^.pRollbackHook := nil;
+  pDb^.pWalHook     := nil;
 
   Tcl_CreateObjCommand(interp, zDbName,
     @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd);

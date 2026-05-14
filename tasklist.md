@@ -474,7 +474,7 @@ acceptance gate for this section.
     busy-handler / progress-callback / interrupt wiring.  C ref:
     `tclsqlite.c:681..737` (DbBusyHandler, DbProgressHandler) +
     `2810..2860` (dispatch).
-  - [ ] **9.4.2.l** `db update_hook` / `db commit_hook` /
+  - [X] **9.4.2.l** `db update_hook` / `db commit_hook` /
     `db rollback_hook` / `db wal_hook` — change-notification
     callbacks.  C ref: `tclsqlite.c:834..980` (4 handlers) +
     `2980..3070` (dispatch).
