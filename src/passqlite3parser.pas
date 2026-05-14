@@ -978,14 +978,33 @@ begin
 
     CC_DOLLAR,
     CC_VARALPHA: begin
-      { $var, @var, :var, #var }
+      { $var, @var, :var, #var — tokenize.c:507..544.
+        Includes the SQLITE_OMIT_TCL_VARIABLE-guarded arms that allow
+        $var(...) array refs and $foo::bar namespace separators so that
+        Tcl-style bound parameters like $::w tokenize as a single
+        TK_VARIABLE rather than an illegal bare '$'. }
       nId := 0;
       tokenType^ := TK_VARIABLE;
       i := 1;
       while z[i] <> 0 do begin
-        if sqlite3IsIdChar(z[i]) <> 0 then
-          Inc(nId)
-        else
+        c := z[i];
+        if sqlite3IsIdChar(c) <> 0 then begin
+          Inc(nId);
+        end else if (c = Ord('(')) and (nId > 0) then begin
+          { tokenize.c:519..527 — $var(...) Tcl array reference. }
+          repeat
+            Inc(i);
+            c := z[i];
+          until (c = 0) or (sqlite3Isspace(c) <> 0) or (c = Ord(')'));
+          if c = Ord(')') then
+            Inc(i)
+          else
+            tokenType^ := TK_ILLEGAL;
+          Break;
+        end else if (c = Ord(':')) and (z[i+1] = Ord(':')) then begin
+          { tokenize.c:528..529 — $foo::bar namespace separator. }
+          Inc(i);
+        end else
           Break;
         Inc(i);
       end;
