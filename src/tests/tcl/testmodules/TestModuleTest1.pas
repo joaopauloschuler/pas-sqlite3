@@ -406,6 +406,11 @@ begin
     @test_atomic_batch_write, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('load_static_extension'),
     @tclLoadStaticExtensionCmd, nil, nil);
+  { test1.c:9370..9371 — expose the undocumented sort counter so
+    regression tests (between.test's `queryplan` proc, etc.) can
+    verify the optimizer correctly elides ORDER BY sorts. }
+  Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
+    @sqlite3_sort_count, TCL_LINK_INT);
   Result := TCL_OK;
 end;
 

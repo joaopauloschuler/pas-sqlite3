@@ -1847,6 +1847,14 @@ var
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
+{ Undocumented test-only global incremented by OP_Sort / OP_SorterSort
+  (vdbe.c:79, vdbe.c:6350, guarded by SQLITE_TEST).  Regression tests
+  (e.g. between.test's `queryplan` proc) read it via the Tcl-linked
+  `sqlite_sort_count` variable to verify the optimizer correctly
+  elides sorts.  Always present here; harmless when unused. }
+var
+  sqlite3_sort_count: i32 = 0;
+
 implementation
 
 uses
@@ -10358,6 +10366,9 @@ begin
       Rewind the sorter/index and jump to P2 if empty. }
     OP_SorterSort,
     OP_Sort: begin
+      { vdbe.c:6349..6351 — SQLITE_TEST-guarded sort counter, read by
+        regression tests to confirm sorts are elided when possible. }
+      Inc(sqlite3_sort_count);
       Inc(v^.aCounter[SQLITE_STMTSTATUS_SORT]);
       { Fall through to OP_Rewind logic }
       pCur  := v^.apCsr[pOp^.p1];
