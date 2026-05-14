@@ -248,3 +248,15 @@ proc finish_test {} {
   catch {db close}
   if {0==[info exists ::SLAVE]} { finalize_testing }
 }
+
+# integrity_check — upstream tester.tcl:1674..1678.  Verbatim port: a
+# thin do_test wrapper around `PRAGMA integrity_check` that asserts the
+# result list is exactly `{ok}`.  Wrapped in `ifcapable integrityck` so
+# builds compiled with SQLITE_OMIT_INTEGRITY_CHECK skip the assertion;
+# our `ifcapable` stub always runs the body, matching the default cap
+# set.  C ref: tester.tcl:1674..1678.
+proc integrity_check {name {db db}} {
+  ifcapable integrityck {
+    do_test $name [list execsql {PRAGMA integrity_check} $db] {ok}
+  }
+}

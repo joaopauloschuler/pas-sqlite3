@@ -169,6 +169,22 @@ begin
   if CounterNTest <> 5 then Die('after fail-1 nTest=' + IntToStr(CounterNTest) + ' want 5');
   Writeln('PASS: do_catchsql_test fail-1, nTest=5 nErr=1');
 
+  { Step 9b — integrity_check (9.4.2.g.4).  Create a small table, insert
+    rows, then run integrity_check.  PRAGMA integrity_check on a healthy
+    in-memory db must return "ok"; nErr must be unchanged, nTest+=1. }
+  sRes := EvalGet(
+    'sqlite3 db :memory:; ' +
+    'execsql {create table ic(a,b); insert into ic values (1,''x''),(2,''y''),(3,''z'')}',
+    rc);
+  if rc <> TCL_OK then Die('ic setup rc=' + IntToStr(rc) + ' err=' + sRes);
+  sRes := EvalGet('integrity_check ic-1', rc);
+  if rc <> TCL_OK then Die('integrity_check ic-1 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then
+    Die('after ic-1 nErr=' + IntToStr(CounterNErr) + ' want 1 (unchanged)');
+  if CounterNTest <> 6 then
+    Die('after ic-1 nTest=' + IntToStr(CounterNTest) + ' want 6');
+  Writeln('PASS: integrity_check ic-1, nTest=6 nErr=1 (unchanged)');
+
   sRes := EvalGet('db close', rc);
   if rc <> TCL_OK then Die('db close rc=' + IntToStr(rc) + ' err=' + sRes);
   Writeln('PASS: db close OK');

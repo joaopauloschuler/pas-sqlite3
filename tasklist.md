@@ -397,9 +397,13 @@ acceptance gate for this section.
     `bin/TestTclTesterMin` (in-proc forcedelete + missing-path
     delete_file) plus a sub-tclsh run that exercises finish_test ->
     finalize_testing -> exit 0.
-  - [ ] **9.4.2.g.4** `integrity_check` — wrapper that runs
+  - [X] **9.4.2.g.4** `integrity_check` — wrapper that runs
     `PRAGMA integrity_check` and asserts "ok".  C ref:
-    `tester.tcl:1567..1583`.
+    `tester.tcl:1674..1678` (verbatim port: `ifcapable integrityck`
+    guard + `do_test NAME [list execsql {PRAGMA integrity_check} $db]
+    {ok}`).  Smoke gated by `bin/TestTclTesterMin` ic-1 case (create
+    table + insert + integrity_check; nTest+=1, nErr unchanged on
+    healthy db).
   - [ ] **9.4.2.g.5** `working_64bit_int` + `presql` + `omit_test` —
     capability/permutation helpers.  C ref: `tester.tcl:1740..1772`,
     `1340..1360`, `1280..1320`.

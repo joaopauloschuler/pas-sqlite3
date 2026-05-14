@@ -35,25 +35,27 @@ Bootstrapped under task **9.4.4.a**.  Format:
   `finish_test`.  `working_64bit_int` is a build-cap probe gating the
   whole file (skips body if false).  Cite: 9.4.2.g bullet.
 
-## 9.4.2.g.3 re-evaluation note
+## 9.4.2.g.4 re-evaluation note
 
-After landing `finish_test`, `forcedelete`, and `delete_file`, several
-entries above now lack only `integrity_check` (still pending under
-9.4.2.g.4) to be source-able through `tester_min.tcl`:
+After landing `ifcapable`, `catchsql`/`do_catchsql_test`, `finish_test`,
+`forcedelete`/`delete_file`, and now `integrity_check`, the following
+entries are shim-complete and only await the 9.4.4.b re-sweep to either
+promote out of SKIP.md (if they pass) or be reclassified as engine
+divergences:
 
-  - **insert.test**, **index.test**, **reindex.test**, **update.test**,
-    **delete.test** — block only on `integrity_check`
-    (and `do_eqp_test` for update.test).
+  - **insert.test**, **index.test**, **reindex.test**, **delete.test**
+    — all required shim helpers landed (g.1..g.4); ready for re-sweep.
   - **lastinsert.test** — fully unblocked on the shim side after
-    9.4.2.g.3; may now run end-to-end.  Pending 9.4.4.b re-sweep to
-    confirm.
+    9.4.2.g.3.
+  - **update.test** — still blocked on `do_eqp_test` (9.4.2.g.6).
   - **cast.test** — still blocked on `do_realnum_test` (9.4.2.g.7).
   - **boundary1.test** — still blocked on `working_64bit_int`
     (9.4.2.g.5).
 
-These tests stay listed here until 9.4.4.b actually re-runs them against
-the grown shim; `integrity_check` is the remaining single bottleneck for
-most of the bucket.
+Per task instructions, entries are NOT promoted out of SKIP.md until
+9.4.4.b actually exercises them against the grown shim; g.5
+(`working_64bit_int`) is the next bottleneck and may unblock further
+files when it lands.
 
 ## Notes for future shim growth
 
@@ -67,8 +69,9 @@ unblocks the most tests:
    **Landed 9.4.2.g.2.**
 3. ~~`do_catchsql_test NAME SQL EXP` — `catchsql` + `do_test` combo
    (upstream tester.tcl:973..976).~~  **Landed 9.4.2.g.2.**
-4. `integrity_check NAME ?DB?` — `do_test NAME { execsql {PRAGMA
-   integrity_check} } {ok}` (upstream tester.tcl:1620..1627).
+4. ~~`integrity_check NAME ?DB?` — `do_test NAME { execsql {PRAGMA
+   integrity_check} } {ok}` (upstream tester.tcl:1674..1678).~~
+   **Landed 9.4.2.g.4.**
 5. ~~`finish_test` — alias for `finalize_testing` (upstream tester.tcl:1255).~~
    **Landed 9.4.2.g.3.**
 6. ~~`forcedelete FILE` — `file delete -force` retry loop (~tester.tcl:200).~~
