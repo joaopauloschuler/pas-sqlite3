@@ -6256,11 +6256,29 @@ begin
   end;
 end;
 
-{ btree.c lines 2500-2506: busy-handler callback registered with pager }
+{ btree.c lines 2500-2506: busy-handler callback registered with pager.
+  Mirrors sqlite3InvokeBusyHandler (main.c:1770) inline — passqlite3main
+  cannot be referenced from here (main uses btree), but the BusyHandler
+  record lives in passqlite3util which we already use. }
 function btreeInvokeBusyHandler(pArg: Pointer): i32;
+var
+  pBt: PBtShared;
+  p  : passqlite3util.PBusyHandler;
+  rc : i32;
 begin
-  { Without a real db->busyHandler we simply return 0 (do not retry). }
-  Result := 0;
+  pBt := PBtShared(pArg);
+  if pBt^.db = nil then begin Result := 0; Exit; end;
+  p := @passqlite3util.PTsqlite3(pBt^.db)^.busyHandler;
+  if (p = nil) or not Assigned(p^.xBusyHandler) or (p^.nBusy < 0) then
+  begin
+    Result := 0; Exit;
+  end;
+  rc := p^.xBusyHandler(p^.pBusyArg, p^.nBusy);
+  if rc = 0 then
+    p^.nBusy := -1
+  else
+    Inc(p^.nBusy);
+  Result := rc;
 end;
 
 { ===========================================================================

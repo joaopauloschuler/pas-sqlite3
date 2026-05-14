@@ -667,7 +667,7 @@ acceptance gate for this section.
     TEMPFILENAME, MMAP_SIZE.  Many already partly wired via Phase
     10.1f.8 (.filectrl).  Audit + close gaps.  C ref:
     `../sqlite3/src/os_unix.c:unixFileControl`.
-  - [ ] **9.4.6.p** `sqlite3_busy_timeout` / `sqlite3_busy_handler` —
+  - [X] **9.4.6.p** `sqlite3_busy_timeout` / `sqlite3_busy_handler` —
     audit; pair with 9.4.2.k.
 
 - [~] **9.4.7** Build-matrix / harness infrastructure.  Many tests
