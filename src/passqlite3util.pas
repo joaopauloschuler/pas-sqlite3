@@ -731,6 +731,8 @@ procedure sqlite3MallocEnd;
 function  sqlite3MallocMutex: Psqlite3_mutex;
 function  sqlite3_memory_used: i64;
 function  sqlite3HeapNearlyFull: i32;
+function  sqlite3SoftHeapLimit64(n: i64): i64;
+function  sqlite3HardHeapLimit64(n: i64): i64;
 
 { Reference-counted string/blob (RCStr) — printf.c.
   An RCStr is a libc-malloc'd buffer prefixed by an 8-byte refcount header.
@@ -2673,6 +2675,53 @@ end;
 function sqlite3HeapNearlyFull: i32;
 begin
   Result := gNearlyFull;
+end;
+
+{ malloc.c:95 — sqlite3_soft_heap_limit64.  Set the soft heap-size limit.
+  An argument of zero disables the limit; a negative argument is a no-op
+  used to obtain the return value.  If the hard heap limit is enabled the
+  soft limit cannot be disabled nor raised above the hard limit.  The
+  autoinit guard from C lives in the main.pas wrapper (this unit cannot
+  see sqlite3_initialize without a unit cycle).  This build does not
+  compile SQLITE_ENABLE_MEMORY_MANAGEMENT, so sqlite3_release_memory() is
+  a no-op and the trailing "release excess" step is elided. }
+function sqlite3SoftHeapLimit64(n: i64): i64;
+var
+  priorLimit, nUsed: i64;
+begin
+  sqlite3_mutex_enter(gMem0Mutex);
+  priorLimit := gAlarmThreshold;
+  if n < 0 then begin
+    sqlite3_mutex_leave(gMem0Mutex);
+    Result := priorLimit;
+    Exit;
+  end;
+  if (gHardLimit > 0) and ((n > gHardLimit) or (n = 0)) then
+    n := gHardLimit;
+  gAlarmThreshold := n;
+  nUsed := sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+  if (n > 0) and (n <= nUsed) then gNearlyFull := 1 else gNearlyFull := 0;
+  sqlite3_mutex_leave(gMem0Mutex);
+  Result := priorLimit;
+end;
+
+{ malloc.c:137 — sqlite3_hard_heap_limit64.  An argument of zero disables
+  the hard limit; a negative argument is a no-op returning the prior
+  value.  Setting the hard limit also activates and constrains the soft
+  limit so it never exceeds the hard limit. }
+function sqlite3HardHeapLimit64(n: i64): i64;
+var
+  priorLimit: i64;
+begin
+  sqlite3_mutex_enter(gMem0Mutex);
+  priorLimit := gHardLimit;
+  if n >= 0 then begin
+    gHardLimit := n;
+    if (n < gAlarmThreshold) or (gAlarmThreshold = 0) then
+      gAlarmThreshold := n;
+  end;
+  sqlite3_mutex_leave(gMem0Mutex);
+  Result := priorLimit;
 end;
 
 { ============================================================

@@ -4608,32 +4608,30 @@ begin
   else Result := u64(MemSize(p));
 end;
 
-{ malloc.c — soft/hard heap-limit accessors.  SQLITE_ENABLE_MEMORY_MANAGEMENT
-  is off in this build, so the no-op return path is the upstream contract:
-  return the previously-set limit (kept in unit-level state) without
-  installing a real alarm. }
-var
-  gSoftHeapLimit: i64 = 0;
-  gHardHeapLimit: i64 = 0;
-
+{ malloc.c:95/137 — soft/hard heap-limit accessors.  The core mem0-state
+  logic (alarmThreshold/hardLimit/nearlyFull interaction) lives in
+  passqlite3util; these exported wrappers add the C autoinit guard
+  (sqlite3_initialize) that util cannot call without a unit cycle.
+  SQLITE_ENABLE_MEMORY_MANAGEMENT is off in this build, so the trailing
+  sqlite3_release_memory(excess) step from malloc.c:117 is a no-op and is
+  elided in the util core. }
 function sqlite3_soft_heap_limit64(n: i64): i64; cdecl;
-var
-  prior: i64;
 begin
-  prior := gSoftHeapLimit;
-  if n >= 0 then gSoftHeapLimit := n;
-  Result := prior;
+{$IFNDEF SQLITE_OMIT_AUTOINIT}
+  if sqlite3_initialize() <> 0 then begin Result := -1; Exit; end;
+{$ENDIF}
+  Result := passqlite3util.sqlite3SoftHeapLimit64(n);
 end;
 
 function sqlite3_hard_heap_limit64(n: i64): i64; cdecl;
-var
-  prior: i64;
 begin
-  prior := gHardHeapLimit;
-  if n >= 0 then gHardHeapLimit := n;
-  Result := prior;
+{$IFNDEF SQLITE_OMIT_AUTOINIT}
+  if sqlite3_initialize() <> 0 then begin Result := -1; Exit; end;
+{$ENDIF}
+  Result := passqlite3util.sqlite3HardHeapLimit64(n);
 end;
 
+{ malloc.c:120 — deprecated sqlite3_soft_heap_limit (32-bit wrapper). }
 procedure sqlite3_soft_heap_limit(n: i32); cdecl;
 begin
   if n < 0 then n := 0;
