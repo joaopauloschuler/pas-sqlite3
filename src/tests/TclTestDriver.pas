@@ -37,6 +37,7 @@ const
 
 var
   gRoot       : string;        { absolute pas-sqlite3 root }
+  gBinDir     : string;        { absolute path to bin/ (holds .so + pkgIndex.tcl) }
   gSoPath     : string;        { absolute path to libpassqlite3tcl.so }
   gTclDir     : string;        { absolute path to src/tests/tcl }
   gManifest   : string;        { absolute manifest path }
@@ -111,8 +112,15 @@ var sb: TStringList;
 begin
   sb := TStringList.Create;
   try
-    sb.Add('load {' + gSoPath + '} Sqlite3');
-    sb.Add('package require sqlite3');
+    { 9.4.7.h: put bin/ on ::auto_path so `package require sqlite3` finds
+      the generated pkgIndex.tcl and loads libpassqlite3tcl.so itself.
+      Fall back to an explicit `load` if the pkgIndex isn't present (e.g.
+      bin/ built before 9.4.7.h landed). }
+    sb.Add('lappend ::auto_path {' + gBinDir + '}');
+    sb.Add('if {[catch {package require sqlite3}]} {');
+    sb.Add('  load {' + gSoPath + '} Sqlite3');
+    sb.Add('  package require sqlite3');
+    sb.Add('}');
     { 9.4.7.f: cd into the per-test tmpdir so any test.db / -journal / -wal
       the test leaks lands in a throwaway directory the driver deletes
       afterwards — tests can no longer cross-pollinate each other.
@@ -429,7 +437,8 @@ var
   startTotal: QWord;
 begin
   gRoot := ResolveRoot;
-  gSoPath := IncludeTrailingPathDelimiter(gRoot) + 'bin' + DirectorySeparator + 'libpassqlite3tcl.so';
+  gBinDir := IncludeTrailingPathDelimiter(gRoot) + 'bin';
+  gSoPath := IncludeTrailingPathDelimiter(gBinDir) + 'libpassqlite3tcl.so';
   gTclDir := IncludeTrailingPathDelimiter(gRoot) + 'src' + DirectorySeparator + 'tests' + DirectorySeparator + 'tcl';
   gManifest := IncludeTrailingPathDelimiter(gTclDir) + 'MANIFEST.txt';
 
