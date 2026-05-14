@@ -350,7 +350,7 @@ Remaining update.test failures (3.x/9.x error text = divbug.14/.15,
 update-19.10 `idxColIsBeingUpdated rowid` AssertH) are separate,
 pre-existing, and unrelated to this segfault.
 
-## 9.4.divbug.13 — Result-set row ORDER for inequality scans is unstable — OPEN
+## 9.4.divbug.13 — Result-set row ORDER for inequality scans is unstable — FIXED
 
 Affects: 1 test (`../sqlite3/test/boundary1.test`, ~888/1511 sub-tests).
 Symptom: divbug.10's empty-result symptom is GONE — boundary1's
@@ -358,13 +358,21 @@ table now populates and the `>`, `>=`, `<`, `<=` scans return the
 *right rows*, but in the *wrong order*.  e.g. `boundary1-2.1.gt.1`
 expects `[3 28]`, gets `[28 3]`; `boundary1-2.1.ge.2` expects
 `[28 17 3]` (DESC), gets `[17 28 3]`.
-Likely cause: the boundary scans rely on the rowid b-tree traversal
-order (and `ORDER BY rowid DESC` for the DESC cases).  Either the
-WhereCode index-scan direction flag is not honoured, or the
-implicit rowid ordering of an unindexed scan diverges from C.
-This is the residue of divbug.10 after the `ipkColumn` fix — keep
-divbug.10 marked FIXED (empty-result) and track ordering here.
-Surfaced by: 9.4.4.b.2 re-sweep.
+Root cause: the Pascal `whereShortCut` (codegen.pas) folds an IPK
+*range* scan into the planner shortcut (a stand-in the real C
+`whereShortCut` does not have — C only emits WHERE_ONEROW plans).
+After picking that plan it ran the same tail as the ONEROW plans,
+`pWInfo^.nOBSat := pOrderBy^.nExpr` — claiming the scan satisfied
+*any* ORDER BY.  select.c then NOOP'd the SorterOpen and emitted
+rows in raw rowid b-tree order.  A range scan visits many rows, so
+its traversal order satisfies only `ORDER BY rowid`, never an
+arbitrary column.
+Fix: restrict the `nOBSat := nExpr` claim in `whereShortCut` to
+genuine `WHERE_ONEROW` plans; range plans leave `nOBSat` at its
+zeroed default so select.c installs the sorter.  All 1511
+boundary1.test sub-tests now pass (0 errors); engine regression
+clean; TestExplainParity unchanged (224 pass).
+Surfaced by: 9.4.4.b.2 re-sweep.  Fixed by: 9.4.divbug.13.
 
 ## 9.4.divbug.14 — SQL error messages still drop the object name — OPEN
 

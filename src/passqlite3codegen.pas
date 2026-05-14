@@ -19038,7 +19038,19 @@ begin
     pLoop^.maskSelf := 1; { sqlite3WhereGetMask(&pWInfo^.sMaskSet, iCur) }
     whereInfoLevels(pWInfo)[0].iTabCur := iCur;
     pWInfo^.nRowOut := pLoop^.nOut;
-    if pWInfo^.pOrderBy <> nil then
+    { where.c whereShortCut sets nOBSat = pOrderBy->nExpr unconditionally
+      because every plan it produces is WHERE_ONEROW (IPK-EQ / IN /
+      unique-index-EQ): a one-row result trivially satisfies any ORDER BY.
+      The Pascal port additionally folds an IPK *range* scan into this
+      shortcut (a stand-in for the full whereLoopAddBtree path); a range
+      scan visits many rows, so its b-tree traversal order only satisfies
+      ORDER BY rowid — never ORDER BY on an arbitrary column.  Claiming
+      nOBSat = nExpr there made select.c skip the sorter and emit rows in
+      raw rowid order (9.4.divbug.13).  Restrict the nOBSat=nExpr claim to
+      genuine ONEROW plans; range plans leave nOBSat at its zeroed default
+      so select.c installs the sorter. }
+    if (pWInfo^.pOrderBy <> nil)
+       and ((pLoop^.wsFlags and WHERE_ONEROW) <> 0) then
       pWInfo^.nOBSat := i8(pWInfo^.pOrderBy^.nExpr);
     if (pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
       pWInfo^.eDistinct := WHERE_DISTINCT_UNIQUE;
