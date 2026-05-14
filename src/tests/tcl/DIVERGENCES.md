@@ -305,3 +305,114 @@ lastinsert), which in turn exposes four new engine divergences
 (divbug.7..10).  The two unchanged FAIL buckets (numcast,
 delete-ish remaining) remain on divbug.5 and missing `db one`.
 
+## 9.4.divbug.11 — `multiSelectByMerge: iOrderByCol<=0` assert (compound SELECT ORDER BY) — OPEN
+
+Affects: 1 test (`../sqlite3/test/select1.test`, `select1-6.22`).
+Symptom: after divbug.1 was fixed, select1.test now runs all the way
+to `select1-6.22` and then aborts with the C-port assertion
+`AssertH FAILED: multiSelectByMerge: iOrderByCol<=0` (stderr).
+`select1-6.22` is a compound (UNION ALL) SELECT with an ORDER BY
+that the merge-sort optimiser path picks up.
+Likely cause: the resolver leaves an ORDER BY term's `iOrderByCol`
+unset (0) for a compound select where the term resolves by name
+rather than by position; `multiSelectOrderBy` then asserts.  Port
+gap in `resolveOrderByTermToExprList` / `multiSelectOrderBy`
+(select.c:2300-ish).  Surfaced by: 9.4.4.b.2 re-sweep.
+
+## 9.4.divbug.12 — `update.test` segfaults at `update-17.10` — OPEN
+
+Affects: 1 test (`../sqlite3/test/update.test`).
+Symptom: update.test now runs cleanly through `update-17.1..9`
+(divbug.2/4 are no longer fatal) and SIGSEGVs inside `update-17.10`.
+The 17.x group exercises UPDATE with `LIMIT`/`ORDER BY` and
+multi-row UPDATE-FROM.  No diff printed — hard crash.
+Likely cause: not yet rooted — candidate is the UPDATE…FROM or
+UPDATE…ORDER BY LIMIT codegen path dereferencing a nil cursor /
+SrcList item.  Surfaced by: 9.4.4.b.2 re-sweep (was masked in
+9.4.4.b by the `reset_db` SOURCE-ERROR cutting the run short).
+
+## 9.4.divbug.13 — Result-set row ORDER for inequality scans is unstable — OPEN
+
+Affects: 1 test (`../sqlite3/test/boundary1.test`, ~888/1511 sub-tests).
+Symptom: divbug.10's empty-result symptom is GONE — boundary1's
+table now populates and the `>`, `>=`, `<`, `<=` scans return the
+*right rows*, but in the *wrong order*.  e.g. `boundary1-2.1.gt.1`
+expects `[3 28]`, gets `[28 3]`; `boundary1-2.1.ge.2` expects
+`[28 17 3]` (DESC), gets `[17 28 3]`.
+Likely cause: the boundary scans rely on the rowid b-tree traversal
+order (and `ORDER BY rowid DESC` for the DESC cases).  Either the
+WhereCode index-scan direction flag is not honoured, or the
+implicit rowid ordering of an unindexed scan diverges from C.
+This is the residue of divbug.10 after the `ipkColumn` fix — keep
+divbug.10 marked FIXED (empty-result) and track ordering here.
+Surfaced by: 9.4.4.b.2 re-sweep.
+
+## 9.4.divbug.14 — SQL error messages still drop the object name — OPEN
+
+Affects: 3+ tests (`../sqlite3/test/insert.test`,
+`../sqlite3/test/index.test`, `../sqlite3/test/select1.test`).
+Symptom: divbug.2 fixed two specific arms, but a broader family of
+error messages still emit the generic prefix-only form:
+  * `table has no column with that name`  vs upstream
+    `table test1 has no column named four` (insert-1.4).
+  * `no such column: t3` vs `no such column: t3.a` — the
+    table-qualified-name tail is truncated (insert-4.3).
+  * `table may not be indexed` vs `table sqlite_master may not be
+    indexed`; `index already exists` vs `index index1 already
+    exists`; `there is already a table with that name` vs
+    `there is already a table named test1` (index-5.1 / 6.1 / 6.2).
+  * `misuse of aggregate function min()` expected as
+    `misuse of aggregate function min()` — *we* now emit
+    `misuse of aggregate: min()` (divbug.2 used the wrong upstream
+    spelling for the non-aliased arm); aliased form should be
+    `misuse of aliased aggregate <name>` (select1-2.20..23).
+Likely cause: scattered `sqlite3ErrorMsg` call sites still use
+bespoke literals instead of the upstream `%s`/`%S` format strings.
+Surfaced by: 9.4.4.b.2 re-sweep.  Sibling of divbug.2.
+
+## 9.4.divbug.15 — `no such function` not raised at prepare time — OPEN
+
+Affects: 2 tests (`../sqlite3/test/insert.test` insert-4.6,
+`../sqlite3/test/delete.test` delete-4.2).
+Symptom: a statement referencing an undefined SQL function
+(`SELECT notafunc(...)`) is expected to fail with
+`no such function: notafunc`, but our build returns `[0 {}]`
+(success, empty result) — the unknown function is silently
+treated as NULL / no-op instead of raising at prepare time.
+Likely cause: `sqlite3ExprFunctionUsable` / the function-lookup
+arm in `resolveExprStep` (resolve.c:1860-ish) does not emit the
+`no such function` error when `sqlite3FindFunction` returns nil.
+Surfaced by: 9.4.4.b.2 re-sweep.
+
+## Run summary (9.4.4.b.2 sweep)
+
+First fixed a driver regression: the 9.4.7.f per-test tmpdir
+isolation cd's tclsh into a throwaway dir, but `ProcessEntry` still
+handed `BuildScript` the *relative* manifest path — so every test
+SOURCE-ERROR'd in ~11 ms (a spurious 0/10/0).  Fix: `ExpandFileName`
+the path to absolute before `BuildScript`.  After that the sweep
+runs for real and is reproducible under `bin/TclTestDriver`.
+
+| Test            | 9.4.4.b            | 9.4.4.b.2          | Δ / divbug                         |
+|-----------------|--------------------|--------------------|------------------------------------|
+| select1.test    | CRASH @ 4.4        | FAIL (assert @6.22)| divbug.1 FIXED; new divbug.11 + .14 |
+| insert.test     | TIMEOUT (hang)     | FAIL 3/36          | divbug.7 FIXED; divbug.14/.15 left  |
+| update.test     | FAIL 34/128        | CRASH @ 17.10      | helpers/divbug.2/4 OK; new divbug.12|
+| delete.test     | FAIL 1/23          | FAIL 2/49          | runs further; divbug.15 + CTAS gap  |
+| index.test      | CRASH @ 3.3        | FAIL 11/101        | divbug.3/.8 FIXED; divbug.14 left   |
+| boundary1.test  | FAIL 1481/1511     | FAIL 888/1511      | divbug.10 FIXED (empty); new .13    |
+| cast.test       | PASS (vacuous)     | **PASS** (vacuous) | unchanged                          |
+| lastinsert.test | CRASH @ 1.1w       | **PASS** 6/6       | divbug.9 FIXED                      |
+| numcast.test    | FAIL 50/51         | **PASS** 51/51     | divbug.5 FIXED                      |
+| reindex.test    | PASS (vacuous)     | **PASS** (vacuous) | unchanged                          |
+
+PASS / FAIL / CRASH under 9.4.4.b.2 = **4 / 5 / 1** (under
+`bin/TclTestDriver`; the driver reports `update.test` as FAIL since
+the segfault is a nonzero exit — counted as CRASH here).  cast +
+reindex remain vacuous PASSes.
+
+Buckets CLOSED by the landed harness+engine fixes: divbug.1, .3,
+.5, .7, .8, .9 (and .10's empty-result symptom).  Buckets still
+OPEN / newly opened: divbug.2 (sibling .14), .4 (no longer fatal
+but error-text still off), .11, .12, .13, .14, .15.
+

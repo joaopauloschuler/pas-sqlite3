@@ -400,7 +400,13 @@ var
   cls       : string;
   nT        : Integer;
 begin
-  absPath := relPath;
+  { 9.4.4.b.2: resolve to an *absolute* path.  The 9.4.7.f per-test
+    tmpdir isolation cd's tclsh into a throwaway directory, so a
+    relative manifest path (e.g. ../sqlite3/test/foo.test) no longer
+    resolves from inside the child — every test SOURCE-ERROR'd in
+    ~11ms.  ExpandFileName the candidate against the driver's CWD
+    (repo root) before handing it to BuildScript. }
+  absPath := ExpandFileName(relPath);
   if not FileExists(absPath) then
     absPath := ExpandFileName(IncludeTrailingPathDelimiter(gRoot) + relPath);
   if not FileExists(absPath) then

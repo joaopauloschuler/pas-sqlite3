@@ -5,8 +5,10 @@ Tests listed here fail not because of an engine divergence but because
 unported test-only C API (`sqlite3_test_control`, `optimization_control`,
 private pragmas, `db_save`, vfs-injection harness, etc.).
 
-Bootstrapped under task **9.4.4.a**; re-curated under **9.4.4.b**.
-Format:
+Bootstrapped under task **9.4.4.a**; re-curated under **9.4.4.b**;
+re-swept under **9.4.4.b.2** (see the 9.4.4.b.2 re-sweep note at the
+bottom — most of the original SKIP entries now *run* and several
+PASS).  Format:
 
     - **<path>** — <reason>.  Cite: <Phase X.Y bullet | unported helper | etc.>
 
@@ -125,6 +127,37 @@ Audited every `../sqlite3/test/*_common.tcl` (note: there is **no**
   `enter_db_mutex` / `leave_db_mutex`, and the low-level
   `sqlite3_prepare_v2` / `sqlite3_step` / `sqlite3_column_*` Tcl
   bridge.  Cite: 9.4.7.e (sqlthread + threading test API).
+
+## 9.4.4.b.2 re-sweep result
+
+Re-ran the 10-test set under `bin/TclTestDriver` after fixing the
+driver's relative-path regression (see DIVERGENCES.md 9.4.4.b.2 run
+summary).  Every original SKIP entry is now shim-complete *and*
+runs to completion or further:
+
+- **numcast.test** — now **PASS 51/51** (divbug.5 fixed).  Removed
+  from the SKIP gate.
+- **lastinsert.test** — now **PASS 6/6** (divbug.9 fixed).  Removed.
+- **insert.test** — now **runs** 36 sub-tests, 3 errors (divbug.7
+  hang fixed); remaining fails are divbug.14/.15 + a `source`-time
+  `can't read "AUTOVACUUM"` (the test reads `$AUTOVACUUM` from the
+  shim — `tester_min.tcl` should `set ::AUTOVACUUM 0`).  Stays as a
+  divergence-gated entry, not a shim gate.
+- **index.test** — now **runs** 101 sub-tests, 11 errors (divbug.3
+  + .8 crashes fixed); remaining are divbug.14 error-text +
+  `sqlite3_db_config` SOURCE-ERROR (unported test command).
+- **delete.test** — now **runs** 49 sub-tests, 2 errors; the old
+  `db one` blocker is gone; remaining are divbug.15 + a
+  `sqlite3_connection_pointer` SOURCE-ERROR (unported test command)
+  + `CREATE TABLE AS SELECT not yet supported in this build`.
+- **update.test** — now SIGSEGVs at `update-17.10` — new
+  **9.4.divbug.12**.
+- **boundary1.test** — empty-result (divbug.10) fixed; now fails on
+  row *ordering* — new **9.4.divbug.13**.
+
+Remaining shim/test-command gaps surfaced (port-side follow-ups,
+not divergences): `sqlite3_db_config`, `sqlite3_connection_pointer`,
+`CREATE TABLE AS SELECT`, and `set ::AUTOVACUUM` in `tester_min.tcl`.
 
 ## Notes for future shim growth
 
