@@ -31,7 +31,7 @@ function Sqlite3_SafeInit(interp: PTclInterp): cint; cdecl;
 implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
-     passqlite3codegen, passqlite3dbstat;
+     passqlite3codegen, passqlite3dbstat, passqlite3backup;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -69,6 +69,9 @@ type
   TSqliteDb = record
     db:     PTsqlite3;     { tclsqlite.c:216  — the sqlite3* handle }
     interp: PTclInterp;    { tclsqlite.c:217  — owning Tcl interp   }
+    openFlags: cint;       { tclsqlite.c:226 — flags used to open, masked
+                             to SQLITE_OPEN_URI; ORed into the target
+                             open in the backup/restore arms (9.4.2.q). }
     zNull:  PAnsiChar;     { tclsqlite.c:230  — placeholder for NULL,
                              populated by the `nullvalue` subcmd in
                              9.4.2.e; held as raw PChar so this record
@@ -2356,6 +2359,161 @@ begin
   end;
 end;
 
+{ DbBackupArm — port of the DB_BACKUP arm of DbObjCmd (tclsqlite.c:2549..
+  2590).  `db backup ?SRCDB? FILENAME` — opens FILENAME read/write+create
+  and copies SRCDB ("main" by default) into its "main".  Collapses onto
+  sqlite3_backup_init / _step / _finish (9.4.2.q). }
+function DbBackupArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:       PSqliteDb;
+  zDestFile: PAnsiChar;
+  zSrcDb:    PAnsiChar;
+  pDest:     PTsqlite3;
+  pBackup:   PSqlite3Backup;
+  rc:        i32;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc = 3 then
+  begin
+    zSrcDb    := 'main';
+    zDestFile := Tcl_GetString(ObjvAt(objv, 2));
+  end
+  else if objc = 4 then
+  begin
+    zSrcDb    := Tcl_GetString(ObjvAt(objv, 2));
+    zDestFile := Tcl_GetString(ObjvAt(objv, 3));
+  end
+  else
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?DATABASE? FILENAME'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pDest := nil;
+  rc := sqlite3_open_v2(zDestFile, @pDest,
+          i32(SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE) or
+          i32(pDb^.openFlags), nil);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, PChar('cannot open target database: '),
+      PAnsiChar(sqlite3_errmsg(pDest)), Pointer(nil));
+    sqlite3_close(pDest);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pBackup := sqlite3_backup_init(pDest, 'main', pDb^.db, zSrcDb);
+  if pBackup = nil then
+  begin
+    Tcl_AppendResult(interp, PChar('backup failed: '),
+      PAnsiChar(sqlite3_errmsg(pDest)), Pointer(nil));
+    sqlite3_close(pDest);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  repeat
+    rc := sqlite3_backup_step(pBackup, 100);
+  until rc <> SQLITE_OK;
+  sqlite3_backup_finish(pBackup);
+
+  if rc = SQLITE_DONE then
+    Result := TCL_OK
+  else
+  begin
+    Tcl_AppendResult(interp, PChar('backup failed: '),
+      PAnsiChar(sqlite3_errmsg(pDest)), Pointer(nil));
+    Result := TCL_ERROR;
+  end;
+  sqlite3_close(pDest);
+end;
+
+{ DbRestoreArm — port of the DB_RESTORE arm of DbObjCmd (tclsqlite.c:3672..
+  3722).  `db restore ?DESTDB? FILENAME` — opens FILENAME read-only and
+  copies its "main" into DESTDB ("main" by default).  Retries SQLITE_BUSY
+  up to 3 times with a 100ms sleep, matching upstream (9.4.2.q). }
+function DbRestoreArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:      PSqliteDb;
+  zSrcFile: PAnsiChar;
+  zDestDb:  PAnsiChar;
+  pSrc:     PTsqlite3;
+  pBackup:  PSqlite3Backup;
+  rc:       i32;
+  nTimeout: cint;
+begin
+  pDb := PSqliteDb(clientData);
+  nTimeout := 0;
+  if objc = 3 then
+  begin
+    zDestDb  := 'main';
+    zSrcFile := Tcl_GetString(ObjvAt(objv, 2));
+  end
+  else if objc = 4 then
+  begin
+    zDestDb  := Tcl_GetString(ObjvAt(objv, 2));
+    zSrcFile := Tcl_GetString(ObjvAt(objv, 3));
+  end
+  else
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?DATABASE? FILENAME'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pSrc := nil;
+  rc := sqlite3_open_v2(zSrcFile, @pSrc,
+          i32(SQLITE_OPEN_READONLY) or i32(pDb^.openFlags), nil);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, PChar('cannot open source database: '),
+      PAnsiChar(sqlite3_errmsg(pSrc)), Pointer(nil));
+    sqlite3_close(pSrc);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pBackup := sqlite3_backup_init(pDb^.db, zDestDb, pSrc, 'main');
+  if pBackup = nil then
+  begin
+    Tcl_AppendResult(interp, PChar('restore failed: '),
+      PAnsiChar(sqlite3_errmsg(pDb^.db)), Pointer(nil));
+    sqlite3_close(pSrc);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  repeat
+    rc := sqlite3_backup_step(pBackup, 100);
+    if rc = SQLITE_BUSY then
+    begin
+      if nTimeout >= 3 then Break;
+      Inc(nTimeout);
+      sqlite3_sleep(100);
+    end;
+  until (rc <> SQLITE_OK) and (rc <> SQLITE_BUSY);
+  sqlite3_backup_finish(pBackup);
+
+  if rc = SQLITE_DONE then
+    Result := TCL_OK
+  else if (rc = SQLITE_BUSY) or (rc = SQLITE_LOCKED) then
+  begin
+    Tcl_AppendResult(interp, PChar('restore failed: source database busy'),
+      Pointer(nil));
+    Result := TCL_ERROR;
+  end
+  else
+  begin
+    Tcl_AppendResult(interp, PChar('restore failed: '),
+      PAnsiChar(sqlite3_errmsg(pDb^.db)), Pointer(nil));
+    Result := TCL_ERROR;
+  end;
+  sqlite3_close(pSrc);
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -2617,6 +2775,20 @@ begin
     Exit;
   end;
 
+  { backup — tclsqlite.c:2549 (DB_BACKUP).  sqlite3_backup_* to a file. }
+  if (zSub <> nil) and (StrComp(zSub, 'backup') = 0) then
+  begin
+    Result := DbBackupArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { restore — tclsqlite.c:3672 (DB_RESTORE).  sqlite3_backup_* from a file. }
+  if (zSub <> nil) and (StrComp(zSub, 'restore') = 0) then
+  begin
+    Result := DbRestoreArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
   { status — tclsqlite.c:3766 (DB_STATUS).  Return a per-statement counter
     captured for the most recent `db eval` (9.4.6.c). }
   if (zSub <> nil) and (StrComp(zSub, 'status') = 0) then
@@ -2755,6 +2927,10 @@ begin
   New(pDb);
   pDb^.db       := pHandle;
   pDb^.interp   := interp;
+  { This minimal DbMain opens with fixed RW|CREATE flags and parses no
+    ?OPTIONS?, so the SQLITE_OPEN_URI-masked openFlags is always 0.
+    Kept as a field for the backup/restore arms (tclsqlite.c:4400). }
+  pDb^.openFlags := 0;
   pDb^.zNull    := nil;
   pDb^.pFunc    := nil;
   pDb^.zTrace   := nil;
