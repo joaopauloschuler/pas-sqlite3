@@ -104,7 +104,10 @@ begin
     sb.Add('  }');
     sb.Add('  return [uplevel 1 __orig_source [list $path] $args]');
     sb.Add('}');
-    sb.Add('sqlite3 db :memory:');
+    { 9.4.divbug.3: tester_min.tcl now opens `db` on a fresh on-disk
+      ./test.db via reset_db (mirroring upstream tester.tcl), so the
+      driver no longer issues its own `sqlite3 db :memory:` — that
+      broke sub-tests that re-open test.db to re-read the schema. }
     sb.Add('if {[catch {source ' + testAbsPath + '} __err __opts]} {');
     sb.Add('  puts stderr "SOURCE-ERROR: $__err"');
     sb.Add('}');

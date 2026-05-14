@@ -764,13 +764,15 @@ acceptance gate for this section.
   through `sqlite3VMPrintf` and `%s` / `%d` substitutions are
   swallowed.  Audit all `sqlite3ErrorMsg` call sites in `src/*.pas`
   against `../sqlite3/src/parse.y` / `resolve.c` shaped error texts.
-- [ ] **9.4.divbug.3** Schema introspection result columns reordered
-  / missing — `index.test` sub-tests `index-1.1c` / `index-1.1d`:
-  upstream `SELECT name, sql, tbl_name, type FROM sqlite_master`
-  diverges from pas-sqlite3 row order/content.  Likely codegen
-  column-order or sqlite_master row population delta.  C ref:
-  `../sqlite3/src/build.c` (CREATE INDEX row insert) +
-  `select.c` (sqlite_master read path).
+- [X] **9.4.divbug.3** Schema introspection result columns reordered
+  / missing — `index.test` sub-tests `index-1.1c` / `index-1.1d`.
+  Not an engine bug: `tester_min.tcl` never opened `db`, and the
+  driver hardcoded `sqlite3 db :memory:`, so sub-tests that do
+  `db close; sqlite3 db test.db` to re-read the schema from disk
+  saw an empty database.  Fix: add a `reset_db` proc to
+  `tester_min.tcl` (forcedelete test.db family + `sqlite3 db
+  ./test.db`), call it at shim load, and drop the driver's
+  `:memory:` open.  index-1.1c/1.1d/1.2 now PASS.
 - [ ] **9.4.divbug.4** `OP_VerifyFormat` / aggregate setup yields
   spurious `out of memory` — `update.test` sub-test `update-10.1`
   reports `error: out of memory` instead of running, with no

@@ -58,17 +58,30 @@ strings (`'misuse of aggregate: %s()'` keyed off `pExpr^.u.zToken`,
 `'table %S has %d columns but %d values were supplied'` using `%S` on
 `@SrcListItems(pTabList)[0]`).
 
-## 9.4.divbug.3 — Schema introspection result columns reordered / missing
+## 9.4.divbug.3 — Schema introspection result columns reordered / missing — FIXED
 
 Affects: 1 test (`../sqlite3/test/index.test`, sub-test `index-1.1c` /
 `index-1.1d`).
-Symptom: upstream `SELECT name, sql, tbl_name, type FROM sqlite_master`
-returns `{index1 {CREATE INDEX ...} test1 index}`; our build returns
-`{index1 test1}` — i.e. the `sql` and `type` columns come back as
-empty strings or the result set is column-shifted.
-Likely cause: writes into `sqlite_schema` from `CREATE INDEX` codegen
-in passqlite3build are missing the `sql` / `type` field assignments,
-or one of the column inserts is targeting the wrong register.
+Symptom (was): `index-1.1c` / `index-1.1d` returned `{}` (empty
+result) where upstream returns `{index1 {CREATE INDEX ...} test1
+index}` / `{index1 test1}`.
+Actual root cause: not an engine bug — the CREATE INDEX schema-write
+path (`emitSchemaRowInsert`, `passqlite3codegen.pas:39544`) populates
+all five `sqlite_master` columns correctly, and a direct on-disk
+round-trip (`CREATE INDEX` → `db close` → reopen → `SELECT ... FROM
+sqlite_master`) works.  The divergence was in the test harness:
+`tester_min.tcl` never opened the `db` handle, and `TclTestDriver`
+hardcoded `sqlite3 db :memory:`.  Upstream `tester.tcl:553..556`
+opens `db` on an on-disk `./test.db`.  `index-1.1` created the table
++ index in the in-memory db; `index-1.1c` then runs `db close;
+sqlite3 db test.db`, reopening a *fresh empty* on-disk file — so the
+schema query saw nothing.
+Fix: add a `reset_db` proc to `tester_min.tcl` (port of
+tester.tcl:550..557 — forcedelete the test.db family, `sqlite3 db
+./test.db`), invoke it at shim load time, and remove the driver's
+`sqlite3 db :memory:` line.  index-1.1c / 1.1d / 1.2 now PASS.
+Remaining index.test failures (index-2.1b/2.2 error-text, index-3.3
+crash) are unrelated — see divbug.8.
 
 ## 9.4.divbug.4 — `OP_VerifyFormat` / aggregate setup yields `out of memory`
 

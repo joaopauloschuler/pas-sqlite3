@@ -384,3 +384,25 @@ proc omit_test {name reason {append 1}} {
   }
   set_test_counter omit_list $omitList
 }
+
+# reset_db — upstream tester.tcl:550..557.  Closes any open `db`
+# handle, force-deletes the test.db family, and reopens `db` on a
+# fresh on-disk ./test.db.  pas-sqlite3 previously opened `db` on
+# `:memory:` from the driver, which broke any upstream sub-test that
+# does `db close; sqlite3 db test.db` to re-read the schema from disk
+# (e.g. index-1.1c/1.1d): the reopened handle saw an empty database
+# because the in-memory schema was never persisted (9.4.divbug.3).
+# C ref: tester.tcl:548..558.
+proc reset_db {} {
+  catch {db close}
+  forcedelete test.db
+  forcedelete test.db-journal
+  forcedelete test.db-wal
+  forcedelete test.db-shm
+  sqlite3 db ./test.db
+}
+
+# Open `db` on a fresh on-disk ./test.db at shim load time, mirroring
+# upstream tester.tcl:553..556.  The driver no longer issues its own
+# `sqlite3 db :memory:`.
+reset_db
