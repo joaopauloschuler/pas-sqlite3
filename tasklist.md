@@ -455,7 +455,7 @@ acceptance gate for this section.
     file sourced by tens of tests.  Audit each; copy verbatim where
     no internal hooks; SKIP-cite per file where they call
     `sqlite3_test_control` opcodes we haven't wired.
-  - [ ] **9.4.2.h** `db eval` 3-arg form (`db eval $sql arrayName
+  - [X] **9.4.2.h** `db eval` 3-arg form (`db eval $sql arrayName
     { script }`) — per-row callback with column-name `Tcl_TraceVar`
     binding into the named array.  Used by ~30% of tcl-feature tests.
     Also: typed-Obj marshalling for column values (Int via

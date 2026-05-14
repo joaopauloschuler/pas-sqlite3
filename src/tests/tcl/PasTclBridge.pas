@@ -131,6 +131,16 @@ function Tcl_PkgProvide(interp: PTclInterp; name, version: PChar): cint; cdecl; 
 function Tcl_GetVar(interp: PTclInterp; varName: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
 function Tcl_SetVar(interp: PTclInterp; varName, newValue: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
 
+{ Two-part (array) variable plumbing.  tclsqlite.c uses Tcl_ObjSetVar2 /
+  Tcl_UnsetVar2 for the `db eval sql arr script` 3-arg form (DbEvalNextCmd
+  at tclsqlite.c:1935..1944).  Tcl_SetVar2 is the string-keyed variant. }
+function Tcl_SetVar2(interp: PTclInterp; part1, part2, newValue: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
+function Tcl_ObjSetVar2(interp: PTclInterp; part1Ptr, part2Ptr, newValuePtr: PTclObj; flags: cint): PTclObj; cdecl; external 'tcl8.6';
+function Tcl_UnsetVar2(interp: PTclInterp; part1, part2: PChar; flags: cint): cint; cdecl; external 'tcl8.6';
+
+{ Reset the interpreter result.  tclsqlite.c:2003 (DbEvalNextCmd cleanup). }
+procedure Tcl_ResetResult(interp: PTclInterp); cdecl; external 'tcl8.6';
+
 { Tcl_Obj -> primitive accessors.  tclsqlite.c:874, :1138, :1146. }
 function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): cint; cdecl; external 'tcl8.6';
 function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';

@@ -113,20 +113,70 @@ begin
   Dispose(pDb);
 end;
 
-{ DbEvalArm — minimum port of the "eval" arm of DbObjCmd
-  (tclsqlite.c ~2700..2820) plus the row-stepper loop body from
-  dbEvalStep (tclsqlite.c:1766..1823).
+{ DbEvalColumnValue — Pas port of dbEvalColumnValue (tclsqlite.c:1850..1876).
+  Returns a fresh (refcount-0) typed Tcl_Obj for column iCol of the row the
+  statement currently points at:
+    SQLITE_INTEGER -> Tcl_NewWideIntObj  (via sqlite3_column_int64)
+    SQLITE_FLOAT   -> Tcl_NewDoubleObj
+    SQLITE_BLOB    -> Tcl_NewByteArrayObj
+    SQLITE_NULL    -> Tcl_NewStringObj(zNull, -1)
+    else (text)    -> Tcl_NewStringObj(sqlite3_column_text, -1)
+  Divergence vs upstream: upstream narrows small int64 to Tcl_NewIntObj; we
+  always use Tcl_NewWideIntObj — Tcl stringifies both identically and the
+  numeric value is exact, so no observable difference. }
+function DbEvalColumnValue(pStmt: Pointer; iCol: cint;
+  zNullStr: PAnsiChar): PTclObj;
+var
+  zBlob: Pointer;
+  nByte: cint;
+  zTxt:  PAnsiChar;
+begin
+  case sqlite3_column_type(pStmt, iCol) of
+    SQLITE_INTEGER:
+      Result := Tcl_NewWideIntObj(sqlite3_column_int64(pStmt, iCol));
+    SQLITE_FLOAT:
+      Result := Tcl_NewDoubleObj(sqlite3_column_double(pStmt, iCol));
+    SQLITE_BLOB:
+      begin
+        nByte := sqlite3_column_bytes(pStmt, iCol);
+        zBlob := sqlite3_column_blob(pStmt, iCol);
+        if zBlob = nil then nByte := 0;
+        Result := Tcl_NewByteArrayObj(zBlob, nByte);
+      end;
+    SQLITE_NULL:
+      Result := Tcl_NewStringObj(zNullStr, -1);
+    else
+      begin
+        zTxt := sqlite3_column_text(pStmt, iCol);
+        Result := Tcl_NewStringObj(zTxt, -1);
+      end;
+  end;
+end;
 
-  Contract: objc>=3, objv[2]=SQL text.  All rows in all statements
-  contained in the SQL text are appended (column by column) onto a
-  freshly built Tcl list, which becomes the interp's obj-result on
-  success.  On any SQLITE error we set the interp result to
-  sqlite3_errmsg() and return TCL_ERROR.
+{ DbEvalArm — port of the "eval" arm of DbObjCmd (tclsqlite.c:3299..3360)
+  plus the row-stepper loop body from dbEvalStep (tclsqlite.c:1766..1823)
+  and DbEvalNextCmd (tclsqlite.c:1915..2005).
 
-  NULL column policy mirrors dbEvalColumnValue (tclsqlite.c:1871):
-  Tcl_NewStringObj(zNull, -1).  We pass an empty C string when
-  pDb^.zNull is nil (i.e. before any `db nullvalue ...` call); the
-  nullvalue subcommand lands in 9.4.2.e. }
+  Contract:
+    objc==3:  `db eval SQL` — accumulate a flat list of typed column
+              Tcl_Objs and return it as the interp result.
+    objc==5 (or objc==4 with empty array name):
+              `db eval SQL ARRAY-NAME SCRIPT` — for each row, bind every
+              column value into the named Tcl array (column-name -> value)
+              via Tcl_ObjSetVar2, then evaluate the script body.
+              TCL_BREAK / TCL_CONTINUE / TCL_RETURN / TCL_ERROR from the
+              body are handled exactly as upstream DbEvalNextCmd.
+    objc==4 with a non-empty 3rd arg:
+              `db eval SQL SCRIPT` — pVarName is 0, so each column NAME is
+              itself used as the scalar variable (upstream: pVarName==0
+              -> Tcl_ObjSetVar2(interp, apColName[i], 0, value)).
+
+  On any SQLITE error we SET the interp result to sqlite3_errmsg() and
+  return TCL_ERROR (9.4.divbug.6 — SET, not Append, so a UDF error already
+  on the interp result is not duplicated).
+
+  Not ported (vs upstream): NRE machinery, -withoutnulls / -asdict flags,
+  the prepared-statement cache, busy-handler SCHEMA retries. }
 function DbEvalArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
 var
@@ -138,16 +188,21 @@ var
   rcStep:     i32;
   i, nCol:    cint;
   pList:      PTclObj;
-  pCol:       PTclObj;
-  zVal:       PAnsiChar;
   zNullStr:   PAnsiChar;
   emptyNull:  array[0..0] of AnsiChar;
   nVar:       i32;
   iParam:     i32;
   zParamName: PAnsiChar;
   pVarStr:    PChar;
+  pVarName:   PTclObj;       { array name obj, or nil for the scalar form }
+  pScript:    PTclObj;       { per-row script body, or nil for objc==3   }
+  pColName:   PTclObj;
+  pColVal:    PTclObj;
+  rcBody:     cint;
+  zArrName:   PAnsiChar;
+  bDone:      Boolean;
 begin
-  if objc < 3 then
+  if (objc < 3) or (objc > 5) then
   begin
     Tcl_WrongNumArgs(interp, 2, objv, PChar('SQL ?ARRAY-NAME? ?SCRIPT?'));
     Result := TCL_ERROR;
@@ -162,30 +217,51 @@ begin
     Exit;
   end;
 
+  { Decide the row-callback shape — mirrors tclsqlite.c:3320..3349. }
+  pVarName := nil;
+  pScript  := nil;
+  if objc >= 4 then
+  begin
+    pScript := ObjvAt(objv, objc - 1);
+    if objc >= 5 then
+    begin
+      { objv[3] is the array name; an empty string means "scalar form". }
+      zArrName := Tcl_GetStringFromObj(ObjvAt(objv, 3), nil);
+      if (zArrName <> nil) and (zArrName^ <> #0) then
+        pVarName := ObjvAt(objv, 3);
+    end;
+    Tcl_IncrRefCount(pScript);
+  end;
+
   emptyNull[0] := #0;
   if pDb^.zNull <> nil then
     zNullStr := pDb^.zNull
   else
     zNullStr := @emptyNull[0];
 
-  pList := Tcl_NewListObj(0, nil);
-  Tcl_IncrRefCount(pList);
+  if pScript = nil then
+  begin
+    pList := Tcl_NewListObj(0, nil);
+    Tcl_IncrRefCount(pList);
+  end
+  else
+    pList := nil;
+
+  rcBody := TCL_OK;
+  bDone  := False;
 
   { Outer loop: walk through zSql, one prepared statement per
     sqlite3_prepare_v2 call, advancing via pzTail.  Mirrors the
     `while (p->zSql[0] || p->pPreStmt)` loop of dbEvalStep:1769. }
-  while (zSql <> nil) and (zSql^ <> #0) do
+  while (not bDone) and (zSql <> nil) and (zSql^ <> #0) do
   begin
     pStmt := nil;
     zTail := nil;
     rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, @zTail);
     if rc <> SQLITE_OK then
     begin
-      Tcl_DecrRefCount(pList);
-      { 9.4.divbug.6: mirror upstream tclsqlite.c:1812 — SET the interp result
-        from sqlite3_errmsg, do not Append.  The UDF trampoline may have
-        already pushed an error string (sqlite3_result_error), and AppendResult
-        on top of that doubled the text ("boomboom"). }
+      if pList <> nil then Tcl_DecrRefCount(pList);
+      if pScript <> nil then Tcl_DecrRefCount(pScript);
       Tcl_SetObjResult(interp,
         Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
       Result := TCL_ERROR;
@@ -202,14 +278,7 @@ begin
     { 9.4.divbug.5 — minimal port of tclsqlite.c:dbPrepareAndBind
       (tclsqlite.c:1490..1556).  Walk the prepared statement's parameter
       list and substitute `$NAME` / `:NAME` / `@NAME` from the calling
-      Tcl scope.  Without this, every `db eval {... $var ...}` resolves
-      to NULL and CAST/arithmetic return empty — which is what the
-      numcast.test suite (and many others) trip over.
-
-      Simplification vs upstream: we do not consult `pVar->typePtr` for
-      `int` / `double` / `bytearray` fast paths.  Tcl carries the value
-      as a string by default and SQLite affinity / OP_Cast does the
-      coercion at run-time.  The numcast scenario only needs strings. }
+      Tcl scope. }
     nVar := sqlite3_bind_parameter_count(pStmt);
     for iParam := 1 to nVar do begin
       zParamName := sqlite3_bind_parameter_name(pStmt, iParam);
@@ -229,25 +298,54 @@ begin
       rcStep := sqlite3_step(pStmt);
       if rcStep = SQLITE_ROW then
       begin
-        for i := 0 to nCol - 1 do
+        if pScript = nil then
         begin
-          zVal := sqlite3_column_text(pStmt, i);
-          if zVal = nil then
-            pCol := Tcl_NewStringObj(zNullStr, -1)
-          else
-            pCol := Tcl_NewStringObj(zVal, -1);
-          Tcl_ListObjAppendElement(interp, pList, pCol);
+          { objc==3: accumulate typed column values onto the flat list. }
+          for i := 0 to nCol - 1 do
+            Tcl_ListObjAppendElement(interp, pList,
+              DbEvalColumnValue(pStmt, i, zNullStr));
+        end
+        else
+        begin
+          { 3-arg form: populate the target then run the script body.
+            Mirrors the per-row block of DbEvalNextCmd (tclsqlite.c:1930..). }
+          for i := 0 to nCol - 1 do
+          begin
+            pColName := Tcl_NewStringObj(sqlite3_column_name(pStmt, i), -1);
+            Tcl_IncrRefCount(pColName);
+            pColVal  := DbEvalColumnValue(pStmt, i, zNullStr);
+            if pVarName = nil then
+              { pVarName==0: the column NAME itself is the scalar var. }
+              Tcl_ObjSetVar2(interp, pColName, nil, pColVal, 0)
+            else
+              { array form: ARRAY(colName) = colValue. }
+              Tcl_ObjSetVar2(interp, pVarName, pColName, pColVal, 0);
+            Tcl_DecrRefCount(pColName);
+          end;
+
+          rcBody := Tcl_EvalObjEx(interp, pScript, 0);
+          if (rcBody <> TCL_OK) and (rcBody <> TCL_CONTINUE) then
+          begin
+            { TCL_BREAK / TCL_RETURN / TCL_ERROR — stop stepping. }
+            bDone := True;
+            break;  { out of the repeat..until row loop }
+          end;
         end;
       end;
     until rcStep <> SQLITE_ROW;
 
     sqlite3_finalize(pStmt);
 
+    if bDone then
+    begin
+      { Body asked us to stop; finalize already done above. }
+      break;
+    end;
+
     if (rcStep <> SQLITE_DONE) and (rcStep <> SQLITE_OK) then
     begin
-      Tcl_DecrRefCount(pList);
-      { 9.4.divbug.6: see comment above — must SET, not Append, so a UDF
-        error already on the interp result is not duplicated. }
+      if pList <> nil then Tcl_DecrRefCount(pList);
+      if pScript <> nil then Tcl_DecrRefCount(pScript);
       Tcl_SetObjResult(interp,
         Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
       Result := TCL_ERROR;
@@ -257,9 +355,25 @@ begin
     zSql := zTail;
   end;
 
-  Tcl_SetObjResult(interp, pList);
-  Tcl_DecrRefCount(pList);
-  Result := TCL_OK;
+  if pScript = nil then
+  begin
+    { objc==3: the flat list is the result. }
+    Tcl_SetObjResult(interp, pList);
+    Tcl_DecrRefCount(pList);
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { 3-arg form cleanup — mirrors DbEvalNextCmd tail (tclsqlite.c:1999..2005). }
+  Tcl_DecrRefCount(pScript);
+  if (rcBody = TCL_OK) or (rcBody = TCL_BREAK) or (rcBody = TCL_CONTINUE) then
+  begin
+    Tcl_ResetResult(interp);
+    Result := TCL_OK;
+  end
+  else
+    { TCL_RETURN / TCL_ERROR propagate to the caller verbatim. }
+    Result := rcBody;
 end;
 
 { DbNullValueArm — port of the "nullvalue" arm of DbObjCmd
