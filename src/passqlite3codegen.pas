@@ -41970,7 +41970,14 @@ begin
       pIndex^.idxFlags := (pIndex^.idxFlags and not u32($08))   { uniqNotNull }
                           or u32(1 shl 11);                     { bHasExpr   }
     end;
-    if (n >= 0) and (n = pTab^.iPKey) then n := -1;  { rowid alias }
+    { build.c:4235..4239 — when the indexed term resolves to the rowid
+      alias (iColumn<0), C maps it BACK to the real IPK column number
+      (j = pTab->iPKey) and stores THAT in aiColumn[].  An index key
+      column must never carry XN_ROWID — only the implicit rowid tail
+      slot does.  The earlier port rewrote IPK columns to -1 here, which
+      tripped the `iIdxCol<>XN_ROWID` assert in indexColumnIsBeingUpdated
+      during UPDATE (9.4.divbug.25).  sqlite3ColumnIndex already returns
+      the real column number, so simply leave n unchanged. }
     { Mirror build.c:4241..4243 — uniqNotNull only stays set when every
       indexed column is declared NOT NULL.  rowid (n<0) is implicitly
       NOT NULL so does not clear the bit. }
