@@ -218,48 +218,12 @@ regressions without human triage.
   - [X] **9.2.divbug.H** WITHOUT ROWID count(*) fast path → CORRUPT — codegen missing P4_KEYINFO on the PK index cursor (select.c:8793..8814). Archive.
   - [X] **9.2.divbug.I** Round-trip cell-layout drift (4 sites: wal/multipage/generated-column/triggers) — TWO bugs: (1) generated-column STORED expr referencing IPK column read SoftNull slot, fix aliases `iColumn==iPKey` to rowid reg (codegen.pas:5689, expr.c:5026..5074); (2) `printf('%.*c',N,'X')` ignored precision-as-repeat-count, fix in printf.pas:1255 + codegen.pas:50334 (printf.c:769..790). Archive.
   - [X] **9.2.divbug.J** Round-trip trigger-fire EAV — `sqlite3VdbeClearObject` released aMem/aVar/pVList/pFree on sub-vdbes still in VDBE_INIT_STATE (raw-malloc garbage). Gate on `eVdbeState != VDBE_INIT_STATE` per vdbeaux.c:3747..3751. Archive.
-  - [ ] **9.2.divbug.B** Bare `VACUUM;` raises `EAccessViolation` on
-    the Pascal port (1 site: autovacuum vector).  Almost certainly the
-    unported `incrVacuumStep` / `relocatePage` / `modifyPagePointer`
-    arms enumerated in **6.28** (gated on productive ptrmap).  Cross-
-    link: closing 6.28's incremental-vacuum step closes this bucket.
-    Partial progress: the AV *inside* `runVacuumImpl`
-    (passqlite3main.pas:5242) is now eliminated — fixed in
-    `sqlite3BtreeOpen` (passqlite3btree.pas:6497) which was setting
-    `BTS_PAGESIZE_FIXED` unconditionally on every open.  Mirroring
-    btree.c:2703..2730 (set the flag *only* when the file header
-    carries a valid page size; for an empty new file the flag must
-    stay clear so VACUUM's later
-    `sqlite3BtreeSetPageSize(pTemp, nextPagesize=0, …)` is allowed)
-    lets `runVacuumImpl` proceed through schema mirror + CopyFile +
-    Commit.  Remaining issue (separate bullet candidate): on the
-    autovacuum vector `sqlite3BtreeCommit(pTemp)` →
-    `autoVacuumCommit` returns `SQLITE_CORRUPT_BKPT` because pTemp
-    ends up with only 2 pages (header + ptrmap) — the schema-mirror
-    inserts under `DBFLAG_Vacuum` aren't materialising in pTemp.
-    The downstream EAV post-return (after `sqlite3ResetAllSchemas-
-    OfConnection`) is a tertiary cleanup-on-CORRUPT issue and out of
-    scope for this bullet.  Bucket-B stays open until those two
-    follow-ups land.
+  - [X] **9.2.divbug.B** Bare `VACUUM;` `EAccessViolation` — root cause was `sqlite3_config` writing the address of a stack parameter slot into `GlobalConfig.xLog`, plus three `SQLITE_OMIT_AUTOVACUUM`-stubbed btree arms (`btreeCreateTable` root relocation, `allocateBtreePage` ptrmap-page skip, `sqlite3BtreeInsert` PTRMAP_OVERFLOW1).  VACUUM no longer crashes.  See vectors/DIVERGENCES.md bucket-B.
   - [X] **9.2.divbug.C** ALTER TABLE RENAME on VIEW-dependent table → EAV — `sqlite3CreateView` reduced pSelect under IN_RENAME_OBJECT; resolver wrote past EP_TokenOnly/EP_Reduced allocations. Fix per build.c:3041..3046 + walker.c:71 + parse.y:1166. Memory: `feedback_view_body_in_rename_object_must_be_full`. Archive.
   - [X] **9.2.divbug.D** CREATE INDEX on WITHOUT ROWID byte-different — `sqlite3CreateIndex` missing pPk arm (build.c:4278..4292) that copies PK columns into index-key suffix. Archive.
   - [X] **9.2.divbug.E** RENAME COLUMN on partial-index byte-different — missing IN_RENAME_OBJECT arm pinning `pIndex^.aColExpr` (build.c:4209, alter.c:1639). Archive.
   - [X] **9.2.divbug.K** UTF-16 `hex()` byte-swapped — `sqlite3_result_text*`/`_blob*` skipped `sqlite3VdbeChangeEncoding(pOut, pCtx->enc)` from `setResultStrOrError` (vdbeapi.c:387..427). Fix routes all result setters through ported `setResultStrOrError`. Archive.
-  - [ ] **9.2.divbug.L** Auto-vacuum round-trip page-count drift —
-    `autovacuum.db` (auto_vacuum=FULL, delete at COMMIT triggers
-    freelist truncation) and `incrvacuum.db` (auto_vacuum=INCREMENTAL
-    + explicit `PRAGMA incremental_vacuum(1)`).  Both vectors
-    round-trip to a larger Pas blob than C with diverging page-1
-    header bytes 32..39 (free-page count + freelist trunk).  Neither
-    mutator script contains a bare `VACUUM;` keyword.  Cross-link to
-    **6.28** — the unported `incrVacuumStep` / `relocatePage` /
-    `modifyPagePointer` arms are almost certainly the root cause; the
-    auto-vacuum-at-COMMIT path falls into a less aggressive branch
-    where bucket-B's bare VACUUM crashes outright.  C reference:
-    `../sqlite3/src/btree.c (autoVacuumCommit, incrVacuumStep,
-    relocatePage)`.  Surfaced by 9.2.3.followup once the bucket-A
-    umbrella was lifted from the round-trip gate.  See bucket-L in
-    `src/tests/vectors/DIVERGENCES.md`.
+  - [X] **9.2.divbug.L** Auto-vacuum round-trip page-count drift — fixed `finalDbSize` (exact `ptrmapPageno` walk + `PTRMAP_ISPAGE` guard, btree.c:4135) and ported the missing `PRAGMA incremental_vacuum` codegen arm (pragma.c:854).  autovacuum/incrvacuum vectors now round-trip byte-identical; `TestVectorRoundTrip`/`SchemaChange`/`ReadOnly` skipped=0.  See vectors/DIVERGENCES.md bucket-L.
   - [X] **9.2.divbug.L.1** Port `incrVacuumStep` (btree.c:4034..4128) + prerequisite ptrmap stubs (`ptrmapPageno`/`Put`/`Get`, `setChildPtrmaps`). Wired into `sqlite3BtreeIncrVacuum`. Archive.
   - [X] **9.2.divbug.L.2** Port `relocatePage` + `modifyPagePointer` (btree.c:3876..4012). Archive.
   - [X] **9.2.divbug.L.3** Wire `autoVacuumCommit` body (btree.c:4194..4277) + CommitPhaseOne caller. incrvacuum.db now truncates freelist correctly; autovacuum.db still drifts on page-cleanup hygiene (bucket-L stays open on narrowed symptom). Archive.
@@ -435,13 +399,8 @@ acceptance gate for this section.
     combinations.  For full-corpus first cut, land a stub that
     runs *only* the baseline permutation; full matrix gated under
     9.4.7.e.  C ref: `permutations.tcl:1..400`.
-  - [ ] **9.4.2.g.9** `do_malloc_test` — exercises every malloc()
-    call site with an injected failure.  Requires memdebug build
-    (9.4.7.b) + `sqlite3_memdebug_*` exports (9.4.6.n).  C ref:
-    `tester.tcl:1488..1567`.
-  - [ ] **9.4.2.g.10** `do_ioerr_test` — wraps test under fault-
-    injecting VFS.  Requires ioerr VFS shim (9.4.7.c).  C ref:
-    `tester.tcl:1593..1693`.
+  - [X] **9.4.2.g.9** `do_malloc_test` ported verbatim into `tester_min.tcl` (malloc_common.tcl:416..538); drives the memdebug `sqlite3_memdebug_fail` / `install_malloc_faultsim` primitives.  Runs clean when no fault fires; an actual injected malloc failure segfaults the engine OOM-recovery path — tracked as **9.4.divbug.27**.
+  - [X] **9.4.2.g.10** `do_ioerr_test` + `run_ioerr_prep` ported verbatim into `tester_min.tcl` (tester.tcl:1890..2118); drives the 9.4.7.c counters.  Runs end-to-end (fault fires, engine recovers, terminates cleanly).
   - [ ] **9.4.2.g.11** `crashsql` — spawns child process that aborts
     mid-write; parent verifies WAL/journal recovery.  Requires crash
     harness (9.4.7.d).  C ref: `crash.tcl:1..200`,
@@ -463,10 +422,7 @@ acceptance gate for this section.
     `bc_common.tcl`, `fts3_common.tcl`, `pg_common.tcl`,
     `thread_common.tcl` (need testvfs / testfixture / sqlthread /
     sqlite3_memdebug_* / Pgtcl — unported).
-  - [ ] **9.4.2.g.14** `tester_min.tcl` config vars — add
-    `set ::AUTOVACUUM 0` and the other build-config globals upstream
-    tests read (e.g. `insert.test` reads `$AUTOVACUUM`).  Surfaced
-    by the 9.4.4.c sweep.  C ref: `tester.tcl` config-var block.
+  - [X] **9.4.2.g.14** `tester_min.tcl` config vars — added `AUTOVACUUM 0`, `TEMP_STORE 1`, `SQLITE_DEFAULT_SYNCHRONOUS 2`, `SQLITE_DEFAULT_WAL_SYNCHRONOUS 2`, `SQLITE_DEFAULT_FILE_FORMAT 4`, `MEMORY_MANAGEMENT 0` + a minimal `sqlite_options()` array, all derived from this port's actual build config.
   - [X] **9.4.2.h** `db eval` 3-arg form (`db eval $sql arrayName
     { script }`) — per-row callback with column-name `Tcl_TraceVar`
     binding into the named array.  Used by ~30% of tcl-feature tests.
@@ -544,11 +500,7 @@ acceptance gate for this section.
     Tcl shim, both behind `{$ifdef SQLITE_ENABLE_PREUPDATE_HOOK}`;
     `PREUPDATE=1` env toggle in `build_tcl_lib.sh`.  Compiles flag
     on/off; NOT yet runtime-exercised — see 9.4.2.u.1.
-  - [ ] **9.4.2.u.1** Runtime-exercise the preupdate hook — port a
-    `preupdate.test`-style test (or a `Diag*`/`Test*` unit) that
-    builds with `PREUPDATE=1` and fires the hook on INSERT/UPDATE/
-    DELETE, asserting `preupdate old/new/count/depth`.  C ref:
-    `../sqlite3/test/preupdate.test`.
+  - [X] **9.4.2.u.1** Runtime-exercise the preupdate hook — ported `src/tests/tcl/preupdate.test` (subset of upstream `hook.test` hook-7.*; this SQLite version has no standalone preupdate.test).  14/14 PASS under a `PREUPDATE=1` build.  Found+fixed 6 codegen/compile bugs behind the `{$ifdef}`: xferOptimization `OP_RowData`, DELETE-truncate disable when hook registered, UPDATE `OPFLAG_ISUPDATE` OP_Delete, REPLACE rowid-conflict `OPFLAG_ISNOOP`, `columnNullValue`, plus const-fixups.
   - [X] **9.4.2.v** `db unlock_notify` (`-DSQLITE_ENABLE_UNLOCK_NOTIFY`
     build only).  Engine port in 9.4.6.k.  Tcl shim is a 1-arg
     callback registration.  C ref: `tclsqlite.c:2820..2870`.
@@ -645,10 +597,7 @@ acceptance gate for this section.
     (ranked by filesize / probable simplicity).  Continue
     skip-and-cite convention.  Triage new divbug.* clusters.
     Do this only after 9.4.4.b.2 confirms the 10-test baseline.
-  - [ ] **9.4.4.d** Broaden sweep to 100 tests.  Expected to surface
-    most of the "small bridge gaps" (typed marshalling, eval 3-arg,
-    trace/profile).  Land each found gap as a new sub-bullet of
-    9.4.2.h..w or a new 9.4.divbug.N.
+  - [X] **9.4.4.d** Broaden sweep to first 100 tcl-feature tests — **72 PASS / 28 FAIL / 0 SKIP** (`bin/TclTestDriver --limit 100`).  First-50 subset improved 41→43 PASS vs 9.4.4.c (atof2 + atomic flipped via 9.4.6.q).  Surfaced new engine divbugs **9.4.divbug.19..24** and harness-gap follow-ups **9.4.6.q.1 / 9.4.6.q.2**.  See `src/tests/tcl/DIVERGENCES.md` "Run summary (9.4.4.d sweep)" + `STATUS.txt`.
   - [ ] **9.4.4.e** Broaden sweep to 250 tests (~25% of corpus).
     Expected to surface the bulk of port-side divbugs.
   - [ ] **9.4.4.f** Broaden sweep to 500 tests.
@@ -727,28 +676,12 @@ acceptance gate for this section.
     `Md5_Register` + md5/md5file Tcl cmds (test_md5.c →
     `TestModuleMd5.pas`).  `register_wholenumber_module` already
     done in 10.1.69.  Remaining sub-tasks below.
-    - [ ] **9.4.6.l.1** `register_echo_module` — the echo virtual
-      table.  ~1453 lines of C (full read/write proxy vtab:
-      xCreate/xConnect/xBestIndex/xFilter/xUpdate/xFindFunction/
-      xRename/savepoints).  Dedicated large port.  C ref:
-      `../sqlite3/src/test8.c`.
-    - [ ] **9.4.6.l.4** `registerTestFunction` — the test scalar
-      UDFs.  Blocked: (a) `test_extract`/`test_decode` need
-      `sqlite3VdbeSerialGet` exported from the engine interface;
-      (b) the mechanism relies on `sqlite3_auto_extension` actually
-      being *invoked* on db-open — this port's auto-extension list
-      is a registry that is never run.  Prereq: wire auto-extension
-      invocation on connection open + export `sqlite3VdbeSerialGet`.
-      C ref: `../sqlite3/src/test_func.c`.
-    - [ ] **9.4.6.l.5** `register_async_vtab` — `test_async.c` does
-      NOT exist in `../sqlite3/src/`.  Needs the upstream source
-      sourced before this can be ported, or drop the bullet.
+    - [X] **9.4.6.l.1** `register_echo_module` — 1:1 port of `test8.c` into `src/tests/tcl/testmodules/TestModuleEcho.pas` (full read/write proxy vtab: xCreate/xConnect/xBestIndex/xFilter/xUpdate/xFindFunction/xRename/savepoints; registers `echo` + `echo_v2`).  SELECT/DELETE/UPDATE proxy correctly; INSERT residue tracked as **9.4.divbug.26**.
+    - [X] **9.4.6.l.4** `registerTestFunction` — ported `test_func.c` scalar/aggregate test UDFs + `autoinstall_test_functions` into `src/tests/tcl/testmodules/TestModuleFunc.pas`.  Prereqs done: ported `sqlite3AutoLoadExtensions` and wired it into `openDatabase` (the auto-extension registry was never run); `sqlite3VdbeSerialGet` was already in the interface section.
+    - [X] **9.4.6.l.5** `register_async_vtab` — DROPPED.  Investigation confirmed `test_async.c` is absent from this SQLite version (the async VFS was deprecated/removed upstream); no `.test` file references `register_async_vtab`.  See `src/tests/tcl/DIVERGENCES.md`.
   - [X] **9.4.6.m** `sqlite3_log` (already wired in 10.1.36) +
     `sqlite3_io_trace` — Tcl bindings + assert hooks.
-  - [ ] **9.4.6.n** `sqlite3_memdebug_*` set — `_settitle`,
-    `_malloc_failed`, `_backtrace`, `_pending_byte`.  Gated on
-    memdebug build (9.4.7.b).  Pairs with `do_malloc_test`
-    (9.4.2.g.9).
+  - [X] **9.4.6.n** `sqlite3_memdebug_*` set — ported the `test_malloc.c` fault-injection allocator + Tcl commands (`sqlite3_memdebug_fail`/`_pending`/`_settitle`/`_backtrace`/`_malloc_count`, `install_malloc_faultsim`, …) into `src/tests/tcl/testmodules/TestModuleMalloc.pas`.  Debug-only arms gated `{$ifdef SQLITE_MEMDEBUG}`.  Deferred: `SQLITE_TESTCTRL_BENIGN_MALLOC_HOOKS` (op 10) not yet in the engine's `sqlite3_test_control` — only affects `-benigncnt` reporting.
   - [X] **9.4.6.o** File-control opcodes — PERSIST_WAL, LOCKSTATE,
     CHUNK_SIZE, SIZE_LIMIT, POWERSAFE_OVERWRITE, ZIPVFS, BUSYHANDLER,
     TEMPFILENAME, MMAP_SIZE.  Many already partly wired via Phase
@@ -756,16 +689,10 @@ acceptance gate for this section.
     `../sqlite3/src/os_unix.c:unixFileControl`.
   - [X] **9.4.6.p** `sqlite3_busy_timeout` / `sqlite3_busy_handler` —
     audit; pair with 9.4.2.k.
-  - [ ] **9.4.6.q** Unported test-only Tcl commands surfaced by the
-    9.4.4.c 50-test sweep — `sqlite3_connection_pointer`,
-    `sqlite3_db_config`, `faultsim_save_and_close`,
-    `load_static_extension`, `atomic_batch_write`, and the
-    `real2hex` / `hex2real` SQL functions.  C ref:
-    `../sqlite3/src/test1.c` + `test_func.c`.
-  - [ ] **9.4.6.r** Faithful `fcntlSizeHint` port — the unix VFS
-    currently treats `SQLITE_FCNTL_SIZE_HINT` as an advisory no-op;
-    C routes it through `fcntlSizeHint` to pre-grow the file via
-    ftruncate/fallocate.  C ref: `../sqlite3/src/os_unix.c`.
+  - [X] **9.4.6.q** Unported test-only Tcl commands — ported the `test1.c` subset (`sqlite3_connection_pointer`, `sqlite3_db_config`, `atomic_batch_write`, `load_static_extension`) into `src/tests/tcl/testmodules/TestModuleTest1.pas`; `real2hex` SQL func + `faultsim_save_and_close` family into the test modules / `tester_min.tcl`.  `hex2real` does not exist upstream (spurious cite).  atof2.test + atomic.test flipped to PASS.
+    - [ ] **9.4.6.q.1** test1.c prepared-statement C-API subset — `sqlite3_prepare(_v2)`, `sqlite3_exec`, `sqlite3_backup`, `sqlite3_errmsg`, `sqlite3_transfer_bindings`.  Biggest single unlock from the 9.4.4.d sweep: 7 tests (bind, bind2, bindxfer, capi2, badutf, badutf2, backup5).  C ref: `../sqlite3/src/test1.c`.
+    - [ ] **9.4.6.q.2** Remaining 9.4.4.d-surfaced test commands — `do_not_use_codec`, `wal_set/check_journal_mode`, `test_set_config_pagecache`, `sqlite3_create_aggregate` (Tcl), `do_faultsim_test`.  Plus missing harness file `permutations.test` (all.test).  C ref: `test1.c` / `tester.tcl`.
+  - [X] **9.4.6.r** Faithful `fcntlSizeHint` port — ported `fcntlSizeHint` (os_unix.c:4049) into `src/passqlite3os.pas`: `SQLITE_FCNTL_SIZE_HINT` now pre-grows via `posix_fallocate` with chunk-size rounding instead of being a no-op.
 
 - [~] **9.4.7** Build-matrix / harness infrastructure.  Many tests
   require a *different* build of libpassqlite3 than the default.
@@ -776,19 +703,9 @@ acceptance gate for this section.
     symbol on the Pascal side must report through
     `sqlite3_compileoption_used`.  Walk `src/passqlite3.inc` to
     enumerate them; add to the registry.  Pairs with 9.4.6.a.
-  - [ ] **9.4.7.b** Memdebug build profile — `-dSQLITE_MEMDEBUG`
-    + the `sqlite3_memdebug_*` exports (9.4.6.n).  New build
-    script `src/tests/build_tcl_lib_memdebug.sh` produces
-    `bin/libpassqlite3tcl-memdebug.so`.  Required by
-    `do_malloc_test` (9.4.2.g.9).  Substantial — needs the
-    `sqlite3Malloc` arms instrumented to honour
-    `sqlite3_memdebug_fail`.  C ref:
-    `../sqlite3/src/test_malloc.c` (~1100 lines).
-  - [ ] **9.4.7.c** I/O-error injection VFS — a wrapper VFS that
-    fault-injects on the N-th read/write.  Required by
-    `do_ioerr_test` (9.4.2.g.10).  Adapt
-    `../sqlite3/src/test_devsym.c` (~600 lines) to
-    `passqlite3testvfs.pas`.  Registers via
+  - [X] **9.4.7.b** Memdebug build profile — `src/tests/build_tcl_lib_memdebug.sh` adds `-dSQLITE_MEMDEBUG` and produces `bin/libpassqlite3tcl-memdebug.so` (private staging dir so its `.ppu`/`.o` don't clobber the default build).  Fault allocator + exports landed in 9.4.6.n.  `--build` driver selection still pending (9.4.7).
+  - [X] **9.4.7.c** I/O-error injection — ported the `os_common.h` `SQLITE_TEST` machinery (the `SimulateIOError`/`SimulateDiskfullError` counter checks) directly into the Pascal unix VFS read/write/sync/truncate rather than a `test_devsym.c` wrapper VFS (the wrong tool — `do_ioerr_test` drives global counters).  `src/tests/tcl/testmodules/TestModuleIoerr.pas` (`test2.c` port) `Tcl_LinkVar`s the counters.  All `{$ifdef SQLITE_TEST}`-gated; default build byte-unaffected.
+  - [~] **9.4.7.c.old** ~~test_devsym.c wrapper VFS~~ — superseded by the counter-instrumentation approach above; kept only if a future test needs a real device-characteristics shim.  Registers via
     `sqlite3_vfs_register`.
   - [ ] **9.4.7.d** Crash-test harness — `crashsql` (9.4.2.g.11)
     spawns a child `tclsh` invocation that `_exit`'s mid-write.
@@ -923,26 +840,23 @@ acceptance gate for this section.
   rowid-alias branch (C insert.c:1097).  Table stayed empty so every
   downstream query returned `{}`.  Fixed by porting the `ipkColumn`
   rowid-alias arm.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.11** Compound `SELECT ... ORDER BY` asserts on
-  `iOrderByCol<=0` (surfaced by the 9.4.4.c 50-test sweep).  See
-  DIVERGENCES.md.
-- [ ] **9.4.divbug.12** `update.test` sub-test `update-17.10`
-  segfaults — UPDATE with ORDER BY / FROM.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.13** `boundary1.test` scan row-ordering residue
-  of divbug.10 — WhereCode scan direction.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.14** Truncated SQL error messages (sibling of
-  divbug.2) — format-string args still dropped on some
-  `sqlite3ErrorMsg` paths.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.15** `no such function` not raised at prepare
-  time (deferred to runtime).  See DIVERGENCES.md.
-- [ ] **9.4.divbug.16** `affinity3.test` segfaults — affinity
-  propagation crash.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.17** Nested aggregate produces row-wise result
-  + segfault — AggInfo nesting.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.18** WITHOUT ROWID virtual-table `xUpdate`
-  codegen mis-handles DELETE (no-op) and UPDATE (segfault) —
-  surfaced porting `register_tcl_module` (9.4.6.l).  Engine-side
-  codegen bug.  See DIVERGENCES.md.
+- [X] **9.4.divbug.11** Compound `SELECT ... ORDER BY` `iOrderByCol<=0` assert — ported `resolveCompoundOrderBy` (resolve.c:1589); select1.test runs past 6.22.
+- [X] **9.4.divbug.12** `update-17.10` segfault — actually a constant-expr `CREATE INDEX` crash; gated `sqlite3CreateIndex` column lookup to identifier tokens (build.c:4220).
+- [X] **9.4.divbug.13** Inequality-scan row ordering — gated `whereShortCut` `nOBSat:=nExpr` to `WHERE_ONEROW` plans so IPK range scans get a sorter; boundary1.test 1511/1511.
+- [X] **9.4.divbug.14** SQL errors drop object name — routed scattered `sqlite3ErrorMsg` sites through upstream `%s`/`%S`/`%T` formats (build.c / resolve.c).
+- [X] **9.4.divbug.15** `no such function` not raised at prepare — ported the `resolveExprStep` TK_FUNCTION error arm (resolve.c:1129..1276).
+- [X] **9.4.divbug.16** `affinity3.test` segfault — `sqlite3WhereBegin` skipped opening a RIGHT JOIN table cursor scanned index-only; ported the `JT_LTORJ|JT_RIGHT` gate (where.c:7252).
+- [X] **9.4.divbug.17** Subquery-nested aggregate evaluated row-wise — ported the resolver's outward AggInfo-binding arm (resolve.c:1337..1352).  aggnested-3.x residue tracked as divbug.24.
+- [X] **9.4.divbug.18** WITHOUT ROWID vtab `xUpdate` — DELETE now emits `OP_Column` for argv[0]; `updateVirtualTable` routed through `sqlite3WhereBegin` so `xBestIndex` runs.
+- [ ] **9.4.divbug.19** Table-qualified `rowid` alias (`t1.rowid`, `sp.rowid`) not resolved → `no such column` (boundary3, autoindex5).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.20** BETWEEN-on-indexed-column planner picks `nosort` and also drops matching rows (between).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.21** Cross-connection EXCLUSIVE lock not detected; `BEGIN IMMEDIATE` succeeds instead of `database is locked` (busy).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.22** Large row payload / `PRAGMA page_size=65536` overflow handling segfaults (bigrow, btree01).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.23** Correlated FROM-subquery not materialised into a co-routine; EXPLAIN QUERY PLAN drift (autoindex3).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.24** `sqlite_sequence` double-created for AUTOINCREMENT + aggregate mis-fold + segfault — aggnested-3.x residue of divbug.17 (aggnested).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.25** `update-19.10` `AssertH FAILED: idxColIsBeingUpdated rowid` — surfaced by the divbug.12 fix once update.test ran further.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.26** Echo vtab INSERT fails — `echoUpdate` emits `%Q`-quoted column names and the Pascal parser rejects single-quoted column identifiers that upstream SQLite accepts.  Surfaced porting `register_echo_module` (9.4.6.l.1).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.27** Engine OOM-recovery path segfaults under an injected malloc failure (memdebug build) — blocks `do_malloc_test` from being fully useful.  Surfaced by 9.4.2.g.9.  See DIVERGENCES.md.
 
 ---
 
