@@ -20161,6 +20161,10 @@ begin
       pLevel^.addrBrk := sqlite3VdbeMakeLabel(pParse);
       if (ii = 0) or ((pTabItem^.fg.jointype and JT_LEFT) <> 0) then
         pLevel^.addrHalt := pLevel^.addrBrk
+      else if whereInfoLevels(pWInfo)[ii - 1].pRJ <> nil then
+        { where.c:7254..7255 — when the previous level is a RIGHT JOIN, the
+          halt target is that level's addrBrk (not its addrHalt). }
+        pLevel^.addrHalt := whereInfoLevels(pWInfo)[ii - 1].addrBrk
       else
         pLevel^.addrHalt := whereInfoLevels(pWInfo)[ii - 1].addrHalt;
 
@@ -20186,7 +20190,15 @@ begin
           { IsVirtual(pTab) without WHERE_VIRTUALTABLE — no cursor needed. }
         end
         else
-        if (pLoop^.wsFlags and WHERE_IDX_ONLY) = 0 then
+        { where.c:7271..7274 — open the table cursor when the plan is not
+          index-only and not an OR-subclause disjunct, OR unconditionally
+          when this table sits on either side of a RIGHT JOIN (JT_LTORJ /
+          JT_RIGHT) — the right-join machinery (OP_DeferredSeek targets,
+          the post-scan unmatched pass) needs the table cursor live even
+          for WHERE_IDX_ONLY plans. }
+        if (((pLoop^.wsFlags and WHERE_IDX_ONLY) = 0)
+              and ((wctrlFlags and WHERE_OR_SUBCLAUSE) = 0))
+           or ((pTabItem^.fg.jointype and (JT_LTORJ or JT_RIGHT)) <> 0) then
         begin
           sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
           { 7.4b.2 — reduce OP_OpenRead p4 (column count) to the highest

@@ -414,15 +414,26 @@ raises `no such function: <name>`, and a name matched only with
 `nArg=-2` raises `wrong number of arguments to function <name>()`.
 insert-4.6 / delete-4.2 now pass.
 
-## 9.4.divbug.16 — `affinity3.test` segfaults — OPEN
+## 9.4.divbug.16 — `affinity3.test` segfaults — FIXED
 
 Affects: 1 test (`../sqlite3/test/affinity3.test`).
-Symptom: tclsh SIGSEGVs partway through affinity3.test (no diff
-printed, exit 139).  affinity3 exercises column-affinity coercion
-across `CREATE TABLE ... AS SELECT`, views, and compound queries.
-Likely cause: not yet rooted — candidate is the affinity-propagation
-path for a view or `... AS SELECT` result column dereferencing a nil
-`Column`/`Expr`.  Surfaced by: 9.4.4.c sweep.
+Symptom: tclsh SIGSEGVd at affinity3-111 (`SELECT ... FROM v1rj`,
+a RIGHT JOIN view, with `automatic_index=ON`).  Crash was a nil
+cursor deref in `sqlite3VdbeExec` `OP_DeferredSeek` (`pTabCur` =
+`v^.apCsr[pOp^.p3]` = nil).
+
+Root cause: `sqlite3WhereBegin`'s cursor-open loop (codegen.pas
+~20160) diverged from `where.c:7252..7274`:
+1. The `OP_OpenRead` gate only checked `WHERE_IDX_ONLY = 0`; it
+   omitted C's `|| (jointype & (JT_LTORJ|JT_RIGHT))` clause, so a
+   RIGHT JOIN table scanned index-only never had its *table*
+   cursor opened — yet `OP_DeferredSeek` still targeted it.
+2. The `addrHalt` selection lacked C's
+   `else if( pWInfo->a[ii-1].pRJ )` → use prior level's `addrBrk`.
+Both ported faithfully.  affinity3-111..142 now pass; residual
+non-crash failures (affinity3-200/210/220/250/260) are separate
+unported features (`CREATE TABLE AS SELECT`, JOIN-USING automatic-
+index affinity) — not part of this divbug.  Fixed: 9.4.divbug.16.
 
 ## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — OPEN
 
