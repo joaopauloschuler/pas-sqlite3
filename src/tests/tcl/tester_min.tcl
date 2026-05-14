@@ -611,6 +611,387 @@ proc do_eqp_test {name sql res} {
   }
 }
 
+# ===========================================================================
+# Fault-injection helpers — do_malloc_test (task 9.4.2.g.9) and
+# do_ioerr_test (task 9.4.2.g.10).
+#
+# do_malloc_test is a verbatim port of malloc_common.tcl:416..538; it
+# drives the `sqlite3_memdebug_fail` primitive (TestModuleMalloc, the
+# memdebug build).  do_ioerr_test is a verbatim port of
+# tester.tcl:1927..2118; it drives the ::sqlite_io_error_* counters
+# (TestModuleIoerr / passqlite3os.pas instrumentation, task 9.4.7.c).
+#
+# A handful of upstream C test commands these procs lean on are not yet
+# ported (save/restore_prng_state, sqlite3_extended_result_codes,
+# sqlite3_db_config_lookaside, sqlite3_errcode).  They are advisory —
+# they tune determinism / result-code reporting but do not change which
+# faults fire — so they are provided here as thin shims:
+#   * save_prng_state / restore_prng_state — no-ops (the engine PRNG is
+#     not yet Tcl-controllable; tests still run, just less reproducible).
+#   * sqlite3_extended_result_codes — no-op (extended codes are always
+#     on in this build's error reporting).
+#   * sqlite3_db_config_lookaside — no-op (lookaside tuning only).
+#   * sqlite3_errcode — defers to the `db errorcode` subcommand.
+# C ref: malloc_common.tcl, tester.tcl, test1.c, test2.c.
+# ===========================================================================
+if {[llength [info commands save_prng_state]]==0} {
+  proc save_prng_state {} {}
+}
+if {[llength [info commands restore_prng_state]]==0} {
+  proc restore_prng_state {} {}
+}
+if {[llength [info commands sqlite3_extended_result_codes]]==0} {
+  proc sqlite3_extended_result_codes {db onoff} {}
+}
+if {[llength [info commands sqlite3_db_config_lookaside]]==0} {
+  proc sqlite3_db_config_lookaside {db args} {}
+}
+if {[llength [info commands sqlite3_errcode]]==0} {
+  proc sqlite3_errcode {db} { return [$db errorcode] }
+}
+
+# cksum — verbatim port of tester.tcl (used by do_ioerr_test -cksum).
+# Returns a content checksum of the main database.
+if {[llength [info commands cksum]]==0} {
+  proc cksum {{db db}} {
+    set txt [$db eval {
+        SELECT name, type, sql FROM sqlite_master order by name
+    }]\n
+    foreach tbl [$db eval {
+        SELECT name FROM sqlite_master WHERE type='table' order by name
+    }] {
+      append txt [$db eval "SELECT * FROM $tbl"]\n
+    }
+    foreach prag {default_synchronous default_cache_size} {
+      append txt $prag-[$db eval "PRAGMA $prag"]\n
+    }
+    set cksum [string length $txt]-[md5 $txt]
+    return $cksum
+  }
+}
+# output2 — verbatim port of tester.tcl: writes to stdout.
+if {[llength [info commands output2]]==0} {
+  proc output2 {args} { uplevel puts $args }
+}
+
+# do_malloc_test — verbatim port of malloc_common.tcl:416..538.
+# Each iteration arms the Nth sqlite3_malloc() call to fail (transient
+# on the first pass, persistent on the second), runs the -tclbody /
+# -sqlbody, and asserts SQLite either succeeded or reported an OOM.
+proc do_malloc_test {tn args} {
+  array unset ::mallocopts
+  array set ::mallocopts $args
+
+  if {[string is integer $tn]} {
+    set tn malloc-$tn
+    catch { set tn $::testprefix-$tn }
+  }
+  if {[info exists ::mallocopts(-start)]} {
+    set start $::mallocopts(-start)
+  } else {
+    set start 0
+  }
+  if {[info exists ::mallocopts(-end)]} {
+    set end $::mallocopts(-end)
+  } else {
+    set end 50000
+  }
+  save_prng_state
+
+  foreach ::iRepeat {0 10000000} {
+    set ::go 1
+    for {set ::n $start} {$::go && $::n <= $end} {incr ::n} {
+
+      # If $::iRepeat is 0, then the malloc() failure is transient - it
+      # fails and then subsequent calls succeed. If $::iRepeat is 1,
+      # then the failure is persistent - once malloc() fails it keeps
+      # failing.
+      #
+      set zRepeat "transient"
+      if {$::iRepeat} {set zRepeat "persistent"}
+      restore_prng_state
+      foreach file [glob -nocomplain test.db-mj*] {forcedelete $file}
+
+      do_test ${tn}.${zRepeat}.${::n} {
+
+        # Remove all traces of database files test.db and test2.db
+        # from the file-system. Then open (empty database) "test.db"
+        # with the handle [db].
+        #
+        catch {db close}
+        catch {db2 close}
+        forcedelete test.db
+        forcedelete test.db-journal
+        forcedelete test.db-wal
+        forcedelete test2.db
+        forcedelete test2.db-journal
+        forcedelete test2.db-wal
+        if {[info exists ::mallocopts(-testdb)]} {
+          copy_file $::mallocopts(-testdb) test.db
+        }
+        catch { sqlite3 db test.db }
+        if {[info commands db] ne ""} {
+          sqlite3_extended_result_codes db 1
+        }
+        sqlite3_db_config_lookaside db 0 0 0
+
+        # Execute any -tclprep and -sqlprep scripts.
+        #
+        if {[info exists ::mallocopts(-tclprep)]} {
+          eval $::mallocopts(-tclprep)
+        }
+        if {[info exists ::mallocopts(-sqlprep)]} {
+          execsql $::mallocopts(-sqlprep)
+        }
+
+        # Now set the ${::n}th malloc() to fail and execute the -tclbody
+        # and -sqlbody scripts.
+        #
+        sqlite3_memdebug_fail $::n -repeat $::iRepeat
+        set ::mallocbody {}
+        if {[info exists ::mallocopts(-tclbody)]} {
+          append ::mallocbody "$::mallocopts(-tclbody)\n"
+        }
+        if {[info exists ::mallocopts(-sqlbody)]} {
+          append ::mallocbody "db eval {$::mallocopts(-sqlbody)}"
+        }
+
+        # The following block sets local variables as follows:
+        #
+        #     isFail  - True if an error (any error) was reported by sqlite.
+        #     nFail   - The total number of simulated malloc() failures.
+        #     nBenign - The number of benign simulated malloc() failures.
+        #
+        set isFail [catch $::mallocbody msg]
+        set nFail [sqlite3_memdebug_fail -1 -benigncnt nBenign]
+
+        # If one or more mallocs failed, run this loop body again.
+        #
+        set go [expr {$nFail>0}]
+
+        if {($nFail-$nBenign)==0} {
+          if {$isFail} {
+            set v2 $msg
+          } else {
+            set isFail 1
+            set v2 1
+          }
+        } elseif {!$isFail} {
+          set v2 $msg
+        } elseif {
+          [info command db]=="" ||
+          [db errorcode]==7 ||
+          $msg=="out of memory"
+        } {
+          set v2 1
+        } else {
+          set v2 $msg
+          puts [db errorcode]
+        }
+        lappend isFail $v2
+      } {1 1}
+
+      if {[info exists ::mallocopts(-cleanup)]} {
+        catch [list uplevel #0 $::mallocopts(-cleanup)] msg
+      }
+    }
+  }
+  unset ::mallocopts
+  sqlite3_memdebug_fail -1
+}
+
+# run_ioerr_prep — verbatim port of tester.tcl:1890..1908.  Deletes the
+# test.db family and reopens `db`, then runs any -tclprep / -sqlprep.
+proc run_ioerr_prep {} {
+  set ::sqlite_io_error_pending 0
+  catch {db close}
+  catch {db2 close}
+  catch {forcedelete test.db}
+  catch {forcedelete test.db-journal}
+  catch {forcedelete test2.db}
+  catch {forcedelete test2.db-journal}
+  set ::DB [sqlite3 db test.db; sqlite3_connection_pointer db]
+  sqlite3_extended_result_codes $::DB $::ioerropts(-erc)
+  if {[info exists ::ioerropts(-tclprep)]} {
+    eval $::ioerropts(-tclprep)
+  }
+  if {[info exists ::ioerropts(-sqlprep)]} {
+    execsql $::ioerropts(-sqlprep)
+  }
+  expr 0
+}
+
+# do_ioerr_test — verbatim port of tester.tcl:1927..2118.  Each
+# iteration arms the Nth I/O operation to fail (via the
+# ::sqlite_io_error_* counters linked by TestModuleIoerr), runs the
+# -tclbody / -sqlbody, and asserts that either no I/O error fired and
+# the SQL succeeded, or an I/O error fired and the SQL failed.
+proc do_ioerr_test {testname args} {
+
+  set ::ioerropts(-start) 1
+  set ::ioerropts(-cksum) 0
+  set ::ioerropts(-erc) 0
+  set ::ioerropts(-count) 100000000
+  set ::ioerropts(-persist) 1
+  set ::ioerropts(-ckrefcount) 0
+  set ::ioerropts(-restoreprng) 1
+  array set ::ioerropts $args
+
+  # TEMPORARY: For 3.5.9, disable testing of extended result codes. There are
+  # a couple of obscure IO errors that do not return them.
+  set ::ioerropts(-erc) 0
+
+  # Create a single TCL script from the TCL and SQL specified
+  # as the body of the test.
+  set ::ioerrorbody {}
+  if {[info exists ::ioerropts(-tclbody)]} {
+    append ::ioerrorbody "$::ioerropts(-tclbody)\n"
+  }
+  if {[info exists ::ioerropts(-sqlbody)]} {
+    append ::ioerrorbody "db eval {$::ioerropts(-sqlbody)}"
+  }
+
+  save_prng_state
+  if {$::ioerropts(-cksum)} {
+    run_ioerr_prep
+    eval $::ioerrorbody
+    set ::goodcksum [cksum]
+  }
+
+  set ::go 1
+  for {set n $::ioerropts(-start)} {$::go} {incr n} {
+    set ::TN $n
+    incr ::ioerropts(-count) -1
+    if {$::ioerropts(-count)<0} break
+
+    # Skip this IO error if it was specified with the "-exclude" option.
+    if {[info exists ::ioerropts(-exclude)]} {
+      if {[lsearch $::ioerropts(-exclude) $n]!=-1} continue
+    }
+    if {$::ioerropts(-restoreprng)} {
+      restore_prng_state
+    }
+
+    # Delete the files test.db and test2.db, then execute the TCL and
+    # SQL (in that order) to prepare for the test case.
+    do_test $testname.$n.1 {
+      run_ioerr_prep
+    } {0}
+
+    # Read the 'checksum' of the database.
+    if {$::ioerropts(-cksum)} {
+      set ::checksum [cksum]
+    }
+
+    # Set the Nth IO error to fail.
+    do_test $testname.$n.2 [subst {
+      set ::sqlite_io_error_persist $::ioerropts(-persist)
+      set ::sqlite_io_error_pending $n
+    }] $n
+
+    # Execute the TCL script created for the body of this test. If
+    # at least N IO operations performed by SQLite as a result of
+    # the script, the Nth will fail.
+    do_test $testname.$n.3 {
+      set ::sqlite_io_error_hit 0
+      set ::sqlite_io_error_hardhit 0
+      set r [catch $::ioerrorbody msg]
+      set ::errseen $r
+      if {[info commands db]!=""} {
+        set rc [sqlite3_errcode db]
+        if {$::ioerropts(-erc)} {
+          # If we are in extended result code mode, make sure all of the
+          # IOERRs we get back really do have their extended code values.
+          if {[regexp {^SQLITE_IOERR} $rc] && ![regexp {IOERR\+\d} $rc]} {
+            return $rc
+          }
+        } else {
+          # If we are not in extended result code mode, make sure no
+          # extended error codes are returned.
+          if {[regexp {\+\d} $rc]} {
+            return $rc
+          }
+        }
+      }
+      # The test repeats as long as $::go is non-zero.  $::go starts out
+      # as 1.  When a test runs to completion without hitting an I/O
+      # error, that means there is no point in continuing with this test
+      # case so set $::go to zero.
+      #
+      if {$::sqlite_io_error_pending>0} {
+        set ::go 0
+        set q 0
+        set ::sqlite_io_error_pending 0
+      } else {
+        set q 1
+      }
+
+      set s [expr $::sqlite_io_error_hit==0]
+      if {$::sqlite_io_error_hit>$::sqlite_io_error_hardhit && $r==0} {
+        set r 1
+      }
+      set ::sqlite_io_error_hit 0
+
+      # One of two things must have happened. either
+      #   1.  We never hit the IO error and the SQL returned OK
+      #   2.  An IO error was hit and the SQL failed
+      #
+      expr { ($s && !$r && !$q) || (!$s && $r && $q) }
+    } {1}
+
+    set ::sqlite_io_error_hit 0
+    set ::sqlite_io_error_pending 0
+
+    # If there is an open database handle and no open transaction,
+    # and the pager is not running in exclusive-locking mode,
+    # check that the pager is in "unlocked" state.
+    #
+    ifcapable pragma {
+      if { [info commands db] ne ""
+        && $::ioerropts(-ckrefcount)
+        && [db one {pragma locking_mode}] eq "normal"
+        && [sqlite3_get_autocommit db]
+      } {
+        do_test $testname.$n.5 {
+          set bt [btree_from_db db]
+          db_enter db
+          array set stats [btree_pager_stats $bt]
+          db_leave db
+          set stats(state)
+        } 0
+      }
+    }
+
+    # If an IO error occurred, then the checksum of the database should
+    # be the same as before the script that caused the IO error was run.
+    #
+    if {$::go && $::sqlite_io_error_hardhit && $::ioerropts(-cksum)} {
+      do_test $testname.$n.6 {
+        catch {db close}
+        catch {db2 close}
+        set ::DB [sqlite3 db test.db; sqlite3_connection_pointer db]
+        set nowcksum [cksum]
+        set res [expr {$nowcksum==$::checksum || $nowcksum==$::goodcksum}]
+        if {$res==0} {
+          output2 "now=$nowcksum"
+          output2 "the=$::checksum"
+          output2 "fwd=$::goodcksum"
+        }
+        set res
+      } 1
+    }
+
+    set ::sqlite_io_error_hardhit 0
+    set ::sqlite_io_error_pending 0
+    if {[info exists ::ioerropts(-cleanup)]} {
+      catch $::ioerropts(-cleanup)
+    }
+  }
+  set ::sqlite_io_error_pending 0
+  set ::sqlite_io_error_persist 0
+  unset ::ioerropts
+}
+
 # Build-configuration globals — upstream tester.tcl:2609..2611 sets
 # `$AUTOVACUUM` from `$sqlite_options(default_autovacuum)`, and
 # test_config.c (set_options) Tcl_LinkVar's the integer build constants

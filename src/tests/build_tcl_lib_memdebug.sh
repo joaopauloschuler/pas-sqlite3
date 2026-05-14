@@ -68,4 +68,3 @@ echo "+ ${FPC_CMD[*]}"
 
 echo "+ file $BIN_DIR/libpassqlite3tcl-memdebug.so"
 file "$BIN_DIR/libpassqlite3tcl-memdebug.so"
-</content>
