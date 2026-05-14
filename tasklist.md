@@ -522,6 +522,13 @@ acceptance gate for this section.
     no `DbFuncStep`/`DbFuncFinal` exist.  Nothing C-faithful to port
     for an aggregate `db function` form.  C ref: `tclsqlite.c:1013..1163`
     (tclSqlFunc), `:3386..3460` (DB_FUNCTION arm).
+  - [ ] **9.4.2.s.1** `DbSqlFunc` script-body forms — the ported
+    `tclSqlFunc` always dispatches the callback via `Tcl_EvalObjv`
+    when argc>0, so a `db function` whose proc body is anything but
+    a bare command name (e.g. `{apply {{x} ...}}` or a multi-word
+    script) fails.  Port C's `useEvalObjv` decision + the
+    list-copy / `Tcl_EvalObjEx` fallback path (`tclsqlite.c` in
+    `tclSqlFunc`).  Surfaced by the 9.4.2.s agent.
   - [X] **9.4.2.t** `db nullvalue` follow-ups + `db errorcode`
     extended-code arm (sqlite3_extended_errcode).  Coupled with
     9.4.6.j.
@@ -563,6 +570,19 @@ acceptance gate for this section.
     source .../tester_min.tcl; source <path>"`, captures rc + timing,
     emits `PASS|FAIL|SKIP <path> <assertions> <duration>` to stdout.
     `bin/TclTestDriver` lands (no gate yet — gate comes in 9.4.4.a).
+  - [ ] **9.4.3.b** Fix the driver polling race — `TclTestDriver`
+    under-reports per-test duration (noted in the 9.4.4.b sweep,
+    which fell back to direct `tclsh + tester_min` invocations with
+    a `timeout` wrapper).  Audit the child-process wait/poll loop in
+    `TclTestDriver.pas`; replace the busy-poll with a blocking
+    `WaitOnExit` + a wall-clock delta captured around it.  Also
+    rebuild `bin/TclTestDriver` (the binary was stale after the
+    9.4.divbug.3 `:memory:`→`./test.db` edit landed in the source).
+  - [ ] **9.4.3.c** Per-test `testdir` wiring — confirm the driver
+    sets `::testdir` to `src/tests/tcl` so the `*_common.tcl` shims
+    copied under 9.4.2.g.13 (`wal_common.tcl`, `fuzz_common.tcl`)
+    resolve, and upstream `source $testdir/<x>_common.tcl` lines
+    find them.  Smoke a test that source-includes one.
 
 - [~] **9.4.4** Skip-list curation.  Tests that depend on
   `sqlite3_test_control`, `PRAGMA legacy_*`, or other internal
@@ -585,9 +605,22 @@ acceptance gate for this section.
     update / boundary1 now run further (helpers landed) but still
     fail on existing divbug.2/3/4 + missing `db one` / `reset_db`
     sub-commands.
+  - [ ] **9.4.4.b.2** Re-sweep the same 10 tests after the
+    2026-05-14 landing wave: divbug.1/3/4/7/8/9/10 all FIXED, plus
+    14 bridge arms (`db eval` 3-arg, function/typed-argv,
+    trace/profile, authorizer, busy/progress/interrupt, the four
+    change hooks, collate, transaction, the trivial-passthrough
+    arms incl. `db one`/`onecolumn`/`exists`, `db status`,
+    `reset_db`).  Expectation: most of the 10 flip to PASS; record
+    the new PASS/FAIL/CRASH split, prune SKIP.md entries that the
+    landed arms unblocked, and open any genuinely new
+    `9.4.divbug.N`.  Prerequisite for 9.4.4.c being meaningful.
+    Use direct `tclsh + tester_min` with a `timeout` wrapper until
+    9.4.3.b fixes the driver.
   - [ ] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
     (ranked by filesize / probable simplicity).  Continue
     skip-and-cite convention.  Triage new divbug.* clusters.
+    Do this only after 9.4.4.b.2 confirms the 10-test baseline.
   - [ ] **9.4.4.d** Broaden sweep to 100 tests.  Expected to surface
     most of the "small bridge gaps" (typed marshalling, eval 3-arg,
     trace/profile).  Land each found gap as a new sub-bullet of
