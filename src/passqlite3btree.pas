@@ -4802,7 +4802,7 @@ begin
 
   { Payload spills onto overflow pages }
   mn        := i32(pPage^.minLocal);
-  n         := mn + (nPayload - mn) mod i32(pBt^.usableSize - 4);
+  n         := mn + (nPayload - mn) mod i32(pPage^.pBt^.usableSize - 4);
   if n > i32(pPage^.maxLocal) then n := mn;
   spaceLeft := n;
   pnSize    := n + nHeader + 4;
