@@ -33,7 +33,7 @@ implementation
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
      TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
-     TestModuleMalloc;
+     TestModuleMalloc, TestModuleEcho;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -3773,6 +3773,8 @@ begin
   Md5_Init(interp);
   { 9.4.6.l.2 — test_tclvar.c: register the `register_tclvar_module` cmd. }
   Sqlitetesttclvar_Init(interp);
+  { 9.4.6.l.1 — test8.c: register_echo_module / sqlite3_declare_vtab. }
+  Sqlitetest8_Init(interp);
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
     atomic_batch_write / load_static_extension. }
   Sqlitetest1_Init(interp);
