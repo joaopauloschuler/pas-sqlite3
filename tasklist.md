@@ -531,9 +531,15 @@ acceptance gate for this section.
   - [ ] **9.4.2.v** `db unlock_notify` (`-DSQLITE_ENABLE_UNLOCK_NOTIFY`
     build only).  Engine port in 9.4.6.k.  Tcl shim is a 1-arg
     callback registration.  C ref: `tclsqlite.c:2820..2870`.
-  - [ ] **9.4.2.w** Bridge symbol-table audit — re-grep `tclsqlite.c`
+  - [X] **9.4.2.w** Bridge symbol-table audit — re-grep `tclsqlite.c`
     after 9.4.2.h..v all land; verify every `Tcl_*` symbol it calls
     has an extern in `PasTclBridge.pas`.  Close gaps.
+    Audit result: no gaps — every `Tcl_*` symbol used by ported arms is
+    declared with a `cdecl` signature matching the Tcl 8.6 C ABI
+    (`int`-width length params correct for 8.6; varargs on
+    `Tcl_AppendResult`; refcount macros bound via `Tcl_Db*RefCount`).
+    Unported-arm symbols (NRE, channels-create, dict, GetVersion,
+    InitStubs, etc.) correctly left undeclared.
   - [ ] **9.4.2.x** NRE (Non-Recursive Eval) support — `db eval`
     with a script body and `db transaction` need
     `Tcl_NRCreateCommand` + `Tcl_NREvalObj` arms to interrupt
