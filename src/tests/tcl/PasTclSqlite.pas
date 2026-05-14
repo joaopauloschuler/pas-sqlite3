@@ -31,7 +31,7 @@ function Sqlite3_SafeInit(interp: PTclInterp): cint; cdecl;
 implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
-     passqlite3codegen, passqlite3dbstat, passqlite3backup;
+     passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -2514,6 +2514,149 @@ begin
   sqlite3_close(pSrc);
 end;
 
+{ DbSerializeArm — port of the DB_SERIALIZE arm of DbObjCmd (tclsqlite.c
+  :3732..3756).  `db serialize ?DATABASE?` — returns a byte-array
+  serialization of DATABASE ("main" by default).  Tries the NOCOPY fast
+  path first, falling back to an owned buffer that is sqlite3_free'd after
+  the byte-array copy (9.4.2.r). }
+function DbSerializeArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:      PSqliteDb;
+  zSchema:  PAnsiChar;
+  sz:       i64;
+  pData:    Pu8;
+  needFree: Boolean;
+begin
+  pDb := PSqliteDb(clientData);
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?DATABASE?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if objc >= 3 then
+    zSchema := Tcl_GetString(ObjvAt(objv, 2))
+  else
+    zSchema := 'main';
+
+  sz := 0;
+  pData := sqlite3_serialize(pDb^.db, zSchema, @sz, SQLITE_SERIALIZE_NOCOPY);
+  if pData <> nil then
+    needFree := False
+  else
+  begin
+    pData := sqlite3_serialize(pDb^.db, zSchema, @sz, 0);
+    needFree := True;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(pData, cint(sz)));
+  if needFree then sqlite3_free(pData);
+  Result := TCL_OK;
+end;
+
+{ DbDeserializeArm — port of the DB_DESERIALIZE arm of DbObjCmd
+  (tclsqlite.c:3133..3203).  `db deserialize ?-maxsize N? ?-readonly BOOL?
+  ?DATABASE? VALUE` — replaces the contents of DATABASE ("main" by
+  default) with the byte-array VALUE via sqlite3_deserialize, transferring
+  buffer ownership with FREEONCLOSE (9.4.2.r). }
+function DbDeserializeArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_FCNTL_SIZE_LIMIT = 36;
+var
+  pDb:        PSqliteDb;
+  zSchema:    PAnsiChar;
+  pValue:     PTclObj;
+  pBA:        PAnsiChar;
+  pData:      Pu8;
+  len:        cint;
+  xrc:        i32;
+  mxSize:     i64;
+  isReadonly: cint;
+  i:          cint;
+  z:          PAnsiChar;
+  wx:         Int64;
+  flags:      u32;
+begin
+  pDb := PSqliteDb(clientData);
+  zSchema    := nil;
+  mxSize     := 0;
+  isReadonly := 0;
+
+  if objc < 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?DATABASE? VALUE'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  i := 2;
+  while i < objc - 1 do
+  begin
+    z := Tcl_GetString(ObjvAt(objv, i));
+    if (StrComp(z, '-maxsize') = 0) and (i < objc - 2) then
+    begin
+      Inc(i);
+      if Tcl_GetWideIntFromObj(interp, ObjvAt(objv, i), @wx) <> TCL_OK then
+      begin
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      mxSize := wx;
+      Inc(i);
+      Continue;
+    end;
+    if (StrComp(z, '-readonly') = 0) and (i < objc - 2) then
+    begin
+      Inc(i);
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @isReadonly) <> TCL_OK then
+      begin
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      Inc(i);
+      Continue;
+    end;
+    if (zSchema = nil) and (i = objc - 2) and (z[0] <> '-') then
+    begin
+      zSchema := z;
+      Inc(i);
+      Continue;
+    end;
+    Tcl_AppendResult(interp, PChar('unknown option: '), z, Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pValue := ObjvAt(objv, objc - 1);
+  len := 0;
+  pBA := Tcl_GetByteArrayFromObj(pValue, @len);
+  pData := Pu8(sqlite3_malloc64(u64(len)));
+  if (pData = nil) and (len > 0) then
+  begin
+    Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  if len > 0 then Move(pBA^, pData^, len);
+  if isReadonly <> 0 then
+    flags := SQLITE_DESERIALIZE_FREEONCLOSE or SQLITE_DESERIALIZE_READONLY
+  else
+    flags := SQLITE_DESERIALIZE_FREEONCLOSE or SQLITE_DESERIALIZE_RESIZEABLE;
+
+  Result := TCL_OK;
+  xrc := sqlite3_deserialize(pDb^.db, zSchema, pData, len, len, flags);
+  if xrc <> 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('unable to set MEMDB content'),
+      Pointer(nil));
+    Result := TCL_ERROR;
+  end;
+  if mxSize > 0 then
+    sqlite3_file_control(pDb^.db, zSchema, SQLITE_FCNTL_SIZE_LIMIT, @mxSize);
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -2786,6 +2929,21 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'restore') = 0) then
   begin
     Result := DbRestoreArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { serialize — tclsqlite.c:3732 (DB_SERIALIZE).  sqlite3_serialize shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'serialize') = 0) then
+  begin
+    Result := DbSerializeArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { deserialize — tclsqlite.c:3133 (DB_DESERIALIZE).  sqlite3_deserialize
+    shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'deserialize') = 0) then
+  begin
+    Result := DbDeserializeArm(clientData, interp, objc, objv);
     Exit;
   end;
 
