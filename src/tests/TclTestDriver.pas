@@ -53,10 +53,31 @@ var
 function ResolveRoot: string;
 var s: string;
 begin
-  s := ExpandFileName(ParamStr(0));
-  { strip /bin/TclTestDriver -> root }
-  Result := ExtractFileDir(ExtractFileDir(s));
-  if Result = '' then Result := GetCurrentDir;
+  s := ParamStr(0);
+  { ParamStr(0) may be a bare name (PATH lookup) or a relative path;
+    ExpandFileName against CWD is only correct for relative-with-slash
+    invocations.  Prefer the well-known absolute install location. }
+  if (Pos(DirectorySeparator, s) = 0) then begin
+    { bare name — fall back to a path containing this source tree }
+    Result := '';
+  end else
+    s := ExpandFileName(s);
+  if s <> '' then
+    Result := ExtractFileDir(ExtractFileDir(s))   { strip /bin/TclTestDriver }
+  else
+    Result := '';
+  { last-resort fallbacks so ::testdir always lands on a real directory }
+  if (Result = '') or
+     (not DirectoryExists(IncludeTrailingPathDelimiter(Result)
+                          + 'src' + DirectorySeparator + 'tests'
+                          + DirectorySeparator + 'tcl')) then
+  begin
+    if DirectoryExists(IncludeTrailingPathDelimiter(GetCurrentDir)
+         + 'src' + DirectorySeparator + 'tests' + DirectorySeparator + 'tcl') then
+      Result := GetCurrentDir
+    else if Result = '' then
+      Result := GetCurrentDir;
+  end;
 end;
 
 procedure ParseArgs;
@@ -88,14 +109,18 @@ var sb: TStringList;
 begin
   sb := TStringList.Create;
   try
-    sb.Add('load ' + gSoPath + ' Sqlite3');
+    sb.Add('load {' + gSoPath + '} Sqlite3');
     sb.Add('package require sqlite3');
-    sb.Add('set ::testdir ' + gTclDir);
+    { 9.4.3.c: ::testdir is pinned to the *absolute* src/tests/tcl path so
+      .test files can `source $::testdir/wal_common.tcl` etc. regardless of
+      the interpreter's current working directory (which 9.4.7.f changes to
+      a per-test tmpdir).  Brace-quoted to survive spaces in the path. }
+    sb.Add('set ::testdir {' + gTclDir + '}');
     sb.Add('source $::testdir/tester_min.tcl');
     { 9.4.4.a: monkey-patch [source] so upstream .test files that begin with
       `source $testdir/tester.tcl` transparently re-route to our tester_min
       shim.  Without this, every upstream .test fails at the first line. }
-    sb.Add('set ::pas_shim_dir ' + gTclDir);
+    sb.Add('set ::pas_shim_dir {' + gTclDir + '}');
     sb.Add('rename source __orig_source');
     sb.Add('proc source {path args} {');
     sb.Add('  set tail [file tail $path]');
