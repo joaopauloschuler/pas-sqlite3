@@ -625,7 +625,7 @@ acceptance gate for this section.
   - [X] **9.4.6.e** `sqlite3_set_authorizer` — engine port +
     pairs with 9.4.2.j Tcl shim.  C ref:
     `../sqlite3/src/auth.c` (entire file, ~250 lines).
-  - [ ] **9.4.6.f** `sqlite3_create_collation` /
+  - [X] **9.4.6.f** `sqlite3_create_collation` /
     `sqlite3_create_collation_v2` — engine surface audit
     (`8.x.colneed` already partial).  Pairs with 9.4.2.m.
   - [ ] **9.4.6.g** `sqlite3_blob_open` / `_read` / `_write` /
