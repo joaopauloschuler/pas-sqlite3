@@ -323,6 +323,82 @@ proc do_delete_file {force args} {
   }
 }
 
+# copy_file / forcecopy / do_copy_file — upstream tester.tcl:197..235.
+# Mirror of delete_file/forcedelete/do_delete_file above: `copy_file`
+# errors on a copy failure, `forcecopy` uses `file copy -force`.  Both
+# share do_copy_file, whose Windows retry path is dormant on Linux
+# (getFileRetries returns 0 by default).  C ref: tester.tcl:197, 201,
+# 205..235.
+proc copy_file {from to} {
+  do_copy_file false $from $to
+}
+
+proc forcecopy {from to} {
+  do_copy_file true $from $to
+}
+
+proc do_copy_file {force from to} {
+  set nRetry [getFileRetries]
+  set nDelay [getFileRetryDelay]
+  if {$nRetry > 0} {
+    for {set i 0} {$i<$nRetry} {incr i} {
+      set rc [catch {
+        if {$force} {
+          file copy -force $from $to
+        } else {
+          file copy $from $to
+        }
+      } msg]
+      if {$rc==0} break
+      if {$nDelay > 0} { after $nDelay }
+    }
+    if {$rc} { error $msg }
+  } else {
+    if {$force} {
+      file copy -force $from $to
+    } else {
+      file copy $from $to
+    }
+  }
+}
+
+# db_save / db_save_and_close / db_restore / db_restore_and_reopen /
+# db_delete_and_reopen — upstream tester.tcl:2458..2486.  Verbatim port
+# of the snapshot helpers: db_save copies the whole test.db* family
+# aside as sv_test.db*, db_restore copies it back, and the *_and_close /
+# *_and_reopen variants additionally close/reopen the `db` handle.
+# All depend only on forcedelete/forcecopy (ported above), so the port
+# is byte-for-byte.  C ref: tester.tcl:2458..2486.
+proc db_save {} {
+  foreach f [glob -nocomplain sv_test.db*] { forcedelete $f }
+  foreach f [glob -nocomplain test.db*] {
+    set f2 "sv_$f"
+    forcecopy $f $f2
+  }
+}
+proc db_save_and_close {} {
+  db_save
+  catch { db close }
+  return ""
+}
+proc db_restore {} {
+  foreach f [glob -nocomplain test.db*] { forcedelete $f }
+  foreach f2 [glob -nocomplain sv_test.db*] {
+    set f [string range $f2 3 end]
+    forcecopy $f2 $f
+  }
+}
+proc db_restore_and_reopen {{dbfile test.db}} {
+  catch { db close }
+  db_restore
+  sqlite3 db $dbfile
+}
+proc db_delete_and_reopen {{file test.db}} {
+  catch { db close }
+  foreach f [glob -nocomplain test.db*] { forcedelete $f }
+  sqlite3 db $file
+}
+
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
 # runs finish_test_precleanup (deregisters test VFSes), optionally
 # sources extra scripts from $argv, closes `db`, then defers to

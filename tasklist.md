@@ -446,7 +446,7 @@ acceptance gate for this section.
     mid-write; parent verifies WAL/journal recovery.  Requires crash
     harness (9.4.7.d).  C ref: `crash.tcl:1..200`,
     `tester.tcl:1893..1968`.
-  - [ ] **9.4.2.g.12** `db_save_and_close` / `db_restore_and_reopen`
+  - [X] **9.4.2.g.12** `db_save_and_close` / `db_restore_and_reopen`
     + `forcecopy` — snapshot helpers for tests that mutate then
     revert.  C ref: `tester.tcl:1714..1760`.
   - [ ] **9.4.2.g.13** `*_common.tcl` source-include shims —
