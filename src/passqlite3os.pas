@@ -441,6 +441,7 @@ type
 type
   PUnixUnusedFd   = ^UnixUnusedFd;
   PunixInodeInfo  = ^unixInodeInfo;
+  PPunixInodeInfo = ^PunixInodeInfo;
   PunixShmNode    = ^unixShmNode;
   PunixShm        = ^unixShm;
   PunixFile       = ^unixFile;
@@ -1454,11 +1455,30 @@ end;
 { ============================================================
   Section 14a: Low-level POSIX advisory locking helper  (os_unix.c)
 
-  Phase 1 simplification: each unixFile owns a private unixInodeInfo
-  (no sharing between multiple sqlite3* handles on the same file within
-  one process).  Cross-process advisory locking via fcntl still works
-  correctly.  Full inodeInfo sharing is deferred to Phase 3.
+  unixInodeInfo objects are shared process-wide via inodeList, keyed by
+  (device, inode).  This is required so that two sqlite3* handles open on
+  the same on-disk file within one process see each other's lock state:
+  POSIX fcntl advisory locks never conflict between fds of the same
+  process, so the inode-level eFileLock/nShared bookkeeping is what
+  enforces SHARED/RESERVED/PENDING/EXCLUSIVE mutual exclusion intra-process.
   ============================================================ }
+
+var
+  { os_unix.c ~1349: list of all unixInodeInfo objects.
+    Protected by unixBigLock (SQLITE_MUTEX_STATIC_VFS1). }
+  inodeList : PunixInodeInfo = nil;
+
+{ os_unix.c ~899: unixEnterMutex / unixLeaveMutex — acquire the global
+  VFS mutex that protects inodeList. }
+procedure unixEnterMutex;
+begin
+  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS1));
+end;
+
+procedure unixLeaveMutex;
+begin
+  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS1));
+end;
 
 { os_unix.c ~1857: unixFileLock — issue a POSIX advisory lock via F_SETLK }
 function unixFileLock(pFile: PunixFile; var lock: FLock): cint;
@@ -1467,29 +1487,105 @@ begin
   Result := FpFcntl(pFile^.h, F_SETLK, lock);
 end;
 
+{ os_unix.c ~1527: unixFindInodeInfo — locate the unixInodeInfo describing
+  pFile's file descriptor, creating a new one if necessary.  The global
+  unixBigLock must be held when calling this routine. }
+function unixFindInodeInfo(pFile: PunixFile;
+                           ppInode: PPunixInodeInfo): cint;
+var
+  rc      : cint;
+  statbuf : Stat;
+  fileId  : unixFileId;
+  pInode  : PunixInodeInfo;
+begin
+  rc := FpFStat(pFile^.h, statbuf);
+  if rc <> 0 then begin
+    pFile^.lastErrno := fpgeterrno;
+    Result := SQLITE_IOERR;
+    Exit;
+  end;
+
+  FillChar(fileId, SizeOf(fileId), 0);
+  fileId.dev := statbuf.st_dev;
+  fileId.ino := u64(statbuf.st_ino);
+
+  pInode := inodeList;
+  while (pInode <> nil) and
+        (CompareByte(fileId, pInode^.fileId, SizeOf(fileId)) <> 0) do
+    pInode := pInode^.pNext;
+
+  if pInode = nil then begin
+    pInode := PunixInodeInfo(sqlite3_malloc(SizeOf(unixInodeInfo)));
+    if pInode = nil then begin
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    FillChar(pInode^, SizeOf(unixInodeInfo), 0);
+    Move(fileId, pInode^.fileId, SizeOf(fileId));
+    pInode^.pLockMutex := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+    if pInode^.pLockMutex = nil then begin
+      sqlite3_free(pInode);
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    pInode^.nRef  := 1;
+    pInode^.pNext := inodeList;
+    pInode^.pPrev := nil;
+    if inodeList <> nil then
+      inodeList^.pPrev := pInode;
+    inodeList := pInode;
+  end else
+    Inc(pInode^.nRef);
+
+  ppInode^ := pInode;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c ~1490: unixReleaseInodeInfo — drop a reference to the
+  unixInodeInfo previously obtained from unixFindInodeInfo.  The global
+  unixBigLock must be held; the inode's pLockMutex must NOT be held. }
+procedure unixReleaseInodeInfo(pFile: PunixFile);
+var
+  pInode : PunixInodeInfo;
+begin
+  pInode := pFile^.pInode;
+  if pInode = nil then Exit;
+  Dec(pInode^.nRef);
+  if pInode^.nRef = 0 then begin
+    { Phase 1: closePendingFds omitted — deferred to Phase 3 }
+    if pInode^.pPrev <> nil then
+      pInode^.pPrev^.pNext := pInode^.pNext
+    else
+      inodeList := pInode^.pNext;
+    if pInode^.pNext <> nil then
+      pInode^.pNext^.pPrev := pInode^.pPrev;
+    if pInode^.pLockMutex <> nil then
+      sqlite3_mutex_free(pInode^.pLockMutex);
+    sqlite3_free(pInode);
+  end;
+end;
+
 { ============================================================
   Section 14b: unix I/O method implementations  (os_unix.c)
   These are the cdecl functions stored in the unixIoMethods vtable.
   ============================================================ }
 
 { os_unix.c ~2341: unixClose_impl
-  Unlocks, frees the private inodeInfo, closes the fd, and zeroes the struct. }
+  Unlocks, drops the inodeInfo reference, closes the fd, zeroes the struct. }
 function unixClose_impl(pFile: Psqlite3_file): cint; cdecl;
 var
-  pf    : PunixFile;
-  pInode: PunixInodeInfo;
+  pf : PunixFile;
 begin
   pf := PunixFile(pFile);
   { Unlock: release any held lock }
   unixUnlock_impl(pFile, NO_LOCK);
 
-  pInode := pf^.pInode;
-  if pInode <> nil then begin
-    { Free the lock mutex }
-    if pInode^.pLockMutex <> nil then
-      sqlite3_mutex_free(pInode^.pLockMutex);
-    { Phase 1: private inodeInfo — free it directly }
-    sqlite3_free(pInode);
+  { Drop our reference on the shared inodeInfo (os_unix.c ~2360).
+    unixReleaseInodeInfo frees it once the last reference is gone. }
+  if pf^.pInode <> nil then begin
+    unixEnterMutex;
+    unixReleaseInodeInfo(pf);
+    unixLeaveMutex;
   end;
 
   if pf^.pPreallocatedUnused <> nil then
@@ -2201,24 +2297,18 @@ begin
   if (flags and SQLITE_OPEN_URI) <> 0 then
     ctrlFlags := ctrlFlags or UNIXFILE_URI;
 
-  { Allocate a private inodeInfo (Phase 1 simplification: one per file) }
-  pInode := PunixInodeInfo(sqlite3_malloc(SizeOf(unixInodeInfo)));
-  if pInode = nil then begin
+  { Locate (or create) the process-wide shared inodeInfo keyed by
+    (device, inode) so that multiple sqlite3* handles on the same file
+    share lock state (os_unix.c ~6138: findInodeInfo). }
+  p^.h := fd;
+  unixEnterMutex;
+  Result := unixFindInodeInfo(p, @pInode);
+  unixLeaveMutex;
+  if Result <> SQLITE_OK then begin
     FpClose(fd);
+    p^.h := -1;
     if p^.pPreallocatedUnused <> nil then
       sqlite3_free(p^.pPreallocatedUnused);
-    Result := SQLITE_NOMEM;
-    Exit;
-  end;
-  FillChar(pInode^, SizeOf(unixInodeInfo), 0);
-  pInode^.nRef := 1;
-  pInode^.pLockMutex := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
-  if pInode^.pLockMutex = nil then begin
-    FpClose(fd);
-    sqlite3_free(pInode);
-    if p^.pPreallocatedUnused <> nil then
-      sqlite3_free(p^.pPreallocatedUnused);
-    Result := SQLITE_NOMEM;
     Exit;
   end;
 

@@ -6730,7 +6730,13 @@ begin
 
     if rc <> SQLITE_OK then
       unlockBtreeIfUnused(pBt);
-  until (rc and $FF) <> SQLITE_BUSY;
+  { btree.c:3736..3737 — retry only while BUSY *and* no transaction was
+    already open *and* the busy-handler asks us to try again.  The two
+    latter conjuncts were previously dropped, so a BUSY with no busy
+    handler installed spun forever (9.4.divbug.21). }
+  until ((rc and $FF) <> SQLITE_BUSY) or
+        (pBt^.inTransaction <> TRANS_NONE) or
+        (btreeInvokeBusyHandler(pBt) = 0);
 
   if rc = SQLITE_OK then begin
     if p^.inTrans = TRANS_NONE then
