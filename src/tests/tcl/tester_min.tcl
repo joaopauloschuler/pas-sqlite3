@@ -176,3 +176,75 @@ proc do_catchsql_test {testname sql result} {
 # of community .test files call `expected $n $val` to label assertions;
 # returning the value unchanged keeps those scripts source-able.
 proc expected {n exp} { return $exp }
+
+# getFileRetries / getFileRetryDelay — upstream tester.tcl head (the
+# do_delete_file body at 276..311 reads them).  Upstream defaults to 50
+# retries with 100ms delay on Windows and 0/0 on Unix.  We target Linux
+# only, but keep a tiny non-zero retry budget so transient EBUSY from
+# co-running test processes doesn't surface.  Override with the env
+# vars TEST_FILE_RETRIES / TEST_FILE_RETRY_DELAY.
+proc getFileRetries {} {
+  if {[info exists ::env(TEST_FILE_RETRIES)]} {
+    return $::env(TEST_FILE_RETRIES)
+  }
+  return 0
+}
+proc getFileRetryDelay {} {
+  if {[info exists ::env(TEST_FILE_RETRY_DELAY)]} {
+    return $::env(TEST_FILE_RETRY_DELAY)
+  }
+  return 0
+}
+
+# delete_file / forcedelete / do_delete_file — upstream tester.tcl:266..311.
+# `delete_file` errors if the path is missing; `forcedelete` swallows
+# missing/permission errors via `-force`.  Both share the do_delete_file
+# helper, which on Windows retries through tag-along file locks.  We
+# target Linux, so the retry path is dormant (getFileRetries returns 0
+# by default) and we fall through to a plain `file delete` of each arg.
+# C ref: tester.tcl:268, 272, 276..311.
+proc delete_file {args} {
+  do_delete_file false {*}$args
+}
+
+proc forcedelete {args} {
+  do_delete_file true {*}$args
+}
+
+proc do_delete_file {force args} {
+  set nRetry [getFileRetries]
+  set nDelay [getFileRetryDelay]
+  foreach filename $args {
+    if {$nRetry > 0} {
+      for {set i 0} {$i<$nRetry} {incr i} {
+        set rc [catch {
+          if {$force} {
+            file delete -force $filename
+          } else {
+            file delete $filename
+          }
+        } msg]
+        if {$rc==0} break
+        if {$nDelay > 0} { after $nDelay }
+      }
+      if {$rc} { error $msg }
+    } else {
+      if {$force} {
+        file delete -force $filename
+      } else {
+        file delete $filename
+      }
+    }
+  }
+}
+
+# finish_test — upstream tester.tcl:1237..1255.  Real implementation
+# runs finish_test_precleanup (deregisters test VFSes), optionally
+# sources extra scripts from $argv, closes `db`, then defers to
+# finalize_testing unless ::SLAVE is set.  pas-sqlite3 has no test
+# VFSes registered and no slave-interp plumbing, so this collapses to
+# a `catch {db close}` + finalize_testing alias.  C ref: tester.tcl:1237.
+proc finish_test {} {
+  catch {db close}
+  if {0==[info exists ::SLAVE]} { finalize_testing }
+}

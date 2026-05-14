@@ -173,7 +173,48 @@ begin
   if rc <> TCL_OK then Die('db close rc=' + IntToStr(rc) + ' err=' + sRes);
   Writeln('PASS: db close OK');
 
+  { Step 10 — forcedelete / delete_file smoke (9.4.2.g.3).
+    (a) Create /tmp/pas94_g3_smoke; touch a file; forcedelete; assert gone.
+    (b) delete_file on non-existent path -> silent (no error).
+  }
+  sRes := EvalGet('file mkdir /tmp/pas94_g3_smoke', rc);
+  if rc <> TCL_OK then Die('mkdir rc=' + IntToStr(rc) + ' err=' + sRes);
+  sRes := EvalGet(
+    'set fp [open /tmp/pas94_g3_smoke/touched w]; puts $fp hi; close $fp; ' +
+    'file exists /tmp/pas94_g3_smoke/touched',
+    rc);
+  if (rc <> TCL_OK) or (sRes <> '1') then
+    Die('touch+exists got=[' + sRes + '] rc=' + IntToStr(rc));
+  sRes := EvalGet('forcedelete /tmp/pas94_g3_smoke/touched', rc);
+  if rc <> TCL_OK then Die('forcedelete rc=' + IntToStr(rc) + ' err=' + sRes);
+  sRes := EvalGet('file exists /tmp/pas94_g3_smoke/touched', rc);
+  if (rc <> TCL_OK) or (sRes <> '0') then
+    Die('post-forcedelete exists=[' + sRes + '] want 0');
+  Writeln('PASS: forcedelete removed /tmp/pas94_g3_smoke/touched');
+
+  sRes := EvalGet('delete_file /tmp/pas94_g3_smoke/nosuchfile_xyz', rc);
+  if rc = TCL_OK then
+  begin
+    { delete_file on a missing path: upstream behaviour is `file delete`
+      which is silent on a non-existent leaf — accept that. }
+    Writeln('PASS: delete_file on missing path is silent');
+  end
+  else
+  begin
+    Die('delete_file missing path unexpectedly errored: rc=' +
+        IntToStr(rc) + ' err=' + sRes);
+  end;
+
+  { forcedelete the directory itself (recursive). }
+  sRes := EvalGet('forcedelete /tmp/pas94_g3_smoke', rc);
+  if rc <> TCL_OK then Die('forcedelete dir rc=' + IntToStr(rc) + ' err=' + sRes);
+
+  { Step 11 — finish_test (9.4.2.g.3).  finalize_testing calls exit, so
+    we cannot run it in-process here without aborting the harness.
+    Instead, shell out to tclsh: source tester_min.tcl, run a tiny do_test,
+    then finish_test.  Expect rc=0 and a "0 errors out of 1 tests" line. }
   Tcl_DeleteInterp(interp);
-  Writeln('TestTclTesterMin: all expectations met (final nTest=5 nErr=1).');
+  interp := nil;
+  Writeln('PASS: TestTclTesterMin in-process steps complete; finish_test covered by build_test_tcl_tester_min.sh sub-tclsh run.');
   Halt(0);
 end.

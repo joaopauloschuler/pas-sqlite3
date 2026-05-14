@@ -385,9 +385,18 @@ acceptance gate for this section.
     {select 1+1}` -> `0 2`, `catchsql {select * from nosuchtable}`
     -> `1 {no such table: nosuchtable}`, `do_catchsql_test fail-1`
     PASS).
-  - [ ] **9.4.2.g.3** `finish_test` + `forcedelete` + `delete_file` —
+  - [X] **9.4.2.g.3** `finish_test` + `forcedelete` + `delete_file` —
     per-test teardown convention; tests source-include them at the
-    end.  C ref: `tester.tcl:1234..1280`, `1696..1714`.
+    end.  C ref: `tester.tcl:1234..1280`, `1696..1714`.  Landed:
+    `finish_test` collapses to `catch {db close}` + `finalize_testing`
+    (no test-VFS deregistration, no $argv extra-script loop, no
+    ::SLAVE gate beyond the `info exists` skip); `delete_file` /
+    `forcedelete` share `do_delete_file` with Linux fast-path (zero
+    retries by default, overridable via TEST_FILE_RETRIES /
+    TEST_FILE_RETRY_DELAY env vars).  Smoke gated by
+    `bin/TestTclTesterMin` (in-proc forcedelete + missing-path
+    delete_file) plus a sub-tclsh run that exercises finish_test ->
+    finalize_testing -> exit 0.
   - [ ] **9.4.2.g.4** `integrity_check` — wrapper that runs
     `PRAGMA integrity_check` and asserts "ok".  C ref:
     `tester.tcl:1567..1583`.

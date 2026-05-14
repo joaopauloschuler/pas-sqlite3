@@ -45,4 +45,32 @@ echo "+ $BIN_DIR/TestTclTesterMin"
 "$BIN_DIR/TestTclTesterMin"
 rc=$?
 echo "TestTclTesterMin rc=$rc"
-exit $rc
+if [ $rc -ne 0 ]; then exit $rc; fi
+
+# 9.4.2.g.3 finish_test sub-tclsh gate.  finalize_testing calls exit, so
+# we can't drive it from the in-process Pascal harness.  Spawn a child
+# tclsh that loads the pas-sqlite3 Tcl bridge, sources tester_min.tcl,
+# runs one trivial do_test, then finish_test.  Expect rc=0 (no errors)
+# and the canonical "0 errors out of 1 tests" summary line.
+echo "+ tclsh sub-process: tester_min.tcl finish_test gate"
+SUB_OUT="$(tclsh <<TCL
+load {$BIN_DIR/libpassqlite3tcl.so} Sqlite3
+package require sqlite3
+source {$TCL_DIR/tester_min.tcl}
+sqlite3 db :memory:
+do_test g3-finish-1 { expr 41+1 } 42
+finish_test
+TCL
+)"
+sub_rc=$?
+echo "$SUB_OUT"
+if [ $sub_rc -ne 0 ]; then
+  echo "ERROR: sub-tclsh finish_test exited rc=$sub_rc"
+  exit $sub_rc
+fi
+if ! echo "$SUB_OUT" | grep -q '0 errors out of 1 tests'; then
+  echo "ERROR: sub-tclsh finish_test missing summary line"
+  exit 3
+fi
+echo "PASS: sub-tclsh finish_test rc=0 with expected summary"
+exit 0
