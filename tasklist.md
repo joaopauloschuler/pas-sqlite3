@@ -819,12 +819,13 @@ acceptance gate for this section.
   Likely overflow in `sqlite3_last_insert_rowid` path or a stale
   pointer in the `db last_insert_rowid` sub-command shim.
   See DIVERGENCES.md.
-- [ ] **9.4.divbug.10** `boundary1.test` SELECTs on small-integer
-  primary-key ranges (`boundary1-2.66.ge.*`) return `{}` where
-  upstream returns the expected 64-element sequence; the `le`
-  variants pass.  Suggests a `>=` / range-scan operand mishandled
-  in WhereCode when the lower bound equals the table minimum.
-  1481/1511 sub-tests fire this fingerprint.  See DIVERGENCES.md.
+- [X] **9.4.divbug.10** `boundary1.test` SELECTs returned `{}` not
+  because of WhereCode, but because `boundary1-1.1`'s 64 `INSERT INTO
+  t1(oid,a,x) VALUES(...)` rows all failed: sqlite3Insert's IDLIST
+  loop errored on any name not a real column, never honouring the
+  rowid-alias branch (C insert.c:1097).  Table stayed empty so every
+  downstream query returned `{}`.  Fixed by porting the `ipkColumn`
+  rowid-alias arm.  See DIVERGENCES.md.
 
 ---
 

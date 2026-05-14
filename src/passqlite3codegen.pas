@@ -35597,6 +35597,7 @@ var
   ipkInSelect:    Boolean;
   k:              i32;
   pNx:            PUpsert;
+  ipkColumn:      i32;
   pTabItem0:      PSrcItem;
   needsGenericCoro: Boolean;
   addrTopCoro:    i32;
@@ -35624,6 +35625,7 @@ begin
   pTab          := nil;
   v             := nil;
   bIdListInOrder := 0;
+  ipkColumn     := -1;
   pRowsList     := nil;
   nRows         := 1;
   isMulti       := False;
@@ -35960,15 +35962,31 @@ generic_coro_done:
     for i := 0 to pColumn^.nId - 1 do
     begin
       j := sqlite3ColumnIndex(pTab, pIdItems[i].zName);
-      if j < 0 then
+      if j >= 0 then
+      begin
+        if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
+        if i <> j then bIdListInOrder := 0;
+        if j = i32(pTab^.iPKey) then
+        begin
+          ipkColumn := i;
+          { assert( withoutRowid = 0 ) }
+        end;
+      end
+      else if (sqlite3IsRowid(pIdItems[i].zName) <> 0) and (withoutRowid = 0) then
+      begin
+        { Rowid alias named in IDLIST for a table with no declared
+          INTEGER PRIMARY KEY — C insert.c:1097..1099.  The IDLIST index
+          becomes ipkColumn; the term carries the user-supplied rowid. }
+        ipkColumn := i;
+        bIdListInOrder := 0;
+      end
+      else
       begin
         sqlite3ErrorMsg(pParse,
           PAnsiChar('table has no column with that name'));
         pParse^.parseFlags := pParse^.parseFlags or $200;
         goto insert_cleanup;
       end;
-      if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
-      if i <> j then bIdListInOrder := 0;
     end;
   end;
 
@@ -36119,6 +36137,15 @@ generic_coro_done:
           regFromSelect + i32(pTab^.iPKey), regRowid);
         ipkInSelect := True;
       end;
+    end
+    else if ipkColumn >= 0 then
+    begin
+      { Rowid-alias IDLIST term, no declared IPK — C insert.c:1346..1350.
+        The coroutine streams IDLIST values into regFromSelect in order,
+        so the rowid term lives at regFromSelect + ipkColumn. }
+      sqlite3VdbeAddOp2(v, OP_Copy,
+        regFromSelect + ipkColumn, regRowid);
+      ipkInSelect := True;
     end;
   end;
 
@@ -36293,6 +36320,24 @@ generic_coro_done:
         sqlite3VdbeJumpHere(v, addrIpkNotNull);
         sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
       end
+      else if (pTab^.iPKey < 0) and (ipkColumn >= 0) then
+      begin
+        { Rowid alias named in IDLIST, no declared INTEGER PRIMARY KEY —
+          C insert.c:1506..1535.  Load the user-supplied rowid term, then
+          fall back to OP_NewRowid when it is NULL. }
+        if useTempTable then
+          sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid)
+        else if useCoroutine then
+        begin
+          { Rowid already copied into regRowid in the coroutine arm. }
+        end
+        else
+          sqlite3ExprCode(pParse, pListItems[ipkColumn].pExpr, regRowid);
+        addrIpkNotNull := sqlite3VdbeAddOp1(v, OP_NotNull, regRowid);
+        sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+        sqlite3VdbeJumpHere(v, addrIpkNotNull);
+        sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
+      end
       else if withoutRowid <> 0 then
         sqlite3VdbeAddOp2(v, OP_Null, 0, regRowid)
       else
@@ -36337,8 +36382,20 @@ generic_coro_done:
     else if not (isView <> 0) then
     begin
       bMayReplace := False;
-      if (pTab^.iPKey >= 0) and ipkColumnPresent then pkChng := 1 else pkChng := 0;
-      if (pTab^.iPKey >= 0) and ipkColumnPresent then appendBias := 0 else appendBias := 1;
+      { C insert.c:1570 passes ipkColumn>=0 as pkChng.  ipkColumn is set
+        for a declared IPK named in the IDLIST/positional, or for a rowid
+        alias named in the IDLIST. }
+      if ((pTab^.iPKey >= 0) and ipkColumnPresent) or (ipkColumn >= 0) then
+        pkChng := 1
+      else
+        pkChng := 0;
+      { appendFlag (C) is set only in the auto-NewRowid branches; a
+        user-supplied rowid (declared IPK present, or rowid alias) leaves
+        it 0 so appendBias stays 0. }
+      if ((pTab^.iPKey >= 0) and ipkColumnPresent) or (ipkColumn >= 0) then
+        appendBias := 0
+      else
+        appendBias := 1;
       sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
         regIns, 0, pkChng, u8(onError), endOfLoop,
         @bMayReplace, nil, pUpsert);

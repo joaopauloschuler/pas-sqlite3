@@ -219,17 +219,27 @@ Result: lastinsert.test → 6/6 Ok; engine regression 99/100
 Surfaced by: 9.4.4.b re-sweep (was masked in 9.4.4.a by
 `catchsql` absence — the test couldn't reach this line).
 
-## 9.4.divbug.10 — `boundary1.test` `>=` range scan returns empty
+## 9.4.divbug.10 — `boundary1.test` empty results — FIXED
 
 Affects: 1 test (`../sqlite3/test/boundary1.test`).
-Symptom: 1481 / 1511 sub-tests fail with the same fingerprint —
-`SELECT a FROM t1 WHERE a >= <small-int> ORDER BY a` returns `{}`
-where upstream returns the full 64-element sequence.  The `<`,
-`<=`, and `=` siblings all PASS; only `>=` and (sometimes) `>` fail.
-Likely cause: WhereCode mis-encodes the `>=` operand against an
-integer-PK column when the lower bound equals the table minimum —
-possibly an off-by-one in `OP_SeekGE` / `OP_IdxGE` setup, or an
-inverted `bRev` flag dropping every result.
+Symptom: 1481 / 1511 sub-tests failed returning `{}`.
+Root cause: NOT a WhereCode bug.  `boundary1-1.1` populates the
+table with 64 `INSERT INTO t1(oid,a,x) VALUES(...)` rows — i.e. it
+names the rowid alias `oid` in the IDLIST.  `sqlite3Insert`'s
+IDLIST-resolution loop (passqlite3codegen.pas) unconditionally
+raised "table has no column with that name" whenever
+`sqlite3ColumnIndex` returned `< 0`, never porting C's rowid-alias
+branch (insert.c:1097: `if sqlite3IsRowid(name) && !withoutRowid`).
+So `boundary1-1.1` failed, the table stayed empty, and every
+downstream SELECT — `>=`, `>`, `<`, `<=`, `=` alike — returned `{}`.
+Fix: ported the C `ipkColumn` concept.  The IDLIST loop now sets
+`ipkColumn` (the IDLIST index) for a declared-IPK column or a
+rowid-alias term; rowid-alias terms with no declared IPK are
+accepted instead of erroring.  Added the matching rowid-emission
+arm (`pTab^.iPKey < 0 and ipkColumn >= 0` → ExprCode the term,
+NotNull/NewRowid/MustBeInt) and the coroutine `OP_Copy` arm, and
+fed `ipkColumn >= 0` into the `pkChng` / `appendBias` decision
+(C insert.c:1570).  WITHOUT ROWID tables still reject rowid aliases.
 Surfaced by: 9.4.4.b re-sweep (was guard-skipped in 9.4.4.a by
 missing `working_64bit_int`).
 
