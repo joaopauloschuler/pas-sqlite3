@@ -356,6 +356,17 @@ function sqlite3_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
 function sqlite3_cancel_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
 procedure sqlite3_reset_auto_extension;
 
+{ sqlite3AutoLoadExtensions — loadext.c:908.  Runs every registered
+  auto-extension against a freshly-opened connection.  The auto-extension
+  init functions take the C signature
+    int xInit(sqlite3*, char**, const sqlite3_api_routines*)
+  which the port models as Tsqlite3_loadext_entry below. }
+type
+  Tsqlite3_loadext_entry = function(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+                                    pThunk: Pointer): i32; cdecl;
+
+procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
+
 { ----------------------------------------------------------------------
   Phase 6.9-bis step 11g.1 — schema-init dispatcher.
 
@@ -962,6 +973,14 @@ begin
 
   sqlite3Error(db, SQLITE_OK);
   rc := SQLITE_OK;
+
+  { Load automatic extensions — extensions registered via
+    sqlite3_auto_extension().  Port of main.c:3618..3627. }
+  if rc = SQLITE_OK then begin
+    sqlite3AutoLoadExtensions(db);
+    rc := sqlite3_errcode(db);
+    if rc <> SQLITE_OK then goto opendb_out;
+  end;
 
 opendb_out:
   if (rc and $FF) = SQLITE_NOMEM then begin
@@ -2911,6 +2930,46 @@ begin
   SetLength(gAutoExt, 0);
   gAutoExtN := 0;
   sqlite3_mutex_leave(pMainMtx);
+end;
+
+{ sqlite3AutoLoadExtensions — loadext.c:908.  Faithful.  SQLITE_OMIT_LOAD_
+  EXTENSION is set for this port, so pThunk is always nil. }
+procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
+var
+  i        : i32;
+  go       : Boolean;
+  rc       : i32;
+  xInit    : Tsqlite3_loadext_entry;
+  zErrmsg  : PAnsiChar;
+  zMsg     : PAnsiChar;
+  pMainMtx : Psqlite3_mutex;
+begin
+  if gAutoExtN = 0 then Exit;
+  go := True;
+  i  := 0;
+  pMainMtx := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+  while go do begin
+    sqlite3_mutex_enter(pMainMtx);
+    if i >= gAutoExtN then begin
+      xInit := nil;
+      go    := False;
+    end else
+      xInit := Tsqlite3_loadext_entry(gAutoExt[i]);
+    sqlite3_mutex_leave(pMainMtx);
+    zErrmsg := nil;
+    if Assigned(xInit) then begin
+      rc := xInit(db, @zErrmsg, nil);
+      if rc <> 0 then begin
+        zMsg := sqlite3MPrintf(db,
+          'automatic extension loading failed: %s', [zErrmsg]);
+        sqlite3ErrorWithMsg(db, rc, zMsg);
+        sqlite3DbFree(db, zMsg);
+        go := False;
+      end;
+    end;
+    sqlite3_free(zErrmsg);
+    Inc(i);
+  end;
 end;
 
 { ----------------------------------------------------------------------
