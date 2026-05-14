@@ -66,6 +66,21 @@ type
   { Tcl_CmdDeleteProc — typedef'd in tcl.h:760. }
   TTclCmdDeleteProc = procedure(clientData: TClientData); cdecl;
 
+  { Tcl_CmdInfo — tcl.h struct queried by Tcl_GetCommandInfo.  Field
+    order/types must match tcl.h exactly; only objClientData is read by
+    register_dbstat_vtab (the SqliteDb* behind a `db` command). }
+  PTclCmdInfo = ^TTclCmdInfo;
+  TTclCmdInfo = record
+    isNativeObjectProc: cint;
+    objProc:            Pointer;
+    objClientData:      TClientData;
+    proc:               Pointer;
+    clientData:         TClientData;
+    deleteProc:         Pointer;
+    deleteData:         TClientData;
+    namespacePtr:       Pointer;
+  end;
+
 { ----------------------------------------------------------------------
   Interpreter lifecycle.  tclsqlite.c:4583 (CreateInterp), paired Delete. }
 function  Tcl_CreateInterp: PTclInterp; cdecl; external 'tcl8.6';
@@ -85,6 +100,11 @@ function Tcl_DuplicateObj(objPtr: PTclObj): PTclObj; cdecl; external 'tcl8.6';
 function Tcl_CreateObjCommand(interp: PTclInterp; cmdName: PChar;
   proc: TTclObjCmdProc; clientData: TClientData;
   deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ Command introspection — returns 1 and fills infoPtr if cmdName exists.
+  Used by register_dbstat_vtab (test1.c:8601) to recover the SqliteDb*. }
+function Tcl_GetCommandInfo(interp: PTclInterp; cmdName: PChar;
+  infoPtr: PTclCmdInfo): cint; cdecl; external 'tcl8.6';
 
 { Command teardown.  tclsqlite.c:2744 (Tcl_DeleteCommand by name in
   the DB_CLOSE arm of DbObjCmd); token form is the modern API.  Both

@@ -31,7 +31,7 @@ function Sqlite3_SafeInit(interp: PTclInterp): cint; cdecl;
 implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
-     passqlite3codegen;
+     passqlite3codegen, passqlite3dbstat;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -2777,6 +2777,36 @@ begin
   Result := TCL_OK;
 end;
 
+{ TestRegisterDbstatVtab — Tcl `register_dbstat_vtab DB`.  Pas port of
+  test_register_dbstat_vtab (test1.c:8583..8609).  Resolves the named
+  `db` command back to its SqliteDb* via Tcl_GetCommandInfo, then calls
+  sqlite3DbstatRegister to install the eponymous `dbstat` vtab on that
+  connection.  Mirrors C: a non-existent command name is silently
+  ignored (Tcl_GetCommandInfo returns 0), only objc!=2 is an error. }
+function TestRegisterDbstatVtab(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zDb:     PAnsiChar;
+  cmdInfo: TTclCmdInfo;
+  pDb:     PSqliteDb;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  zDb := Tcl_GetString(ObjvAt(objv, 1));
+  if Tcl_GetCommandInfo(interp, zDb, @cmdInfo) <> 0 then
+  begin
+    pDb := PSqliteDb(cmdInfo.objClientData);
+    if (pDb <> nil) and (pDb^.db <> nil) then
+      sqlite3DbstatRegister(pDb^.db);
+  end;
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -2785,6 +2815,8 @@ begin
     @DbMain, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite'),
     @DbMain, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('register_dbstat_vtab'),
+    @TestRegisterDbstatVtab, nil, nil);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;
