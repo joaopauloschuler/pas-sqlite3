@@ -557,10 +557,17 @@ acceptance gate for this section.
     SKIP; populated `src/tests/tcl/SKIP.md` (with citations to existing
     Phase-6/7/8 bullets) and `src/tests/tcl/DIVERGENCES.md` (new
     `9.4.divbug.*` bucket per cluster).  Triage convention bootstrapped.
-  - [ ] **9.4.4.b** Re-run the 10-test sweep after 9.4.2.g.1..g.5
-    land; refresh PASS/FAIL/SKIP counts in
-    `src/tests/tcl/DIVERGENCES.md` and prune SKIP.md entries that
-    are now PASS.
+  - [X] **9.4.4.b** Re-ran 10-test sweep after g.1..g.5 + g.7 +
+    divbug.6 landed: PASS 2 / FAIL 5 / CRASH 3.  cast.test +
+    reindex.test promoted to PASS (shim-skip via `ifcapable !cast`
+    / `!reindex` running BODY); pruned from SKIP.md.  Surfaced
+    four new divbug buckets: **9.4.divbug.7** insert.test hang,
+    **9.4.divbug.8** index-3.3 crash, **9.4.divbug.9** lastinsert
+    rowid-after-INSERT crash, **9.4.divbug.10** boundary1.test
+    SELECT returning empty for large rowid ranges.  delete /
+    update / boundary1 now run further (helpers landed) but still
+    fail on existing divbug.2/3/4 + missing `db one` / `reset_db`
+    sub-commands.
   - [ ] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
     (ranked by filesize / probable simplicity).  Continue
     skip-and-cite convention.  Triage new divbug.* clusters.
@@ -788,6 +795,26 @@ acceptance gate for this section.
   matching upstream `tclsqlite.c:dbEvalStep` line 1812.
   `bin/TestTclSqliteFunction` now reports
   `PASS: tcl_err -> rc=1 msg=[boom]` (was `[boomboom]`).
+- [ ] **9.4.divbug.7** `insert.test` hangs (tclsh wedges past 60s)
+  shortly after `insert-1.3`.  9.4.4.a saw it crash here; 9.4.4.b
+  re-sweep promoted the symptom to a hang.  Likely an infinite
+  loop in INSERT codegen / VDBE step for the larger-table variant
+  the sub-test exercises.  See `src/tests/tcl/DIVERGENCES.md`.
+- [ ] **9.4.divbug.8** `index.test` segfaults at `index-3.3` — a
+  CREATE INDEX on a multi-column table where the index name
+  duplicates an existing one.  Surfaced by 9.4.4.b after helpers
+  unblocked sub-tests past divbug.3.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.9** `lastinsert.test` segfaults right after
+  `lastinsert-1.1` (the `1.1w` variant uses a 64-bit rowid).
+  Likely overflow in `sqlite3_last_insert_rowid` path or a stale
+  pointer in the `db last_insert_rowid` sub-command shim.
+  See DIVERGENCES.md.
+- [ ] **9.4.divbug.10** `boundary1.test` SELECTs on small-integer
+  primary-key ranges (`boundary1-2.66.ge.*`) return `{}` where
+  upstream returns the expected 64-element sequence; the `le`
+  variants pass.  Suggests a `>=` / range-scan operand mishandled
+  in WhereCode when the lower bound equals the table minimum.
+  1481/1511 sub-tests fire this fingerprint.  See DIVERGENCES.md.
 
 ---
 

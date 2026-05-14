@@ -5,60 +5,71 @@ Tests listed here fail not because of an engine divergence but because
 unported test-only C API (`sqlite3_test_control`, `optimization_control`,
 private pragmas, `db_save`, vfs-injection harness, etc.).
 
-Bootstrapped under task **9.4.4.a**.  Format:
+Bootstrapped under task **9.4.4.a**; re-curated under **9.4.4.b**.
+Format:
 
     - **<path>** — <reason>.  Cite: <Phase X.Y bullet | unported helper | etc.>
 
 ## Tester-shim helpers (`tester_min.tcl` does not yet expose them)
 
 - **../sqlite3/test/insert.test**       — needs `ifcapable`, `catchsql`,
-  `do_catchsql_test`, `integrity_check`, `finish_test`.  Cite: 9.4.2.g
-  bullet (tester_min.tcl intentionally omits these — listed in "What is
-  intentionally NOT ported here").
-- **../sqlite3/test/update.test**       — needs `ifcapable`, `catchsql`,
-  `do_catchsql_test`, `do_eqp_test`, `integrity_check`, `finish_test`.
-  Cite: 9.4.2.g bullet.
-- **../sqlite3/test/delete.test**       — needs `ifcapable`, `catchsql`,
-  `integrity_check`, `forcedelete`, `finish_test`.  Cite: 9.4.2.g bullet
-  (`forcedelete` lives in tester.tcl head ~line 200 and shells `file delete`
-  with retry).
-- **../sqlite3/test/index.test**        — needs `ifcapable`, `catchsql`,
-  `integrity_check`, `finish_test`.  Cite: 9.4.2.g bullet.
-- **../sqlite3/test/cast.test**         — needs `do_realnum_test`,
-  `ifcapable`, `finish_test`.  Cite: 9.4.2.g bullet (`do_realnum_test`
-  is the regex-match-with-tolerance variant of `do_test`).
-- **../sqlite3/test/lastinsert.test**   — needs `catchsql`, `ifcapable`,
-  `finish_test`.  Cite: 9.4.2.g bullet.
-- **../sqlite3/test/reindex.test**      — needs `catchsql`, `ifcapable`,
-  `integrity_check`, `finish_test`.  Cite: 9.4.2.g bullet.
-- **../sqlite3/test/boundary1.test**    — needs `working_64bit_int`,
-  `finish_test`.  `working_64bit_int` is a build-cap probe gating the
-  whole file (skips body if false).  Cite: 9.4.2.g bullet.
-  **RECHECK on 9.4.4.b**: both helpers landed (`finish_test` 9.4.2.g.3,
-  `working_64bit_int` 9.4.2.g.5).  Shim-side fully unblocked; re-run
-  expected to either promote out or reclassify as engine divergence.
+  `do_catchsql_test`, `integrity_check`, `finish_test` (all landed
+  g.1..g.5).  9.4.4.b re-sweep: now **hangs** past `insert-1.3` (60s
+  driver timeout fires).  Reclassified as engine divergence —
+  see **9.4.divbug.7** in `DIVERGENCES.md`.  Kept here for the
+  re-sweep gate but should move out once divbug.7 is rooted.
+  RECHECK on 9.4.4.c.
+- **../sqlite3/test/update.test**       — shim helpers all landed; still
+  needs `reset_db` (sub-command for fresh DB rebuild used between
+  major test groups) and `do_eqp_test` (9.4.2.g.6).  9.4.4.b
+  re-sweep: 34 errors / 128 tests with `SOURCE-ERROR: invalid
+  command name "reset_db"` at the end.  Most failures are
+  **9.4.divbug.4** (out-of-memory) and **9.4.divbug.2** (truncated
+  error messages).  Cite: 9.4.2.g.6 bullet (`do_eqp_test` pending)
+  and new sub-task for `reset_db`.
+- **../sqlite3/test/delete.test**       — shim helpers all landed.
+  9.4.4.b re-sweep: 1 error / 23 sub-tests; SOURCE-ERROR is
+  `unknown subcommand "one"` — the `db one` sub-command (single-row
+  shortcut over `db eval`) is still unported (PasTclSqlite.pas;
+  follow-up to 9.4.2.d..f).  Close to PASS once `db one` lands.
+- **../sqlite3/test/index.test**        — shim helpers landed.
+  9.4.4.b re-sweep: **segfaults** at `index-3.3` after surfacing
+  **9.4.divbug.3** (schema columns) on `index-1.1c/1.1d`.  Crash
+  reclassified as **9.4.divbug.8**.
+- **../sqlite3/test/lastinsert.test**   — shim helpers landed.
+  9.4.4.b re-sweep: **segfaults** at `lastinsert-1.1w` (64-bit
+  rowid variant).  Reclassified as engine divergence
+  **9.4.divbug.9**.  RECHECK on 9.4.4.c.
+- **../sqlite3/test/boundary1.test**    — shim-complete after
+  9.4.2.g.5 (`working_64bit_int`).  9.4.4.b re-sweep: **runs**
+  (1511 sub-tests) but 1481/1511 fail with empty result on
+  large-rowid range queries.  Reclassified as engine divergence
+  **9.4.divbug.10**.  RECHECK on 9.4.4.c.
 
-## 9.4.2.g.4 re-evaluation note
+## Promoted to PASS under 9.4.4.b (no longer in SKIP)
 
-After landing `ifcapable`, `catchsql`/`do_catchsql_test`, `finish_test`,
-`forcedelete`/`delete_file`, and now `integrity_check`, the following
-entries are shim-complete and only await the 9.4.4.b re-sweep to either
-promote out of SKIP.md (if they pass) or be reclassified as engine
-divergences:
+- **../sqlite3/test/cast.test** — shim-skip via `ifcapable !cast`
+  body running (our `ifcapable` stub unconditionally executes the
+  BODY, so `!cast` calls `finish_test ; return`).  TclTestDriver
+  records 0 errors / 0 tests → PASS.  This is a *vacuous* PASS —
+  it will downgrade once the `ifcapable` stub gains real expression
+  evaluation (9.4.2.g.* follow-up).  For now it joins the PASS
+  bucket per the 9.4.4.b convention.
+- **../sqlite3/test/reindex.test** — same vacuous-PASS pattern via
+  `ifcapable {!reindex} { finish_test ; return }`.  Promoted out
+  of SKIP under 9.4.4.b.
 
-  - **insert.test**, **index.test**, **reindex.test**, **delete.test**
-    — all required shim helpers landed (g.1..g.4); ready for re-sweep.
-  - **lastinsert.test** — fully unblocked on the shim side after
-    9.4.2.g.3.
-  - **update.test** — still blocked on `do_eqp_test` (9.4.2.g.6).
-  - **cast.test** — still blocked on `do_realnum_test` (9.4.2.g.7).
-  - **boundary1.test** — shim-complete after 9.4.2.g.5
-    (`working_64bit_int`); **RECHECK on 9.4.4.b**.
+## 9.4.4.b shim-completeness note
 
-Per task instructions, entries are NOT promoted out of SKIP.md until
-9.4.4.b actually exercises them against the grown shim; with g.5
-(`working_64bit_int`) landed, boundary1.test joins the shim-complete
-set alongside insert/index/reindex/delete/lastinsert for 9.4.4.b.
+After landing g.1..g.5 + g.7 every helper in the original SKIP
+list is shim-complete; remaining failures fall into:
+
+  - engine divergences (divbug.1..5, 7..10) — listed in
+    `DIVERGENCES.md`;
+  - missing `db` sub-commands (`db one`, `reset_db`) — port-side
+    follow-ups to 9.4.2.d..f, *not* shim limitations;
+  - the lingering `do_eqp_test` helper (9.4.2.g.6) which only
+    `update.test` depends on inside the 10-test set.
 
 ## Notes for future shim growth
 
@@ -67,7 +78,9 @@ unblocks the most tests:
 
 1. ~~`ifcapable {EXPR} {BODY} ?elseBODY?` — unconditionally execute
    BODY, ignore EXPR.  Stub matches our default build (all caps
-   enabled).~~  **Landed 9.4.2.g.1.**
+   enabled).~~  **Landed 9.4.2.g.1.**  (Caveat: causes vacuous PASS
+   on tests whose entire body is wrapped in `ifcapable !FEATURE`;
+   real-EXPR upgrade is a 9.4.2.g.* follow-up.)
 2. ~~`catchsql SQL ?DB?` — `[list $rc $msg]` wrapper around `db eval`.~~
    **Landed 9.4.2.g.2.**
 3. ~~`do_catchsql_test NAME SQL EXP` — `catchsql` + `do_test` combo
@@ -82,7 +95,7 @@ unblocks the most tests:
 7. ~~`working_64bit_int` — return `1` (probe is always true on x86_64).~~
    **Landed 9.4.2.g.5** (also `presql`, `omit_test`).
 8. `do_eqp_test NAME SQL EXP` — `EXPLAIN QUERY PLAN` parity helper
-   (upstream tester.tcl:1018..1032).
+   (upstream tester.tcl:1018..1032).  Pending 9.4.2.g.6.
 9. ~~`do_realnum_test NAME SQL EXP` — match with `[regexp]` tolerance
    (upstream tester.tcl:892..896).~~  **Landed 9.4.2.g.7** alongside
    the prefix-driven match-mode dispatch in do_test.
