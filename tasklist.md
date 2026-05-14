@@ -506,11 +506,14 @@ acceptance gate for this section.
     sqlite3_serialize / _deserialize.  Engine `_deserialize` already
     ported under 10.1.102; `_serialize` audit + Tcl shim.  C ref:
     `tclsqlite.c:3490..3550`.
-  - [ ] **9.4.2.s** `db function` enhancements: `-returntype`,
-    `-directonly`, `-innocuous`, `-deterministic` (already done),
-    typed argv marshalling, aggregate UDF (xStep/xFinal arms).
-    Aggregate UDFs are used by ~50 tests.  C ref:
-    `tclsqlite.c:1118..1305` (DbSqlFunc, DbFuncStep, DbFuncFinal).
+  - [X] **9.4.2.s** `db function` enhancements: `-returntype`,
+    `-directonly`, `-innocuous` flags + result-type routing (eType),
+    full typed argv marshalling (blob branch + int/wideint split).
+    NOTE: there is no aggregate UDF in `tclsqlite.c` — the `DB_FUNCTION`
+    arm only ever calls `sqlite3_create_function(... tclSqlFunc,0,0)`;
+    no `DbFuncStep`/`DbFuncFinal` exist.  Nothing C-faithful to port
+    for an aggregate `db function` form.  C ref: `tclsqlite.c:1013..1163`
+    (tclSqlFunc), `:3386..3460` (DB_FUNCTION arm).
   - [ ] **9.4.2.t** `db nullvalue` follow-ups + `db errorcode`
     extended-code arm (sqlite3_extended_errcode).  Coupled with
     9.4.6.j.

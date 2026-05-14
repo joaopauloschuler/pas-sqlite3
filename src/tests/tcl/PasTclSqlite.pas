@@ -45,6 +45,8 @@ type
     interp:   PTclInterp;  { tclsqlite.c:150 — the Tcl interp to eval into }
     pScript:  PTclObj;     { tclsqlite.c:151 — the user-supplied Tcl script,
                              refcount-incremented for our duration }
+    eType:    cint;        { tclsqlite.c:153 — declared -returntype, or
+                             SQLITE_NULL meaning "auto-detect" }
     pNext:    PSqlFunc;    { tclsqlite.c:156 — next on the per-db chain }
   end;
 
@@ -564,6 +566,11 @@ var
   nText:  cint;
   objv:   PPTclObj;
   objc:   cint;
+  eType:  cint;
+  wv:     Int64;
+  rv:     Double;
+  data:   PAnsiChar;
+  n:      cint;
 begin
   pFn := PSqlFunc(sqlite3_user_data(pCtx));
   if pFn = nil then
@@ -594,8 +601,20 @@ begin
       pVal := Psqlite3_value(pIn^);
       vType := sqlite3_value_type(pVal);
       case vType of
+        SQLITE_BLOB:
+          begin
+            nText := sqlite3_value_bytes(pVal);
+            pArg := Tcl_NewByteArrayObj(sqlite3_value_blob(pVal), nText);
+          end;
         SQLITE_INTEGER:
-          pArg := Tcl_NewWideIntObj(sqlite3_value_int64(pVal));
+          begin
+            { C:1060..1065 — narrow ints get an int-typed Tcl_Obj. }
+            if (sqlite3_value_int64(pVal) >= -2147483647) and
+               (sqlite3_value_int64(pVal) <= 2147483647) then
+              pArg := Tcl_NewIntObj(cint(sqlite3_value_int64(pVal)))
+            else
+              pArg := Tcl_NewWideIntObj(sqlite3_value_int64(pVal));
+          end;
         SQLITE_FLOAT:
           pArg := Tcl_NewDoubleObj(sqlite3_value_double(pVal));
         SQLITE_NULL:
@@ -642,13 +661,74 @@ begin
   end
   else
   begin
-    pRes := Tcl_GetObjResult(pFn^.interp);
-    nRes := 0;
-    zRes := Tcl_GetStringFromObj(pRes, @nRes);
-    if zRes = nil then
-      sqlite3_result_null(pCtx)
-    else
-      sqlite3_result_text(pCtx, zRes, nRes, SQLITE_TRANSIENT);
+    { Result type routing — C:1107..1158.  eType is the declared
+      -returntype; SQLITE_NULL means "auto-detect".  We can't read
+      Tcl_Obj.typePtr->name from Pascal (Tcl_Obj is opaque here), so
+      the auto-detect arm probes the obj with the Tcl_Get*FromObj
+      accessors instead of inspecting the type name — same net result
+      for the integer/double/text/blob distinction. }
+    pRes  := Tcl_GetObjResult(pFn^.interp);
+    eType := pFn^.eType;
+
+    if eType = SQLITE_NULL then
+    begin
+      { Probe-based auto-detection.  A bytearray with no string rep is
+        a blob; otherwise prefer wideInt, then double, else text. }
+      n := 0;
+      data := Tcl_GetByteArrayFromObj(pRes, @n);
+      if (data <> nil) and (n = 0) then
+        eType := SQLITE_BLOB
+      else if Tcl_GetWideIntFromObj(nil, pRes, @wv) = TCL_OK then
+        eType := SQLITE_INTEGER
+      else if Tcl_GetDoubleFromObj(nil, pRes, @rv) = TCL_OK then
+        eType := SQLITE_FLOAT
+      else
+        eType := SQLITE_TEXT;
+    end;
+
+    case eType of
+      SQLITE_BLOB:
+        begin
+          n := 0;
+          data := Tcl_GetByteArrayFromObj(pRes, @n);
+          sqlite3_result_blob(pCtx, data, n, SQLITE_TRANSIENT);
+        end;
+      SQLITE_INTEGER:
+        begin
+          if Tcl_GetWideIntFromObj(nil, pRes, @wv) = TCL_OK then
+            sqlite3_result_int64(pCtx, wv)
+          else if Tcl_GetDoubleFromObj(nil, pRes, @rv) = TCL_OK then
+            sqlite3_result_double(pCtx, rv)
+          else
+          begin
+            n := 0;
+            zRes := Tcl_GetStringFromObj(pRes, @n);
+            if zRes = nil then sqlite3_result_null(pCtx)
+            else sqlite3_result_text(pCtx, zRes, n, SQLITE_TRANSIENT);
+          end;
+        end;
+      SQLITE_FLOAT:
+        begin
+          if Tcl_GetDoubleFromObj(nil, pRes, @rv) = TCL_OK then
+            sqlite3_result_double(pCtx, rv)
+          else
+          begin
+            n := 0;
+            zRes := Tcl_GetStringFromObj(pRes, @n);
+            if zRes = nil then sqlite3_result_null(pCtx)
+            else sqlite3_result_text(pCtx, zRes, n, SQLITE_TRANSIENT);
+          end;
+        end;
+      else
+        begin
+          nRes := 0;
+          zRes := Tcl_GetStringFromObj(pRes, @nRes);
+          if zRes = nil then
+            sqlite3_result_null(pCtx)
+          else
+            sqlite3_result_text(pCtx, zRes, nRes, SQLITE_TRANSIENT);
+        end;
+    end;
   end;
 end;
 
@@ -692,8 +772,16 @@ var
   nArg:    cint;
   flags:   cint;
   i:       cint;
+  nZ:      cint;
+  eType:   cint;
+  idx:     cint;
   rc:      i32;
   pScript: PTclObj;
+const
+  { tclsqlite.c:3417 — order fixes the SQLITE_* codes: index 0 ->
+    integer(1), 1 -> real(2), 2 -> text(3), 3 -> blob(4), 4 -> any. }
+  azType: array[0..5] of PAnsiChar =
+    ('integer', 'real', 'text', 'blob', 'any', nil);
 begin
   if objc < 4 then
   begin
@@ -704,13 +792,17 @@ begin
   pDb   := PSqliteDb(clientData);
   nArg  := -1;
   flags := SQLITE_UTF8;
+  eType := SQLITE_NULL;
 
-  { Flag loop runs over objv[3 .. objc-2]; objv[objc-1] is the script. }
+  { Flag loop runs over objv[3 .. objc-2]; objv[objc-1] is the script.
+    Mirrors C's prefix-match (strncmp(z, "-opt", n) with n = strlen(z),
+    n>1) so abbreviations like -det / -arg work. }
   i := 3;
   while i < (objc - 1) do
   begin
-    z := Tcl_GetStringFromObj(ObjvAt(objv, i), nil);
-    if (z <> nil) and (StrComp(z, PAnsiChar('-argcount')) = 0) then
+    z := Tcl_GetStringFromObj(ObjvAt(objv, i), @nZ);
+    if z = nil then z := PAnsiChar('');
+    if (nZ > 1) and (StrLComp(z, PAnsiChar('-argcount'), nZ) = 0) then
     begin
       if i = (objc - 2) then
       begin
@@ -736,16 +828,48 @@ begin
       nArg := nA;
       Inc(i, 2);
     end
-    else if (z <> nil) and (StrComp(z, PAnsiChar('-deterministic')) = 0) then
+    else if (nZ > 1) and (StrLComp(z, PAnsiChar('-deterministic'), nZ) = 0) then
     begin
       flags := flags or SQLITE_DETERMINISTIC;
+      Inc(i);
+    end
+    else if (nZ > 1) and (StrLComp(z, PAnsiChar('-directonly'), nZ) = 0) then
+    begin
+      flags := flags or SQLITE_DIRECTONLY;
+      Inc(i);
+    end
+    else if (nZ > 1) and (StrLComp(z, PAnsiChar('-innocuous'), nZ) = 0) then
+    begin
+      flags := flags or SQLITE_INNOCUOUS;
+      Inc(i);
+    end
+    else if (nZ > 1) and (StrLComp(z, PAnsiChar('-returntype'), nZ) = 0) then
+    begin
+      if i = (objc - 2) then
+      begin
+        Tcl_AppendResult(interp,
+          PChar('option requires an argument: '), z, Pointer(nil));
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      Inc(i);
+      idx := 0;
+      if Tcl_GetIndexFromObj(interp, ObjvAt(objv, i), @azType[0],
+                             PChar('type'), 0, @idx) <> TCL_OK then
+      begin
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      { C:3437 eType++ : index 0(integer)->1 ... 4(any)->5(=SQLITE_NULL). }
+      eType := idx + 1;
       Inc(i);
     end
     else
     begin
       Tcl_AppendResult(interp,
         PChar('bad option "'), z,
-        PChar('": must be -argcount or -deterministic'),
+        PChar('": must be -argcount, -deterministic, -directonly,'
+            + ' -innocuous, or -returntype'),
         Pointer(nil));
       Result := TCL_ERROR;
       Exit;
@@ -762,6 +886,7 @@ begin
   pFn^.pDb     := pDb;
   pFn^.interp  := interp;
   pFn^.pScript := pScript;
+  pFn^.eType   := eType;
   Tcl_IncrRefCount(pScript);
   pFn^.pNext   := pDb^.pFunc;
   pDb^.pFunc   := pFn;
