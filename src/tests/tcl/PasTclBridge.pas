@@ -77,6 +77,8 @@ procedure Tcl_FindExecutable(argv0: PChar); cdecl; external 'tcl8.6';  // tclsql
 function Tcl_Eval(interp: PTclInterp; script: PChar): cint; cdecl; external 'tcl8.6';
 function Tcl_EvalFile(interp: PTclInterp; fileName: PChar): cint; cdecl; external 'tcl8.6';
 function Tcl_EvalObjEx(interp: PTclInterp; objPtr: PTclObj; flags: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_EvalObjv(interp: PTclInterp; objc: cint; objv: PPTclObj; flags: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_DuplicateObj(objPtr: PTclObj): PTclObj; cdecl; external 'tcl8.6';
 
 { Command registration.  tclsqlite.c:4407. }
 function Tcl_CreateObjCommand(interp: PTclInterp; cmdName: PChar;
