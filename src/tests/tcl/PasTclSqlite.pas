@@ -110,6 +110,23 @@ type
     nSort:         cint;   { tclsqlite.c:223 — SQLITE_STMTSTATUS_SORT. }
     nIndex:        cint;   { tclsqlite.c:223 — SQLITE_STMTSTATUS_AUTOINDEX. }
     nVMStep:       cint;   { tclsqlite.c:224 — SQLITE_STMTSTATUS_VM_STEP. }
+    pIncrblob:     Pointer; { tclsqlite.c:222 — head of the open-incrblob
+                             channel chain (PIncrblobChannel).  Closed
+                             en-masse by DbDeleteCmd (9.4.2.p). }
+  end;
+
+  { Pas analogue of struct IncrblobChannel — tclsqlite.c:233..241.
+    Only pointer/scalar fields, Tcl_Alloc'd (matching upstream), so it
+    never holds a managed AnsiString. }
+  PIncrblobChannel = ^TIncrblobChannel;
+  TIncrblobChannel = record
+    pBlob:    Psqlite3_blob;     { tclsqlite.c:234 — sqlite3 blob handle }
+    pDb:      PSqliteDb;         { tclsqlite.c:235 — owning connection }
+    iSeek:    Int64;            { tclsqlite.c:236 — current seek offset }
+    isClosed: cuint;            { tclsqlite.c:237 — TCL_CLOSE_READ/WRITE }
+    channel:  TTclChannel;      { tclsqlite.c:238 — channel identifier }
+    pNext:    PIncrblobChannel; { tclsqlite.c:239 }
+    pPrev:    PIncrblobChannel; { tclsqlite.c:240 }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -130,6 +147,291 @@ begin
   Result := (PPTclObj(PtrUInt(objv) + PtrUInt(i) * SizeOf(Pointer)))^;
 end;
 
+{ ======================================================================
+  Incremental-blob Tcl channel — Pas port of tclsqlite.c:254..511
+  (the SQLITE_OMIT_INCRBLOB-guarded block).  A `db incrblob` subcommand
+  opens an sqlite3_blob handle and wraps it in a custom Tcl channel so
+  the blob can be driven with `read`/`puts`/`seek`/`close`.
+  ====================================================================== }
+
+{ incrblobClose2 — tclsqlite.c:277.  Tcl_DriverClose2Proc.  When `flags`
+  is non-zero Tcl only wants to half-close (record it and return); when
+  zero we genuinely tear the channel down. }
+function IncrblobClose2(instanceData: TClientData; interp: PTclInterp;
+  flags: cint): cint; cdecl;
+var
+  p:  PIncrblobChannel;
+  rc: cint;
+  db: PTsqlite3;
+begin
+  p := PIncrblobChannel(instanceData);
+  db := p^.pDb^.db;
+  if flags <> 0 then
+  begin
+    p^.isClosed := p^.isClosed or cuint(flags);
+    Result := TCL_OK;
+    Exit;
+  end;
+  rc := sqlite3_blob_close(p^.pBlob);
+  { Unlink from the SqliteDb.pIncrblob list — tclsqlite.c:294..303. }
+  if p^.pNext <> nil then
+    p^.pNext^.pPrev := p^.pPrev;
+  if p^.pPrev <> nil then
+    p^.pPrev^.pNext := p^.pNext;
+  if PIncrblobChannel(p^.pDb^.pIncrblob) = p then
+    p^.pDb^.pIncrblob := p^.pNext;
+  Tcl_Free(PChar(p));
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetResult(interp, PChar(sqlite3_errmsg(db)), TCL_VOLATILE);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ incrblobClose — tclsqlite.c:314.  Tcl_DriverCloseProc thunk. }
+function IncrblobClose(instanceData: TClientData; interp: PTclInterp): cint; cdecl;
+begin
+  Result := IncrblobClose2(instanceData, interp, 0);
+end;
+
+{ incrblobInput — tclsqlite.c:325.  Read up to bufSize bytes from the
+  blob at the current seek offset, clamped to the blob length. }
+function IncrblobInput(instanceData: TClientData; buf: PChar; bufSize: cint;
+  errorCodePtr: pcint): cint; cdecl;
+var
+  p:     PIncrblobChannel;
+  nRead: Int64;
+  nBlob: Int64;
+  rc:    cint;
+begin
+  p := PIncrblobChannel(instanceData);
+  nRead := bufSize;
+  nBlob := sqlite3_blob_bytes(p^.pBlob);
+  if (p^.iSeek + nRead) > nBlob then
+    nRead := nBlob - p^.iSeek;
+  if nRead <= 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  rc := sqlite3_blob_read(p^.pBlob, Pointer(buf), cint(nRead), cint(p^.iSeek));
+  if rc <> SQLITE_OK then
+  begin
+    errorCodePtr^ := rc;
+    Result := -1;
+    Exit;
+  end;
+  p^.iSeek := p^.iSeek + nRead;
+  Result := cint(nRead);
+end;
+
+{ incrblobOutput — tclsqlite.c:357.  Write toWrite bytes at the current
+  seek offset; the blob cannot grow, so an over-long write is EINVAL. }
+function IncrblobOutput(instanceData: TClientData; buf: PChar; toWrite: cint;
+  errorCodePtr: pcint): cint; cdecl;
+const
+  EINVAL = 22;
+  EIO    = 5;
+var
+  p:      PIncrblobChannel;
+  nWrite: Int64;
+  nBlob:  Int64;
+  rc:     cint;
+begin
+  p := PIncrblobChannel(instanceData);
+  nWrite := toWrite;
+  nBlob := sqlite3_blob_bytes(p^.pBlob);
+  if (p^.iSeek + nWrite) > nBlob then
+  begin
+    errorCodePtr^ := EINVAL;
+    Result := -1;
+    Exit;
+  end;
+  if nWrite <= 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  rc := sqlite3_blob_write(p^.pBlob, Pointer(buf), cint(nWrite), cint(p^.iSeek));
+  if rc <> SQLITE_OK then
+  begin
+    errorCodePtr^ := EIO;
+    Result := -1;
+    Exit;
+  end;
+  p^.iSeek := p^.iSeek + nWrite;
+  Result := cint(nWrite);
+end;
+
+{ incrblobWideSeek — tclsqlite.c:397.  Tcl_DriverWideSeekProc. }
+function IncrblobWideSeek(instanceData: TClientData; offset: Int64;
+  seekMode: cint; errorCodePtr: pcint): Int64; cdecl;
+var
+  p: PIncrblobChannel;
+begin
+  p := PIncrblobChannel(instanceData);
+  case seekMode of
+    SEEK_SET: p^.iSeek := offset;
+    SEEK_CUR: p^.iSeek := p^.iSeek + offset;
+    SEEK_END: p^.iSeek := sqlite3_blob_bytes(p^.pBlob) + offset;
+  end;
+  Result := p^.iSeek;
+end;
+
+{ incrblobSeek — tclsqlite.c:421.  Narrow Tcl_DriverSeekProc thunk. }
+function IncrblobSeek(instanceData: TClientData; offset: clong;
+  seekMode: cint; errorCodePtr: pcint): cint; cdecl;
+begin
+  Result := cint(IncrblobWideSeek(instanceData, offset, seekMode, errorCodePtr));
+end;
+
+{ incrblobWatch — tclsqlite.c:431.  No-op. }
+procedure IncrblobWatch(instanceData: TClientData; mask: cint); cdecl;
+begin
+end;
+
+{ incrblobHandle — tclsqlite.c:437.  Always fails (no OS handle). }
+function IncrblobHandle(instanceData: TClientData; direction: cint;
+  handlePtr: PPointer): cint; cdecl;
+begin
+  Result := TCL_ERROR;
+end;
+
+{ IncrblobChannelType — tclsqlite.c:445.  Driver dispatch table. }
+var
+  IncrblobChannelType: TTclChannelType = (
+    typeName:         'incrblob';
+    version:          TCL_CHANNEL_VERSION_5;
+    closeProc:        @IncrblobClose;
+    inputProc:        @IncrblobInput;
+    outputProc:       @IncrblobOutput;
+    seekProc:         @IncrblobSeek;
+    setOptionProc:    nil;
+    getOptionProc:    nil;
+    watchProc:        @IncrblobWatch;
+    getHandleProc:    @IncrblobHandle;
+    close2Proc:       @IncrblobClose2;
+    blockModeProc:    nil;
+    flushProc:        nil;
+    handlerProc:      nil;
+    wideSeekProc:     @IncrblobWideSeek;
+    threadActionProc: nil;
+    truncateProc:     nil;
+  );
+
+  { Channel-name counter — tclsqlite.c:489 `static int count`. }
+  gIncrblobCount: cint = 0;
+
+{ createIncrblobChannel — tclsqlite.c:466.  Opens the blob, allocates an
+  IncrblobChannel, registers a "incrblob_N" channel, links it into the
+  per-db chain, and returns the channel name as the interp result. }
+function CreateIncrblobChannel(interp: PTclInterp; pDb: PSqliteDb;
+  const zDb, zTable, zColumn: PAnsiChar; iRow: Int64;
+  isReadonly: cint): cint;
+var
+  p:        PIncrblobChannel;
+  db:       PTsqlite3;
+  pBlob:    Psqlite3_blob;
+  rc:       cint;
+  flags:    cint;
+  wrFlag:   cint;
+  zChannel: array[0..63] of AnsiChar;
+begin
+  db := pDb^.db;
+  flags := TCL_READABLE;
+  if isReadonly = 0 then
+    flags := flags or TCL_WRITABLE;
+  if isReadonly <> 0 then wrFlag := 0 else wrFlag := 1;
+
+  rc := sqlite3_blob_open(db, zDb, zTable, zColumn, iRow, wrFlag, pBlob);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetResult(interp, PChar(sqlite3_errmsg(pDb^.db)), TCL_VOLATILE);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  p := PIncrblobChannel(Tcl_Alloc(SizeOf(TIncrblobChannel)));
+  FillChar(p^, SizeOf(TIncrblobChannel), 0);
+  p^.pBlob := pBlob;
+  if (flags and TCL_WRITABLE) = 0 then
+    p^.isClosed := p^.isClosed or cuint(TCL_CLOSE_WRITE);
+
+  Inc(gIncrblobCount);
+  StrPCopy(zChannel, 'incrblob_' + IntToStr(gIncrblobCount));
+  p^.channel := Tcl_CreateChannel(@IncrblobChannelType, zChannel, p, flags);
+  Tcl_RegisterChannel(interp, p^.channel);
+
+  { Link into SqliteDb.pIncrblob — tclsqlite.c:500..507. }
+  p^.pNext := PIncrblobChannel(pDb^.pIncrblob);
+  p^.pPrev := nil;
+  if p^.pNext <> nil then
+    p^.pNext^.pPrev := p;
+  pDb^.pIncrblob := p;
+  p^.pDb := pDb;
+
+  Tcl_SetResult(interp, Tcl_GetChannelName(p^.channel), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ closeIncrblobChannels — tclsqlite.c:259.  Called from DbDeleteCmd at
+  connection shutdown; Tcl_UnregisterChannel fires incrblobClose which
+  frees each IncrblobChannel, so we must not touch p after that. }
+procedure CloseIncrblobChannels(pDb: PSqliteDb);
+var
+  p, pNext: PIncrblobChannel;
+begin
+  p := PIncrblobChannel(pDb^.pIncrblob);
+  while p <> nil do
+  begin
+    pNext := p^.pNext;
+    Tcl_UnregisterChannel(pDb^.interp, p^.channel);
+    p := pNext;
+  end;
+end;
+
+{ DbIncrblobArm — tclsqlite.c:3468 (DB_INCRBLOB).  Parses
+  `db incrblob ?-readonly? ?DB? TABLE COLUMN ROWID`. }
+function DbIncrblobArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:        PSqliteDb;
+  isReadonly: cint;
+  zDb:        PAnsiChar;
+  zTable:     PAnsiChar;
+  zColumn:    PAnsiChar;
+  iRow:       Int64;
+  rc:         cint;
+begin
+  pDb := PSqliteDb(clientData);
+  isReadonly := 0;
+  zDb := 'main';
+
+  { Check for the -readonly option — tclsqlite.c:3479. }
+  if (objc > 3) and (StrComp(Tcl_GetString(ObjvAt(objv, 2)), '-readonly') = 0) then
+    isReadonly := 1;
+
+  if (objc <> (5 + isReadonly)) and (objc <> (6 + isReadonly)) then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, '?-readonly? ?DB? TABLE COLUMN ROWID');
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  if objc = (6 + isReadonly) then
+    zDb := Tcl_GetString(ObjvAt(objv, 2 + isReadonly));
+  zTable  := Tcl_GetString(ObjvAt(objv, objc - 3));
+  zColumn := Tcl_GetString(ObjvAt(objv, objc - 2));
+  rc := Tcl_GetWideIntFromObj(interp, ObjvAt(objv, objc - 1), @iRow);
+
+  if rc = TCL_OK then
+    rc := CreateIncrblobChannel(interp, pDb, zDb, zTable, zColumn,
+                                iRow, isReadonly);
+  Result := rc;
+end;
+
 { DbDeleteCmd — Tcl_CmdDeleteProc invoked when the per-connection
   command is destroyed (either via `db1 close` -> Tcl_DeleteCommand,
   or via `rename db1 ""`).  Tears the SqliteDb down.
@@ -143,6 +445,9 @@ var
 begin
   pDb := PSqliteDb(clientData);
   if pDb = nil then Exit;
+  { Close any still-open incrblob channels before the connection goes —
+    tclsqlite.c:614 (closeIncrblobChannels in the DbDeleteCmd path). }
+  CloseIncrblobChannels(pDb);
   { sqlite3_close_v2 fires our DbSqlFuncDelete xDestroy hook for every
     TSqlFunc previously registered via sqlite3_create_function_v2, which
     decrefs pScript and Disposes each chain entry.  After this call the
@@ -2817,6 +3122,14 @@ begin
   begin
     sqlite3_interrupt(PSqliteDb(clientData)^.db);
     Result := TCL_OK;
+    Exit;
+  end;
+
+  { incrblob — tclsqlite.c:3468 (DB_INCRBLOB).  Wraps an sqlite3_blob
+    handle in a custom Tcl channel. }
+  if (zSub <> nil) and (StrComp(zSub, 'incrblob') = 0) then
+  begin
+    Result := DbIncrblobArm(clientData, interp, objc, objv);
     Exit;
   end;
 

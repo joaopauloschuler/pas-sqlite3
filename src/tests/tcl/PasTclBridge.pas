@@ -237,6 +237,88 @@ function  Tcl_GetByteArrayFromObj(objPtr: PTclObj; lengthPtr: pcint): PChar; cde
 procedure Tcl_SetObjLength(objPtr: PTclObj; length: cint); cdecl; external 'tcl8.6';
 
 { ----------------------------------------------------------------------
+  Tcl custom channels — used by the DB_INCRBLOB arm of DbObjCmd
+  (tclsqlite.c:445..511, the IncrblobChannelType / createIncrblobChannel
+  path).  A custom channel is created from a Tcl_ChannelType driver
+  table.  We mirror the tcl.h 8.6 `Tcl_ChannelType` struct exactly: the
+  field order/types must match or Tcl will mis-dispatch driver calls.
+
+  tcl.h (8.6) struct Tcl_ChannelType {
+    const char *typeName;
+    Tcl_ChannelTypeVersion version;        (an enum -> int-sized pointer)
+    Tcl_DriverCloseProc *closeProc;
+    Tcl_DriverInputProc *inputProc;
+    Tcl_DriverOutputProc *outputProc;
+    Tcl_DriverSeekProc *seekProc;
+    Tcl_DriverSetOptionProc *setOptionProc;
+    Tcl_DriverGetOptionProc *getOptionProc;
+    Tcl_DriverWatchProc *watchProc;
+    Tcl_DriverGetHandleProc *getHandleProc;
+    Tcl_DriverClose2Proc *close2Proc;
+    Tcl_DriverBlockModeProc *blockModeProc;
+    Tcl_DriverFlushProc *flushProc;
+    Tcl_DriverHandlerProc *handlerProc;
+    Tcl_DriverWideSeekProc *wideSeekProc;
+    Tcl_DriverThreadActionProc *threadActionProc;
+    Tcl_DriverTruncateProc *truncateProc;
+  }
+  TCL_CHANNEL_VERSION_5 is the symbolic enum value used by tclsqlite.c. }
+const
+  TCL_CHANNEL_VERSION_5 = Pointer(5);
+
+  { Channel access-mode bits — tcl.h:1445..1446, passed to Tcl_CreateChannel. }
+  TCL_READABLE = 1 shl 1;   { = 2 }
+  TCL_WRITABLE = 1 shl 2;   { = 4 }
+
+  { close2Proc flag bits — tcl.h:1465..1466, used by incrblobClose2. }
+  TCL_CLOSE_READ  = 1 shl 1;  { = 2 }
+  TCL_CLOSE_WRITE = 1 shl 2;  { = 4 }
+
+  { seekMode values for the seek driver proc — <unistd.h> SEEK_*. }
+  SEEK_SET = 0;
+  SEEK_CUR = 1;
+  SEEK_END = 2;
+
+type
+  { Driver proc typedefs — tcl.h.  All cdecl. }
+  TTclDriverCloseProc     = function(instanceData: TClientData; interp: PTclInterp): cint; cdecl;
+  TTclDriverClose2Proc    = function(instanceData: TClientData; interp: PTclInterp; flags: cint): cint; cdecl;
+  TTclDriverInputProc     = function(instanceData: TClientData; buf: PChar; bufSize: cint; errorCodePtr: pcint): cint; cdecl;
+  TTclDriverOutputProc    = function(instanceData: TClientData; buf: PChar; toWrite: cint; errorCodePtr: pcint): cint; cdecl;
+  TTclDriverSeekProc      = function(instanceData: TClientData; offset: clong; seekMode: cint; errorCodePtr: pcint): cint; cdecl;
+  TTclDriverWideSeekProc  = function(instanceData: TClientData; offset: Int64; seekMode: cint; errorCodePtr: pcint): Int64; cdecl;
+  TTclDriverWatchProc     = procedure(instanceData: TClientData; mask: cint); cdecl;
+  TTclDriverGetHandleProc = function(instanceData: TClientData; direction: cint; handlePtr: PPointer): cint; cdecl;
+
+  PTclChannelType = ^TTclChannelType;
+  TTclChannelType = record
+    typeName:         PChar;
+    version:          Pointer;
+    closeProc:        TTclDriverCloseProc;
+    inputProc:        TTclDriverInputProc;
+    outputProc:       TTclDriverOutputProc;
+    seekProc:         TTclDriverSeekProc;
+    setOptionProc:    Pointer;
+    getOptionProc:    Pointer;
+    watchProc:        TTclDriverWatchProc;
+    getHandleProc:    TTclDriverGetHandleProc;
+    close2Proc:       TTclDriverClose2Proc;
+    blockModeProc:    Pointer;
+    flushProc:        Pointer;
+    handlerProc:      Pointer;
+    wideSeekProc:     TTclDriverWideSeekProc;
+    threadActionProc: Pointer;
+    truncateProc:     Pointer;
+  end;
+
+function  Tcl_CreateChannel(typePtr: PTclChannelType; chanName: PChar;
+  instanceData: TClientData; mask: cint): TTclChannel; cdecl; external 'tcl8.6';
+procedure Tcl_RegisterChannel(interp: PTclInterp; chan: TTclChannel); cdecl; external 'tcl8.6';
+function  Tcl_UnregisterChannel(interp: PTclInterp; chan: TTclChannel): cint; cdecl; external 'tcl8.6';
+function  Tcl_GetChannelName(chan: TTclChannel): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_SetResult(interp: PTclInterp; result: PChar; freeProc: Pointer); cdecl; external 'tcl8.6';
+
+{ ----------------------------------------------------------------------
   Pascal-side helpers. }
 procedure InitTclLibrary;
 function  TclEvalGetString(interp: PTclInterp; const cmd: AnsiString): AnsiString;
