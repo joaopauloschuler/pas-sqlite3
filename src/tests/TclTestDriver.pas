@@ -150,6 +150,7 @@ var
   script     : AnsiString;
   scriptBytes: TBytes;
   startTick  : QWord;
+  endTick    : QWord;
   cwd        : string;
 begin
   sOut := '';
@@ -178,31 +179,47 @@ begin
       end;
     end;
 
-    { feed script then close stdin }
+    { feed script then close stdin — the test only starts running after
+      stdin is closed, so re-baseline startTick here: fork/exec and the
+      script-write above are driver overhead, not test time. }
     SetLength(scriptBytes, Length(script));
     if Length(script) > 0 then
       Move(script[1], scriptBytes[0], Length(script));
     if Length(scriptBytes) > 0 then
       p.Input.Write(scriptBytes[0], Length(scriptBytes));
     p.CloseInput;
+    startTick := GetTickCount64;
 
+    { Poll loop.  The previous version captured the end time AFTER the
+      final post-loop drain, so any time spent in AppendChunk draining a
+      large backlog was silently folded away from one test and (worse)
+      the last Sleep(10) before `Running` flipped false was never
+      attributed at all — per-test duration came out short.  Fix: stamp
+      endTick the instant the loop observes the child has exited, then
+      drain.  endTick is also stamped on every iteration so a child that
+      exits mid-Sleep is measured to within one poll interval rather
+      than losing the whole final interval. }
+    endTick := startTick;
     while p.Running do begin
       AppendChunk(p.Output, sOut);
       AppendChunk(p.Stderr, sErr);
-      if (GetTickCount64 - startTick) > PER_TEST_TIMEOUT_MS then begin
+      endTick := GetTickCount64;
+      if (endTick - startTick) > PER_TEST_TIMEOUT_MS then begin
         Writeln(StdErr, 'timeout: ', testAbsPath);
         p.Terminate(124);
-        durationMs := PER_TEST_TIMEOUT_MS;
+        durationMs := Int64(endTick - startTick);
         Result := -2;
         Exit;
       end;
-      Sleep(10);
+      Sleep(5);
     end;
+    { child has exited — stamp end time before draining residual output }
+    endTick := GetTickCount64;
     { final drain }
     AppendChunk(p.Output, sOut);
     AppendChunk(p.Stderr, sErr);
 
-    durationMs := Int64(GetTickCount64 - startTick);
+    durationMs := Int64(endTick - startTick);
     Result := p.ExitStatus;
   finally
     p.Free;
