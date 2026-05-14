@@ -16,7 +16,7 @@
 # this shim and run against the Tcl-bridge build of pas-sqlite3.
 #
 # What is intentionally NOT ported here (vs upstream tester.tcl):
-#   - do_eqp_test, do_catchsql_test, do_realnum_test, do_vmstep_test
+#   - do_eqp_test, do_realnum_test, do_vmstep_test
 #   - presql, permutations, runtest, NRE harness, slave interp plumbing
 #   - sqlite3_test_control, sqlite3_memdebug_*, db_save, threading
 #   - regex / glob / numeric-range match in expected (only exact compare)
@@ -149,6 +149,25 @@ proc finalize_testing {} {
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set c [catch {uplevel 1 $code} r]
   return -code $c $r
+}
+
+# catchsql — upstream tester.tcl:1460..1465.  Verbatim.  Runs $sql
+# via `$db eval` under `catch`, then returns the two-element Tcl list
+# `[list $rc $msg]`: rc=0 with msg = the result rows on success, rc!=0
+# with msg = the error string on failure.  C ref: tester.tcl:1460..1465.
+proc catchsql {sql {db db}} {
+  set r [catch [list uplevel [list $db eval $sql]] msg]
+  lappend r $msg
+  return $r
+}
+
+# do_catchsql_test — upstream tester.tcl:973..976.  Thin wrapper that
+# delegates to `do_test NAME { catchsql {SQL} } RESULT` so a failing
+# SQL statement can be asserted by expected `{rc errmsg}` pair without
+# tripping the do_test catch arm.  C ref: tester.tcl:973..976.
+proc do_catchsql_test {testname sql result} {
+  fix_testname testname
+  uplevel do_test [list $testname] [list "catchsql {$sql}"] [list $result]
 }
 
 # expected — passthrough stub.  Upstream tester.tcl has no such proc as

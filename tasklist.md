@@ -378,9 +378,13 @@ acceptance gate for this section.
     `sqlite3_compileoption_get` wiring deferred to 9.4.6.a.  Smoke gate
     extended in `TestTclTesterMin` (foo-4.0 verifies BODY runs even on
     a bogus EXPR).  C ref: `tester.tcl:1725..1739`.
-  - [ ] **9.4.2.g.2** `catchsql` + `do_catchsql_test` — runs SQL,
+  - [X] **9.4.2.g.2** `catchsql` + `do_catchsql_test` — runs SQL,
     captures `(rc, errmsg)` as a 2-list.  Unblocks every error-path
-    test (~30% of total).  C ref: `tester.tcl:1455..1490`, `983..1010`.
+    test (~30% of total).  C ref: `tester.tcl:1460..1465`, `973..976`.
+    Verbatim port; smoke gate in `TestTclTesterMin` (`catchsql
+    {select 1+1}` -> `0 2`, `catchsql {select * from nosuchtable}`
+    -> `1 {no such table: nosuchtable}`, `do_catchsql_test fail-1`
+    PASS).
   - [ ] **9.4.2.g.3** `finish_test` + `forcedelete` + `delete_file` —
     per-test teardown convention; tests source-include them at the
     end.  C ref: `tester.tcl:1234..1280`, `1696..1714`.

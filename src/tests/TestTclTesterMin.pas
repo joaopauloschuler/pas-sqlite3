@@ -143,11 +143,37 @@ begin
   if CounterNTest <> 4 then Die('after foo-4.0 nTest=' + IntToStr(CounterNTest) + ' want 4');
   Writeln('PASS: foo-4.0 ifcapable body ran, nTest=4 nErr=1');
 
+  { Step 8 — catchsql (9.4.2.g.2).  Success arm returns "0 2"; failure
+    arm returns "1 {no such table: ...}".  We check both strings
+    exactly against the format tclsh produces under upstream tester.tcl. }
+  sRes := EvalGet('catchsql {select 1+1}', rc);
+  if rc <> TCL_OK then Die('catchsql ok rc=' + IntToStr(rc) + ' err=' + sRes);
+  if sRes <> '0 2' then Die('catchsql ok got=[' + sRes + '] want [0 2]');
+  Writeln('PASS: catchsql {select 1+1} -> [', sRes, ']');
+
+  sRes := EvalGet('catchsql {select * from nosuchtable}', rc);
+  if rc <> TCL_OK then Die('catchsql err rc=' + IntToStr(rc) + ' err=' + sRes);
+  if sRes <> '1 {no such table: nosuchtable}' then
+    Die('catchsql err got=[' + sRes + '] want [1 {no such table: nosuchtable}]');
+  Writeln('PASS: catchsql {select * from nosuchtable} -> [', sRes, ']');
+
+  { Step 9 — do_catchsql_test (9.4.2.g.2).  Wraps catchsql + do_test;
+    the expected list is the `{rc errmsg}` pair.  Must PASS (no nErr
+    bump). }
+  sRes := EvalGet(
+    'do_catchsql_test fail-1 {select * from nosuchtable} ' +
+    '{1 {no such table: nosuchtable}}',
+    rc);
+  if rc <> TCL_OK then Die('do_catchsql_test rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after fail-1 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  if CounterNTest <> 5 then Die('after fail-1 nTest=' + IntToStr(CounterNTest) + ' want 5');
+  Writeln('PASS: do_catchsql_test fail-1, nTest=5 nErr=1');
+
   sRes := EvalGet('db close', rc);
   if rc <> TCL_OK then Die('db close rc=' + IntToStr(rc) + ' err=' + sRes);
   Writeln('PASS: db close OK');
 
   Tcl_DeleteInterp(interp);
-  Writeln('TestTclTesterMin: all expectations met (final nTest=4 nErr=1).');
+  Writeln('TestTclTesterMin: all expectations met (final nTest=5 nErr=1).');
   Halt(0);
 end.

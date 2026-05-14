@@ -43,9 +43,10 @@ unblocks the most tests:
 1. ~~`ifcapable {EXPR} {BODY} ?elseBODY?` — unconditionally execute
    BODY, ignore EXPR.  Stub matches our default build (all caps
    enabled).~~  **Landed 9.4.2.g.1.**
-2. `catchsql SQL ?DB?` — `[list $rc $msg]` wrapper around `db eval`.
-3. `do_catchsql_test NAME SQL EXP` — `catchsql` + `do_test` combo
-   (upstream tester.tcl:993..1006).
+2. ~~`catchsql SQL ?DB?` — `[list $rc $msg]` wrapper around `db eval`.~~
+   **Landed 9.4.2.g.2.**
+3. ~~`do_catchsql_test NAME SQL EXP` — `catchsql` + `do_test` combo
+   (upstream tester.tcl:973..976).~~  **Landed 9.4.2.g.2.**
 4. `integrity_check NAME ?DB?` — `do_test NAME { execsql {PRAGMA
    integrity_check} } {ok}` (upstream tester.tcl:1620..1627).
 5. `finish_test` — alias for `finalize_testing` (upstream tester.tcl:1255).
