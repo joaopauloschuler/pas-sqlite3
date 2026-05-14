@@ -3006,6 +3006,11 @@ type
     uKey:        TPreUpdateKeyInfoSpace;
   end;
 
+  { Signature of the user callback registered via sqlite3_preupdate_hook.
+    db^.xPreUpdateCallback is stored as a bare Pointer; cast through this. }
+  TPreUpdateCb = procedure(pArg: Pointer; db: PTsqlite3; op: i32;
+                           zDb, zTbl: PAnsiChar; k1, k2: i64); cdecl;
+
 procedure sqlite3VdbePreUpdateHook(v: PVdbe; pCsr: PVdbeCursor; op: i32;
   zDb: PAnsiChar; pTab: PTable2; iKey1: i64; iReg: i32; iBlobWrite: i32);
 
@@ -33512,11 +33517,17 @@ begin
   end;
 
   { Truncate optimisation: bare DELETE FROM t with no WHERE / no
-    triggers / no FK / non-virtual / no preupdate-hook → OP_Clear. }
+    triggers / no FK / non-virtual / no preupdate-hook → OP_Clear.
+    delete.c:471..478 — when a pre-update hook is registered the truncate
+    optimisation must be disabled so the hook fires once per deleted row. }
   if (rcauth = SQLITE_OK)
      and (pWhere = nil)
      and (bComplex = 0)
-     and (pTab^.eTabType <> TABTYP_VTAB) then
+     and (pTab^.eTabType <> TABTYP_VTAB)
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+     and (db^.xPreUpdateCallback = nil)
+{$ENDIF}
+     then
   begin
     { Phase 7: shared-cache TableLock no-op. }
     if HasRowid(pTab) then
@@ -35113,10 +35124,25 @@ begin
       sqlite3VdbeAddOp1(v, OP_FinishSeek, iDataCur);
 
     AssertH(regNew = regNewRowid + 1, 'Update regNew = regNewRowid+1');
-    { OP_Delete for chngKey / hasFK>1.  PREUPDATE_HOOK arm omitted (default
-      build). }
+    { update.c:1064..1090 — if changing the rowid or there are FK constraints
+      to process, delete the old record.  Otherwise, with the pre-update hook
+      compiled in, still emit a no-op OP_Delete so the hook fires; in the
+      default build that no-op is simply skipped.  P3 = regNewRowid so
+      sqlite3_preupdate_new() can read new.* from regNewRowid+1+iCol. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+    if (hasFK > 1) or (chngKey <> 0) then
+      sqlite3VdbeAddOp3(v, OP_Delete, iDataCur, i32(OPFLAG_ISUPDATE), regNewRowid)
+    else
+      sqlite3VdbeAddOp3(v, OP_Delete, iDataCur,
+        i32(OPFLAG_ISUPDATE) or i32(OPFLAG_ISNOOP), regNewRowid);
+    if eOnePass = ONEPASS_MULTI then
+      sqlite3VdbeChangeP5(v, OPFLAG_SAVEPOSITION);
+    if pParse^.nested = 0 then
+      sqlite3VdbeAppendP4(v, Pointer(pTab), P4_TABLE);
+{$ELSE}
     if (hasFK > 1) or (chngKey <> 0) then
       sqlite3VdbeAddOp2(v, OP_Delete, iDataCur, 0);
+{$ENDIF}
 
     if hasFK <> 0 then
       sqlite3FkCheck(pParse, pTab, 0, regNewRowid, aXRef, i32(chngKey));
@@ -37221,8 +37247,20 @@ begin
       insFlags := OPFLAG_NCHANGE or OPFLAG_LASTROWID
                   or OPFLAG_APPEND or OPFLAG_PREFORMAT;
 
-    { SQLITE_ENABLE_PREUPDATE_HOOK arm not in default build. }
-    sqlite3VdbeAddOp3(v, OP_RowCell, iDest, iSrc, regRowid);
+    { insert.c:3301..3309 — with the pre-update hook compiled in, the xfer
+      fast path cannot use the OP_RowCell preformat shortcut: the hook needs
+      the source row materialised into regData so sqlite3_preupdate_new() can
+      deserialize it.  Emit OP_RowData + drop OPFLAG_PREFORMAT instead.  For
+      VACUUM (or the default no-hook build) keep the OP_RowCell preformat. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+    if (db^.mDbFlags and DBFLAG_Vacuum) = 0 then
+    begin
+      sqlite3VdbeAddOp3(v, OP_RowData, iSrc, regData, 1);
+      insFlags := insFlags and (not OPFLAG_PREFORMAT);
+    end
+    else
+{$ENDIF}
+      sqlite3VdbeAddOp3(v, OP_RowCell, iDest, iSrc, regRowid);
     sqlite3VdbeAddOp3(v, OP_Insert, iDest, regData, regRowid);
     if (db^.mDbFlags and DBFLAG_Vacuum) = 0 then
       sqlite3VdbeChangeP4(v, -1, PAnsiChar(Pointer(pDest)), P4_TABLE);
@@ -37780,6 +37818,15 @@ begin
         end
         else
         begin
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+          { insert.c:2344..2352 — no DELETE triggers: still emit a no-op
+            OP_Delete (P4 = table) so the pre-update hook fires for the
+            row being replaced.  It does not touch the b-tree — the coming
+            OP_Insert replaces the existing entry. }
+          AssertH(HasRowid(pTab), 'GenCnstChecks IPK Replace HasRowid');
+          sqlite3VdbeAddOp2(v, OP_Delete, iDataCur, i32(OPFLAG_ISNOOP));
+          sqlite3VdbeAppendP4(v, Pointer(pTab), P4_TABLE);
+{$ENDIF}
           if pTab^.pIndex <> nil then
           begin
             sqlite3MultiWrite(pParse);
@@ -60676,11 +60723,11 @@ function preupdateUnpackRecord(pKeyInfo: PKeyInfo2; nKey: i32;
 var
   pRet: PUnpackedRecord;
 begin
-  pRet := PUnpackedRecord(sqlite3VdbeAllocUnpackedRecord(PKeyInfo(pKeyInfo)));
+  pRet := PUnpackedRecord(sqlite3VdbeAllocUnpackedRecord(Pointer(pKeyInfo)));
   if pRet <> nil then
   begin
     FillChar(pRet^.aMem^, SizeOf(TMem) * (i32(pKeyInfo^.nKeyField) + 1), 0);
-    sqlite3VdbeRecordUnpack(PKeyInfo(pKeyInfo), nKey, pKey, pRet);
+    sqlite3VdbeRecordUnpack(Pointer(pKeyInfo), nKey, pKey, pRet);
   end;
   Result := pRet;
 end;
@@ -60689,15 +60736,18 @@ end;
 procedure preupdateFreeUnpacked(db: PTsqlite3; nField: i32;
   p: PUnpackedRecord);
 var
-  i:    i32;
-  pMem: PMem;
+  i:     i32;
+  aMem0: passqlite3vdbe.PMem;
+  pCell: passqlite3vdbe.PMem;
 begin
   if p <> nil then
   begin
+    aMem0 := p^.aMem;
     for i := 0 to nField - 1 do
     begin
-      pMem := PMem(PtrUInt(p^.aMem) + PtrUInt(i) * SizeOf(TMem));
-      if pMem^.zMalloc <> nil then sqlite3VdbeMemReleaseMalloc(pMem);
+      pCell := aMem0;
+      Inc(pCell, i);
+      if pCell^.zMalloc <> nil then sqlite3VdbeMemReleaseMalloc(pCell);
     end;
     sqlite3DbNNFreeNN(db, p);
   end;
@@ -60713,8 +60763,7 @@ var
   preupdate: TPreUpdate;
   zTbl:      PAnsiChar;
   i:         i32;
-  xCb:       procedure(pArg: Pointer; db: PTsqlite3; op: i32;
-                       zDb, zTbl: PAnsiChar; k1, k2: i64); cdecl;
+  xCb:       TPreUpdateCb;
 begin
   db   := v^.db;
   zTbl := pTab^.zName;
@@ -60728,8 +60777,8 @@ begin
     preupdate.pPk := sqlite3PrimaryKeyIndex(pTab);
   end else
   begin
-    if op = SQLITE_UPDATE then
-      iKey2 := PMem(PtrUInt(v^.aMem) + PtrUInt(iReg) * SizeOf(TMem))^.u.i
+    if op = SQLITE_UPDATE_AUTH then
+      iKey2 := passqlite3vdbe.PMem(PtrUInt(v^.aMem) + PtrUInt(iReg) * SizeOf(TMem))^.u.i
     else
       iKey2 := iKey1;
   end;
@@ -60749,7 +60798,7 @@ begin
   preupdate.iBlobWrite := iBlobWrite;
 
   db^.pPreUpdate := @preupdate;
-  xCb := db^.xPreUpdateCallback;
+  xCb := TPreUpdateCb(db^.xPreUpdateCallback);
   if Assigned(xCb) then
     xCb(db^.pPreUpdateArg, db, op, zDb, zTbl, iKey1, iKey2);
   db^.pPreUpdate := nil;
@@ -60763,7 +60812,7 @@ begin
   if preupdate.aNew <> nil then
   begin
     for i := 0 to i32(pCsr^.nField) - 1 do
-      sqlite3VdbeMemRelease(PMem(PtrUInt(preupdate.aNew) +
+      sqlite3VdbeMemRelease(passqlite3vdbe.PMem(PtrUInt(preupdate.aNew) +
         PtrUInt(i) * SizeOf(TMem)));
     sqlite3DbNNFreeNN(db, preupdate.aNew);
   end;
@@ -60776,13 +60825,31 @@ begin
   end;
 end;
 
+{ vdbeapi.c:1285 columnNullValue — pointer to static memory holding an SQL
+  NULL value.  Used by sqlite3_preupdate_old/_new for ALTER-TABLE-added
+  columns with no default. }
+var
+  gPreupdateNullMem: passqlite3vdbe.TMem;
+  gPreupdateNullMemInit: Boolean = False;
+
+function columnNullValue: passqlite3vdbe.PMem;
+begin
+  if not gPreupdateNullMemInit then
+  begin
+    FillChar(gPreupdateNullMem, SizeOf(passqlite3vdbe.TMem), 0);
+    gPreupdateNullMem.flags := MEM_Null;
+    gPreupdateNullMemInit := True;
+  end;
+  Result := @gPreupdateNullMem;
+end;
+
 { vdbeapi.c:2209 sqlite3_preupdate_old (body, sans API-armor — caller
   does the armor checks). }
 function sqlite3PreupdateOldImpl(db: PTsqlite3; iIdx: i32;
   ppValue: PPointer): i32;
+label preupdate_old_out;
 var
   p:      PPreUpdate;
-  pMem:   PMem;
   rc:     i32;
   iStore: i32;
   nRec:   u32;
@@ -60790,12 +60857,12 @@ var
   pCol:   PColumn;
   pDflt:  PExpr;
   pVal:   Psqlite3_value;
-label preupdate_old_out;
+  pMem:   passqlite3vdbe.PMem;
 begin
   rc     := SQLITE_OK;
   iStore := 0;
   p := PPreUpdate(db^.pPreUpdate);
-  if (p = nil) or (p^.op = SQLITE_INSERT) then
+  if (p = nil) or (p^.op = SQLITE_INSERT_AUTH) then
   begin
     rc := SQLITE_MISUSE;
     goto preupdate_old_out;
@@ -60841,7 +60908,7 @@ begin
       p^.aRecord := aRec;
     end;
 
-    pMem := PMem(PtrUInt(p^.pUnpacked^.aMem) + PtrUInt(iStore) * SizeOf(TMem));
+    pMem := passqlite3vdbe.PMem(PtrUInt(p^.pUnpacked^.aMem) + PtrUInt(iStore) * SizeOf(TMem));
     ppValue^ := pMem;
     if iStore >= i32(p^.pUnpacked^.nField) then
     begin
@@ -60917,24 +60984,24 @@ end;
 { vdbeapi.c:2369 sqlite3_preupdate_new (body, sans API-armor). }
 function sqlite3PreupdateNewImpl(db: PTsqlite3; iIdx: i32;
   ppValue: PPointer): i32;
+label preupdate_new_out;
 var
   p:       PPreUpdate;
   rc:      i32;
-  pMem:    PMem;
+  pMem:    passqlite3vdbe.PMem;
   iStore:  i32;
   pUnpack: PUnpackedRecord;
-  pData:   PMem;
-label preupdate_new_out;
+  pData:   passqlite3vdbe.PMem;
 begin
   rc     := SQLITE_OK;
   iStore := 0;
   p := PPreUpdate(db^.pPreUpdate);
-  if (p = nil) or (p^.op = SQLITE_DELETE) then
+  if (p = nil) or (p^.op = SQLITE_DELETE_AUTH) then
   begin
     rc := SQLITE_MISUSE;
     goto preupdate_new_out;
   end;
-  if (p^.pPk <> nil) and (p^.op <> SQLITE_UPDATE) then
+  if (p^.pPk <> nil) and (p^.op <> SQLITE_UPDATE_AUTH) then
     iStore := sqlite3TableColumnToIndex(p^.pPk, i16(iIdx))
   else if iIdx >= i32(p^.pTab^.nCol) then
   begin
@@ -60949,13 +61016,13 @@ begin
     goto preupdate_new_out;
   end;
 
-  if p^.op = SQLITE_INSERT then
+  if p^.op = SQLITE_INSERT_AUTH then
   begin
     { Memory cell p->iNewReg holds the serialized record being inserted. }
     pUnpack := p^.pNewUnpacked;
     if pUnpack = nil then
     begin
-      pData := PMem(PtrUInt(p^.v^.aMem) + PtrUInt(p^.iNewReg) * SizeOf(TMem));
+      pData := passqlite3vdbe.PMem(PtrUInt(p^.v^.aMem) + PtrUInt(p^.iNewReg) * SizeOf(TMem));
       rc := sqlite3VdbeMemExpandBlob(pData);
       if rc <> SQLITE_OK then goto preupdate_new_out;
       pUnpack := preupdateUnpackRecord(p^.pKeyinfo, pData^.n, pData^.z);
@@ -60966,7 +61033,7 @@ begin
       end;
       p^.pNewUnpacked := pUnpack;
     end;
-    pMem := PMem(PtrUInt(pUnpack^.aMem) + PtrUInt(iStore) * SizeOf(TMem));
+    pMem := passqlite3vdbe.PMem(PtrUInt(pUnpack^.aMem) + PtrUInt(iStore) * SizeOf(TMem));
     if iIdx = i32(p^.pTab^.iPKey) then
       sqlite3VdbeMemSetInt64(pMem, p^.iKey2)
     else if iStore >= i32(pUnpack^.nField) then
@@ -60976,7 +61043,7 @@ begin
     { UPDATE: cell (p->iNewReg+1+iStore) holds the required value. }
     if p^.aNew = nil then
     begin
-      p^.aNew := PMem(sqlite3DbMallocZero(db,
+      p^.aNew := passqlite3vdbe.PMem(sqlite3DbMallocZero(db,
         u64(SizeOf(TMem)) * u64(p^.pCsr^.nField)));
       if p^.aNew = nil then
       begin
@@ -60984,14 +61051,14 @@ begin
         goto preupdate_new_out;
       end;
     end;
-    pMem := PMem(PtrUInt(p^.aNew) + PtrUInt(iStore) * SizeOf(TMem));
+    pMem := passqlite3vdbe.PMem(PtrUInt(p^.aNew) + PtrUInt(iStore) * SizeOf(TMem));
     if pMem^.flags = 0 then
     begin
       if iIdx = i32(p^.pTab^.iPKey) then
         sqlite3VdbeMemSetInt64(pMem, p^.iKey2)
       else
       begin
-        rc := sqlite3VdbeMemCopy(pMem, PMem(PtrUInt(p^.v^.aMem) +
+        rc := sqlite3VdbeMemCopy(pMem, passqlite3vdbe.PMem(PtrUInt(p^.v^.aMem) +
           PtrUInt(p^.iNewReg + 1 + iStore) * SizeOf(TMem)));
         if rc <> SQLITE_OK then goto preupdate_new_out;
       end;

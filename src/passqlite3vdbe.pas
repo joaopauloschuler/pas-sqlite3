@@ -8987,7 +8987,7 @@ begin
         if (db^.xPreUpdateCallback <> nil)
            and ((pOp^.p5 and OPFLAG_ISUPDATE) = 0)
            and Assigned(gVdbePreUpdateHook) then
-          gVdbePreUpdateHook(v, pCur, SQLITE_INSERT, zHookDb,
+          gVdbePreUpdateHook(v, pCur, SQLITE_INSERT_AUTH, zHookDb,
             pOp^.p4.pTab, xPay.nKey, pOp^.p2, -1);
         if (db^.xUpdateCallback = nil)
            or (PTableHookFields(pOp^.p4.pTab)^.aCol = nil) then begin
@@ -9071,10 +9071,10 @@ begin
       if (db^.xPreUpdateCallback <> nil) and (pHookTab <> nil)
          and Assigned(gVdbePreUpdateHook) then begin
         if (opflags and OPFLAG_ISUPDATE) <> 0 then
-          gVdbePreUpdateHook(v, pCur, SQLITE_UPDATE, zHookDb,
+          gVdbePreUpdateHook(v, pCur, SQLITE_UPDATE_AUTH, zHookDb,
             pOp^.p4.pTab, pCur^.movetoTarget, pOp^.p3, -1)
         else
-          gVdbePreUpdateHook(v, pCur, SQLITE_DELETE, zHookDb,
+          gVdbePreUpdateHook(v, pCur, SQLITE_DELETE_AUTH, zHookDb,
             pOp^.p4.pTab, pCur^.movetoTarget, pOp^.p3, -1);
       end;
       if (opflags and OPFLAG_ISNOOP) = 0 then begin

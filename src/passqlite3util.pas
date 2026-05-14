@@ -3166,14 +3166,36 @@ end;
   sqlite3_uri_parameter: 4 leading zero bytes, then the database name and
   query parameter key/value pairs separated by NULs, an extra NUL, then
   the journal name, the WAL name, and two trailing NULs. }
+{ FPC codegen note: an earlier form of this routine ended with a
+  pointer-difference AssertH —
+    AssertH((PtrUInt(p)-PtrUInt(pResult)) = PtrUInt(nByte), ...)
+  — which crashes the FPC compiler (internal error 200510011 /
+  EAccessViolation) under some define/optimisation combinations (observed
+  with -dSQLITE_ENABLE_PREUPDATE_HOOK).  The {$ifdef} blocks elsewhere
+  shift codegen just enough to expose the compiler bug.  The fix tracks
+  the bytes written in a plain i64 counter (nWritten) instead, so the
+  sanity check is an ordinary i64=i64 comparison with no pointer casts. }
 function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
   nParam: i32; azParam: PPChar): PChar; cdecl;
 var
-  nByte   : i64;
-  i       : i32;
-  pResult : PChar;
-  p       : PChar;
-  azP     : PPChar;
+  nByte    : i64;
+  nWritten : i64;
+  i        : i32;
+  pResult  : PChar;
+  p        : PChar;
+  azP      : PPChar;
+
+  { local appendText analogue that also advances nWritten }
+  function emit(z: PChar): PChar;
+  var n: i64;
+  begin
+    if z = nil then n := 0 else n := sqlite3Strlen30(z);
+    Move(z^, p^, n + 1);
+    p := p + n + 1;
+    nWritten := nWritten + n + 1;
+    Result := p;
+  end;
+
 begin
   nByte := sqlite3Strlen30(zDatabase) + sqlite3Strlen30(zJournal)
          + sqlite3Strlen30(zWal) + 10;
@@ -3183,18 +3205,19 @@ begin
   pResult := PChar(sqlite3_malloc64(u64(nByte)));
   p := pResult;
   if p = nil then begin Result := nil; Exit; end;
+  nWritten := 0;
   FillChar(p^, 4, 0);
-  p := p + 4;
-  p := appendText(p, zDatabase);
+  p := p + 4; nWritten := nWritten + 4;
+  emit(zDatabase);
   for i := 0 to (nParam * 2) - 1 do
-    p := appendText(p, azP[i]);
-  p^ := #0; Inc(p);
-  p := appendText(p, zJournal);
-  p := appendText(p, zWal);
-  p^ := #0; Inc(p);
-  p^ := #0; Inc(p);
-  AssertH((PtrUInt(p) - PtrUInt(pResult)) = PtrUInt(nByte),
-    'sqlite3_create_filename: byte-count mismatch');
+    emit(azP[i]);
+  p^ := #0; Inc(p); Inc(nWritten);
+  emit(zJournal);
+  emit(zWal);
+  p^ := #0; Inc(p); Inc(nWritten);
+  p^ := #0; Inc(p); Inc(nWritten);
+  if nWritten <> nByte then
+    AssertH(False, 'sqlite3_create_filename: byte-count mismatch');
   Result := pResult + 4;
 end;
 
