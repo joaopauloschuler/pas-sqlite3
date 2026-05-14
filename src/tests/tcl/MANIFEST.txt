@@ -1186,3 +1186,4 @@ tcl-feature	../sqlite3/test/zerodamage.test
 tcl-feature	../sqlite3/test/zipfile.test
 tcl-feature	../sqlite3/test/zipfile2.test
 tcl-internal	../sqlite3/test/zipfilefault.test
+tcl-feature	src/tests/tcl/preupdate.test

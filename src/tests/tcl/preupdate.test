@@ -1,0 +1,172 @@
+# preupdate.test — runtime exercise of the pre-update hook (task 9.4.2.u.1).
+#
+# This is a focused port of the hook-7.* section of upstream
+# ../sqlite3/test/hook.test (the upstream tree folds the preupdate tests
+# into hook.test rather than a standalone preupdate.test).  It drives the
+# Tcl `db preupdate hook` callback and the `db preupdate old|new|count|
+# depth` subcommands against a PREUPDATE=1 build of bin/libpassqlite3tcl.so.
+#
+# It exercises:
+#   * INSERT  — single row, INSERT...SELECT (with/without xfer opt)
+#   * REPLACE — rowid conflict and UNIQUE-index conflict (DELETE+INSERT)
+#   * DELETE  — single row and truncate-optimised whole-table delete
+#   * UPDATE  — plain, rowid-modifying
+#   * preupdate old/new column values, preupdate count
+#   * preupdate depth (callbacks fired from within a trigger)
+#
+# The shim's `ifcapable` stub always runs the body, so this file must
+# only be swept against the PREUPDATE=1 lib — see tcl/STATUS.txt.
+#
+# C ref: ../sqlite3/test/hook.test lines 442..865.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix preupdate
+
+#--------------------------------------------------------------------------
+# do_preupdate_test / preupdate_hook — verbatim from hook.test:477..511.
+#
+proc do_preupdate_test {tn sql x} {
+  set X [list]
+  foreach elem $x {lappend X $elem}
+  uplevel do_test $tn [list "
+    set ::preupdate \[list\]
+    execsql { $sql }
+    set ::preupdate
+  "] [list $X]
+}
+
+proc preupdate_hook {args} {
+  set type [lindex $args 0]
+  eval lappend ::preupdate $args
+  if {$type != "INSERT"} {
+    for {set i 0} {$i < [db preupdate count]} {incr i} {
+      lappend ::preupdate [db preupdate old $i]
+    }
+  }
+  if {$type != "DELETE"} {
+    for {set i 0} {$i < [db preupdate count]} {incr i} {
+      set rc [catch { db preupdate new $i } v]
+      lappend ::preupdate $v
+    }
+  }
+}
+
+db close
+forcedelete test.db
+sqlite3 db test.db
+db preupdate hook preupdate_hook
+
+# Schema for tests 1.* .. 3.* — hook.test:519..530.
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b);
+  CREATE TABLE t2(x, y);
+  CREATE TABLE t3(i, j, UNIQUE(i));
+
+  INSERT INTO t2 VALUES('a', 'b');
+  INSERT INTO t2 VALUES('c', 'd');
+
+  INSERT INTO t3 VALUES(4, 16);
+  INSERT INTO t3 VALUES(5, 25);
+  INSERT INTO t3 VALUES(6, 36);
+}
+
+#--------------------------------------------------------------------------
+# 1.* — INSERT.
+#
+do_preupdate_test 1.1 {
+  INSERT INTO t1 VALUES('x', 'y')
+} {INSERT main t1 1 1  x y}
+
+# 1.2.1 does not use the xfer optimization; 1.2.2 does.
+do_preupdate_test 1.2.1 {
+  INSERT INTO t1 SELECT y, x FROM t2;
+} {INSERT main t1 2 2 b a   INSERT main t1 3 3 d c}
+do_preupdate_test 1.2.2 {
+  INSERT INTO t1 SELECT * FROM t2;
+} {INSERT main t1 4 4 a b   INSERT main t1 5 5 c d}
+
+do_preupdate_test 1.3 {
+  REPLACE INTO t1(rowid, a, b) VALUES(1, 1, 1);
+} {
+  DELETE main t1 1 1   x y
+  INSERT main t1 1 1   1 1
+}
+
+do_preupdate_test 1.4 {
+  REPLACE INTO t3 VALUES(4, NULL);
+} {
+  DELETE main t3 1 1   4 16
+  INSERT main t3 4 4   4 {}
+}
+
+#--------------------------------------------------------------------------
+# 2.* — DELETE.
+#
+do_execsql_test 2.0 { SELECT rowid FROM t1 } {1 2 3 4 5}
+
+do_preupdate_test 2.1 {
+  DELETE FROM t1 WHERE rowid = 3
+} {DELETE main t1 3 3 d c}
+
+do_preupdate_test 2.2 {
+  DELETE FROM t1
+} {
+  DELETE main t1 1 1 1 1   DELETE main t1 2 2 b a
+  DELETE main t1 4 4 a b   DELETE main t1 5 5 c d
+}
+
+#--------------------------------------------------------------------------
+# 3.* — UPDATE.
+#
+do_execsql_test 3.0 {
+  INSERT INTO t1 VALUES('a', 'b');
+  INSERT INTO t1 VALUES('c', 'd');
+}
+
+do_preupdate_test 3.1 {
+  UPDATE t1 SET a = 'X' WHERE rowid = 2;
+} {UPDATE main t1 2 2  c d  X d}
+
+do_preupdate_test 3.2 {
+  UPDATE t1 SET rowid = 5 WHERE rowid = 1;
+} {UPDATE main t1 1 5  a b  a b}
+
+#--------------------------------------------------------------------------
+# 4.* — preupdate depth, exercised from inside a trigger.
+# hook.test:753..820.
+#
+proc preupdate_hook {args} {
+  set type [lindex $args 0]
+  eval lappend ::preupdate $args
+  eval lappend ::preupdate [db preupdate depth]
+  if {$type != "INSERT"} {
+    for {set i 0} {$i < [db preupdate count]} {incr i} {
+      lappend ::preupdate [db preupdate old $i]
+    }
+  }
+  if {$type != "DELETE"} {
+    for {set i 0} {$i < [db preupdate count]} {incr i} {
+      set rc [catch { db preupdate new $i } v]
+      lappend ::preupdate $v
+    }
+  }
+}
+db preupdate hook preupdate_hook
+
+do_execsql_test 4.0 {
+  CREATE TABLE t4(x);
+  CREATE TABLE log(x);
+  CREATE TRIGGER t4_ai AFTER INSERT ON t4 BEGIN
+    INSERT INTO log VALUES(new.x);
+  END;
+}
+
+do_preupdate_test 4.1 {
+  INSERT INTO t4 VALUES('depth-test');
+} {
+  INSERT main t4 1 1 0 depth-test
+  INSERT main log 1 1 1 depth-test
+}
+
+finish_test

@@ -1214,3 +1214,4 @@ pas-skip	../sqlite3/test/zerodamage.test	unswept
 pas-skip	../sqlite3/test/zipfile.test	unswept
 pas-skip	../sqlite3/test/zipfile2.test	unswept
 pas-skip	../sqlite3/test/zipfilefault.test	unswept
+pas-skip	src/tests/tcl/preupdate.test	9.4.2.u.1-needs-PREUPDATE=1
