@@ -178,7 +178,12 @@ begin
     if rc <> SQLITE_OK then
     begin
       Tcl_DecrRefCount(pList);
-      Tcl_AppendResult(interp, sqlite3_errmsg(pDb^.db), Pointer(nil));
+      { 9.4.divbug.6: mirror upstream tclsqlite.c:1812 — SET the interp result
+        from sqlite3_errmsg, do not Append.  The UDF trampoline may have
+        already pushed an error string (sqlite3_result_error), and AppendResult
+        on top of that doubled the text ("boomboom"). }
+      Tcl_SetObjResult(interp,
+        Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
       Result := TCL_ERROR;
       Exit;
     end;
@@ -213,7 +218,10 @@ begin
     if (rcStep <> SQLITE_DONE) and (rcStep <> SQLITE_OK) then
     begin
       Tcl_DecrRefCount(pList);
-      Tcl_AppendResult(interp, sqlite3_errmsg(pDb^.db), Pointer(nil));
+      { 9.4.divbug.6: see comment above — must SET, not Append, so a UDF
+        error already on the interp result is not duplicated. }
+      Tcl_SetObjResult(interp,
+        Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
       Result := TCL_ERROR;
       Exit;
     end;

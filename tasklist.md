@@ -743,17 +743,17 @@ acceptance gate for this section.
   `sqlite3_value_text` consumers in the CAST opcode probably
   miss a `sqlite3VdbeChangeEncoding` before parse.  C ref:
   `vdbe.c:OP_Cast`, `vdbemem.c:sqlite3VdbeMemCast`.
-- [ ] **9.4.divbug.6** Doubled error string in `db1 eval`'s error
+- [X] **9.4.divbug.6** Doubled error string in `db1 eval`'s error
   return — surfaced by 9.4.2.f gate `tcl_err()` returning
   `boomboom` instead of `boom`.  Root cause: `DbEvalArm`
-  (PasTclSqlite.pas) appends `sqlite3_errmsg(db)` on top of the
+  (PasTclSqlite.pas) appended `sqlite3_errmsg(db)` on top of the
   already-populated Tcl interp result string (the UDF trampoline
   already routed `error "boom"` to `sqlite3_result_error`, which
-  propagates verbatim).  Fix: in the error branch of `DbEvalArm`,
-  set the Tcl result via `Tcl_SetObjResult` from `sqlite3_errmsg`
-  rather than `Tcl_AppendResult`.  C ref: `tclsqlite.c:dbEvalStep`
-  error tail.  Bridge-local bug — not present in DIVERGENCES.md
-  (surfaced by the 9.4.2.f smoke gate, not the corpus sweep).
+  propagates verbatim).  Fix: both error tails in `DbEvalArm` now
+  call `Tcl_SetObjResult(interp, Tcl_NewStringObj(sqlite3_errmsg(db),-1))`,
+  matching upstream `tclsqlite.c:dbEvalStep` line 1812.
+  `bin/TestTclSqliteFunction` now reports
+  `PASS: tcl_err -> rc=1 msg=[boom]` (was `[boomboom]`).
 
 ---
 
