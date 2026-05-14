@@ -416,7 +416,7 @@ acceptance gate for this section.
     Smoke gated by `bin/TestTclTesterMin` step 9c (working_64bit_int=1,
     presql=[] when unset, omit_test myskip records
     `{myskip {reason text}}`).
-  - [ ] **9.4.2.g.6** `do_eqp_test` — EXPLAIN QUERY PLAN comparison;
+  - [X] **9.4.2.g.6** `do_eqp_test` — EXPLAIN QUERY PLAN comparison;
     needs `db eval` 3-arg form (9.4.2.h) for row→list flattening.
     C ref: `tester.tcl:1064..1098`.
   - [X] **9.4.2.g.7** `do_test` glob/regexp/numeric-range forms

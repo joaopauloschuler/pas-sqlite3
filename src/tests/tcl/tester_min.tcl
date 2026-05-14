@@ -402,6 +402,71 @@ proc reset_db {} {
   sqlite3 db ./test.db
 }
 
+# query_plan_graph — upstream tester.tcl:990..1001.  Renders the
+# EXPLAIN QUERY PLAN output of $sql as the indented ASCII graph that
+# do_eqp_test compares against.  Relies on the `db eval` 3-arg array
+# form (9.4.2.h) for the row->array binding.
+proc query_plan_graph {sql} {
+  db eval "EXPLAIN QUERY PLAN $sql" {
+    set dx($id) $detail
+    lappend cx($parent) $id
+  }
+  set a "\n  QUERY PLAN\n"
+  append a [append_graph "  " dx cx 0]
+  regsub -all {SUBQUERY 0x[A-F0-9]+\y} $a {SUBQUERY xxxxxx} a
+  regsub -all {(MATERIALIZE|CO-ROUTINE|SUBQUERY) \d+\y} $a {\1 xxxxxx} a
+  regsub -all {\((join|subquery)-\d+\)} $a {(\1-xxxxxx)} a
+  return $a
+}
+
+# append_graph — upstream tester.tcl:1017..1039.  Helper for
+# query_plan_graph: emit the rows of the graph that are children of
+# $level, prefixed with the tree-drawing characters.
+proc append_graph {prefix dxname cxname level} {
+  upvar $dxname dx $cxname cx
+  set a ""
+  set x $cx($level)
+  set n [llength $x]
+  for {set i 0} {$i<$n} {incr i} {
+    set id [lindex $x $i]
+    if {$i==$n-1} {
+      set p1 "`--"
+      set p2 "   "
+    } else {
+      set p1 "|--"
+      set p2 "|  "
+    }
+    append a $prefix$p1$dx($id)\n
+    if {[info exists cx($id)]} {
+      append a [append_graph "$prefix$p2" dx cx $id]
+    }
+  }
+  return $a
+}
+
+# do_eqp_test — upstream tester.tcl:1048..1066.  Run EXPLAIN QUERY PLAN
+# on $sql and compare against $res.  If $res begins with a
+# "\s+QUERY PLAN\n" line it is the complete expected graph and must
+# match query_plan_graph exactly; otherwise $res is a substring that
+# must appear somewhere in the EQP output (wrapped as a /*...*/ glob).
+proc do_eqp_test {name sql res} {
+  if {[regexp {^\s+QUERY PLAN\n} $res]} {
+    set query_plan [query_plan_graph $sql]
+    if {[list {*}$query_plan]==[list {*}$res]} {
+      uplevel [list do_test $name [list set {} ok] ok]
+    } else {
+      uplevel [list \
+        do_test $name [list query_plan_graph $sql] $res
+      ]
+    }
+  } else {
+    if {[string index $res 0]!="/"} {
+      set res "/*$res*/"
+    }
+    uplevel do_execsql_test $name [list "EXPLAIN QUERY PLAN $sql"] [list $res]
+  }
+}
+
 # Open `db` on a fresh on-disk ./test.db at shim load time, mirroring
 # upstream tester.tcl:553..556.  The driver no longer issues its own
 # `sqlite3 db :memory:`.
