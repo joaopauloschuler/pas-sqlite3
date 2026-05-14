@@ -1994,7 +1994,10 @@ begin
     Result := SQLITE_MISUSE;
     Exit;
   end;
-  sqlite3GlobalConfig.xLog    := Pointer({$IFDEF FPC}@{$ENDIF}xLog);
+  { xLog is already a procedure-pointer variable; `@xLog` would take the
+    address of the local parameter slot (a stack address) rather than the
+    callback's code address.  Cast the value directly. }
+  sqlite3GlobalConfig.xLog    := Pointer(xLog);
   sqlite3GlobalConfig.pLogArg := pCtx;
   Result := SQLITE_OK;
 end;

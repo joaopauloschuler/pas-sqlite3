@@ -47802,6 +47802,7 @@ var
   iCookie:  i32;
   iVal:     i32;
   addrOp:   i32;
+  iIncrVacAddr: i32;
   pBtArg:   PBtree;
   db:       PTsqlite3;
   i:        i32;
@@ -48394,6 +48395,26 @@ begin
     sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
     sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
+  { PragTyp_INCREMENTAL_VACUUM (pragma.c:854).  Faithful port: loop
+    OP_IncrVacuum up to iLimit steps, returning one result row per step. }
+  if SameText(zName, 'incremental_vacuum') then begin
+    iVal := 0;
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if (sqlite3GetInt32(PChar(zRight), @iVal) = 0) or (iVal <= 0) then
+        iVal := $7FFFFFFF;
+    end else
+      iVal := $7FFFFFFF;
+    sqlite3BeginWriteOperation(pParse, 0, iDb);
+    sqlite3VdbeAddOp2(v, OP_Integer, iVal, 1);
+    iIncrVacAddr := sqlite3VdbeAddOp1(v, OP_IncrVacuum, iDb);
+    sqlite3VdbeAddOp1(v, OP_ResultRow, 1);
+    sqlite3VdbeAddOp2(v, OP_AddImm, 1, -1);
+    sqlite3VdbeAddOp2(v, OP_IfPos, 1, iIncrVacAddr);
+    sqlite3VdbeJumpHere(v, iIncrVacAddr);
     Exit;
   end;
 

@@ -89,12 +89,52 @@ autovacuum + incrvacuum) and bucket-M (UTF-16 INSERT stores raw
 UTF-8 on utf16.db).  Round-trip probe today: gated=8 ok=5
 diverged=0 skipped=3 rc=0.
 
-## Bucket B — VACUUM raises EAccessViolation on the Pascal port (9.2.4)
+## Bucket B — VACUUM raises EAccessViolation on the Pascal port (9.2.4) [FIXED 9.2.divbug.B]
 
-Symptom: a bare `VACUUM;` statement against any committed `.db` vector
-crashes the Pascal port with `EAccessViolation` and rc=217 (uncaught
-FPC exception).  The C oracle returns rc=0 and rewrites the database
-in-place.
+**Fixed.**  Three root causes, all in the auto-vacuum path:
+
+1. `sqlite3_config` (passqlite3main.pas:1997) wrote `Pointer(@xLog)` — the
+   *address of the local procedure-pointer parameter* (a stack slot) —
+   into `sqlite3GlobalConfig.xLog` instead of `Pointer(xLog)`.  The shell
+   installs an `xLog` callback via `SQLITE_CONFIG_LOG`; every statement
+   abort then jumped through that stack address.  This is what produced
+   the `EAccessViolation` — it only fired once a VACUUM sub-statement
+   actually aborted.  Fixed by casting the value directly.
+
+2. `btreeCreateTable` (passqlite3btree.pas) was the
+   `SQLITE_OMIT_AUTOVACUUM` stub — it allocated the new root page with a
+   plain `allocateBtreePage(...,1,0)`.  On an auto-vacuum temp database
+   the first user table's root must be relocated past the pointer-map
+   page and recorded in the ptrmap + `meta[4]` (BTREE_LARGEST_ROOT_PAGE).
+   Without it the `t` table root landed on page 2 (the ptrmap page);
+   the next `balance_deeper` then tripped `ptrmapPut`'s "ptrmap page in
+   use as btree page" corruption guard.  Ported the full
+   `!SQLITE_OMIT_AUTOVACUUM` arm (btree.c:10055..10153).
+
+3. `allocateBtreePage`'s file-extend arm (passqlite3btree.pas) was also
+   the omit-autovacuum stub — it never skipped a freshly-extended
+   pointer-map page.  Ported btree.c:6764..6783: when the extended page
+   is itself a ptrmap page, allocate two pages (one ptrmap, one for the
+   caller).
+
+Also fixed a latent `balance_deeper` bug — the `if rc<>SQLITE_OK`
+early-out did a bare `Exit` without `Result := rc`, returning an
+uninitialised value (this is what turned the underlying SQLITE_CORRUPT
+into garbage rc / a second crash).  And added the missing `ISAUTOVACUUM`
+arm of `sqlite3BtreeInsert`'s `BTREE_PREFORMAT` branch
+(btree.c:9576..9584) — the PTRMAP_OVERFLOW1 entry for a preformatted
+cell that spills to overflow.
+
+Result: bare `VACUUM;` against `autovacuum.db` / `incrvacuum.db` /
+`view-cte.db` / `withoutrowid.db` / `partial-index.db` now returns rc=0
+and the rewritten blob is byte-identical to the C oracle.  All three
+9.2.x vector probes (`TestVectorReadOnly`, `TestVectorRoundTrip`,
+`TestVectorSchemaChange`) report gated=N skipped=0 diverged=0.
+
+Original symptom (kept for historical context): a bare `VACUUM;`
+statement against any committed `.db` vector crashes the Pascal port
+with `EAccessViolation` and rc=217 (uncaught FPC exception).  The C
+oracle returns rc=0 and rewrites the database in-place.
 
 Reproducer:
 
@@ -347,9 +387,35 @@ Affected vector: `triggers.db` — now runs cleanly; remaining db-blob
 divergence at byte 8185 is reclassified as bucket-I (cell-layout
 drift).
 
-## Bucket L — Auto-vacuum round-trip page-count drift (9.2.3.followup)
+## Bucket L — Auto-vacuum round-trip page-count drift (9.2.3.followup) [FIXED 9.2.divbug.L]
 
-Symptom: round-trip mutator against the `autovacuum.db` and
+**Fixed.**  Two root causes:
+
+1. The same unported `btreeCreateTable` / `allocateBtreePage`
+   auto-vacuum arms behind bucket-B — see 9.2.divbug.B above.  With the
+   temp-database root pages and pointer-map pages laid out faithfully,
+   the auto-vacuum-at-COMMIT path (`autoVacuumCommit` → `incrVacuumStep`
+   → freelist truncation) reclaims and truncates exactly as the C oracle
+   does, so `autovacuum.db` round-trips byte-identically.
+
+2. `finalDbSize` (passqlite3btree.pas) used an *approximation* of
+   `PTRMAP_PAGENO(pBt, nOrig)` (`nOrig div nEntry`) and its terminal
+   `while` loop only stepped over the pending-byte page, not ptrmap
+   pages.  Replaced with the exact `ptrmapPageno` call and the faithful
+   `while PTRMAP_ISPAGE(pBt,nFin) or nFin=PENDING_BYTE_PAGE` guard
+   (btree.c:4135..4150).
+
+3. `PRAGMA incremental_vacuum` had no codegen arm at all — the pragma
+   was silently a no-op, so `incrvacuum.db` never reclaimed its
+   freelist pages (4 KB larger blob, missing stdout row).  Ported
+   pragma.c:854..866: emit `OP_Integer`/`OP_IncrVacuum`/`OP_ResultRow`/
+   `OP_AddImm`/`OP_IfPos` loop.
+
+Result: both `autovacuum.db` and `incrvacuum.db` round-trip
+byte-identically (blob + stdout) against the C oracle.
+
+Original symptom (kept for historical context): round-trip mutator
+against the `autovacuum.db` and
 `incrvacuum.db` vectors leaves a byte-different `.db` blob versus the
 C oracle, both rc=0.  Neither mutator script contains a bare `VACUUM;`
 keyword — the divergence is in the auto-vacuum-at-COMMIT (autovacuum,

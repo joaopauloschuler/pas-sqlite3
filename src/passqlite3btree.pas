@@ -4393,6 +4393,7 @@ var
   dist, d2 : i32;
   iNewTrunk: Pgno;
   pNewTrunk: PMemPage;
+  pPg      : PMemPage;
 label
   end_allocate_page;
 begin
@@ -4523,6 +4524,28 @@ begin
     Inc(pBt^.nPage);
     if pBt^.nPage = PENDING_BYTE_PAGE(pBt) then
       Inc(pBt^.nPage);
+
+    { btree.c:6764..6783 — if the newly-extended page is itself a
+      pointer-map page, allocate two pages: the first becomes a fresh
+      ptrmap page, the second is handed back to the caller. }
+    if (pBt^.autoVacuum <> 0)
+       and (ptrmapPageno(pBt, pBt^.nPage) = pBt^.nPage) then begin
+      Assert(pBt^.nPage <> PENDING_BYTE_PAGE(pBt));
+      pPg := nil;
+      rc := btreeGetUnusedPage(pBt, pBt^.nPage, pPg, bNoContent);
+      if rc = SQLITE_OK then begin
+        rc := sqlite3PagerWrite(pPg^.pDbPage);
+        releasePage(pPg);
+      end;
+      if rc <> SQLITE_OK then begin
+        Result := rc;
+        Exit;
+      end;
+      Inc(pBt^.nPage);
+      if pBt^.nPage = PENDING_BYTE_PAGE(pBt) then
+        Inc(pBt^.nPage);
+    end;
+
     sqlite3Put4byte(@pBt^.pPage1^.aData[28], pBt^.nPage);
     pPgno := pBt^.nPage;
     rc := btreeGetUnusedPage(pBt, pPgno, ppPage, bNoContent);
@@ -5779,6 +5802,7 @@ begin
   end;
   if rc <> SQLITE_OK then begin
     releasePage(pChild);
+    Result := rc;
     Exit;
   end;
 
@@ -6120,10 +6144,22 @@ begin
 
   newCell := p^.pBt^.pTmpSpace;
   if (flags and BTREE_PREFORMAT) <> 0 then begin
+    rc    := SQLITE_OK;
     szNew := p^.pBt^.nPreformatSize;
     if szNew < 4 then begin
       szNew       := 4;
       newCell[3]  := 0;
+    end;
+    { btree.c:9576..9584 — when the preformatted cell spills to overflow
+      pages on an auto-vacuum database, record the PTRMAP_OVERFLOW1 entry
+      for the first overflow page. }
+    if ISAUTOVACUUM(p^.pBt) and (szNew > i32(pPage^.maxLocal)) then begin
+      pPage^.xParseCell(pPage, newCell, @info);
+      if info.nPayload <> info.nLocal then begin
+        ptrmapPut(p^.pBt, get4byte(@newCell[szNew - 4]),
+                  PTRMAP_OVERFLOW1, pPage^.pgno, @rc);
+        if rc <> SQLITE_OK then goto end_insert;
+      end;
     end;
   end else begin
     rc := fillInCell(pPage, newCell, pX, szNew);
@@ -7167,29 +7203,108 @@ begin
   Result := rc;
 end;
 
-{ btree.c lines 10039-10182: btreeCreateTable (simplified: SQLITE_OMIT_AUTOVACUUM) }
+{ btree.c lines 10039-10182: btreeCreateTable.  Full port including the
+  !SQLITE_OMIT_AUTOVACUUM arm — the new root-page must be relocated past
+  any pointer-map / pending-byte page and recorded in the ptrmap and
+  meta[4] (BTREE_LARGEST_ROOT_PAGE). }
 function btreeCreateTable(p: PBtree; piTable: PPgno; createTabFlags: i32): i32;
 var
-  pBt     : PBtShared;
-  pRoot   : PMemPage;
-  pgnoRoot: Pgno;
-  rc      : i32;
-  ptfFlags: i32;
+  pBt      : PBtShared;
+  pRoot    : PMemPage;
+  pgnoRoot : Pgno;
+  rc       : i32;
+  ptfFlags : i32;
+  pgnoMove : Pgno;
+  pPageMove: PMemPage;
+  eType    : u8;
+  iPtrPage : Pgno;
 begin
-  pBt     := p^.pBt;
-  pRoot   := nil;
+  pBt      := p^.pBt;
+  pRoot    := nil;
   pgnoRoot := 0;
   rc := SQLITE_OK;
 
-  { No autovacuum: allocate page normally }
-  rc := allocateBtreePage(pBt, pRoot, pgnoRoot, 1, 0);
-  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  if pBt^.autoVacuum <> 0 then begin
+    { btree.c:10055..10153 — autovacuum root-page allocation. }
+    invalidateAllOverflowCache(pBt);
 
-  rc := sqlite3PagerWrite(pRoot^.pDbPage);
-  if rc <> SQLITE_OK then begin
-    releasePage(pRoot);
-    Result := rc;
-    Exit;
+    sqlite3BtreeGetMeta(p, BTREE_LARGEST_ROOT_PAGE, @pgnoRoot);
+    if pgnoRoot > btreePagecount(pBt) then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    Inc(pgnoRoot);
+
+    { The new root-page may not be a pointer-map page or the pending-byte
+      page. }
+    while (pgnoRoot = ptrmapPageno(pBt, pgnoRoot)) or
+          (pgnoRoot = PENDING_BYTE_PAGE(pBt)) do
+      Inc(pgnoRoot);
+    Assert(pgnoRoot >= 3);
+
+    pPageMove := nil;
+    pgnoMove  := 0;
+    rc := allocateBtreePage(pBt, pPageMove, pgnoMove, pgnoRoot, BTALLOC_EXACT);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+    if pgnoMove <> pgnoRoot then begin
+      eType    := 0;
+      iPtrPage := 0;
+
+      rc := saveAllCursors(pBt, 0, nil);
+      releasePage(pPageMove);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+      rc := btreeGetPage(pBt, pgnoRoot, pRoot, 0);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      rc := ptrmapGet(pBt, pgnoRoot, eType, iPtrPage);
+      if (eType = PTRMAP_ROOTPAGE) or (eType = PTRMAP_FREEPAGE) then
+        rc := SQLITE_CORRUPT_BKPT;
+      if rc <> SQLITE_OK then begin
+        releasePage(pRoot);
+        Result := rc;
+        Exit;
+      end;
+      Assert(eType <> PTRMAP_ROOTPAGE);
+      Assert(eType <> PTRMAP_FREEPAGE);
+      rc := relocatePage(pBt, pRoot, eType, iPtrPage, pgnoMove, 0);
+      releasePage(pRoot);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      rc := btreeGetPage(pBt, pgnoRoot, pRoot, 0);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      rc := sqlite3PagerWrite(pRoot^.pDbPage);
+      if rc <> SQLITE_OK then begin
+        releasePage(pRoot);
+        Result := rc;
+        Exit;
+      end;
+    end else
+      pRoot := pPageMove;
+
+    ptrmapPut(pBt, pgnoRoot, PTRMAP_ROOTPAGE, 0, @rc);
+    if rc <> SQLITE_OK then begin
+      releasePage(pRoot);
+      Result := rc;
+      Exit;
+    end;
+
+    rc := sqlite3BtreeUpdateMeta(p, 4, pgnoRoot);
+    if rc <> SQLITE_OK then begin
+      releasePage(pRoot);
+      Result := rc;
+      Exit;
+    end;
+  end else begin
+    { No autovacuum: allocate page normally }
+    rc := allocateBtreePage(pBt, pRoot, pgnoRoot, 1, 0);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+    rc := sqlite3PagerWrite(pRoot^.pDbPage);
+    if rc <> SQLITE_OK then begin
+      releasePage(pRoot);
+      Result := rc;
+      Exit;
+    end;
   end;
 
   if (createTabFlags and BTREE_INTKEY) <> 0 then
@@ -7839,16 +7954,12 @@ var
   nFin    : Pgno;
 begin
   nEntry := pBt^.usableSize div 5;
-  nPtrmap := (nFree - nOrig + (nOrig div Pgno(nEntry)) + Pgno(nEntry))
+  nPtrmap := (nFree - nOrig + ptrmapPageno(pBt, nOrig) + Pgno(nEntry))
               div Pgno(nEntry);
-  { NOTE: PTRMAP_PAGENO(pBt, nOrig) is approximated as (nOrig / nEntry).
-    The faithful expansion (btree.c PTRMAP_PAGENO) would compute it exactly,
-    but ptrmap is stubbed in this port — IncrVacuum returns SQLITE_DONE
-    before reaching this code path. }
   nFin := nOrig - nFree - nPtrmap;
   if (nOrig > PENDING_BYTE_PAGE(pBt)) and (nFin < PENDING_BYTE_PAGE(pBt)) then
     Dec(nFin);
-  while (nFin = PENDING_BYTE_PAGE(pBt)) do
+  while PTRMAP_ISPAGE(pBt, nFin) or (nFin = PENDING_BYTE_PAGE(pBt)) do
     Dec(nFin);
   Result := nFin;
 end;

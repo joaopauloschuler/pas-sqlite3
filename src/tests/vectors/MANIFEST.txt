@@ -91,9 +91,17 @@ btree.c:3622).  See DIVERGENCES.md.  Removing the bucket-A umbrella
 surfaced four read-only divergences the umbrella was previously hiding;
 they are tracked as bucket-F / bucket-G / bucket-H below.
 
-  pas-skip autovacuum.db       bucket-B,bucket-L (script-trailing VACUUM EAccessViolation in 9.2.4 schema-change; round-trip mutator also diverges on auto-vacuum-at-COMMIT page-count drift — bucket-L; bucket-F lifted by 9.2.divbug.F)
-  pas-skip incrvacuum.db       bucket-L (round-trip mutator + PRAGMA incremental_vacuum produces different page count + missing stdout newline; bucket-F lifted by 9.2.divbug.F)
-  pas-skip view-cte.db         bucket-B (script-trailing VACUUM still EAccessViolations — 9.2.divbug.B; rename arm of bucket-C cleared in 9.2.divbug.C; round-trip mutator byte-identical post-9.2.3.followup)
+  # autovacuum.db: bucket-B lifted by 9.2.divbug.B (btreeCreateTable +
+  #   allocateBtreePage autovacuum arms ported; bare VACUUM no longer
+  #   EAccessViolations and round-trips byte-identical).  bucket-L lifted
+  #   by 9.2.divbug.L (auto-vacuum-at-COMMIT round-trip now byte-identical).
+  #   bucket-F lifted by 9.2.divbug.F.  Fully gated.
+  # incrvacuum.db: bucket-L lifted by 9.2.divbug.L (incremental_vacuum
+  #   pragma now emits OP_IncrVacuum; round-trip mutator byte-identical
+  #   incl. stdout).  bucket-F lifted by 9.2.divbug.F.  Fully gated.
+  # view-cte.db: bucket-B lifted by 9.2.divbug.B (script-trailing VACUUM
+  #   no longer EAccessViolations); bucket-C cleared in 9.2.divbug.C.
+  #   Fully gated.
   # utf16.db: bucket-M lifted by 9.2.divbug.M (vdbeapi setResultStrOrError)
   #           bucket-N lifted by 9.2.divbug.N (round-trip mutator now
   #           byte-identical against the in-tree libsqlite3.so oracle that
@@ -104,7 +112,10 @@ they are tracked as bucket-F / bucket-G / bucket-H below.
   #           freeSpace memset gated on BTS_FAST_SECURE.  Upstream
   #           ./configure && make (the in-tree oracle) leaves SECURE_DELETE
   #           off, matching the Pas port's default.
-  pas-skip withoutrowid.db     bucket-B (trailing VACUUM EAccessViolation in 9.2.4 schema-change script; bucket-D lifted by 9.2.divbug.D — CREATE INDEX on WITHOUT ROWID now byte-identical; bucket-H lifted by 9.2.divbug.H — RO/RW probes now byte-identical; round-trip mutator byte-identical post-9.2.3.followup)
+  # withoutrowid.db: bucket-B lifted by 9.2.divbug.B (trailing VACUUM in
+  #   the 9.2.4 schema-change script no longer EAccessViolations and
+  #   round-trips byte-identical); bucket-D lifted by 9.2.divbug.D;
+  #   bucket-H lifted by 9.2.divbug.H.  Fully gated.
   # bucket-I (round-trip cell-layout drift) lifted by 9.2.divbug.I:
   #   (1) IPK column refs inside generated-column expressions read from the
   #       row-storage slot (SoftNull) instead of the rowid register, so
@@ -118,7 +129,9 @@ they are tracked as bucket-F / bucket-G / bucket-H below.
   #       oracle stored 1000-byte rows, blowing up the cell-content area.
   # All four round-trip vectors now byte-identical against upstream
   # ../sqlite3/sqlite3 (same lib the probe links against).
-  pas-skip partial-index.db    bucket-B (script-trailing VACUUM EAccessViolation; bucket-E lifted by 9.2.divbug.E)
+  # partial-index.db: bucket-B lifted by 9.2.divbug.B (script-trailing
+  #   VACUUM no longer EAccessViolations); bucket-E lifted by
+  #   9.2.divbug.E.  Fully gated.
 
 Reproducibility gate
 --------------------
