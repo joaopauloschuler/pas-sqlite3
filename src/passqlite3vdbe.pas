@@ -6160,30 +6160,65 @@ begin
   Result := sqlite3_finalize(pStmt);
 end;
 
+{ vdbeblob.c:381..466 — blobReadWrite.  Shared helper for blob_read and
+  blob_write.  xCall is either sqlite3BtreePayloadChecked (read) or
+  sqlite3BtreePutData (write).  Faithful port: takes the db mutex, brackets
+  the b-tree cursor access, and on SQLITE_ABORT finalises the held
+  statement so the handle is permanently invalidated.  The
+  SQLITE_ENABLE_PREUPDATE_HOOK arm is omitted (not compiled in this build;
+  preupdate engine is a separate task). }
+type
+  TBlobRWCall = function(pCur: PBtCursor; offset: u32; amt: u32;
+                         pBuf: Pointer): i32;
+
+function blobReadWrite(pBlob: Psqlite3_blob; z: Pointer; n: i32;
+                       iOffset: i32; xCall: TBlobRWCall): i32;
+var
+  p:  PIncrblob;
+  v:  PVdbe;
+  db: PTsqlite3;
+  rc: i32;
+begin
+  p := pBlob;
+  if p = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  db := p^.db;
+  sqlite3_mutex_enter(db^.mutex);
+  v := p^.pStmt;
+
+  if (n < 0) or (iOffset < 0) or
+     (i64(iOffset) + i64(n) > p^.nByte) then
+    { Request is out of range.  Return a transient error. }
+    rc := SQLITE_ERROR
+  else if v = nil then
+    { No statement handle — the blob handle has been invalidated. }
+    rc := SQLITE_ABORT
+  else begin
+    sqlite3BtreeEnterCursor(p^.pCsr);
+    rc := xCall(p^.pCsr, u32(iOffset + p^.iOffset), u32(n), z);
+    sqlite3BtreeLeaveCursor(p^.pCsr);
+    if rc = SQLITE_ABORT then begin
+      sqlite3VdbeFinalize(v);
+      p^.pStmt := nil;
+    end else
+      v^.rc := rc;
+  end;
+
+  db^.errCode := rc;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
 function sqlite3_blob_read(pBlob: Psqlite3_blob; z: Pointer;
                            n: i32; iOffset: i32): i32;
 begin
-  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
-  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
-  if (n < 0) or (iOffset < 0) or
-     (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
-    Result := SQLITE_ERROR; Exit;
-  end;
-  Result := sqlite3BtreePayloadChecked(pBlob^.pCsr,
-              u32(iOffset + pBlob^.iOffset), u32(n), z);
+  Result := blobReadWrite(pBlob, z, n, iOffset, @sqlite3BtreePayloadChecked);
 end;
 
 function sqlite3_blob_write(pBlob: Psqlite3_blob; z: Pointer;
                             n: i32; iOffset: i32): i32;
 begin
-  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
-  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
-  if (n < 0) or (iOffset < 0) or
-     (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
-    Result := SQLITE_ERROR; Exit;
-  end;
-  Result := sqlite3BtreePutData(pBlob^.pCsr,
-              u32(iOffset + pBlob^.iOffset), u32(n), z);
+  Result := blobReadWrite(pBlob, z, n, iOffset, @sqlite3BtreePutData);
 end;
 
 function sqlite3_blob_bytes(pBlob: Psqlite3_blob): i32;
