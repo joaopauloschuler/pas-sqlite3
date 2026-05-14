@@ -41599,8 +41599,29 @@ begin
       zCollName := pColExpr^.u.zToken;
       pColExpr  := pColExpr^.pLeft;
     end;
-    if pColExpr <> nil then
-      n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken);
+    { build.c:4220..4250 — only a plain column reference resolves through
+      sqlite3ColumnIndex; any other expression (a literal, a function call,
+      an arithmetic term, ...) is an expression-index slot.  In non-rename
+      mode the port has not yet run sqlite3StringToId/ResolveSelfReference,
+      so a column name still wears its parser token TK_ID/TK_STRING.  For
+      a non-identifier expression u.zToken is NOT a valid pointer (e.g. an
+      integer literal carries u.iValue under EP_IntValue) — dereferencing
+      it segfaults (9.4.divbug.12).  Route such slots to XN_EXPR like C. }
+    if (pColExpr <> nil)
+       and ((pColExpr^.op = TK_ID) or (pColExpr^.op = TK_STRING))
+       and ((pColExpr^.flags and EP_IntValue) = 0) then
+      n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken)
+    else
+      n := XN_EXPR;
+    if n = XN_EXPR then
+    begin
+      { build.c:4226..4233 — pin the per-column pExpr list, mark the index
+        as carrying an expression key, and drop the uniqNotNull bit. }
+      if pIndex^.aColExpr = nil then
+        pIndex^.aColExpr := pList;
+      pIndex^.idxFlags := (pIndex^.idxFlags and not u32($08))   { uniqNotNull }
+                          or u32(1 shl 11);                     { bHasExpr   }
+    end;
     if (n >= 0) and (n = pTab^.iPKey) then n := -1;  { rowid alias }
     { Mirror build.c:4241..4243 — uniqNotNull only stays set when every
       indexed column is declared NOT NULL.  rowid (n<0) is implicitly
@@ -41688,6 +41709,12 @@ begin
   end;
 
   sqlite3DefaultRowEst(pIndex);
+
+  { build.c:4227..4228 — once an expression-index slot has pinned pList
+    onto pIndex^.aColExpr, ownership has transferred; null the local so
+    the exit_create_index cleanup does not double-free it. }
+  if (pIndex^.aColExpr <> nil) and (pIndex^.aColExpr = pList) then
+    pList := nil;
 
   { Codegen / hash-publish phase. }
   if not InRenameObject(pParse) then begin

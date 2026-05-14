@@ -327,17 +327,28 @@ iteration (resolve.c:2093).  select1.test now runs past 6.22/6.23
 to completion.  Verified via `bin/TclTestDriver` script + full
 engine regression (`src/tests/build.sh`, no new failures).
 
-## 9.4.divbug.12 — `update.test` segfaults at `update-17.10` — OPEN
+## 9.4.divbug.12 — `update.test` segfaults at `update-17.10` — FIXED
 
 Affects: 1 test (`../sqlite3/test/update.test`).
-Symptom: update.test now runs cleanly through `update-17.1..9`
-(divbug.2/4 are no longer fatal) and SIGSEGVs inside `update-17.10`.
-The 17.x group exercises UPDATE with `LIMIT`/`ORDER BY` and
-multi-row UPDATE-FROM.  No diff printed — hard crash.
-Likely cause: not yet rooted — candidate is the UPDATE…FROM or
-UPDATE…ORDER BY LIMIT codegen path dereferencing a nil cursor /
-SrcList item.  Surfaced by: 9.4.4.b.2 re-sweep (was masked in
-9.4.4.b by the `reset_db` SOURCE-ERROR cutting the run short).
+Symptom: update.test SIGSEGV'd inside `update-17.10`.  The crash was
+not in UPDATE at all but in the preceding `CREATE INDEX t1x1 ON t1(1)
+WHERE 3` — an index whose key is the constant expression `1`.
+Root cause: `sqlite3CreateIndex`'s per-column loop in
+`passqlite3codegen.pas` called `sqlite3ColumnIndex(pTab,
+pColExpr^.u.zToken)` unconditionally.  For a non-identifier index
+expression (here an integer literal, `op=TK_INTEGER`,
+`EP_IntValue` set) `u.zToken` is not a valid pointer — it aliases
+`u.iValue` — so the lookup dereferenced `0x1` and segfaulted.
+build.c:4220..4250 only resolves a column name through
+`sqlite3ColumnIndex`; any other expression is an `XN_EXPR` slot.
+Fix: gate the zToken lookup on `op in {TK_ID,TK_STRING}` and not
+`EP_IntValue`; route everything else to `XN_EXPR`, pin `pList` onto
+`pIndex^.aColExpr`, set `bHasExpr`, clear `uniqNotNull`, and null the
+local `pList` after the transfer so exit cleanup does not double-free.
+Verified: `update-17.10... Ok`; update.test runs to completion.
+Remaining update.test failures (3.x/9.x error text = divbug.14/.15,
+update-19.10 `idxColIsBeingUpdated rowid` AssertH) are separate,
+pre-existing, and unrelated to this segfault.
 
 ## 9.4.divbug.13 — Result-set row ORDER for inequality scans is unstable — OPEN
 
