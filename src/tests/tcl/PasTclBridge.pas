@@ -67,6 +67,14 @@ type
   { Tcl_CmdDeleteProc — typedef'd in tcl.h:760. }
   TTclCmdDeleteProc = procedure(clientData: TClientData); cdecl;
 
+  { Tcl_NRPostProc — typedef'd in tcl.h (NRE callback).  Signature:
+    int (*)(ClientData data[2..], Tcl_Interp*, int result).  The data
+    argument is a ClientData[] of (by Tcl convention) up to 4 slots;
+    we expose it as ^TClientData and index it. }
+  PClientDataArray = ^TClientData;
+  TTclNRPostProc = function(data: PClientDataArray; interp: PTclInterp;
+    result: cint): cint; cdecl;
+
   { Tcl_CmdInfo — tcl.h struct queried by Tcl_GetCommandInfo.  Field
     order/types must match tcl.h exactly; only objClientData is read by
     register_dbstat_vtab (the SqliteDb* behind a `db` command). }
@@ -101,6 +109,37 @@ function Tcl_DuplicateObj(objPtr: PTclObj): PTclObj; cdecl; external 'tcl8.6';
 function Tcl_CreateObjCommand(interp: PTclInterp; cmdName: PChar;
   proc: TTclObjCmdProc; clientData: TClientData;
   deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ NRE (Non-Recursive Eval) command registration — tcl.h (8.6+).
+  tclsqlite.c:4404 registers the `db` command via Tcl_NRCreateCommand so
+  that [db eval]/[db transaction] script bodies can be evaluated without
+  growing the C stack, allowing clean interruption across nested [vwait].
+  Signature matches Tcl_CreateObjCommand plus a second (NRE) objProc. }
+function Tcl_NRCreateCommand(interp: PTclInterp; cmdName: PChar;
+  proc: TTclObjCmdProc; nreProc: TTclObjCmdProc; clientData: TClientData;
+  deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ Tcl_NRCallObjProc — invoked from an objCmd adaptor to dispatch into
+  the NRE-enabled implementation.  tclsqlite.c:4217 (DbObjCmdAdaptor). }
+function Tcl_NRCallObjProc(interp: PTclInterp; proc: TTclObjCmdProc;
+  clientData: TClientData; objc: cint; objv: PPTclObj): cint; cdecl;
+  external 'tcl8.6';
+
+{ Tcl_NREvalObj — schedule objPtr for evaluation by the NRE trampoline
+  rather than evaluating it recursively.  tclsqlite.c:1990, :4004. }
+function Tcl_NREvalObj(interp: PTclInterp; objPtr: PTclObj;
+  flags: cint): cint; cdecl; external 'tcl8.6';
+
+{ Tcl_NRAddCallback — push an NRE continuation; data0..data3 are opaque
+  ClientData slots passed back to the TTclNRPostProc.  tclsqlite.c:1989,
+  :4003. }
+procedure Tcl_NRAddCallback(interp: PTclInterp; postProcPtr: TTclNRPostProc;
+  data0, data1, data2, data3: TClientData); cdecl; external 'tcl8.6';
+
+{ Tcl_GetVersion — runtime Tcl version probe.  tclsqlite.c:1885 (DbUseNre)
+  tests this so a stubs build links against pre-8.6 libraries gracefully. }
+procedure Tcl_GetVersion(major, minor, patchLevel, releaseType: pcint);
+  cdecl; external 'tcl8.6';
 
 { Command introspection — returns 1 and fills infoPtr if cmdName exists.
   Used by register_dbstat_vtab (test1.c:8601) to recover the SqliteDb*. }

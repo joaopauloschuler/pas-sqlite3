@@ -3609,6 +3609,41 @@ begin
   Result := TCL_ERROR;
 end;
 
+{ DbUseNre — port of tclsqlite.c:1884..1890.  Runtime probe of the
+  linked Tcl version: NRE (Non-Recursive Eval) command dispatch is only
+  available on Tcl 8.6 or newer.  Even though we link directly against
+  tcl8.6, upstream tests at runtime so a stubs-enabled build can load
+  against an older library; we keep the same shape for faithfulness. }
+function DbUseNre: Boolean;
+var
+  major, minor: cint;
+begin
+  major := 0;
+  minor := 0;
+  Tcl_GetVersion(@major, @minor, nil, nil);
+  Result := ((major = 8) and (minor >= 6)) or (major > 8);
+end;
+
+{ DbObjCmdNRE — port of tclsqlite.c:4206..4219 (DbObjCmdAdaptor in
+  upstream naming).  Thin NRE trampoline: when the `db` command is
+  registered via Tcl_NRCreateCommand, Tcl invokes this objProc, which
+  immediately bounces into the real dispatcher (our DbObjCmdAdaptor,
+  which plays the role of upstream DbObjCmd) through Tcl_NRCallObjProc.
+  This lets script bodies scheduled with Tcl_NREvalObj unwind cleanly.
+
+  NOTE: the per-row [db eval] / [db transaction] bodies are still
+  evaluated on the direct (recursive) Tcl_EvalObjEx path inside
+  DbEvalArm / DbTransactionArm — equivalent to upstream's !DbUseNre()
+  branch.  Converting those to genuine Tcl_NRAddCallback continuations
+  needs the DbEvalContext continuation-machinery rewrite and is left as
+  a follow-up; see the report for 9.4.2.x. }
+function DbObjCmdNRE(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  Result := Tcl_NRCallObjProc(interp, @DbObjCmdAdaptor,
+                              clientData, objc, objv);
+end;
+
 { DbMain — constructor for the `sqlite3 db1 FILE` Tcl command.
   Minimal port of tclsqlite.c:4253..4570: skips flag parsing, key
   options, busy/encoding setup; just defaults RW+CREATE which is the
@@ -3678,8 +3713,16 @@ begin
   pDb^.pCollateNeeded := nil;
   pDb^.nTransaction   := 0;
 
-  Tcl_CreateObjCommand(interp, zDbName,
-    @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd);
+  { tclsqlite.c:4403..4408 — register the per-connection command with
+    the NRE trampoline when the linked Tcl supports it, else fall back
+    to the plain objCmd path.  Both register the same dispatcher
+    (DbObjCmdAdaptor) and teardown proc (DbDeleteCmd). }
+  if DbUseNre then
+    Tcl_NRCreateCommand(interp, zDbName,
+      @DbObjCmdNRE, @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd)
+  else
+    Tcl_CreateObjCommand(interp, zDbName,
+      @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd);
 
   Result := TCL_OK;
 end;
