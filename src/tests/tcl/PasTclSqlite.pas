@@ -61,6 +61,10 @@ type
     pFunc:  PSqlFunc;      { tclsqlite.c:209  — head of TSqlFunc chain,
                              populated by the `function` subcmd in
                              9.4.2.f.  Freed in DbDeleteCmd. }
+    zTrace:   PAnsiChar;   { tclsqlite.c:201 — `trace` callback script,
+                             Tcl_Alloc'd; freed in DbDeleteCmd. }
+    zTraceV2: PAnsiChar;   { tclsqlite.c:202 — `trace_v2` callback script. }
+    zProfile: PAnsiChar;   { tclsqlite.c:203 — `profile` callback script. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -109,6 +113,22 @@ begin
   begin
     FreeMem(pDb^.zNull);
     pDb^.zNull := nil;
+  end;
+  { Free trace/profile callback scripts — tclsqlite.c:631..639. }
+  if pDb^.zTrace <> nil then
+  begin
+    Tcl_Free(pDb^.zTrace);
+    pDb^.zTrace := nil;
+  end;
+  if pDb^.zTraceV2 <> nil then
+  begin
+    Tcl_Free(pDb^.zTraceV2);
+    pDb^.zTraceV2 := nil;
+  end;
+  if pDb^.zProfile <> nil then
+  begin
+    Tcl_Free(pDb^.zProfile);
+    pDb^.zProfile := nil;
   end;
   Dispose(pDb);
 end;
@@ -674,6 +694,293 @@ begin
   Result := TCL_OK;
 end;
 
+{ ----------------------------------------------------------------------
+  Trace / profile callback trampolines — tclsqlite.c:715..826.
+
+  Each fires on prepared-statement events and evaluates the stored Tcl
+  script with the per-event arguments appended as list elements. }
+
+{ DbTraceHandler — legacy sqlite3_trace callback.  tclsqlite.c:710..727.
+  Signature: void (*)(void *cd, const char *zSql). }
+procedure DbTraceHandler(cd: Pointer; zSql: PAnsiChar); cdecl;
+var
+  pDb: PSqliteDb;
+  str: TTclDString;
+begin
+  pDb := PSqliteDb(cd);
+  Tcl_DStringInit(@str);
+  Tcl_DStringAppend(@str, pDb^.zTrace, -1);
+  Tcl_DStringAppendElement(@str, zSql);
+  Tcl_Eval(pDb^.interp, Tcl_DStringValue(@str));
+  Tcl_DStringFree(@str);
+  Tcl_ResetResult(pDb^.interp);
+end;
+
+{ DbTraceV2Handler — sqlite3_trace_v2 callback.  tclsqlite.c:737..803.
+  Signature: int (*)(unsigned type, void *cd, void *pd, void *xd). }
+function DbTraceV2Handler(traceType: cuint;
+  cd, pd, xd: Pointer): cint; cdecl;
+var
+  pDb:  PSqliteDb;
+  pCmd: PTclObj;
+  zSql: PAnsiChar;
+  ns:   Int64;
+begin
+  pDb := PSqliteDb(cd);
+  case traceType of
+    SQLITE_TRACE_STMT:
+      begin
+        zSql := PAnsiChar(xd);
+        pCmd := Tcl_NewStringObj(pDb^.zTraceV2, -1);
+        Tcl_IncrRefCount(pCmd);
+        Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+          Tcl_NewWideIntObj(Int64(PtrUInt(pd))));
+        Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+          Tcl_NewStringObj(zSql, -1));
+        Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+        Tcl_DecrRefCount(pCmd);
+        Tcl_ResetResult(pDb^.interp);
+      end;
+    SQLITE_TRACE_PROFILE:
+      begin
+        ns   := PInt64(xd)^;
+        pCmd := Tcl_NewStringObj(pDb^.zTraceV2, -1);
+        Tcl_IncrRefCount(pCmd);
+        Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+          Tcl_NewWideIntObj(Int64(PtrUInt(pd))));
+        Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+          Tcl_NewWideIntObj(ns));
+        Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+        Tcl_DecrRefCount(pCmd);
+        Tcl_ResetResult(pDb^.interp);
+      end;
+    SQLITE_TRACE_ROW:
+      begin
+        pCmd := Tcl_NewStringObj(pDb^.zTraceV2, -1);
+        Tcl_IncrRefCount(pCmd);
+        Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+          Tcl_NewWideIntObj(Int64(PtrUInt(pd))));
+        Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+        Tcl_DecrRefCount(pCmd);
+        Tcl_ResetResult(pDb^.interp);
+      end;
+    SQLITE_TRACE_CLOSE:
+      begin
+        pCmd := Tcl_NewStringObj(pDb^.zTraceV2, -1);
+        Tcl_IncrRefCount(pCmd);
+        Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+          Tcl_NewWideIntObj(Int64(PtrUInt(pd))));
+        Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+        Tcl_DecrRefCount(pCmd);
+        Tcl_ResetResult(pDb^.interp);
+      end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ DbProfileHandler — legacy sqlite3_profile callback.  tclsqlite.c:812..825.
+  Signature: void (*)(void *cd, const char *zSql, sqlite_uint64 tm). }
+procedure DbProfileHandler(cd: Pointer; zSql: PAnsiChar; tm: UInt64); cdecl;
+var
+  pDb: PSqliteDb;
+  str: TTclDString;
+  zTm: array[0..63] of AnsiChar;
+begin
+  pDb := PSqliteDb(cd);
+  StrPCopy(zTm, IntToStr(tm));
+  Tcl_DStringInit(@str);
+  Tcl_DStringAppend(@str, pDb^.zProfile, -1);
+  Tcl_DStringAppendElement(@str, zSql);
+  Tcl_DStringAppendElement(@str, zTm);
+  Tcl_Eval(pDb^.interp, Tcl_DStringValue(@str));
+  Tcl_DStringFree(@str);
+  Tcl_ResetResult(pDb^.interp);
+end;
+
+{ DbTraceArm — `db trace ?CALLBACK?`  tclsqlite.c:3831..3863. }
+function DbTraceArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:    PSqliteDb;
+  zTrace: PAnsiChar;
+  len:    cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zTrace <> nil then
+      Tcl_AppendResult(interp, pDb^.zTrace, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zTrace <> nil then
+      Tcl_Free(pDb^.zTrace);
+    zTrace := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zTrace <> nil) and (len > 0) then
+    begin
+      pDb^.zTrace := Tcl_Alloc(len + 1);
+      Move(zTrace^, pDb^.zTrace^, len + 1);
+    end
+    else
+      pDb^.zTrace := nil;
+    if pDb^.zTrace <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_trace(pDb^.db, @DbTraceHandler, pDb);
+    end
+    else
+      sqlite3_trace(pDb^.db, nil, nil);
+  end;
+  Result := TCL_OK;
+end;
+
+{ DbTraceV2Arm — `db trace_v2 ?CALLBACK? ?MASK?`  tclsqlite.c:3871..3945. }
+function DbTraceV2Arm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  TTYPE_strs: array[0..4] of PChar =
+    ('statement', 'profile', 'row', 'close', nil);
+var
+  pDb:      PSqliteDb;
+  zTraceV2: PAnsiChar;
+  len:      cint;
+  wMask:    Int64;
+  i:        cint;
+  pObj:     PTclObj;
+  ttype:    cint;
+  wType:    Int64;
+  pError:   PTclObj;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK? ?MASK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zTraceV2 <> nil then
+      Tcl_AppendResult(interp, pDb^.zTraceV2, Pointer(nil));
+  end
+  else
+  begin
+    wMask := 0;
+    if objc = 4 then
+    begin
+      if Tcl_ListObjLength(interp, ObjvAt(objv, 3), @len) <> TCL_OK then
+      begin
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      for i := 0 to len - 1 do
+      begin
+        if Tcl_ListObjIndex(interp, ObjvAt(objv, 3), i, @pObj) <> TCL_OK then
+        begin
+          Result := TCL_ERROR;
+          Exit;
+        end;
+        if Tcl_GetIndexFromObj(interp, pObj, @TTYPE_strs[0],
+             PChar('trace type'), 0, @ttype) <> TCL_OK then
+        begin
+          pError := Tcl_DuplicateObj(Tcl_GetObjResult(interp));
+          Tcl_IncrRefCount(pError);
+          if Tcl_GetWideIntFromObj(interp, pObj, @wType) = TCL_OK then
+          begin
+            Tcl_DecrRefCount(pError);
+            wMask := wMask or wType;
+          end
+          else
+          begin
+            Tcl_SetObjResult(interp, pError);
+            Tcl_DecrRefCount(pError);
+            Result := TCL_ERROR;
+            Exit;
+          end;
+        end
+        else
+        begin
+          case ttype of
+            0: wMask := wMask or SQLITE_TRACE_STMT;
+            1: wMask := wMask or SQLITE_TRACE_PROFILE;
+            2: wMask := wMask or SQLITE_TRACE_ROW;
+            3: wMask := wMask or SQLITE_TRACE_CLOSE;
+          end;
+        end;
+      end;
+    end
+    else
+      wMask := SQLITE_TRACE_STMT;  { the "legacy" default }
+    if pDb^.zTraceV2 <> nil then
+      Tcl_Free(pDb^.zTraceV2);
+    zTraceV2 := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zTraceV2 <> nil) and (len > 0) then
+    begin
+      pDb^.zTraceV2 := Tcl_Alloc(len + 1);
+      Move(zTraceV2^, pDb^.zTraceV2^, len + 1);
+    end
+    else
+      pDb^.zTraceV2 := nil;
+    if pDb^.zTraceV2 <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_trace_v2(pDb^.db, cuint(wMask), @DbTraceV2Handler, pDb);
+    end
+    else
+      sqlite3_trace_v2(pDb^.db, 0, nil, nil);
+  end;
+  Result := TCL_OK;
+end;
+
+{ DbProfileArm — `db profile ?CALLBACK?`  tclsqlite.c:3620..3651. }
+function DbProfileArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:      PSqliteDb;
+  zProfile: PAnsiChar;
+  len:      cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zProfile <> nil then
+      Tcl_AppendResult(interp, pDb^.zProfile, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zProfile <> nil then
+      Tcl_Free(pDb^.zProfile);
+    zProfile := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zProfile <> nil) and (len > 0) then
+    begin
+      pDb^.zProfile := Tcl_Alloc(len + 1);
+      Move(zProfile^, pDb^.zProfile^, len + 1);
+    end
+    else
+      pDb^.zProfile := nil;
+    if pDb^.zProfile <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_profile(pDb^.db, @DbProfileHandler, pDb);
+    end
+    else
+      sqlite3_profile(pDb^.db, nil, nil);
+  end;
+  Result := TCL_OK;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -782,6 +1089,27 @@ begin
     Exit;
   end;
 
+  { trace — tclsqlite.c:3831 (DB_TRACE).  Legacy sqlite3_trace shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'trace') = 0) then
+  begin
+    Result := DbTraceArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { trace_v2 — tclsqlite.c:3871 (DB_TRACE_V2).  sqlite3_trace_v2 shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'trace_v2') = 0) then
+  begin
+    Result := DbTraceV2Arm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { profile — tclsqlite.c:3620 (DB_PROFILE).  Legacy sqlite3_profile shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'profile') = 0) then
+  begin
+    Result := DbProfileArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
   Tcl_AppendResult(interp,
     PChar('unknown subcommand "'),
     zSub,
@@ -834,10 +1162,13 @@ begin
     (zNull is a raw PAnsiChar, not an AnsiString).  See memory
     feedback_new_record_ansistring for the trap to avoid. }
   New(pDb);
-  pDb^.db     := pHandle;
-  pDb^.interp := interp;
-  pDb^.zNull  := nil;
-  pDb^.pFunc  := nil;
+  pDb^.db       := pHandle;
+  pDb^.interp   := interp;
+  pDb^.zNull    := nil;
+  pDb^.pFunc    := nil;
+  pDb^.zTrace   := nil;
+  pDb^.zTraceV2 := nil;
+  pDb^.zProfile := nil;
 
   Tcl_CreateObjCommand(interp, zDbName,
     @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd);

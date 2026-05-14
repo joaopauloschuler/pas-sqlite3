@@ -149,6 +149,38 @@ function Tcl_GetDoubleFromObj(interp: PTclInterp; objPtr: PTclObj; doublePtr: PD
 { Misc command-arg helpers.  tclsqlite.c:2476. }
 procedure Tcl_WrongNumArgs(interp: PTclInterp; objc: cint; objv: PPTclObj; message: PChar); cdecl; external 'tcl8.6';
 
+{ List introspection — tclsqlite.c:3891 (ListObjLength), :3897 (ListObjIndex). }
+function Tcl_ListObjLength(interp: PTclInterp; listPtr: PTclObj; lengthPtr: pcint): cint; cdecl; external 'tcl8.6';
+function Tcl_ListObjIndex(interp: PTclInterp; listPtr: PTclObj; index: cint; objPtrPtr: PPTclObj): cint; cdecl; external 'tcl8.6';
+
+{ Index-from-table lookup — tclsqlite.c:3900 (Tcl_GetIndexFromObj). }
+function Tcl_GetIndexFromObj(interp: PTclInterp; objPtr: PTclObj;
+  tablePtr: PPChar; msg: PChar; flags: cint; indexPtr: pcint): cint; cdecl; external 'tcl8.6';
+
+{ Tcl allocator — tclsqlite.c:3636 (Tcl_Alloc / Tcl_Free) for stored callbacks. }
+function  Tcl_Alloc(size: cuint): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_Free(ptr: PChar); cdecl; external 'tcl8.6';
+
+{ Tcl_DString — dynamic string builder.  tclsqlite.c:721..725.  Mirrors
+  the C struct tcl.h: { char *string; int length; int spaceAvl;
+  char staticSpace[TCL_DSTRING_STATIC_SIZE=200]; }.  Tcl_DStringValue is
+  a macro in tcl.h (-> dsPtr->string), so we expose it as a Pascal
+  inline that reads the first field directly. }
+type
+  TTclDString = record
+    str:         PChar;
+    length:      cint;
+    spaceAvl:    cint;
+    staticSpace: array[0..199] of AnsiChar;
+  end;
+  PTclDString = ^TTclDString;
+
+procedure Tcl_DStringInit(dsPtr: PTclDString); cdecl; external 'tcl8.6';
+function  Tcl_DStringAppend(dsPtr: PTclDString; bytes: PChar; length: cint): PChar; cdecl; external 'tcl8.6';
+function  Tcl_DStringAppendElement(dsPtr: PTclDString; element: PChar): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_DStringFree(dsPtr: PTclDString); cdecl; external 'tcl8.6';
+function  Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+
 { ----------------------------------------------------------------------
   Pascal-side helpers. }
 procedure InitTclLibrary;
@@ -162,6 +194,12 @@ implementation
 procedure InitTclLibrary;
 begin
   Tcl_FindExecutable(nil);
+end;
+
+{ Tcl_DStringValue — macro in tcl.h: ((dsPtr)->string). }
+function Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+begin
+  Result := dsPtr^.str;
 end;
 
 procedure Tcl_IncrRefCount(objPtr: PTclObj); inline;

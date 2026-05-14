@@ -5739,6 +5739,9 @@ end;
 { --- sqlite3_step / sqlite3_reset / sqlite3_finalize (vdbeapi.c:771) --- }
 
 function sqlite3_step(pStmt: PVdbe): i32;
+type
+  { vdbeapi.c:72 — legacy sqlite3_profile callback shape. }
+  TVdbeLegacyProfileFn = procedure(p: Pointer; zSql: PAnsiChar; tm: u64); cdecl;
 var
   rc: i32;
   db: PTsqlite3;
@@ -5788,6 +5791,9 @@ begin
     iNowProf := 0;
     sqlite3OsCurrentTimeInt64(Psqlite3_vfs(db^.pVfs), @iNowProf);
     iElapse := (iNowProf - pStmt^.startTime) * 1000000;
+    { vdbeapi.c:70..73 — NOT SQLITE_OMIT_DEPRECATED: legacy xProfile. }
+    if Assigned(db^.xProfile) then
+      TVdbeLegacyProfileFn(db^.xProfile)(db^.pProfileArg, pStmt^.zSql, iElapse);
     if ((db^.mTrace and SQLITE_TRACE_PROFILE) <> 0)
        and Assigned(db^.trace.xV2) then
       db^.trace.xV2(SQLITE_TRACE_PROFILE, db^.pTraceArg, pStmt, @iElapse);

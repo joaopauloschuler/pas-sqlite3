@@ -462,7 +462,7 @@ acceptance gate for this section.
     sqlite3_column_int64 → Tcl_NewWideIntObj; Real → Tcl_NewDoubleObj;
     Blob → Tcl_NewByteArrayObj).  C ref: `tclsqlite.c:dbEvalStep`
     (1766..) + 4-arg eval arm.
-  - [ ] **9.4.2.i** `db trace` / `db trace_v2` / `db profile` —
+  - [X] **9.4.2.i** `db trace` / `db trace_v2` / `db profile` —
     callbacks fired on each prepared statement.  Many error-path
     tests diff against the trace stream.  C ref: `tclsqlite.c:737..833`
     (DbTraceV2Handler) + `2900..2970` (dispatch).
