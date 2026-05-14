@@ -185,6 +185,31 @@ begin
     Die('after ic-1 nTest=' + IntToStr(CounterNTest) + ' want 6');
   Writeln('PASS: integrity_check ic-1, nTest=6 nErr=1 (unchanged)');
 
+  { Step 9c — working_64bit_int / presql / omit_test (9.4.2.g.5).
+    (a) working_64bit_int returns 1 (probe always true on x86_64).
+    (b) presql with no ::G(perm:presql) set returns "".
+    (c) omit_test myskip {reason text} runs without error and appends
+        a `{myskip {reason text}}` element to the TC(omit_list) counter. }
+  sRes := EvalGet('working_64bit_int', rc);
+  if (rc <> TCL_OK) or (sRes <> '1') then
+    Die('working_64bit_int rc=' + IntToStr(rc) + ' got=[' + sRes + '] want 1');
+  Writeln('PASS: working_64bit_int -> 1');
+
+  { Ensure ::G(perm:presql) is unset, then call presql. }
+  sRes := EvalGet('catch {unset ::G(perm:presql)}; presql', rc);
+  if rc <> TCL_OK then Die('presql rc=' + IntToStr(rc) + ' err=' + sRes);
+  if sRes <> '' then Die('presql unset got=[' + sRes + '] want []');
+  Writeln('PASS: presql with unset ::G(perm:presql) -> []');
+
+  { omit_test should not error and should add to omit_list. }
+  sRes := EvalGet('set_test_counter omit_list {}; omit_test myskip {reason text}', rc);
+  if rc <> TCL_OK then Die('omit_test rc=' + IntToStr(rc) + ' err=' + sRes);
+  sRes := EvalGet('set_test_counter omit_list', rc);
+  if rc <> TCL_OK then Die('omit_list getter rc=' + IntToStr(rc) + ' err=' + sRes);
+  if sRes <> '{myskip {reason text}}' then
+    Die('omit_list got=[' + sRes + '] want [{myskip {reason text}}]');
+  Writeln('PASS: omit_test myskip recorded -> [', sRes, ']');
+
   sRes := EvalGet('db close', rc);
   if rc <> TCL_OK then Die('db close rc=' + IntToStr(rc) + ' err=' + sRes);
   Writeln('PASS: db close OK');

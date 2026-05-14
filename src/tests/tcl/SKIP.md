@@ -34,6 +34,9 @@ Bootstrapped under task **9.4.4.a**.  Format:
 - **../sqlite3/test/boundary1.test**    — needs `working_64bit_int`,
   `finish_test`.  `working_64bit_int` is a build-cap probe gating the
   whole file (skips body if false).  Cite: 9.4.2.g bullet.
+  **RECHECK on 9.4.4.b**: both helpers landed (`finish_test` 9.4.2.g.3,
+  `working_64bit_int` 9.4.2.g.5).  Shim-side fully unblocked; re-run
+  expected to either promote out or reclassify as engine divergence.
 
 ## 9.4.2.g.4 re-evaluation note
 
@@ -49,13 +52,13 @@ divergences:
     9.4.2.g.3.
   - **update.test** — still blocked on `do_eqp_test` (9.4.2.g.6).
   - **cast.test** — still blocked on `do_realnum_test` (9.4.2.g.7).
-  - **boundary1.test** — still blocked on `working_64bit_int`
-    (9.4.2.g.5).
+  - **boundary1.test** — shim-complete after 9.4.2.g.5
+    (`working_64bit_int`); **RECHECK on 9.4.4.b**.
 
 Per task instructions, entries are NOT promoted out of SKIP.md until
-9.4.4.b actually exercises them against the grown shim; g.5
-(`working_64bit_int`) is the next bottleneck and may unblock further
-files when it lands.
+9.4.4.b actually exercises them against the grown shim; with g.5
+(`working_64bit_int`) landed, boundary1.test joins the shim-complete
+set alongside insert/index/reindex/delete/lastinsert for 9.4.4.b.
 
 ## Notes for future shim growth
 
@@ -76,7 +79,8 @@ unblocks the most tests:
    **Landed 9.4.2.g.3.**
 6. ~~`forcedelete FILE` — `file delete -force` retry loop (~tester.tcl:200).~~
    **Landed 9.4.2.g.3** (also `delete_file`).
-7. `working_64bit_int` — return `1` (probe is always true on x86_64).
+7. ~~`working_64bit_int` — return `1` (probe is always true on x86_64).~~
+   **Landed 9.4.2.g.5** (also `presql`, `omit_test`).
 8. `do_eqp_test NAME SQL EXP` — `EXPLAIN QUERY PLAN` parity helper
    (upstream tester.tcl:1018..1032).
 9. `do_realnum_test NAME SQL EXP` — match with `[regexp]` tolerance

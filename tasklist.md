@@ -404,9 +404,18 @@ acceptance gate for this section.
     {ok}`).  Smoke gated by `bin/TestTclTesterMin` ic-1 case (create
     table + insert + integrity_check; nTest+=1, nErr unchanged on
     healthy db).
-  - [ ] **9.4.2.g.5** `working_64bit_int` + `presql` + `omit_test` —
-    capability/permutation helpers.  C ref: `tester.tcl:1740..1772`,
-    `1340..1360`, `1280..1320`.
+  - [X] **9.4.2.g.5** `working_64bit_int` + `presql` + `omit_test` —
+    capability/permutation helpers.  C ref: `tester.tcl:593..599`
+    (`omit_test`), `tester.tcl:2334..2338` (`presql`), and the C-side
+    build-cap probe in tclsqlite.c (`working_64bit_int`; no
+    `proc working_64bit_int` exists in upstream tester.tcl — the
+    probe is registered native and always returns 1 on x86_64).
+    Ported as: `working_64bit_int` -> constant `return 1` (probe is
+    always true on x86_64), `presql` -> verbatim catch around
+    `::G(perm:presql)`, `omit_test` -> verbatim append to TC(omit_list).
+    Smoke gated by `bin/TestTclTesterMin` step 9c (working_64bit_int=1,
+    presql=[] when unset, omit_test myskip records
+    `{myskip {reason text}}`).
   - [ ] **9.4.2.g.6** `do_eqp_test` — EXPLAIN QUERY PLAN comparison;
     needs `db eval` 3-arg form (9.4.2.h) for row→list flattening.
     C ref: `tester.tcl:1064..1098`.

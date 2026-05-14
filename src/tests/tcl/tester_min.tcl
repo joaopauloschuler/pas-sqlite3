@@ -17,11 +17,11 @@
 #
 # What is intentionally NOT ported here (vs upstream tester.tcl):
 #   - do_eqp_test, do_realnum_test, do_vmstep_test
-#   - presql, permutations, runtest, NRE harness, slave interp plumbing
+#   - permutations, runtest, NRE harness, slave interp plumbing
 #   - sqlite3_test_control, sqlite3_memdebug_*, db_save, threading
 #   - regex / glob / numeric-range match in expected (only exact compare)
 #   - puts override / output1 / output2 verbosity machinery
-#   - known-problems.txt, omit, warn lists
+#   - known-problems.txt, warn lists
 #
 # Citations against /home/bpsa/app/sqlite3/test/tester.tcl follow each proc.
 
@@ -259,4 +259,43 @@ proc integrity_check {name {db db}} {
   ifcapable integrityck {
     do_test $name [list execsql {PRAGMA integrity_check} $db] {ok}
   }
+}
+
+# working_64bit_int — upstream tester.tcl has no `proc working_64bit_int`
+# definition in our source tree; the helper originates as a build-cap
+# probe registered C-side (tclsqlite.c) that runs a SQL probe equivalent
+# to `SELECT (1<<32)-1 == 4294967295` and returns 1 iff the host int
+# layer carries 64-bit precision.  Call sites
+# (boundary{1..4}.test, expr.test:164, func.test:888, tkt3922.test, ...)
+# only gate big-int arms.  pas-sqlite3 targets x86_64 Linux with FPC
+# `Int64` everywhere, so the probe is always true on x86_64 — return 1
+# unconditionally.  C ref: test/boundary1.test:22 (`if {![working_64bit_int]}
+# { finish_test; return }`).
+proc working_64bit_int {} {
+  return 1
+}
+
+# presql — upstream tester.tcl:2334..2338.  Returns the SQL string the
+# active permutation wants prepended to every fresh `sqlite3` handle
+# (e.g. `PRAGMA journal_mode=wal`).  pas-sqlite3 has no permutation
+# matrix wired yet (9.4.2.g.8), so `::G(perm:presql)` is never set and
+# the catch arm leaves the local empty; verbatim port matches upstream
+# byte-for-byte.  C ref: tester.tcl:2334..2338.
+proc presql {} {
+  set presql ""
+  catch {set presql $::G(perm:presql)}
+  set presql
+}
+
+# omit_test — upstream tester.tcl:593..599.  Appends `[list NAME REASON]`
+# to the `omit_list` TC() counter.  Used by .test files (and our future
+# fix_ifcapable_expr) to record gracefully-skipped sub-tests so the
+# finalize_testing summary can list them.  Verbatim port.  C ref:
+# tester.tcl:593..599.
+proc omit_test {name reason {append 1}} {
+  set omitList [set_test_counter omit_list]
+  if {$append} {
+    lappend omitList [list $name $reason]
+  }
+  set_test_counter omit_list $omitList
 }
