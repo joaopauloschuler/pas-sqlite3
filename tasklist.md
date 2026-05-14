@@ -483,7 +483,7 @@ acceptance gate for this section.
     port already exists (8.x.colneed in tasklist); Tcl shim needs
     DbCollateNeeded + per-collation trampoline.  C ref:
     `tclsqlite.c:1175..1240` + `3100..3140` (dispatch).
-  - [ ] **9.4.2.n** `db transaction { script }` — savepoint-nested
+  - [X] **9.4.2.n** `db transaction { script }` — savepoint-nested
     transaction with rollback-on-error.  C ref:
     `tclsqlite.c:1308..1410` (DbTransPostCmd, NRE arm) +
     `3170..3240` (dispatch).

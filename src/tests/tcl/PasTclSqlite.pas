@@ -92,6 +92,8 @@ type
                              populated by the `collate` subcmd.  Freed in
                              DbDeleteCmd. }
     pCollateNeeded: PTclObj; { tclsqlite.c:217 — `collation_needed` script. }
+    nTransaction:  cint;   { tclsqlite.c:225 — nesting depth of [transaction]
+                             sub-commands; 0 = no open [transaction]. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -1645,6 +1647,102 @@ begin
   Result := TCL_OK;
 end;
 
+{ DbTransPostCmd — port of tclsqlite.c:1308..1349.  Invoked after the
+  [transaction] script body has been evaluated; commits/releases on
+  success or rolls back on error.  `result` is the rc of the body eval. }
+function DbTransPostCmd(pDb: PSqliteDb; interp: PTclInterp;
+  bodyRc: cint): cint;
+const
+  azEnd: array[0..3] of PChar = (
+    'RELEASE _tcl_transaction',                        { rc==ERROR, nTrans!=0 }
+    'COMMIT',                                          { rc!=ERROR, nTrans==0 }
+    'ROLLBACK TO _tcl_transaction ; RELEASE _tcl_transaction',
+    'ROLLBACK');                                       { rc==ERROR, nTrans==0 }
+var
+  rc:   cint;
+  zEnd: PChar;
+  idx:  cint;
+begin
+  rc := bodyRc;
+  Dec(pDb^.nTransaction);
+  idx := 0;
+  if rc = TCL_ERROR then idx := idx + 2;
+  if pDb^.nTransaction = 0 then idx := idx + 1;
+  zEnd := azEnd[idx];
+
+  if sqlite3_exec(pDb^.db, zEnd, nil, nil, nil) <> SQLITE_OK then
+  begin
+    { The most likely cause is a SQLITE_BUSY on the top-level COMMIT,
+      or an IO error.  Throw a Tcl exception and roll back. }
+    if rc <> TCL_ERROR then
+    begin
+      Tcl_AppendResult(interp, PAnsiChar(sqlite3_errmsg(pDb^.db)),
+        Pointer(nil));
+      rc := TCL_ERROR;
+    end;
+    sqlite3_exec(pDb^.db, PChar('ROLLBACK'), nil, nil, nil);
+  end;
+
+  Result := rc;
+end;
+
+{ DbTransactionArm — port of the DB_TRANSACTION arm (tclsqlite.c:3958..4009).
+  `db transaction ?TYPE? SCRIPT` — opens a transaction (or, if nested,
+  a SAVEPOINT), evaluates SCRIPT, then commits/releases on success or
+  rolls back on error.  Nesting depth tracked via pDb^.nTransaction.
+  The NRE machinery from upstream is out of scope; we use the simple
+  recursive Tcl_EvalObjEx form. }
+function DbTransactionArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  TTYPE_strs: array[0..3] of PChar = (
+    'deferred', 'exclusive', 'immediate', nil);
+var
+  pDb:     PSqliteDb;
+  pScript: PTclObj;
+  zBegin:  PChar;
+  ttype:   cint;
+begin
+  pDb := PSqliteDb(clientData);
+  zBegin := 'SAVEPOINT _tcl_transaction';
+  if (objc <> 3) and (objc <> 4) then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('[TYPE] SCRIPT'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  if (pDb^.nTransaction = 0) and (objc = 4) then
+  begin
+    if Tcl_GetIndexFromObj(interp, ObjvAt(objv, 2), @TTYPE_strs[0],
+         PChar('transaction type'), 0, @ttype) <> TCL_OK then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    case ttype of
+      0: ;                                  { deferred — no-op }
+      1: zBegin := 'BEGIN EXCLUSIVE';        { exclusive }
+      2: zBegin := 'BEGIN IMMEDIATE';        { immediate }
+    end;
+  end;
+  pScript := ObjvAt(objv, objc - 1);
+
+  { Run the BEGIN/SAVEPOINT to open a transaction or savepoint. }
+  if sqlite3_exec(pDb^.db, zBegin, nil, nil, nil) <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, PAnsiChar(sqlite3_errmsg(pDb^.db)),
+      Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Inc(pDb^.nTransaction);
+
+  { Evaluate the body, then commit (or rollback) the transaction. }
+  pDb^.interp := interp;
+  Result := DbTransPostCmd(pDb, interp, Tcl_EvalObjEx(interp, pScript, 0));
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -1852,6 +1950,14 @@ begin
     Exit;
   end;
 
+  { transaction — tclsqlite.c:3958 (DB_TRANSACTION).  BEGIN/COMMIT or,
+    when nested, SAVEPOINT/RELEASE around a Tcl script body. }
+  if (zSub <> nil) and (StrComp(zSub, 'transaction') = 0) then
+  begin
+    Result := DbTransactionArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
   Tcl_AppendResult(interp,
     PChar('unknown subcommand "'),
     zSub,
@@ -1918,6 +2024,9 @@ begin
   pDb^.pUpdateHook  := nil;
   pDb^.pRollbackHook := nil;
   pDb^.pWalHook     := nil;
+  pDb^.pCollate       := nil;
+  pDb^.pCollateNeeded := nil;
+  pDb^.nTransaction   := 0;
 
   Tcl_CreateObjCommand(interp, zDbName,
     @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd);
