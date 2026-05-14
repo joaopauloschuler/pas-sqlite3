@@ -67,6 +67,14 @@ type
   { Tcl_CmdDeleteProc — typedef'd in tcl.h:760. }
   TTclCmdDeleteProc = procedure(clientData: TClientData); cdecl;
 
+  { Tcl_CmdProc — the legacy string-based command proc, typedef'd in
+    tcl.h:758.  Signature: int (*)(ClientData, Tcl_Interp*, int argc,
+    const char *argv[]).  Used by the test_md5 commands which were
+    written against the old Tcl_CreateCommand interface. }
+  PPAnsiCharArr = ^PAnsiChar;
+  TTclCmdProc = function(clientData: TClientData; interp: PTclInterp;
+    argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+
   { Tcl_NRPostProc — typedef'd in tcl.h (NRE callback).  Signature:
     int (*)(ClientData data[2..], Tcl_Interp*, int result).  The data
     argument is a ClientData[] of (by Tcl convention) up to 4 slots;
@@ -108,6 +116,12 @@ function Tcl_DuplicateObj(objPtr: PTclObj): PTclObj; cdecl; external 'tcl8.6';
 { Command registration.  tclsqlite.c:4407. }
 function Tcl_CreateObjCommand(interp: PTclInterp; cmdName: PChar;
   proc: TTclObjCmdProc; clientData: TClientData;
+  deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ Legacy string-based command registration — tcl.h:758.  test_md5.c
+  registers `md5`, `md5file`, etc. via Tcl_CreateCommand. }
+function Tcl_CreateCommand(interp: PTclInterp; cmdName: PChar;
+  proc: TTclCmdProc; clientData: TClientData;
   deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
 
 { NRE (Non-Recursive Eval) command registration — tcl.h (8.6+).
@@ -198,6 +212,11 @@ function Tcl_SetVar(interp: PTclInterp; varName, newValue: PChar; flags: cint): 
 function Tcl_SetVar2(interp: PTclInterp; part1, part2, newValue: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
 function Tcl_ObjSetVar2(interp: PTclInterp; part1Ptr, part2Ptr, newValuePtr: PTclObj; flags: cint): PTclObj; cdecl; external 'tcl8.6';
 function Tcl_UnsetVar2(interp: PTclInterp; part1, part2: PChar; flags: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_UnsetVar(interp: PTclInterp; varName: PChar; flags: cint): cint; cdecl; external 'tcl8.6';
+
+{ Tcl_GetVar2Ex — array-aware variable read returning a Tcl_Obj.  Used
+  by the tclvar virtual table's xColumn (test_tclvar.c:270). }
+function Tcl_GetVar2Ex(interp: PTclInterp; part1, part2: PChar; flags: cint): PTclObj; cdecl; external 'tcl8.6';
 
 { Reset the interpreter result.  tclsqlite.c:2003 (DbEvalNextCmd cleanup). }
 procedure Tcl_ResetResult(interp: PTclInterp); cdecl; external 'tcl8.6';

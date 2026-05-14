@@ -32,6 +32,9 @@ fi
 FPC_CMD=(fpc
   -MObjFPC -Scghi -O1
   -Fu"$TCL_DIR"
+  -Fu"$TCL_DIR/testmodules"
+  -Fu"$SRC_DIR"
+  -Fi"$SRC_DIR"
   -FU"$BIN_DIR"
   -FE"$BIN_DIR"
   -o"$BIN_DIR/TestTclTesterMin"

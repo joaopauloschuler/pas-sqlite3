@@ -21,6 +21,7 @@ library libpassqlite3tcl;
 uses
   ctypes,
   PasTclBridge,
+  TestModuleMd5,
   PasTclSqlite;
 
 exports
