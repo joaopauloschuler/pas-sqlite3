@@ -76,6 +76,13 @@ begin
   if pDb = nil then Exit;
   if pDb^.db <> nil then
     sqlite3_close_v2(pDb^.db);
+  { Free zNull buffer if any — owned by us, see DbNullValueArm.  Pairs
+    with the GetMem in the nullvalue setter (9.4.2.e). }
+  if pDb^.zNull <> nil then
+  begin
+    FreeMem(pDb^.zNull);
+    pDb^.zNull := nil;
+  end;
   Dispose(pDb);
 end;
 
@@ -192,6 +199,47 @@ begin
   Result := TCL_OK;
 end;
 
+{ DbNullValueArm — port of the "nullvalue" arm of DbObjCmd
+  (tclsqlite.c:3524..3545).  2-arg form is a getter (returns current
+  pDb^.zNull as a string, "" if nil).  3-arg form is a setter: free
+  old buffer if any, copy objv[2] verbatim into a freshly GetMem'd
+  PAnsiChar.  Tcl owns the objv string so we must copy.
+
+  Memory rule: GetMem here matches FreeMem in DbDeleteCmd above. }
+function DbNullValueArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:  PSqliteDb;
+  zArg: PAnsiChar;
+  nArg: cint;
+begin
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('NULLVALUE'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  pDb := PSqliteDb(clientData);
+  if objc = 3 then
+  begin
+    nArg := 0;
+    zArg := Tcl_GetStringFromObj(ObjvAt(objv, 2), @nArg);
+    if pDb^.zNull <> nil then
+    begin
+      FreeMem(pDb^.zNull);
+      pDb^.zNull := nil;
+    end;
+    if (zArg <> nil) and (nArg > 0) then
+    begin
+      GetMem(pDb^.zNull, nArg + 1);
+      Move(zArg^, pDb^.zNull^, nArg);
+      pDb^.zNull[nArg] := #0;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(pDb^.zNull, -1));
+  Result := TCL_OK;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -247,6 +295,48 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'eval') = 0) then
   begin
     Result := DbEvalArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { version — tclsqlite.c:4161. }
+  if (zSub <> nil) and (StrComp(zSub, 'version') = 0) then
+  begin
+    Tcl_AppendResult(interp, sqlite3_libversion(), Pointer(nil));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { changes — tclsqlite.c:2728.  We use sqlite3_changes64 (i64). }
+  if (zSub <> nil) and (StrComp(zSub, 'changes') = 0) then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewWideIntObj(sqlite3_changes64(PSqliteDb(clientData)^.db)));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { last_insert_rowid — tclsqlite.c:3552. }
+  if (zSub <> nil) and (StrComp(zSub, 'last_insert_rowid') = 0) then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewWideIntObj(sqlite3_last_insert_rowid(PSqliteDb(clientData)^.db)));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { errorcode — tclsqlite.c:3236. }
+  if (zSub <> nil) and (StrComp(zSub, 'errorcode') = 0) then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewIntObj(sqlite3_errcode(PSqliteDb(clientData)^.db)));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { nullvalue — tclsqlite.c:3524.  Mutates pDb^.zNull. }
+  if (zSub <> nil) and (StrComp(zSub, 'nullvalue') = 0) then
+  begin
+    Result := DbNullValueArm(clientData, interp, objc, objv);
     Exit;
   end;
 
