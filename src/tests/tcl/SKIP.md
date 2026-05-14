@@ -40,8 +40,9 @@ Bootstrapped under task **9.4.4.a**.  Format:
 When `tester_min.tcl` grows, prefer to land helpers in this order — each
 unblocks the most tests:
 
-1. `ifcapable {EXPR} {BODY} ?elseBODY?` — unconditionally execute BODY,
-   ignore EXPR.  Stub matches our default build (all caps enabled).
+1. ~~`ifcapable {EXPR} {BODY} ?elseBODY?` — unconditionally execute
+   BODY, ignore EXPR.  Stub matches our default build (all caps
+   enabled).~~  **Landed 9.4.2.g.1.**
 2. `catchsql SQL ?DB?` — `[list $rc $msg]` wrapper around `db eval`.
 3. `do_catchsql_test NAME SQL EXP` — `catchsql` + `do_test` combo
    (upstream tester.tcl:993..1006).

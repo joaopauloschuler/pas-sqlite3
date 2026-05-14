@@ -127,11 +127,27 @@ begin
   if CounterNTest <> 3 then Die('after foo-3.0 nTest=' + IntToStr(CounterNTest) + ' want 3');
   Writeln('PASS: foo-3.0 intentional fail counted, nTest=3 nErr=1');
 
+  { Step 7 — ifcapable stub (9.4.2.g.1).  Body must run regardless of
+    EXPR.  We seed a sentinel inside BODY and check it after; also run
+    a do_test inside ifcapable to confirm the counter advances. }
+  sRes := EvalGet('set ::ifcap_seen 0', rc);
+  if rc <> TCL_OK then Die('seed ifcap_seen rc=' + IntToStr(rc) + ' err=' + sRes);
+  sRes := EvalGet(
+    'ifcapable {nosuchcap && bogus_expr} { set ::ifcap_seen 1; do_test foo-4.0 { expr 2+2 } 4 }',
+    rc);
+  if rc <> TCL_OK then Die('ifcapable rc=' + IntToStr(rc) + ' err=' + sRes);
+  sRes := EvalGet('set ::ifcap_seen', rc);
+  if (rc <> TCL_OK) or (sRes <> '1') then
+    Die('ifcap_seen=' + sRes + ' want 1 (body did not execute)');
+  if CounterNErr <> 1 then Die('after foo-4.0 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  if CounterNTest <> 4 then Die('after foo-4.0 nTest=' + IntToStr(CounterNTest) + ' want 4');
+  Writeln('PASS: foo-4.0 ifcapable body ran, nTest=4 nErr=1');
+
   sRes := EvalGet('db close', rc);
   if rc <> TCL_OK then Die('db close rc=' + IntToStr(rc) + ' err=' + sRes);
   Writeln('PASS: db close OK');
 
   Tcl_DeleteInterp(interp);
-  Writeln('TestTclTesterMin: all expectations met (final nTest=3 nErr=1).');
+  Writeln('TestTclTesterMin: all expectations met (final nTest=4 nErr=1).');
   Halt(0);
 end.

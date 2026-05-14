@@ -138,6 +138,19 @@ proc finalize_testing {} {
   if {$nE>0} { exit 1 } else { exit 0 }
 }
 
+# ifcapable — upstream tester.tcl:1725..1739.  Real implementation
+# evaluates a boolean expression of SQLITE_OMIT_*/SQLITE_ENABLE_*
+# compile-time caps (see fix_ifcapable_expr) and runs BODY iff true,
+# else ELSEBODY.  pas-sqlite3 is built with the default set of caps
+# enabled (no SQLITE_OMIT_*), so for our smoke sweeps every expression
+# evaluates true — we unconditionally uplevel BODY and ignore both EXPR
+# and ELSEBODY.  Real cap-probe wiring lives behind 9.4.6.a / 9.4.2.g.1
+# follow-up.  C ref: tester.tcl:1725..1739.
+proc ifcapable {expr code {else ""} {elsecode ""}} {
+  set c [catch {uplevel 1 $code} r]
+  return -code $c $r
+}
+
 # expected — passthrough stub.  Upstream tester.tcl has no such proc as
 # a self-contained helper (the word "expected" only appears as a
 # parameter name to do_test, see upstream lines 692..702).  A handful

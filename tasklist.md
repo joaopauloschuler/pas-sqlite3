@@ -369,13 +369,15 @@ acceptance gate for this section.
     Smoke gate `bin/TestTclTesterMin` sources tester_min.tcl + runs
     `do_test foo-1.0 {expr 1+1} 2`.  Remaining helpers tracked in
     9.4.2.g.1.
-  - [ ] **9.4.2.g.1** `ifcapable` — gates a test (file-level or
+  - [X] **9.4.2.g.1** `ifcapable` — gates a test (file-level or
     block-level) on `SQLITE_OMIT_*` / `SQLITE_ENABLE_*` compile flags.
     Single biggest unlock — ~70% of tcl-feature tests open with
     `ifcapable !foreignkey { finish_test ; return }` or similar.
-    Tcl wrapper just calls into `sqlite3_compileoption_used` /
-    `sqlite3_compileoption_get` (audit/finish in 9.4.6.a).
-    C ref: `tester.tcl:1810..1870`.
+    Landed as an unconditional `uplevel 1 $code` stub matching our
+    default build (all caps enabled); real `sqlite3_compileoption_used` /
+    `sqlite3_compileoption_get` wiring deferred to 9.4.6.a.  Smoke gate
+    extended in `TestTclTesterMin` (foo-4.0 verifies BODY runs even on
+    a bogus EXPR).  C ref: `tester.tcl:1725..1739`.
   - [ ] **9.4.2.g.2** `catchsql` + `do_catchsql_test` — runs SQL,
     captures `(rc, errmsg)` as a 2-list.  Unblocks every error-path
     test (~30% of total).  C ref: `tester.tcl:1455..1490`, `983..1010`.
