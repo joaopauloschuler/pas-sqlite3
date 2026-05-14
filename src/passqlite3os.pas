@@ -1842,11 +1842,26 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ os_unix.c ~4034: unixModeBit — read or write a single ctrlFlags bit.
+  If *pArg<0 the current state is returned in *pArg; otherwise *pArg
+  (0/non-0) sets or clears the bit. }
+procedure unixModeBit(pf: PunixFile; mask: u16; pArg: PcInt);
+begin
+  if pArg^ < 0 then begin
+    if (pf^.ctrlFlags and mask) <> 0 then pArg^ := 1 else pArg^ := 0;
+  end else if pArg^ = 0 then
+    pf^.ctrlFlags := pf^.ctrlFlags and (not mask)
+  else
+    pf^.ctrlFlags := pf^.ctrlFlags or mask;
+end;
+
 { os_unix.c ~4050: unixFileControl_impl — handle FCNTL opcodes }
 function unixFileControl_impl(pFile: Psqlite3_file; op: cint;
                               pArg: Pointer): cint; cdecl;
 var
-  pf : PunixFile;
+  pf     : PunixFile;
+  zTFile : PAnsiChar;
+  mxPath : cint;
 begin
   pf := PunixFile(pFile);
   case op of
@@ -1859,11 +1874,35 @@ begin
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_SIZE_HINT: begin
-      { Ignore for Phase 1 }
+      { os_unix.c routes this through fcntlSizeHint to pre-grow the file;
+        the Pascal port treats it as an advisory no-op. }
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_CHUNK_SIZE: begin
       pf^.szChunk := PcInt(pArg)^;
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_PERSIST_WAL: begin
+      { os_unix.c:4093 }
+      unixModeBit(pf, UNIXFILE_PERSIST_WAL, PcInt(pArg));
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_POWERSAFE_OVERWRITE: begin
+      { os_unix.c:4097 }
+      unixModeBit(pf, UNIXFILE_PSOW, PcInt(pArg));
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_TEMPFILENAME: begin
+      { os_unix.c:4105 — return a sqlite3_malloc'd temp filename in *pArg }
+      if pf^.pVfs <> nil then
+        mxPath := Psqlite3_vfs(pf^.pVfs)^.mxPathname
+      else
+        mxPath := MAX_PATHNAME;
+      zTFile := sqlite3Malloc(mxPath);
+      if zTFile <> nil then begin
+        unixGetTempname(mxPath, zTFile);
+        PPointer(pArg)^ := zTFile;
+      end;
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_VFS_POINTER: begin

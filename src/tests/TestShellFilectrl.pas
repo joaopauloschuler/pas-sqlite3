@@ -11,8 +11,8 @@
     - .filectrl chunk_size N           (set, isOk=2, empty stdout)
     - .filectrl chunk_size             (no arg → Usage line, rc=1)
     - .filectrl size_limit             (read, prints -1)
-    - .filectrl persist_wal            (skipped — see note below)
-    - .filectrl --schema main persist_wal (skipped — see note below)
+    - .filectrl persist_wal            (read, prints 0 — 9.4.6.o)
+    - .filectrl --schema main persist_wal (read via --schema shift — 9.4.6.o)
     - .filectrl bogus                  (unknown-control error path)
     - .filectrl data_version           (numeric-line shape only — port
                                         pager's iDataVersion lifecycle
@@ -29,14 +29,11 @@
     - .sha3sum    shell.c.in:11064..11240
 
   Notes:
-    - persist_wal: the port's unix VFS layer does not yet wire
-      SQLITE_FCNTL_PERSIST_WAL in its xFileControl arm (see os_unix.c
-      :4183 in upstream; passqlite3os.pas declares UNIXFILE_PERSIST_WAL
-      but its file-control dispatch is unported).  Upstream returns 0
-      after the FCNTL update; the port leaves -1 (the caller's initial
-      value).  Documented here; gating it would mask the port-VFS gap
-      rather than the .filectrl arm being tested.  Skipped with a
-      header SKIP entry until the VFS arm lands.
+    - persist_wal: 9.4.6.o ported SQLITE_FCNTL_PERSIST_WAL (and
+      POWERSAFE_OVERWRITE / TEMPFILENAME) into the port's unix VFS
+      xFileControl arm via unixModeBit (os_unix.c:4034..4112).  The
+      .filectrl persist_wal read now matches upstream's "0" line on a
+      freshly-seeded non-WAL db.
     - data_version variant uses a shape-only check; the bare numeric
       line differs because the port's sqlite3PagerDataVersion is
       currently driven only by pager_reset/sqlite3PagerSharedLock paths,
@@ -201,13 +198,17 @@ begin
   DiffArgv('filectrl-size_limit-read',
     '"' + workDirExp + '/fc.db" ".filectrl size_limit"');
 
-  { persist_wal / --schema NAME persist_wal: SKIPPED.  The port's unix
-    VFS does not implement SQLITE_FCNTL_PERSIST_WAL in xFileControl, so
-    the caller's initial -1 is not overwritten with the current bit,
-    and upstream's 0 / 1 lines diverge.  See header note.  We do still
-    exercise the --schema parser shift via the bogus / size_limit /
-    data_version arms above. }
-  WriteLn('SKIP    filectrl-persist_wal* (port unix VFS lacks PERSIST_WAL arm)');
+  { persist_wal: 9.4.6.o wired SQLITE_FCNTL_PERSIST_WAL into the port's
+    unix VFS xFileControl (via unixModeBit), so the caller's initial -1
+    is now overwritten with the current ctrlFlags bit.  Read on a
+    freshly-seeded (non-WAL) db reports "0". }
+  DiffArgv('filectrl-persist_wal',
+    '"' + workDirExp + '/fc.db" ".filectrl persist_wal"');
+
+  { --schema main persist_wal: same arm reached through the bShifted
+    --schema parser path. }
+  DiffArgv('filectrl-schema-persist_wal',
+    '"' + workDirExp + '/fc.db" ".filectrl --schema main persist_wal"');
 
   { --schema main with size_limit: exercises the bShifted arm without
     relying on PERSIST_WAL being wired. }
