@@ -10055,12 +10055,35 @@ begin
       iRollback5g := pOp^.p2;
       if desiredAC5g <> i32(db^.autoCommit) then begin
         if iRollback5g <> 0 then begin
+          { assert( desiredAutoCommit==1 ) }
           sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
           db^.autoCommit := 1;
+        end else if (desiredAC5g <> 0) and (db^.nVdbeWrite > 0) then begin
+          { vdbe.c:4032 — this instruction implements a COMMIT but other VMs
+            are still writing; tell the caller they must complete first. }
+          sqlite3VdbeError(v,
+            'cannot commit transaction - SQL statements in progress');
+          rc := SQLITE_BUSY;
+          goto abort_due_to_error;
         end else begin
+          rc := sqlite3VdbeCheckFkDeferred(v);
+          if rc <> SQLITE_OK then
+            goto vdbe_return;
           db^.autoCommit := u8(desiredAC5g);
         end;
-        sqlite3VdbeHalt(v);
+        { vdbe.c:4044 — if sqlite3VdbeHalt could not obtain the required
+          locks (another connection holds a conflicting lock), the commit
+          must be retried.  Rewind pc, restore autoCommit, and surface
+          SQLITE_BUSY.  The previous Pascal port ignored VdbeHalt's return
+          value, so a cross-connection lock conflict on COMMIT was silently
+          reported as success (9.4.divbug.21). }
+        if sqlite3VdbeHalt(v) = SQLITE_BUSY then begin
+          v^.pc := i32(pOp - aOp);
+          db^.autoCommit := u8(1 - desiredAC5g);
+          v^.rc := SQLITE_BUSY;
+          rc    := SQLITE_BUSY;
+          goto vdbe_return;
+        end;
         sqlite3CloseSavepoints(db);
         if v^.rc = SQLITE_OK then
           rc := SQLITE_DONE
