@@ -151,6 +151,15 @@ procedure Tcl_BackgroundError(interp: PTclInterp); cdecl; external 'tcl8.6';
 function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): cint; cdecl; external 'tcl8.6';
 function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';
 function Tcl_GetDoubleFromObj(interp: PTclInterp; objPtr: PTclObj; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
+function Tcl_GetBooleanFromObj(interp: PTclInterp; objPtr: PTclObj; boolPtr: pcint): cint; cdecl; external 'tcl8.6';
+
+{ Boolean Tcl_Obj factory — tclsqlite.c:3289 (DB_EXISTS arm). }
+function Tcl_NewBooleanObj(boolValue: cint): PTclObj; cdecl; external 'tcl8.6';
+
+{ In-place result-obj setters — tclsqlite.c:2735 (Tcl_SetWideIntObj on
+  the GetObjResult), :3119 (Tcl_SetIntObj in DB_COPY). }
+procedure Tcl_SetWideIntObj(objPtr: PTclObj; wideValue: Int64); cdecl; external 'tcl8.6';
+procedure Tcl_SetIntObj(objPtr: PTclObj; intValue: cint); cdecl; external 'tcl8.6';
 
 { Misc command-arg helpers.  tclsqlite.c:2476. }
 procedure Tcl_WrongNumArgs(interp: PTclInterp; objc: cint; objv: PPTclObj; message: PChar); cdecl; external 'tcl8.6';
@@ -186,6 +195,26 @@ function  Tcl_DStringAppend(dsPtr: PTclDString; bytes: PChar; length: cint): PCh
 function  Tcl_DStringAppendElement(dsPtr: PTclDString; element: PChar): PChar; cdecl; external 'tcl8.6';
 procedure Tcl_DStringFree(dsPtr: PTclDString); cdecl; external 'tcl8.6';
 function  Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+
+{ ----------------------------------------------------------------------
+  Tcl I/O channels — used by the DB_COPY arm of DbObjCmd
+  (tclsqlite.c:3043..3057, the CSV-import command).  Tcl_Channel is an
+  opaque handle. }
+type
+  TTclChannel = Pointer;
+
+function  Tcl_OpenFileChannel(interp: PTclInterp; fileName, modeString: PChar;
+  permissions: cint): TTclChannel; cdecl; external 'tcl8.6';
+function  Tcl_Close(interp: PTclInterp; chan: TTclChannel): cint; cdecl; external 'tcl8.6';
+function  Tcl_SetChannelOption(interp: PTclInterp; chan: TTclChannel;
+  optionName, newValue: PChar): cint; cdecl; external 'tcl8.6';
+function  Tcl_GetsObj(chan: TTclChannel; objPtr: PTclObj): cint; cdecl; external 'tcl8.6';
+
+{ Misc Tcl_Obj plumbing used by DB_COPY — tclsqlite.c:3055 (NewObj),
+  :3064 (GetByteArrayFromObj), :3110 (SetObjLength). }
+function  Tcl_NewObj: PTclObj; cdecl; external 'tcl8.6';
+function  Tcl_GetByteArrayFromObj(objPtr: PTclObj; lengthPtr: pcint): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_SetObjLength(objPtr: PTclObj; length: cint); cdecl; external 'tcl8.6';
 
 { ----------------------------------------------------------------------
   Pascal-side helpers. }

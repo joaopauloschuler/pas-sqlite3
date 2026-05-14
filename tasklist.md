@@ -487,7 +487,7 @@ acceptance gate for this section.
     transaction with rollback-on-error.  C ref:
     `tclsqlite.c:1308..1410` (DbTransPostCmd, NRE arm) +
     `3170..3240` (dispatch).
-  - [ ] **9.4.2.o** `db total_changes` / `db onecolumn` /
+  - [X] **9.4.2.o** `db total_changes` / `db onecolumn` /
     `db exists` / `db status` / `db cache flush|size` /
     `db enable_load_extension` / `db config` / `db timeout` /
     `db copy` — the remaining ~10 trivial-passthrough arms.

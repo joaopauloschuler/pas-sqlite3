@@ -94,6 +94,10 @@ type
     pCollateNeeded: PTclObj; { tclsqlite.c:217 — `collation_needed` script. }
     nTransaction:  cint;   { tclsqlite.c:225 — nesting depth of [transaction]
                              sub-commands; 0 = no open [transaction]. }
+    maxStmt:       cint;   { tclsqlite.c:228 — bound on the prepared-statement
+                             cache.  This minimal bridge has no stmt cache,
+                             so `db cache size N` just stores N here and
+                             `db cache flush` is a no-op (9.4.2.o). }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -1743,6 +1747,440 @@ begin
   Result := DbTransPostCmd(pDb, interp, Tcl_EvalObjEx(interp, pScript, 0));
 end;
 
+{ DbOneColumnExistsArm — port of the shared DB_EXISTS / DB_ONECOLUMN arm
+  of DbObjCmd (tclsqlite.c:3259..3297).  `db onecolumn $sql` returns the
+  first column of the first row (empty if no rows); `db exists $sql`
+  returns 1 if any row, else 0.  Upstream uses dbEvalInit/dbEvalStep; we
+  drive sqlite3_prepare_v2 + a single sqlite3_step directly.
+
+  bExists=False -> onecolumn; bExists=True -> exists. }
+function DbOneColumnExistsArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj; bExists: Boolean): cint; cdecl;
+var
+  pDb:      PSqliteDb;
+  zSql:     PAnsiChar;
+  pStmt:    Pointer;
+  rc:       i32;
+  rcStep:   i32;
+  pResult:  PTclObj;
+  zNullStr: PAnsiChar;
+  emptyNull: array[0..0] of AnsiChar;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('SQL'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pDb  := PSqliteDb(clientData);
+  zSql := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, nil);
+  if rc <> SQLITE_OK then
+  begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Tcl_SetObjResult(interp,
+      Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if pStmt = nil then
+  begin
+    { No statement compiled (empty / comment-only SQL) — behaves like
+      "no rows". }
+    if bExists then
+      Tcl_SetObjResult(interp, Tcl_NewBooleanObj(0));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  rcStep := sqlite3_step(pStmt);
+  pResult := nil;
+  if not bExists then
+  begin
+    { onecolumn: return column 0 of the first row, or "" if no rows. }
+    if rcStep = SQLITE_ROW then
+    begin
+      emptyNull[0] := #0;
+      if pDb^.zNull <> nil then zNullStr := pDb^.zNull
+      else zNullStr := @emptyNull[0];
+      pResult := DbEvalColumnValue(pStmt, 0, zNullStr);
+    end;
+  end
+  else
+  begin
+    { exists: 1 if the query produced a row, else 0. }
+    if (rcStep = SQLITE_ROW) or (rcStep = SQLITE_DONE) then
+      pResult := Tcl_NewBooleanObj(Ord(rcStep = SQLITE_ROW));
+  end;
+
+  rc := sqlite3_finalize(pStmt);
+  if (rc <> SQLITE_OK) and (rcStep <> SQLITE_ROW) then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  if pResult <> nil then
+    Tcl_SetObjResult(interp, pResult);
+  Result := TCL_OK;
+end;
+
+{ DbCacheArm — port of the DB_CACHE arm of DbObjCmd (tclsqlite.c:2678..
+  2718).  `db cache flush` finalises the stmt cache; `db cache size N`
+  bounds it.  This minimal bridge keeps no stmt cache, so `flush` is a
+  no-op and `size N` simply records N in pDb^.maxStmt (clamped >= 0). }
+function DbCacheArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:     PSqliteDb;
+  zSubCmd: PAnsiChar;
+  n:       cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc <= 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('cache option ?arg?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zSubCmd := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
+  if (zSubCmd <> nil) and (zSubCmd^ = 'f') and
+     (StrComp(zSubCmd, PAnsiChar('flush')) = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('flush'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    { flushStmtCache(pDb) — no stmt cache in this bridge; no-op. }
+  end
+  else if (zSubCmd <> nil) and (zSubCmd^ = 's') and
+          (StrComp(zSubCmd, PAnsiChar('size')) = 0) then
+  begin
+    if objc <> 4 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('size n'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    if Tcl_GetIntFromObj(interp, ObjvAt(objv, 3), @n) = TCL_ERROR then
+    begin
+      Tcl_AppendResult(interp, PChar('cannot convert "'),
+        Tcl_GetStringFromObj(ObjvAt(objv, 3), nil),
+        PChar('" to integer'), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    if n < 0 then n := 0;       { flushStmtCache + n=0 upstream }
+    pDb^.maxStmt := n;
+  end
+  else
+  begin
+    Tcl_AppendResult(interp, PChar('bad option "'),
+      Tcl_GetStringFromObj(ObjvAt(objv, 2), nil),
+      PChar('": must be flush or size'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ DbConfigArm — port of the DB_CONFIG arm of DbObjCmd (tclsqlite.c:
+  2864..2940).  With no args, lists every boolean DBCONFIG option and its
+  current value; with `?OPTION? ?BOOLEAN?` reads or sets one.  Routes
+  through sqlite3_db_config_int — the typed entry point for the boolean
+  DBCONFIG ops in this port. }
+function DbConfigArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  { Mirrors aDbConfig[] in tclsqlite.c:2865..2882. }
+  cfgNames: array[0..15] of PChar = (
+    'defensive', 'dqs_ddl', 'dqs_dml', 'enable_fkey', 'enable_qpsg',
+    'enable_trigger', 'enable_view', 'fts3_tokenizer', 'legacy_alter_table',
+    'legacy_file_format', 'load_extension', 'no_ckpt_on_close',
+    'reset_database', 'trigger_eqp', 'trusted_schema', 'writable_schema');
+  cfgOps: array[0..15] of i32 = (
+    SQLITE_DBCONFIG_DEFENSIVE, SQLITE_DBCONFIG_DQS_DDL,
+    SQLITE_DBCONFIG_DQS_DML, SQLITE_DBCONFIG_ENABLE_FKEY,
+    SQLITE_DBCONFIG_ENABLE_QPSG, SQLITE_DBCONFIG_ENABLE_TRIGGER,
+    SQLITE_DBCONFIG_ENABLE_VIEW, SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER,
+    SQLITE_DBCONFIG_LEGACY_ALTER_TABLE, SQLITE_DBCONFIG_LEGACY_FILE_FORMAT,
+    SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+    SQLITE_DBCONFIG_RESET_DATABASE, SQLITE_DBCONFIG_TRIGGER_EQP,
+    SQLITE_DBCONFIG_TRUSTED_SCHEMA, SQLITE_DBCONFIG_WRITABLE_SCHEMA);
+var
+  pDb:     PSqliteDb;
+  pResult: PTclObj;
+  ii:      cint;
+  v:       i32;
+  zOpt:    PAnsiChar;
+  onoff:   cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?OPTION? ?BOOLEAN?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if objc = 2 then
+  begin
+    { No args — list every option with its current value. }
+    pResult := Tcl_NewListObj(0, nil);
+    for ii := 0 to High(cfgNames) do
+    begin
+      v := 0;
+      sqlite3_db_config_int(pDb^.db, cfgOps[ii], -1, @v);
+      Tcl_ListObjAppendElement(interp, pResult,
+        Tcl_NewStringObj(cfgNames[ii], -1));
+      Tcl_ListObjAppendElement(interp, pResult, Tcl_NewIntObj(v));
+    end;
+  end
+  else
+  begin
+    zOpt := Tcl_GetString(ObjvAt(objv, 2));
+    onoff := -1;
+    v := 0;
+    if (zOpt <> nil) and (zOpt^ = '-') then Inc(zOpt);
+    ii := 0;
+    while (ii <= High(cfgNames)) and
+          (StrComp(cfgNames[ii], zOpt) <> 0) do
+      Inc(ii);
+    if ii > High(cfgNames) then
+    begin
+      Tcl_AppendResult(interp, PChar('unknown config option: "'),
+        zOpt, PChar('"'), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    if objc = 4 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, 3), @onoff) <> TCL_OK then
+      begin
+        Result := TCL_ERROR;
+        Exit;
+      end;
+    end;
+    sqlite3_db_config_int(pDb^.db, cfgOps[ii], onoff, @v);
+    pResult := Tcl_NewIntObj(v);
+  end;
+  Tcl_SetObjResult(interp, pResult);
+  Result := TCL_OK;
+end;
+
+{ QuoteSqlIdent — Pascal stand-in for sqlite3_mprintf's `%q` conversion
+  (this port's sqlite3_mprintf has no C-ABI varargs).  Returns a new
+  AnsiString with every single-quote doubled, suitable for embedding
+  between '...' delimiters. }
+function QuoteSqlIdent(const z: AnsiString): AnsiString;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(z) do
+  begin
+    if z[i] = '''' then Result := Result + '''''';
+    Result := Result + z[i];
+  end;
+end;
+
+{ DbCopyArm — port of the DB_COPY arm of DbObjCmd (tclsqlite.c:2946..
+  3122).  `db copy CONFLICT TABLE FILENAME ?SEP? ?NULL?` — bulk-imports
+  the PostgreSQL-COPY-format file into TABLE.  Returns the line count on
+  success.  Faithful port; SQL strings are built with QuoteSqlIdent in
+  place of sqlite3_mprintf("%q"). }
+function DbCopyArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:       PSqliteDb;
+  zTable:    PAnsiChar;
+  zFile:     PAnsiChar;
+  zConflict: PAnsiChar;
+  pStmt:     Pointer;
+  nCol:      cint;
+  i:         cint;
+  nSep:      cint;
+  nNull:     cint;
+  sqlStr:    AnsiString;
+  rc:        i32;
+  zLine:     PAnsiChar;
+  byteLen:   cint;
+  in_:       TTclChannel;
+  lineno:    cint;
+  str:       PTclObj;
+  zCommit:   PChar;
+  zSep:      PAnsiChar;
+  zNull:     PAnsiChar;
+  azCol:     array of PAnsiChar;
+  z:         PAnsiChar;
+  pResult:   PTclObj;
+  zErr:      AnsiString;
+begin
+  pDb := PSqliteDb(clientData);
+  if (objc < 5) or (objc > 7) then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv,
+      PChar('CONFLICT-ALGORITHM TABLE FILENAME ?SEPARATOR? ?NULLINDICATOR?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if objc >= 6 then zSep := Tcl_GetStringFromObj(ObjvAt(objv, 5), nil)
+  else zSep := PChar(#9);
+  if objc >= 7 then zNull := Tcl_GetStringFromObj(ObjvAt(objv, 6), nil)
+  else zNull := PChar('');
+  zConflict := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
+  zTable    := Tcl_GetStringFromObj(ObjvAt(objv, 3), nil);
+  zFile     := Tcl_GetStringFromObj(ObjvAt(objv, 4), nil);
+  nSep  := StrLen(zSep);
+  nNull := StrLen(zNull);
+  if nSep = 0 then
+  begin
+    Tcl_AppendResult(interp,
+      PChar('Error: non-null separator required for copy'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if (StrComp(zConflict, PAnsiChar('rollback')) <> 0) and
+     (StrComp(zConflict, PAnsiChar('abort'))    <> 0) and
+     (StrComp(zConflict, PAnsiChar('fail'))     <> 0) and
+     (StrComp(zConflict, PAnsiChar('ignore'))   <> 0) and
+     (StrComp(zConflict, PAnsiChar('replace'))  <> 0) then
+  begin
+    Tcl_AppendResult(interp, PChar('Error: "'), zConflict,
+      PChar('", conflict-algorithm must be one of: rollback, ' +
+            'abort, fail, ignore, or replace'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  { Probe the table for its column count. }
+  sqlStr := 'SELECT * FROM ''' + QuoteSqlIdent(zTable) + '''';
+  pStmt := nil;
+  rc := sqlite3_prepare(pDb^.db, PChar(sqlStr), -1, @pStmt, nil);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('Error: '),
+      PAnsiChar(sqlite3_errmsg(pDb^.db)), Pointer(nil));
+    nCol := 0;
+  end
+  else
+    nCol := sqlite3_column_count(pStmt);
+  sqlite3_finalize(pStmt);
+  if nCol = 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  { Build "INSERT OR <conflict> INTO '<table>' VALUES(?,?,...)". }
+  sqlStr := 'INSERT OR ' + AnsiString(zConflict) + ' INTO ''' +
+            QuoteSqlIdent(zTable) + ''' VALUES(?';
+  for i := 1 to nCol - 1 do
+    sqlStr := sqlStr + ',?';
+  sqlStr := sqlStr + ')';
+  pStmt := nil;
+  rc := sqlite3_prepare(pDb^.db, PChar(sqlStr), -1, @pStmt, nil);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('Error: '),
+      PAnsiChar(sqlite3_errmsg(pDb^.db)), Pointer(nil));
+    sqlite3_finalize(pStmt);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  in_ := Tcl_OpenFileChannel(interp, zFile, PChar('rb'), 0666);
+  if in_ = nil then
+  begin
+    sqlite3_finalize(pStmt);
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Tcl_SetChannelOption(nil, in_, PChar('-translation'), PChar('auto'));
+  SetLength(azCol, nCol + 1);
+
+  str := Tcl_NewObj();
+  Tcl_IncrRefCount(str);
+  sqlite3_exec(pDb^.db, PChar('BEGIN'), nil, nil, nil);
+  zCommit := 'COMMIT';
+  lineno  := 0;
+
+  while Tcl_GetsObj(in_, str) >= 0 do
+  begin
+    Inc(lineno);
+    byteLen := 0;
+    zLine := Tcl_GetByteArrayFromObj(str, @byteLen);
+    azCol[0] := zLine;
+    i := 0;
+    z := zLine;
+    while z^ <> #0 do
+    begin
+      if (z^ = zSep[0]) and (StrLComp(z, zSep, nSep) = 0) then
+      begin
+        z^ := #0;
+        Inc(i);
+        if i < nCol then
+        begin
+          azCol[i] := z + nSep;
+          z := z + (nSep - 1);
+        end;
+      end;
+      Inc(z);
+    end;
+    if i + 1 <> nCol then
+    begin
+      zErr := 'Error: ' + AnsiString(zFile) + ' line ' + IntToStr(lineno) +
+        ': expected ' + IntToStr(nCol) + ' columns of data but found ' +
+        IntToStr(i + 1);
+      Tcl_AppendResult(interp, PChar(zErr), Pointer(nil));
+      zCommit := 'ROLLBACK';
+      break;
+    end;
+    for i := 0 to nCol - 1 do
+    begin
+      if ((nNull > 0) and (StrComp(azCol[i], zNull) = 0)) or
+         (StrLen(azCol[i]) = 0) then
+        sqlite3_bind_null(pStmt, i + 1)
+      else
+        sqlite3_bind_text(pStmt, i + 1, azCol[i], -1, SQLITE_STATIC);
+    end;
+    sqlite3_step(pStmt);
+    rc := sqlite3_reset(pStmt);
+    Tcl_SetObjLength(str, 0);
+    if rc <> SQLITE_OK then
+    begin
+      Tcl_AppendResult(interp, PChar('Error: '),
+        PAnsiChar(sqlite3_errmsg(pDb^.db)), Pointer(nil));
+      zCommit := 'ROLLBACK';
+      break;
+    end;
+  end;
+
+  Tcl_DecrRefCount(str);
+  azCol := nil;
+  Tcl_Close(interp, in_);
+  sqlite3_finalize(pStmt);
+  sqlite3_exec(pDb^.db, zCommit, nil, nil, nil);
+
+  if zCommit[0] = 'C' then
+  begin
+    pResult := Tcl_GetObjResult(interp);
+    Tcl_SetIntObj(pResult, lineno);
+    Result := TCL_OK;
+  end
+  else
+  begin
+    Tcl_AppendResult(interp, PChar(', failed while processing line: '),
+      PChar(IntToStr(lineno)), Pointer(nil));
+    Result := TCL_ERROR;
+  end;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -1751,6 +2189,7 @@ function DbObjCmdAdaptor(clientData: TClientData; interp: PTclInterp;
 var
   zSub:  PAnsiChar;
   zSelf: PAnsiChar;
+  iBool: cint;
 begin
   if objc < 2 then
   begin
@@ -1958,10 +2397,105 @@ begin
     Exit;
   end;
 
+  { total_changes — tclsqlite.c:3814 (DB_TOTAL_CHANGES). }
+  if (zSub <> nil) and (StrComp(zSub, 'total_changes') = 0) then
+  begin
+    if objc <> 2 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar(''));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Tcl_SetObjResult(interp,
+      Tcl_NewWideIntObj(sqlite3_total_changes64(PSqliteDb(clientData)^.db)));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { onecolumn — tclsqlite.c:3260 (DB_ONECOLUMN). }
+  if (zSub <> nil) and (StrComp(zSub, 'onecolumn') = 0) then
+  begin
+    Result := DbOneColumnExistsArm(clientData, interp, objc, objv, False);
+    Exit;
+  end;
+
+  { one — alias of onecolumn used by the test harness. }
+  if (zSub <> nil) and (StrComp(zSub, 'one') = 0) then
+  begin
+    Result := DbOneColumnExistsArm(clientData, interp, objc, objv, False);
+    Exit;
+  end;
+
+  { exists — tclsqlite.c:3259 (DB_EXISTS). }
+  if (zSub <> nil) and (StrComp(zSub, 'exists') = 0) then
+  begin
+    Result := DbOneColumnExistsArm(clientData, interp, objc, objv, True);
+    Exit;
+  end;
+
+  { cache — tclsqlite.c:2678 (DB_CACHE).  flush / size N. }
+  if (zSub <> nil) and (StrComp(zSub, 'cache') = 0) then
+  begin
+    Result := DbCacheArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { config — tclsqlite.c:2864 (DB_CONFIG).  sqlite3_db_config passthrough. }
+  if (zSub <> nil) and (StrComp(zSub, 'config') = 0) then
+  begin
+    Result := DbConfigArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { copy — tclsqlite.c:2946 (DB_COPY).  Bulk CSV/COPY-format import. }
+  if (zSub <> nil) and (StrComp(zSub, 'copy') = 0) then
+  begin
+    Result := DbCopyArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { enable_load_extension — tclsqlite.c:3211 (DB_ENABLE_LOAD_EXTENSION). }
+  if (zSub <> nil) and (StrComp(zSub, 'enable_load_extension') = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('BOOLEAN'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, 2), @iBool) <> TCL_OK then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    sqlite3_enable_load_extension(PSqliteDb(clientData)^.db, iBool);
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { timeout — tclsqlite.c:3797 (DB_TIMEOUT).  sqlite3_busy_timeout. }
+  if (zSub <> nil) and (StrComp(zSub, 'timeout') = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('MILLISECONDS'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    if Tcl_GetIntFromObj(interp, ObjvAt(objv, 2), @iBool) <> TCL_OK then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    sqlite3_busy_timeout(PSqliteDb(clientData)^.db, iBool);
+    Result := TCL_OK;
+    Exit;
+  end;
+
   Tcl_AppendResult(interp,
     PChar('unknown subcommand "'),
     zSub,
-    PChar('" - implemented in 9.4.2.d..f'),
+    PChar('" - implemented in 9.4.2.d..o'),
     Pointer(nil));
   Result := TCL_ERROR;
 end;
