@@ -384,6 +384,30 @@ arm in `resolveExprStep` (resolve.c:1860-ish) does not emit the
 `no such function` error when `sqlite3FindFunction` returns nil.
 Surfaced by: 9.4.4.b.2 re-sweep.
 
+## 9.4.divbug.16 — `affinity3.test` segfaults — OPEN
+
+Affects: 1 test (`../sqlite3/test/affinity3.test`).
+Symptom: tclsh SIGSEGVs partway through affinity3.test (no diff
+printed, exit 139).  affinity3 exercises column-affinity coercion
+across `CREATE TABLE ... AS SELECT`, views, and compound queries.
+Likely cause: not yet rooted — candidate is the affinity-propagation
+path for a view or `... AS SELECT` result column dereferencing a nil
+`Column`/`Expr`.  Surfaced by: 9.4.4.c sweep.
+
+## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — OPEN
+
+Affects: 1 test (`../sqlite3/test/aggnested.test`).
+Symptom: `aggnested-1.1` expects `[1x2x3]` (the inner aggregate
+folded across rows) but our build returns `[1x1 2x2 3x3]` — the
+nested aggregate is evaluated per-row instead of being collapsed by
+the outer aggregate context.  The run then SIGSEGVs further in.
+Likely cause: the resolver's nested-aggregate handling
+(`NC_HasAgg` / `pAggInfo` nesting in resolve.c) is not ported — the
+inner `group_concat`/`sum` is bound to the wrong `AggInfo`, and a
+later nested-agg row eventually walks a nil context (the segfault).
+Sibling area to divbug.1/.11 (aggregate resolution).  Surfaced by:
+9.4.4.c sweep.
+
 ## Run summary (9.4.4.b.2 sweep)
 
 First fixed a driver regression: the 9.4.7.f per-test tmpdir
@@ -416,3 +440,34 @@ Buckets CLOSED by the landed harness+engine fixes: divbug.1, .3,
 OPEN / newly opened: divbug.2 (sibling .14), .4 (no longer fatal
 but error-text still off), .11, .12, .13, .14, .15.
 
+
+## Run summary (9.4.4.c sweep)
+
+Broadened the sweep to the **first 50 tcl-feature tests** in
+MANIFEST.txt order, run under `bin/TclTestDriver` (the relative-path
+fix from 9.4.4.b.2 in place).
+
+PASS / FAIL / SKIP = **41 / 9 / 0** (50 total, 6.6 s).
+
+The 9 FAILs break down as:
+
+| Test            | Verdict           | Bucket / cause                          |
+|-----------------|-------------------|-----------------------------------------|
+| affinity3.test  | CRASH (SIGSEGV)   | new **9.4.divbug.16**                   |
+| aggerror.test   | FAIL 6/6          | `sqlite3_connection_pointer` unported + |
+|                 |                   | divbug.14 (error text)                  |
+| aggfault.test   | FAIL (SOURCE-ERR) | `faultsim_save_and_close` unported      |
+| aggnested.test  | CRASH + wrong res | new **9.4.divbug.17**                   |
+| aggorderby.test | FAIL 3/29         | divbug.14 + `ORDER BY may not be used   |
+|                 |                   | with non-aggregate` not raised (.15 fam)|
+| all.test        | FAIL (SOURCE-ERR) | sources `permutations.test` (absent)    |
+| atof1.test      | FAIL 39998/40005  | `real2hex`/`hex2real` test SQL funcs    |
+|                 |                   | unported                                |
+| atof2.test      | FAIL (SOURCE-ERR) | `load_static_extension` unported        |
+| atomic.test     | FAIL (SOURCE-ERR) | `atomic_batch_write` unported           |
+
+Only **two** are genuine new engine divergences (divbug.16, .17);
+the other seven are unported test-only Tcl commands / SQL functions
+or a missing harness file — port-side follow-ups, not engine bugs.
+See STATUS.txt for the per-test pas-strict/soft/skip tags seeded
+from this run under 9.4.8.b.
