@@ -2523,8 +2523,13 @@ begin
         iAmt := i32(amt);
         if iAmt + i32(offset) > i32(ovflSize) then
           iAmt := i32(ovflSize) - i32(offset);
-        rc := sqlite3PagerGet(pBt^.pPager, nextPage, @pDbPg,
-                              i32(eOp = 0));
+        { btree.c:5283 — read uses PAGER_GET_READONLY, write uses 0.
+          NB: must NOT pass Ord(eOp=0)=1, which collides with
+          PAGER_GET_NOCONTENT ($01) and zeroes the page buffer. }
+        if eOp = 0 then
+          rc := sqlite3PagerGet(pBt^.pPager, nextPage, @pDbPg, PAGER_GET_READONLY)
+        else
+          rc := sqlite3PagerGet(pBt^.pPager, nextPage, @pDbPg, 0);
         if rc = SQLITE_OK then begin
           aPayload := Pu8(sqlite3PagerGetData(pDbPg));
           nextPage := get4byte(aPayload);
