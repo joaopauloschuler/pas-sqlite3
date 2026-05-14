@@ -777,13 +777,14 @@ acceptance gate for this section.
   set by an early-return path in aggregate setup.  C ref:
   `../sqlite3/src/vdbe.c` (OP_VerifyFormat) +
   `select.c` (aggregate prologue).
-- [ ] **9.4.divbug.5** UTF-16 `CAST(x AS NUMERIC)` returns empty
-  on input the C oracle parses correctly — `numcast.test` sub-tests
-  `numcast-utf16le.*` / `numcast-utf16be.*`.  Counterpart of
-  `feedback_result_text_change_encoding.md` on the *input* side:
-  `sqlite3_value_text` consumers in the CAST opcode probably
-  miss a `sqlite3VdbeChangeEncoding` before parse.  C ref:
-  `vdbe.c:OP_Cast`, `vdbemem.c:sqlite3VdbeMemCast`.
+- [X] **9.4.divbug.5** `numcast.test` 0/51 → 51/51 Ok.  Root cause was
+  *not* engine-side: `sqlite3VdbeMemCast` / `MemRealValueRC` slow path
+  already handle UTF-16LE/BE.  Two bridge-side bugs: (a) `DbEvalArm` in
+  `PasTclSqlite.pas` never bound `$var`/`:var`/`@var` placeholders, so
+  every CAST input arrived NULL → `{}`; (b) `PRAGMA encoding='...'` in
+  `passqlite3codegen.pas` lacked a write arm, so the test's encoding
+  preamble silently no-op'd.  Fix: minimal port of `dbPrepareAndBind`'s
+  param loop + the `PragTyp_ENCODING` write arm (pragma.c:2267..2286).
 - [X] **9.4.divbug.6** Doubled error string in `db1 eval`'s error
   return — surfaced by 9.4.2.f gate `tcl_err()` returning
   `boomboom` instead of `boom`.  Root cause: `DbEvalArm`

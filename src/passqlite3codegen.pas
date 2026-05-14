@@ -46954,6 +46954,7 @@ var
   pModA:    passqlite3vtab.PVtabModule;
   bShowInternal: i32;
   pPragmaId: PToken;
+  newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
   { 6.28.6.a — locals for PRAGMA integrity_check / quick_check.  Match
     C var names from pragma.c:1696 (i, j, addr, mxErr, x, pTbls, aRoot,
     cnt, pTab, pIdx, nIdx, isQuick).  Renamed to *Ic suffix where the
@@ -47464,6 +47465,39 @@ begin
       sqlite3VdbeLoadString(v, 1, 'UTF-8');
     end;
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
+  if SameText(zName, 'encoding') and (pValue <> nil) then begin
+    { PragTyp_ENCODING write arm (pragma.c:2267..2286).  Only changes
+      db^.enc if the encoding is not yet fixed (DBFLAG_EncodingFixed
+      clear); the new value is also stamped into the SCHEMA_ENC slot
+      via db^.aDb[0].pSchema^.enc so that subsequent schema-load picks
+      it up.  9.4.divbug.5 — without this, numcast-utf16{le,be}.0
+      always reports `UTF-8` because PRAGMA encoding= silently no-ops. }
+    if (db^.mDbFlags and u32($0040){ DBFLAG_EncodingFixed }) = 0 then begin
+      { zRight was dequoted at the top of sqlite3Pragma (line 47063..47077),
+        so we compare the bare encoding name. }
+      newEnc := 0;
+      if (SameText(zRight, 'UTF8')) or (SameText(zRight, 'UTF-8')) then
+        newEnc := SQLITE_UTF8
+      else if (SameText(zRight, 'UTF-16le')) or (SameText(zRight, 'UTF16le')) then
+        newEnc := SQLITE_UTF16LE
+      else if (SameText(zRight, 'UTF-16be')) or (SameText(zRight, 'UTF16be')) then
+        newEnc := SQLITE_UTF16BE
+      else if (SameText(zRight, 'UTF-16')) or (SameText(zRight, 'UTF16')) then begin
+        { SQLITE_UTF16NATIVE — little-endian on every platform pas-sqlite3
+          targets right now. }
+        newEnc := SQLITE_UTF16LE;
+      end;
+      if newEnc <> 0 then begin
+        if (db^.aDb[0].pSchema <> nil) then
+          db^.aDb[0].pSchema^.enc := newEnc;
+        sqlite3SetTextEncoding(db, newEnc);
+      end else
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar(AnsiString('unsupported encoding: ') + zRight));
+    end;
     Exit;
   end;
 

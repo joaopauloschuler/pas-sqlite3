@@ -142,6 +142,10 @@ var
   zVal:       PAnsiChar;
   zNullStr:   PAnsiChar;
   emptyNull:  array[0..0] of AnsiChar;
+  nVar:       i32;
+  iParam:     i32;
+  zParamName: PAnsiChar;
+  pVarStr:    PChar;
 begin
   if objc < 3 then
   begin
@@ -193,6 +197,30 @@ begin
       { Trailing whitespace / comment — no statement compiled. }
       zSql := zTail;
       continue;
+    end;
+
+    { 9.4.divbug.5 — minimal port of tclsqlite.c:dbPrepareAndBind
+      (tclsqlite.c:1490..1556).  Walk the prepared statement's parameter
+      list and substitute `$NAME` / `:NAME` / `@NAME` from the calling
+      Tcl scope.  Without this, every `db eval {... $var ...}` resolves
+      to NULL and CAST/arithmetic return empty — which is what the
+      numcast.test suite (and many others) trip over.
+
+      Simplification vs upstream: we do not consult `pVar->typePtr` for
+      `int` / `double` / `bytearray` fast paths.  Tcl carries the value
+      as a string by default and SQLite affinity / OP_Cast does the
+      coercion at run-time.  The numcast scenario only needs strings. }
+    nVar := sqlite3_bind_parameter_count(pStmt);
+    for iParam := 1 to nVar do begin
+      zParamName := sqlite3_bind_parameter_name(pStmt, iParam);
+      if (zParamName <> nil) and
+         ((zParamName[0] = '$') or (zParamName[0] = ':') or (zParamName[0] = '@')) then begin
+        pVarStr := Tcl_GetVar(interp, zParamName + 1, 0);
+        if pVarStr <> nil then
+          sqlite3_bind_text(pStmt, iParam, pVarStr, -1, SQLITE_TRANSIENT)
+        else
+          sqlite3_bind_null(pStmt, iParam);
+      end;
     end;
 
     nCol := sqlite3_column_count(pStmt);

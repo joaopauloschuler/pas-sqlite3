@@ -68,21 +68,38 @@ Likely cause: error-code path in update.test setup misroutes
 `SQLITE_ERROR` (or similar) to `SQLITE_NOMEM`, surfacing the
 generic "out of memory" string via `sqlite3_errmsg`.
 
-## 9.4.divbug.5 — UTF-16 numcast (`numcast-utf16*`) returns empty string
+## 9.4.divbug.5 — UTF-16 numcast (`numcast-utf16*`) returns empty string — FIXED
 
-Affects: 1 test (`../sqlite3/test/numcast.test`, sub-tests
-`numcast-utf16le.*` and `numcast-utf16be.*`).
-Symptom: cast-to-NUMERIC / cast-to-INTEGER on a UTF-16 source column
-returns `{}` (empty) where upstream returns the parsed `12345.0` /
-`12345` etc.  Note that `numcast-utf8.*` also fail but with a different
-fingerprint — they return `{}` because their setup uses `db_save`
-(unported) or `db eval` against an attached non-existent encoding;
-the UTF-16 bucket is the engine-level divergence.
-Likely cause: `sqlite3VdbeMemNumerify` / the `OP_Affinity` arm doesn't
-ChangeEncoding the source to UTF-8 before parsing — pas-sqlite3 reads
-the raw UTF-16 byte stream as if it were UTF-8 and bails at the first
-zero-byte.  Related to feedback note
-`feedback_result_text_change_encoding.md` but on the input side.
+Affects (was): 1 test (`../sqlite3/test/numcast.test`, sub-tests
+`numcast-utf16le.*`, `numcast-utf16be.*`, and `numcast-utf8.*`).
+Symptom (was): `CAST($str AS real)` / `CAST($str AS integer)` returned
+`{}` for all 50 substituted sub-tests, and `numcast-utf16{le,be}.0`
+also reported `utf8` from `PRAGMA encoding` instead of the requested
+`utf16le` / `utf16be`.
+Actual root cause: two-part bug, both upstream of `sqlite3VdbeMemCast`
+(which itself was correct — the slow path in `sqlite3MemRealValueRC`
+already decodes UTF-16LE/BE before handing the buffer to
+`sqlite3AtoF`):
+
+  1. `DbEvalArm` in `src/tests/tcl/PasTclSqlite.pas` never bound Tcl
+     variables to `$NAME` / `:NAME` / `@NAME` placeholders.  Every
+     prepared statement parameter therefore stepped as NULL, so
+     `CAST(NULL AS real)` produced NULL → Tcl `{}`.
+  2. `PRAGMA encoding = '<name>'` in `src/passqlite3codegen.pas` had
+     only a *read* arm; the write arm was missing, so the connection
+     stayed locked to UTF-8 even after the test ran
+     `db eval "PRAGMA encoding='utf16le'"`.
+Fix (single commit, 9.4.divbug.5):
+  * Port `dbPrepareAndBind`'s minimal `$var` / `:var` / `@var` lookup
+    loop (tclsqlite.c:1490..1556) into `DbEvalArm`.  Bind via
+    `sqlite3_bind_text(..., SQLITE_TRANSIENT)` — string-only, no
+    `pVar->typePtr` type-detection fast paths (SQLite affinity / the
+    OP_Cast we are exercising does the run-time coercion).
+  * Add the `PragTyp_ENCODING` write arm (pragma.c:2267..2286) to
+    `sqlite3Pragma`: gate on `DBFLAG_EncodingFixed`, recognise
+    UTF8/UTF-8/UTF-16le/UTF16le/UTF-16be/UTF16be/UTF-16/UTF16, stamp
+    `db^.aDb[0].pSchema^.enc`, call `sqlite3SetTextEncoding`.
+Result: numcast-{utf8,utf16le,utf16be}.* → 51/51 Ok (was 1/51).
 
 ## 9.4.divbug.7 — `insert.test` wedges past `insert-1.3`
 
