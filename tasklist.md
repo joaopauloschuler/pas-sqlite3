@@ -622,7 +622,7 @@ acceptance gate for this section.
   - [ ] **9.4.6.d** `sqlite3_table_column_metadata` — used by ~20
     tests + by `.expert`.  Audit if already exported.  C ref:
     `../sqlite3/src/main.c:sqlite3_table_column_metadata`.
-  - [ ] **9.4.6.e** `sqlite3_set_authorizer` — engine port +
+  - [X] **9.4.6.e** `sqlite3_set_authorizer` — engine port +
     pairs with 9.4.2.j Tcl shim.  C ref:
     `../sqlite3/src/auth.c` (entire file, ~250 lines).
   - [ ] **9.4.6.f** `sqlite3_create_collation` /
