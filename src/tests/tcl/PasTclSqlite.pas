@@ -32,7 +32,7 @@ implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
-     TestModuleMd5;
+     TestModuleMd5, TestModuleTclvar;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -3770,6 +3770,8 @@ begin
     @TestRegisterDbstatVtab, nil, nil);
   { 9.4.6.l.3 — test_md5.c: register md5 / md5-10x8 / md5file commands. }
   Md5_Init(interp);
+  { 9.4.6.l.2 — test_tclvar.c: register the `register_tclvar_module` cmd. }
+  Sqlitetesttclvar_Init(interp);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;

@@ -22,6 +22,7 @@ uses
   ctypes,
   PasTclBridge,
   TestModuleMd5,
+  TestModuleTclvar,
   PasTclSqlite;
 
 exports
