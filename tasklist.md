@@ -449,12 +449,20 @@ acceptance gate for this section.
   - [X] **9.4.2.g.12** `db_save_and_close` / `db_restore_and_reopen`
     + `forcecopy` — snapshot helpers for tests that mutate then
     revert.  C ref: `tester.tcl:1714..1760`.
-  - [ ] **9.4.2.g.13** `*_common.tcl` source-include shims —
+  - [X] **9.4.2.g.13** `*_common.tcl` source-include shims —
     `malloc_common.tcl`, `lock_common.tcl`, `incrblob_common.tcl`,
     `wal_common.tcl`, `fts3_common.tcl`.  Each is a shared helper
     file sourced by tens of tests.  Audit each; copy verbatim where
     no internal hooks; SKIP-cite per file where they call
     `sqlite3_test_control` opcodes we haven't wired.
+    Outcome: audited all 7 `../sqlite3/test/*_common.tcl` (no
+    `incrblob_common.tcl` exists upstream).  Driver sets `::testdir`
+    at `src/tests/tcl/`, so copies ARE needed.  Copied verbatim:
+    `wal_common.tcl`, `fuzz_common.tcl` (pure Tcl, no internal
+    hooks).  SKIP-cited: `malloc_common.tcl`, `lock_common.tcl`,
+    `bc_common.tcl`, `fts3_common.tcl`, `pg_common.tcl`,
+    `thread_common.tcl` (need testvfs / testfixture / sqlthread /
+    sqlite3_memdebug_* / Pgtcl — unported).
   - [X] **9.4.2.h** `db eval` 3-arg form (`db eval $sql arrayName
     { script }`) — per-row callback with column-name `Tcl_TraceVar`
     binding into the named array.  Used by ~30% of tcl-feature tests.

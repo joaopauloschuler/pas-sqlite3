@@ -71,6 +71,61 @@ list is shim-complete; remaining failures fall into:
   - the lingering `do_eqp_test` helper (9.4.2.g.6) which only
     `update.test` depends on inside the 10-test set.
 
+## `*_common.tcl` source-include helpers — 9.4.2.g.13 audit
+
+Upstream `.test` files `source $testdir/<name>_common.tcl`.  The
+TclTestDriver sets `::testdir` at `src/tests/tcl/`, so a copy of
+each safe helper must live here for the `source` to resolve.
+
+Audited every `../sqlite3/test/*_common.tcl` (note: there is **no**
+`incrblob_common.tcl` upstream — incrblob tests inline their helpers).
+
+### Copied verbatim into `src/tests/tcl/` (no internal hooks)
+
+- **wal_common.tcl** — pure Tcl: `expr` / `binary` / `file` / `open`
+  arithmetic + WAL header checksum helpers.  `set_tvfs_hdr` /
+  `incr_tvfs_hdr` reference the `tvfs` testvfs command, but only
+  inside proc bodies (not at source time) — tests that actually call
+  those still need 9.4.7.b testvfs wiring, but the file is safe to
+  source.
+- **fuzz_common.tcl** — pure-Tcl SQL fuzz generators; at source time
+  only opens `fuzzy.log` and defines procs.  `do_fuzzy_test` uses
+  `do_test` / `execsql` / `subst` (all in tester_min.tcl).
+
+### SKIP-and-cite (depend on unported internal hooks — NOT copied)
+
+- **malloc_common.tcl** — `do_malloc_test` / `do_faultsim_test` /
+  `do_select_test` need `sqlite3_memdebug_fail`,
+  `sqlite3_db_config_lookaside`, `sqlite3_extended_result_codes`,
+  `save_prng_state` / `restore_prng_state`, and `testvfs` (shmfault).
+  Source-time itself is harmless (our `ifcapable` stub runs the
+  `builtin_test` body → `set MEMDEBUG 1`).  Cite: 9.4.2.g.9 (do_malloc_test)
+  / 9.4.7.b (sqlite3_memdebug_* + testvfs).
+- **lock_common.tcl** — `do_multiclient_test` / `launch_testfixture` /
+  `testfixture` need a child `testfixture` process,
+  `sqlite3_test_control_pending_byte`, and `permutation`.
+  Cite: 9.4.7.c (testfixture multi-process harness) / 9.4.2.g.8
+  (permutation matrix).
+- **bc_common.tcl** — `bc_find_binaries` / `do_bc_test` need
+  `launch_testfixture` + `testfixture` (backwards-compat against
+  historical binaries).  Cite: 9.4.7.c (testfixture harness).
+- **fts3_common.tcl** — source-time `ifcapable fts3 {
+  sqlite3_fts3_may_be_corrupt 0 }`: our `ifcapable` stub runs the
+  body unconditionally → calls the unported `sqlite3_fts3_may_be_corrupt`
+  test command → **source-time error**.  Helpers also use
+  `fts3_tokenizer_test` and `read_fts3varint`.  Cite: 9.4.7.d (fts3
+  test-only commands) / 9.4.2.g.1 follow-up (real `ifcapable` EXPR).
+- **pg_common.tcl** — `package require Pgtcl`, connects to a live
+  Postgres at source time, and **redefines** `execsql` to route to
+  pg_exec.  Not a SQLite-side helper at all (used only to regenerate
+  golden `.test` files).  Cite: not applicable — out of scope for the
+  pas-sqlite3 sweep.
+- **thread_common.tcl** — source-time `return 0` early, so sourcing is
+  inert, but `thread_spawn` / `run_thread_tests` need `sqlthread`,
+  `enter_db_mutex` / `leave_db_mutex`, and the low-level
+  `sqlite3_prepare_v2` / `sqlite3_step` / `sqlite3_column_*` Tcl
+  bridge.  Cite: 9.4.7.e (sqlthread + threading test API).
+
 ## Notes for future shim growth
 
 When `tester_min.tcl` grows, prefer to land helpers in this order — each
