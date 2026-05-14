@@ -32,7 +32,7 @@ implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
-     TestModuleMd5, TestModuleTclvar, TestModuleTest1;
+     TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -3775,6 +3775,8 @@ begin
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
     atomic_batch_write / load_static_extension. }
   Sqlitetest1_Init(interp);
+  { 9.4.6.l.4 — test_func.c: autoinstall_test_functions. }
+  Sqlitetestfunc_Init(interp);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;
