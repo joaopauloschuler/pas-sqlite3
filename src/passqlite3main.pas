@@ -3251,6 +3251,9 @@ begin
               zCopy, @sqlite3InvalidFunction, nil, nil, @sqlite3_free);
 end;
 
+{ Forward — sqlite3Init body lives further down (prepare.c:438). }
+function sqlite3Init(db: PTsqlite3; pzErrMsg: PPAnsiChar): i32; forward;
+
 { main.c:4009 — sqlite3_table_column_metadata.  Return type, collation,
   NOT NULL, PK and AUTOINCREMENT metadata for a table column.  When
   zColumnName is nil, only existence of the table is checked.  rowid
@@ -3290,6 +3293,9 @@ begin
 
   sqlite3_mutex_enter(db^.mutex);
   sqlite3BtreeEnterAll(db);
+  rc := sqlite3Init(db, @zErrMsg);
+  if rc <> SQLITE_OK then
+    goto error_out;
 
   pTab := sqlite3FindTable(db, zTableName, zDbName);
   if (pTab = nil) or IsView(pTab) then begin

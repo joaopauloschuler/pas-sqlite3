@@ -622,7 +622,7 @@ acceptance gate for this section.
     `sqlite3_status64` audit — extend export coverage so every
     `_STATUS_*` opcode used by tests works.  C ref:
     `../sqlite3/src/status.c`.
-  - [ ] **9.4.6.d** `sqlite3_table_column_metadata` — used by ~20
+  - [X] **9.4.6.d** `sqlite3_table_column_metadata` — used by ~20
     tests + by `.expert`.  Audit if already exported.  C ref:
     `../sqlite3/src/main.c:sqlite3_table_column_metadata`.
   - [X] **9.4.6.e** `sqlite3_set_authorizer` — engine port +
