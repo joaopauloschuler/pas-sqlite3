@@ -611,6 +611,42 @@ proc do_eqp_test {name sql res} {
   }
 }
 
+# Build-configuration globals — upstream tester.tcl:2609..2611 sets
+# `$AUTOVACUUM` from `$sqlite_options(default_autovacuum)`, and
+# test_config.c (set_options) Tcl_LinkVar's the integer build constants
+# TEMP_STORE / DEFAULT_SYNCHRONOUS / DEFAULT_WAL_SYNCHRONOUS /
+# DEFAULT_FILE_FORMAT plus the sqlite_options() array.  pas-sqlite3 has
+# no testfixture / set_options C shim, so the .test files that read
+# these globals (insert.test reads $AUTOVACUUM, etc.) error on the
+# undefined variable.  Surfaced by the 9.4.4.c sweep (tasklist 9.4.2.g.14).
+#
+# Values are derived from THIS port's actual default build config — the
+# port does not override the upstream C defaults:
+#   AUTOVACUUM=0   — src/passqlite3btree.pas:118 SQLITE_DEFAULT_AUTOVACUUM=0
+#   TEMP_STORE=1   — upstream SQLITE_TEMP_STORE compile-time default
+#   DEFAULT_SYNCHRONOUS=2     — src/passqlite3pager.pas:237
+#   DEFAULT_WAL_SYNCHRONOUS=2 — upstream defaults this to
+#                    SQLITE_DEFAULT_SYNCHRONOUS when not separately set
+#   DEFAULT_FILE_FORMAT=4     — src/passqlite3main.pas:5878
+#                    SQLITE_MAX_FILE_FORMAT_L=4 (newest format written)
+#   MEMORY_MANAGEMENT=0       — SQLITE_ENABLE_MEMORY_MANAGEMENT is off in
+#                    this build (src/passqlite3main.pas:4815, pcache.pas:227)
+# C ref: tester.tcl:2609..2611, src/test_config.c set_options().
+set ::AUTOVACUUM 0
+set ::TEMP_STORE 1
+set ::SQLITE_DEFAULT_SYNCHRONOUS 2
+set ::SQLITE_DEFAULT_WAL_SYNCHRONOUS 2
+set ::SQLITE_DEFAULT_FILE_FORMAT 4
+set ::MEMORY_MANAGEMENT 0
+
+# Minimal sqlite_options() array — upstream test_config.c populates this
+# from compile-time SQLITE_OMIT_*/SQLITE_ENABLE_* macros.  pas-sqlite3 is
+# built with the default cap set (no SQLITE_OMIT_*).  We seed only
+# default_autovacuum (read directly by tester.tcl:2611) here; ifcapable
+# expressions are handled by the always-true `ifcapable` stub above.
+# C ref: src/test_config.c:309..313.
+array set ::sqlite_options {default_autovacuum 0}
+
 # Open `db` on a fresh on-disk ./test.db at shim load time, mirroring
 # upstream tester.tcl:553..556.  The driver no longer issues its own
 # `sqlite3 db :memory:`.
