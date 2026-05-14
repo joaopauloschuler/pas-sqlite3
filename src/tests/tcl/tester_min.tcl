@@ -399,6 +399,27 @@ proc db_delete_and_reopen {{file test.db}} {
   sqlite3 db $file
 }
 
+# faultsim_save / faultsim_save_and_close / faultsim_restore /
+# faultsim_restore_and_reopen — upstream malloc_common.tcl:169..177.
+# These are thin aliases over the db_* snapshot helpers above.  The
+# full malloc-fault machinery (malloc_common.tcl) is SKIP-cited
+# (9.4.2.g.13); only the snapshot-aliases are ported here, since
+# aggfault.test / atof tests use just those.  The C
+# faultsim_restore_and_reopen additionally calls
+# `sqlite3_extended_result_codes db 1` and
+# `sqlite3_db_config_lookaside db 0 0 0`; those test commands are not
+# yet ported, so they are omitted here (they only tune fault-injection
+# behaviour, which is not exercised without the malloc machinery).
+proc faultsim_save {args} { uplevel db_save $args }
+proc faultsim_save_and_close {args} { uplevel db_save_and_close $args }
+proc faultsim_restore {args} { uplevel db_restore $args }
+proc faultsim_restore_and_reopen {args} {
+  uplevel db_restore_and_reopen $args
+}
+proc faultsim_delete_and_reopen {args} {
+  uplevel db_delete_and_reopen $args
+}
+
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
 # runs finish_test_precleanup (deregisters test VFSes), optionally
 # sources extra scripts from $argv, closes `db`, then defers to

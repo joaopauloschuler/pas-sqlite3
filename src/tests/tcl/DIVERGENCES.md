@@ -569,3 +569,29 @@ the other seven are unported test-only Tcl commands / SQL functions
 or a missing harness file — port-side follow-ups, not engine bugs.
 See STATUS.txt for the per-test pas-strict/soft/skip tags seeded
 from this run under 9.4.8.b.
+
+### 9.4.6.q follow-up — test1.c command subset ported
+
+Ported `sqlite3_connection_pointer`, `sqlite3_db_config`,
+`atomic_batch_write`, `load_static_extension` (test1.c) into
+`testmodules/TestModuleTest1.pas`, plus the `real2hex` SQL scalar
+(test_func.c) and `faultsim_save_and_close` / `faultsim_restore` /
+`faultsim_restore_and_reopen` aliases in `tester_min.tcl`.  Of the 7
+non-engine FAILs above:
+
+- **atof2.test** — now **PASS** (0/4 errors); `load_static_extension
+  ieee754` wires the already-ported `passqlite3ieee754` unit.
+- **atomic.test** — now **PASS** (0/0; skips gracefully — VFS reports
+  no batch-atomic support); `atomic_batch_write` ported.
+- **aggfault.test** — `faultsim_save_and_close` unblocked; now fails
+  only on `do_faultsim_test` (full malloc-fault machinery, 9.4.2.g.13).
+- **aggerror.test** — `sqlite3_connection_pointer` unblocked; still
+  blocked on unported `sqlite3_create_aggregate` (separate test1.c
+  command, out of 9.4.6.q scope) + divbug.14.
+- **atof1.test** — `real2hex` exists and is reachable via
+  `load_static_extension real2hex`, but atof1.test invokes it directly
+  expecting `autoinstall_test_functions` (task 9.4.6.l.4); still
+  blocked on that.
+
+`hex2real` does not exist in upstream C — only `real2hex` is real;
+the tasklist mention of `hex2real` was spurious.

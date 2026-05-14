@@ -23,6 +23,7 @@ uses
   PasTclBridge,
   TestModuleMd5,
   TestModuleTclvar,
+  TestModuleTest1,
   PasTclSqlite;
 
 exports
