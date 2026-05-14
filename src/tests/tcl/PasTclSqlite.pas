@@ -68,6 +68,10 @@ type
     zProfile: PAnsiChar;   { tclsqlite.c:203 — `profile` callback script. }
     zAuth:    PAnsiChar;   { tclsqlite.c:206 — `authorizer` callback script,
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
+    zBusy:    PAnsiChar;   { tclsqlite.c:199 — `busy` callback script,
+                             Tcl_Alloc'd; freed in DbDeleteCmd. }
+    zProgress: PAnsiChar;  { tclsqlite.c:204 — `progress` callback script,
+                             Tcl_Alloc'd; freed in DbDeleteCmd. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -138,6 +142,18 @@ begin
   begin
     Tcl_Free(pDb^.zAuth);
     pDb^.zAuth := nil;
+  end;
+  { Free busy callback script — tclsqlite.c:628..630. }
+  if pDb^.zBusy <> nil then
+  begin
+    Tcl_Free(pDb^.zBusy);
+    pDb^.zBusy := nil;
+  end;
+  { Free progress callback script — tclsqlite.c:631..633. }
+  if pDb^.zProgress <> nil then
+  begin
+    Tcl_Free(pDb^.zProgress);
+    pDb^.zProgress := nil;
   end;
   Dispose(pDb);
 end;
@@ -1125,6 +1141,150 @@ begin
   Result := TCL_OK;
 end;
 
+{ DbBusyHandler — the sqlite3_busy_handler callback trampoline.
+  Port of DbBusyHandler (tclsqlite.c:681..692).  Builds "<zBusy> <n>"
+  and evals it; a TCL error or a zero/non-integer result means
+  "give up" (return 0), a non-zero integer result means "retry"
+  (return 1).  Signature: int (*)(void*, int). }
+function DbBusyHandler(cd: Pointer; nTries: cint): cint; cdecl;
+var
+  pDb:  PSqliteDb;
+  str:  TTclDString;
+  zVal: AnsiString;
+  rc:   cint;
+begin
+  pDb  := PSqliteDb(cd);
+  zVal := IntToStr(nTries);   { "%d" of nTries — tclsqlite.c:686 }
+  Tcl_DStringInit(@str);
+  Tcl_DStringAppend(@str, pDb^.zBusy, -1);
+  Tcl_DStringAppend(@str, PChar(' '), 1);
+  Tcl_DStringAppend(@str, PChar(zVal), -1);
+  rc := Tcl_Eval(pDb^.interp, Tcl_DStringValue(@str));
+  Tcl_DStringFree(@str);
+  if (rc <> TCL_OK) or
+     (StrToIntDef(string(Tcl_GetStringResult(pDb^.interp)), 0) <> 0) then
+    Result := 0
+  else
+    Result := 1;
+end;
+
+{ DbBusyArm — `db busy ?CALLBACK?`  tclsqlite.c:2641..2670.
+  2-arg form reports the current callback; 3-arg form replaces it and
+  (re)registers via sqlite3_busy_handler (or clears it). }
+function DbBusyArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:   PSqliteDb;
+  zBusy: PAnsiChar;
+  len:   cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('CALLBACK'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zBusy <> nil then
+      Tcl_AppendResult(interp, pDb^.zBusy, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zBusy <> nil then
+      Tcl_Free(pDb^.zBusy);
+    zBusy := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zBusy <> nil) and (len > 0) then
+    begin
+      pDb^.zBusy := Tcl_Alloc(len + 1);
+      Move(zBusy^, pDb^.zBusy^, len + 1);
+    end
+    else
+      pDb^.zBusy := nil;
+    if pDb^.zBusy <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_busy_handler(pDb^.db, @DbBusyHandler, pDb);
+    end
+    else
+      sqlite3_busy_handler(pDb^.db, nil, nil);
+  end;
+  Result := TCL_OK;
+end;
+
+{ DbProgressHandler — the sqlite3_progress_handler callback trampoline.
+  Port of DbProgressHandler (tclsqlite.c:698..708).  Evals the stored
+  script; a TCL error or a non-zero/non-integer result interrupts the
+  query (return 1), otherwise continue (return 0).
+  Signature: int (*)(void*). }
+function DbProgressHandler(cd: Pointer): cint; cdecl;
+var
+  pDb: PSqliteDb;
+  rc:  cint;
+begin
+  pDb := PSqliteDb(cd);
+  rc  := Tcl_Eval(pDb^.interp, pDb^.zProgress);
+  if (rc <> TCL_OK) or
+     (StrToIntDef(string(Tcl_GetStringResult(pDb^.interp)), 0) <> 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ DbProgressArm — `db progress ?N CALLBACK?`  tclsqlite.c:3574..3606.
+  2-arg form reports the current callback and clears it; 4-arg form
+  (re)registers a callback fired every N opcodes via
+  sqlite3_progress_handler. }
+function DbProgressArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:       PSqliteDb;
+  zProgress: PAnsiChar;
+  len:       cint;
+  N:         cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc = 2 then
+  begin
+    if pDb^.zProgress <> nil then
+      Tcl_AppendResult(interp, pDb^.zProgress, Pointer(nil));
+    sqlite3_progress_handler(pDb^.db, 0, nil, nil);
+  end
+  else if objc = 4 then
+  begin
+    if Tcl_GetIntFromObj(interp, ObjvAt(objv, 2), @N) <> TCL_OK then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    if pDb^.zProgress <> nil then
+      Tcl_Free(pDb^.zProgress);
+    zProgress := Tcl_GetStringFromObj(ObjvAt(objv, 3), @len);
+    if (zProgress <> nil) and (len > 0) then
+    begin
+      pDb^.zProgress := Tcl_Alloc(len + 1);
+      Move(zProgress^, pDb^.zProgress^, len + 1);
+    end
+    else
+      pDb^.zProgress := nil;
+    if pDb^.zProgress <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_progress_handler(pDb^.db, N, @DbProgressHandler, pDb);
+    end
+    else
+      sqlite3_progress_handler(pDb^.db, 0, nil, nil);
+  end
+  else
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('N CALLBACK'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Result := TCL_OK;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -1259,6 +1419,29 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'authorizer') = 0) then
   begin
     Result := DbAuthorizerArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { busy — tclsqlite.c:2641 (DB_BUSY).  sqlite3_busy_handler shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'busy') = 0) then
+  begin
+    Result := DbBusyArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { progress — tclsqlite.c:3574 (DB_PROGRESS).  sqlite3_progress_handler
+    shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'progress') = 0) then
+  begin
+    Result := DbProgressArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { interrupt — tclsqlite.c:3511 (DB_INTERRUPT).  Direct passthrough. }
+  if (zSub <> nil) and (StrComp(zSub, 'interrupt') = 0) then
+  begin
+    sqlite3_interrupt(PSqliteDb(clientData)^.db);
+    Result := TCL_OK;
     Exit;
   end;
 

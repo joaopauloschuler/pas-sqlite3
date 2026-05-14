@@ -470,7 +470,7 @@ acceptance gate for this section.
     sqlite3_set_authorizer with 5-tuple action codes.  Engine port
     in 9.4.6.e.  C ref: `tclsqlite.c:984..1070` (auth_callback) +
     `2740..2780` (dispatch).
-  - [ ] **9.4.2.k** `db busy` + `db progress` + `db interrupt` —
+  - [X] **9.4.2.k** `db busy` + `db progress` + `db interrupt` —
     busy-handler / progress-callback / interrupt wiring.  C ref:
     `tclsqlite.c:681..737` (DbBusyHandler, DbProgressHandler) +
     `2810..2860` (dispatch).
