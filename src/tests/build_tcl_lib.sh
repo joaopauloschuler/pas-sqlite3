@@ -46,9 +46,14 @@ fi
 # -FU/-FE   : .ppu/.o + final binary into bin/
 # -k-ltcl8.6 -k-ldl : link Tcl + dlopen runtime
 # Output .so name pinned via -o.
+# -dSQLITE_TEST enables the {$ifdef SQLITE_TEST} I/O-error injection
+# instrumentation in passqlite3os.pas (task 9.4.7.c) and the test2.c
+# counter wiring in TestModuleIoerr.  The default engine build (build.sh)
+# does NOT pass this, so the production .so stays byte-for-byte unaffected.
 FPC_CMD=(fpc
   -MObjFPC -Scghi -O1
   -Cg
+  -dSQLITE_TEST
   "${PREUPDATE_FLAGS[@]}"
   "${UNLOCK_NOTIFY_FLAGS[@]}"
   -Fu"$TCL_DIR"

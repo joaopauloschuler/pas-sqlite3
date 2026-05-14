@@ -218,6 +218,20 @@ function Tcl_UnsetVar(interp: PTclInterp; varName: PChar; flags: cint): cint; cd
   by the tclvar virtual table's xColumn (test_tclvar.c:270). }
 function Tcl_GetVar2Ex(interp: PTclInterp; part1, part2: PChar; flags: cint): PTclObj; cdecl; external 'tcl8.6';
 
+{ Tcl_LinkVar — bind a Tcl variable to a C/Pascal storage location so
+  reads/writes of the Tcl variable mirror the native variable.  Used by
+  test2.c:740 to expose the I/O-error injection counters to the test
+  harness (sqlite_io_error_pending etc.). }
+const
+  TCL_LINK_INT       = 1;
+  TCL_LINK_DOUBLE    = 2;
+  TCL_LINK_BOOLEAN   = 3;
+  TCL_LINK_STRING    = 4;
+  TCL_LINK_WIDE_INT  = 5;
+  TCL_LINK_READ_ONLY = $80;
+function Tcl_LinkVar(interp: PTclInterp; varName: PChar; addr: Pointer; typ: cint): cint; cdecl; external 'tcl8.6';
+procedure Tcl_UnlinkVar(interp: PTclInterp; varName: PChar); cdecl; external 'tcl8.6';
+
 { Reset the interpreter result.  tclsqlite.c:2003 (DbEvalNextCmd cleanup). }
 procedure Tcl_ResetResult(interp: PTclInterp); cdecl; external 'tcl8.6';
 

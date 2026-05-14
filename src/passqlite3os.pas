@@ -667,6 +667,27 @@ var
   { Filled by sqlite3MutexInit with the current method table }
   gMutexMethods : sqlite3_mutex_methods;
 
+{$ifdef SQLITE_TEST}
+{ ============================================================
+  Section 16: I/O-error injection counters  (task 9.4.7.c)
+
+  Faithful port of the SQLITE_TEST block in os_common.h:48..86.
+  These globals are driven from Tcl via Tcl_LinkVar (see the
+  ioerr test module) exactly as test2.c:740..751 wires them up.
+  unixRead/Write/Sync/Truncate consult them through the
+  SimulateIOError / SimulateDiskfullError helpers below.  The
+  whole block is inert unless the unit is compiled -dSQLITE_TEST,
+  so the default (non-test) build is byte-for-byte unaffected.
+  ============================================================ }
+var
+  sqlite3_io_error_hit      : cint = 0;
+  sqlite3_io_error_hardhit  : cint = 0;
+  sqlite3_io_error_pending  : cint = 0;
+  sqlite3_io_error_persist  : cint = 0;
+  sqlite3_io_error_benign   : cint = 0;
+  sqlite3_diskfull_pending  : cint = 0;
+  sqlite3_diskfull          : cint = 0;
+{$endif}
 
 
 implementation
@@ -1481,6 +1502,55 @@ begin
   Result := SQLITE_OK;
 end;
 
+{$ifdef SQLITE_TEST}
+{ os_common.h:65..70 — local_ioerr(): record a simulated I/O hit. }
+procedure local_ioerr;
+begin
+  Inc(sqlite3_io_error_hit);
+  if sqlite3_io_error_benign = 0 then
+    Inc(sqlite3_io_error_hardhit);
+end;
+
+{ os_common.h:60..64 — SimulateIOError(): returns True when the caller
+  should inject a fault on this I/O operation.  The C macro decrements
+  sqlite3_io_error_pending and fires the CODE block when it underflows
+  to 1, or whenever a persistent fault is already latched. }
+function SimulateIOError: Boolean;
+begin
+  if ((sqlite3_io_error_persist <> 0) and (sqlite3_io_error_hit <> 0))
+     or (sqlite3_io_error_pending = 1) then
+  begin
+    Dec(sqlite3_io_error_pending);
+    local_ioerr;
+    Result := True;
+  end
+  else
+  begin
+    Dec(sqlite3_io_error_pending);
+    Result := False;
+  end;
+end;
+
+{ os_common.h:71..81 — SimulateDiskfullError(): returns True when the
+  caller should inject an SQLITE_FULL fault on this operation. }
+function SimulateDiskfullError: Boolean;
+begin
+  Result := False;
+  if sqlite3_diskfull_pending <> 0 then
+  begin
+    if sqlite3_diskfull_pending = 1 then
+    begin
+      local_ioerr;
+      sqlite3_diskfull := 1;
+      sqlite3_io_error_hit := 1;
+      Result := True;
+    end
+    else
+      Dec(sqlite3_diskfull_pending);
+  end;
+end;
+{$endif}
+
 { os_unix.c ~3512: unixRead_impl — positional read using pread(2) }
 function unixRead_impl(pFile: Psqlite3_file; pBuf: Pointer;
                        iAmt: cint; iOfst: i64): cint; cdecl;
@@ -1491,6 +1561,10 @@ begin
   pf := PunixFile(pFile);
   repeat
     got := FpPRead(pf^.h, pBuf, iAmt, iOfst);
+    {$ifdef SQLITE_TEST}
+    { os_unix.c:3475 — SimulateIOError( got = -1 ) }
+    if SimulateIOError then got := -1;
+    {$endif}
   until not ((got < 0) and (fpgeterrno = ESysEINTR));
 
   if got = ssize_t(iAmt) then
@@ -1528,6 +1602,21 @@ begin
     end;
     Inc(totalWritten, cint(wrote));
   end;
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3707..3708 — SimulateIOError / SimulateDiskfullError fire
+    after the write loop.  The C CODE blocks force amt>wrote so the
+    caller falls into the error arm; here we just return directly. }
+  if SimulateIOError then begin
+    pf^.lastErrno := 0;
+    Result := SQLITE_IOERR_WRITE;
+    Exit;
+  end;
+  if SimulateDiskfullError then begin
+    pf^.lastErrno := ESysENOSPC;
+    Result := SQLITE_FULL;
+    Exit;
+  end;
+  {$endif}
   Result := SQLITE_OK;
 end;
 
@@ -1538,6 +1627,13 @@ var
   rc : cint;
 begin
   pf := PunixFile(pFile);
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3965 — SimulateIOError( return SQLITE_IOERR_TRUNCATE ) }
+  if SimulateIOError then begin
+    Result := SQLITE_IOERR_TRUNCATE;
+    Exit;
+  end;
+  {$endif}
   { If a chunk-size is set, round up to the next multiple }
   if pf^.szChunk > 0 then
     size := ((size + pf^.szChunk - 1) div pf^.szChunk) * pf^.szChunk;
@@ -1556,7 +1652,18 @@ var
   rc : cint;
 begin
   pf := PunixFile(pFile);
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3926 — SimulateDiskfullError( return SQLITE_FULL ) }
+  if SimulateDiskfullError then begin
+    Result := SQLITE_FULL;
+    Exit;
+  end;
+  {$endif}
   rc := c_fsync(pf^.h);
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3931 — SimulateIOError( rc=1 ) }
+  if SimulateIOError then rc := 1;
+  {$endif}
   if rc <> 0 then begin
     pf^.lastErrno := fpgeterrno;
     Result := SQLITE_IOERR_FSYNC;

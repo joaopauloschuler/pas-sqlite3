@@ -50,6 +50,7 @@ FPC_CMD=(fpc
   -MObjFPC -Scghi -O1
   -Cg
   -dSQLITE_MEMDEBUG
+  -dSQLITE_TEST
   "${PREUPDATE_FLAGS[@]}"
   "${UNLOCK_NOTIFY_FLAGS[@]}"
   -Fu"$TCL_DIR"

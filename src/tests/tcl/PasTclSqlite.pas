@@ -33,7 +33,7 @@ implementation
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
      TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
-     TestModuleMalloc, TestModuleEcho;
+     TestModuleMalloc, TestModuleEcho, TestModuleIoerr;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -3784,6 +3784,10 @@ begin
     (install_malloc_faultsim, sqlite3_memdebug_fail / _pending / _settitle,
     sqlite3_malloc / _realloc / _free, sqlite3_memory_used / _highwater). }
   Sqlitetest_malloc_Init(interp);
+  { 9.4.7.c — test2.c: Tcl_LinkVar the I/O-error injection counters
+    (sqlite_io_error_pending / _persist / _hit / _hardhit / _benign,
+    sqlite_diskfull_pending / sqlite_diskfull) driven by do_ioerr_test. }
+  Sqlitetest2_Init(interp);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;
