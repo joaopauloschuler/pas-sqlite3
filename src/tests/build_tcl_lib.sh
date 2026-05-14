@@ -20,6 +20,16 @@ TCL_DIR="$SCRIPT_DIR/tcl"
 
 mkdir -p "$BIN_DIR"
 
+# Opt-in pre-update hook support: `PREUPDATE=1 ./build_tcl_lib.sh` adds
+# -dSQLITE_ENABLE_PREUPDATE_HOOK so the engine pre-update API and the
+# `db preupdate` Tcl subcommand are compiled in.  Off by default
+# (matches build.sh and the upstream oracle build).
+PREUPDATE_FLAGS=()
+if [ "${PREUPDATE:-0}" = "1" ]; then
+  echo "PREUPDATE=1 — passing -dSQLITE_ENABLE_PREUPDATE_HOOK to fpc."
+  PREUPDATE_FLAGS=(-dSQLITE_ENABLE_PREUPDATE_HOOK)
+fi
+
 # -Fu paths:
 #   $TCL_DIR  : PasTclBridge.pas, PasTclSqlite.pas
 #   $SRC_DIR  : passqlite3types.pas (for SQLITE_VERSION constant)
@@ -29,6 +39,7 @@ mkdir -p "$BIN_DIR"
 FPC_CMD=(fpc
   -MObjFPC -Scghi -O1
   -Cg
+  "${PREUPDATE_FLAGS[@]}"
   -Fu"$TCL_DIR"
   -Fu"$SRC_DIR"
   -FU"$BIN_DIR"

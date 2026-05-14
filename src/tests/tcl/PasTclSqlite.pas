@@ -95,6 +95,9 @@ type
     pUpdateHook:   PTclObj; { tclsqlite.c:222 — `update_hook` script Tcl_Obj. }
     pRollbackHook: PTclObj; { tclsqlite.c:223 — `rollback_hook` script Tcl_Obj. }
     pWalHook:      PTclObj; { tclsqlite.c:224 — `wal_hook` script Tcl_Obj. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+    pPreUpdateHook: PTclObj; { tclsqlite.c:211 — `preupdate hook` script. }
+{$ENDIF}
     pCollate:      PSqlCollate; { tclsqlite.c:215 — head of TSqlCollate chain,
                              populated by the `collate` subcmd.  Freed in
                              DbDeleteCmd. }
@@ -520,6 +523,14 @@ begin
     Tcl_DecrRefCount(pDb^.pWalHook);
     pDb^.pWalHook := nil;
   end;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  { Free the pre-update hook script — tclsqlite.c:652..654. }
+  if pDb^.pPreUpdateHook <> nil then
+  begin
+    Tcl_DecrRefCount(pDb^.pPreUpdateHook);
+    pDb^.pPreUpdateHook := nil;
+  end;
+{$ENDIF}
   { Free Tcl-callback collations — tclsqlite.c:622..627.  Walk the
     pCollate chain, freeing each zScript buffer and the node itself. }
   while pDb^.pCollate <> nil do
@@ -2022,6 +2033,34 @@ begin
   Tcl_DecrRefCount(pCmd);
 end;
 
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+{ DbPreUpdateHandler — sqlite3_preupdate_hook trampoline.  tclsqlite.c:910..944.
+  Appends (op-as-string, zDb, zTbl, iKey1, iKey2) to a duplicate of
+  pDb^.pPreUpdateHook and evals it.
+  Signature: void (*)(void*, sqlite3*, int, const char*, const char*,
+                      sqlite3_int64, sqlite3_int64). }
+procedure DbPreUpdateHandler(p: Pointer; db: PTsqlite3; op: cint;
+  zDb, zTbl: PAnsiChar; iKey1, iKey2: Int64); cdecl;
+const
+  azStr: array[0..2] of PAnsiChar = ('DELETE', 'INSERT', 'UPDATE');
+var
+  pDb:  PSqliteDb;
+  pCmd: PTclObj;
+begin
+  pDb  := PSqliteDb(p);
+  pCmd := Tcl_DuplicateObj(pDb^.pPreUpdateHook);
+  Tcl_IncrRefCount(pCmd);
+  Tcl_ListObjAppendElement(nil, pCmd,
+    Tcl_NewStringObj(azStr[(op - 1) div 9], -1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewStringObj(zDb, -1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewStringObj(zTbl, -1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewWideIntObj(iKey1));
+  Tcl_ListObjAppendElement(nil, pCmd, Tcl_NewWideIntObj(iKey2));
+  Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+  Tcl_DecrRefCount(pCmd);
+end;
+{$ENDIF}
+
 { DbCommitHookArm — `db commit_hook ?CALLBACK?`  tclsqlite.c:2807..2839. }
 function DbCommitHookArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
@@ -2092,6 +2131,12 @@ begin
     end;
   end;
 
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  if pDb^.pPreUpdateHook <> nil then
+    sqlite3_preupdate_hook(db, @DbPreUpdateHandler, pDb)
+  else
+    sqlite3_preupdate_hook(db, nil, nil);
+{$ENDIF}
   if pDb^.pUpdateHook <> nil then
     sqlite3_update_hook(db, @DbUpdateHandler, pDb)
   else
@@ -2133,6 +2178,122 @@ begin
     DbHookCmd(interp, pDb, nil, ppHook);
   Result := TCL_OK;
 end;
+
+{ DbPreUpdateArm — `db preupdate SUB-COMMAND ?ARGS?`  tclsqlite.c:4054..4131.
+  Forms: `db preupdate count`, `db preupdate depth`,
+         `db preupdate hook ?SCRIPT?`, `db preupdate new INDEX`,
+         `db preupdate old INDEX`.
+  When SQLITE_ENABLE_PREUPDATE_HOOK is not defined the whole subcommand
+  reports the compile-time-omitted error, matching tclsqlite.c:4055..4058. }
+function DbPreUpdateArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+const
+  azSub: array[0..5] of PAnsiChar =
+    ('count', 'depth', 'hook', 'new', 'old', nil);
+  PRE_COUNT = 0; PRE_DEPTH = 1; PRE_HOOK = 2; PRE_NEW = 3; PRE_OLD = 4;
+var
+  pDb:    PSqliteDb;
+  iSub:   cint;
+  nCol:   cint;
+  iIdx:   cint;
+  rc:     cint;
+  pValue: Psqlite3_value;
+  pObj:   PTclObj;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc < 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('SUB-COMMAND ?ARGS?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetIndexFromObj(interp, ObjvAt(objv, 2), @azSub[0],
+       PChar('sub-command'), 0, @iSub) <> TCL_OK then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  case iSub of
+    PRE_COUNT:
+      begin
+        nCol := sqlite3_preupdate_count(pDb^.db);
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(nCol));
+        Result := TCL_OK;
+      end;
+
+    PRE_HOOK:
+      begin
+        if objc > 4 then
+        begin
+          Tcl_WrongNumArgs(interp, 2, objv, PChar('hook ?SCRIPT?'));
+          Result := TCL_ERROR;
+          Exit;
+        end;
+        pDb^.interp := interp;
+        if objc = 4 then
+          DbHookCmd(interp, pDb, ObjvAt(objv, 3), @pDb^.pPreUpdateHook)
+        else
+          DbHookCmd(interp, pDb, nil, @pDb^.pPreUpdateHook);
+        Result := TCL_OK;
+      end;
+
+    PRE_DEPTH:
+      begin
+        if objc <> 3 then
+        begin
+          Tcl_WrongNumArgs(interp, 3, objv, PChar(''));
+          Result := TCL_ERROR;
+          Exit;
+        end;
+        Tcl_SetObjResult(interp,
+          Tcl_NewIntObj(sqlite3_preupdate_depth(pDb^.db)));
+        Result := TCL_OK;
+      end;
+
+    PRE_NEW, PRE_OLD:
+      begin
+        if objc <> 4 then
+        begin
+          Tcl_WrongNumArgs(interp, 3, objv, PChar('INDEX'));
+          Result := TCL_ERROR;
+          Exit;
+        end;
+        if Tcl_GetIntFromObj(interp, ObjvAt(objv, 3), @iIdx) <> TCL_OK then
+        begin
+          Result := TCL_ERROR;
+          Exit;
+        end;
+        pValue := nil;
+        if iSub = PRE_OLD then
+          rc := sqlite3_preupdate_old(pDb^.db, iIdx, @pValue)
+        else
+          rc := sqlite3_preupdate_new(pDb^.db, iIdx, @pValue);
+        if rc = SQLITE_OK then
+        begin
+          pObj := Tcl_NewStringObj(PAnsiChar(sqlite3_value_text(pValue)), -1);
+          Tcl_SetObjResult(interp, pObj);
+          Result := TCL_OK;
+        end
+        else
+        begin
+          Tcl_AppendResult(interp, PAnsiChar(sqlite3_errmsg(pDb^.db)),
+            Pointer(nil));
+          Result := TCL_ERROR;
+        end;
+      end;
+  else
+    Result := TCL_OK;
+  end;
+end;
+{$ELSE}
+begin
+  Tcl_AppendResult(interp,
+    PChar('preupdate_hook was omitted at compile-time'), Pointer(nil));
+  Result := TCL_ERROR;
+end;
+{$ENDIF}
 
 { DbTransPostCmd — port of tclsqlite.c:1308..1349.  Invoked after the
   [transaction] script body has been evaluated; commits/releases on
@@ -3164,6 +3325,14 @@ begin
     Exit;
   end;
 
+  { preupdate — tclsqlite.c:4054 (DB_PREUPDATE).  sqlite3_preupdate_*
+    shim; gated on SQLITE_ENABLE_PREUPDATE_HOOK (9.4.2.u). }
+  if (zSub <> nil) and (StrComp(zSub, 'preupdate') = 0) then
+  begin
+    Result := DbPreUpdateArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
   { collate — tclsqlite.c:2754 (DB_COLLATE).  Tcl-callback collation
     registration via sqlite3_create_collation. }
   if (zSub <> nil) and (StrComp(zSub, 'collate') = 0) then
@@ -3414,6 +3583,9 @@ begin
   pDb^.pUpdateHook  := nil;
   pDb^.pRollbackHook := nil;
   pDb^.pWalHook     := nil;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+  pDb^.pPreUpdateHook := nil;
+{$ENDIF}
   pDb^.pCollate       := nil;
   pDb^.pCollateNeeded := nil;
   pDb^.nTransaction   := 0;
