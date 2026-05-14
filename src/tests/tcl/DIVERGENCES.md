@@ -465,6 +465,47 @@ aggregate's args / aliased aggregate in HAVING, no subquery); the
 build already raises an error there, only the message spelling
 diverges (tracked under divbug.14 residual).
 
+## 9.4.divbug.18 — WITHOUT ROWID virtual-table xUpdate codegen mis-handles DELETE (no-op) and UPDATE (segfault) — FIXED
+
+Surfaced porting `register_tcl_module` / `register_tclvar_module`
+(`test_tclvar.c` → `testmodules/TestModuleTclvar.pas`).  The tclvar
+vtab is `WITHOUT ROWID` with a single-column TEXT primary key
+(`fullname`).  `DELETE FROM vars WHERE …` silently removed no Tcl
+variables, and `UPDATE vars SET value=… WHERE …` SIGSEGV'd.
+
+Two distinct codegen bugs, both in `passqlite3codegen.pas`:
+
+1. **DELETE no-op** — the two-pass DELETE arm (`DeleteFrom`,
+   `pPk <> nil` branch) emitted `OP_RowData iEphCur, iKey`
+   unconditionally.  For a virtual table, `delete.c:618..622`
+   instead emits `OP_Column iEphCur, 0, iKey`: xUpdate's `argv[0]`
+   must be the *bare PK column value*, not the serialised
+   composite-key record blob.  The vtab therefore got a garbage
+   `argv[0]` and `tclvarUpdate` unset nothing.  Fixed by adding the
+   `IsVirtual` branch (`eTabType = TABTYP_VTAB` → `OP_Column`).
+
+2. **UPDATE segfault** — `updateVirtualTable` hand-rolled a
+   `OP_VOpen` / `OP_Integer` / `OP_VFilter` full scan instead of
+   driving the scan through `sqlite3WhereBegin` as
+   `update.c:1271..1352` does.  That bypassed `xBestIndex`
+   entirely, so the vtab's `xFilter` was invoked with `idxNum=0`,
+   `idxStr=NULL`, `argc=0`.  `test_tclvar.c`'s `tclvarFilter`
+   dereferences `idxStr` (`while( idxStr[i] )`) → nil-pointer
+   crash.  Fixed by porting the single-source arm faithfully:
+   `sqlite3WhereBegin` (runs `xBestIndex` and emits a populated
+   `OP_VFilter`), then `sqlite3WhereOkOnePass` selects between the
+   ephemeral-buffer two-pass arm and the single-`OP_VUpdate`
+   onepass arm — matching the C control flow exactly.  The stray
+   unconditional `OPFLAG_NOCHNG_MAGIC` p5 on the buffering
+   `OP_MakeRecord` (a `SQLITE_DEBUG`-only assert hint in C) was
+   also dropped.
+
+Verified: against the tclvar vtab, DELETE now actually unsets the
+Tcl variables, single-row / multi-row / value-expression UPDATEs
+apply correctly, and neither path crashes.  Full engine regression
+unchanged (99/1 — the 1 is the pre-existing `TestFuzzDiff` arg-less
+invocation); `TestExplainParity` stays 1026/1026.
+
 ## Run summary (9.4.4.b.2 sweep)
 
 First fixed a driver regression: the 9.4.7.f per-test tmpdir
