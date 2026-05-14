@@ -184,17 +184,38 @@ still fails, unrelated).
 Surfaced by: 9.4.4.b re-sweep (was masked by divbug.3 hard-stop in
 9.4.4.a).
 
-## 9.4.divbug.9 — `lastinsert.test` segfaults at `lastinsert-1.1w`
+## 9.4.divbug.9 — `lastinsert.test` segfaults at `lastinsert-1.1w` — FIXED
 
 Affects: 1 test (`../sqlite3/test/lastinsert.test`).
-Symptom: `lastinsert-1.1` (32-bit rowid) PASSes, then `lastinsert-1.1w`
-(the "wide" 64-bit rowid variant) crashes.  No diff is printed —
-the SIGSEGV happens inside `db last_insert_rowid` evaluation or the
-preceding INSERT.
-Likely cause: 64-bit rowid path overflows in
-`sqlite3_last_insert_rowid` wiring; or the `db last_insert_rowid`
-sub-command shim in PasTclSqlite.pas mis-marshals an `Int64` as
-`Integer`.
+Symptom (was): `lastinsert-1.1` (32-bit rowid) PASSes, then
+`lastinsert-1.1w` crashes.  No diff is printed — SIGSEGV.
+Actual root cause: nothing to do with `Int64` marshalling or rowid
+overflow — `db last_insert_rowid` already routes through
+`Tcl_NewWideIntObj`.  The crash was in the *preceding INSERT*.
+`lastinsert-1.1w` runs `CREATE TABLE t1w(k INTEGER PRIMARY KEY)
+WITHOUT ROWID`.  Our `sqlite3EndTable` had only a partial WITHOUT
+ROWID arm: it folded `TF_WithoutRowid` into `tabFlags` and assumed
+`sqlite3PrimaryKeyIndex(pTab)` already returned a real Index object.
+That holds for a *non-IPK* PK (the implicit UNIQUE index exists), but
+for `k INTEGER PRIMARY KEY` the table is an IPK table — `iPKey >= 0`
+and there is **no** index object.  `sqlite3GenerateConstraintChecks`
+then hit the WITHOUT-ROWID else-branch and dereferenced the nil
+`pPk` at `pPk^.nKeyCol` (codegen.pas:36940).
+Fix (9.4.divbug.9): finish the port of `convertToWithoutRowidTable`
+(build.c:2354..2507) inside `sqlite3EndTable`:
+  * Port the AUTOINCREMENT / `TF_HasPrimaryKey`-missing precondition
+    errors (build.c:2722..2730).
+  * Step (1): mark every `COLFLAG_PRIMKEY` column NOT NULL, set
+    `TF_HasNotNull` (build.c:2363..2374).
+  * For `iPKey >= 0`, synthesise the PK index: `sqlite3TokenInit` the
+    IPK column name, `sqlite3ExprListAppend` a `TK_ID` expr, clear
+    `iPKey`, call `sqlite3CreateIndex(... SQLITE_IDXTYPE_PRIMARYKEY)`
+    (build.c:2388..2409).
+  * After folding all table columns into the PK index, rebuild
+    `colNotIdxed` via the newly-ported `recomputeColumnsNotIndexed`
+    (build.c:2295..2328, called at 2506).
+Result: lastinsert.test → 6/6 Ok; engine regression 99/100
+(only the pre-existing unrelated `TestFuzzDiff`).
 Surfaced by: 9.4.4.b re-sweep (was masked in 9.4.4.a by
 `catchsql` absence — the test couldn't reach this line).
 

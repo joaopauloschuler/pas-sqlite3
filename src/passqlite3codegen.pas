@@ -38102,6 +38102,27 @@ begin
   Result := nil;
 end;
 
+{ recomputeColumnsNotIndexed — port of build.c:2295..2328.  Rebuilds the
+  colNotIdxed bitmask: a 0 bit for each non-virtual indexed column within
+  the first BMS-1 columns, 1 everywhere else (TOPBIT always 1). }
+procedure recomputeColumnsNotIndexed(pIdx: PIndex2);
+var
+  m:    Bitmask;
+  j:    i32;
+  x:    i32;
+  pTab: PTable2;
+begin
+  m := 0;
+  pTab := pIdx^.pTable;
+  for j := i32(pIdx^.nColumn) - 1 downto 0 do begin
+    x := (pIdx^.aiColumn + j)^;
+    if (x >= 0) and ((pTab^.aCol[x].colFlags and COLFLAG_VIRTUAL) = 0) then
+      if x < BMS - 1 then
+        m := m or (Bitmask(1) shl x);
+  end;
+  pIdx^.colNotIdxed := not m;
+end;
+
 { sqlite3TableColumnToIndex — find iCol in index column list (build.c:1081) }
 function sqlite3TableColumnToIndex(pIdx: PIndex2; iCol: i16): i32;
 var
@@ -39909,6 +39930,8 @@ var
   nExtraPk: i32;
   jPk:     i32;
   zCollPk: PAnsiChar;
+  pListPk: PExprList;
+  ipkTokenPk: TToken;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -39999,18 +40022,33 @@ begin
     end;
   end;
 
-  { STRICT / CHECK loops omitted — see banner.
-
-    WITHOUT ROWID: in C this branch errors out when PRIMARY KEY is missing
-    or AUTOINCREMENT is set, then calls convertToWithoutRowidTable.  All
-    three depend on AddColumn / AddPrimaryKey, which are stubs today, so
-    none of the TF_* preconditions are ever set.  Calling sqlite3ErrorMsg
-    here would also short-circuit sqlite3FinishCoding's epilogue and
-    leave the Vdbe half-initialised — so we *defer the entire WITHOUT
-    ROWID arm* until those parser stubs land.  Just fold the flags into
-    tabFlags so layout snapshots are correct. }
+  { WITHOUT ROWID processing — port of build.c:2720..2733 +
+    convertToWithoutRowidTable (build.c:2354..2507). }
   if (tabOpts and TF_WithoutRowid) <> 0 then begin
+    { build.c:2722..2730 — AUTOINCREMENT / PRIMARY KEY preconditions. }
+    if (pTab^.tabFlags and TF_Autoincrement) <> 0 then begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('AUTOINCREMENT not allowed on WITHOUT ROWID tables'));
+      Exit;
+    end;
+    if (pTab^.tabFlags and TF_HasPrimaryKey) = 0 then begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'PRIMARY KEY missing on table %s', [pTab^.zName]));
+      Exit;
+    end;
     pTab^.tabFlags := pTab^.tabFlags or TF_WithoutRowid or TF_NoVisibleRowid;
+
+    { convertToWithoutRowidTable step (1): mark every PRIMARY KEY column
+      NOT NULL (build.c:2363..2374).  imposterTable bit lives in
+      Tsqlite3InitInfo.flags bit 1. }
+    if (db^.init.flags and $02) = 0 then begin
+      for ii := 0 to pTab^.nCol - 1 do
+        if ((pTab^.aCol[ii].colFlags and COLFLAG_PRIMKEY) <> 0)
+           and ((pTab^.aCol[ii].typeFlags and $0F) = OE_None) then
+          pTab^.aCol[ii].typeFlags :=
+            (pTab^.aCol[ii].typeFlags and $F0) or u8(OE_Abort and $0F);
+      pTab^.tabFlags := pTab^.tabFlags or TF_HasNotNull;
+    end;
     { Back-patch the placeholder OP_CreateBtree from BTREE_INTKEY (1) to
       BTREE_BLOBKEY (2) — port of build.c:2376..2383. }
     if pParse^.u1.cr.addrCrTab <> 0 then
@@ -40023,6 +40061,30 @@ begin
       schema-row INSERT sequence; converting that Noop to OP_Goto jumps
       over the whole sub-sequence so the WITHOUT-ROWID PK shares the
       table's root page (set just below: pPk^.tnum := pTab^.tnum). }
+    { build.c:2385..2433 — locate the PK index, or synthesise one when
+      the table was declared INTEGER PRIMARY KEY (iPKey >= 0): there is
+      no index object yet, so build one via sqlite3CreateIndex.  The
+      non-IPK redundant-column dedup loop (build.c:2417..2432) is a
+      no-op for the single-column keys our parser produces and is
+      skipped. }
+    if pTab^.iPKey >= 0 then begin
+      sqlite3TokenInit(@ipkTokenPk, pTab^.aCol[pTab^.iPKey].zCnName);
+      pListPk := sqlite3ExprListAppend(pParse, nil,
+                   sqlite3ExprAlloc(db, TK_ID, @ipkTokenPk, 0));
+      if pListPk = nil then begin
+        pTab^.tabFlags := pTab^.tabFlags and not TF_WithoutRowid;
+        Exit;
+      end;
+      ExprListItems(pListPk)[0].fg.sortFlags := pParse^.iPkSortOrder;
+      pTab^.iPKey := -1;
+      sqlite3CreateIndex(pParse, nil, nil, nil, pListPk,
+                         i32(pTab^.keyConf), nil, nil, 0, 0,
+                         SQLITE_IDXTYPE_PRIMARYKEY);
+      if pParse^.nErr <> 0 then begin
+        pTab^.tabFlags := pTab^.tabFlags and not TF_WithoutRowid;
+        Exit;
+      end;
+    end;
     pPk2 := sqlite3PrimaryKeyIndex(pTab);
     if (db^.init.busy = 0) then begin
       v := sqlite3GetVdbe(pParse);
@@ -40066,6 +40128,11 @@ begin
         end;
       end;
     end;
+
+    { build.c:2506 — colNotIdxed must be rebuilt now that every table
+      column has been folded into the PK index. }
+    if pPk2 <> nil then
+      recomputeColumnsNotIndexed(pPk2);
   end;
 
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);

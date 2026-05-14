@@ -814,7 +814,7 @@ acceptance gate for this section.
   CURSOR_REQUIRESEEK), leaving the schema-table cursor on a
   balanced-away page → OP_Column fetched a NULL payload → SIGSEGV.
   Fixed by coercing bPreserve to a 0/1 boolean.  See DIVERGENCES.md.
-- [ ] **9.4.divbug.9** `lastinsert.test` segfaults right after
+- [X] **9.4.divbug.9** `lastinsert.test` segfaults right after
   `lastinsert-1.1` (the `1.1w` variant uses a 64-bit rowid).
   Likely overflow in `sqlite3_last_insert_rowid` path or a stale
   pointer in the `db last_insert_rowid` sub-command shim.
