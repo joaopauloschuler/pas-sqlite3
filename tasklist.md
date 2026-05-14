@@ -748,13 +748,14 @@ acceptance gate for this section.
 
 #### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
 
-- [ ] **9.4.divbug.1** `select1.test select1-4.4` (`ORDER BY min(f1)`)
-  triggers a Pascal-side AV/segfault.  C oracle returns
-  `misuse of aggregate function`.  Likely path: codegen for the
-  ORDER-BY-on-aggregate-misuse arm needs a guard before the
-  aggregate context is consumed by the sorter.  C ref:
-  `../sqlite3/src/select.c` (aggregate-misuse diagnostic arm) +
-  `resolve.c` (ResolveOuterRefs).
+- [X] **9.4.divbug.1** `select1.test select1-4.4` (`ORDER BY min(f1)`)
+  triggered a Pascal-side segfault.  Root cause: the pas resolver never
+  rewrote aggregate `TK_FUNCTION` calls in ORDER BY of a non-aggregate
+  query to `TK_AGG_FUNCTION` (resolve.c:1330), so codegen emitted a
+  scalar `OP_Function` and `minStep` crashed in `sqlite3_aggregate_context`.
+  Fixed by tagging those nodes in `sqlite3ResolveSelectNames` after
+  ORDER BY resolution; codegen's `TK_AGG_FUNCTION` misuse arm now raises
+  `misuse of aggregate: min()` matching the C oracle.
 - [X] **9.4.divbug.2** SQL error messages drop their format-arg
   tails: `misuse of aggregate function` should read
   `misuse of aggregate function min()`; `table has wrong number

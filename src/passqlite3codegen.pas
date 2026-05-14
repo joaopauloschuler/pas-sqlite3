@@ -9906,6 +9906,90 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { SelectIsAggregate — true if the SELECT is an aggregate query: it has
+    a GROUP BY clause, or its result-set / HAVING expressions contain an
+    aggregate function call.  Mirrors the SF_Aggregate decision made by
+    resolve.c:1956..1967 (pGroupBy || NC_HasAgg); the pas resolver does
+    not track NC_HasAgg so it is re-derived here from the expression
+    tree, the same way selectMarkAggregate does later. }
+  function SelectIsAggregate(pSel: PSelect): Boolean;
+  var
+    items: PExprListItem;
+    i:     i32;
+  begin
+    Result := True;
+    if pSel^.pGroupBy <> nil then Exit;
+    if (pSel^.pHaving <> nil)
+       and (ExprIsOrContainsAggregate(pSel^.pHaving) = 1) then Exit;
+    if pSel^.pEList <> nil then
+    begin
+      items := ExprListItems(pSel^.pEList);
+      for i := 0 to pSel^.pEList^.nExpr - 1 do
+        if ExprIsOrContainsAggregate(items[i].pExpr) = 1 then Exit;
+    end;
+    Result := False;
+  end;
+
+  { RewriteOrderByAggToAggFunc — for a non-aggregate query, mirror
+    resolve.c:1330 (pExpr->op = TK_AGG_FUNCTION) on aggregate-function
+    TK_FUNCTION nodes that appear in ORDER BY.  In C, ORDER BY is
+    resolved with NC_AllowAgg set, so `ORDER BY min(f1)` becomes a
+    TK_AGG_FUNCTION node whose pAggInfo is left NULL (the query is not
+    aggregate, so sqlite3ExprAnalyzeAggregates never wires it).  Codegen
+    then hits the TK_AGG_FUNCTION misuse arm (expr.c:5320) and raises
+    "misuse of aggregate: min()".  Without this rewrite the pas codegen
+    would code `min` as a scalar OP_Function and crash at run time when
+    minStep calls sqlite3_aggregate_context (9.4.divbug.1). }
+  procedure RewriteAggToAggFunc(pX: PExpr); forward;
+
+  procedure RewriteAggToAggFuncList(pList: PExprList);
+  var
+    items: PExprListItem;
+    i:     i32;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      RewriteAggToAggFunc(items[i].pExpr);
+  end;
+
+  procedure RewriteAggToAggFunc(pX: PExpr);
+  var
+    pDef: PTFuncDef;
+    n:    i32;
+  begin
+    if pX = nil then Exit;
+    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil) then
+    begin
+      if ExprUseXList(pX) and (pX^.x.pList <> nil) then
+        n := pX^.x.pList^.nExpr
+      else
+        n := 0;
+      pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, n,
+                                  pParse^.db^.enc, 0);
+      if (pDef = nil) and (n <> 0) then
+        pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
+                                    pParse^.db^.enc, 0);
+      if (pDef <> nil) and Assigned(pDef^.xFinalize) then
+      begin
+        pX^.op  := TK_AGG_FUNCTION;
+        pX^.op2 := 0;
+      end;
+    end;
+    if not ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then
+    begin
+      RewriteAggToAggFunc(pX^.pLeft);
+      RewriteAggToAggFunc(pX^.pRight);
+      if not ExprHasProperty(pX, EP_xIsSelect) then
+        RewriteAggToAggFuncList(pX^.x.pList);
+    end;
+  end;
+
+  procedure RewriteOrderByAggToAggFunc(pList: PExprList);
+  begin
+    RewriteAggToAggFuncList(pList);
+  end;
+
 var
   pTopSel: PSelect;
 begin
@@ -9957,6 +10041,15 @@ begin
     ResolveAliasOrderByCol(p^.pOrderBy);
 
   ResolveExprList(p^.pOrderBy);
+
+  { 9.4.divbug.1 — for a non-aggregate query, tag aggregate-function
+    calls in ORDER BY as TK_AGG_FUNCTION (resolve.c:1330).  Their
+    pAggInfo stays NULL because no aggregate analysis runs for a
+    non-aggregate SELECT, so codegen's TK_AGG_FUNCTION misuse arm
+    (expr.c:5320) raises "misuse of aggregate: <name>()" instead of
+    coding a scalar OP_Function that crashes minStep at run time. }
+  if (p^.pOrderBy <> nil) and (not SelectIsAggregate(p)) then
+    RewriteOrderByAggToAggFunc(p^.pOrderBy);
 
   { Integer-arm tagging + structural-compare match + alias rewrite for
     ORDER BY / GROUP BY (resolve.c:1793..1834).  The structural-compare

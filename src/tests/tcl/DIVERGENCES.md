@@ -10,19 +10,30 @@ belongs to Phase 6 / 7 / 8 follow-ups.  Format:
     Symptom: ...
     Likely cause: ...
 
-## 9.4.divbug.1 — `select1.test` segfaults inside libpassqlite3tcl.so
+## 9.4.divbug.1 — `select1.test` segfaults inside libpassqlite3tcl.so — FIXED
 
 Affects: 1 test (`../sqlite3/test/select1.test`).
-Symptom: tclsh exits with SIGSEGV after running ~120 sub-tests.  Last
-asserted name before crash is `select1-4.4` which exercises
-`SELECT f1 FROM test1 ORDER BY min(f1)` (a use of an aggregate at a
-non-aggregate context, expected to raise "misuse of aggregate: min()").
-Run-time before segfault: ~1–8 s depending on warm-up.
-Likely cause: error-message construction path in aggregate-misuse
-diagnostic walks freed memory (or formats a NULL `Expr.u.zToken`).
-Note that **9.4.divbug.2** — truncated diagnostic text — also fires on
-the same code path (`select1-2.20`), suggesting both symptoms are two
-faces of the same bug.
+Symptom (was): tclsh exits with SIGSEGV at `select1-4.4`, which
+exercises `SELECT f1 FROM test1 ORDER BY min(f1)` (a use of an
+aggregate at a non-aggregate context, expected to raise
+"misuse of aggregate: min()").
+Actual root cause: not a freed-memory diagnostic walk — the crash was
+at *run time* inside `minStep` → `sqlite3_aggregate_context`.  In C,
+`resolveExprStep` resolves ORDER BY with `NC_AllowAgg` set and rewrites
+the aggregate `min` call to a `TK_AGG_FUNCTION` node (resolve.c:1330);
+because the query is non-aggregate, no aggregate analysis runs, so the
+node's `pAggInfo` stays NULL and codegen's `TK_AGG_FUNCTION` misuse arm
+(expr.c:5320) raises `misuse of aggregate: min()`.  The pas minimal
+resolver never performed the `TK_FUNCTION`→`TK_AGG_FUNCTION` rewrite
+for ORDER BY terms (it only happens for SF_Aggregate queries, gated in
+`markAggregateInExprList`), so `min` stayed a plain `TK_FUNCTION` and
+codegen emitted a scalar `OP_Function` — calling `minStep` with no
+aggregate context → SIGSEGV.
+Fix: in `sqlite3ResolveSelectNames`, after `ResolveExprList(pOrderBy)`,
+for a non-aggregate SELECT (no GROUP BY, no aggregate in pEList/pHaving)
+recurse `pOrderBy` and tag every aggregate-function `TK_FUNCTION` node
+as `TK_AGG_FUNCTION` (op2:=0), mirroring resolve.c:1330.  Codegen's
+existing misuse arm then fires with the correct message.
 
 ## 9.4.divbug.2 — Truncated SQL error messages drop the function name — FIXED
 
