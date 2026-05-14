@@ -48,6 +48,17 @@ type
     pNext:    PSqlFunc;    { tclsqlite.c:156 — next on the per-db chain }
   end;
 
+  PSqlCollate = ^TSqlCollate;
+  { Per-collation state.  Pas analogue of struct SqlCollate in
+    tclsqlite.c:163..168.  Only pointer fields, so New/Dispose is safe;
+    zScript is Tcl_Alloc'd separately (upstream tacks it onto the same
+    Tcl_Alloc block via `&pCollate[1]`). }
+  TSqlCollate = record
+    interp:   PTclInterp;  { tclsqlite.c:165 — the Tcl interp to eval into }
+    zScript:  PAnsiChar;   { tclsqlite.c:166 — the comparison Tcl script }
+    pNext:    PSqlCollate; { tclsqlite.c:167 — next on the per-db chain }
+  end;
+
   { Per-connection state.  Pas analogue of struct SqliteDb in
     tclsqlite.c:215..  Only the fields needed by 9.4.2.c..f are present;
     later sub-tasks will extend (stmt cache, hooks). }
@@ -77,6 +88,10 @@ type
     pUpdateHook:   PTclObj; { tclsqlite.c:222 — `update_hook` script Tcl_Obj. }
     pRollbackHook: PTclObj; { tclsqlite.c:223 — `rollback_hook` script Tcl_Obj. }
     pWalHook:      PTclObj; { tclsqlite.c:224 — `wal_hook` script Tcl_Obj. }
+    pCollate:      PSqlCollate; { tclsqlite.c:215 — head of TSqlCollate chain,
+                             populated by the `collate` subcmd.  Freed in
+                             DbDeleteCmd. }
+    pCollateNeeded: PTclObj; { tclsqlite.c:217 — `collation_needed` script. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -105,7 +120,8 @@ end;
   path, collapsed because we have no refcount or hook state yet. }
 procedure DbDeleteCmd(clientData: TClientData); cdecl;
 var
-  pDb: PSqliteDb;
+  pDb:   PSqliteDb;
+  pColl: PSqlCollate;
 begin
   pDb := PSqliteDb(clientData);
   if pDb = nil then Exit;
@@ -180,6 +196,22 @@ begin
   begin
     Tcl_DecrRefCount(pDb^.pWalHook);
     pDb^.pWalHook := nil;
+  end;
+  { Free Tcl-callback collations — tclsqlite.c:622..627.  Walk the
+    pCollate chain, freeing each zScript buffer and the node itself. }
+  while pDb^.pCollate <> nil do
+  begin
+    pColl := pDb^.pCollate;
+    pDb^.pCollate := pColl^.pNext;
+    if pColl^.zScript <> nil then
+      Tcl_Free(pColl^.zScript);
+    Dispose(pColl);
+  end;
+  { Free collation-needed script — tclsqlite.c:660..662. }
+  if pDb^.pCollateNeeded <> nil then
+  begin
+    Tcl_DecrRefCount(pDb^.pCollateNeeded);
+    pDb^.pCollateNeeded := nil;
   end;
   Dispose(pDb);
 end;
@@ -742,6 +774,115 @@ begin
     Result := TCL_ERROR;
     Exit;
   end;
+  Result := TCL_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  Tcl-callback collations — tclsqlite.c:163..168, 981..1008, 2749..2796.
+
+  `db collate NAME script` registers a TSqlCollate via
+  sqlite3_create_collation; the trampoline tclSqlCollate evals
+  `script $lhs $rhs` and returns atoi() of the Tcl result.
+
+  `db collation_needed script` registers tclCollateNeeded via
+  sqlite3_collation_needed; that callback evals `script $collName`. }
+
+{ DbSqlCollate — port of tclSqlCollate (tclsqlite.c:992..1008).  The
+  per-collation comparison trampoline. }
+function DbSqlCollate(pCtx: Pointer; nA: i32; zA: Pointer;
+  nB: i32; zB: Pointer): i32; cdecl;
+var
+  p:    PSqlCollate;
+  pCmd: PTclObj;
+begin
+  p := PSqlCollate(pCtx);
+  pCmd := Tcl_NewStringObj(p^.zScript, -1);
+  Tcl_IncrRefCount(pCmd);
+  Tcl_ListObjAppendElement(p^.interp, pCmd, Tcl_NewStringObj(PChar(zA), nA));
+  Tcl_ListObjAppendElement(p^.interp, pCmd, Tcl_NewStringObj(PChar(zB), nB));
+  Tcl_EvalObjEx(p^.interp, pCmd, TCL_EVAL_DIRECT);
+  Tcl_DecrRefCount(pCmd);
+  Result := StrToIntDef(string(Tcl_GetStringResult(p^.interp)), 0);
+end;
+
+{ DbCollateNeeded — port of tclCollateNeeded (tclsqlite.c:976..988).
+  The collation-needed factory callback. }
+procedure DbCollateNeeded(pCtx: Pointer; db: PTsqlite3; enc: i32;
+  zName: PAnsiChar); cdecl;
+var
+  pDb:     PSqliteDb;
+  pScript: PTclObj;
+begin
+  pDb := PSqliteDb(pCtx);
+  pScript := Tcl_DuplicateObj(pDb^.pCollateNeeded);
+  Tcl_IncrRefCount(pScript);
+  Tcl_ListObjAppendElement(nil, pScript, Tcl_NewStringObj(zName, -1));
+  Tcl_EvalObjEx(pDb^.interp, pScript, 0);
+  Tcl_DecrRefCount(pScript);
+end;
+
+{ DbCollateArm — port of the `collate` arm of DbObjCmd
+  (tclsqlite.c:2754..2776).  `db collate NAME SCRIPT`. }
+function DbCollateArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:      PSqliteDb;
+  pCollate: PSqlCollate;
+  zName:    PAnsiChar;
+  zScript:  PAnsiChar;
+  nScript:  cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('NAME SCRIPT'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zName   := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
+  zScript := Tcl_GetStringFromObj(ObjvAt(objv, 3), @nScript);
+
+  { Allocate fresh TSqlCollate + a separate Tcl_Alloc'd zScript copy.
+    Upstream tacks zScript onto the same block via `&pCollate[1]`; we
+    split it because TSqlCollate is New/Dispose-managed. }
+  New(pCollate);
+  pCollate^.interp  := interp;
+  pCollate^.pNext   := pDb^.pCollate;
+  pCollate^.zScript := Tcl_Alloc(nScript + 1);
+  Move(zScript^, pCollate^.zScript^, nScript + 1);
+  pDb^.pCollate := pCollate;
+
+  if sqlite3_create_collation(pDb^.db, zName, SQLITE_UTF8,
+       Pointer(pCollate), @DbSqlCollate) <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp,
+      PAnsiChar(sqlite3_errmsg(pDb^.db)), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ DbCollationNeededArm — port of the `collation_needed` arm of DbObjCmd
+  (tclsqlite.c:2786..2797).  `db collation_needed SCRIPT`. }
+function DbCollationNeededArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb: PSqliteDb;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('SCRIPT'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if pDb^.pCollateNeeded <> nil then
+    Tcl_DecrRefCount(pDb^.pCollateNeeded);
+  pDb^.pCollateNeeded := Tcl_DuplicateObj(ObjvAt(objv, 2));
+  Tcl_IncrRefCount(pDb^.pCollateNeeded);
+  pDb^.interp := interp;
+  sqlite3_collation_needed(pDb^.db, Pointer(pDb), @DbCollateNeeded);
   Result := TCL_OK;
 end;
 
@@ -1692,6 +1833,22 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'wal_hook') = 0) then
   begin
     Result := DbHookArm(clientData, interp, objc, objv, 0);
+    Exit;
+  end;
+
+  { collate — tclsqlite.c:2754 (DB_COLLATE).  Tcl-callback collation
+    registration via sqlite3_create_collation. }
+  if (zSub <> nil) and (StrComp(zSub, 'collate') = 0) then
+  begin
+    Result := DbCollateArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { collation_needed — tclsqlite.c:2786 (DB_COLLATION_NEEDED).
+    sqlite3_collation_needed factory-callback shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'collation_needed') = 0) then
+  begin
+    Result := DbCollationNeededArm(clientData, interp, objc, objv);
     Exit;
   end;
 

@@ -478,7 +478,7 @@ acceptance gate for this section.
     `db rollback_hook` / `db wal_hook` — change-notification
     callbacks.  C ref: `tclsqlite.c:834..980` (4 handlers) +
     `2980..3070` (dispatch).
-  - [ ] **9.4.2.m** `db collate` + `db collation_needed` — Tcl
+  - [X] **9.4.2.m** `db collate` + `db collation_needed` — Tcl
     callback registered via sqlite3_create_collation_v2.  Engine
     port already exists (8.x.colneed in tasklist); Tcl shim needs
     DbCollateNeeded + per-collation trampoline.  C ref:
