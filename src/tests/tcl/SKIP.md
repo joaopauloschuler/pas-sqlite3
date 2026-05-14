@@ -83,5 +83,6 @@ unblocks the most tests:
    **Landed 9.4.2.g.5** (also `presql`, `omit_test`).
 8. `do_eqp_test NAME SQL EXP` — `EXPLAIN QUERY PLAN` parity helper
    (upstream tester.tcl:1018..1032).
-9. `do_realnum_test NAME SQL EXP` — match with `[regexp]` tolerance
-   (upstream tester.tcl:983..991).
+9. ~~`do_realnum_test NAME SQL EXP` — match with `[regexp]` tolerance
+   (upstream tester.tcl:892..896).~~  **Landed 9.4.2.g.7** alongside
+   the prefix-driven match-mode dispatch in do_test.

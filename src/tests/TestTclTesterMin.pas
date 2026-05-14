@@ -210,6 +210,55 @@ begin
     Die('omit_list got=[' + sRes + '] want [{myskip {reason text}}]');
   Writeln('PASS: omit_test myskip recorded -> [', sRes, ']');
 
+  { Step 9d — do_test match modes (9.4.2.g.7).  Exercises each of the
+    five prefix-driven arms in the ported dispatch; nErr must stay at 1
+    throughout (every assertion below is expected to PASS). }
+
+  { (i) glob via outer `*GLOB*` form — expected `*world*` matches result
+    "hello world". }
+  sRes := EvalGet('do_test glob-1 { set _ {hello world} } *world*', rc);
+  if rc <> TCL_OK then Die('do_test glob-1 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after glob-1 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  Writeln('PASS: do_test glob-1 (*world* matches "hello world")');
+
+  { (ii) regexp via `/RE/` form — expected `/^foo.*$/` matches "foobar". }
+  sRes := EvalGet('do_test re-1 { set _ foobar } {/^foo.*$/}', rc);
+  if rc <> TCL_OK then Die('do_test re-1 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after re-1 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  Writeln('PASS: do_test re-1 (/^foo.*$/ matches "foobar")');
+
+  { (iii) negated regexp via `~/RE/` form — expected `~/baz/` on "foobar"
+    must report ok (no match -> negated true). }
+  sRes := EvalGet('do_test re-2 { set _ foobar } {~/baz/}', rc);
+  if rc <> TCL_OK then Die('do_test re-2 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after re-2 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  Writeln('PASS: do_test re-2 (~/baz/ rejects "foobar")');
+
+  { (iv) numeric-range via `#/A..B/` form — expected `#/0..9/` on "5"
+    must pass (5 is in [0,9]).  Upstream wraps the `#` numeric prefix
+    inside the outer `/.../` regex gate (tester.tcl:739, 753..767).
+    NB: upstream's `A..B` parser regex requires single-digit `B`
+    (`^(-?\d+)\.\.(-?\d)$` — tester.tcl:760), so we keep B <= 9 to
+    match upstream byte-for-byte. }
+  sRes := EvalGet('do_test num-1 { set _ 5 } {#/0..9/}', rc);
+  if rc <> TCL_OK then Die('do_test num-1 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after num-1 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  Writeln('PASS: do_test num-1 (#/0..9/ accepts 5)');
+
+  { (v) exact-compare arm still works for plain strings. }
+  sRes := EvalGet('do_test exact-1 { set _ {hi there} } {hi there}', rc);
+  if rc <> TCL_OK then Die('do_test exact-1 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after exact-1 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  Writeln('PASS: do_test exact-1 (plain string compare unchanged)');
+
+  { Step 9e — do_realnum_test (9.4.2.g.7).  realnum_normalize strips
+    e+00 → e and 1.#INF → inf.  Verify that expected "1.0e+05" matches
+    a result of "1.0e+5" after normalisation. }
+  sRes := EvalGet('do_realnum_test rn-1 { set _ 1.0e+5 } 1.0e+05', rc);
+  if rc <> TCL_OK then Die('do_realnum_test rn-1 rc=' + IntToStr(rc) + ' err=' + sRes);
+  if CounterNErr <> 1 then Die('after rn-1 nErr=' + IntToStr(CounterNErr) + ' want 1');
+  Writeln('PASS: do_realnum_test rn-1 (1.0e+5 vs 1.0e+05 normalised)');
+
   sRes := EvalGet('db close', rc);
   if rc <> TCL_OK then Die('db close rc=' + IntToStr(rc) + ' err=' + sRes);
   Writeln('PASS: db close OK');

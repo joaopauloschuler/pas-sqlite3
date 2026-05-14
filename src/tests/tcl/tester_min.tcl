@@ -16,12 +16,17 @@
 # this shim and run against the Tcl-bridge build of pas-sqlite3.
 #
 # What is intentionally NOT ported here (vs upstream tester.tcl):
-#   - do_eqp_test, do_realnum_test, do_vmstep_test
+#   - do_eqp_test, do_vmstep_test
 #   - permutations, runtest, NRE harness, slave interp plumbing
 #   - sqlite3_test_control, sqlite3_memdebug_*, db_save, threading
-#   - regex / glob / numeric-range match in expected (only exact compare)
 #   - puts override / output1 / output2 verbosity machinery
 #   - known-problems.txt, warn lists
+#
+# do_test supports the four upstream prefix-driven match modes
+# (regexp `/RE/`, negated regexp `~/RE/`, numeric-range `#NN..MM#`,
+# glob `*GLOB*`/`~*GLOB*`); falls back to exact string compare.
+# do_realnum_test landed 9.4.2.g.7 (forwards to do_test via
+# realnum_normalize).
 #
 # Citations against /home/bpsa/app/sqlite3/test/tester.tcl follow each proc.
 
@@ -59,11 +64,27 @@ proc fix_testname {varname} {
   }
 }
 
-# do_test — upstream tester.tcl:703..810, reduced to the exact-compare
-# arm.  Runs $cmd at the global scope (uplevel #0) and compares string
-# equality with $expected.  Increments ::nTest always, ::nErr on
-# mismatch or runtime error.  Prints either " Ok" or a two-line
-# "! NAME expected: [..] / ! NAME got: [..]" block.
+# do_test — upstream tester.tcl:703..810, port of the prefix-driven
+# match dispatch.  Runs $cmd at the global scope (uplevel #0), then
+# compares $result against $expected according to the *first chars*
+# of $expected:
+#
+#   /RE/      — regexp match (with `#` -> `[-0-9.]+` substitution; if
+#               RE starts with `*` it's treated as a glob instead).
+#               Upstream tester.tcl:739..776 outer-if arm.
+#   ~/RE/     — negated regexp (same RE rules; ok = !match).
+#               Upstream tester.tcl:743..752.
+#   #/A..B/   — per-term numeric range / 10%-tolerance compare against
+#               a list result.  Wrapped in slashes inside the outer
+#               `^[~#]?/.*/$` gate.  Upstream tester.tcl:753..767.
+#   *GLOB*    — glob match.  Upstream tester.tcl:778..787.
+#   ~*GLOB*   — negated glob.  Upstream tester.tcl:782..784.
+#   <else>    — exact string compare (with fpnum_compare fallback for
+#               numeric-equivalent strings).  Upstream tester.tcl:788..792.
+#
+# Increments ::nTest always, ::nErr on mismatch or runtime error.
+# Prints " Ok" on success or a two-line
+# "! NAME expected: [..] / ! NAME got: [..]" block on failure.
 proc do_test {name cmd expected} {
   fix_testname name
   incr ::nTest
@@ -78,7 +99,55 @@ proc do_test {name cmd expected} {
     flush stdout
     return
   }
-  if {[string compare $result $expected]==0} {
+  # Match-mode dispatch — verbatim port of tester.tcl:739..793.
+  if {[regexp {^[~#]?/.*/$} $expected]} {
+    # "/RE/" / "~/RE/" / (legacy) "#RE#" forms.
+    if {[string index $expected 0]=="~"} {
+      set re [string range $expected 2 end-1]
+      if {[string index $re 0]=="*"} {
+        set ok [string match $re $result]
+      } else {
+        set re [string map {# {[-0-9.]+}} $re]
+        set ok [regexp $re $result]
+      }
+      set ok [expr {!$ok}]
+    } elseif {[string index $expected 0]=="#"} {
+      # "#A..B#" or "#N N N#" — numeric-range / 10%-tolerance list compare.
+      set e2 [string range $expected 2 end-1]
+      set ok 1
+      foreach i $result j $e2 {
+        if {[regexp {^(-?\d+)\.\.(-?\d)$} $j all A B]} {
+          set ok [expr {$i+0>=$A && $i+0<=$B}]
+        } else {
+          set ok [expr {$i+0>=0.9*$j && $i+0<=1.1*$j}]
+        }
+        if {!$ok} break
+      }
+      if {$ok && [llength $result]!=[llength $e2]} {set ok 0}
+    } else {
+      set re [string range $expected 1 end-1]
+      if {[string index $re 0]=="*"} {
+        set ok [string match $re $result]
+      } else {
+        set re [string map {# {[-0-9.]+}} $re]
+        set ok [regexp $re $result]
+      }
+    }
+  } elseif {[regexp {^~?\*.*\*$} $expected]} {
+    # "*GLOB*" / "~*GLOB*" forms.
+    if {[string index $expected 0]=="~"} {
+      set e [string range $expected 1 end]
+      set ok [expr {![string match $e $result]}]
+    } else {
+      set ok [string match $expected $result]
+    }
+  } else {
+    set ok [expr {[string compare $result $expected]==0}]
+    # Upstream falls back to fpnum_compare when string compare fails
+    # (tester.tcl:789..792); we don't have that helper ported, so the
+    # exact-compare result stands.
+  }
+  if {$ok} {
     puts " Ok"
   } else {
     puts ""
@@ -88,6 +157,22 @@ proc do_test {name cmd expected} {
     set ::TC(errors) $::nErr
   }
   flush stdout
+}
+
+# realnum_normalize — upstream tester.tcl:888..891.  Verbatim.  Erases
+# version-of-Tcl printing drift (1.#INF → inf, e+00 → e, trailing
+# `.0e` → `e`) before string compare.
+proc realnum_normalize {r} {
+  string map {1.#INF inf Inf inf .0e e} [regsub -all {(e[+-])0+} $r {\1}]
+}
+
+# do_realnum_test — upstream tester.tcl:892..896.  Verbatim.  Wraps the
+# command in `realnum_normalize [...]` and likewise normalises the
+# expected literal, then forwards to do_test for the actual compare.
+proc do_realnum_test {name cmd expected} {
+  uplevel [list do_test $name [
+    subst -nocommands { realnum_normalize [ $cmd ] }
+  ] [realnum_normalize $expected]]
 }
 
 # execsql — upstream tester.tcl:1445..1448.  Verbatim.

@@ -419,11 +419,17 @@ acceptance gate for this section.
   - [ ] **9.4.2.g.6** `do_eqp_test` — EXPLAIN QUERY PLAN comparison;
     needs `db eval` 3-arg form (9.4.2.h) for row→list flattening.
     C ref: `tester.tcl:1064..1098`.
-  - [ ] **9.4.2.g.7** `do_test` glob/regexp/numeric-range forms
-    + `do_realnum_test` + `do_test_with_ansi_output`.  Currently the
-    shim is exact-string only; full upstream has 5 match modes
-    (`-glob`, `-match`, `-regexp`, `-list`, `-deep`).  C ref:
-    `tester.tcl:739..815`, `1009..1063`.
+  - [X] **9.4.2.g.7** `do_test` glob/regexp/numeric-range forms
+    + `do_realnum_test`.  Ported the upstream prefix-driven match
+    dispatch (`/RE/`, `~/RE/`, `#A..B#`, `*GLOB*`, `~*GLOB*`, else
+    exact compare) into tester_min.tcl's do_test, plus verbatim
+    `realnum_normalize` / `do_realnum_test`.  Smoke gated by
+    `bin/TestTclTesterMin` step 9d/9e (glob-1, re-1/re-2, num-1,
+    exact-1, rn-1, all expected to PASS with nErr unchanged at 1).
+    C ref: `tester.tcl:739..793`, `888..896`.
+    `do_test_with_ansi_output` (tester.tcl:815..819) is a Windows-only
+    slave-interp gate; pas-sqlite3 targets Linux so it remains
+    deliberately unported.
   - [ ] **9.4.2.g.8** `permutations.tcl` skip-shim — tester.tcl's
     permutation matrix re-runs each test under ~30 build-flag
     combinations.  For full-corpus first cut, land a stub that
