@@ -30,7 +30,8 @@ function Sqlite3_SafeInit(interp: PTclInterp): cint; cdecl;
 
 implementation
 
-uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe;
+uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
+     passqlite3codegen;
 
 type
   PSqlFunc = ^TSqlFunc;
@@ -65,6 +66,8 @@ type
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
     zTraceV2: PAnsiChar;   { tclsqlite.c:202 — `trace_v2` callback script. }
     zProfile: PAnsiChar;   { tclsqlite.c:203 — `profile` callback script. }
+    zAuth:    PAnsiChar;   { tclsqlite.c:206 — `authorizer` callback script,
+                             Tcl_Alloc'd; freed in DbDeleteCmd. }
   end;
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
@@ -129,6 +132,12 @@ begin
   begin
     Tcl_Free(pDb^.zProfile);
     pDb^.zProfile := nil;
+  end;
+  { Free authorizer callback script — tclsqlite.c:643..645. }
+  if pDb^.zAuth <> nil then
+  begin
+    Tcl_Free(pDb^.zAuth);
+    pDb^.zAuth := nil;
   end;
   Dispose(pDb);
 end;
@@ -981,6 +990,141 @@ begin
   Result := TCL_OK;
 end;
 
+{ DbAuthHandler — the sqlite3_set_authorizer callback trampoline.
+  Port of auth_callback (tclsqlite.c:1170..1248).  Maps the integer
+  action code to its symbolic string, appends the symbolic code plus
+  the four string args as Tcl list elements to the stored callback
+  script, GlobalEval's it, then maps the result string back to an
+  integer rc.  Signature:
+    int (*)(void*, int, const char*, const char*,
+            const char*, const char*). }
+function DbAuthHandler(pArg: Pointer; code: cint;
+  zArg1, zArg2, zArg3, zArg4: PAnsiChar): cint; cdecl;
+var
+  pDb:    PSqliteDb;
+  zCode:  PAnsiChar;
+  str:    TTclDString;
+  rc:     cint;
+  zReply: PAnsiChar;
+begin
+  pDb := PSqliteDb(pArg);
+
+  { EVIDENCE-OF: R-56518-44310 — the second parameter to the callback
+    is an integer action code that specifies the action to authorize. }
+  case code of
+    0                          : zCode := 'SQLITE_COPY';
+    SQLITE_CREATE_INDEX        : zCode := 'SQLITE_CREATE_INDEX';
+    SQLITE_CREATE_TABLE        : zCode := 'SQLITE_CREATE_TABLE';
+    SQLITE_CREATE_TEMP_INDEX   : zCode := 'SQLITE_CREATE_TEMP_INDEX';
+    SQLITE_CREATE_TEMP_TABLE   : zCode := 'SQLITE_CREATE_TEMP_TABLE';
+    SQLITE_CREATE_TEMP_TRIGGER : zCode := 'SQLITE_CREATE_TEMP_TRIGGER';
+    SQLITE_CREATE_TEMP_VIEW    : zCode := 'SQLITE_CREATE_TEMP_VIEW';
+    SQLITE_CREATE_TRIGGER      : zCode := 'SQLITE_CREATE_TRIGGER';
+    SQLITE_CREATE_VIEW         : zCode := 'SQLITE_CREATE_VIEW';
+    SQLITE_DELETE_AUTH         : zCode := 'SQLITE_DELETE';
+    SQLITE_DROP_INDEX          : zCode := 'SQLITE_DROP_INDEX';
+    SQLITE_DROP_TABLE          : zCode := 'SQLITE_DROP_TABLE';
+    SQLITE_DROP_TEMP_INDEX     : zCode := 'SQLITE_DROP_TEMP_INDEX';
+    SQLITE_DROP_TEMP_TABLE     : zCode := 'SQLITE_DROP_TEMP_TABLE';
+    SQLITE_DROP_TEMP_TRIGGER   : zCode := 'SQLITE_DROP_TEMP_TRIGGER';
+    SQLITE_DROP_TEMP_VIEW      : zCode := 'SQLITE_DROP_TEMP_VIEW';
+    SQLITE_DROP_TRIGGER        : zCode := 'SQLITE_DROP_TRIGGER';
+    SQLITE_DROP_VIEW           : zCode := 'SQLITE_DROP_VIEW';
+    SQLITE_INSERT_AUTH         : zCode := 'SQLITE_INSERT';
+    SQLITE_PRAGMA_AUTH         : zCode := 'SQLITE_PRAGMA';
+    SQLITE_READ_AUTH           : zCode := 'SQLITE_READ';
+    SQLITE_SELECT_AUTH         : zCode := 'SQLITE_SELECT';
+    SQLITE_TRANSACTION_AUTH    : zCode := 'SQLITE_TRANSACTION';
+    SQLITE_UPDATE_AUTH         : zCode := 'SQLITE_UPDATE';
+    SQLITE_ATTACH_AUTH         : zCode := 'SQLITE_ATTACH';
+    SQLITE_DETACH_AUTH         : zCode := 'SQLITE_DETACH';
+    SQLITE_ALTER_TABLE_AUTH    : zCode := 'SQLITE_ALTER_TABLE';
+    SQLITE_REINDEX_AUTH        : zCode := 'SQLITE_REINDEX';
+    SQLITE_ANALYZE_AUTH        : zCode := 'SQLITE_ANALYZE';
+    SQLITE_CREATE_VTABLE       : zCode := 'SQLITE_CREATE_VTABLE';
+    SQLITE_DROP_VTABLE         : zCode := 'SQLITE_DROP_VTABLE';
+    SQLITE_FUNCTION_AUTH       : zCode := 'SQLITE_FUNCTION';
+    SQLITE_SAVEPOINT_AUTH      : zCode := 'SQLITE_SAVEPOINT';
+    SQLITE_RECURSIVE_AUTH      : zCode := 'SQLITE_RECURSIVE';
+  else
+    zCode := '????';
+  end;
+
+  Tcl_DStringInit(@str);
+  Tcl_DStringAppend(@str, pDb^.zAuth, -1);
+  Tcl_DStringAppendElement(@str, zCode);
+  if zArg1 <> nil then Tcl_DStringAppendElement(@str, zArg1)
+                  else Tcl_DStringAppendElement(@str, '');
+  if zArg2 <> nil then Tcl_DStringAppendElement(@str, zArg2)
+                  else Tcl_DStringAppendElement(@str, '');
+  if zArg3 <> nil then Tcl_DStringAppendElement(@str, zArg3)
+                  else Tcl_DStringAppendElement(@str, '');
+  if zArg4 <> nil then Tcl_DStringAppendElement(@str, zArg4)
+                  else Tcl_DStringAppendElement(@str, '');
+  rc := Tcl_GlobalEval(pDb^.interp, Tcl_DStringValue(@str));
+  Tcl_DStringFree(@str);
+
+  if rc = TCL_OK then
+    zReply := Tcl_GetStringResult(pDb^.interp)
+  else
+    zReply := 'SQLITE_DENY';
+
+  if StrComp(zReply, 'SQLITE_OK') = 0 then
+    rc := SQLITE_OK
+  else if StrComp(zReply, 'SQLITE_DENY') = 0 then
+    rc := SQLITE_DENY
+  else if StrComp(zReply, 'SQLITE_IGNORE') = 0 then
+    rc := SQLITE_IGNORE
+  else
+    rc := 999;
+  Result := rc;
+end;
+
+{ DbAuthorizerArm — `db authorizer ?CALLBACK?`  tclsqlite.c:2503..2541.
+  2-arg form reports the current callback; 3-arg form replaces it and
+  (re)registers via sqlite3_set_authorizer (or clears it). }
+function DbAuthorizerArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:   PSqliteDb;
+  zAuth: PAnsiChar;
+  len:   cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zAuth <> nil then
+      Tcl_AppendResult(interp, pDb^.zAuth, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zAuth <> nil then
+      Tcl_Free(pDb^.zAuth);
+    zAuth := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zAuth <> nil) and (len > 0) then
+    begin
+      pDb^.zAuth := Tcl_Alloc(len + 1);
+      Move(zAuth^, pDb^.zAuth^, len + 1);
+    end
+    else
+      pDb^.zAuth := nil;
+    if pDb^.zAuth <> nil then
+    begin
+      pDb^.interp := interp;
+      sqlite3_set_authorizer(pDb^.db, @DbAuthHandler, pDb);
+    end
+    else
+      sqlite3_set_authorizer(pDb^.db, nil, nil);
+  end;
+  Result := TCL_OK;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -1110,6 +1254,14 @@ begin
     Exit;
   end;
 
+  { authorizer — tclsqlite.c:2503 (DB_AUTHORIZER).  sqlite3_set_authorizer
+    shim. }
+  if (zSub <> nil) and (StrComp(zSub, 'authorizer') = 0) then
+  begin
+    Result := DbAuthorizerArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
   Tcl_AppendResult(interp,
     PChar('unknown subcommand "'),
     zSub,
@@ -1169,6 +1321,7 @@ begin
   pDb^.zTrace   := nil;
   pDb^.zTraceV2 := nil;
   pDb^.zProfile := nil;
+  pDb^.zAuth    := nil;
 
   Tcl_CreateObjCommand(interp, zDbName,
     @DbObjCmdAdaptor, TClientData(pDb), @DbDeleteCmd);

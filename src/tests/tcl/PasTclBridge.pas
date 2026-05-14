@@ -75,6 +75,7 @@ procedure Tcl_FindExecutable(argv0: PChar); cdecl; external 'tcl8.6';  // tclsql
 { ----------------------------------------------------------------------
   Script evaluation.  tclsqlite.c:703 (Tcl_Eval), :757 (EvalObjEx). }
 function Tcl_Eval(interp: PTclInterp; script: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_GlobalEval(interp: PTclInterp; command: PChar): cint; cdecl; external 'tcl8.6';
 function Tcl_EvalFile(interp: PTclInterp; fileName: PChar): cint; cdecl; external 'tcl8.6';
 function Tcl_EvalObjEx(interp: PTclInterp; objPtr: PTclObj; flags: cint): cint; cdecl; external 'tcl8.6';
 function Tcl_EvalObjv(interp: PTclInterp; objc: cint; objv: PPTclObj; flags: cint): cint; cdecl; external 'tcl8.6';

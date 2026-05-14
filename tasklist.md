@@ -466,7 +466,7 @@ acceptance gate for this section.
     callbacks fired on each prepared statement.  Many error-path
     tests diff against the trace stream.  C ref: `tclsqlite.c:737..833`
     (DbTraceV2Handler) + `2900..2970` (dispatch).
-  - [ ] **9.4.2.j** `db authorizer` — Tcl callback invoked by
+  - [X] **9.4.2.j** `db authorizer` — Tcl callback invoked by
     sqlite3_set_authorizer with 5-tuple action codes.  Engine port
     in 9.4.6.e.  C ref: `tclsqlite.c:984..1070` (auth_callback) +
     `2740..2780` (dispatch).
