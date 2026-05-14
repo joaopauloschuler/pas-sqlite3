@@ -435,19 +435,35 @@ non-crash failures (affinity3-200/210/220/250/260) are separate
 unported features (`CREATE TABLE AS SELECT`, JOIN-USING automatic-
 index affinity) — not part of this divbug.  Fixed: 9.4.divbug.16.
 
-## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — OPEN
+## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — FIXED
 
 Affects: 1 test (`../sqlite3/test/aggnested.test`).
-Symptom: `aggnested-1.1` expects `[1x2x3]` (the inner aggregate
-folded across rows) but our build returns `[1x1 2x2 3x3]` — the
-nested aggregate is evaluated per-row instead of being collapsed by
-the outer aggregate context.  The run then SIGSEGVs further in.
-Likely cause: the resolver's nested-aggregate handling
-(`NC_HasAgg` / `pAggInfo` nesting in resolve.c) is not ported — the
-inner `group_concat`/`sum` is bound to the wrong `AggInfo`, and a
-later nested-agg row eventually walks a nil context (the segfault).
-Sibling area to divbug.1/.11 (aggregate resolution).  Surfaced by:
-9.4.4.c sweep.
+Symptom: `aggnested-1.1` expected `[1x2x3]` (the inner aggregate
+folded across rows) but our build returned `[1x1 2x2 3x3]` — the
+nested aggregate was evaluated per-row instead of being collapsed by
+the outer aggregate context.  The run then SIGSEGV'd further in.
+Root cause: the resolver's nested-aggregate outward-binding loop
+(resolve.c:1337..1352 `pNC2` / `sqlite3ReferencesSrcList`) was not
+ported.  The Pas resolver is a per-Select walk with no NameContext
+chain, so an aggregate textually inside a subquery whose arguments
+only reference an *outer* table was being bound to the subquery's
+own (wrong) AggInfo.
+Fixed (passqlite3codegen.pas): after the inner SELECT is resolved in
+the TK_SELECT arm of `ResolveExpr`, new helpers `FindNestedAggToOuter`
+/ `ExprArgRefsOuterCursor` detect aggregate `TK_FUNCTION` nodes whose
+args reference an outer cursor and *no* inner cursor (mirroring
+`sqlite3ReferencesSrcList`'s 0x01 bit), rewrite them to
+`TK_AGG_FUNCTION` with `op2 := 1` (nesting depth), and flag the outer
+SELECT `SF_Aggregate`.  `analyzeAggregate` (driven from the outer
+select, walkerDepth-aware) then binds the node to the outer AggInfo
+at `walkerDepth = op2`.  aggnested-1.1..2.0 now pass and the file no
+longer segfaults; aggnested-3.x failures remain but are an unrelated
+`sqlite_sequence`/AUTOINCREMENT issue.
+Not covered: select1-2.20..23 (`misuse of aliased aggregate`) — that
+is a distinct resolve path (aggregate directly nested in an
+aggregate's args / aliased aggregate in HAVING, no subquery); the
+build already raises an error there, only the message spelling
+diverges (tracked under divbug.14 residual).
 
 ## Run summary (9.4.4.b.2 sweep)
 

@@ -9270,6 +9270,148 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc);
   end;
 
+  { 9.4.divbug.17 — nested-aggregate outward binding.  Mirrors the
+    resolve.c:1337..1352 `pNC2` loop: an aggregate function call that
+    appears textually inside a subquery but whose arguments only
+    reference tables of an *outer* query belongs to that outer query's
+    aggregate context, not the subquery's.  The Pas resolver is a
+    per-Select walk with no NameContext chain, so we detect the case
+    explicitly here: after the inner SELECT has been resolved, any
+    aggregate TK_FUNCTION whose argument list references an outer
+    cursor (and no inner cursor) is rewritten to TK_AGG_FUNCTION with
+    op2 = 1 (the nesting depth) and the outer SELECT is flagged
+    SF_Aggregate.  analyzeAggregate then binds it to the outer AggInfo
+    when its walker descends to walkerDepth = op2. }
+
+  function ExprArgRefsOuterCursor(pX: PExpr; pOuterSrc: PSrcList): Boolean; forward;
+
+  function ExprListArgRefsOuterCursor(pList: PExprList;
+    pOuterSrc: PSrcList): Boolean;
+  var i: i32;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for i := 0 to pList^.nExpr - 1 do
+      if ExprArgRefsOuterCursor(ExprListItems(pList)[i].pExpr,
+                                pOuterSrc) then
+      begin Result := True; Exit; end;
+  end;
+
+  { True iff pX's subtree contains a TK_COLUMN/TK_AGG_COLUMN bound to a
+    cursor in pOuterSrc.  Recurses into nested subqueries' clauses too
+    (so a doubly-nested reference is still seen).  TK_AGG_FUNCTION
+    nodes already bound elsewhere are skipped. }
+  function ExprArgRefsOuterCursor(pX: PExpr; pOuterSrc: PSrcList): Boolean;
+  var
+    j:    i32;
+    base: PSrcItem;
+    pIt:  PSrcItem;
+    pSub: PSelect;
+  begin
+    Result := False;
+    if (pX = nil) or (pOuterSrc = nil) then Exit;
+    if (pX^.op = TK_COLUMN) or (pX^.op = TK_AGG_COLUMN) then
+    begin
+      base := SrcListItems(pOuterSrc);
+      for j := 0 to pOuterSrc^.nSrc - 1 do
+      begin
+        pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+        if pX^.iTable = pIt^.iCursor then begin Result := True; Exit; end;
+      end;
+      Exit;
+    end;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if ExprArgRefsOuterCursor(pX^.pLeft,  pOuterSrc) then begin Result := True; Exit; end;
+    if ExprArgRefsOuterCursor(pX^.pRight, pOuterSrc) then begin Result := True; Exit; end;
+    if (pX^.flags and EP_xIsSelect) = 0 then
+    begin
+      if pX^.x.pList <> nil then
+        for j := 0 to pX^.x.pList^.nExpr - 1 do
+          if ExprArgRefsOuterCursor(ExprListItems(pX^.x.pList)[j].pExpr,
+                                    pOuterSrc) then
+          begin Result := True; Exit; end;
+    end
+    else if pX^.x.pSelect <> nil then
+    begin
+      pSub := pX^.x.pSelect;
+      if ExprListArgRefsOuterCursor(pSub^.pEList, pOuterSrc) then begin Result := True; Exit; end;
+      if ExprArgRefsOuterCursor(pSub^.pWhere,  pOuterSrc) then begin Result := True; Exit; end;
+      if ExprArgRefsOuterCursor(pSub^.pHaving, pOuterSrc) then begin Result := True; Exit; end;
+    end;
+  end;
+
+  { Walk pX looking for aggregate-function TK_FUNCTION nodes that, per
+    resolve.c:1337..1352 / sqlite3ReferencesSrcList, belong to the
+    outer SELECT: their arguments reference an outer cursor and do NOT
+    reference any inner cursor.  (If they reference the inner SrcList,
+    sqlite3ReferencesSrcList returns 1 — bit 0x01 — and the aggregate
+    stays bound to the inner query, so we must leave it alone.)
+    Rewrite each qualifying node to TK_AGG_FUNCTION/op2=1 and set
+    bFound. }
+  procedure FindNestedAggToOuter(pX: PExpr; pOuterSrc: PSrcList;
+    pInnerSrc: PSrcList; var bFound: Boolean);
+  var
+    pDef: PTFuncDef;
+    n:    i32;
+    j:    i32;
+    isAgg: Boolean;
+    refOuter, refInner: Boolean;
+  begin
+    if pX = nil then Exit;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil)
+       and ((pX^.flags and EP_xIsSelect) = 0) then
+    begin
+      if pX^.x.pList <> nil then n := pX^.x.pList^.nExpr else n := 0;
+      pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, n,
+                                  pParse^.db^.enc, 0);
+      if (pDef = nil) and (n <> 0) then
+        pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
+                                    pParse^.db^.enc, 0);
+      isAgg := (pDef <> nil) and Assigned(pDef^.xFinalize);
+      if isAgg then
+      begin
+        refOuter := ExprListArgRefsOuterCursor(pX^.x.pList, pOuterSrc)
+           or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+               and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+               and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pOuterSrc));
+        refInner := ExprListArgRefsOuterCursor(pX^.x.pList, pInnerSrc)
+           or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+               and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+               and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
+        if refOuter and not refInner then
+        begin
+          pX^.op  := TK_AGG_FUNCTION;
+          pX^.op2 := 1;
+          bFound  := True;
+        end;
+        { Aggregate args may themselves nest further aggregates, but
+          C does not look through one aggregate into another for this
+          purpose (analyzeAggregate prunes); stop recursion here. }
+        Exit;
+      end;
+    end;
+    FindNestedAggToOuter(pX^.pLeft,  pOuterSrc, pInnerSrc, bFound);
+    FindNestedAggToOuter(pX^.pRight, pOuterSrc, pInnerSrc, bFound);
+    if (pX^.flags and EP_xIsSelect) = 0 then
+    begin
+      if pX^.x.pList <> nil then
+        for j := 0 to pX^.x.pList^.nExpr - 1 do
+          FindNestedAggToOuter(ExprListItems(pX^.x.pList)[j].pExpr,
+                               pOuterSrc, pInnerSrc, bFound);
+    end;
+  end;
+
+  procedure FindNestedAggListToOuter(pList: PExprList; pOuterSrc: PSrcList;
+    pInnerSrc: PSrcList; var bFound: Boolean);
+  var i: i32;
+  begin
+    if pList = nil then Exit;
+    for i := 0 to pList^.nExpr - 1 do
+      FindNestedAggToOuter(ExprListItems(pList)[i].pExpr,
+                           pOuterSrc, pInnerSrc, bFound);
+  end;
+
   procedure ResolveExpr(pE: PExpr);
   var
     pSrc:   PSrcList;
@@ -9281,6 +9423,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     nArg_:  i32;
     pInner: PSelect;
     bCorr:  Boolean;
+    bNestedAgg: Boolean;
     pMatch: PSrcItem;
     matchCol: i32;
     cnt:    i32;
@@ -9583,6 +9726,23 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           ExprSetProperty(pE, EP_VarSelect);
           pInner^.selFlags := pInner^.selFlags or SF_Correlated;
+        end;
+        { 9.4.divbug.17 — resolve.c:1337..1352 pNC2 outward-binding.
+          An aggregate function textually inside this subquery whose
+          arguments only reference an outer cursor belongs to the
+          outer SELECT's aggregate context.  Rewrite it to
+          TK_AGG_FUNCTION/op2=1 and flag the outer SELECT aggregate so
+          analyzeAggregate (driven from the outer select) binds it to
+          the outer AggInfo at walkerDepth = op2. }
+        if (p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0) then
+        begin
+          bNestedAgg := False;
+          FindNestedAggListToOuter(pInner^.pEList, p^.pSrc, pInner^.pSrc,
+                                   bNestedAgg);
+          FindNestedAggToOuter(pInner^.pHaving, p^.pSrc, pInner^.pSrc,
+                               bNestedAgg);
+          if bNestedAgg then
+            p^.selFlags := p^.selFlags or SF_Aggregate;
         end;
       end;
     end;
