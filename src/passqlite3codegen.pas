@@ -8398,6 +8398,7 @@ procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr);
 var
   i:      i32;
   pList_: PExprList;
+  pFnDef: PTFuncDef;
 begin
   if pE = nil then Exit;
   if pParse = nil then Exit;
@@ -8414,6 +8415,59 @@ begin
       end;
     end;
     Exit;
+  end;
+  { TK_DOT — a table-qualified column reference (e.g. `t3.a`) that survived
+    name resolution.  Mirror resolve.c lookupName's cnt==0 tail
+    (resolve.c:784..795): emit "no such column: zTab.zCol" with the full
+    qualified tail rather than recursing into pLeft and reporting only the
+    bare table token (9.4.divbug.14). }
+  if pE^.op = TK_DOT then
+  begin
+    if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+       and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
+       and (pE^.pLeft^.u.zToken <> nil)
+       and (pE^.pRight^.u.zToken <> nil) then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('no such column: '
+                  + AnsiString(pE^.pLeft^.u.zToken) + '.'
+                  + AnsiString(pE^.pRight^.u.zToken)));
+      sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+    end;
+    Exit;
+  end;
+  { TK_FUNCTION — mirror resolveExprStep's function-lookup arm
+    (resolve.c:1129..1276): a function name that sqlite3FindFunction
+    cannot resolve must raise "no such function: <name>" at prepare
+    time, and a name that only matches with nArg=-2 raises "wrong
+    number of arguments to function <name>()".  Without this arm an
+    INSERT ... VALUES(notafunc(...)) silently treated the unknown
+    call as a no-op instead of erroring (9.4.divbug.15). }
+  if pE^.op = TK_FUNCTION then
+  begin
+    if (pE^.u.zToken <> nil) and ExprUseXList(pE) then
+    begin
+      if pE^.x.pList <> nil then i := pE^.x.pList^.nExpr else i := 0;
+      pFnDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, i,
+                                    pParse^.db^.enc, 0);
+      if pFnDef = nil then
+      begin
+        pFnDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                      pParse^.db^.enc, 0);
+        if pParse^.db^.init.busy = 0 then
+        begin
+          if pFnDef = nil then
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              'no such function: %s', [pE^.u.zToken]))
+          else
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              'wrong number of arguments to function %s()',
+              [pE^.u.zToken]));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          Exit;
+        end;
+      end;
+    end;
   end;
   if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
   flagUnresolvedTKID(pParse, pE^.pLeft);
@@ -36205,9 +36259,10 @@ generic_coro_done:
       end
       else
       begin
-        sqlite3ErrorMsg(pParse,
-          PAnsiChar('table has no column with that name'));
-        pParse^.parseFlags := pParse^.parseFlags or $200;
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+          'table %S has no column named %s',
+          [@SrcListItems(pTabList)[0], pIdItems[i].zName]));
+        pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
         goto insert_cleanup;
       end;
     end;
@@ -39226,10 +39281,14 @@ begin
     pTable := sqlite3FindTable(db, zName, zDb);
     if pTable <> nil then begin
       if noErr = 0 then begin
-        if (pTable^.tabFlags and TF_Ephemeral) <> 0 then
-          sqlite3ErrorMsg(pParse, 'view already exists')
+        { build.c:1285 — "%s %T already exists" with the object type and
+          the parser token (so the db-qualified spelling is preserved). }
+        if pTable^.eTabType = TABTYP_VIEW then
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+            'view %T already exists', [pName]))
         else
-          sqlite3ErrorMsg(pParse, 'table already exists');
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+            'table %T already exists', [pName]));
       end else begin
         sqlite3CodeVerifySchema(pParse, iDb);
         sqlite3ForceNotReadOnly(pParse);
@@ -41468,7 +41527,8 @@ begin
 
   if (sqlite3_strnicmp(pTab^.zName, 'sqlite_', 7) = 0) and
      (db^.init.busy = 0) and (pTblName <> nil) then begin
-    sqlite3ErrorMsg(pParse, 'table may not be indexed');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'table %s may not be indexed', [pTab^.zName]));
     goto exit_create_index;
   end;
   if pTab^.eTabType = TABTYP_VIEW then begin
@@ -41490,13 +41550,15 @@ begin
     if not InRenameObject(pParse) then begin
       if db^.init.busy = 0 then begin
         if sqlite3FindTable(db, zName, pDb^.zDbSName) <> nil then begin
-          sqlite3ErrorMsg(pParse, 'there is already a table with that name');
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+            'there is already a table named %s', [zName]));
           goto exit_create_index;
         end;
       end;
       if sqlite3FindIndex(db, zName, pDb^.zDbSName) <> nil then begin
         if ifNotExist = 0 then begin
-          sqlite3ErrorMsg(pParse, 'index already exists');
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+            'index %s already exists', [zName]));
         end else begin
           sqlite3CodeVerifySchema(pParse, iDb);
           sqlite3ForceNotReadOnly(pParse);

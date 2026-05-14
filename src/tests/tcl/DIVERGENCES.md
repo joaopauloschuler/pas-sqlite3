@@ -374,42 +374,45 @@ boundary1.test sub-tests now pass (0 errors); engine regression
 clean; TestExplainParity unchanged (224 pass).
 Surfaced by: 9.4.4.b.2 re-sweep.  Fixed by: 9.4.divbug.13.
 
-## 9.4.divbug.14 — SQL error messages still drop the object name — OPEN
+## 9.4.divbug.14 — SQL error messages still drop the object name — FIXED
 
 Affects: 3+ tests (`../sqlite3/test/insert.test`,
 `../sqlite3/test/index.test`, `../sqlite3/test/select1.test`).
 Symptom: divbug.2 fixed two specific arms, but a broader family of
-error messages still emit the generic prefix-only form:
-  * `table has no column with that name`  vs upstream
-    `table test1 has no column named four` (insert-1.4).
-  * `no such column: t3` vs `no such column: t3.a` — the
-    table-qualified-name tail is truncated (insert-4.3).
-  * `table may not be indexed` vs `table sqlite_master may not be
-    indexed`; `index already exists` vs `index index1 already
-    exists`; `there is already a table with that name` vs
-    `there is already a table named test1` (index-5.1 / 6.1 / 6.2).
-  * `misuse of aggregate function min()` expected as
-    `misuse of aggregate function min()` — *we* now emit
-    `misuse of aggregate: min()` (divbug.2 used the wrong upstream
-    spelling for the non-aliased arm); aliased form should be
-    `misuse of aliased aggregate <name>` (select1-2.20..23).
-Likely cause: scattered `sqlite3ErrorMsg` call sites still use
-bespoke literals instead of the upstream `%s`/`%S` format strings.
-Surfaced by: 9.4.4.b.2 re-sweep.  Sibling of divbug.2.
+error messages still emit the generic prefix-only form.
+Fixed (passqlite3codegen.pas) by routing the scattered call sites
+through the upstream `%s`/`%S`/`%T` format strings:
+  * insert column miss → `table %S has no column named %s`
+    (insert.c:1101) — insert-1.4 now passes.
+  * unresolved `TK_DOT` in a FROM-less expr (e.g. an INSERT VALUES
+    list) → `no such column: zTab.zCol` instead of recursing into
+    `pLeft` and reporting just the bare table token — insert-4.3.
+  * `table %s may not be indexed`, `there is already a table named
+    %s`, `index %s already exists` (build.c:4043/4082/4088) —
+    index-5.1 / 6.1 / 6.2 now pass.
+  * CREATE TABLE/VIEW collision → `%s %T already exists`
+    (build.c:1285).
+Remaining: the `misuse of aggregate function min()` /
+`misuse of aliased aggregate <name>` spelling (select1-2.20..23)
+is a resolve-time nested-aggregate detection gap tracked under
+divbug.17 — the codegen site already matches expr.c:5320 exactly;
+the fix is to raise at resolve time, not codegen time.
 
-## 9.4.divbug.15 — `no such function` not raised at prepare time — OPEN
+## 9.4.divbug.15 — `no such function` not raised at prepare time — FIXED
 
 Affects: 2 tests (`../sqlite3/test/insert.test` insert-4.6,
 `../sqlite3/test/delete.test` delete-4.2).
 Symptom: a statement referencing an undefined SQL function
-(`SELECT notafunc(...)`) is expected to fail with
-`no such function: notafunc`, but our build returns `[0 {}]`
-(success, empty result) — the unknown function is silently
-treated as NULL / no-op instead of raising at prepare time.
-Likely cause: `sqlite3ExprFunctionUsable` / the function-lookup
-arm in `resolveExprStep` (resolve.c:1860-ish) does not emit the
-`no such function` error when `sqlite3FindFunction` returns nil.
-Surfaced by: 9.4.4.b.2 re-sweep.
+(`SELECT notafunc(...)`) was expected to fail with
+`no such function: notafunc`, but the build returned `[0 {}]`
+(success, empty result).
+Fixed: `flagUnresolvedTKID` (passqlite3codegen.pas) — the walker
+that runs over INSERT/VALUES expression trees — now ports the
+function-lookup arm of `resolveExprStep` (resolve.c:1129..1276):
+a `TK_FUNCTION` whose name `sqlite3FindFunction` cannot resolve
+raises `no such function: <name>`, and a name matched only with
+`nArg=-2` raises `wrong number of arguments to function <name>()`.
+insert-4.6 / delete-4.2 now pass.
 
 ## 9.4.divbug.16 — `affinity3.test` segfaults — OPEN
 
