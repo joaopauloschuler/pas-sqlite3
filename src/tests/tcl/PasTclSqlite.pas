@@ -30,7 +30,7 @@ function Sqlite3_SafeInit(interp: PTclInterp): cint; cdecl;
 
 implementation
 
-uses SysUtils, passqlite3types, passqlite3util, passqlite3main;
+uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe;
 
 type
   { Per-connection state.  Pas analogue of struct SqliteDb in
@@ -49,6 +49,8 @@ type
 
 { Forward decl: DbMain hands DbObjCmdAdaptor to Tcl_CreateObjCommand. }
 function DbObjCmdAdaptor(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl; forward;
+function DbEvalArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl; forward;
 procedure DbDeleteCmd(clientData: TClientData); cdecl; forward;
 
@@ -77,6 +79,119 @@ begin
   Dispose(pDb);
 end;
 
+{ DbEvalArm — minimum port of the "eval" arm of DbObjCmd
+  (tclsqlite.c ~2700..2820) plus the row-stepper loop body from
+  dbEvalStep (tclsqlite.c:1766..1823).
+
+  Contract: objc>=3, objv[2]=SQL text.  All rows in all statements
+  contained in the SQL text are appended (column by column) onto a
+  freshly built Tcl list, which becomes the interp's obj-result on
+  success.  On any SQLITE error we set the interp result to
+  sqlite3_errmsg() and return TCL_ERROR.
+
+  NULL column policy mirrors dbEvalColumnValue (tclsqlite.c:1871):
+  Tcl_NewStringObj(zNull, -1).  We pass an empty C string when
+  pDb^.zNull is nil (i.e. before any `db nullvalue ...` call); the
+  nullvalue subcommand lands in 9.4.2.e. }
+function DbEvalArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:        PSqliteDb;
+  zSql:       PAnsiChar;
+  zTail:      PAnsiChar;
+  pStmt:      Pointer;
+  rc:         i32;
+  rcStep:     i32;
+  i, nCol:    cint;
+  pList:      PTclObj;
+  pCol:       PTclObj;
+  zVal:       PAnsiChar;
+  zNullStr:   PAnsiChar;
+  emptyNull:  array[0..0] of AnsiChar;
+begin
+  if objc < 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('SQL ?ARRAY-NAME? ?SCRIPT?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  pDb  := PSqliteDb(clientData);
+  zSql := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
+  if zSql = nil then
+  begin
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  emptyNull[0] := #0;
+  if pDb^.zNull <> nil then
+    zNullStr := pDb^.zNull
+  else
+    zNullStr := @emptyNull[0];
+
+  pList := Tcl_NewListObj(0, nil);
+  Tcl_IncrRefCount(pList);
+
+  { Outer loop: walk through zSql, one prepared statement per
+    sqlite3_prepare_v2 call, advancing via pzTail.  Mirrors the
+    `while (p->zSql[0] || p->pPreStmt)` loop of dbEvalStep:1769. }
+  while (zSql <> nil) and (zSql^ <> #0) do
+  begin
+    pStmt := nil;
+    zTail := nil;
+    rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, @zTail);
+    if rc <> SQLITE_OK then
+    begin
+      Tcl_DecrRefCount(pList);
+      Tcl_AppendResult(interp, sqlite3_errmsg(pDb^.db), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+
+    if pStmt = nil then
+    begin
+      { Trailing whitespace / comment — no statement compiled. }
+      zSql := zTail;
+      continue;
+    end;
+
+    nCol := sqlite3_column_count(pStmt);
+
+    repeat
+      rcStep := sqlite3_step(pStmt);
+      if rcStep = SQLITE_ROW then
+      begin
+        for i := 0 to nCol - 1 do
+        begin
+          zVal := sqlite3_column_text(pStmt, i);
+          if zVal = nil then
+            pCol := Tcl_NewStringObj(zNullStr, -1)
+          else
+            pCol := Tcl_NewStringObj(zVal, -1);
+          Tcl_ListObjAppendElement(interp, pList, pCol);
+        end;
+      end;
+    until rcStep <> SQLITE_ROW;
+
+    sqlite3_finalize(pStmt);
+
+    if (rcStep <> SQLITE_DONE) and (rcStep <> SQLITE_OK) then
+    begin
+      Tcl_DecrRefCount(pList);
+      Tcl_AppendResult(interp, sqlite3_errmsg(pDb^.db), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+
+    zSql := zTail;
+  end;
+
+  Tcl_SetObjResult(interp, pList);
+  Tcl_DecrRefCount(pList);
+  Result := TCL_OK;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -101,6 +216,37 @@ begin
     zSelf := Tcl_GetStringFromObj(ObjvAt(objv, 0), nil);
     Tcl_DeleteCommand(interp, zSelf);
     Result := TCL_OK;
+    Exit;
+  end;
+
+  { eval — tclsqlite.c "eval" arm of DbObjCmd (~2700..2820, dispatch
+    table at :2445).  This is a straight-line minimum port of
+    dbEvalStep (tclsqlite.c:1766..1823): we drive
+    sqlite3_prepare_v2 / sqlite3_step / sqlite3_finalize in-line and
+    accumulate a flat Tcl list of column values.
+
+    KNOWN DIVERGENCE from upstream's dbEvalColumnValue
+    (tclsqlite.c:1850..1876): every column is stringified through
+    sqlite3_column_text (UTF-8) and wrapped with Tcl_NewStringObj.
+    Upstream returns typed Tcl_Obj (Int / WideInt / Double /
+    ByteArray) per sqlite3_column_type.  Cite the Pascal feedback
+    feedback_result_text_change_encoding.md re: text encoding —
+    sqlite3_column_text always renders UTF-8, so Tcl_NewStringObj is
+    safe here.  Typed-Obj marshalling lands as a follow-up (9.4.2.d.1
+    if/when a .test file demands it; `puts [db eval ...]` stringifies
+    anyway so the divergence is invisible to ~99% of tester.tcl
+    call sites).
+
+    Also deferred vs upstream:
+      * 4-arg form `db eval sql arrayName script` — would require a
+        sub-interpreter eval per row;
+      * `$var` substitution in SQL (dbPrepareAndBind);
+      * the prepared-statement cache (SqlPreparedStmt);
+      * DbEvalContext / NRE machinery;
+      * busy-handler retries on SQLITE_SCHEMA. }
+  if (zSub <> nil) and (StrComp(zSub, 'eval') = 0) then
+  begin
+    Result := DbEvalArm(clientData, interp, objc, objv);
     Exit;
   end;
 
