@@ -98,6 +98,9 @@ type
 {$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
     pPreUpdateHook: PTclObj; { tclsqlite.c:211 — `preupdate hook` script. }
 {$ENDIF}
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+    pUnlockNotify: PTclObj;  { tclsqlite.c:212 — `unlock_notify` script. }
+{$ENDIF}
     pCollate:      PSqlCollate; { tclsqlite.c:215 — head of TSqlCollate chain,
                              populated by the `collate` subcmd.  Freed in
                              DbDeleteCmd. }
@@ -2061,6 +2064,26 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+{ DbUnlockNotify — sqlite3_unlock_notify trampoline.  tclsqlite.c:895..910.
+  Each apArg[i] is the SqliteDb* that registered a callback; eval its
+  stored pUnlockNotify script then drop the reference (one-shot). }
+procedure DbUnlockNotify(apArg: PPointer; nArg: cint); cdecl;
+var
+  i:   cint;
+  pDb: PSqliteDb;
+begin
+  for i := 0 to nArg - 1 do
+  begin
+    pDb := PSqliteDb(apArg[i]);
+    Tcl_EvalObjEx(pDb^.interp, pDb^.pUnlockNotify,
+      TCL_EVAL_GLOBAL or TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(pDb^.pUnlockNotify);
+    pDb^.pUnlockNotify := nil;
+  end;
+end;
+{$ENDIF}
+
 { DbCommitHookArm — `db commit_hook ?CALLBACK?`  tclsqlite.c:2807..2839. }
 function DbCommitHookArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
@@ -2291,6 +2314,62 @@ end;
 begin
   Tcl_AppendResult(interp,
     PChar('preupdate_hook was omitted at compile-time'), Pointer(nil));
+  Result := TCL_ERROR;
+end;
+{$ENDIF}
+
+{ DbUnlockNotifyArm — `db unlock_notify ?SCRIPT?`  tclsqlite.c:4012..4047.
+  Registers a one-shot unlock-notify callback.  With no SCRIPT it cancels
+  any prior registration.  When SQLITE_ENABLE_UNLOCK_NOTIFY is not
+  defined the whole subcommand reports the compile-time-omitted error,
+  matching tclsqlite.c:4015..4018. }
+function DbUnlockNotifyArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+var
+  pDb:        PSqliteDb;
+  xNotify:    Tsqlite3_unlock_notify_cb;
+  pNotifyArg: Pointer;
+begin
+  pDb := PSqliteDb(clientData);
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?SCRIPT?'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  xNotify    := nil;
+  pNotifyArg := nil;
+
+  if pDb^.pUnlockNotify <> nil then
+  begin
+    Tcl_DecrRefCount(pDb^.pUnlockNotify);
+    pDb^.pUnlockNotify := nil;
+  end;
+
+  if objc = 3 then
+  begin
+    xNotify    := @DbUnlockNotify;
+    pNotifyArg := pDb;
+    pDb^.interp := interp;
+    pDb^.pUnlockNotify := ObjvAt(objv, 2);
+    Tcl_IncrRefCount(pDb^.pUnlockNotify);
+  end;
+
+  if sqlite3_unlock_notify(pDb^.db, xNotify, pNotifyArg) <> 0 then
+  begin
+    Tcl_AppendResult(interp, PAnsiChar(sqlite3_errmsg(pDb^.db)),
+      Pointer(nil));
+    Result := TCL_ERROR;
+  end
+  else
+    Result := TCL_OK;
+end;
+{$ELSE}
+begin
+  Tcl_AppendResult(interp,
+    PChar('unlock_notify not available in this build'), Pointer(nil));
   Result := TCL_ERROR;
 end;
 {$ENDIF}
@@ -3330,6 +3409,15 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'preupdate') = 0) then
   begin
     Result := DbPreUpdateArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { unlock_notify — tclsqlite.c:4012 (DB_UNLOCK_NOTIFY).
+    sqlite3_unlock_notify shim; gated on SQLITE_ENABLE_UNLOCK_NOTIFY
+    (9.4.2.v). }
+  if (zSub <> nil) and (StrComp(zSub, 'unlock_notify') = 0) then
+  begin
+    Result := DbUnlockNotifyArm(clientData, interp, objc, objv);
     Exit;
   end;
 

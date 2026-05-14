@@ -48,8 +48,9 @@ const
   TCL_DYNAMIC  : Pointer = Pointer(3);
 
   { Tcl variable / eval flag bits.  tcl.h:885 (TCL_GLOBAL_ONLY),
-    tcl.h:931 (TCL_EVAL_DIRECT). }
+    tcl.h:931 (TCL_EVAL_DIRECT), tcl.h:930 (TCL_EVAL_GLOBAL). }
   TCL_GLOBAL_ONLY = 1;       // tclsqlite.c:887
+  TCL_EVAL_GLOBAL = $20000;  // tclsqlite.c:898 (DbUnlockNotify)
   TCL_EVAL_DIRECT = $40000;  // tclsqlite.c:757
 
 type
