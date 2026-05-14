@@ -9760,6 +9760,150 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { resolve.c:1589 — resolveCompoundOrderBy.  The ORDER BY clause of a
+    compound SELECT hangs off the top-most select but its terms must be
+    matched against the result-set of each element of the compound,
+    beginning with the left-most.  At the first match the term is rewritten
+    into an integer column number and its u.x.iOrderByCol is set so the
+    merge-sort path (multiSelectOrderBy) has a valid permutation index.
+    Without this, a name-resolved compound ORDER BY term keeps
+    iOrderByCol=0 and multiSelectByMerge asserts `iOrderByCol<=0`.
+
+    pTopSel here is the top-most select; its pPrior chain runs toward the
+    left-most.  Each leaf's pEList is already resolved by the time the
+    main loop reaches the left-most select, which is where this is called
+    from.  pE is name-resolved against the current loop select `p` (bound
+    by the enclosing sqlite3ResolveSelectNames) via ResolveExpr — at the
+    call site `p` is the left-most select, matching C's start point. }
+  procedure ResolveCompoundOrderBy(pTopSel: PSelect);
+  var
+    pOrderBy: PExprList;
+    pItems:   PExprListItem;
+    pSel:     PSelect;
+    pEList:   PExprList;
+    pELItems: PExprListItem;
+    i, j:     i32;
+    iCol:     i32;
+    pE, pDup, pNew: PExpr;
+  begin
+    if pTopSel = nil then Exit;
+    pOrderBy := pTopSel^.pOrderBy;
+    if pOrderBy = nil then Exit;
+    if p^.pEList = nil then Exit;
+    pItems := ExprListItems(pOrderBy);
+    { resolve.c:1609..1613 — wire pNext along the pPrior chain so the walk
+      below can run left-most -> top-most. }
+    pTopSel^.pNext := nil;
+    pSel := pTopSel;
+    while pSel^.pPrior <> nil do
+    begin
+      pSel^.pPrior^.pNext := pSel;
+      pSel := pSel^.pPrior;
+    end;
+    { Walk the compound chain from the left-most (the bound `p`, where the
+      enclosing sqlite3ResolveSelectNames has set up name resolution) toward
+      the top-most select.  For each leaf, try to match every still-untagged
+      ORDER BY term against that leaf's result set; the first match wins
+      (resolve.c:1606..1679, the `while(pSelect && moreToDo)` loop). }
+    pSel := p;
+    while pSel <> nil do
+    begin
+      pEList := pSel^.pEList;
+      if pEList = nil then
+      begin
+        if pSel = pTopSel then Break;
+        pSel := pSel^.pNext;
+        Continue;
+      end;
+      pELItems := ExprListItems(pEList);
+      for i := 0 to pOrderBy^.nExpr - 1 do
+      begin
+        if pItems[i].u.x.iOrderByCol <> 0 then Continue;
+        pE := sqlite3ExprSkipCollateAndLikely(pItems[i].pExpr);
+        if pE = nil then Continue;
+        iCol := 0;
+        { Integer arm — resolve.c:1625. }
+        if sqlite3ExprIsInteger(pE, @iCol, nil) <> 0 then
+        begin
+          if (iCol >= 1) and (iCol <= pEList^.nExpr) then
+            pItems[i].u.x.iOrderByCol := u16(iCol);
+          Continue;
+        end;
+        { resolveAsName arm — resolve.c:1631.  Matches a bare TK_ID against
+          this leaf's result-set AS-names. }
+        iCol := ResolveAsName(pEList, pE);
+        { resolveOrderByTermToExprList arm — resolve.c:1647.  Only the
+          left-most select has live name resolution here (ResolveExpr is
+          bound to the enclosing `p`); other leaves rely on the integer /
+          alias arms above plus the structural compare below. }
+        if (iCol = 0) and (pSel = p) then
+        begin
+          pDup := sqlite3ExprDup(pParse^.db, pE, 0);
+          if pDup <> nil then
+          begin
+            ResolveExpr(pDup);
+            if pParse^.nErr = 0 then
+            begin
+              for j := 0 to pEList^.nExpr - 1 do
+                { resolve.c:1549 — sqlite3ExprCompare(0, eList, pE, -1)<2.
+                  C resolves the dup against the same pSrc/iCursor as the
+                  result-set column; this port can re-resolve against a
+                  different cursor value, so pass the result-set column's
+                  iTable as the iTab tolerance argument. }
+                if sqlite3ExprCompare(nil, pELItems[j].pExpr, pDup,
+                     pELItems[j].pExpr^.iTable) < 2 then
+                begin
+                  iCol := j + 1;
+                  Break;
+                end;
+            end
+            else
+              pParse^.nErr := 0;  { suppressed — resolve.c db->suppressErr }
+            sqlite3ExprDelete(pParse^.db, pDup);
+          end;
+        end;
+        { Structural compare against the already-resolved pEList — covers
+          non-left-most leaves where ResolveExpr cannot run. }
+        if iCol = 0 then
+          for j := 0 to pEList^.nExpr - 1 do
+            if sqlite3ExprCompare(nil, pELItems[j].pExpr, pE, -1) = 0 then
+            begin
+              iCol := j + 1;
+              Break;
+            end;
+        if iCol > 0 then
+        begin
+          { Rewrite the ORDER BY term into an integer column number,
+            preserving any COLLATE wrapper (resolve.c:1656..1672). }
+          pNew := sqlite3ExprInt32(pParse^.db, iCol);
+          if pNew = nil then Exit;
+          if pItems[i].pExpr = pE then
+            pItems[i].pExpr := pNew
+          else
+          begin
+            pDup := pItems[i].pExpr;
+            while (pDup^.pLeft <> nil) and (pDup^.pLeft^.op = TK_COLLATE) do
+              pDup := pDup^.pLeft;
+            pDup^.pLeft := pNew;
+          end;
+          sqlite3ExprDelete(pParse^.db, pE);
+          pItems[i].u.x.iOrderByCol := u16(iCol);
+        end;
+      end;
+      if pSel = pTopSel then Break;
+      pSel := pSel^.pNext;
+    end;
+    { resolve.c:1680 — any term still unresolved is an error. }
+    for i := 0 to pOrderBy^.nExpr - 1 do
+      if pItems[i].u.x.iOrderByCol = 0 then
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+          '%r ORDER BY term does not match any column in the result set',
+          [i + 1]));
+        Exit;
+      end;
+  end;
+
   { resolve.c:658..698 NC_UEList fallback for HAVING.  HAVING is a single
     boolean expression rather than an ExprList, so the iOrderByCol pre-tag
     used for ORDER BY / GROUP BY does not apply.  Walk pHaving's tree and
@@ -10039,16 +10183,25 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   end;
 
 var
-  pTopSel: PSelect;
+  pTopSel:    PSelect;
+  isCompound: Boolean;
+  deferOB:    Boolean;
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
   { Walk the compound pPrior chain so every leaf SELECT in a UNION ALL
     has its expressions resolved against its own FROM clause.  Mirrors
     C resolve.c which dispatches per-Select via the walker. }
-  pTopSel := p;
+  pTopSel    := p;
+  isCompound := pTopSel^.pPrior <> nil;
   while p <> nil do
   begin
+  { resolve.c:2040 — the ORDER BY clause of a compound SELECT hangs off the
+    top-most select but must be resolved against the result-sets of all
+    elements of the compound, after every leaf is resolved.  Defer it to
+    ResolveCompoundOrderBy (called from the left-most iteration) rather than
+    handling it per-select here. }
+  deferOB := isCompound and (p = pTopSel);
   ResolveExprList(p^.pEList);
   { Phase 6.13.B.8 — resolve TABFUNC argument lists in pSrc so
     fitTabFuncArgs (called later inside sqlite3WhereBegin) sees fully
@@ -10085,10 +10238,11 @@ begin
     pOrderBy so a bare alias TK_ID gets tagged via iOrderByCol and is
     skipped by name resolution (which would otherwise fail with
     "no such column: rn"). }
-  if p^.pOrderBy <> nil then
+  if (p^.pOrderBy <> nil) and (not deferOB) then
     ResolveAliasOrderByCol(p^.pOrderBy);
 
-  ResolveExprList(p^.pOrderBy);
+  if not deferOB then
+    ResolveExprList(p^.pOrderBy);
 
   { 9.4.divbug.1 — for a non-aggregate query, tag aggregate-function
     calls in ORDER BY as TK_AGG_FUNCTION (resolve.c:1330).  Their
@@ -10096,19 +10250,28 @@ begin
     non-aggregate SELECT, so codegen's TK_AGG_FUNCTION misuse arm
     (expr.c:5320) raises "misuse of aggregate: <name>()" instead of
     coding a scalar OP_Function that crashes minStep at run time. }
-  if (p^.pOrderBy <> nil) and (not SelectIsAggregate(p)) then
+  if (p^.pOrderBy <> nil) and (not deferOB) and (not SelectIsAggregate(p)) then
     RewriteOrderByAggToAggFunc(p^.pOrderBy);
 
   { Integer-arm tagging + structural-compare match + alias rewrite for
     ORDER BY / GROUP BY (resolve.c:1793..1834).  The structural-compare
     pass runs after the integer arm so an explicit positional reference
     is not overridden by a coincidental structural match. }
-  if p^.pOrderBy <> nil then
+  if (p^.pOrderBy <> nil) and (not deferOB) then
   begin
     ResolveIntegerOrderByCol(p^.pOrderBy);
     ResolveStructuralOrderByCol(p^.pOrderBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pOrderBy, 'ORDER');
   end;
+  { resolve.c:2093 — resolve the deferred compound ORDER BY once every leaf
+    of the compound has been resolved.  This iteration (`p` = left-most)
+    runs last, so all pELists are bound and ResolveExpr resolves names
+    against the left-most FROM, matching C's resolveCompoundOrderBy start.
+    Unlike a singleton SELECT, the compound ORDER BY terms are NOT rewritten
+    into pEList aliases — they stay as integer column numbers with
+    u.x.iOrderByCol set, which is what multiSelectOrderBy consumes. }
+  if isCompound and (p^.pPrior = nil) and (pTopSel^.pOrderBy <> nil) then
+    ResolveCompoundOrderBy(pTopSel);
   if p^.pGroupBy <> nil then
   begin
     ResolveIntegerOrderByCol(p^.pGroupBy);

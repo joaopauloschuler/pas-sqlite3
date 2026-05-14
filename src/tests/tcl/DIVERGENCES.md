@@ -305,19 +305,27 @@ lastinsert), which in turn exposes four new engine divergences
 (divbug.7..10).  The two unchanged FAIL buckets (numcast,
 delete-ish remaining) remain on divbug.5 and missing `db one`.
 
-## 9.4.divbug.11 — `multiSelectByMerge: iOrderByCol<=0` assert (compound SELECT ORDER BY) — OPEN
+## 9.4.divbug.11 — `multiSelectByMerge: iOrderByCol<=0` assert (compound SELECT ORDER BY) — FIXED
 
-Affects: 1 test (`../sqlite3/test/select1.test`, `select1-6.22`).
-Symptom: after divbug.1 was fixed, select1.test now runs all the way
-to `select1-6.22` and then aborts with the C-port assertion
-`AssertH FAILED: multiSelectByMerge: iOrderByCol<=0` (stderr).
-`select1-6.22` is a compound (UNION ALL) SELECT with an ORDER BY
-that the merge-sort optimiser path picks up.
-Likely cause: the resolver leaves an ORDER BY term's `iOrderByCol`
-unset (0) for a compound select where the term resolves by name
-rather than by position; `multiSelectOrderBy` then asserts.  Port
-gap in `resolveOrderByTermToExprList` / `multiSelectOrderBy`
-(select.c:2300-ish).  Surfaced by: 9.4.4.b.2 re-sweep.
+Affects: 1 test (`../sqlite3/test/select1.test`, `select1-6.22`/`6.23`).
+Was: select1.test aborted at `select1-6.22` with
+`AssertH FAILED: multiSelectByMerge: iOrderByCol<=0`.
+Root cause: the Pas resolver had no port of `resolveCompoundOrderBy`
+(resolve.c:1589).  The per-select loop in `sqlite3ResolveSelectNames`
+ran `sqlite3ResolveOrderGroupBy` against the top-most compound's
+ORDER BY using only that select's pEList, so a term resolving by
+name against a *different* element of the compound kept
+`iOrderByCol=0` and `multiSelectByMerge` asserted.
+Fix: add `ResolveCompoundOrderBy` (passqlite3codegen.pas ~9763) — a
+port of resolve.c's `resolveCompoundOrderBy` that walks the compound
+chain left-most→top-most, matching each ORDER BY term via the
+integer / `resolveAsName` / resolve-dup-and-structural-compare arms
+and setting `u.x.iOrderByCol`.  The main loop now defers the
+top-most compound's ORDER BY (mirrors resolve.c:2040 `isCompound`
+guard) and calls `ResolveCompoundOrderBy` from the left-most
+iteration (resolve.c:2093).  select1.test now runs past 6.22/6.23
+to completion.  Verified via `bin/TclTestDriver` script + full
+engine regression (`src/tests/build.sh`, no new failures).
 
 ## 9.4.divbug.12 — `update.test` segfaults at `update-17.10` — OPEN
 
