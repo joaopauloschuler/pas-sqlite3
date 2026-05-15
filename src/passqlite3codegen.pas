@@ -42556,7 +42556,16 @@ begin
   if pNew = nil then begin Result := nil; Exit; end;
   pItem := PIdListItem(PByte(IdListItems(pNew)) +
     pNew^.nId * SizeOf(TIdListItem));
+  { build.c:4726 — use sqlite3NameFromToken to dequote any STRING/"id"/[id]
+    tokens that flow into the idlist via `nm ::= STRING` (parse.y:340).
+    Without dequoting, `INSERT INTO t('a','b') VALUES(…)` (emitted by
+    echoUpdate %Q quoting in test8.c:642..654) registers a column name of
+    `'a'` (with the single quotes) and the resolver in sqlite3ColumnIndex
+    raises "no column named 'a'".  9.4.divbug.26.  Parser-unit
+    sqlite3NameFromToken is not visible here — inline the two-step
+    StrNDup+Dequote (cf. analyzeNameFromToken below). }
   pItem^.zName := sqlite3DbStrNDup(db, PChar(pToken^.z), pToken^.n);
+  if pItem^.zName <> nil then sqlite3Dequote(pItem^.zName);
   Inc(pNew^.nId);
   Result := pNew;
 end;
