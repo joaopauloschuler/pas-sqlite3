@@ -1041,13 +1041,55 @@ partial landings cannot silently no-op.
       pre-existing baseline drift, not introduced here).**  STAT4=1
       smoke: same binaries green except TestWhereBasic T28 hard-coded
       size assertion (prereq.b will refresh).
-    - [ ] **10.1.42.b.7.prereq.b** analyze.c STAT4 collection.  Port
-      StatSample/StatAccum STAT4 fields, sampleClear / SetRowid×2 /
-      Copy, sampleIsBetter, sampleInsert STAT4 branches, statInit STAT4
-      alloc arm, statPush / statGet STAT4 branches, sqlite3DeleteIndexSamples
-      real body, loadStat4 reader, analyzeOneTable STAT4 column wiring.
-      ~900 LOC.  STAT4 build smoke: `STAT4=1 src/tests/build.sh` + ANALYZE
-      on test table emits sqlite_stat4 rows.
+    - [X] **10.1.42.b.7.prereq.b** analyze.c STAT4 collection (partial:
+      writer-side complete; loadStat4 reader deferred to .b.7.prereq.c
+      since whereKeyStats / value-from-expr consumers land there too).
+      Landed under `{$IFDEF SQLITE_ENABLE_STAT4}`:
+        * `TStatSample` full record (anEq/anLt/u.aRowid|iRowid/nRowid/
+          isPSample/iCol/iHash) + `TStatAccum` STAT4 tail (nPSample/
+          mxSample/iPrn/aBest/iMin/nSample/nMaxEqZero/iGet/a) at
+          `passqlite3codegen.pas:47093..47129`.
+        * `sampleClear` / `sampleSetRowid` / `sampleSetRowidInt64` /
+          `sampleCopy` at `:47132..47175`.
+        * `statAccumDestructor` STAT4 cleanup arm at `:47179..47204`.
+        * `statInitImpl` STAT4 alloc + a[]/aBest[] layout at
+          `:47230..47286` (analyze.c:429..477).
+        * `sampleIsBetterPost` / `sampleIsBetter` / `sampleAt` / `bestAt`
+          / `sampleInsert` / `samplePushPrevious` at `:47291..47416`
+          (analyze.c:511..681).
+        * `statPushImpl` STAT4 arms — anEq=1 init, anLt accumulation,
+          rowid setter, periodic sample insert, aBest[] update — at
+          `:47432..47498` (analyze.c:720..773).
+        * `statGetImpl` STAT4 branches — STAT_GET_ROWID/_NEQ/_NLT/_NDLT
+          via `sqlite3_str`-equivalent space-joined integers — at
+          `:47517..47578` (analyze.c:818..917).
+        * `sqlite3DeleteIndexSamples` real body at `:48168..48190`
+          (analyze.c:1656..1676).
+        * `openStatTable` extended to open `sqlite_stat4` (cNToOpen=2,
+          cTabCols[1]='tbl,idx,neq,nlt,ndlt,sample') at `:47593..47604`.
+        * `callStatGet` emits `OP_Integer iParam, regStat+1` and uses
+          `1+IsStat4` arg count at `:47655..47668` (analyze.c:935..946).
+        * `analyzeOneTable` STAT4 regRowid load (IdxRowid for rowid
+          tables; MakeRecord-over-PK for WITHOUT ROWID) at `:48056..
+          48075`, and the full STAT_GET_ROWID/NEQ/NLT/NDLT row-emit
+          block with doOnce/mxCol/OP_NotExists|OP_NotFound at
+          `:48097..48148` (analyze.c:1227..1351).
+        * `IsStat4=1` / `SQLITE_STAT4_SAMPLES=24` const block hoisted
+          before the StatAccum types so `aStatFuncs[*].nArg` and
+          `sqlite3VdbeAddFunctionCall(..., 1|2+IsStat4, ...)` build.
+      Default-build smoke: `src/tests/build.sh` — regression 99/100
+      green (sole pre-existing TestFuzzDiff baseline drift), bytecode
+      shape unchanged.  STAT4=1 build smoke: builds clean; ANALYZE on
+      a 10-row INDEX(a,b) emits 10 sqlite_stat4 rows with correct nEq /
+      nLt / nDLt (nEq=3 for the dup'd (1,*) prefix, monotonic nLt/nDLt,
+      sample BLOBs matched).  C-oracle byte-compare deferred — the
+      bundled `/home/bpsa/app/sqlite3/sqlite3` binary is non-STAT4 so
+      direct diff requires a -DSQLITE_ENABLE_STAT4 rebuild of the
+      oracle.  TestWhereBasic T28 trips under STAT4=1 (SizeOf(TIndex)
+      grows by 40 bytes — refresh deferred to landed `IsStat4=1` build
+      convention).  **Deferred to prereq.c**: `loadStat4` /
+      `loadStatTbl` / `initAvgEq` / `findIndexOrPrimaryKey` (reader
+      side; consumed by where.c estimators which already land there).
     - [ ] **10.1.42.b.7.prereq.c** Consumers (rolls in 10.1.42.b.7
       itself).  Port vdbemem.c STAT4 layer (ValueNewStat4Ctx + valueNew +
       valueFromFunction + stat4ValueFromExpr + 2 publics + valueFromExpr

@@ -46957,6 +46957,22 @@ end;
 procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
                           iStatCur, iMem, iTab: i32); forward;
 
+{ STAT_GET_* function selectors (analyze.c:793..797).  Non-STAT4 build
+  only references STAT_GET_STAT1; the others are emitted by the STAT4
+  arms of analyzeOneTable to feed sqlite_stat4. }
+const
+  STAT_GET_STAT1 = 0;
+  STAT_GET_ROWID = 1;
+  STAT_GET_NEQ   = 2;
+  STAT_GET_NLT   = 3;
+  STAT_GET_NDLT  = 4;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  IsStat4              = 1;
+  SQLITE_STAT4_SAMPLES = 24;
+  {$ELSE}
+  IsStat4        = 0;  { non-STAT4 build }
+  {$ENDIF}
+
 { ============================================================
   StatAccum — non-STAT4 layout, port of analyze.c:265..302.
   Trailing tRowcnt[nCol] (anDLt) lives just past the record body,
@@ -46964,9 +46980,27 @@ procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
   ============================================================ }
 type
   PStatAccum = ^TStatAccum;
-  TStatSampleSlim = record
-    anDLt: ^u64;          { tRowcnt = u64 in this build }
+  PStatSample = ^TStatSample;
+  TStatSampleU = record
+    case Integer of
+      0: (iRowid: i64);
+      1: (aRowid: Pu8);
   end;
+  TStatSample = record
+    anDLt:     ^u64;          { tRowcnt = u64 in this build }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    anEq:      ^u64;
+    anLt:      ^u64;
+    u:         TStatSampleU;  { 8 bytes — iRowid or aRowid pointer }
+    nRowid:    u32;           { Sizeof aRowid[] }
+    isPSample: u8;            { True if periodic sample }
+    _pad13:    array[0..2] of u8;
+    iCol:      i32;
+    iHash:     u32;           { Tiebreaker hash }
+    {$ENDIF}
+  end;
+  { Legacy slim alias — uses the same first field as the C non-STAT4 path. }
+  TStatSampleSlim = TStatSample;
   TStatAccum = record
     db:         Pointer;  { sqlite3* — Pointer keeps unit deps minimal }
     nEst:       u64;      { tRowcnt nEst (set from sqlite3_value_int64) }
@@ -46976,16 +47010,95 @@ type
     nKeyCol:    i32;
     nSkipAhead: u8;
     _pad0:      array[0..2] of Byte;  { align trailing pointer }
-    current:    TStatSampleSlim;
+    current:    TStatSample;
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    nPSample:   u64;
+    mxSample:   i32;
+    iPrn:       u32;
+    aBest:      PStatSample;
+    iMin:       i32;
+    nSample:    i32;
+    nMaxEqZero: i32;
+    iGet:       i32;
+    a:          PStatSample;
+    {$ENDIF}
   end;
 
-{ statAccumDestructor — analyze.c:366..377.  Non-STAT4 build: nothing
-  to free in StatSample, just the StatAccum block itself. }
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ sampleClear — analyze.c:307..313.  Free rowid blob (if any). }
+procedure sampleClear(db: PTsqlite3; p: PStatSample);
+begin
+  if p^.nRowid <> 0 then
+  begin
+    sqlite3DbFree(db, p^.u.aRowid);
+    p^.nRowid := 0;
+  end;
+end;
+
+{ sampleSetRowid — analyze.c:319..329.  Set BLOB rowid (WITHOUT ROWID PK). }
+procedure sampleSetRowid(db: PTsqlite3; p: PStatSample; n: i32; pData: Pu8);
+begin
+  if p^.nRowid <> 0 then sqlite3DbFree(db, p^.u.aRowid);
+  p^.u.aRowid := Pu8(sqlite3DbMallocRawNN(db, u64(n)));
+  if p^.u.aRowid <> nil then
+  begin
+    p^.nRowid := u32(n);
+    Move(pData^, p^.u.aRowid^, n);
+  end else
+    p^.nRowid := 0;
+end;
+
+{ sampleSetRowidInt64 — analyze.c:335..340. }
+procedure sampleSetRowidInt64(db: PTsqlite3; p: PStatSample; iRowid: i64);
+begin
+  if p^.nRowid <> 0 then sqlite3DbFree(db, p^.u.aRowid);
+  p^.nRowid   := 0;
+  p^.u.iRowid := iRowid;
+end;
+
+{ sampleCopy — analyze.c:348..360. }
+procedure sampleCopy(p: PStatAccum; pTo, pFrom: PStatSample);
+begin
+  pTo^.isPSample := pFrom^.isPSample;
+  pTo^.iCol      := pFrom^.iCol;
+  pTo^.iHash     := pFrom^.iHash;
+  Move(pFrom^.anEq^,  pTo^.anEq^,  SizeOf(u64) * p^.nCol);
+  Move(pFrom^.anLt^,  pTo^.anLt^,  SizeOf(u64) * p^.nCol);
+  Move(pFrom^.anDLt^, pTo^.anDLt^, SizeOf(u64) * p^.nCol);
+  if pFrom^.nRowid <> 0 then
+    sampleSetRowid(p^.db, pTo, i32(pFrom^.nRowid), pFrom^.u.aRowid)
+  else
+    sampleSetRowidInt64(p^.db, pTo, pFrom^.u.iRowid);
+end;
+{$ENDIF}
+
+{ statAccumDestructor — analyze.c:366..377. }
 procedure statAccumDestructor(p: Pointer); cdecl;
-var pAcc: PStatAccum;
+var
+  pAcc: PStatAccum;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  i: i32;
+  pS: PStatSample;
+  {$ENDIF}
 begin
   pAcc := PStatAccum(p);
   if pAcc = nil then Exit;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  if pAcc^.mxSample <> 0 then
+  begin
+    for i := 0 to pAcc^.nCol - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.aBest) + i * SizeOf(TStatSample));
+      sampleClear(pAcc^.db, pS);
+    end;
+    for i := 0 to pAcc^.mxSample - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.a) + i * SizeOf(TStatSample));
+      sampleClear(pAcc^.db, pS);
+    end;
+    sampleClear(pAcc^.db, @pAcc^.current);
+  end;
+  {$ENDIF}
   sqlite3DbFree(pAcc^.db, pAcc);
 end;
 
@@ -47001,9 +47114,22 @@ var
   nColUp:  i32;
   n:       u64;
   db:      Pointer;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  mxSample: i32;
+  pSpace:   Pu8;
+  i:        i32;
+  pS:       PStatSample;
+  nEstArg:  i64;
+  {$ENDIF}
 begin
   if argc < 4 then Exit;
   db   := sqlite3_context_db_handle(pCtx);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  if OptimizationEnabled(PTsqlite3(db), SQLITE_Stat4) then
+    mxSample := SQLITE_STAT4_SAMPLES
+  else
+    mxSample := 0;
+  {$ENDIF}
   nCol := sqlite3_value_int(Psqlite3_value(argv^));
   AssertH(nCol > 0, 'statInit: nCol>0');
   nColUp  := nCol;     { sizeof(tRowcnt)==8 here, so nColUp==nCol (analyze.c:421) }
@@ -47012,6 +47138,13 @@ begin
   AssertH(nKeyCol > 0,     'statInit: nKeyCol>0');
 
   n := u64(SizeOf(TStatAccum)) + u64(SizeOf(u64)) * u64(nColUp);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  n := n + u64(SizeOf(u64)) * u64(nColUp);   { current.anEq }
+  if mxSample <> 0 then
+    n := n + u64(SizeOf(u64)) * u64(nColUp)                                          { current.anLt }
+           + u64(SizeOf(TStatSample)) * u64(nCol + mxSample)                         { aBest[], a[] }
+           + u64(SizeOf(u64)) * 3 * u64(nColUp) * u64(nCol + mxSample);              { per-sample anEq/anLt/anDLt }
+  {$ENDIF}
   pAcc := PStatAccum(sqlite3DbMallocZero(db, n));
   if pAcc = nil then
   begin
@@ -47020,7 +47153,12 @@ begin
   end;
 
   pAcc^.db         := db;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  nEstArg          := sqlite3_value_int64(Psqlite3_value((argv + 2)^));
+  pAcc^.nEst       := u64(nEstArg);
+  {$ELSE}
   pAcc^.nEst       := u64(sqlite3_value_int64(Psqlite3_value((argv + 2)^)));
+  {$ENDIF}
   pAcc^.nRow       := 0;
   pAcc^.nLimit     := sqlite3_value_int(Psqlite3_value((argv + 3)^));
   pAcc^.nCol       := nCol;
@@ -47029,22 +47167,195 @@ begin
   { current.anDLt = (tRowcnt*)&p[1] — first byte after the record. }
   pAcc^.current.anDLt := Pointer(PByte(pAcc) + SizeOf(TStatAccum));
 
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  pAcc^.current.anEq := Pointer(PByte(pAcc^.current.anDLt) + SizeOf(u64) * nColUp);
+  if pAcc^.nLimit = 0 then pAcc^.mxSample := mxSample
+  else                     pAcc^.mxSample := 0;
+  if mxSample <> 0 then
+  begin
+    pAcc^.nPSample := u64(pAcc^.nEst div u64(mxSample div 3 + 1) + 1);
+    pAcc^.current.anLt := Pointer(PByte(pAcc^.current.anEq) + SizeOf(u64) * nColUp);
+    pAcc^.iPrn := u32($689e962d) * u32(nCol) xor u32($d0944565) * u32(nEstArg);
+    pAcc^.iGet := -1;
+
+    { Set up a[] and aBest[] arrays.  a[] of size mxSample, aBest[] of size nCol. }
+    pAcc^.a     := PStatSample(PByte(pAcc^.current.anLt) + SizeOf(u64) * nColUp);
+    pAcc^.aBest := PStatSample(PByte(pAcc^.a) + SizeOf(TStatSample) * mxSample);
+    pSpace      := Pu8(PByte(pAcc^.a) + SizeOf(TStatSample) * (mxSample + nCol));
+    for i := 0 to (mxSample + nCol) - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.a) + i * SizeOf(TStatSample));
+      pS^.anEq  := Pointer(pSpace); Inc(pSpace, SizeOf(u64) * nColUp);
+      pS^.anLt  := Pointer(pSpace); Inc(pSpace, SizeOf(u64) * nColUp);
+      pS^.anDLt := Pointer(pSpace); Inc(pSpace, SizeOf(u64) * nColUp);
+    end;
+    for i := 0 to nCol - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.aBest) + i * SizeOf(TStatSample));
+      pS^.iCol := i;
+    end;
+  end;
+  {$ENDIF}
+
   { Return the StatAccum pointer as a BLOB.  Only the pointer (the 2nd
     parameter) matters; size is opaque to callers. }
   sqlite3_result_blob(pCtx, pAcc, i32(SizeOf(TStatAccum)),
                       @statAccumDestructor);
 end;
 
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ sampleIsBetterPost — analyze.c:511..525. }
+function sampleIsBetterPost(pAccum: PStatAccum; pNew, pOld: PStatSample): Boolean;
+var i: i32;
+begin
+  for i := pNew^.iCol + 1 to pAccum^.nCol - 1 do
+  begin
+    if pNew^.anEq[i] > pOld^.anEq[i] then Exit(True);
+    if pNew^.anEq[i] < pOld^.anEq[i] then Exit(False);
+  end;
+  Result := pNew^.iHash > pOld^.iHash;
+end;
+
+{ sampleIsBetter — analyze.c:535..552. }
+function sampleIsBetter(pAccum: PStatAccum; pNew, pOld: PStatSample): Boolean;
+var nEqNew, nEqOld: u64;
+begin
+  nEqNew := pNew^.anEq[pNew^.iCol];
+  nEqOld := pOld^.anEq[pOld^.iCol];
+  if nEqNew > nEqOld then Exit(True);
+  if nEqNew = nEqOld then
+  begin
+    if pNew^.iCol < pOld^.iCol then Exit(True);
+    Result := (pNew^.iCol = pOld^.iCol) and sampleIsBetterPost(pAccum, pNew, pOld);
+    Exit;
+  end;
+  Result := False;
+end;
+
+{ sampleAt — index into p->a[i]. }
+function sampleAt(p: PStatAccum; i: i32): PStatSample; inline;
+begin
+  Result := PStatSample(PByte(p^.a) + i * SizeOf(TStatSample));
+end;
+
+function bestAt(p: PStatAccum; i: i32): PStatSample; inline;
+begin
+  Result := PStatSample(PByte(p^.aBest) + i * SizeOf(TStatSample));
+end;
+
+{ sampleInsert — analyze.c:558..640. }
+procedure sampleInsert(p: PStatAccum; pNew: PStatSample; nEqZero: i32);
+label find_new_min;
+var
+  pSample, pOld, pUpgrade, pMin: PStatSample;
+  i, iMin: i32;
+  anEq, anLt, anDLt: ^u64;
+begin
+  pSample := nil;
+
+  if nEqZero > p^.nMaxEqZero then p^.nMaxEqZero := nEqZero;
+  if pNew^.isPSample = 0 then
+  begin
+    pUpgrade := nil;
+    for i := p^.nSample - 1 downto 0 do
+    begin
+      pOld := sampleAt(p, i);
+      if pOld^.anEq[pNew^.iCol] = 0 then
+      begin
+        if pOld^.isPSample <> 0 then Exit;
+        if (pUpgrade = nil) or sampleIsBetter(p, pOld, pUpgrade) then
+          pUpgrade := pOld;
+      end;
+    end;
+    if pUpgrade <> nil then
+    begin
+      pUpgrade^.iCol := pNew^.iCol;
+      pUpgrade^.anEq[pUpgrade^.iCol] := pNew^.anEq[pUpgrade^.iCol];
+      goto find_new_min;
+    end;
+  end;
+
+  { Make room. }
+  if p^.nSample >= p^.mxSample then
+  begin
+    pMin  := sampleAt(p, p^.iMin);
+    anEq  := pMin^.anEq;
+    anLt  := pMin^.anLt;
+    anDLt := pMin^.anDLt;
+    sampleClear(p^.db, pMin);
+    Move(PByte(pMin)[SizeOf(TStatSample)], pMin^,
+         SizeOf(TStatSample) * (p^.nSample - p^.iMin - 1));
+    pSample := sampleAt(p, p^.nSample - 1);
+    pSample^.nRowid := 0;
+    pSample^.anEq   := anEq;
+    pSample^.anDLt  := anDLt;
+    pSample^.anLt   := anLt;
+    p^.nSample := p^.mxSample - 1;
+  end;
+
+  pSample := sampleAt(p, p^.nSample);
+  sampleCopy(p, pSample, pNew);
+  Inc(p^.nSample);
+
+  if nEqZero > 0 then
+    FillChar(pSample^.anEq^, SizeOf(u64) * nEqZero, 0);
+
+find_new_min:
+  if p^.nSample >= p^.mxSample then
+  begin
+    iMin := -1;
+    for i := 0 to p^.mxSample - 1 do
+    begin
+      if sampleAt(p, i)^.isPSample <> 0 then Continue;
+      if (iMin < 0) or sampleIsBetter(p, sampleAt(p, iMin), sampleAt(p, i)) then
+        iMin := i;
+    end;
+    p^.iMin := iMin;
+  end;
+end;
+
+{ samplePushPrevious — analyze.c:650..680. }
+procedure samplePushPrevious(p: PStatAccum; iChng: i32);
+var
+  i, j:  i32;
+  pBest: PStatSample;
+begin
+  for i := p^.nCol - 2 downto iChng do
+  begin
+    pBest := bestAt(p, i);
+    pBest^.anEq[i] := p^.current.anEq[i];
+    if (p^.nSample < p^.mxSample)
+       or sampleIsBetter(p, pBest, sampleAt(p, p^.iMin)) then
+      sampleInsert(p, pBest, i);
+  end;
+  if iChng < p^.nMaxEqZero then
+  begin
+    for i := p^.nSample - 1 downto 0 do
+      for j := iChng to p^.nCol - 1 do
+        if sampleAt(p, i)^.anEq[j] = 0 then
+          sampleAt(p, i)^.anEq[j] := p^.current.anEq[j];
+    p^.nMaxEqZero := iChng;
+  end;
+end;
+{$ENDIF}
+
 { statPushImpl — analyze.c:702..779.  stat_push(P, iChng [,R]).
   Non-STAT4 build: third arg (rowid) is unused.  Updates anDLt[]
   for columns >= iChng on every row except the first, and emits a
-  signal value if the per-loop scan budget is exhausted. }
+  signal value if the per-loop scan budget is exhausted.
+  STAT4 build: also maintains anEq[]/anLt[], rowid blob, periodic
+  samples, and the aBest[] working set. }
 procedure statPushImpl(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pAcc:  PStatAccum;
   iChng: i32;
   i:     i32;
   anDLt: ^u64;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  pVal:  Psqlite3_value;
+  nLt:   u64;
+  pB:    PStatSample;
+  {$ENDIF}
 begin
   if argc < 2 then Exit;
   pAcc  := PStatAccum(sqlite3_value_blob(Psqlite3_value(argv^)));
@@ -47053,13 +47364,62 @@ begin
   AssertH(pAcc^.nCol > 0, 'statPush: nCol>0');
   AssertH(iChng < pAcc^.nCol, 'statPush: iChng<nCol');
 
-  if pAcc^.nRow <> 0 then
+  if pAcc^.nRow = 0 then
   begin
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    for i := 0 to pAcc^.nCol - 1 do
+      pAcc^.current.anEq[i] := 1;
+    {$ENDIF}
+  end else begin
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    if pAcc^.mxSample <> 0 then samplePushPrevious(pAcc, iChng);
+    for i := 0 to iChng - 1 do
+      Inc(pAcc^.current.anEq[i]);
+    {$ENDIF}
     anDLt := pAcc^.current.anDLt;
     for i := iChng to pAcc^.nCol - 1 do
+    begin
       Inc(anDLt[i]);
+      {$IFDEF SQLITE_ENABLE_STAT4}
+      if pAcc^.mxSample <> 0 then
+        pAcc^.current.anLt[i] := pAcc^.current.anLt[i] + pAcc^.current.anEq[i];
+      pAcc^.current.anEq[i] := 1;
+      {$ENDIF}
+    end;
   end;
   Inc(pAcc^.nRow);
+
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  if pAcc^.mxSample <> 0 then
+  begin
+    pVal := Psqlite3_value((argv + 2)^);
+    if sqlite3_value_type(pVal) = SQLITE_INTEGER then
+      sampleSetRowidInt64(pAcc^.db, @pAcc^.current, sqlite3_value_int64(pVal))
+    else
+      sampleSetRowid(pAcc^.db, @pAcc^.current, sqlite3_value_bytes(pVal),
+                     Pu8(sqlite3_value_blob(pVal)));
+    pAcc^.iPrn := pAcc^.iPrn * 1103515245 + 12345;
+    pAcc^.current.iHash := pAcc^.iPrn;
+
+    nLt := pAcc^.current.anLt[pAcc^.nCol - 1];
+    if (nLt div pAcc^.nPSample) <> ((nLt + 1) div pAcc^.nPSample) then
+    begin
+      pAcc^.current.isPSample := 1;
+      pAcc^.current.iCol      := 0;
+      sampleInsert(pAcc, @pAcc^.current, pAcc^.nCol - 1);
+      pAcc^.current.isPSample := 0;
+    end;
+
+    for i := 0 to pAcc^.nCol - 2 do
+    begin
+      pAcc^.current.iCol := i;
+      pB := bestAt(pAcc, i);
+      if (i >= iChng) or sampleIsBetterPost(pAcc, @pAcc^.current, pB) then
+        sampleCopy(pAcc, pB, @pAcc^.current);
+    end;
+    Exit;
+  end;
+  {$ENDIF}
 
   if (pAcc^.nLimit <> 0)
      and (pAcc^.nRow > u64(pAcc^.nLimit) * (u64(pAcc^.nSkipAhead) + 1)) then
@@ -47085,11 +47445,21 @@ var
   iVal:      u64;
   nDistinct: u64;
   nReport:   u64;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  eCall:     i32;
+  pS:        PStatSample;
+  aCnt:      ^u64;
+  {$ENDIF}
 begin
   if argc < 1 then Exit;
   pAcc := PStatAccum(sqlite3_value_blob(Psqlite3_value(argv^)));
   if pAcc = nil then Exit;
 
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  eCall := sqlite3_value_int(Psqlite3_value((argv + 1)^));
+  if eCall = STAT_GET_STAT1 then
+  begin
+  {$ENDIF}
   if pAcc^.nSkipAhead <> 0 then nReport := pAcc^.nEst
   else                          nReport := pAcc^.nRow;
   s := IntToStr(QWord(nReport));
@@ -47102,6 +47472,45 @@ begin
     s := s + ' ' + IntToStr(QWord(iVal));
   end;
   sqlite3_result_text(pCtx, PAnsiChar(s), i32(Length(s)), SQLITE_TRANSIENT);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  end
+  else if eCall = STAT_GET_ROWID then
+  begin
+    if pAcc^.iGet < 0 then
+    begin
+      samplePushPrevious(pAcc, 0);
+      pAcc^.iGet := 0;
+    end;
+    if pAcc^.iGet < pAcc^.nSample then
+    begin
+      pS := sampleAt(pAcc, pAcc^.iGet);
+      if pS^.nRowid = 0 then
+        sqlite3_result_int64(pCtx, pS^.u.iRowid)
+      else
+        sqlite3_result_blob(pCtx, pS^.u.aRowid, i32(pS^.nRowid),
+                            SQLITE_TRANSIENT);
+    end;
+  end
+  else
+  begin
+    aCnt := nil;
+    pS := sampleAt(pAcc, pAcc^.iGet);
+    case eCall of
+      STAT_GET_NEQ: aCnt := pS^.anEq;
+      STAT_GET_NLT: aCnt := pS^.anLt;
+    else
+      aCnt := pS^.anDLt;
+      Inc(pAcc^.iGet);
+    end;
+    s := '';
+    for i := 0 to pAcc^.nCol - 1 do
+    begin
+      if i > 0 then s := s + ' ';
+      s := s + IntToStr(QWord(aCnt[i]));
+    end;
+    sqlite3_result_text(pCtx, PAnsiChar(s), i32(Length(s)), SQLITE_TRANSIENT);
+  end;
+  {$ENDIF}
 end;
 
 var
@@ -47128,12 +47537,12 @@ begin
   aStatFuncs[0].xSFunc    := @statInitImpl;
   aStatFuncs[0].zName     := 'stat_init';
 
-  aStatFuncs[1].nArg      := 2;     { 2+IsStat4; non-STAT4 == 2 }
+  aStatFuncs[1].nArg      := 2 + IsStat4;     { 2+IsStat4; non-STAT4 == 2 }
   aStatFuncs[1].funcFlags := STAT_FUNC_FLAGS;
   aStatFuncs[1].xSFunc    := @statPushImpl;
   aStatFuncs[1].zName     := 'stat_push';
 
-  aStatFuncs[2].nArg      := 1;     { 1+IsStat4; non-STAT4 == 1 }
+  aStatFuncs[2].nArg      := 1 + IsStat4;     { 1+IsStat4; non-STAT4 == 1 }
   aStatFuncs[2].funcFlags := STAT_FUNC_FLAGS;
   aStatFuncs[2].xSFunc    := @statGetImpl;
   aStatFuncs[2].zName     := 'stat_get';
@@ -47155,8 +47564,14 @@ const
   cTabName: array[0..2] of PAnsiChar =
     ('sqlite_stat1', 'sqlite_stat4', 'sqlite_stat3');
   cTabCols: array[0..2] of PAnsiChar =
-    ('tbl,idx,stat', nil, nil);
-  cNToOpen = 1;  { non-STAT4 build }
+    ('tbl,idx,stat',
+     {$IFDEF SQLITE_ENABLE_STAT4} 'tbl,idx,neq,nlt,ndlt,sample', {$ELSE} nil, {$ENDIF}
+     nil);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  cNToOpen = 2;
+  {$ELSE}
+  cNToOpen = 1;
+  {$ENDIF}
 var
   i:          i32;
   db:         PTsqlite3;
@@ -47230,16 +47645,14 @@ end;
   same xFunc resolution path as any other registered function). }
 procedure callStatGet(pParse: PParse; regStat, iParam, regOut: i32);
 begin
-  { Non-STAT4 path: iParam silenced, see analyze.c:941. }
   AssertH((regOut <> regStat) and (regOut <> regStat + 1),
           'callStatGet: regOut overlap');
-  { Look up stat_get by name (matches sqlite3VdbeAddFunctionCall's
-    eventual lookup against db->aFunc).  Until the StatAccum SQL funcs
-    are registered the resolver returns nil and this becomes a no-op
-    OP_Function with P4=nil — same shape as upstream's PRAGMA-only
-    path. }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { STAT4: stat_get takes a second integer argument (the J selector). }
+  sqlite3VdbeAddOp2(sqlite3GetVdbe(pParse), OP_Integer, iParam, regStat + 1);
+  {$ENDIF}
   sqlite3AnalyzeFunctions;  { idempotent — guarantees the FuncDef is set up }
-  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1,
+  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1 + IsStat4,
                              @aStatFuncs[2], 0);  { statGetFuncdef }
 end;
 
@@ -47419,14 +47832,6 @@ end;
 
 { STAT_GET_* function selectors (analyze.c:793..797).  Non-STAT4 build
   only references STAT_GET_STAT1; the others land for shape-parity. }
-const
-  STAT_GET_STAT1 = 0;
-  STAT_GET_ROWID = 1;
-  STAT_GET_NEQ   = 2;
-  STAT_GET_NLT   = 3;
-  STAT_GET_NDLT  = 4;
-  IsStat4        = 0;  { non-STAT4 build }
-
 { analyzeOneTable — port of analyze.c:977..1378.  1:1 body (non-STAT4,
   non-PREUPDATE_HOOK build) — emits the per-index OP_OpenRead /
   stat_init / Rewind / next-row distinct-test / stat_push / Next /
@@ -47473,7 +47878,18 @@ var
   uniqNN:       u32;
   azCollPP:     PPAnsiChar;
   j1, j2, j3:   i32;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  pPk:          PIndex2;
+  pX:           PIndex2;
+  regKey, j, k: i32;
+  regEq, regLt, regDLt, regSample, regCol, regSampleRowid: i32;
+  addrNext, addrIsNull, seekOp, mxCol, nColX: i32;
+  doOnce:       Boolean;
+  {$ENDIF}
 begin
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  doOnce := True;
+  {$ENDIF}
   iMemLocal := iMem;
   iTabLocal := iTab;
   jZeroRows := -1;
@@ -47606,6 +48022,27 @@ begin
       sqlite3DbFree(db, aGotoChng);
     end;
 
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    if OptimizationEnabled(db, SQLITE_Stat4) then
+    begin
+      AssertH(regRowid = regStat + 2, 'analyzeOneTable: regRowid layout (STAT4)');
+      if HasRowid(pTab) then
+        sqlite3VdbeAddOp2(v, OP_IdxRowid, iIdxCur, regRowid)
+      else
+      begin
+        pPk := sqlite3PrimaryKeyIndex(pIdx^.pTable);
+        regKey := sqlite3GetTempRange(pParse, pPk^.nKeyCol);
+        for j := 0 to pPk^.nKeyCol - 1 do
+        begin
+          k := sqlite3TableColumnToIndex(pIdx, Pi16(pPk^.aiColumn)[j]);
+          sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, k, regKey + j);
+          analyzeVdbeCommentIndexWithColumnName(v, pIdx, k);
+        end;
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regKey, pPk^.nKeyCol, regRowid);
+        sqlite3ReleaseTempRange(pParse, regKey, pPk^.nKeyCol);
+      end;
+    end;
+    {$ENDIF}
     {   stat_push(P, regChng, regRowid)
         Next csr ; if !eof goto next_row }
     AssertH(regChng = regStat + 1, 'analyzeOneTable: regChng layout');
@@ -47639,6 +48076,61 @@ begin
     sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
     sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
 
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { Add entries to the stat4 table (analyze.c:1284..1351). }
+    if OptimizationEnabled(db, SQLITE_Stat4) and (db^.nAnalysisLimit = 0) then
+    begin
+      regEq          := regStat1;
+      regLt          := regStat1 + 1;
+      regDLt         := regStat1 + 2;
+      regSample      := regStat1 + 3;
+      regCol         := regStat1 + 4;
+      regSampleRowid := regCol + nCol;
+      if HasRowid(pTab) then seekOp := OP_NotExists
+      else                   seekOp := OP_NotFound;
+
+      if addrGotoEnd = 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Cast, regStat1, SQLITE_AFF_INTEGER);
+        addrGotoEnd := sqlite3VdbeAddOp1(v, OP_IfNot, regStat1);
+      end;
+
+      if doOnce then
+      begin
+        mxCol := nCol;
+        pX := pTab^.pIndex;
+        while pX <> nil do
+        begin
+          if (not HasRowid(pTab)) and ((pX^.idxFlags and 3) = 2) then
+            nColX := pX^.nKeyCol
+          else
+            nColX := pX^.nColumn;
+          if nColX > mxCol then mxCol := nColX;
+          pX := pX^.pNext;
+        end;
+        sqlite3TouchRegister(pParse, regCol + mxCol);
+        doOnce := False;
+        sqlite3ClearTempRegCache(pParse);
+      end;
+
+      addrNext := sqlite3VdbeCurrentAddr(v);
+      callStatGet(pParse, regStat, STAT_GET_ROWID, regSampleRowid);
+      addrIsNull := sqlite3VdbeAddOp1(v, OP_IsNull, regSampleRowid);
+      callStatGet(pParse, regStat, STAT_GET_NEQ,  regEq);
+      callStatGet(pParse, regStat, STAT_GET_NLT,  regLt);
+      callStatGet(pParse, regStat, STAT_GET_NDLT, regDLt);
+      sqlite3VdbeAddOp4Int(v, seekOp, iTabCur, addrNext, regSampleRowid, 0);
+      for i := 0 to nCol - 1 do
+        sqlite3ExprCodeLoadIndexColumn(pParse, pIdx, iTabCur, i, regCol + i);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regCol, nCol, regSample);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regTabname, 6, regTemp);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur + 1, regNewRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, iStatCur + 1, regTemp, regNewRowid);
+      sqlite3VdbeAddOp2(v, OP_Goto, 1, addrNext);
+      sqlite3VdbeJumpHere(v, addrIsNull);
+    end;
+    {$ENDIF}
+
     { End of analysis }
     if addrGotoEnd <> 0 then sqlite3VdbeJumpHere(v, addrGotoEnd);
 
@@ -47662,10 +48154,31 @@ begin
 end;
 
 procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
+{$IFDEF SQLITE_ENABLE_STAT4}
+var
+  j: i32;
+  pS: PIndexSample;
+{$ENDIF}
 begin
-  { analyze.c:1656 — body is gated under SQLITE_ENABLE_STAT4, off in default
-    upstream build.  The non-STAT4 arm is a no-op (UNUSED_PARAMETER pair),
-    which matches the existing implementation. }
+  { analyze.c:1656..1676 — gated under SQLITE_ENABLE_STAT4. }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  AssertH(db <> nil, 'DeleteIndexSamples: db<>nil');
+  AssertH(pIdx <> nil, 'DeleteIndexSamples: pIdx<>nil');
+  if pIdx^.aSample <> nil then
+  begin
+    for j := 0 to pIdx^.nSample - 1 do
+    begin
+      pS := PIndexSample(PByte(pIdx^.aSample) + j * SizeOf(TIndexSample));
+      sqlite3DbFree(db, pS^.p);
+    end;
+    sqlite3DbFree(db, pIdx^.aSample);
+  end;
+  if db^.pnBytesFreed = nil then
+  begin
+    pIdx^.nSample := 0;
+    pIdx^.aSample := nil;
+  end;
+  {$ENDIF}
 end;
 
 function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
