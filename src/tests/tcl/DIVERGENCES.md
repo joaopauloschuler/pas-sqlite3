@@ -284,21 +284,39 @@ is a plan-shape divergence; the query still returns correct rows, so
 the impact is limited to EQP-asserting tests.
 Surfaced by: 9.4.4.d sweep.
 
-## 9.4.divbug.24 — AUTOINCREMENT / `sqlite_sequence` double-create + segfault
+## 9.4.divbug.24 — AUTOINCREMENT / `sqlite_sequence` double-create — FIXED
 
 Affects: 1 test (`../sqlite3/test/aggnested.test`, `aggnested-3.x`).
-Symptom: `aggnested-3.0`/`3.1` error `table sqlite_sequence already
-exists`; `aggnested-3.2`/`3.3` return row-wise instead of folded
-results (`[0 1 0 1 0 1]` vs `[1 0]`); `aggnested-3.11` SIGSEGVs.
-This is the residual cluster divbug.17 explicitly deferred ("aggnested
--3.x failures remain but are an unrelated `sqlite_sequence`/
-AUTOINCREMENT issue") — now assigned its own bucket.
-Likely cause: the `sqlite_sequence` shadow table for AUTOINCREMENT is
-being CREATE'd a second time instead of reused (the
-`OP_OpenWrite sqlite_sequence` / `autoIncBegin` path does not detect
-the existing table), and an aggregate-over-AUTOINCREMENT shape both
-mis-folds and eventually nil-derefs.
+Symptom (original): `aggnested-3.0`/`3.1` error `table sqlite_sequence
+already exists`; `aggnested-3.2`/`3.3` return row-wise instead of
+folded results (`[0 1 0 1 0 1]` vs `[1 0]`); `aggnested-3.11` SIGSEGVs.
+Root cause of the double-CREATE: Pascal `sqlite3CreateTable` did NOT
+port the C `strcmp(p->zName,"sqlite_sequence")==0 → pSchema->pSeqTab=p`
+arm (build.c:2967..2972).  The init.busy reparse of `sqlite_sequence`
+itself never pinned `pSchema^.pSeqTab`, so when the user's NEXT
+AUTOINCREMENT CREATE TABLE checked the early guard
+`pSchema^.pSeqTab = nil` (build.c:2925 equivalent) it tried to
+re-CREATE the shadow.  Fix: port build.c:2968..2970 verbatim into
+codegen.pas:40916+ — pin pSeqTab whenever the table being added under
+init.busy IS named `sqlite_sequence`.
+Status after fix: aggnested-3.0 / 3.1 now return correct rows
+(`{2 1}` / `{1 1}`).  Residual aggregate-mis-fold + segfault tracked
+as **9.4.divbug.24.b** — independent of sqlite_sequence (3.2 has no
+AUTOINCREMENT at all; reproduces folded-row count = group count
+instead of folded result; 3.11 still SIGSEGVs).
 Surfaced by: 9.4.4.d sweep (deferred from divbug.17).
+
+## 9.4.divbug.24.b — aggregate sub-query in correlated GROUP BY mis-folds + segfault
+
+Affects: `../sqlite3/test/aggnested.test` `aggnested-3.1` (after .24
+fix, returns 4 rows `{1 1 1 1}` instead of `{1 1}`), `aggnested-3.2`
+(returns `{0 1 0 1 0 1}` instead of folded `{1 0}`), `aggnested-3.3`,
+`aggnested-3.11` (still SIGSEGV).  No AUTOINCREMENT in 3.2/3.3 — pure
+aggregate-sub-query-in-correlated-GROUP-BY mis-fold.  Likely root:
+the scalar sub-select `(SELECT … FROM t2)` in the outer SELECT list is
+emitted per inner row instead of per GROUP — the GROUP BY fold of the
+inner query is being bypassed for outer rows that carry a sub-query
+expression.  Independent of divbug.24; tracked separately.
 
 ## Run summary (9.4.4.d sweep)
 

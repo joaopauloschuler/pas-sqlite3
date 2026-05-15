@@ -40907,17 +40907,23 @@ begin
     pParse^.pNewTable := nil;
     db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
 
-    { sqlite_sequence pSeqTab pin (build.c:2952..2956).  During init.busy
-      reparse of the AUTOINCREMENT table, pin sqlite_sequence on the
-      schema so autoIncBegin can find it.  May resolve to nil if
-      sqlite_sequence has not yet been reparsed (depends on
-      ParseSchema callback order); autoIncBegin re-attempts the
-      lookup at insert-codegen time as a fallback. }
+    { sqlite_sequence pSeqTab pin (build.c:2963..2972).  When the table
+      being added under init.busy IS sqlite_sequence, pin pSeqTab on its
+      schema so subsequent AUTOINCREMENT CREATEs (and autoIncBegin) can
+      find it without re-CREATEing the shadow.  C cites strcmp(p->zName,
+      "sqlite_sequence")==0 → p->pSchema->pSeqTab = p; (build.c:2968..
+      2970). }
+    if sqlite3StrICmp(pTab^.zName, 'sqlite_sequence') = 0 then
+      passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab := pTab;
+    { Legacy fallback: also try to pin via FindTable when the table being
+      added is itself AUTOINCREMENT (covers reparse-order races where
+      sqlite_sequence may have been reparsed earlier). }
     if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
     begin
-      passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab :=
-        sqlite3FindTable(db, PAnsiChar('sqlite_sequence'),
-                         db^.aDb[iDb].zDbSName);
+      if passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab = nil then
+        passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab :=
+          sqlite3FindTable(db, PAnsiChar('sqlite_sequence'),
+                           db^.aDb[iDb].zDbSName);
     end;
   end;
 
