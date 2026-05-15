@@ -1172,9 +1172,15 @@ partial landings cannot silently no-op.
       `aiRowEst`.  Default build: TestExplainParity 1026/1026, 99/100
       (TestFuzzDiff pre-existing).  STAT4=1: compiles clean, regression
       identical to prereq.c.5 baseline (3 pre-existing fails).
-    - [ ] **10.1.42.b.7.prereq.c.7** Port `whereKeyStats`
+    - [X] **10.1.42.b.7.prereq.c.7** Port `whereKeyStats`
       (where.c:1718..1978) into `src/passqlite3codegen.pas`.  Binary
       search over `aSample[]` returning interpolated `aStat[3]`.
+      Landed: STAT4-gated function added before `whereRangeAdjust`;
+      `PRowCntArr`/`TRowCntArr` hoisted to interface type block so the
+      signature is visible to (eventual) c.8/c.9 callers.  Default build:
+      TestExplainParity 1026/1026, 99/100 (TestFuzzDiff pre-existing).
+      STAT4=1: compiles clean, regression identical to prereq.c.5/c.6
+      baseline (3 pre-existing fails).
     - [ ] **10.1.42.b.7.prereq.c.8** Port `whereRangeSkipScanEst`
       (where.c:1980..2030) + re-enable its WHERETRACE 0x20 arm at host
       site (where.c:2002, 2006).

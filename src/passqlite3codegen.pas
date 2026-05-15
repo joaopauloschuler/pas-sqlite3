@@ -405,6 +405,9 @@ type
   PIndex2   = ^TIndex;   { upgraded from Pointer stub — TIndex defined below }
   {$IFDEF SQLITE_ENABLE_STAT4}
   PIndexSample = ^TIndexSample;   { 10.1.42.b.7.prereq.a — STAT4 sample header }
+  { tRowcnt u64-array view; impl-section duplicate is preserved as-is. }
+  TRowCntArr = array[0..1024*1024-1] of u64;
+  PRowCntArr = ^TRowCntArr;
   {$ENDIF}
   PColumn   = ^TColumn;
   PPColumn  = ^PColumn;
@@ -1912,6 +1915,17 @@ function  columnIsGoodIndexCandidate(pTab: PTable2; iCol: i32): i32;
 function  termCanDriveIndex(pTerm: PWhereTerm; pSrc: PSrcItem;
   notReady: Bitmask): i32;
 function  indexHasStat1(pIdx: PIndex2): i32; inline;
+
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ 10.1.42.b.7.prereq.c.7 — whereKeyStats (where.c:1718..1902).
+  Binary search over pIdx^.aSample[] returning an interpolated count vector
+  in aStat[0..1]: rows < pRec and rows == pRec.  Index returned identifies
+  the smallest virtual sample >= pRec (in the field-prefix-expanded space).
+  Consumers (prereq.c.8/.c.9): whereRangeSkipScanEst / whereEqualScanEst /
+  whereInScanEst. }
+function  whereKeyStats(pParse: PParse; pIdx: PIndex2;
+  pRec: PUnpackedRecord; roundUp: i32; aStat: PRowCntArr): i32;
+{$ENDIF}
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — UNIQUE-index DISTINCT cluster
   (where.c:583..627).  Two leaf helpers feeding the (b) branch of
@@ -15087,6 +15101,135 @@ function indexHasStat1(pIdx: PIndex2): i32; inline;
 begin
   Result := i32((pIdx^.idxFlags shr 7) and 1);
 end;
+
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ whereKeyStats — direct port of where.c:1718..1902.
+  Estimates location of pRec among samples in pIdx^.aSample[].  Writes:
+    aStat[0]  est. rows < pRec
+    aStat[1]  est. rows == pRec
+  Returns index into the virtual (nField-expanded) sample space of the
+  smallest sample >= pRec.  STAT4-only; called from range/equal/IN scan
+  estimators (prereq.c.8/.c.9). }
+function whereKeyStats(pParse: PParse; pIdx: PIndex2;
+  pRec: PUnpackedRecord; roundUp: i32; aStat: PRowCntArr): i32;
+var
+  aSample: PIndexSample;       { pIdx^.aSample[] — record-typed pointer }
+  pSmp:    PIndexSample;       { aSample[iSamp] — renamed: PIndexSample shadow }
+  pSmpPrev: PIndexSample;      { aSample[iSamp-1] for prefix-extension scan }
+  iCol:    i32;                { index of required stats in anEq[] etc. }
+  i:       i32;                { index of first sample >= pRec }
+  iSample: i32;                { smallest sample larger than or equal to pRec }
+  iMin:    i32;                { smallest sample not yet tested }
+  iTest:   i32;                { next sample to test }
+  res:     i32;                { result of comparison }
+  nField:  i32;                { number of fields in pRec }
+  iLower:  u64;                { anLt[]+anEq[] of largest sample pRec is > }
+  iSamp:   i32;                { aSample[] index of test sample }
+  n:       i32;                { number of fields in test sample }
+  iUpper:  u64;
+  iGap:    u64;
+begin
+  { Silence unused-parameter warning when SQLITE_DEBUG is off. }
+  if pParse = nil then ;
+
+  aSample := pIdx^.aSample;
+  iMin    := 0;
+  iLower  := 0;
+  res     := 0;
+  iCol    := 0;
+
+  Assert(pRec <> nil);
+  Assert(pIdx^.nSample > 0);
+  Assert(pRec^.nField > 0);
+
+  if (not HasRowid(pIdx^.pTable))
+     and ((pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY) then
+    nField := i32(pIdx^.nKeyCol)
+  else
+    nField := i32(pIdx^.nColumn);
+  if i32(pRec^.nField) < nField then
+    nField := i32(pRec^.nField);
+  iSample := pIdx^.nSample * nField;
+
+  repeat
+    iTest := (iMin + iSample) div 2;
+    iSamp := iTest div nField;
+    if iSamp > 0 then
+    begin
+      { Proposed effective sample is a prefix of aSample[iSamp]; find shortest
+        prefix of at least (1 + iTest%nField) fields greater than previous. }
+      n := (iTest mod nField) + 1;
+      pSmp     := @aSample[iSamp];
+      pSmpPrev := @aSample[iSamp - 1];
+      while n < nField do
+      begin
+        if pSmpPrev^.anLt[n - 1] <> pSmp^.anLt[n - 1] then Break;
+        Inc(n);
+      end;
+    end
+    else
+    begin
+      n := iTest + 1;
+      pSmp := @aSample[iSamp];
+    end;
+
+    pRec^.nField := u16(n);
+    res := passqlite3vdbe.sqlite3VdbeRecordCompare(pSmp^.n, pSmp^.p, pRec);
+    if res < 0 then
+    begin
+      iLower := pSmp^.anLt[n - 1] + pSmp^.anEq[n - 1];
+      iMin   := iTest + 1;
+    end
+    else if (res = 0) and (n < nField) then
+    begin
+      iLower := pSmp^.anLt[n - 1];
+      iMin   := iTest + 1;
+      res    := -1;
+    end
+    else
+    begin
+      iSample := iTest;
+      iCol    := n - 1;
+    end;
+  until (res = 0) or (iMin >= iSample);
+  i := iSample div nField;
+
+  if res = 0 then
+  begin
+    { pRec equal to sample i. }
+    Assert(iCol = nField - 1);
+    pSmp := @aSample[i];
+    aStat^[0] := pSmp^.anLt[iCol];
+    aStat^[1] := pSmp^.anEq[iCol];
+  end
+  else
+  begin
+    { (iCol+1)-field prefix of aSample[i] is first sample > pRec;
+      or i == nSample → pRec larger than all samples. }
+    if i >= pIdx^.nSample then
+      iUpper := pIdx^.nRowEst0
+    else
+    begin
+      pSmp   := @aSample[i];
+      iUpper := pSmp^.anLt[iCol];
+    end;
+    if iLower >= iUpper then
+      iGap := 0
+    else
+      iGap := iUpper - iLower;
+    if roundUp <> 0 then
+      iGap := (iGap * 2) div 3
+    else
+      iGap := iGap div 3;
+    aStat^[0] := iLower + iGap;
+    aStat^[1] := pIdx^.aAvgEq[nField - 1];
+  end;
+
+  { Restore pRec^.nField before returning. }
+  pRec^.nField := u16(nField);
+  Result := i;
+end;
+{$ENDIF}
 
 function whereRangeAdjust(pTerm: PWhereTerm; nNew: i16): i16;
 var
@@ -39224,9 +39367,7 @@ begin
 end;
 
 {$IFDEF SQLITE_ENABLE_STAT4}
-type
-  PRowCntArr = ^TRowCntArr;
-  TRowCntArr = array[0..1024*1024-1] of u64;
+{ PRowCntArr/TRowCntArr hoisted to interface for whereKeyStats signature. }
 
 { Local tRowcnt array decoder — variant of decodeIntArray that writes
   raw u64 counts (not LogEst) into a tRowcnt vector.  Mirrors the
