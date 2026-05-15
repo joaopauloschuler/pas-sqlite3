@@ -23824,6 +23824,7 @@ var
   apColl:      PPointer;
   pSItem:      PSrcItem;
   base:        Pointer;
+  savedAddrExplainRec: i32;
 label
   end_of_recursive;
 begin
@@ -23953,7 +23954,14 @@ begin
   pSetup        := pFirstRec^.pPrior;
   pSetup^.pNext := nil;
   pSetup^.selFlags := pSetup^.selFlags and (not u32(SF_Compound));
+  { ExplainQueryPlan((pParse, 1, "SETUP")) — select.c:2781.  Push a SETUP
+    node so the setup query's scans nest under it; sqlite3Select does not
+    auto-pop in this port, so save/restore addrExplain manually around the
+    recursion (mirrors the scalar-subquery pattern at codegen.pas:5514). }
+  savedAddrExplainRec := pParse^.addrExplain;
+  sqlite3VdbeExplain(pParse, 1, 'SETUP', []);
   rc := sqlite3Select(pParse, pSetup, @destQueue);
+  pParse^.addrExplain := savedAddrExplainRec;
   pSetup^.selFlags := pSetup^.selFlags or SF_Compound;
   pSetup^.pNext := p;
   if rc <> 0 then goto end_of_recursive;
@@ -23980,7 +23988,11 @@ begin
     fires normally; restore after. }
   pFirstRec^.pPrior := nil;
   pFirstRec^.selFlags := pFirstRec^.selFlags and (not u32(SF_Compound));
+  { ExplainQueryPlan((pParse, 1, "RECURSIVE STEP")) — select.c:2813. }
+  savedAddrExplainRec := pParse^.addrExplain;
+  sqlite3VdbeExplain(pParse, 1, 'RECURSIVE STEP', []);
   sqlite3Select(pParse, p, @destQueue);
+  pParse^.addrExplain := savedAddrExplainRec;
   pFirstRec^.selFlags := pFirstRec^.selFlags or SF_Compound;
   Assert(pFirstRec^.pPrior = nil);
   pFirstRec^.pPrior := pSetup;
@@ -26938,6 +26950,7 @@ var
   addrEnd:     i32;
   addrTopOfLoop: i32;
   addrSkip:    i32;
+  savedAddrExplainSub: i32;
   addrSetAbort: i32;
   addr1:       i32;
   addrOutputRow: i32;
@@ -29369,13 +29382,29 @@ begin
           begin
             { Aggregate-on-subquery arm — Phase 6.13(b)-coagg.  Materialise
               the subquery into an ephemeral rowid table at pItem^.iCursor,
-              then drive a Rewind/updateAccumulator/Next/Close scan. }
+              then drive a Rewind/updateAccumulator/Next/Close scan.
+
+              EQP: C codes this FROM-subquery as a co-routine
+              (fromClauseTermCanBeCoroutine returns 1 for the i==0,nSrc==1
+              case) and emits ExplainQueryPlan((pParse,1,"CO-ROUTINE %!S"))
+              before recursing into sqlite3Select (select.c:8054).  We keep
+              the materialise bytecode shape but reproduce the EQP node so
+              the recursive CTE's SETUP / RECURSIVE STEP children nest
+              correctly underneath.  sqlite3Select does not auto-pop in this
+              port, so save/restore addrExplain manually. }
+            savedAddrExplainSub := pParse^.addrExplain;
+            sqlite3VdbeExplain(pParse, 1, 'CO-ROUTINE %!S', [Pointer(pItem)]);
             sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
             sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
             if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
             begin
               Result := SQLITE_ERROR; Exit;
             end;
+            pParse^.addrExplain := savedAddrExplainSub;
+            { Outer scan of the materialised result — ExplainQueryPlan
+              "SCAN %!S" (where.c:6954 / wherecode.c sqlite3WhereExplainOneScan
+              for an ephemeral / co-routine source). }
+            sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
             addrEnd := sqlite3VdbeMakeLabel(pParse);
             addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
             if p^.pWhere <> nil then
