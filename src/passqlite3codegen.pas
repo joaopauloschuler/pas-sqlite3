@@ -1925,6 +1925,17 @@ function  indexHasStat1(pIdx: PIndex2): i32; inline;
   whereInScanEst. }
 function  whereKeyStats(pParse: PParse; pIdx: PIndex2;
   pRec: PUnpackedRecord; roundUp: i32; aStat: PRowCntArr): i32;
+{ 10.1.42.b.7.prereq.c.8 — whereRangeSkipScanEst (where.c:1980..2049).
+  Sample-driven selectivity estimate for skip-scan range queries.  See
+  body comment near the implementation for details. }
+function  whereRangeSkipScanEst(pParse: PParse;
+                                pLower, pUpper: PWhereTerm;
+                                pLoop: PWhereLoop;
+                                pbDone: Pi32): i32;
+{ Interface forward — body lives later in implementation (vdbemem.c:2127). }
+function  sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
+                                    aff: u8;
+                                    apVal: PPointer): i32;
 {$ENDIF}
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — UNIQUE-index DISTINCT cluster
@@ -15228,6 +15239,130 @@ begin
   { Restore pRec^.nField before returning. }
   pRec^.nField := u16(nField);
   Result := i;
+end;
+
+{ 10.1.42.b.7.prereq.c.8 — whereRangeSkipScanEst (where.c:1980..2049).
+
+  Estimate range-scan selectivity for a skip-scan candidate where the leading
+  index column is not equality-constrained.  Walks pIdx^.aSample[] counting how
+  many samples lie between the extracted lower / upper bound values:
+
+    nLower  := count of samples with sample[i].col[nEq] >= $L
+    nUpper  := count of samples with sample[i].col[nEq] >= $U   (default nSample
+              when $U cannot be extracted, 0 when $U exists in samples)
+
+  When at least one of $L / $U is extractable, the count difference nUpper-nLower
+  drives a LogEst adjustment applied to pLoop^.nOut:
+
+    nAdjust := sqlite3LogEst(p^.nSample) - sqlite3LogEst(nDiff)
+    pLoop^.nOut := pLoop^.nOut - nAdjust
+
+  Closed-range cases where nDiff degenerates to 1 fall through (caller will apply
+  the BETWEEN -75% / 1-64 default model).  *pbDone is set to 1 iff the adjustment
+  was applied; on the no-extract path it is left unchanged.  Returns SQLITE_OK
+  on success or an SQLite error code (typically NOMEM from value allocation). }
+function whereRangeSkipScanEst(pParse: PParse;
+                               pLower, pUpper: PWhereTerm;
+                               pLoop: PWhereLoop;
+                               pbDone: Pi32): i32;
+var
+  p:       PIndex2;
+  nEq:     i32;
+  db:      PTsqlite3;
+  nLower:  i32;
+  nUpper:  i32;
+  rc:      i32;
+  aff:     u8;
+  zAff:    PAnsiChar;
+  pColl:   Pointer;
+  p1, p2, pVal: Psqlite3_value;
+  i:       i32;
+  nDiff:   i32;
+  res:     i32;
+  nAdjust: i32;
+begin
+  p      := pLoop^.u.btree.pIndex;
+  nEq    := i32(pLoop^.u.btree.nEq);
+  db     := pParse^.db;
+  nLower := -1;
+  nUpper := p^.nSample + 1;
+  rc     := SQLITE_OK;
+
+  { sqlite3IndexColumnAffinity(db, p, nEq) — inlined as zColAff[nEq] with
+    sqlite3IndexAffinityStr lazy materialise (matches stat4ValueFromExpr at
+    codegen.pas:61621..61628). }
+  if p^.zColAff = nil then zAff := sqlite3IndexAffinityStr(db, p)
+  else                     zAff := p^.zColAff;
+  if zAff <> nil then aff := u8(zAff[nEq])
+  else                aff := u8(SQLITE_AFF_BLOB);
+
+  p1 := nil; p2 := nil; pVal := nil;
+
+  pColl := sqlite3LocateCollSeq(pParse, PPAnsiChar(p^.azColl)[nEq]);
+
+  if pLower <> nil then
+  begin
+    rc     := sqlite3Stat4ValueFromExpr(pParse, pLower^.pExpr^.pRight,
+                                        aff, PPointer(@p1));
+    nLower := 0;
+  end;
+  if (pUpper <> nil) and (rc = SQLITE_OK) then
+  begin
+    rc := sqlite3Stat4ValueFromExpr(pParse, pUpper^.pExpr^.pRight,
+                                    aff, PPointer(@p2));
+    if p2 <> nil then nUpper := 0
+    else              nUpper := p^.nSample;
+  end;
+
+  if (p1 <> nil) or (p2 <> nil) then
+  begin
+    i := 0;
+    while (rc = SQLITE_OK) and (i < p^.nSample) do
+    begin
+      rc := passqlite3vdbe.sqlite3Stat4Column(Psqlite3(db),
+              p^.aSample[i].p, p^.aSample[i].n, nEq, pVal);
+      if (rc = SQLITE_OK) and (p1 <> nil) then
+      begin
+        res := passqlite3vdbe.sqlite3MemCompare(p1, pVal, pColl);
+        if res >= 0 then Inc(nLower);
+      end;
+      if (rc = SQLITE_OK) and (p2 <> nil) then
+      begin
+        res := passqlite3vdbe.sqlite3MemCompare(p2, pVal, pColl);
+        if res >= 0 then Inc(nUpper);
+      end;
+      Inc(i);
+    end;
+    nDiff := nUpper - nLower;
+    if nDiff <= 0 then nDiff := 1;
+
+    { When both bounds extracted and counts are within one sample, fall through
+      to caller's default closed-range -75% model. }
+    if (nDiff <> 1) or (pUpper = nil) or (pLower = nil) then
+    begin
+      nAdjust := i32(sqlite3LogEst(u64(p^.nSample)))
+               - i32(sqlite3LogEst(u64(nDiff)));
+      pLoop^.nOut := i16(pLoop^.nOut - nAdjust);
+      pbDone^ := 1;
+      {$IFDEF SQLITE_DEBUG}
+      { WHERETRACE(0x20, "range skip-scan regions: %u..%u  adjust=%d est=%d")
+        (where.c:2036..2037). }
+      if (sqlite3WhereTrace and $20) <> 0 then
+        sqlite3DebugPrintf(
+          'range skip-scan regions: %u..%u  adjust=%d est=%d'#10,
+          [u32(nLower), u32(nUpper), -nAdjust, pLoop^.nOut]);
+      {$ENDIF}
+    end;
+  end
+  else
+  begin
+    Assert(pbDone^ = 0);
+  end;
+
+  sqlite3ValueFree(p1);
+  sqlite3ValueFree(p2);
+  sqlite3ValueFree(pVal);
+  Result := rc;
 end;
 {$ENDIF}
 
@@ -61372,16 +61507,11 @@ end;
 
 {$IFDEF SQLITE_ENABLE_STAT4}
 { -----------------------------------------------------------------------
-  sqlite3Stat4ValueFromExpr — forward stub for prereq.c.4 (vdbemem.c:2127).
-  Real port lands in prereq.c.4; until then this stub mirrors the
-  "expression cannot be converted to a sqlite3_value" fallback:
-  *apVal := nil, return SQLITE_OK.  Keeps valueFromFunctionImpl below
-  callable in STAT4=1 builds without dragging in the full Expr->sample
-  pipeline.
+  sqlite3Stat4ValueFromExpr — interface forward (declared near whereKeyStats);
+  full body at vdbemem.c:2127..2134 lives further below.  Listed here as a
+  marker for readers; no separate `forward` is needed since the interface
+  declaration is already visible.
   ----------------------------------------------------------------------- }
-function sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
-                                   aff: u8;
-                                   apVal: PPointer): i32; forward;
 
 { -----------------------------------------------------------------------
   valueFromFunctionImpl — port of vdbemem.c:1701..1799.  STAT4 helper that

@@ -1181,9 +1181,23 @@ partial landings cannot silently no-op.
       TestExplainParity 1026/1026, 99/100 (TestFuzzDiff pre-existing).
       STAT4=1: compiles clean, regression identical to prereq.c.5/c.6
       baseline (3 pre-existing fails).
-    - [ ] **10.1.42.b.7.prereq.c.8** Port `whereRangeSkipScanEst`
+    - [X] **10.1.42.b.7.prereq.c.8** Port `whereRangeSkipScanEst`
       (where.c:1980..2030) + re-enable its WHERETRACE 0x20 arm at host
-      site (where.c:2002, 2006).
+      site (where.c:2002, 2006).  Body landed near whereKeyStats under
+      `{$IFDEF SQLITE_ENABLE_STAT4}`; uses inlined IndexColumnAffinity via
+      zColAff[nEq] with sqlite3IndexAffinityStr fallback; consumes
+      sqlite3Stat4ValueFromExpr (c.4) + sqlite3Stat4Column (c.5) +
+      sqlite3MemCompare + sqlite3LocateCollSeq.  Internal WHERETRACE(0x20)
+      "range skip-scan regions: %u..%u  adjust=%d est=%d" wired under
+      SQLITE_DEBUG.  Interface forward for sqlite3Stat4ValueFromExpr
+      hoisted to the interface section so the consumer's call site
+      compiles ahead of the body.  Call-site wiring inside
+      whereRangeScanEst deferred to c.9 (depends on extending
+      TWhereLoopBuilder with STAT4-only pRec/nRecValid fields together
+      with whereEqualScanEst / whereInScanEst).  Default build:
+      TestExplainParity 1026/1026, 99/100 (TestFuzzDiff pre-existing).
+      STAT4=1: compiles clean, 97/100 == prereq.c.5..c.7 baseline (3
+      pre-existing fails: TestFuzzDiff, TestSQLCorpus, TestWhereBasic).
     - [ ] **10.1.42.b.7.prereq.c.9** Port `whereEqualScanEst`
       (where.c:2274..2330) + `whereInScanEst` (:2338..2380); re-enable
       the 4 deferred WHERETRACE 0x20 arms in `whereLoopAddBtree` host
