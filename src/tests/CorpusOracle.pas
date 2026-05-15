@@ -58,6 +58,19 @@ procedure RunPasOracle(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
                       out outStdout, outStderr: AnsiString;
                       out outRc: i32; out outDbBlob: AnsiString);
 
+{ *Seeded variants — identical to the bare RunC/RunPasOracle except they
+  SKIP the workdir wipe so the caller can plant a pre-existing test.db
+  before invoking the oracle.  Used by TestFuzzDiff (Phase 9.3.1) to feed
+  dbsqlfuzz frames whose db prefix is non-empty.  Same four-channel
+  contract; same row-format. }
+procedure RunCOracleSeeded(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                          out outStdout, outStderr: AnsiString;
+                          out outRc: i32; out outDbBlob: AnsiString);
+
+procedure RunPasOracleSeeded(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                            out outStdout, outStderr: AnsiString;
+                            out outRc: i32; out outDbBlob: AnsiString);
+
 { ApplyHeaderMask — zero the non-deterministic byte ranges of an SQLite
   database file header.  Operates in place on the first 100 bytes.
 
@@ -192,9 +205,10 @@ begin
   Result := 0;
 end;
 
-procedure RunCOracle(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
-                    out outStdout, outStderr: AnsiString;
-                    out outRc: i32; out outDbBlob: AnsiString);
+procedure RunCOracleImpl(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                        bWipe: Boolean;
+                        out outStdout, outStderr: AnsiString;
+                        out outRc: i32; out outDbBlob: AnsiString);
 var
   db      : Pcsq_db;
   dbPath  : AnsiString;
@@ -207,7 +221,7 @@ begin
   outRc     := SQLITE_OK;
   outDbBlob := '';
 
-  WipeWorkDir(zWorkDir);
+  if bWipe then WipeWorkDir(zWorkDir);
   dbPath := IncludeTrailingPathDelimiter(AnsiString(zWorkDir)) + 'test.db';
 
   db    := nil;
@@ -252,9 +266,10 @@ begin
   Result := 0;
 end;
 
-procedure RunPasOracle(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
-                      out outStdout, outStderr: AnsiString;
-                      out outRc: i32; out outDbBlob: AnsiString);
+procedure RunPasOracleImpl(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                          bWipe: Boolean;
+                          out outStdout, outStderr: AnsiString;
+                          out outRc: i32; out outDbBlob: AnsiString);
 var
   db      : PTsqlite3;
   dbPath  : AnsiString;
@@ -267,7 +282,7 @@ begin
   outRc     := SQLITE_OK;
   outDbBlob := '';
 
-  WipeWorkDir(zWorkDir);
+  if bWipe then WipeWorkDir(zWorkDir);
   dbPath := IncludeTrailingPathDelimiter(AnsiString(zWorkDir)) + 'test.db';
 
   db    := nil;
@@ -294,6 +309,42 @@ begin
 
   sqlite3_close(db);
   outDbBlob := ReadFileBlob(dbPath);
+end;
+
+{ ----------------------------------------------------------------------
+  Public entry points: bare (wipe) and seeded (no wipe) variants.
+  ---------------------------------------------------------------------- }
+
+procedure RunCOracle(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                    out outStdout, outStderr: AnsiString;
+                    out outRc: i32; out outDbBlob: AnsiString);
+begin
+  RunCOracleImpl(zSql, zWorkDir, True,
+                 outStdout, outStderr, outRc, outDbBlob);
+end;
+
+procedure RunPasOracle(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                      out outStdout, outStderr: AnsiString;
+                      out outRc: i32; out outDbBlob: AnsiString);
+begin
+  RunPasOracleImpl(zSql, zWorkDir, True,
+                   outStdout, outStderr, outRc, outDbBlob);
+end;
+
+procedure RunCOracleSeeded(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                          out outStdout, outStderr: AnsiString;
+                          out outRc: i32; out outDbBlob: AnsiString);
+begin
+  RunCOracleImpl(zSql, zWorkDir, False,
+                 outStdout, outStderr, outRc, outDbBlob);
+end;
+
+procedure RunPasOracleSeeded(const zSql: PAnsiChar; const zWorkDir: PAnsiChar;
+                            out outStdout, outStderr: AnsiString;
+                            out outRc: i32; out outDbBlob: AnsiString);
+begin
+  RunPasOracleImpl(zSql, zWorkDir, False,
+                   outStdout, outStderr, outRc, outDbBlob);
 end;
 
 end.

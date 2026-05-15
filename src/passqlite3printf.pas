@@ -1254,9 +1254,39 @@ begin
         end;
       'c':
         begin
+          { etCHARX — port of printf.c:751..793.  precision >1 is treated
+            as a repeat count; printf('%.*c',1000,'A') emits 1000 A's.
+            9.2.divbug.I — without this, WAL / multipage / triggers vectors
+            (which generate 1000-byte rows via printf('%.*c',1000,...))
+            stored 1-byte rows and the round-trip mutator probe diverged
+            at 4000+ bytes per page. }
           NextArgI64(iv);
           body := AnsiChar(Byte(iv));
-          emitField(a, body, '', width, -1, leftAlign, False, True);
+          if prec > 1 then
+          begin
+            { Width pad is consumed by the repeat count; mirror C's
+              `width -= precision-1`. Left-align skips the leading-space
+              path entirely (post-pad applied by emitField). }
+            if (width > 1) and (not leftAlign) then
+            begin
+              while width - 1 > 0 do
+              begin
+                accumPutChar(a, ' ');
+                Dec(width);
+              end;
+              width := 0;
+            end
+            else if width > 0 then
+              width := width - (prec - 1);
+            { Emit precision copies of body. }
+            for iv := 1 to prec do
+              accumPut(a, body);
+            { Trailing pad for left-align. }
+            if leftAlign and (width > 0) then
+              while width > 0 do begin accumPutChar(a, ' '); Dec(width); end;
+          end
+          else
+            emitField(a, body, '', width, -1, leftAlign, False, True);
           Inc(p);
         end;
       'p':

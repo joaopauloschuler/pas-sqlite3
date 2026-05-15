@@ -32,67 +32,12 @@ program TestLimitOffset;
 uses
   SysUtils,
   passqlite3types, passqlite3util, passqlite3vdbe,
-  passqlite3codegen, passqlite3main;
+  passqlite3codegen, passqlite3main,
+  TestRowCollectCommon;
 
 var
   db: PTsqlite3;
   failures: i32 = 0;
-
-procedure RunDdl(const sql: AnsiString);
-var
-  pStmt: PVdbe;
-  pTail: PAnsiChar;
-  rcs: i32;
-begin
-  pStmt := nil;
-  pTail := nil;
-  rcs := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, @pTail);
-  if pStmt <> nil then begin
-    repeat rcs := sqlite3_step(pStmt) until rcs <> SQLITE_ROW;
-    sqlite3_finalize(pStmt);
-  end;
-end;
-
-function CollectInts(const sql: AnsiString): AnsiString;
-var
-  pStmt: PVdbe;
-  pTail: PAnsiChar;
-  rcs: i32;
-begin
-  Result := '';
-  pStmt := nil;
-  pTail := nil;
-  rcs := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, @pTail);
-  if pStmt = nil then begin
-    Result := '<prepare-failed rc=' + IntToStr(rcs) + '>';
-    Exit;
-  end;
-  while True do begin
-    rcs := sqlite3_step(pStmt);
-    if rcs = SQLITE_ROW then begin
-      if Result <> '' then Result := Result + ',';
-      Result := Result + IntToStr(sqlite3_column_int(pStmt, 0));
-    end else
-      break;
-  end;
-  sqlite3_finalize(pStmt);
-end;
-
-procedure Expect(const label_: AnsiString; const sql, want: AnsiString);
-var
-  got: AnsiString;
-begin
-  got := CollectInts(sql);
-  if got = want then
-    WriteLn('PASS  ', label_, ' -> ', got)
-  else begin
-    WriteLn('FAIL  ', label_, '  want=[', want, ']  got=[', got, ']');
-    WriteLn('      sql: ', sql);
-    Inc(failures);
-  end;
-end;
-
-var
   i: i32;
 begin
   if sqlite3_open(':memory:', @db) <> SQLITE_OK then begin
@@ -100,19 +45,19 @@ begin
     Halt(2);
   end;
 
-  RunDdl('CREATE TABLE t(a INTEGER PRIMARY KEY, b)');
+  RcRunDdl(db,'CREATE TABLE t(a INTEGER PRIMARY KEY, b)');
   for i := 1 to 10 do
-    RunDdl('INSERT INTO t VALUES(' + IntToStr(i) + ',' + IntToStr(i*10) + ')');
+    RcRunDdl(db,'INSERT INTO t VALUES(' + IntToStr(i) + ',' + IntToStr(i*10) + ')');
 
-  Expect('LIMIT 5 OFFSET 2', 'SELECT a FROM t LIMIT 5 OFFSET 2', '3,4,5,6,7');
-  Expect('LIMIT 3',          'SELECT a FROM t LIMIT 3',           '1,2,3');
-  Expect('LIMIT 3 OFFSET 0', 'SELECT a FROM t LIMIT 3 OFFSET 0',  '1,2,3');
-  Expect('LIMIT 100',        'SELECT a FROM t LIMIT 100',         '1,2,3,4,5,6,7,8,9,10');
-  Expect('LIMIT 0',          'SELECT a FROM t LIMIT 0',           '');
-  Expect('LIMIT 5 OFFSET 8', 'SELECT a FROM t LIMIT 5 OFFSET 8',  '9,10');
-  Expect('LIMIT 5 OFFSET 20','SELECT a FROM t LIMIT 5 OFFSET 20', '');
-  Expect('LIMIT -1',         'SELECT a FROM t LIMIT -1',          '1,2,3,4,5,6,7,8,9,10');
-  Expect('LIMIT -1 OFFSET 7','SELECT a FROM t LIMIT -1 OFFSET 7', '8,9,10');
+  RcExpect(db,'LIMIT 5 OFFSET 2', 'SELECT a FROM t LIMIT 5 OFFSET 2', '3,4,5,6,7', failures);
+  RcExpect(db,'LIMIT 3',          'SELECT a FROM t LIMIT 3',           '1,2,3', failures);
+  RcExpect(db,'LIMIT 3 OFFSET 0', 'SELECT a FROM t LIMIT 3 OFFSET 0',  '1,2,3', failures);
+  RcExpect(db,'LIMIT 100',        'SELECT a FROM t LIMIT 100',         '1,2,3,4,5,6,7,8,9,10', failures);
+  RcExpect(db,'LIMIT 0',          'SELECT a FROM t LIMIT 0',           '', failures);
+  RcExpect(db,'LIMIT 5 OFFSET 8', 'SELECT a FROM t LIMIT 5 OFFSET 8',  '9,10', failures);
+  RcExpect(db,'LIMIT 5 OFFSET 20','SELECT a FROM t LIMIT 5 OFFSET 20', '', failures);
+  RcExpect(db,'LIMIT -1',         'SELECT a FROM t LIMIT -1',          '1,2,3,4,5,6,7,8,9,10', failures);
+  RcExpect(db,'LIMIT -1 OFFSET 7','SELECT a FROM t LIMIT -1 OFFSET 7', '8,9,10', failures);
 
   sqlite3_close(db);
 

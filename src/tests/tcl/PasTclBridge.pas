@@ -1,0 +1,443 @@
+unit PasTclBridge;
+
+{
+  PasTclBridge — minimal FPC <-> Tcl 8.6 C ABI shim.
+
+  All cdecl externs below are first used in
+  /home/bpsa/app/sqlite3/src/tclsqlite.c at the cited line.  The libtcl8.6
+  C entry points are stable across 8.6.x and live in
+  /usr/lib/x86_64-linux-gnu/libtcl8.6.so.0 (Debian/Ubuntu so-name
+  `libtcl8.6.so`, resolved via /etc/ld.so.conf.d).  FPC's `external 'tcl8.6'`
+  emits a DT_NEEDED of `libtcl8.6.so` so ld.so finds the .0 SONAME at run
+  time.
+
+  Notes
+  -----
+  * `Tcl_IncrRefCount` / `Tcl_DecrRefCount` are *macros* in tcl.h (they poke
+    the Tcl_Obj.refCount field directly), so the symbols are not exported
+    from libtcl8.6.so.  We instead bind the always-present debug variants
+    `Tcl_DbIncrRefCount` / `Tcl_DbDecrRefCount` and pass dummy file/line —
+    this is the same fall-back trick the Tcl FFI bindings of TclKit and
+    Python's `tkinter` use, and avoids depending on the Tcl_Obj struct
+    layout from Pascal land.  Cites: tclsqlite.c:752, 620.
+  * Tcl_Obj is opaque to us.  We never read its fields; we round-trip
+    pointers and call accessor functions like `Tcl_GetStringFromObj`.
+  * Calling convention is `cdecl` everywhere (libtcl is plain C).
+  * `Tcl_FindExecutable(NULL)` must be called once before any interp work
+    (Tcl >= 8.5 init contract).  See tclsqlite.c:4581.
+}
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses ctypes;
+
+const
+  { Tcl result codes — tcl.h:475..483, used throughout tclsqlite.c. }
+  TCL_OK         = 0;
+  TCL_ERROR      = 1;
+  TCL_RETURN     = 2;
+  TCL_BREAK      = 3;
+  TCL_CONTINUE   = 4;
+
+  { Tcl string-lifetime markers — passed as the `freeProc` arg of
+    Tcl_SetResult/Tcl_AppendElement etc.  tcl.h:1011..1014. }
+  TCL_STATIC   : Pointer = Pointer(0);
+  TCL_VOLATILE : Pointer = Pointer(1);
+  TCL_DYNAMIC  : Pointer = Pointer(3);
+
+  { Tcl variable / eval flag bits.  tcl.h:885 (TCL_GLOBAL_ONLY),
+    tcl.h:931 (TCL_EVAL_DIRECT), tcl.h:930 (TCL_EVAL_GLOBAL). }
+  TCL_GLOBAL_ONLY = 1;       // tclsqlite.c:887
+  TCL_EVAL_GLOBAL = $20000;  // tclsqlite.c:898 (DbUnlockNotify)
+  TCL_EVAL_DIRECT = $40000;  // tclsqlite.c:757
+
+type
+  PTclInterp = Pointer;
+  PTclObj    = Pointer;
+  PPTclObj   = ^PTclObj;
+  TClientData = Pointer;
+
+  { Tcl_ObjCmdProc — typedef'd in tcl.h:769.  Used by Tcl_CreateObjCommand.
+    Signature: int (*)(ClientData, Tcl_Interp*, int objc, Tcl_Obj* const* objv). }
+  TTclObjCmdProc = function(clientData: TClientData; interp: PTclInterp;
+    objc: cint; objv: PPTclObj): cint; cdecl;
+
+  { Tcl_CmdDeleteProc — typedef'd in tcl.h:760. }
+  TTclCmdDeleteProc = procedure(clientData: TClientData); cdecl;
+
+  { Tcl_CmdProc — the legacy string-based command proc, typedef'd in
+    tcl.h:758.  Signature: int (*)(ClientData, Tcl_Interp*, int argc,
+    const char *argv[]).  Used by the test_md5 commands which were
+    written against the old Tcl_CreateCommand interface. }
+  PPAnsiCharArr = ^PAnsiChar;
+  TTclCmdProc = function(clientData: TClientData; interp: PTclInterp;
+    argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+
+  { Tcl_NRPostProc — typedef'd in tcl.h (NRE callback).  Signature:
+    int (*)(ClientData data[2..], Tcl_Interp*, int result).  The data
+    argument is a ClientData[] of (by Tcl convention) up to 4 slots;
+    we expose it as ^TClientData and index it. }
+  PClientDataArray = ^TClientData;
+  TTclNRPostProc = function(data: PClientDataArray; interp: PTclInterp;
+    result: cint): cint; cdecl;
+
+  { Tcl_CmdInfo — tcl.h struct queried by Tcl_GetCommandInfo.  Field
+    order/types must match tcl.h exactly; only objClientData is read by
+    register_dbstat_vtab (the SqliteDb* behind a `db` command). }
+  PTclCmdInfo = ^TTclCmdInfo;
+  TTclCmdInfo = record
+    isNativeObjectProc: cint;
+    objProc:            Pointer;
+    objClientData:      TClientData;
+    proc:               Pointer;
+    clientData:         TClientData;
+    deleteProc:         Pointer;
+    deleteData:         TClientData;
+    namespacePtr:       Pointer;
+  end;
+
+{ ----------------------------------------------------------------------
+  Interpreter lifecycle.  tclsqlite.c:4583 (CreateInterp), paired Delete. }
+function  Tcl_CreateInterp: PTclInterp; cdecl; external 'tcl8.6';
+procedure Tcl_DeleteInterp(interp: PTclInterp); cdecl; external 'tcl8.6';
+procedure Tcl_FindExecutable(argv0: PChar); cdecl; external 'tcl8.6';  // tclsqlite.c:4581
+
+{ ----------------------------------------------------------------------
+  Script evaluation.  tclsqlite.c:703 (Tcl_Eval), :757 (EvalObjEx). }
+function Tcl_Eval(interp: PTclInterp; script: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_GlobalEval(interp: PTclInterp; command: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_EvalFile(interp: PTclInterp; fileName: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_EvalObjEx(interp: PTclInterp; objPtr: PTclObj; flags: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_EvalObjv(interp: PTclInterp; objc: cint; objv: PPTclObj; flags: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_DuplicateObj(objPtr: PTclObj): PTclObj; cdecl; external 'tcl8.6';
+
+{ Command registration.  tclsqlite.c:4407. }
+function Tcl_CreateObjCommand(interp: PTclInterp; cmdName: PChar;
+  proc: TTclObjCmdProc; clientData: TClientData;
+  deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ Legacy string-based command registration — tcl.h:758.  test_md5.c
+  registers `md5`, `md5file`, etc. via Tcl_CreateCommand. }
+function Tcl_CreateCommand(interp: PTclInterp; cmdName: PChar;
+  proc: TTclCmdProc; clientData: TClientData;
+  deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ NRE (Non-Recursive Eval) command registration — tcl.h (8.6+).
+  tclsqlite.c:4404 registers the `db` command via Tcl_NRCreateCommand so
+  that [db eval]/[db transaction] script bodies can be evaluated without
+  growing the C stack, allowing clean interruption across nested [vwait].
+  Signature matches Tcl_CreateObjCommand plus a second (NRE) objProc. }
+function Tcl_NRCreateCommand(interp: PTclInterp; cmdName: PChar;
+  proc: TTclObjCmdProc; nreProc: TTclObjCmdProc; clientData: TClientData;
+  deleteProc: TTclCmdDeleteProc): Pointer; cdecl; external 'tcl8.6';
+
+{ Tcl_NRCallObjProc — invoked from an objCmd adaptor to dispatch into
+  the NRE-enabled implementation.  tclsqlite.c:4217 (DbObjCmdAdaptor). }
+function Tcl_NRCallObjProc(interp: PTclInterp; proc: TTclObjCmdProc;
+  clientData: TClientData; objc: cint; objv: PPTclObj): cint; cdecl;
+  external 'tcl8.6';
+
+{ Tcl_NREvalObj — schedule objPtr for evaluation by the NRE trampoline
+  rather than evaluating it recursively.  tclsqlite.c:1990, :4004. }
+function Tcl_NREvalObj(interp: PTclInterp; objPtr: PTclObj;
+  flags: cint): cint; cdecl; external 'tcl8.6';
+
+{ Tcl_NRAddCallback — push an NRE continuation; data0..data3 are opaque
+  ClientData slots passed back to the TTclNRPostProc.  tclsqlite.c:1989,
+  :4003. }
+procedure Tcl_NRAddCallback(interp: PTclInterp; postProcPtr: TTclNRPostProc;
+  data0, data1, data2, data3: TClientData); cdecl; external 'tcl8.6';
+
+{ Tcl_GetVersion — runtime Tcl version probe.  tclsqlite.c:1885 (DbUseNre)
+  tests this so a stubs build links against pre-8.6 libraries gracefully. }
+procedure Tcl_GetVersion(major, minor, patchLevel, releaseType: pcint);
+  cdecl; external 'tcl8.6';
+
+{ Command introspection — returns 1 and fills infoPtr if cmdName exists.
+  Used by register_dbstat_vtab (test1.c:8601) to recover the SqliteDb*. }
+function Tcl_GetCommandInfo(interp: PTclInterp; cmdName: PChar;
+  infoPtr: PTclCmdInfo): cint; cdecl; external 'tcl8.6';
+
+{ Command teardown.  tclsqlite.c:2744 (Tcl_DeleteCommand by name in
+  the DB_CLOSE arm of DbObjCmd); token form is the modern API.  Both
+  end up firing the registered TTclCmdDeleteProc (i.e. DbDeleteCmd). }
+function Tcl_DeleteCommand(interp: PTclInterp; cmdName: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_DeleteCommandFromToken(interp: PTclInterp; cmd: Pointer): cint; cdecl; external 'tcl8.6';
+
+{ Result accessors.  tclsqlite.c:874 (GetObjResult), :1451 (SetObjResult),
+  :688 (GetStringResult), :1339 (AppendResult). }
+function  Tcl_GetObjResult(interp: PTclInterp): PTclObj; cdecl; external 'tcl8.6';
+procedure Tcl_SetObjResult(interp: PTclInterp; objPtr: PTclObj); cdecl; external 'tcl8.6';
+function  Tcl_GetStringResult(interp: PTclInterp): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_AppendResult(interp: PTclInterp); cdecl; varargs; external 'tcl8.6';
+
+{ Tcl_Obj <-> string.  tclsqlite.c:1094 (GetString), :535 (GetStringFromObj),
+  :751 (NewStringObj). }
+function Tcl_GetString(objPtr: PTclObj): PChar; cdecl; external 'tcl8.6';
+function Tcl_GetStringFromObj(objPtr: PTclObj; lengthPtr: pcint): PChar; cdecl; external 'tcl8.6';
+function Tcl_NewStringObj(bytes: PChar; length: cint): PTclObj; cdecl; external 'tcl8.6';
+
+{ Numeric / blob Tcl_Obj factories.  tclsqlite.c:872 (NewIntObj),
+  :754 (NewWideIntObj), :1070 (NewDoubleObj), :1056 (NewByteArrayObj). }
+function Tcl_NewIntObj(intValue: cint): PTclObj; cdecl; external 'tcl8.6';
+function Tcl_NewWideIntObj(wideValue: Int64): PTclObj; cdecl; external 'tcl8.6';
+function Tcl_NewDoubleObj(doubleValue: Double): PTclObj; cdecl; external 'tcl8.6';
+function Tcl_NewByteArrayObj(bytes: Pointer; length: cint): PTclObj; cdecl; external 'tcl8.6';
+
+{ Lists.  tclsqlite.c:1046 (NewListObj), :753 (ListObjAppendElement),
+  :1042 (ListObjGetElements). }
+function Tcl_NewListObj(objc: cint; objv: PPTclObj): PTclObj; cdecl; external 'tcl8.6';
+function Tcl_ListObjAppendElement(interp: PTclInterp; listPtr, objPtr: PTclObj): cint; cdecl; external 'tcl8.6';
+function Tcl_ListObjGetElements(interp: PTclInterp; listPtr: PTclObj;
+  objcPtr: pcint; objvPtr: PPointer): cint; cdecl; external 'tcl8.6';
+
+{ Tcl_Obj refcount.  See header note above: macros in tcl.h, so we bind the
+  Db* debug variants and pass dummies.  tclsqlite.c:752, 620 use the macros. }
+function  Tcl_DbIncrRefCount(objPtr: PTclObj; fileName: PChar; line: cint): cint; cdecl; external 'tcl8.6';
+function  Tcl_DbDecrRefCount(objPtr: PTclObj; fileName: PChar; line: cint): cint; cdecl; external 'tcl8.6';
+procedure Tcl_IncrRefCount(objPtr: PTclObj); inline;
+procedure Tcl_DecrRefCount(objPtr: PTclObj); inline;
+
+{ Package + variable plumbing.  tclsqlite.c:4452 (PkgProvide),
+  :887 (SetVar with TCL_GLOBAL_ONLY). }
+function Tcl_PkgProvide(interp: PTclInterp; name, version: PChar): cint; cdecl; external 'tcl8.6';
+function Tcl_GetVar(interp: PTclInterp; varName: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
+function Tcl_SetVar(interp: PTclInterp; varName, newValue: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
+
+{ Two-part (array) variable plumbing.  tclsqlite.c uses Tcl_ObjSetVar2 /
+  Tcl_UnsetVar2 for the `db eval sql arr script` 3-arg form (DbEvalNextCmd
+  at tclsqlite.c:1935..1944).  Tcl_SetVar2 is the string-keyed variant. }
+function Tcl_SetVar2(interp: PTclInterp; part1, part2, newValue: PChar; flags: cint): PChar; cdecl; external 'tcl8.6';
+function Tcl_ObjSetVar2(interp: PTclInterp; part1Ptr, part2Ptr, newValuePtr: PTclObj; flags: cint): PTclObj; cdecl; external 'tcl8.6';
+function Tcl_UnsetVar2(interp: PTclInterp; part1, part2: PChar; flags: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_UnsetVar(interp: PTclInterp; varName: PChar; flags: cint): cint; cdecl; external 'tcl8.6';
+
+{ Tcl_GetVar2Ex — array-aware variable read returning a Tcl_Obj.  Used
+  by the tclvar virtual table's xColumn (test_tclvar.c:270). }
+function Tcl_GetVar2Ex(interp: PTclInterp; part1, part2: PChar; flags: cint): PTclObj; cdecl; external 'tcl8.6';
+
+{ Tcl_LinkVar — bind a Tcl variable to a C/Pascal storage location so
+  reads/writes of the Tcl variable mirror the native variable.  Used by
+  test2.c:740 to expose the I/O-error injection counters to the test
+  harness (sqlite_io_error_pending etc.). }
+const
+  TCL_LINK_INT       = 1;
+  TCL_LINK_DOUBLE    = 2;
+  TCL_LINK_BOOLEAN   = 3;
+  TCL_LINK_STRING    = 4;
+  TCL_LINK_WIDE_INT  = 5;
+  TCL_LINK_READ_ONLY = $80;
+function Tcl_LinkVar(interp: PTclInterp; varName: PChar; addr: Pointer; typ: cint): cint; cdecl; external 'tcl8.6';
+procedure Tcl_UnlinkVar(interp: PTclInterp; varName: PChar); cdecl; external 'tcl8.6';
+
+{ Reset the interpreter result.  tclsqlite.c:2003 (DbEvalNextCmd cleanup). }
+procedure Tcl_ResetResult(interp: PTclInterp); cdecl; external 'tcl8.6';
+
+{ Report a background error — used by hook trampolines when an evaled
+  callback script fails.  tclsqlite.c:851, :880 (DbRollbackHandler /
+  DbWalHandler). }
+procedure Tcl_BackgroundError(interp: PTclInterp); cdecl; external 'tcl8.6';
+
+{ Tcl_Obj -> primitive accessors.  tclsqlite.c:874, :1138, :1146. }
+function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): cint; cdecl; external 'tcl8.6';
+function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';
+function Tcl_GetDoubleFromObj(interp: PTclInterp; objPtr: PTclObj; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
+function Tcl_GetBooleanFromObj(interp: PTclInterp; objPtr: PTclObj; boolPtr: pcint): cint; cdecl; external 'tcl8.6';
+
+{ Boolean Tcl_Obj factory — tclsqlite.c:3289 (DB_EXISTS arm). }
+function Tcl_NewBooleanObj(boolValue: cint): PTclObj; cdecl; external 'tcl8.6';
+
+{ In-place result-obj setters — tclsqlite.c:2735 (Tcl_SetWideIntObj on
+  the GetObjResult), :3119 (Tcl_SetIntObj in DB_COPY). }
+procedure Tcl_SetWideIntObj(objPtr: PTclObj; wideValue: Int64); cdecl; external 'tcl8.6';
+procedure Tcl_SetIntObj(objPtr: PTclObj; intValue: cint); cdecl; external 'tcl8.6';
+
+{ Misc command-arg helpers.  tclsqlite.c:2476. }
+procedure Tcl_WrongNumArgs(interp: PTclInterp; objc: cint; objv: PPTclObj; message: PChar); cdecl; external 'tcl8.6';
+
+{ List introspection — tclsqlite.c:3891 (ListObjLength), :3897 (ListObjIndex). }
+function Tcl_ListObjLength(interp: PTclInterp; listPtr: PTclObj; lengthPtr: pcint): cint; cdecl; external 'tcl8.6';
+function Tcl_ListObjIndex(interp: PTclInterp; listPtr: PTclObj; index: cint; objPtrPtr: PPTclObj): cint; cdecl; external 'tcl8.6';
+
+{ Index-from-table lookup — tclsqlite.c:3900 (Tcl_GetIndexFromObj). }
+function Tcl_GetIndexFromObj(interp: PTclInterp; objPtr: PTclObj;
+  tablePtr: PPChar; msg: PChar; flags: cint; indexPtr: pcint): cint; cdecl; external 'tcl8.6';
+
+{ Tcl allocator — tclsqlite.c:3636 (Tcl_Alloc / Tcl_Free) for stored callbacks. }
+function  Tcl_Alloc(size: cuint): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_Free(ptr: PChar); cdecl; external 'tcl8.6';
+
+{ Tcl_DString — dynamic string builder.  tclsqlite.c:721..725.  Mirrors
+  the C struct tcl.h: { char *string; int length; int spaceAvl;
+  char staticSpace[TCL_DSTRING_STATIC_SIZE=200]; }.  Tcl_DStringValue is
+  a macro in tcl.h (-> dsPtr->string), so we expose it as a Pascal
+  inline that reads the first field directly. }
+type
+  TTclDString = record
+    str:         PChar;
+    length:      cint;
+    spaceAvl:    cint;
+    staticSpace: array[0..199] of AnsiChar;
+  end;
+  PTclDString = ^TTclDString;
+
+procedure Tcl_DStringInit(dsPtr: PTclDString); cdecl; external 'tcl8.6';
+function  Tcl_DStringAppend(dsPtr: PTclDString; bytes: PChar; length: cint): PChar; cdecl; external 'tcl8.6';
+function  Tcl_DStringAppendElement(dsPtr: PTclDString; element: PChar): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_DStringFree(dsPtr: PTclDString); cdecl; external 'tcl8.6';
+function  Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+
+{ ----------------------------------------------------------------------
+  Tcl I/O channels — used by the DB_COPY arm of DbObjCmd
+  (tclsqlite.c:3043..3057, the CSV-import command).  Tcl_Channel is an
+  opaque handle. }
+type
+  TTclChannel = Pointer;
+
+function  Tcl_OpenFileChannel(interp: PTclInterp; fileName, modeString: PChar;
+  permissions: cint): TTclChannel; cdecl; external 'tcl8.6';
+function  Tcl_Close(interp: PTclInterp; chan: TTclChannel): cint; cdecl; external 'tcl8.6';
+function  Tcl_SetChannelOption(interp: PTclInterp; chan: TTclChannel;
+  optionName, newValue: PChar): cint; cdecl; external 'tcl8.6';
+function  Tcl_GetsObj(chan: TTclChannel; objPtr: PTclObj): cint; cdecl; external 'tcl8.6';
+
+{ Misc Tcl_Obj plumbing used by DB_COPY — tclsqlite.c:3055 (NewObj),
+  :3064 (GetByteArrayFromObj), :3110 (SetObjLength). }
+function  Tcl_NewObj: PTclObj; cdecl; external 'tcl8.6';
+function  Tcl_GetByteArrayFromObj(objPtr: PTclObj; lengthPtr: pcint): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_SetObjLength(objPtr: PTclObj; length: cint); cdecl; external 'tcl8.6';
+
+{ ----------------------------------------------------------------------
+  Tcl custom channels — used by the DB_INCRBLOB arm of DbObjCmd
+  (tclsqlite.c:445..511, the IncrblobChannelType / createIncrblobChannel
+  path).  A custom channel is created from a Tcl_ChannelType driver
+  table.  We mirror the tcl.h 8.6 `Tcl_ChannelType` struct exactly: the
+  field order/types must match or Tcl will mis-dispatch driver calls.
+
+  tcl.h (8.6) struct Tcl_ChannelType {
+    const char *typeName;
+    Tcl_ChannelTypeVersion version;        (an enum -> int-sized pointer)
+    Tcl_DriverCloseProc *closeProc;
+    Tcl_DriverInputProc *inputProc;
+    Tcl_DriverOutputProc *outputProc;
+    Tcl_DriverSeekProc *seekProc;
+    Tcl_DriverSetOptionProc *setOptionProc;
+    Tcl_DriverGetOptionProc *getOptionProc;
+    Tcl_DriverWatchProc *watchProc;
+    Tcl_DriverGetHandleProc *getHandleProc;
+    Tcl_DriverClose2Proc *close2Proc;
+    Tcl_DriverBlockModeProc *blockModeProc;
+    Tcl_DriverFlushProc *flushProc;
+    Tcl_DriverHandlerProc *handlerProc;
+    Tcl_DriverWideSeekProc *wideSeekProc;
+    Tcl_DriverThreadActionProc *threadActionProc;
+    Tcl_DriverTruncateProc *truncateProc;
+  }
+  TCL_CHANNEL_VERSION_5 is the symbolic enum value used by tclsqlite.c. }
+const
+  TCL_CHANNEL_VERSION_5 = Pointer(5);
+
+  { Channel access-mode bits — tcl.h:1445..1446, passed to Tcl_CreateChannel. }
+  TCL_READABLE = 1 shl 1;   { = 2 }
+  TCL_WRITABLE = 1 shl 2;   { = 4 }
+
+  { close2Proc flag bits — tcl.h:1465..1466, used by incrblobClose2. }
+  TCL_CLOSE_READ  = 1 shl 1;  { = 2 }
+  TCL_CLOSE_WRITE = 1 shl 2;  { = 4 }
+
+  { seekMode values for the seek driver proc — <unistd.h> SEEK_*. }
+  SEEK_SET = 0;
+  SEEK_CUR = 1;
+  SEEK_END = 2;
+
+type
+  { Driver proc typedefs — tcl.h.  All cdecl. }
+  TTclDriverCloseProc     = function(instanceData: TClientData; interp: PTclInterp): cint; cdecl;
+  TTclDriverClose2Proc    = function(instanceData: TClientData; interp: PTclInterp; flags: cint): cint; cdecl;
+  TTclDriverInputProc     = function(instanceData: TClientData; buf: PChar; bufSize: cint; errorCodePtr: pcint): cint; cdecl;
+  TTclDriverOutputProc    = function(instanceData: TClientData; buf: PChar; toWrite: cint; errorCodePtr: pcint): cint; cdecl;
+  TTclDriverSeekProc      = function(instanceData: TClientData; offset: clong; seekMode: cint; errorCodePtr: pcint): cint; cdecl;
+  TTclDriverWideSeekProc  = function(instanceData: TClientData; offset: Int64; seekMode: cint; errorCodePtr: pcint): Int64; cdecl;
+  TTclDriverWatchProc     = procedure(instanceData: TClientData; mask: cint); cdecl;
+  TTclDriverGetHandleProc = function(instanceData: TClientData; direction: cint; handlePtr: PPointer): cint; cdecl;
+
+  PTclChannelType = ^TTclChannelType;
+  TTclChannelType = record
+    typeName:         PChar;
+    version:          Pointer;
+    closeProc:        TTclDriverCloseProc;
+    inputProc:        TTclDriverInputProc;
+    outputProc:       TTclDriverOutputProc;
+    seekProc:         TTclDriverSeekProc;
+    setOptionProc:    Pointer;
+    getOptionProc:    Pointer;
+    watchProc:        TTclDriverWatchProc;
+    getHandleProc:    TTclDriverGetHandleProc;
+    close2Proc:       TTclDriverClose2Proc;
+    blockModeProc:    Pointer;
+    flushProc:        Pointer;
+    handlerProc:      Pointer;
+    wideSeekProc:     TTclDriverWideSeekProc;
+    threadActionProc: Pointer;
+    truncateProc:     Pointer;
+  end;
+
+function  Tcl_CreateChannel(typePtr: PTclChannelType; chanName: PChar;
+  instanceData: TClientData; mask: cint): TTclChannel; cdecl; external 'tcl8.6';
+procedure Tcl_RegisterChannel(interp: PTclInterp; chan: TTclChannel); cdecl; external 'tcl8.6';
+function  Tcl_UnregisterChannel(interp: PTclInterp; chan: TTclChannel): cint; cdecl; external 'tcl8.6';
+function  Tcl_GetChannelName(chan: TTclChannel): PChar; cdecl; external 'tcl8.6';
+procedure Tcl_SetResult(interp: PTclInterp; result: PChar; freeProc: Pointer); cdecl; external 'tcl8.6';
+
+{ ----------------------------------------------------------------------
+  Pascal-side helpers. }
+procedure InitTclLibrary;
+function  TclEvalGetString(interp: PTclInterp; const cmd: AnsiString): AnsiString;
+
+implementation
+
+{ Tcl_FindExecutable(NULL) is required by Tcl >= 8.5 before *any* interp
+  operation; it initialises the static encoding tables.  Without it the
+  first Tcl_CreateInterp returns nil.  See tclsqlite.c:4581. }
+procedure InitTclLibrary;
+begin
+  Tcl_FindExecutable(nil);
+end;
+
+{ Tcl_DStringValue — macro in tcl.h: ((dsPtr)->string). }
+function Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+begin
+  Result := dsPtr^.str;
+end;
+
+procedure Tcl_IncrRefCount(objPtr: PTclObj); inline;
+begin
+  Tcl_DbIncrRefCount(objPtr, 'PasTclBridge', 0);
+end;
+
+procedure Tcl_DecrRefCount(objPtr: PTclObj); inline;
+begin
+  Tcl_DbDecrRefCount(objPtr, 'PasTclBridge', 0);
+end;
+
+{ Eval `cmd` and read back the current obj-result as a Pascal AnsiString.
+  Returns the result regardless of rc — caller checks rc separately if it
+  matters; for the smoke gate, success is sufficient. }
+function TclEvalGetString(interp: PTclInterp; const cmd: AnsiString): AnsiString;
+var
+  rc: cint;
+  zRes: PChar;
+begin
+  rc := Tcl_Eval(interp, PChar(cmd));
+  zRes := Tcl_GetStringFromObj(Tcl_GetObjResult(interp), nil);
+  if zRes = nil then
+    Result := ''
+  else
+    Result := zRes;
+  if rc <> TCL_OK then
+    { Leave Result populated with the error message Tcl produced. } ;
+end;
+
+end.

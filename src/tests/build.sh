@@ -106,7 +106,7 @@ if [ "${SQLITE_ENABLE_STMT_SCANSTATUS:-0}" != "0" ]; then
   DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STMT_SCANSTATUS"
   echo "SQLITE_ENABLE_STMT_SCANSTATUS=${SQLITE_ENABLE_STMT_SCANSTATUS} — passing -dSQLITE_ENABLE_STMT_SCANSTATUS to fpc (NCYCLE hwtime bracket enabled)."
 fi
-FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
+FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fu$SCRIPT_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {
   local name="$1"
@@ -279,6 +279,9 @@ compile_test DiagWindow        # Tasklist 6.10 step 17: 13 window-fn
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors
+compile_test TestVectorReadOnly
+compile_test TestVectorRoundTrip
+compile_test TestVectorSchemaChange
 compile_test Benchmark
 
 # ---- Phase 10: passqlite3 CLI tool ----

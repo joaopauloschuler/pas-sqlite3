@@ -32,116 +32,7 @@
 program DiagWindow;
 
 uses
-  SysUtils,
-  passqlite3types, passqlite3util, passqlite3vdbe,
-  passqlite3codegen, passqlite3main, csqlite3;
-
-var
-  diverged: i32 = 0;
-
-procedure PasRunSeed(const seed, sql: AnsiString;
-                     out prepRc, stepRc: i32;
-                     out concat: AnsiString);
-var
-  db: PTsqlite3;
-  pStmt: PVdbe;
-  rcs, ncols, i: i32;
-  zT: PAnsiChar;
-  s: AnsiString;
-begin
-  prepRc := -1; stepRc := -1; concat := '';
-  db := nil;
-  if sqlite3_open(':memory:', @db) <> 0 then Exit;
-  if seed <> '' then
-    sqlite3_exec(db, PAnsiChar(seed), nil, nil, nil{%H-});
-  pStmt := nil;
-  prepRc := sqlite3_prepare_v2(db, PAnsiChar(sql), -1, @pStmt, nil);
-  if pStmt <> nil then begin
-    repeat
-      rcs := sqlite3_step(pStmt);
-      stepRc := rcs;
-      if rcs = SQLITE_ROW then begin
-        ncols := sqlite3_column_count(pStmt);
-        s := '[';
-        for i := 0 to ncols - 1 do begin
-          if i > 0 then s := s + ',';
-          zT := PAnsiChar(sqlite3_column_text(pStmt, i));
-          if zT = nil then s := s + 'null'
-          else s := s + AnsiString(zT);
-        end;
-        s := s + ']';
-        if concat <> '' then concat := concat + ';';
-        concat := concat + s;
-      end;
-    until rcs <> SQLITE_ROW;
-    sqlite3_finalize(pStmt);
-  end;
-  sqlite3_close(db);
-end;
-
-procedure CRunSeed(const seed, sql: AnsiString;
-                   out prepRc, stepRc: i32;
-                   out concat: AnsiString);
-var
-  db: Pcsq_db;
-  pStmt: Pcsq_stmt;
-  pTail: PChar;
-  rcs, ncols, i: Int32;
-  zT: PChar;
-  s: AnsiString;
-  pErr: PChar;
-begin
-  prepRc := -1; stepRc := -1; concat := '';
-  db := nil;
-  if csq_open(':memory:', db) <> 0 then Exit;
-  pErr := nil;
-  if seed <> '' then
-    csq_exec(db, PAnsiChar(seed), nil, nil, pErr);
-  pStmt := nil; pTail := nil;
-  prepRc := csq_prepare_v2(db, PAnsiChar(sql), -1, pStmt, pTail);
-  if pStmt <> nil then begin
-    repeat
-      rcs := csq_step(pStmt);
-      stepRc := rcs;
-      if rcs = SQLITE_ROW then begin
-        ncols := csq_column_count(pStmt);
-        s := '[';
-        for i := 0 to ncols - 1 do begin
-          if i > 0 then s := s + ',';
-          zT := csq_column_text(pStmt, i);
-          if zT = nil then s := s + 'null'
-          else s := s + AnsiString(zT);
-        end;
-        s := s + ']';
-        if concat <> '' then concat := concat + ';';
-        concat := concat + s;
-      end;
-    until rcs <> SQLITE_ROW;
-    csq_finalize(pStmt);
-  end;
-  csq_close(db);
-end;
-
-procedure Probe(const lbl, seed, sql: AnsiString);
-var
-  pPrep, pStep, cPrep, cStep: i32;
-  pCat, cCat: AnsiString;
-  ok: Boolean;
-begin
-  PasRunSeed(seed, sql, pPrep, pStep, pCat);
-  CRunSeed  (seed, sql, cPrep, cStep, cCat);
-  ok := (pPrep = cPrep) and (pStep = cStep) and (pCat = cCat);
-  if ok then
-    WriteLn('PASS    ', lbl)
-  else
-  begin
-    Inc(diverged);
-    WriteLn('DIVERGE ', lbl);
-    WriteLn('   sql  =', sql);
-    WriteLn('   Pas: prep=', pPrep, ' step=', pStep, ' rows="', pCat, '"');
-    WriteLn('   C  : prep=', cPrep, ' step=', cStep, ' rows="', cCat, '"');
-  end;
-end;
+  DiagCommon;
 
 const
   Seed1 = 'CREATE TABLE t(a INTEGER, b INTEGER);' +
@@ -158,119 +49,119 @@ const
 
 begin
   // --- Window functions: row_number / rank / dense_rank ---
-  Probe('row_number basic',  Seed1,
+  ProbeRows('row_number basic',  Seed1,
     'SELECT a, row_number() OVER (ORDER BY a) FROM t');
-  Probe('rank basic',        Seed1,
+  ProbeRows('rank basic',        Seed1,
     'SELECT a, rank() OVER (ORDER BY a) FROM t');
-  Probe('dense_rank',        Seed1,
+  ProbeRows('dense_rank',        Seed1,
     'SELECT a, dense_rank() OVER (ORDER BY a) FROM t');
 
   // --- Window aggregates ---
-  Probe('sum() OVER all',    Seed1,
+  ProbeRows('sum() OVER all',    Seed1,
     'SELECT a, sum(b) OVER () FROM t');
-  Probe('sum() running',     Seed1,
+  ProbeRows('sum() running',     Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a) FROM t');
-  Probe('avg() OVER',        Seed1,
+  ProbeRows('avg() OVER',        Seed1,
     'SELECT avg(b) OVER () FROM t');
 
   // --- PARTITION BY ---
-  Probe('partition row_num', Seed2,
+  ProbeRows('partition row_num', Seed2,
     'SELECT grp, val, row_number() OVER (PARTITION BY grp ORDER BY val) FROM g');
-  Probe('partition sum',     Seed2,
+  ProbeRows('partition sum',     Seed2,
     'SELECT grp, sum(val) OVER (PARTITION BY grp) FROM g');
 
   // --- LAG / LEAD ---
-  Probe('lag basic',         Seed1,
+  ProbeRows('lag basic',         Seed1,
     'SELECT a, lag(b,1,0) OVER (ORDER BY a) FROM t');
-  Probe('lead basic',        Seed1,
+  ProbeRows('lead basic',        Seed1,
     'SELECT a, lead(b,1,0) OVER (ORDER BY a) FROM t');
 
   // --- FIRST_VALUE / LAST_VALUE / NTH_VALUE ---
-  Probe('first_value',       Seed1,
+  ProbeRows('first_value',       Seed1,
     'SELECT first_value(b) OVER (ORDER BY a) FROM t');
-  Probe('ntile 2',           Seed1,
+  ProbeRows('ntile 2',           Seed1,
     'SELECT ntile(2) OVER (ORDER BY a) FROM t');
 
   // --- Aggregate with FILTER ---
-  Probe('count filter',      Seed1,
+  ProbeRows('count filter',      Seed1,
     'SELECT count(*) FILTER (WHERE a>1) FROM t');
-  Probe('sum filter',        Seed1,
+  ProbeRows('sum filter',        Seed1,
     'SELECT sum(b) FILTER (WHERE a>1) FROM t');
 
   // --- DISTINCT in aggregate ---
-  Probe('count distinct',    Seed2,
+  ProbeRows('count distinct',    Seed2,
     'SELECT count(DISTINCT grp) FROM g');
-  Probe('sum distinct',      Seed2,
+  ProbeRows('sum distinct',      Seed2,
     'SELECT sum(DISTINCT val) FROM g');
 
   // --- GROUP BY + HAVING ---
-  Probe('group having',      Seed2,
+  ProbeRows('group having',      Seed2,
     'SELECT grp, sum(val) FROM g GROUP BY grp HAVING sum(val) > 5');
-  Probe('group order',       Seed2,
+  ProbeRows('group order',       Seed2,
     'SELECT grp, sum(val) FROM g GROUP BY grp ORDER BY grp DESC');
 
   // --- group_concat with ORDER BY ---
-  Probe('group_concat',      Seed2,
+  ProbeRows('group_concat',      Seed2,
     'SELECT group_concat(val,'','') FROM g WHERE grp=''A''');
-  Probe('group_concat order',Seed2,
+  ProbeRows('group_concat order',Seed2,
     'SELECT group_concat(val,'','' ORDER BY val DESC) FROM g WHERE grp=''B''');
 
   // --- min/max with non-trivial input ---
-  Probe('min agg',           Seed2, 'SELECT min(val) FROM g');
-  Probe('max agg',           Seed2, 'SELECT max(val) FROM g');
-  Probe('total agg',         Seed2, 'SELECT total(val) FROM g');
+  ProbeRows('min agg',           Seed2, 'SELECT min(val) FROM g');
+  ProbeRows('max agg',           Seed2, 'SELECT max(val) FROM g');
+  ProbeRows('total agg',         Seed2, 'SELECT total(val) FROM g');
 
   // --- Built-in window functions not yet exercised ---
-  Probe('percent_rank',      Seed1,
+  ProbeRows('percent_rank',      Seed1,
     'SELECT a, percent_rank() OVER (ORDER BY a) FROM t');
-  Probe('cume_dist',         Seed1,
+  ProbeRows('cume_dist',         Seed1,
     'SELECT a, cume_dist() OVER (ORDER BY a) FROM t');
-  Probe('last_value',        Seed1,
+  ProbeRows('last_value',        Seed1,
     'SELECT a, last_value(b) OVER (ORDER BY a) FROM t');
-  Probe('nth_value 2',       Seed1,
+  ProbeRows('nth_value 2',       Seed1,
     'SELECT a, nth_value(b,2) OVER (ORDER BY a) FROM t');
 
   // --- Multi-window: several distinct OVER clauses in one SELECT ---
-  Probe('multi window',      Seed2,
+  ProbeRows('multi window',      Seed2,
     'SELECT grp, val,' +
     ' row_number() OVER (PARTITION BY grp ORDER BY val),' +
     ' sum(val) OVER (PARTITION BY grp),' +
     ' rank() OVER (ORDER BY val) FROM g');
-  Probe('multi window same partition', Seed2,
+  ProbeRows('multi window same partition', Seed2,
     'SELECT grp,' +
     ' sum(val) OVER (PARTITION BY grp ORDER BY val),' +
     ' avg(val) OVER (PARTITION BY grp ORDER BY val) FROM g');
 
   // --- Frame-spec emission: ROWS/RANGE/GROUPS with bounds ---
-  Probe('rows preceding',    Seed1,
+  ProbeRows('rows preceding',    Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t');
-  Probe('rows following',    Seed1,
+  ProbeRows('rows following',    Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t');
-  Probe('rows unbounded',    Seed1,
+  ProbeRows('rows unbounded',    Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t');
-  Probe('range current',     Seed1,
+  ProbeRows('range current',     Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM t');
-  Probe('range preceding',   Seed1,
+  ProbeRows('range preceding',   Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t');
-  Probe('groups',            Seed2,
+  ProbeRows('groups',            Seed2,
     'SELECT grp, val, sum(val) OVER (ORDER BY val GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM g');
-  Probe('exclude current',   Seed1,
+  ProbeRows('exclude current',   Seed1,
     'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t');
-  Probe('exclude group',     Seed2,
+  ProbeRows('exclude group',     Seed2,
     'SELECT grp, val, sum(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM g');
-  Probe('exclude ties',      Seed2,
+  ProbeRows('exclude ties',      Seed2,
     'SELECT grp, val, sum(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM g');
 
   // --- Subset-gate lifts: outer ORDER BY / LIMIT / DISTINCT with windows ---
-  Probe('window outer order alias', Seed2,
+  ProbeRows('window outer order alias', Seed2,
     'SELECT grp, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM g ORDER BY grp DESC, rn');
-  Probe('window outer order',  Seed2,
+  ProbeRows('window outer order',  Seed2,
     'SELECT grp, row_number() OVER (PARTITION BY grp ORDER BY val) FROM g ORDER BY grp DESC, val');
-  Probe('window outer limit', Seed1,
+  ProbeRows('window outer limit', Seed1,
     'SELECT a, row_number() OVER (ORDER BY a) FROM t LIMIT 2');
-  Probe('window outer offset',Seed1,
+  ProbeRows('window outer offset',Seed1,
     'SELECT a, row_number() OVER (ORDER BY a) FROM t LIMIT 2 OFFSET 1');
-  Probe('window outer distinct', Seed2,
+  ProbeRows('window outer distinct', Seed2,
     'SELECT DISTINCT sum(val) OVER (PARTITION BY grp) FROM g');
 
   WriteLn('Total divergences: ', diverged);

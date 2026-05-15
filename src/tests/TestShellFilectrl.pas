@@ -11,8 +11,8 @@
     - .filectrl chunk_size N           (set, isOk=2, empty stdout)
     - .filectrl chunk_size             (no arg → Usage line, rc=1)
     - .filectrl size_limit             (read, prints -1)
-    - .filectrl persist_wal            (skipped — see note below)
-    - .filectrl --schema main persist_wal (skipped — see note below)
+    - .filectrl persist_wal            (read, prints 0 — 9.4.6.o)
+    - .filectrl --schema main persist_wal (read via --schema shift — 9.4.6.o)
     - .filectrl bogus                  (unknown-control error path)
     - .filectrl data_version           (numeric-line shape only — port
                                         pager's iDataVersion lifecycle
@@ -29,14 +29,11 @@
     - .sha3sum    shell.c.in:11064..11240
 
   Notes:
-    - persist_wal: the port's unix VFS layer does not yet wire
-      SQLITE_FCNTL_PERSIST_WAL in its xFileControl arm (see os_unix.c
-      :4183 in upstream; passqlite3os.pas declares UNIXFILE_PERSIST_WAL
-      but its file-control dispatch is unported).  Upstream returns 0
-      after the FCNTL update; the port leaves -1 (the caller's initial
-      value).  Documented here; gating it would mask the port-VFS gap
-      rather than the .filectrl arm being tested.  Skipped with a
-      header SKIP entry until the VFS arm lands.
+    - persist_wal: 9.4.6.o ported SQLITE_FCNTL_PERSIST_WAL (and
+      POWERSAFE_OVERWRITE / TEMPFILENAME) into the port's unix VFS
+      xFileControl arm via unixModeBit (os_unix.c:4034..4112).  The
+      .filectrl persist_wal read now matches upstream's "0" line on a
+      freshly-seeded non-WAL db.
     - data_version variant uses a shape-only check; the bare numeric
       line differs because the port's sqlite3PagerDataVersion is
       currently driven only by pager_reset/sqlite3PagerSharedLock paths,
@@ -55,59 +52,12 @@ program TestShellFilectrl;
 
 uses
   SysUtils, BaseUnix, Unix,
-  passqlite3types, passqlite3util;
+  passqlite3types, passqlite3util,
+  TestShellCommon;
 
 var
   failCount: i32 = 0;
   passCount: i32 = 0;
-
-function readAll(const path: AnsiString): AnsiString;
-var
-  f: file of Byte;
-  n: SizeInt;
-  buf: array[0..4095] of Byte;
-  i: SizeInt;
-begin
-  Result := '';
-  AssignFile(f, path); {$I-} Reset(f); {$I+}
-  if IOResult <> 0 then Exit;
-  while not Eof(f) do begin
-    BlockRead(f, buf[0], SizeOf(buf), n);
-    if n <= 0 then Break;
-    i := Length(Result);
-    SetLength(Result, i + n);
-    Move(buf[0], Result[i + 1], n);
-  end;
-  CloseFile(f);
-end;
-
-procedure writeFileBytes(const path, body: AnsiString);
-var
-  f: file of Byte;
-begin
-  AssignFile(f, path); Rewrite(f);
-  if Length(body) > 0 then
-    BlockWrite(f, body[1], Length(body));
-  CloseFile(f);
-end;
-
-function findUpstreamSqlite3: AnsiString;
-var
-  z: AnsiString;
-  candidates: array[0..3] of AnsiString;
-  i: SizeInt;
-begin
-  z := GetEnvironmentVariable('UPSTREAM_SQLITE3');
-  if (z <> '') and FileExists(z) then begin Result := z; Exit; end;
-  candidates[0] := '/home/bpsa/app/sqlite3/sqlite3';
-  candidates[1] := ExtractFilePath(ExpandFileName(ParamStr(0))) +
-                   '../../sqlite3/sqlite3';
-  candidates[2] := '/usr/local/bin/sqlite3';
-  candidates[3] := '/usr/bin/sqlite3';
-  for i := 0 to High(candidates) do
-    if FileExists(candidates[i]) then begin Result := candidates[i]; Exit; end;
-  Result := '';
-end;
 
 var
   upstream: AnsiString;
@@ -149,8 +99,8 @@ begin
          binPath + '" ' + argTail +
          ' >"' + actOut + '" 2>&1';
   rcAct := fpsystem(cmd);
-  eOut := readAll(expOut);
-  aOut := readAll(actOut);
+  eOut := ShellReadAll(expOut);
+  aOut := ShellReadAll(actOut);
   ok := (rcExp = rcAct) and (eOut = aOut);
   if ok then begin
     WriteLn('PASS    ', name, ' (rc=', rcAct,
@@ -196,8 +146,8 @@ begin
   cmd := 'cd "' + workDirAct + '" && LD_LIBRARY_PATH="' + libDir + '" "' +
          binPath + '" ' + argTail + ' >"' + actOut + '" 2>&1';
   rcAct := fpsystem(cmd);
-  eOut := readAll(expOut);
-  aOut := readAll(actOut);
+  eOut := ShellReadAll(expOut);
+  aOut := ShellReadAll(actOut);
   if (rcExp = 0) and (rcAct = 0)
      and isOneNumericLine(eOut) and isOneNumericLine(aOut) then begin
     WriteLn('PASS    ', name, ' (shape-only: exp=',
@@ -221,7 +171,7 @@ begin
     'CREATE TABLE u(x INTEGER, y REAL);'#10 +
     'INSERT INTO u VALUES(10,1.5),(20,2.5);'#10;
   sqlFile := path + '.seed.sql';
-  writeFileBytes(sqlFile, seedSql);
+  ShellWriteFileBytes(sqlFile, seedSql);
   fpsystem('"' + upstream + '" "' + path + '" <"' + sqlFile + '" >/dev/null 2>&1');
 end;
 
@@ -248,13 +198,17 @@ begin
   DiffArgv('filectrl-size_limit-read',
     '"' + workDirExp + '/fc.db" ".filectrl size_limit"');
 
-  { persist_wal / --schema NAME persist_wal: SKIPPED.  The port's unix
-    VFS does not implement SQLITE_FCNTL_PERSIST_WAL in xFileControl, so
-    the caller's initial -1 is not overwritten with the current bit,
-    and upstream's 0 / 1 lines diverge.  See header note.  We do still
-    exercise the --schema parser shift via the bogus / size_limit /
-    data_version arms above. }
-  WriteLn('SKIP    filectrl-persist_wal* (port unix VFS lacks PERSIST_WAL arm)');
+  { persist_wal: 9.4.6.o wired SQLITE_FCNTL_PERSIST_WAL into the port's
+    unix VFS xFileControl (via unixModeBit), so the caller's initial -1
+    is now overwritten with the current ctrlFlags bit.  Read on a
+    freshly-seeded (non-WAL) db reports "0". }
+  DiffArgv('filectrl-persist_wal',
+    '"' + workDirExp + '/fc.db" ".filectrl persist_wal"');
+
+  { --schema main persist_wal: same arm reached through the bShifted
+    --schema parser path. }
+  DiffArgv('filectrl-schema-persist_wal',
+    '"' + workDirExp + '/fc.db" ".filectrl --schema main persist_wal"');
 
   { --schema main with size_limit: exercises the bShifted arm without
     relying on PERSIST_WAL being wired. }
@@ -303,7 +257,7 @@ begin
 end;
 
 begin
-  upstream := findUpstreamSqlite3;
+  upstream := FindUpstreamSqlite3;
   InitPaths;
   if upstream = '' then begin
     WriteLn('SKIP    filectrl/sha3sum: no upstream sqlite3 binary found');

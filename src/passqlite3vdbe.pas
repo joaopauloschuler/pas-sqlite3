@@ -643,6 +643,23 @@ type
   PCollSeq  = Pointer;  { CollSeq  — opaque alias for OP_CollSeq param compat }
   PTable    = Pointer;  { Table    — Phase 6 (build.c) }
   PIndex    = Pointer;  { Index    — Phase 6 }
+
+  { Minimal field overlay for struct Table — only the members the
+    update-hook arms of OP_Insert / OP_Delete need (zName@0, aCol@8,
+    tabFlags@48).  Full layout lives in passqlite3codegen.TTable, which
+    this unit deliberately does not see; the offsets below mirror it. }
+  PTableHookFields = ^TTableHookFields;
+  TTableHookFields = record
+    zName:    PAnsiChar;            { @0  }
+    aCol:     Pointer;              { @8  }
+    pad0:     array[0..31] of Byte; { @16 — pIndex..nTabRef }
+    tabFlags: u32;                  { @48 }
+  end;
+
+  { Post-update hook callback — sqlite3.xUpdateCallback.
+    void(*)(void*,int,const char*,const char*,sqlite3_int64). }
+  TUpdateCallbackFn = procedure(pArg: Pointer; op: i32;
+    zDb, zTbl: PAnsiChar; rowid: i64); cdecl;
   PExpr     = Pointer;  { Expr     — Phase 6 (expr.c) }
   PParse    = Pointer;  { Parse    — Phase 7 (tokenize.c / parse.y) }
   PVList    = Pointer;  { VList (int array) — Phase 6 }
@@ -1444,6 +1461,18 @@ function  sqlite3OpcodeName(n: i32): PAnsiChar;
 var
   gVdbeTraceBuf: AnsiString;
 
+{ Phase 9.1.6 — opcode coverage counters.  When gVdbeOpCoverageEnabled
+  is non-zero the dispatch loop bumps gVdbeOpCoverage[opcode] once per
+  step.  Default-off (zero) so non-coverage builds pay one branch per
+  step.  Consumers (bin/TestSQLCorpus --coverage) flip the flag, run
+  the corpus, then walk the array and assert every opcode reachable
+  from passqlite3codegen is non-zero.  See tasklist 9.1.6. }
+const
+  SQLITE_NUM_OPCODES = 192;  { 0..191 inclusive (vdbe.pas:67). }
+var
+  gVdbeOpCoverage: array[0..SQLITE_NUM_OPCODES - 1] of u64;
+  gVdbeOpCoverageEnabled: i32;
+
 { sqlite3BuiltinFunctions — global table of built-in SQL functions (callback.c).
   Initialized by sqlite3RegisterBuiltinFunctions. }
 var
@@ -1577,6 +1606,15 @@ var
                                                 the synthesised "PRAGMA name(arg)"
                                                 statement.  Codegen cannot import
                                                 main directly (circular). }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+type
+  TVdbePreUpdateHookFn = procedure(v: Pointer; pCsr: PVdbeCursor; op: i32;
+    zDb: PAnsiChar; pTab: Pointer; iKey1: i64; iReg: i32; iBlobWrite: i32);
+var
+  { wired by passqlite3codegen at init — invokes the pre-update callback.
+    Codegen owns the body (needs Table/Index/KeyInfo layouts). }
+  gVdbePreUpdateHook:      TVdbePreUpdateHookFn;
+{$ENDIF}
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -1686,6 +1724,8 @@ function sqlite3_bind_parameter_index(pStmt: PVdbe; zName: PAnsiChar): i32;
 function sqlite3VdbeParameterIndex(p: PVdbe; zName: PAnsiChar; nName: i32): i32;
 
 { --- vdbeapi.c — sqlite3_result_* context-result setters (Phase 6.6) --- }
+procedure setResultStrOrError(pCtx: Psqlite3_context; z: PAnsiChar;
+                              n: i32; enc: u8; xDel: TxDelProc);
 procedure sqlite3_result_null(pCtx: Psqlite3_context);
 procedure sqlite3_result_int(pCtx: Psqlite3_context; iVal: i32);
 procedure sqlite3_result_int64(pCtx: Psqlite3_context; iVal: i64);
@@ -1806,6 +1846,14 @@ var
 
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
+
+{ Undocumented test-only global incremented by OP_Sort / OP_SorterSort
+  (vdbe.c:79, vdbe.c:6350, guarded by SQLITE_TEST).  Regression tests
+  (e.g. between.test's `queryplan` proc) read it via the Tcl-linked
+  `sqlite_sort_count` variable to verify the optimizer correctly
+  elides sorts.  Always present here; harmless when unused. }
+var
+  sqlite3_sort_count: i32 = 0;
 
 implementation
 
@@ -4216,13 +4264,41 @@ begin
     Write('SQL: [', z, ']'#10);
 end;
 
-{ vdbeaux.c:2520..2543 — SQLITE_ENABLE_IOTRACE-gated.  This port does not
-  wire SQLITE_ENABLE_IOTRACE (no sqlite3IoTrace dispatch installed), so
-  the body is a faithful no-op matching the !ENABLE_IOTRACE branch. }
+{ vdbeaux.c:2519 — sqlite3VdbeIOTraceSql.  Upstream is SQLITE_ENABLE_IOTRACE-
+  gated; this port does not compile that macro, but the sqlite3IoTrace hook
+  variable now exists unconditionally, so dispatch faithfully whenever a sink
+  has been installed.  When sqlite3IoTrace is nil (the default) this is the
+  same no-op as the !ENABLE_IOTRACE branch.  Whitespace is collapsed into
+  single spaces exactly as the C loop does. }
 procedure sqlite3VdbeIOTraceSql(p: PVdbe);
+var
+  pOp: PVdbeOp;
+  z:   array[0..999] of AnsiChar;
+  i, j, nCopy: i32;
 begin
-  { sqlite3IoTrace is unset in this build; nothing to emit. }
-  if p = nil then Exit;
+  if not Assigned(sqlite3IoTrace) then Exit;
+  if (p = nil) or (p^.nOp < 1) then Exit;
+  pOp := @p^.aOp[0];
+  if (pOp^.opcode = OP_Init) and (pOp^.p4.z <> nil) then begin
+    { C: sqlite3_snprintf(sizeof(z), z, "%s", pOp->p4.z) — a bounded copy. }
+    nCopy := strlen(pOp^.p4.z);
+    if nCopy > SizeOf(z) - 1 then nCopy := SizeOf(z) - 1;
+    if nCopy > 0 then Move(pOp^.p4.z^, z[0], nCopy);
+    z[nCopy] := #0;
+    i := 0;
+    while (z[i] <> #0) and (sqlite3Isspace(u8(z[i])) <> 0) do Inc(i);
+    j := 0;
+    while z[i] <> #0 do begin
+      if sqlite3Isspace(u8(z[i])) <> 0 then begin
+        if z[i - 1] <> ' ' then begin z[j] := ' '; Inc(j); end;
+      end else begin
+        z[j] := z[i]; Inc(j);
+      end;
+      Inc(i);
+    end;
+    z[j] := #0;
+    sqlite3IoTrace(@z[0]);
+  end;
 end;
 
 { --- VdbeHalt, VdbeReset, VdbeFinalize --- }
@@ -4729,8 +4805,8 @@ begin
     pAd := PAuxData(sqlite3DbMallocZero(pVm^.db, SizeOf(TAuxData)));
     if pAd = nil then
     begin
+      { failed: — vdbeapi.c sqlite3_set_auxdata }
       if Assigned(xDelete) then xDelete(pAux);
-      if pCtx^.isError = 0 then pCtx^.isError := SQLITE_NOMEM;
       Exit;
     end;
     pAd^.iAuxOp   := pCtx^.iOp;
@@ -4778,7 +4854,7 @@ begin
     sqlite3_result_error_toobig(pCtx);
     Exit;
   end;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, i64(n), enc, xDel);
+  setResultStrOrError(pCtx, z, i32(n), enc, xDel);
 end;
 
 { --- sqlite3VdbeCreate / sqlite3VdbeDelete --- }
@@ -4841,26 +4917,35 @@ begin
     vdbeReleaseColNames(p^.aColName, i32(p^.nResAlloc) * COLNAME_N);
     sqlite3DbFree(db, p^.aColName);
   end;
-  { Free aMem registers }
-  if p^.aMem <> nil then begin
-    for i := 0 to p^.nMem - 1 do begin
-      if (p^.aMem[i].flags and (MEM_Dyn or MEM_Agg)) <> 0 then
-        sqlite3VdbeMemRelease(@p^.aMem[i]);
+  { Gate aMem / aVar / pVList / pFree release on eVdbeState != INIT.
+    Trigger sub-vdbes (codeRowTrigger) are created via VdbeCreate, never
+    transit VdbeMakeReady, and are deleted while still in VDBE_INIT_STATE.
+    Their nVar/aVar/aMem/pVList/pFree fields are raw-malloc garbage in
+    that case (VdbeCreate only zeroes from aOp onwards — see vdbeaux.c:30
+    and the comment in TVdbe at the "Zero-initialised boundary" line).
+    C mirrors this gate at vdbeaux.c:3747..3751 (9.2.divbug.J). }
+  if p^.eVdbeState <> VDBE_INIT_STATE then begin
+    { Free aMem registers }
+    if p^.aMem <> nil then begin
+      for i := 0 to p^.nMem - 1 do begin
+        if (p^.aMem[i].flags and (MEM_Dyn or MEM_Agg)) <> 0 then
+          sqlite3VdbeMemRelease(@p^.aMem[i]);
+      end;
     end;
+    if p^.pVList <> nil then begin
+      sqlite3DbNNFreeNN(db, p^.pVList);
+      p^.pVList := nil;
+    end;
+    { Release any bound parameter Mem cells.  Mirrors vdbeaux.c:3748 —
+      releaseMemArray(p->aVar, p->nVar).  Required so bind-pointer /
+      bind-text/blob destructors fire on finalize. }
+    if (p^.aVar <> nil) and (p^.nVar > 0) then begin
+      for i := 0 to p^.nVar - 1 do
+        sqlite3VdbeMemRelease(p^.aVar + i);
+    end;
+    if p^.pFree <> nil then
+      sqlite3DbFree(db, p^.pFree);
   end;
-  if p^.pVList <> nil then begin
-    sqlite3DbNNFreeNN(db, p^.pVList);
-    p^.pVList := nil;
-  end;
-  { Release any bound parameter Mem cells.  Mirrors vdbeaux.c:3748 —
-    releaseMemArray(p->aVar, p->nVar).  Required so bind-pointer /
-    bind-text/blob destructors fire on finalize. }
-  if (p^.aVar <> nil) and (p^.nVar > 0) then begin
-    for i := 0 to p^.nVar - 1 do
-      sqlite3VdbeMemRelease(p^.aVar + i);
-  end;
-  if p^.pFree <> nil then
-    sqlite3DbFree(db, p^.pFree);
   sqlite3DbFree(db, p^.zErrMsg);
   sqlite3DbFree(db, p^.zSql);
   sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);
@@ -5716,6 +5801,9 @@ end;
 { --- sqlite3_step / sqlite3_reset / sqlite3_finalize (vdbeapi.c:771) --- }
 
 function sqlite3_step(pStmt: PVdbe): i32;
+type
+  { vdbeapi.c:72 — legacy sqlite3_profile callback shape. }
+  TVdbeLegacyProfileFn = procedure(p: Pointer; zSql: PAnsiChar; tm: u64); cdecl;
 var
   rc: i32;
   db: PTsqlite3;
@@ -5765,6 +5853,9 @@ begin
     iNowProf := 0;
     sqlite3OsCurrentTimeInt64(Psqlite3_vfs(db^.pVfs), @iNowProf);
     iElapse := (iNowProf - pStmt^.startTime) * 1000000;
+    { vdbeapi.c:70..73 — NOT SQLITE_OMIT_DEPRECATED: legacy xProfile. }
+    if Assigned(db^.xProfile) then
+      TVdbeLegacyProfileFn(db^.xProfile)(db^.pProfileArg, pStmt^.zSql, iElapse);
     if ((db^.mTrace and SQLITE_TRACE_PROFILE) <> 0)
        and Assigned(db^.trace.xV2) then
       db^.trace.xV2(SQLITE_TRACE_PROFILE, db^.pTraceArg, pStmt, @iElapse);
@@ -5831,18 +5922,43 @@ begin
   sqlite3VdbeMemSetDouble(pCtx^.pOut, rVal);
 end;
 
+{ vdbeapi.c:387 — setResultStrOrError.  After setting the result text on
+  the function's pOut Mem, convert it to pCtx->enc so downstream column
+  output sees bytes in the requested encoding.  Fixes bucket-K: hex()
+  over a UTF-16 text value previously left the hex digits tagged
+  SQLITE_UTF8 inside a UTF-16 database, and column_text returned the
+  raw ASCII bytes wearing a UTF-16 label. }
+procedure setResultStrOrError(pCtx: Psqlite3_context; z: PAnsiChar;
+                              n: i32; enc: u8; xDel: TxDelProc);
+var
+  pOut: PMem;
+  rc:   i32;
+begin
+  pOut := pCtx^.pOut;
+  rc := sqlite3VdbeMemSetStr(pOut, z, n, enc, xDel);
+  if rc <> 0 then
+  begin
+    if rc = SQLITE_TOOBIG then sqlite3_result_error_toobig(pCtx)
+    else sqlite3_result_error_nomem(pCtx);
+    Exit;
+  end;
+  sqlite3VdbeChangeEncoding(pOut, pCtx^.enc);
+  if sqlite3VdbeMemTooBig(pOut) <> 0 then
+    sqlite3_result_error_toobig(pCtx);
+end;
+
 procedure sqlite3_result_text(pCtx: Psqlite3_context; z: PAnsiChar;
   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, SQLITE_UTF8, xDel);
+  setResultStrOrError(pCtx, z, n, SQLITE_UTF8, xDel);
 end;
 
 procedure sqlite3_result_blob(pCtx: Psqlite3_context; z: Pointer;
   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, 0, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n, 0, xDel);
 end;
 
 { vdbeapi.c:880 — wide-length blob result.  Mirrors sqlite3_result_blob
@@ -5857,7 +5973,7 @@ begin
     sqlite3_result_error_toobig(pCtx);
     Exit;
   end;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, z, i64(n), 0, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), i32(n), 0, xDel);
 end;
 
 procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
@@ -5887,8 +6003,8 @@ procedure sqlite3_result_text16(pCtx: Psqlite3_context; z: Pointer;
                                 n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
-                       SQLITE_UTF16NATIVE, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n and (not 1),
+                      SQLITE_UTF16NATIVE, xDel);
 end;
 
 { vdbeapi.c:625 — sqlite3_result_text16be. }
@@ -5896,8 +6012,8 @@ procedure sqlite3_result_text16be(pCtx: Psqlite3_context; z: Pointer;
                                   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
-                       SQLITE_UTF16BE, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n and (not 1),
+                      SQLITE_UTF16BE, xDel);
 end;
 
 { vdbeapi.c:634 — sqlite3_result_text16le. }
@@ -5905,8 +6021,8 @@ procedure sqlite3_result_text16le(pCtx: Psqlite3_context; z: Pointer;
                                   n: i32; xDel: TxDelProc);
 begin
   if pCtx = nil then Exit;
-  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
-                       SQLITE_UTF16LE, xDel);
+  setResultStrOrError(pCtx, PAnsiChar(z), n and (not 1),
+                      SQLITE_UTF16LE, xDel);
 end;
 
 { vdbeapi.c:503 — sqlite3_result_error16.  UTF-16 error string. }
@@ -5992,15 +6108,16 @@ begin
   if pCtx = nil then begin Result := nil; Exit; end;
   pAggMem := pCtx^.pMem;
   if (pAggMem^.flags and MEM_Agg) = 0 then begin
-    if nByte = 0 then begin Result := nil; Exit; end;
-    sqlite3VdbeMemClearAndResize(pAggMem, nByte);
-    if pAggMem^.szMalloc > 0 then begin
-      FillChar(pAggMem^.z^, nByte, 0);
-      pAggMem^.flags     := MEM_Agg or MEM_Dyn;
-      pAggMem^.u.pDef    := pCtx^.pFunc;   { vdbeaux.c sqlite3_aggregate_context — needed by MemFinalize }
+    { createAggContext — vdbeapi.c }
+    if nByte <= 0 then begin
+      sqlite3VdbeMemSetNull(pAggMem);
+      pAggMem^.z := nil;
     end else begin
-      sqlite3OomFault(pAggMem^.db);
-      Result := nil; Exit;
+      sqlite3VdbeMemClearAndResize(pAggMem, nByte);
+      pAggMem^.flags  := MEM_Agg;
+      pAggMem^.u.pDef := pCtx^.pFunc;
+      if pAggMem^.z <> nil then
+        FillChar(pAggMem^.z^, nByte, 0);
     end;
   end;
   Result := pAggMem^.z;
@@ -6060,30 +6177,65 @@ begin
   Result := sqlite3_finalize(pStmt);
 end;
 
+{ vdbeblob.c:381..466 — blobReadWrite.  Shared helper for blob_read and
+  blob_write.  xCall is either sqlite3BtreePayloadChecked (read) or
+  sqlite3BtreePutData (write).  Faithful port: takes the db mutex, brackets
+  the b-tree cursor access, and on SQLITE_ABORT finalises the held
+  statement so the handle is permanently invalidated.  The
+  SQLITE_ENABLE_PREUPDATE_HOOK arm is omitted (not compiled in this build;
+  preupdate engine is a separate task). }
+type
+  TBlobRWCall = function(pCur: PBtCursor; offset: u32; amt: u32;
+                         pBuf: Pointer): i32;
+
+function blobReadWrite(pBlob: Psqlite3_blob; z: Pointer; n: i32;
+                       iOffset: i32; xCall: TBlobRWCall): i32;
+var
+  p:  PIncrblob;
+  v:  PVdbe;
+  db: PTsqlite3;
+  rc: i32;
+begin
+  p := pBlob;
+  if p = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  db := p^.db;
+  sqlite3_mutex_enter(db^.mutex);
+  v := p^.pStmt;
+
+  if (n < 0) or (iOffset < 0) or
+     (i64(iOffset) + i64(n) > p^.nByte) then
+    { Request is out of range.  Return a transient error. }
+    rc := SQLITE_ERROR
+  else if v = nil then
+    { No statement handle — the blob handle has been invalidated. }
+    rc := SQLITE_ABORT
+  else begin
+    sqlite3BtreeEnterCursor(p^.pCsr);
+    rc := xCall(p^.pCsr, u32(iOffset + p^.iOffset), u32(n), z);
+    sqlite3BtreeLeaveCursor(p^.pCsr);
+    if rc = SQLITE_ABORT then begin
+      sqlite3VdbeFinalize(v);
+      p^.pStmt := nil;
+    end else
+      v^.rc := rc;
+  end;
+
+  db^.errCode := rc;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
 function sqlite3_blob_read(pBlob: Psqlite3_blob; z: Pointer;
                            n: i32; iOffset: i32): i32;
 begin
-  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
-  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
-  if (n < 0) or (iOffset < 0) or
-     (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
-    Result := SQLITE_ERROR; Exit;
-  end;
-  Result := sqlite3BtreePayloadChecked(pBlob^.pCsr,
-              u32(iOffset + pBlob^.iOffset), u32(n), z);
+  Result := blobReadWrite(pBlob, z, n, iOffset, @sqlite3BtreePayloadChecked);
 end;
 
 function sqlite3_blob_write(pBlob: Psqlite3_blob; z: Pointer;
                             n: i32; iOffset: i32): i32;
 begin
-  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
-  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
-  if (n < 0) or (iOffset < 0) or
-     (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
-    Result := SQLITE_ERROR; Exit;
-  end;
-  Result := sqlite3BtreePutData(pBlob^.pCsr,
-              u32(iOffset + pBlob^.iOffset), u32(n), z);
+  Result := blobReadWrite(pBlob, z, n, iOffset, @sqlite3BtreePutData);
 end;
 
 function sqlite3_blob_bytes(pBlob: Psqlite3_blob): i32;
@@ -7470,6 +7622,8 @@ var
   seekRes: i32;           { OP_Insert: prior seek result }
   xPay:    TBtreePayload; { OP_Insert/IdxInsert: payload descriptor }
   opflags: i32;           { OP_Delete: opcode flags from P2 }
+  zHookDb:  PAnsiChar;        { OP_Insert/Delete: db name for update hook }
+  pHookTab: PTableHookFields; { OP_Insert/Delete: table for update hook }
   vRow:    i64;           { OP_NewRowid/OP_Rowid: rowid value }
   cntNR:   i32;           { OP_NewRowid: retry counter }
   nEntry:  i64;           { OP_Count: entry count }
@@ -7653,6 +7807,15 @@ begin
       sqlite3_stmt_scanstatus() (vdbe.c:940 `pOp->nExec++`).  nCycle
       hwtime sampling is bracketed below under SQLITE_ENABLE_STMT_SCANSTATUS. }
     Inc(pOp^.nExec);
+
+    { Phase 9.1.6 — opcode coverage hook.  Single predictable branch
+      that compiles to a near-zero-cost no-op when the flag is off
+      (default).  Tests that need coverage flip gVdbeOpCoverageEnabled
+      to 1 before driving the workload. }
+    if gVdbeOpCoverageEnabled <> 0 then begin
+      if (pOp^.opcode >= 0) and (pOp^.opcode < SQLITE_NUM_OPCODES) then
+        Inc(gVdbeOpCoverage[pOp^.opcode]);
+    end;
     {$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}
     { Phase 10.1.39.d.3 — start cycle window.  Mirrors vdbe.c:944..948
       (`pnCycle = &pOp->nCycle; *pnCycle -= sqlite3Hwtime();`).  We stash
@@ -7824,11 +7987,31 @@ begin
       P4.z = string literal, P1 = byte length, P2 = output register, enc = P4 enc.
       OP_String8 converts itself to OP_String on first execution. }
     OP_String8: begin
+      Assert(pOp^.p4.z <> nil);
+      pOut := out2Prerelease(v, pOp);
       pOp^.p1 := sqlite3Strlen30(PChar(pOp^.p4.z));
+      { vdbe.c:1419..1436 — when db's enc is UTF-16 we must convert the
+        literal UTF-8 bytes to native encoding once, then rewrite p4.z to
+        point at the converted buffer so subsequent OP_String fires reuse
+        it as MEM_Static.  Required so column_text sees the bytes in
+        db^.enc (otherwise UTF-8 bytes carry an enc=UTF-16 tag and
+        column_text returns garbled output).  9.2.divbug.G. }
+      if enc <> SQLITE_UTF8 then begin
+        rc := sqlite3VdbeMemSetStr(pOut, pOp^.p4.z, -1, SQLITE_UTF8, SQLITE_STATIC);
+        if rc <> SQLITE_OK then goto too_big;
+        if sqlite3VdbeChangeEncoding(pOut, enc) <> SQLITE_OK then goto no_mem;
+        Assert(pOut^.szMalloc > 0);
+        pOut^.szMalloc := 0;
+        pOut^.flags := pOut^.flags or MEM_Static;
+        if pOp^.p4type = P4_DYNAMIC then
+          sqlite3DbFree(db, pOp^.p4.z);
+        pOp^.p4type := P4_DYNAMIC;
+        pOp^.p4.z := pOut^.z;
+        pOp^.p1 := pOut^.n;
+      end;
       if pOp^.p1 > db^.aLimit[0] { SQLITE_LIMIT_LENGTH } then goto too_big;
       pOp^.opcode := OP_String;
       { fall through to OP_String }
-      pOut := out2Prerelease(v, pOp);
       pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
       pOut^.z     := pOp^.p4.z;
       pOut^.n     := pOp^.p1;
@@ -8786,6 +8969,45 @@ begin
       sqlite3VdbeIncrWriteCounter(v, pCur);
       pIn3 := @aMem[pOp^.p3];  { key register }
       xPay.nKey := pIn3^.u.i;
+
+      { vdbe.c:5778..5784 — derive zDb/pTab for the update hook when P4
+        is a Table* and an update hook is installed.  With the pre-update
+        hook compiled in, HAS_UPDATE_HOOK(db) also covers xPreUpdateCallback. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      if (pOp^.p4type = P4_TABLE)
+         and ((db^.xUpdateCallback <> nil)
+              or (db^.xPreUpdateCallback <> nil)) then begin
+{$ELSE}
+      if (pOp^.p4type = P4_TABLE) and (db^.xUpdateCallback <> nil) then begin
+{$ENDIF}
+        zHookDb  := PDb(PtrUInt(db^.aDb) +
+                        PtrUInt(pCur^.iDb) * SizeOf(TDb))^.zDbSName;
+        pHookTab := PTableHookFields(pOp^.p4.pTab);
+      end else begin
+        zHookDb  := nil;
+        pHookTab := nil;
+      end;
+
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      { vdbe.c:5786..5799 — invoke the pre-update hook (INSERT) before the
+        row is written.  ISNOOP rows fall through without inserting. }
+      if pHookTab <> nil then begin
+        if (db^.xPreUpdateCallback <> nil)
+           and ((pOp^.p5 and OPFLAG_ISUPDATE) = 0)
+           and Assigned(gVdbePreUpdateHook) then
+          gVdbePreUpdateHook(v, pCur, SQLITE_INSERT_AUTH, zHookDb,
+            pOp^.p4.pTab, xPay.nKey, pOp^.p2, -1);
+        if (db^.xUpdateCallback = nil)
+           or (PTableHookFields(pOp^.p4.pTab)^.aCol = nil) then begin
+          { Prevent the post-update hook from running when it should not. }
+          pHookTab := nil;
+        end;
+      end;
+      { ISNOOP rows (vdbe.c:5798) skip the insert entirely — the pre-update
+        hook above is the only side-effect. }
+      if (pOp^.p5 and OPFLAG_ISNOOP) = 0 then begin
+{$ENDIF}
+
       if (pOp^.p5 and OPFLAG_NCHANGE) <> 0 then begin
         Inc(v^.nChange);
         if (pOp^.p5 and OPFLAG_LASTROWID) <> 0 then
@@ -8808,6 +9030,20 @@ begin
       pCur^.cacheStatus    := CACHE_STALE;
       Inc(colCacheCtr);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+
+      { vdbe.c:5824..5831 — invoke the update hook after a successful
+        insert.  ISUPDATE distinguishes UPDATE from INSERT. }
+      if (pHookTab <> nil) and (pHookTab^.aCol <> nil) then begin
+        if (pOp^.p5 and OPFLAG_ISUPDATE) <> 0 then
+          TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
+            SQLITE_UPDATE_AUTH, zHookDb, pHookTab^.zName, xPay.nKey)
+        else
+          TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
+            SQLITE_INSERT_AUTH, zHookDb, pHookTab^.zName, xPay.nKey);
+      end;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      end;  { OPFLAG_ISNOOP guard }
+{$ENDIF}
     end;
 
     { ────── OP_Delete ────── (vdbe.c:5903) }
@@ -8815,13 +9051,62 @@ begin
       opflags := pOp^.p2;
       pCur := v^.apCsr[pOp^.p1];
       sqlite3VdbeIncrWriteCounter(v, pCur);
+
+      { vdbe.c:5937..5950 — derive zDb/pTab for the update hook; if the
+        cursor was last moved with Next/Prev (SAVEPOSITION) capture the
+        current rowid into movetoTarget so it can be passed to the hook. }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      if (pOp^.p4type = P4_TABLE)
+         and ((db^.xUpdateCallback <> nil)
+              or (db^.xPreUpdateCallback <> nil)) then begin
+{$ELSE}
+      if (pOp^.p4type = P4_TABLE) and (db^.xUpdateCallback <> nil) then begin
+{$ENDIF}
+        zHookDb  := PDb(PtrUInt(db^.aDb) +
+                        PtrUInt(pCur^.iDb) * SizeOf(TDb))^.zDbSName;
+        pHookTab := PTableHookFields(pOp^.p4.pTab);
+        if ((pOp^.p5 and OPFLAG_SAVEPOSITION) <> 0) and (pCur^.isTable <> 0) then
+          pCur^.movetoTarget := sqlite3BtreeIntegerKey(pCur^.uc.pCursor);
+      end else begin
+        zHookDb  := nil;
+        pHookTab := nil;
+      end;
+
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      { vdbe.c:5952..5969 — invoke the pre-update hook (DELETE or, for an
+        UPDATE that deletes the old row first, UPDATE) before the row is
+        removed.  ISNOOP rows skip the actual delete. }
+      if (db^.xPreUpdateCallback <> nil) and (pHookTab <> nil)
+         and Assigned(gVdbePreUpdateHook) then begin
+        if (opflags and OPFLAG_ISUPDATE) <> 0 then
+          gVdbePreUpdateHook(v, pCur, SQLITE_UPDATE_AUTH, zHookDb,
+            pOp^.p4.pTab, pCur^.movetoTarget, pOp^.p3, -1)
+        else
+          gVdbePreUpdateHook(v, pCur, SQLITE_DELETE_AUTH, zHookDb,
+            pOp^.p4.pTab, pCur^.movetoTarget, pOp^.p3, -1);
+      end;
+      if (opflags and OPFLAG_ISNOOP) = 0 then begin
+{$ENDIF}
+
       rc := sqlite3BtreeDelete(pCur^.uc.pCursor, u8(pOp^.p5));
       pCur^.cacheStatus := CACHE_STALE;
       Inc(colCacheCtr);
       pCur^.seekResult := 0;
       if rc <> SQLITE_OK then goto abort_due_to_error;
-      if (opflags and OPFLAG_NCHANGE) <> 0 then
+
+      { vdbe.c:5993..6000 — invoke the update hook after a successful
+        delete (rowid tables only). }
+      if (opflags and OPFLAG_NCHANGE) <> 0 then begin
         Inc(v^.nChange);
+        { TF_WithoutRowid = $00000080 (sqliteInt.h); HasRowid == not set. }
+        if (pHookTab <> nil) and (db^.xUpdateCallback <> nil) and
+           ((pHookTab^.tabFlags and u32($00000080)) = 0) then
+          TUpdateCallbackFn(db^.xUpdateCallback)(db^.pUpdateArg,
+            SQLITE_DELETE_AUTH, zHookDb, pHookTab^.zName, pCur^.movetoTarget);
+      end;
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+      end;  { OPFLAG_ISNOOP guard }
+{$ENDIF}
     end;
 
     { ────── OP_ResetCount ────── (vdbe.c:6011) }
@@ -9770,12 +10055,35 @@ begin
       iRollback5g := pOp^.p2;
       if desiredAC5g <> i32(db^.autoCommit) then begin
         if iRollback5g <> 0 then begin
+          { assert( desiredAutoCommit==1 ) }
           sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
           db^.autoCommit := 1;
+        end else if (desiredAC5g <> 0) and (db^.nVdbeWrite > 0) then begin
+          { vdbe.c:4032 — this instruction implements a COMMIT but other VMs
+            are still writing; tell the caller they must complete first. }
+          sqlite3VdbeError(v,
+            'cannot commit transaction - SQL statements in progress');
+          rc := SQLITE_BUSY;
+          goto abort_due_to_error;
         end else begin
+          rc := sqlite3VdbeCheckFkDeferred(v);
+          if rc <> SQLITE_OK then
+            goto vdbe_return;
           db^.autoCommit := u8(desiredAC5g);
         end;
-        sqlite3VdbeHalt(v);
+        { vdbe.c:4044 — if sqlite3VdbeHalt could not obtain the required
+          locks (another connection holds a conflicting lock), the commit
+          must be retried.  Rewind pc, restore autoCommit, and surface
+          SQLITE_BUSY.  The previous Pascal port ignored VdbeHalt's return
+          value, so a cross-connection lock conflict on COMMIT was silently
+          reported as success (9.4.divbug.21). }
+        if sqlite3VdbeHalt(v) = SQLITE_BUSY then begin
+          v^.pc := i32(pOp - aOp);
+          db^.autoCommit := u8(1 - desiredAC5g);
+          v^.rc := SQLITE_BUSY;
+          rc    := SQLITE_BUSY;
+          goto vdbe_return;
+        end;
         sqlite3CloseSavepoints(db);
         if v^.rc = SQLITE_OK then
           rc := SQLITE_DONE
@@ -10081,6 +10389,9 @@ begin
       Rewind the sorter/index and jump to P2 if empty. }
     OP_SorterSort,
     OP_Sort: begin
+      { vdbe.c:6349..6351 — SQLITE_TEST-guarded sort counter, read by
+        regression tests to confirm sorts are elided when possible. }
+      Inc(sqlite3_sort_count);
       Inc(v^.aCounter[SQLITE_STMTSTATUS_SORT]);
       { Fall through to OP_Rewind logic }
       pCur  := v^.apCsr[pOp^.p1];

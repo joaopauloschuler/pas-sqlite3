@@ -441,6 +441,7 @@ type
 type
   PUnixUnusedFd   = ^UnixUnusedFd;
   PunixInodeInfo  = ^unixInodeInfo;
+  PPunixInodeInfo = ^PunixInodeInfo;
   PunixShmNode    = ^unixShmNode;
   PunixShm        = ^unixShm;
   PunixFile       = ^unixFile;
@@ -667,6 +668,27 @@ var
   { Filled by sqlite3MutexInit with the current method table }
   gMutexMethods : sqlite3_mutex_methods;
 
+{$ifdef SQLITE_TEST}
+{ ============================================================
+  Section 16: I/O-error injection counters  (task 9.4.7.c)
+
+  Faithful port of the SQLITE_TEST block in os_common.h:48..86.
+  These globals are driven from Tcl via Tcl_LinkVar (see the
+  ioerr test module) exactly as test2.c:740..751 wires them up.
+  unixRead/Write/Sync/Truncate consult them through the
+  SimulateIOError / SimulateDiskfullError helpers below.  The
+  whole block is inert unless the unit is compiled -dSQLITE_TEST,
+  so the default (non-test) build is byte-for-byte unaffected.
+  ============================================================ }
+var
+  sqlite3_io_error_hit      : cint = 0;
+  sqlite3_io_error_hardhit  : cint = 0;
+  sqlite3_io_error_pending  : cint = 0;
+  sqlite3_io_error_persist  : cint = 0;
+  sqlite3_io_error_benign   : cint = 0;
+  sqlite3_diskfull_pending  : cint = 0;
+  sqlite3_diskfull          : cint = 0;
+{$endif}
 
 
 implementation
@@ -767,6 +789,12 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+{ posix_fallocate(3): pre-allocate disk space for an open file.
+  Returns 0 on success or an error number directly (NOT -1/errno).
+  Used early by fcntlSizeHint; the matching binding in the later
+  syscall-table extern block (~line 2397) is the same symbol. }
+function c_fallocate(fd: cint; off, len: i64): cint; cdecl;
+  external 'c' name 'posix_fallocate';
 function c_getenv(name: PAnsiChar): PAnsiChar; cdecl;
   external 'c' name 'getenv';
 
@@ -1427,11 +1455,30 @@ end;
 { ============================================================
   Section 14a: Low-level POSIX advisory locking helper  (os_unix.c)
 
-  Phase 1 simplification: each unixFile owns a private unixInodeInfo
-  (no sharing between multiple sqlite3* handles on the same file within
-  one process).  Cross-process advisory locking via fcntl still works
-  correctly.  Full inodeInfo sharing is deferred to Phase 3.
+  unixInodeInfo objects are shared process-wide via inodeList, keyed by
+  (device, inode).  This is required so that two sqlite3* handles open on
+  the same on-disk file within one process see each other's lock state:
+  POSIX fcntl advisory locks never conflict between fds of the same
+  process, so the inode-level eFileLock/nShared bookkeeping is what
+  enforces SHARED/RESERVED/PENDING/EXCLUSIVE mutual exclusion intra-process.
   ============================================================ }
+
+var
+  { os_unix.c ~1349: list of all unixInodeInfo objects.
+    Protected by unixBigLock (SQLITE_MUTEX_STATIC_VFS1). }
+  inodeList : PunixInodeInfo = nil;
+
+{ os_unix.c ~899: unixEnterMutex / unixLeaveMutex — acquire the global
+  VFS mutex that protects inodeList. }
+procedure unixEnterMutex;
+begin
+  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS1));
+end;
+
+procedure unixLeaveMutex;
+begin
+  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS1));
+end;
 
 { os_unix.c ~1857: unixFileLock — issue a POSIX advisory lock via F_SETLK }
 function unixFileLock(pFile: PunixFile; var lock: FLock): cint;
@@ -1440,29 +1487,105 @@ begin
   Result := FpFcntl(pFile^.h, F_SETLK, lock);
 end;
 
+{ os_unix.c ~1527: unixFindInodeInfo — locate the unixInodeInfo describing
+  pFile's file descriptor, creating a new one if necessary.  The global
+  unixBigLock must be held when calling this routine. }
+function unixFindInodeInfo(pFile: PunixFile;
+                           ppInode: PPunixInodeInfo): cint;
+var
+  rc      : cint;
+  statbuf : Stat;
+  fileId  : unixFileId;
+  pInode  : PunixInodeInfo;
+begin
+  rc := FpFStat(pFile^.h, statbuf);
+  if rc <> 0 then begin
+    pFile^.lastErrno := fpgeterrno;
+    Result := SQLITE_IOERR;
+    Exit;
+  end;
+
+  FillChar(fileId, SizeOf(fileId), 0);
+  fileId.dev := statbuf.st_dev;
+  fileId.ino := u64(statbuf.st_ino);
+
+  pInode := inodeList;
+  while (pInode <> nil) and
+        (CompareByte(fileId, pInode^.fileId, SizeOf(fileId)) <> 0) do
+    pInode := pInode^.pNext;
+
+  if pInode = nil then begin
+    pInode := PunixInodeInfo(sqlite3_malloc(SizeOf(unixInodeInfo)));
+    if pInode = nil then begin
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    FillChar(pInode^, SizeOf(unixInodeInfo), 0);
+    Move(fileId, pInode^.fileId, SizeOf(fileId));
+    pInode^.pLockMutex := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+    if pInode^.pLockMutex = nil then begin
+      sqlite3_free(pInode);
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    pInode^.nRef  := 1;
+    pInode^.pNext := inodeList;
+    pInode^.pPrev := nil;
+    if inodeList <> nil then
+      inodeList^.pPrev := pInode;
+    inodeList := pInode;
+  end else
+    Inc(pInode^.nRef);
+
+  ppInode^ := pInode;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c ~1490: unixReleaseInodeInfo — drop a reference to the
+  unixInodeInfo previously obtained from unixFindInodeInfo.  The global
+  unixBigLock must be held; the inode's pLockMutex must NOT be held. }
+procedure unixReleaseInodeInfo(pFile: PunixFile);
+var
+  pInode : PunixInodeInfo;
+begin
+  pInode := pFile^.pInode;
+  if pInode = nil then Exit;
+  Dec(pInode^.nRef);
+  if pInode^.nRef = 0 then begin
+    { Phase 1: closePendingFds omitted — deferred to Phase 3 }
+    if pInode^.pPrev <> nil then
+      pInode^.pPrev^.pNext := pInode^.pNext
+    else
+      inodeList := pInode^.pNext;
+    if pInode^.pNext <> nil then
+      pInode^.pNext^.pPrev := pInode^.pPrev;
+    if pInode^.pLockMutex <> nil then
+      sqlite3_mutex_free(pInode^.pLockMutex);
+    sqlite3_free(pInode);
+  end;
+end;
+
 { ============================================================
   Section 14b: unix I/O method implementations  (os_unix.c)
   These are the cdecl functions stored in the unixIoMethods vtable.
   ============================================================ }
 
 { os_unix.c ~2341: unixClose_impl
-  Unlocks, frees the private inodeInfo, closes the fd, and zeroes the struct. }
+  Unlocks, drops the inodeInfo reference, closes the fd, zeroes the struct. }
 function unixClose_impl(pFile: Psqlite3_file): cint; cdecl;
 var
-  pf    : PunixFile;
-  pInode: PunixInodeInfo;
+  pf : PunixFile;
 begin
   pf := PunixFile(pFile);
   { Unlock: release any held lock }
   unixUnlock_impl(pFile, NO_LOCK);
 
-  pInode := pf^.pInode;
-  if pInode <> nil then begin
-    { Free the lock mutex }
-    if pInode^.pLockMutex <> nil then
-      sqlite3_mutex_free(pInode^.pLockMutex);
-    { Phase 1: private inodeInfo — free it directly }
-    sqlite3_free(pInode);
+  { Drop our reference on the shared inodeInfo (os_unix.c ~2360).
+    unixReleaseInodeInfo frees it once the last reference is gone. }
+  if pf^.pInode <> nil then begin
+    unixEnterMutex;
+    unixReleaseInodeInfo(pf);
+    unixLeaveMutex;
   end;
 
   if pf^.pPreallocatedUnused <> nil then
@@ -1475,6 +1598,55 @@ begin
   Result := SQLITE_OK;
 end;
 
+{$ifdef SQLITE_TEST}
+{ os_common.h:65..70 — local_ioerr(): record a simulated I/O hit. }
+procedure local_ioerr;
+begin
+  Inc(sqlite3_io_error_hit);
+  if sqlite3_io_error_benign = 0 then
+    Inc(sqlite3_io_error_hardhit);
+end;
+
+{ os_common.h:60..64 — SimulateIOError(): returns True when the caller
+  should inject a fault on this I/O operation.  The C macro decrements
+  sqlite3_io_error_pending and fires the CODE block when it underflows
+  to 1, or whenever a persistent fault is already latched. }
+function SimulateIOError: Boolean;
+begin
+  if ((sqlite3_io_error_persist <> 0) and (sqlite3_io_error_hit <> 0))
+     or (sqlite3_io_error_pending = 1) then
+  begin
+    Dec(sqlite3_io_error_pending);
+    local_ioerr;
+    Result := True;
+  end
+  else
+  begin
+    Dec(sqlite3_io_error_pending);
+    Result := False;
+  end;
+end;
+
+{ os_common.h:71..81 — SimulateDiskfullError(): returns True when the
+  caller should inject an SQLITE_FULL fault on this operation. }
+function SimulateDiskfullError: Boolean;
+begin
+  Result := False;
+  if sqlite3_diskfull_pending <> 0 then
+  begin
+    if sqlite3_diskfull_pending = 1 then
+    begin
+      local_ioerr;
+      sqlite3_diskfull := 1;
+      sqlite3_io_error_hit := 1;
+      Result := True;
+    end
+    else
+      Dec(sqlite3_diskfull_pending);
+  end;
+end;
+{$endif}
+
 { os_unix.c ~3512: unixRead_impl — positional read using pread(2) }
 function unixRead_impl(pFile: Psqlite3_file; pBuf: Pointer;
                        iAmt: cint; iOfst: i64): cint; cdecl;
@@ -1485,6 +1657,10 @@ begin
   pf := PunixFile(pFile);
   repeat
     got := FpPRead(pf^.h, pBuf, iAmt, iOfst);
+    {$ifdef SQLITE_TEST}
+    { os_unix.c:3475 — SimulateIOError( got = -1 ) }
+    if SimulateIOError then got := -1;
+    {$endif}
   until not ((got < 0) and (fpgeterrno = ESysEINTR));
 
   if got = ssize_t(iAmt) then
@@ -1522,6 +1698,21 @@ begin
     end;
     Inc(totalWritten, cint(wrote));
   end;
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3707..3708 — SimulateIOError / SimulateDiskfullError fire
+    after the write loop.  The C CODE blocks force amt>wrote so the
+    caller falls into the error arm; here we just return directly. }
+  if SimulateIOError then begin
+    pf^.lastErrno := 0;
+    Result := SQLITE_IOERR_WRITE;
+    Exit;
+  end;
+  if SimulateDiskfullError then begin
+    pf^.lastErrno := ESysENOSPC;
+    Result := SQLITE_FULL;
+    Exit;
+  end;
+  {$endif}
   Result := SQLITE_OK;
 end;
 
@@ -1532,6 +1723,13 @@ var
   rc : cint;
 begin
   pf := PunixFile(pFile);
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3965 — SimulateIOError( return SQLITE_IOERR_TRUNCATE ) }
+  if SimulateIOError then begin
+    Result := SQLITE_IOERR_TRUNCATE;
+    Exit;
+  end;
+  {$endif}
   { If a chunk-size is set, round up to the next multiple }
   if pf^.szChunk > 0 then
     size := ((size + pf^.szChunk - 1) div pf^.szChunk) * pf^.szChunk;
@@ -1550,7 +1748,18 @@ var
   rc : cint;
 begin
   pf := PunixFile(pFile);
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3926 — SimulateDiskfullError( return SQLITE_FULL ) }
+  if SimulateDiskfullError then begin
+    Result := SQLITE_FULL;
+    Exit;
+  end;
+  {$endif}
   rc := c_fsync(pf^.h);
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:3931 — SimulateIOError( rc=1 ) }
+  if SimulateIOError then rc := 1;
+  {$endif}
   if rc <> 0 then begin
     pf^.lastErrno := fpgeterrno;
     Result := SQLITE_IOERR_FSYNC;
@@ -1842,11 +2051,65 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ os_unix.c ~4034: unixModeBit — read or write a single ctrlFlags bit.
+  If *pArg<0 the current state is returned in *pArg; otherwise *pArg
+  (0/non-0) sets or clears the bit. }
+procedure unixModeBit(pf: PunixFile; mask: u16; pArg: PcInt);
+begin
+  if pArg^ < 0 then begin
+    if (pf^.ctrlFlags and mask) <> 0 then pArg^ := 1 else pArg^ := 0;
+  end else if pArg^ = 0 then
+    pf^.ctrlFlags := pf^.ctrlFlags and (not mask)
+  else
+    pf^.ctrlFlags := pf^.ctrlFlags or mask;
+end;
+
+{ os_unix.c ~4049: fcntlSizeHint — handle SQLITE_FCNTL_SIZE_HINT.
+  Enlarge the database file to nByte bytes (rounded up to the next
+  chunk-size).  If the file is already nByte or larger, this is a no-op.
+
+  pas-sqlite3 builds on Linux against glibc, which provides
+  posix_fallocate(), so this is the C HAVE_POSIX_FALLOCATE arm — the
+  fake-it #else block (single-byte writes per block) is not ported
+  because it is unreachable on the target platform.  The
+  SQLITE_MAX_MMAP_SIZE>0 tail arm is likewise omitted: this port treats
+  SQLITE_MAX_MMAP_SIZE as 0 (see unit head, ~line 47).  C ref:
+  os_unix.c:4049..4112. }
+function fcntlSizeHint(pf: PunixFile; nByte: i64): cint;
+var
+  buf   : Stat;       { holds the fstat() return values }
+  nSize : i64;        { required file size              }
+  err   : cint;       { posix_fallocate() return value   }
+begin
+  if pf^.szChunk > 0 then begin
+    if FpFStat(pf^.h, buf) <> 0 then begin
+      Result := SQLITE_IOERR_FSTAT;
+      Exit;
+    end;
+    nSize := ((nByte + pf^.szChunk - 1) div pf^.szChunk) * pf^.szChunk;
+    if nSize > i64(buf.st_size) then begin
+      { posix_fallocate() "returns zero on success, or an error number
+        on failure" — c_fallocate is bound directly to it, so the
+        return value IS the errno (not -1/errno). }
+      repeat
+        err := c_fallocate(pf^.h, buf.st_size, nSize - buf.st_size);
+      until err <> ESysEINTR;
+      if (err <> 0) and (err <> ESysEINVAL) then begin
+        Result := SQLITE_IOERR_WRITE;
+        Exit;
+      end;
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
 { os_unix.c ~4050: unixFileControl_impl — handle FCNTL opcodes }
 function unixFileControl_impl(pFile: Psqlite3_file; op: cint;
                               pArg: Pointer): cint; cdecl;
 var
-  pf : PunixFile;
+  pf     : PunixFile;
+  zTFile : PAnsiChar;
+  mxPath : cint;
 begin
   pf := PunixFile(pFile);
   case op of
@@ -1859,11 +2122,36 @@ begin
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_SIZE_HINT: begin
-      { Ignore for Phase 1 }
-      Result := SQLITE_OK;
+      { os_unix.c:4176 — pre-grow the file via fcntlSizeHint.  C wraps
+        the call in SimulateIOErrorBenign(1/0); this port has no
+        I/O-error simulation layer, so the call stands alone. }
+      Result := fcntlSizeHint(pf, Pi64(pArg)^);
     end;
     SQLITE_FCNTL_CHUNK_SIZE: begin
       pf^.szChunk := PcInt(pArg)^;
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_PERSIST_WAL: begin
+      { os_unix.c:4093 }
+      unixModeBit(pf, UNIXFILE_PERSIST_WAL, PcInt(pArg));
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_POWERSAFE_OVERWRITE: begin
+      { os_unix.c:4097 }
+      unixModeBit(pf, UNIXFILE_PSOW, PcInt(pArg));
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_TEMPFILENAME: begin
+      { os_unix.c:4105 — return a sqlite3_malloc'd temp filename in *pArg }
+      if pf^.pVfs <> nil then
+        mxPath := Psqlite3_vfs(pf^.pVfs)^.mxPathname
+      else
+        mxPath := MAX_PATHNAME;
+      zTFile := sqlite3Malloc(mxPath);
+      if zTFile <> nil then begin
+        unixGetTempname(mxPath, zTFile);
+        PPointer(pArg)^ := zTFile;
+      end;
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_VFS_POINTER: begin
@@ -2009,24 +2297,18 @@ begin
   if (flags and SQLITE_OPEN_URI) <> 0 then
     ctrlFlags := ctrlFlags or UNIXFILE_URI;
 
-  { Allocate a private inodeInfo (Phase 1 simplification: one per file) }
-  pInode := PunixInodeInfo(sqlite3_malloc(SizeOf(unixInodeInfo)));
-  if pInode = nil then begin
+  { Locate (or create) the process-wide shared inodeInfo keyed by
+    (device, inode) so that multiple sqlite3* handles on the same file
+    share lock state (os_unix.c ~6138: findInodeInfo). }
+  p^.h := fd;
+  unixEnterMutex;
+  Result := unixFindInodeInfo(p, @pInode);
+  unixLeaveMutex;
+  if Result <> SQLITE_OK then begin
     FpClose(fd);
+    p^.h := -1;
     if p^.pPreallocatedUnused <> nil then
       sqlite3_free(p^.pPreallocatedUnused);
-    Result := SQLITE_NOMEM;
-    Exit;
-  end;
-  FillChar(pInode^, SizeOf(unixInodeInfo), 0);
-  pInode^.nRef := 1;
-  pInode^.pLockMutex := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
-  if pInode^.pLockMutex = nil then begin
-    FpClose(fd);
-    sqlite3_free(pInode);
-    if p^.pPreallocatedUnused <> nil then
-      sqlite3_free(p^.pPreallocatedUnused);
-    Result := SQLITE_NOMEM;
     Exit;
   end;
 
@@ -2355,8 +2637,7 @@ function  c_pwrite(fd: cint; buf: Pointer; n: csize_t; off: i64): cint;
   cdecl; external 'c' name 'pwrite';
 function  c_fchmod(fd: cint; mode: cint): cint;
   cdecl; external 'c' name 'fchmod';
-function  c_fallocate(fd: cint; off, len: i64): cint;
-  cdecl; external 'c' name 'posix_fallocate';
+{ c_fallocate declared earlier (near c_fsync) for fcntlSizeHint. }
 function  c_unlink(zPath: PChar): cint;
   cdecl; external 'c' name 'unlink';
 function  c_mkdir(zPath: PChar; mode: cint): cint;

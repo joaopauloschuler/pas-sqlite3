@@ -445,9 +445,9 @@ type
       NOT SQLITE_OMIT_WAL (xWalCallback present)
       NOT SQLITE_OMIT_PROGRESS_CALLBACK (xProgress present)
       NOT SQLITE_OMIT_AUTHORIZATION (xAuth present)
-      NOT SQLITE_ENABLE_PREUPDATE_HOOK (pPreUpdate NOT present)
+      SQLITE_ENABLE_PREUPDATE_HOOK gates the pPreUpdate* block (opt-in)
       NOT SQLITE_ENABLE_SETLK_TIMEOUT (setlkTimeout NOT present)
-      NOT SQLITE_ENABLE_UNLOCK_NOTIFY (pBlockingConnection NOT present) }
+      SQLITE_ENABLE_UNLOCK_NOTIFY gates the pBlockingConnection block (opt-in) }
   PTsqlite3 = ^Tsqlite3;
   Tsqlite3 = record
     pVfs           : Pointer;          { sqlite3_vfs* }
@@ -509,6 +509,11 @@ type
     xAutovacDestr  : procedure(p: Pointer); cdecl;
     xAutovacPages  : Pointer;
     pParse         : Pointer;          { PParse — opaque }
+{$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
+    pPreUpdateArg     : Pointer;        { First argument to xPreUpdateCallback }
+    xPreUpdateCallback: Pointer;        { Registered via sqlite3_preupdate_hook }
+    pPreUpdate        : Pointer;        { PPreUpdate — context for active hook }
+{$ENDIF}
     xWalCallback   : Pointer;
     pWalArg        : Pointer;
     xCollNeeded    : Pointer;
@@ -545,6 +550,15 @@ type
     pnBytesFreed   : Pi32;
     pDbData        : PDbClientData;
     nSpill         : u64;
+{$IFDEF SQLITE_ENABLE_UNLOCK_NOTIFY}
+    { The following variables are all protected by the STATIC_MAIN mutex,
+      not by sqlite3.mutex.  They are used by code in notify.c. }
+    pBlockingConnection : PTsqlite3;    { Connection that caused SQLITE_LOCKED }
+    pUnlockConnection   : PTsqlite3;    { Connection to watch for unlock }
+    pUnlockArg          : Pointer;      { Argument to xUnlockNotify }
+    xUnlockNotify       : Pointer;      { Unlock notify callback }
+    pNextBlocked        : PTsqlite3;    { Next in list of all blocked connections }
+{$ENDIF}
   end;
 
 { ============================================================
@@ -620,6 +634,16 @@ var
     sqlite3_mprintf-allocated buffer that the app is expected to free). }
   sqlite3_temp_directory: PAnsiChar = nil;
   sqlite3_data_directory: PAnsiChar = nil;
+
+  { main.c:138 — sqlite3IoTrace global I/O-trace hook.  Upstream this is a
+    printf-like `void (*)(const char*, ...)` defined only under
+    SQLITE_ENABLE_IOTRACE; the shell references it via `extern`.  This port
+    does not compile SQLITE_ENABLE_IOTRACE, so the IOTRACE() call sites in
+    pager/vdbe stay faithful no-ops, but the hook variable is provided
+    unconditionally (initialised to nil) so `.iotrace`-style tooling has a
+    well-defined symbol to install a sink into.  Pascal cannot express a
+    C varargs callback, so the exposed type takes the pre-rendered string. }
+  sqlite3IoTrace: procedure(zMsg: PAnsiChar); cdecl = nil;
 
 { ============================================================
   Exported function declarations
@@ -731,6 +755,8 @@ procedure sqlite3MallocEnd;
 function  sqlite3MallocMutex: Psqlite3_mutex;
 function  sqlite3_memory_used: i64;
 function  sqlite3HeapNearlyFull: i32;
+function  sqlite3SoftHeapLimit64(n: i64): i64;
+function  sqlite3HardHeapLimit64(n: i64): i64;
 
 { Reference-counted string/blob (RCStr) — printf.c.
   An RCStr is a libc-malloc'd buffer prefixed by an 8-byte refcount header.
@@ -2675,6 +2701,53 @@ begin
   Result := gNearlyFull;
 end;
 
+{ malloc.c:95 — sqlite3_soft_heap_limit64.  Set the soft heap-size limit.
+  An argument of zero disables the limit; a negative argument is a no-op
+  used to obtain the return value.  If the hard heap limit is enabled the
+  soft limit cannot be disabled nor raised above the hard limit.  The
+  autoinit guard from C lives in the main.pas wrapper (this unit cannot
+  see sqlite3_initialize without a unit cycle).  This build does not
+  compile SQLITE_ENABLE_MEMORY_MANAGEMENT, so sqlite3_release_memory() is
+  a no-op and the trailing "release excess" step is elided. }
+function sqlite3SoftHeapLimit64(n: i64): i64;
+var
+  priorLimit, nUsed: i64;
+begin
+  sqlite3_mutex_enter(gMem0Mutex);
+  priorLimit := gAlarmThreshold;
+  if n < 0 then begin
+    sqlite3_mutex_leave(gMem0Mutex);
+    Result := priorLimit;
+    Exit;
+  end;
+  if (gHardLimit > 0) and ((n > gHardLimit) or (n = 0)) then
+    n := gHardLimit;
+  gAlarmThreshold := n;
+  nUsed := sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+  if (n > 0) and (n <= nUsed) then gNearlyFull := 1 else gNearlyFull := 0;
+  sqlite3_mutex_leave(gMem0Mutex);
+  Result := priorLimit;
+end;
+
+{ malloc.c:137 — sqlite3_hard_heap_limit64.  An argument of zero disables
+  the hard limit; a negative argument is a no-op returning the prior
+  value.  Setting the hard limit also activates and constrains the soft
+  limit so it never exceeds the hard limit. }
+function sqlite3HardHeapLimit64(n: i64): i64;
+var
+  priorLimit: i64;
+begin
+  sqlite3_mutex_enter(gMem0Mutex);
+  priorLimit := gHardLimit;
+  if n >= 0 then begin
+    gHardLimit := n;
+    if (n < gAlarmThreshold) or (gAlarmThreshold = 0) then
+      gAlarmThreshold := n;
+  end;
+  sqlite3_mutex_leave(gMem0Mutex);
+  Result := priorLimit;
+end;
+
 { ============================================================
   Section: Reference-counted string/blob (RCStr)  (printf.c)
   ============================================================ }
@@ -3093,14 +3166,36 @@ end;
   sqlite3_uri_parameter: 4 leading zero bytes, then the database name and
   query parameter key/value pairs separated by NULs, an extra NUL, then
   the journal name, the WAL name, and two trailing NULs. }
+{ FPC codegen note: an earlier form of this routine ended with a
+  pointer-difference AssertH —
+    AssertH((PtrUInt(p)-PtrUInt(pResult)) = PtrUInt(nByte), ...)
+  — which crashes the FPC compiler (internal error 200510011 /
+  EAccessViolation) under some define/optimisation combinations (observed
+  with -dSQLITE_ENABLE_PREUPDATE_HOOK).  The {$ifdef} blocks elsewhere
+  shift codegen just enough to expose the compiler bug.  The fix tracks
+  the bytes written in a plain i64 counter (nWritten) instead, so the
+  sanity check is an ordinary i64=i64 comparison with no pointer casts. }
 function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
   nParam: i32; azParam: PPChar): PChar; cdecl;
 var
-  nByte   : i64;
-  i       : i32;
-  pResult : PChar;
-  p       : PChar;
-  azP     : PPChar;
+  nByte    : i64;
+  nWritten : i64;
+  i        : i32;
+  pResult  : PChar;
+  p        : PChar;
+  azP      : PPChar;
+
+  { local appendText analogue that also advances nWritten }
+  function emit(z: PChar): PChar;
+  var n: i64;
+  begin
+    if z = nil then n := 0 else n := sqlite3Strlen30(z);
+    Move(z^, p^, n + 1);
+    p := p + n + 1;
+    nWritten := nWritten + n + 1;
+    Result := p;
+  end;
+
 begin
   nByte := sqlite3Strlen30(zDatabase) + sqlite3Strlen30(zJournal)
          + sqlite3Strlen30(zWal) + 10;
@@ -3110,18 +3205,19 @@ begin
   pResult := PChar(sqlite3_malloc64(u64(nByte)));
   p := pResult;
   if p = nil then begin Result := nil; Exit; end;
+  nWritten := 0;
   FillChar(p^, 4, 0);
-  p := p + 4;
-  p := appendText(p, zDatabase);
+  p := p + 4; nWritten := nWritten + 4;
+  emit(zDatabase);
   for i := 0 to (nParam * 2) - 1 do
-    p := appendText(p, azP[i]);
-  p^ := #0; Inc(p);
-  p := appendText(p, zJournal);
-  p := appendText(p, zWal);
-  p^ := #0; Inc(p);
-  p^ := #0; Inc(p);
-  AssertH((PtrUInt(p) - PtrUInt(pResult)) = PtrUInt(nByte),
-    'sqlite3_create_filename: byte-count mismatch');
+    emit(azP[i]);
+  p^ := #0; Inc(p); Inc(nWritten);
+  emit(zJournal);
+  emit(zWal);
+  p^ := #0; Inc(p); Inc(nWritten);
+  p^ := #0; Inc(p); Inc(nWritten);
+  if nWritten <> nByte then
+    AssertH(False, 'sqlite3_create_filename: byte-count mismatch');
   Result := pResult + 4;
 end;
 

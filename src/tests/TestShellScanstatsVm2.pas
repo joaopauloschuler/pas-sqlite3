@@ -35,42 +35,13 @@ program TestShellScanstatsVm2;
 
 uses
   SysUtils, BaseUnix, Unix,
-  passqlite3types, passqlite3util;
+  passqlite3types, passqlite3util,
+  TestShellCommon;
 
 var
   failCount: i32 = 0;
   passCount: i32 = 0;
   skipCount: i32 = 0;
-
-function readAll(const path: AnsiString): AnsiString;
-var
-  f: file of Byte;
-  n: SizeInt;
-  buf: array[0..4095] of Byte;
-  i: SizeInt;
-begin
-  Result := '';
-  AssignFile(f, path); {$I-} Reset(f); {$I+}
-  if IOResult <> 0 then Exit;
-  while not Eof(f) do begin
-    BlockRead(f, buf[0], SizeOf(buf), n);
-    if n <= 0 then Break;
-    i := Length(Result);
-    SetLength(Result, i + n);
-    Move(buf[0], Result[i + 1], n);
-  end;
-  CloseFile(f);
-end;
-
-procedure writeFileBytes(const path, body: AnsiString);
-var
-  f: file of Byte;
-begin
-  AssignFile(f, path); Rewrite(f);
-  if Length(body) > 0 then
-    BlockWrite(f, body[1], Length(body));
-  CloseFile(f);
-end;
 
 var
   exeDir:  AnsiString = '';
@@ -123,12 +94,12 @@ begin
     'SELECT a, b FROM t1 WHERE b LIKE ''%a%'' ORDER BY a;'#10 +
     '.scanstats off'#10;
 
-  writeFileBytes(sqlPath, script);
+  ShellWriteFileBytes(sqlPath, script);
 
   cmd := 'LD_LIBRARY_PATH="' + libDir + '" "' + binPath + '" :memory:' +
          ' <"' + sqlPath + '" >"' + actOut + '" 2>&1';
   rc := fpsystem(cmd);
-  aOut := readAll(actOut);
+  aOut := ShellReadAll(actOut);
 
   { Smoke assertions:
       (1) rc=0 — the port did not crash on the .scanstats vm arm

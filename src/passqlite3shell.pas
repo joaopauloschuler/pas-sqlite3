@@ -6786,6 +6786,7 @@ function cmdFilectrl(p: PShellState; const args: array of AnsiString;
 var
   zCmd, zSchema: AnsiString;
   zCmdC: AnsiString;
+  zSchemaP: PAnsiChar;
   i, n2, iCtrl: SizeInt;
   filectrl: i32;
   iRes: i64;
@@ -6808,6 +6809,12 @@ begin
     zCmd := args[2];
     bShifted := True;
   end;
+
+  { C passes a NULL zSchema (defaults to "main" in sqlite3DbNameToBtree)
+    when --schema was not given; an empty PAnsiChar would instead make
+    sqlite3FindDbName fail and leave the caller's buffer untouched. }
+  if zSchema = '' then zSchemaP := nil
+  else                 zSchemaP := PAnsiChar(zSchema);
 
   { Strip leading single or double dash from the command name. }
   zCmdC := zCmd;
@@ -6865,7 +6872,7 @@ begin
         if (nArg = 3) or (nArg = 4) then begin
           if nArg = 4 then iLong := StrToInt64Def(args[3], 0) else iLong := -1;
           iRes := iLong;
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+          sqlite3_file_control(p^.db, zSchemaP,
                                SQLITE_FCNTL_SIZE_LIMIT, @iRes);
           isOk := 1;
         end;
@@ -6873,7 +6880,7 @@ begin
         if (nArg = 1) or (nArg = 2) then begin
           if nArg = 2 then iLong := StrToInt64Def(args[1], 0) else iLong := -1;
           iRes := iLong;
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+          sqlite3_file_control(p^.db, zSchemaP,
                                SQLITE_FCNTL_SIZE_LIMIT, @iRes);
           isOk := 1;
         end;
@@ -6884,13 +6891,13 @@ begin
       if bShifted then begin
         if nArg = 4 then begin
           iVal := StrToIntDef(args[3], 0);
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
           isOk := 2;
         end;
       end else begin
         if nArg = 2 then begin
           iVal := StrToIntDef(args[1], 0);
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
           isOk := 2;
         end;
       end;
@@ -6900,14 +6907,14 @@ begin
       if bShifted then begin
         if (nArg = 3) or (nArg = 4) then begin
           if nArg = 4 then iVal := parseOnOff(args[3], -1) else iVal := -1;
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
           iRes := iVal;
           isOk := 1;
         end;
       end else begin
         if (nArg = 1) or (nArg = 2) then begin
           if nArg = 2 then iVal := parseOnOff(args[1], -1) else iVal := -1;
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
           iRes := iVal;
           isOk := 1;
         end;
@@ -6917,7 +6924,7 @@ begin
     SQLITE_FCNTL_HAS_MOVED: begin
       if ((bShifted and (nArg = 3)) or ((not bShifted) and (nArg = 1))) then begin
         iVal := 0;
-        sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+        sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
         iRes := iVal;
         isOk := 1;
       end;
@@ -6925,7 +6932,7 @@ begin
     SQLITE_FCNTL_TEMPFILENAME: begin
       if ((bShifted and (nArg = 3)) or ((not bShifted) and (nArg = 1))) then begin
         zRet := nil;
-        sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @zRet);
+        sqlite3_file_control(p^.db, zSchemaP, filectrl, @zRet);
         if zRet <> nil then begin
           WriteLn(AnsiString(zRet));
           sqlite3_free(zRet);
@@ -6937,16 +6944,16 @@ begin
       if bShifted then begin
         if nArg >= 4 then begin
           iVal := StrToIntDef(args[3], 0);
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
         end;
       end else begin
         if nArg >= 2 then begin
           iVal := StrToIntDef(args[1], 0);
-          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+          sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
         end;
       end;
       iVal := -1;
-      sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+      sqlite3_file_control(p^.db, zSchemaP, filectrl, @iVal);
       WriteLn(iVal);
       isOk := 2;
     end;

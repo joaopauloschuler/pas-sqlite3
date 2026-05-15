@@ -61,6 +61,10 @@ FPC porting traps that recur often enough to call out up-front:
 
 ---
 
+> Closed-task postmortems for Phases 6–9 archived in
+> [`tasklist-landed.md`](tasklist-landed.md).  This file keeps task IDs +
+> one-line outcomes + key cites only.
+
 ## Phase 5 — Deferred carry-overs
 
 - [ ] **5.7.b** `sqlite3VdbeSorter*` PMA disk-spill — STUB_INVENTORY #13 DRIFTED-XL (~2400 lines C, vdbesort.c).  In-memory mergesort is real and 1:1; PMA (Packed Memory Array) on-disk merge for sorts larger than the in-memory buffer is not yet ported.  Symptom when missed: large ORDER BY / GROUP BY / CREATE INDEX over multi-page data will fail or silently degrade once the sort buffer overflows.  Complexity: XL.  Blockers: none (self-contained — driver and PMA writer/reader port without touching the VDBE dispatch).
@@ -78,18 +82,21 @@ FPC porting traps that recur often enough to call out up-front:
 - [~] **6.26** Window functions (window.c). DiagWindow: 0 divergences. Reopen if DiagWindow regresses.
 - [X] **6.27** schema-mutation + statistics. Analyze, Vacuum, RunVacuum, FkCheck/FkActions.
 - [~] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap). Inventory landed at `src/tests/STUB_INVENTORY.md` (21 actionable entries: 7 high / 6 med / 8 low). One small high-priority entry ported in 6.28 commit (`pas_openDirectory`, os_unix.c:3874..3894 → src/passqlite3os.pas:2331). Doable subtasks for the remaining six high-priority stubs (each cites the open Phase-6/9 bullet it blocks; see STUB_INVENTORY.md for full Pascal/C citations):
-  - [X] **6.28.1** Port `whereLoopAddVirtual` deeper arms — audit verdict (6.28.8): stub-was-real.  Body at passqlite3codegen.pas:15658..15818 is a 1:1 four-pass driver port of where.c:4681..4803 (ALLBITS+IN, ALLBITS+!IN retry, per-distinct-prereqRight loop, all-disabled + all-disabled+!IN fallbacks).  Callees whereLoopAddVirtualOne / allocateIndexInfo / freeIndexInfo / whereLoopResize all real.  Stale "stub" banner at forward decl (codegen.pas:1932) scrubbed.  STUB_INVENTORY #1 closed.
-  - [X] **6.28.2** Port `sqlite3OpenTableAndIndices` full body — audit verdict (6.28.8): stub-was-real.  Body at passqlite3codegen.pas:35907..35963 is a 1:1 port of insert.c:2870..2925 (vtab no-op, cursor assignment, HasRowid+aToOpen[0] gate, IsPrimaryKeyIndex+!HasRowid re-routing, sqlite3VdbeSetP4KeyInfo+ChangeP5).  TableLock fallback correctly inert under OMIT_SHARED_CACHE.  Stale "Phase 6.4 stub" comments inside sqlite3DeleteFrom scrubbed.  STUB_INVENTORY #2 closed.
-  - [X] **6.28.3** Port `sqlite3NestedParse` body — landed at `src/passqlite3codegen.pas:40499` (C ref `build.c:293..323`).  Faithful 1:1 port: nErr/eParseMode early-out, sqlite3VMPrintf format, PARSE_TAIL save/restore via Move/FillChar, DBFLAG_PreferBuiltin toggle, dispatch via gNestedRunParser hook (registered by parser unit init).  All 22 productive call sites pass real format strings.  STUB_INVENTORY entry #3 closed.  Build clean 87/87, 5172/5172.
-  - [X] **6.28.4** Complete `sqlite3AddColumn` drift arms — audit verdict (6.28.8): DRIFTED-S (~25 lines C).  Body at passqlite3codegen.pas:37284 is largely 1:1; missing arms: (a) build.c:1507 `if(!IN_RENAME_OBJECT) sqlite3DequoteToken(&sName)` pre-allocation dequote; (b) build.c:1513..1524 GENERATED-ALWAYS trailing-text strip; (c) build.c:1530 `sqlite3DequoteToken(&sType)` inside standard-typename check.  No STRICT work to do here — STRICT enforcement lives downstream in sqlite3EndTable (original inventory cite to build.c:1862..2026 was wrong).  Complexity: S.  Landed: all three arms ported 1:1 at passqlite3codegen.pas:37400..37445 (pre-alloc dequote of sName, GENERATED ALWAYS trailing-text strip, sType dequote before standard-typename match).  Build 88/88, 5177/5177; TestExplainParity 1026/1026.
-  - [X] **6.28.5** Port `sqlite3LimitWhere` view-rewrite arm — audit verdict (6.28.8): stub-was-real.  Body at passqlite3codegen.pas:31123..31217 is a 1:1 port of delete.c:182..277 (rowid arm, single-PK arm, vector-PK arm, isIndexedBy/isCte FROM-dup, TK_IN wrap).  C has NO useTempRow / view-rewrite arm in this helper (original inventory "two unported arms" was wrong).  Pending work is caller-side wiring in sqlite3DeleteFrom (codegen.pas:31338 TODO) and sqlite3Update (codegen.pas:32419 TODO) — annotated as separate Phase-6.x slices, not part of this helper.  Stale "no-op stub" comments scrubbed.  STUB_INVENTORY #5 closed.
-  - [X] **6.28.6** Port `OP_IntegrityCk` body — audit verdict (6.28.8): stub-was-real.  OP_IntegrityCk arm at passqlite3vdbe.pas:10715..10748 and sqlite3BtreeIntegrityCheck driver at passqlite3btree.pas:7916..8043 are both real 1:1 ports (freelist + auto-vacuum cross-check + checkTreePage walk + page-coverage map + SQLITE_DYNAMIC error string).  Remaining gap is driver-side: `PRAGMA integrity_check` in codegen.pas:45844 still emits hardcoded "ok" instead of building an OP_IntegrityCk plan — that pragma-wiring slice is **not** "port OP_IntegrityCk" and is filed as a follow-up bullet below.  Stale "OP_IntegrityCk is a stub" comment scrubbed.  STUB_INVENTORY #6 closed.
-  - [ ] **6.28.6.b** Higher-level `PRAGMA integrity_check` walk arms — pragma.c:1792..2194 (~430 lines C): index-row-count cross-check, full row walk, CHECK / STRICT / UNIQUE / FK / vtab.xIntegrity per-table arms.  6.28.6.a wired the b-tree slice; this slot lands the schema-level integrity arms.  Complexity: L.
-  - [X] **6.28.6.a** Wire `PRAGMA integrity_check / quick_check` to emit OP_IntegrityCk — landed at codegen.pas:45968 (pragma.c:1695..1820 + endCode at 2195..2217).  Per-attached-db root-page enumeration via tblHash walk, P4_INTARRAY (sqlite3DbMallocZero, owned by VDBE), OP_IntegrityCk emission with banner row + inline integrityCheckResultRow, plus the trailing AddImm/IfNotZero/"ok"/Halt/"corrupt"/Goto endCode block.  Higher-level walk arms (index-row-count cross-check, full row/CHECK/STRICT/UNIQUE/FK/vtab.xIntegrity — pragma.c:1792..2194) filed as 6.28.6.b follow-up.  Smoke: `PRAGMA integrity_check` and `PRAGMA quick_check` both emit "ok" via real OP_IntegrityCk on clean DBs (matches C oracle); DiagPragma integrity_check/quick_check rows green; TestExplainParity 1026/1026.
-  - [X] **6.28.7** Wire `getRowTrigger` mask helper — audit verdict: stub-was-real. `trgGetRowTrigger` (passqlite3codegen.pas:30884) + `codeRowTrigger` (:30709) are 1:1 with trigger.c:1347 / 1231; aColmask[0/1] populated from sub-Parse oldmask/newmask; `sqlite3TriggerColmask` picks up real per-column bits for ordinary triggers. Stale "not yet ported" comments scrubbed; STUB_INVENTORY #7 closed.
-  - [X] **6.28.9** STUB_INVENTORY medium-priority audit pass — audit verdict: 5 stub-was-real (#8 code_outer_join_constraints/pRJ, #9 sqlite3ExprNNCollSeq, #10 sqlite3DefaultRowEst, #11 codeVectorCompare, #12 sqlite3HasExplicitNulls), 1 DRIFTED-XL (#13 sqlite3VdbeSorter PMA-spill deferred; in-memory path fully ported).  Original inventory cites were wrong on 4 of 6 entries (where.c→wherecode.c, expr.c:174→:321, codegen.pas:23998→:36624, expr.c:3210→:697).  Stale "stub" / "Phase 6.6 stub" / "not yet ported" comments scrubbed at codegen.pas:20975 (pRJ banner), :16424 (NNCollSeq banner), :5517 (codeVectorCompare banner), and vdbe.pas:6232 (sorter banner refreshed to "in-memory real; PMA deferred").  STUB_INVENTORY.md updated per-entry.  Build clean.
-  - [X] **6.28.10** STUB_INVENTORY low-priority audit pass — audit verdict: 5 intentional no-ops faithful to C preprocessor-gated empty macros (#14 VdbeComment/NoopComment, #15 AssertAbortable/VerifyNoMallocRequired/VerifyNoResultRow, #16 VdbeEnter/Leave, #17 SchemaMutexHeld, #18 noopWindow*Func), 2 closed (was real) with banner refresh (#19 sqlite3VtabEponymousTableClear, #20 invalidate*OverflowCache), and #21 pas_openDirectory already landed in 6.28.  Stale "stub — full version in 6.bis.1f" / "still a no-op for now" comments scrubbed in passqlite3vtab.pas:39,66.  Citation line numbers refreshed (e.g. noopWindow* moved :52321→:52792).  STUB_INVENTORY.md header now correctly states "2 actionable entries" (#4 DRIFTED-S done in 6.28.4, #13 DRIFTED-XL deferred to Phase 5.7.b).  Build clean.
-  - [X] **6.28.8** Audit-pass remaining high-priority STUB_INVENTORY entries (#1 `whereLoopAddVirtual`, #2 `sqlite3OpenTableAndIndices`, #4 `sqlite3AddColumn`, #5 `sqlite3LimitWhere`, #6 `OP_IntegrityCk`).  Verdicts: #1, #2, #5, #6 were CLOSED (was real) — bodies are 1:1 with their C reference points, the inventory was citing stale marker comments at unrelated call sites; #4 is DRIFTED-S (~25 lines C of small arms — see 6.28.4 note).  Original inventory line-references / C cites were wrong on three of five entries (sqlite3AddColumn cited build.c:1862 but body is at 1490; sqlite3OpenTableAndIndices cited build.c but body is in insert.c; sqlite3LimitWhere cited delete.c:330+ but body ends at 277).  Stale "stub" comments scrubbed in passqlite3codegen.pas at the audit sites.  Net: six of seven original "high-priority" stubs are now closed; future agents have clear S/M/L estimates rather than misleading "~600 lines C" sizing.  Build 87/87 still green.
+  - [X] **6.28.1** `whereLoopAddVirtual` deeper arms — stub-was-real (1:1 port of where.c:4681..4803).
+  - [X] **6.28.2** `sqlite3OpenTableAndIndices` full body — stub-was-real (1:1 port of insert.c:2870..2925).
+  - [X] **6.28.3** `sqlite3NestedParse` body ported (build.c:293..323) via gNestedRunParser hook.
+  - [X] **6.28.4** `sqlite3AddColumn` drift arms — three small dequote/strip arms ported 1:1 (build.c:1507/1513/1530).
+  - [X] **6.28.5** `sqlite3LimitWhere` — stub-was-real (1:1 port of delete.c:182..277).
+  - [X] **6.28.6** `OP_IntegrityCk` body + `sqlite3BtreeIntegrityCheck` — stub-was-real.
+  - [X] **6.28.6.b** Higher-level `PRAGMA integrity_check` walk arms — pragma.c:1792..2194 (row walk, CHECK, per-index validation, UNIQUE duplicate detection). Archive.
+  - [X] **6.28.6.a** PRAGMA integrity_check/quick_check wired to emit real OP_IntegrityCk plan (pragma.c:1695..1820 + 2195..2217).
+  - [X] **6.28.6.c** vtab xIntegrity dispatch:
+    - [~] **6.28.6.c.1** ~~FK referential walk~~ DROPPED 2026-05-13 — phantom cite (integrity_check carries no FK walk; PRAGMA foreign_key_check is separate). Archive.
+    - [X] **6.28.6.c.2** vtab `xIntegrity` dispatch — emits `OP_VCheck p1=iDb, p2=errReg, p3=isQuick, p4=pTab(P4_TABLEREF)`. Cite: pragma.c:2163..2193. Archive.
+  - [X] **6.28.7** `getRowTrigger` / `codeRowTrigger` / `sqlite3TriggerColmask` — stub-was-real (1:1 with trigger.c:1347 / 1231).
+  - [X] **6.28.8** Audit pass on high-priority STUB_INVENTORY entries (#1/#2/#5/#6 CLOSED was-real, #4 DRIFTED-S done in 6.28.4).
+  - [X] **6.28.9** Medium-priority audit pass — 5 stub-was-real, 1 DRIFTED-XL (#13 sorter PMA-spill deferred to 5.7.b).
+  - [X] **6.28.10** Low-priority audit pass — 5 intentional no-ops faithful to C preprocessor-gated empty macros, 2 was-real with banner refresh.
 
 ### Closed bugs (kept as ticked stubs)
 
@@ -109,12 +116,12 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.23** `sqlite3_open_v2` doesn't honor `file:` URI filenames — wired `sqlite3ParseUri` into `openDatabase`; CLI calls `sqlite3_config(SQLITE_CONFIG_URI, 1)`.
 - [X] **6.29 / 6.29.followup** `sum(b) OVER ()` / `avg(b) OVER ()` — colUsed propagation across window-rewrite boundary in sqlite3WindowRewrite.
 - [X] **6.30** unix VFS iVersion bumped to 3 — ported `aSyscall[]` table + `unixSetSystemCall`/`unixGetSystemCall`/`unixNextSystemCall` in `passqlite3os.pas`, wired into `unixVfsObj`.
-- [X] **6.31** unix-VFS locking-style shims — `sqlite3_os_init` now auto-registers `unix-none`/`unix-dotfile`/`unix-excl` siblings alongside `unix`, mirroring the `UNIXVFS` chain at `os_unix.c:8499..8542`. `.vfslist` enumeration now matches upstream's name/order. Limitation: the 4 VFS records share one `xOpen` and the C `pAppData`→finder dispatch is not yet wired through `unixOpen`, so files opened via the sibling names still get the base posix `unixIoMethods` rather than nolock/dotlock locking. Functional locking-style dispatch + dotlock `lockingContext`/mkdir machinery is a follow-up.
-- [X] **6.13.B.11** `.expert` (10.1.101) reported `(no new indexes)`. Original triage blamed an `eTabType`-after-OP_ParseSchema reload, but tracing showed eTabType was correctly `TABTYP_VTAB` on republished vtabs; the real surface was the eponymous-vtab fast arm in `sqlite3Select` firing unconditionally for every single-source vtab SELECT — no WHERE/ORDER BY pushdown, so `xBestIndex` never saw the constraints and `pScan` stayed empty. Fix: in `passqlite3codegen.sqlite3Select` (passqlite3codegen.pas:~26956) restrict the fast arm to the simple `SELECT … FROM <vtab>` shape (`pWhere=nil and pOrderBy=nil and pGroupBy=nil and pHaving=nil and pLimit=nil`); other shapes fall through to `sqlite3WhereBegin → whereLoopAddVirtual` (Phase 6.13.B.7). Verified: `.expert` now emits `CREATE INDEX t1_idx_… ON t1(b)` for `SELECT * FROM t1 WHERE b=?`.
+- [X] **6.31** unix-VFS locking-style shims — `unix-none`/`unix-dotfile`/`unix-excl` siblings auto-registered (os_unix.c:8499..8542). Limitation: 4 VFS records share one `xOpen`; `pAppData`→finder dispatch not yet wired through `unixOpen` (sibling names use base posix `unixIoMethods` rather than nolock/dotlock locking). Functional locking-style dispatch + dotlock machinery is a follow-up.
+- [X] **6.13.B.11** `.expert` `(no new indexes)` — eponymous-vtab fast arm in `sqlite3Select` was firing for every single-source vtab SELECT, suppressing WHERE/ORDER BY pushdown. Fast arm now restricted to bare `SELECT … FROM <vtab>` shape; other shapes fall through to `sqlite3WhereBegin → whereLoopAddVirtual`.
 
 ### Open Bugs (re-opened 2026-05-11)
 
-- [X] **6.32** DiagTxn savepoint-rollback hang — closed 2026-05-12 as no-longer-reproduces. Verified `bin/DiagTxn` completes in ~107 ms with 0 divergences, and a fresh 16-deep `SAVEPOINT`/`ROLLBACK TO` stress (interleaved rollback-to with re-insertion, both `:memory:` and file-backed pagers via `bin/passqlite3`) returns correct results in under 150 ms. Likely fixed in-passing by the OP_Savepoint / pager-savepoint work landed during 6.10/6.11 and the VdbeMakeReady zero-init (bug 6.16). Removed the `timeout 10` standing workaround from `src/tests/build.sh` comment and the Phase-6 orientation note.
+- [X] **6.32** DiagTxn savepoint-rollback hang — closed 2026-05-12 as no-longer-reproduces (likely fixed in-passing by 6.10/6.11 OP_Savepoint work + 6.16 VdbeMakeReady zero-init).
 
 ---
 
@@ -137,35 +144,9 @@ Public-API gap analysis: `../sqlite3/src/sqlite.h.in` exports
 ~238 `sqlite3_*` symbols; the Pascal port currently exposes ~156.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs are excluded.
 
-- [X] **8.4.1** sqlite3_test_control full varargs coverage (overload-based) —
-  testCtrlImpl shared dispatcher with typed overloads (op-only / int /
-  db / db+int / db+pN / int+pU32 / pI32) replaces the 1-arg stub.
-  Arms: PRNG_SAVE/RESTORE/SEED, FK_NO_ACTION, OPTIMIZATIONS, GETOPT,
-  PENDING_BYTE, ASSERT, ALWAYS, LOCALTIME_FAULT, INTERNAL_FUNCTIONS,
-  NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS, ONCE_RESET_THRESHOLD, SORTER_MMAP,
-  BYTEORDER, ISINIT, TRACEFLAGS, JSON_SELFCHECK.  Adds public
-  sqlite3TreeTrace/sqlite3WhereTrace u32 globals (storage only — pas
-  consumer-side WHERETRACE/TREETRACE blocks were skipped during port,
-  matching upstream's non-debug build).  Fixed shell.pas
-  SQLITE_TESTCTRL_FK_NO_ACTION (was 33, now 7 per sqlite.h.in:8690).
-- [X] **8.2.1** sqlite3VdbeScanStatus + sqlite3VdbeScanStatusRange + sqlite3VdbeScanStatusCounters
-  arms ported (vdbeaux.c:1186..1274); per-loop aScan[] / nScan added to TVdbe; nExec
-  added to TVdbeOp and bumped in the dispatch loop; sqlite3_stmt_scanstatus_v2 reader
-  ported (vdbeapi.c:2457..2606) covering NLOOP/NVISIT/EST/NAME/EXPLAIN/SELECTID/PARENTID;
-  NCYCLE deferred (returns -1 — would require hwtime sampling around dispatch and
-  per-op nCycle field).  sqlite3WhereAddScanStatus partially ported and wired at both
-  WhereBegin emit-paths (full-planner + whereShortCut); addrLoop/addrVisit pinned to 0
-  pending TWhereLevel.addrVisit field add (TWhereLevel layout extension deferred —
-  NLOOP/NVISIT therefore report -1).  Shell `.scanstats on` emits per-loop block at
-  end-of-statement (text shape diverges from upstream qrf.c qrfEqpStats; not yet ported).
-- [X] **8.1.1** sqlite3_config / sqlite3_db_config full varargs coverage
-  (overload-based — no C-ABI va_list).  Added overloads for
-  CONFIG_LOOKASIDE (two int), CONFIG_LOG (xLog + pCtx), CONFIG_PAGECACHE
-  (ptr + sz + N), CONFIG_MMAP_SIZE / MEMDB_MAXSIZE (two i64), and a
-  CONFIG_PMASZ arm on the int overload.  sqlite3_db_config typed
-  entry points (_text / _lookaside / _int) cover all upstream db-config
-  shapes including MAINDBNAME, LOOKASIDE, FP_DIGITS, and all flag-toggle
-  ops.  `.log` now installs a real xLog trampoline.
+- [X] **8.4.1** sqlite3_test_control full varargs coverage (overload-based dispatcher; PRNG_*, FK_NO_ACTION, OPTIMIZATIONS, GETOPT, PENDING_BYTE, ASSERT/ALWAYS, LOCALTIME_FAULT, INTERNAL_FUNCTIONS, NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS, ONCE_RESET_THRESHOLD, SORTER_MMAP, BYTEORDER, ISINIT, TRACEFLAGS, JSON_SELFCHECK).
+- [X] **8.2.1** sqlite3VdbeScanStatus + ScanStatusRange + ScanStatusCounters ported (vdbeaux.c:1186..1274); sqlite3_stmt_scanstatus_v2 reader covers NLOOP/NVISIT/EST/NAME/EXPLAIN/SELECTID/PARENTID. NCYCLE landed in 10.1.39.d.
+- [X] **8.1.1** sqlite3_config / sqlite3_db_config full varargs coverage (overload-based; LOOKASIDE, LOG, PAGECACHE, MMAP_SIZE/MEMDB_MAXSIZE, PMASZ; db-config typed entry points _text/_lookaside/_int cover MAINDBNAME, LOOKASIDE, FP_DIGITS, flag-toggle ops).
 - [X] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 - [X] **8.x** unixCurrentTimeInt64; VFS iVersion bumped 1→2.
 - [X] **8.10** Public-API sample-program gate (DiagSampleProg 6 PASS / 0 FAIL).
@@ -199,225 +180,91 @@ regressions without human triage.
   10 dependency) and captures `(stdout, stderr, rc, db-blob)`.
   Wire the same plumbing for the Pascal port via passqlite3.
 
-- [~] **9.1.3** `TestSQLCorpus.pas` skeleton.  Iterate MANIFEST, run
-  both oracles, byte-compare all four channels.  First diverging file
-  prints a one-screen summary (file, channel, first 16-byte window)
-  and exits non-zero.  Gate: `bin/TestSQLCorpus` rc=0.
-  *Skeleton landed 2026-05-12 with 4 inline scripts (ddl/dml/dql/pragma)
-  drawn from MANIFEST tier-1/tier-2 entries; bin/TestSQLCorpus rc=0;
-  db-blob channel currently logs-only (gated on 9.1.4 mask).*
+- [~] **9.1.3** `TestSQLCorpus.pas` skeleton — iterate MANIFEST, run both oracles, byte-compare all four channels; first diverging file prints summary and exits non-zero. Gate: `bin/TestSQLCorpus` rc=0. Skeleton landed 2026-05-12; full coverage delivered by 9.1.3.followup.
 
-- [X] **9.1.3.followup** Expand `TestSQLCorpus.pas` to full MANIFEST
-  coverage: pull every tier-1 source file's SQL list out of its `.pas`
-  literals (the spine is the 1026-row TestExplainParity corpus) and
-  every tier-2 Diag* feature-corner.  Skip tier-4 (shell-driven) and
-  tier-3 entries already overlapped by tier-1.  Requires a small
-  SQL-literal-extractor — landing it under this subtask keeps the
-  9.1.3 skeleton diff small.
-  *Landed 2026-05-12: `src/tests/SQLLiteralExtractor.pas` parses Pascal
-  string literals out of `Add(...)`/`Probe(...)` plus the `Run*/Check/
-  TestExpr/ProbeOne/Case/Diff` label-less anchors used by smaller Diag*
-  files, then groups per-call strings into one multi-statement script
-  so setup/probe pairs run in the same DB.  TestSQLCorpus now iterates
-  51 tier-1 + tier-2 manifest entries (35 yield SQL, 16 use non-anchor
-  helper patterns and extract empty); **2259 scripts run, 2207 pass,
-  52 divergences cataloged** to `src/tests/DIVERGENCES.md` (per task
-  contract: skip-and-cite, do NOT chase; first-divergence per file is
-  quoted with channel + 16-byte window).  Divergences cluster in:
-  RELEASE-without-SAVEPOINT errmsg wording (TestExplainParity / Bytecode
-  / Parser 44 rows), PRAGMA mmap_size/journal_mode (3 rows), DROP INDEX
-  errmsg truncation (1), DiagAnalyze full-script rc (3), DiagBloom
-  pre-existing sqlite_stat1 (1).  bin/TestSQLCorpus rc=0; full
-  regression 88/88 binaries pass.*
+- [X] **9.1.3.followup** Full MANIFEST coverage via `SQLLiteralExtractor.pas`; 51 tier-1+2 entries, 2259 scripts; 52 divergences cataloged to `DIVERGENCES.md`. Archive.
 
-- [X] **9.1.4** Determinism scrub.  Strip the known non-deterministic
-  fields (file-change-counter at offset 24, version-valid-for at 92,
-  in-header text encoding when unset, freelist trunk order under
-  identical workloads — verify each before stripping).  Document
-  every masked byte range in `src/tests/corpus/MASK.md` with the C
-  source citation that justifies the mask.
-  *Landed 2026-05-12: `CorpusOracle.ApplyHeaderMask` zeros 4 verified
-  byte ranges (24..27 change counter, 56..59 text encoding default-fill,
-  92..95 version-valid-for, 96..99 SQLITE_VERSION_NUMBER) — each cites
-  the C source that writes the field (pager.c:3089..3096, build.c:1354).
-  Freelist trunk order + offsets 28/40/52/etc. evaluated and **rejected**
-  (deterministic under identical workloads) with the rationale recorded
-  in `src/tests/corpus/MASK.md`.  TestSQLCorpus now gates the db-blob
-  channel ON; mask uncovers **+25 new db-blob divergences** (total
-  divergence count 52 → 77; 2182 ok / 2259 scripts) cataloged in
-  `DIVERGENCES.md` per skip-and-cite contract.  bin/TestSQLCorpus rc=0;
-  88/88 regression binaries pass.*
+- [X] **9.1.4** Determinism scrub — `ApplyHeaderMask` zeros 4 verified byte ranges (24..27, 56..59, 92..95, 96..99); see `src/tests/corpus/MASK.md`. Cumulative diverge 52 → 77. Archive.
 
-- Triage of `DIVERGENCES.md` clusters surfaced by 9.1.3.followup + 9.1.4
-  (77 cataloged sites, ~7 distinct root causes — each a Pascal-only bug
-  bisectable against the C oracle, skip-and-cite per the corpus contract):
-  - [X] **9.1.divbug.1** RELEASE-without-SAVEPOINT errmsg wording (44 sites
-    across TestExplainParity/Bytecode/Parser) — single root cause, single
-    fix.  Likely in `sqlite3Savepoint` / errmsg formatter; cross-check
-    against `../sqlite3/src/vdbe.c` OP_Savepoint OP_REL_S arm.
-    *Landed 2026-05-12: OP_Savepoint's not-found arm in `passqlite3vdbe.pas:9678`
-    emitted the bare literal `'no such savepoint'`; C `vdbe.c:3902` formats
-    `"no such savepoint: %s"` with the savepoint name via `sqlite3VdbeError`'s
-    variadic formatter.  Fixed by routing the message through `sqlite3MPrintf`
-    with `[zSvptName5g]`, transferring ownership to `zErrMsg` via the existing
-    DbStrDup inside sqlite3VdbeError, then freeing the temp buffer.  Closed
-    44/44 RELEASE sites; TestSQLCorpus divergence count 77 → 8; explain parity
-    holds at 1026/1026; full regression 88/88.*
-  - [X] **9.1.divbug.2** PRAGMA mmap_size / journal_mode output shape (3
-    sites).  Likely missing newline / wrong column count vs upstream.
-    *Landed 2026-05-12: `passqlite3codegen.pas:45911..45931` PRAGMA-default
-    table now seeds `mmap_size`=0 (pragma.c:951..978 disabled-mmap arm), and
-    the `journal_mode` read arm at `:45962..45980` queries the actual pager
-    via `sqlite3PagerGetJournalMode` + `sqlite3JournalModename` instead of
-    hard-coding the memdb literal `"memory"` (pragma.c:734..771).  Closed
-    3/3 sites; corpus 8 → 4 divergences; explain parity 1026/1026; full
-    regression 88/88.*
-  - [X] **9.1.divbug.3** DROP INDEX errmsg truncation (1 site) — verify
-    against `sqlite3DropIndex` / `sqlite3ErrorMsg` arms in delete.c.
-    *Landed 2026-05-12: `passqlite3codegen.pas:38974..38985` now formats
-    `"no such index: %s"` with `pItem^.zName` via `sqlite3MPrintf` + free,
-    matching C `build.c:4614` `"no such index: %S"` for the common
-    non-quoted/non-attached case.  Closed 1/1 site.*
-  - [X] **9.1.divbug.4** DiagAnalyze full-script rc divergence (3 sites)
-    — ANALYZE itself runs but exit rc differs.
-    *Landed 2026-05-12: root cause was `sqlite3WritableSchema`
-    (`passqlite3codegen.pas:36421`) reading bit `0x20`
-    (`SQLITE_CacheSpill`) instead of `0x01` (`SQLITE_WriteSchema`,
-    sqliteInt.h:1829), so `sqlite3CheckObjectName` (build.c:1031..1064)
-    short-circuited on `writable_schema=ON` for every CREATE — users could
-    fabricate `sqlite_stat1` rows that then collided with the real ANALYZE
-    insert path.  Fixed the mask; same patch closes divbug.8.*
-  - [X] **9.1.divbug.5** db-blob: DiagFeatureProbe ALTER COLUMN arm.
-    *Landed 2026-05-12: confirmed already closed as a side-effect of the
-    `sqlite3WritableSchema` bit-mask fix in 9.1.divbug.4+8
-    (`passqlite3codegen.pas:36421`, bit `0x01` SQLITE_WriteSchema vs the
-    previous `0x20` SQLITE_CacheSpill).  ALTER paths re-enter
-    `sqlite3CheckObjectName` during the sqlite_schema rewrite + OP_ParseSchema
-    reload (build.c:1031..1064), and the broken writable-schema read had been
-    letting the rewrite drift on internal names.  DiagFeatureProbe now reports
-    PASS on all 8 ALTER COLUMN / RENAME / DROP COLUMN probes (rename column,
-    add column, rename column+SELECT, add column+SELECT, rename table+SELECT,
-    rename table+pragma, drop column+pragma, drop column+SELECT).  Corpus
-    2259/2259 OK, 0 divergences; explain parity 1026/1026.*
-  - [X] **9.1.divbug.6** db-blob: DiagDml multi-table writes.
-    *Confirmed closed 2026-05-12 by the divbug.4+8 SQLITE_WriteSchema
-    bit-mask fix.  Corpus 2259/2259 OK after the bit-mask landing —
-    no separate fix needed.*
-  - [X] **9.1.divbug.7** db-blob: DiagDropTable.
-    *Confirmed closed 2026-05-12 by the divbug.4+8 SQLITE_WriteSchema
-    bit-mask fix.  Same writable-schema gate had been letting DROP TABLE
-    drift on reserved internal names; once the gate reads bit 0x01
-    correctly, DROP TABLE freelist+schema-cookie rewrite is byte-parity
-    with C.  Corpus 2259/2259 OK.*
-  - [X] **9.1.divbug.8** DiagBloom pre-existing sqlite_stat1 (1 site) —
-    Pascal side emits an extra row when stat1 is already populated.
-    *Landed 2026-05-12 alongside divbug.4 via the same `SQLITE_WriteSchema`
-    bit-mask fix.  Companion shell fix in `passqlite3shell.pas:8540`
-    (`paramTableInit` now toggles `SQLITE_DBCONFIG_WRITABLE_SCHEMA` around
-    `CREATE TABLE IF NOT EXISTS temp.sqlite_parameters`, mirroring
-    `bind_table_init` shell.c.in:2964).  Corpus 4 → 0 divergences;
-    explain parity 1026/1026; regression 88/88.*
+- Triage of `DIVERGENCES.md` clusters (~7 root causes; archive has full details):
+  - [X] **9.1.divbug.1** RELEASE-without-SAVEPOINT errmsg (44 sites) — OP_Savepoint not-found arm formats via sqlite3VdbeError (vdbe.c:3902).
+  - [X] **9.1.divbug.2** PRAGMA mmap_size / journal_mode output shape (3 sites) — pragma.c:951..978 / 734..771.
+  - [X] **9.1.divbug.3** DROP INDEX errmsg truncation (build.c:4614).
+  - [X] **9.1.divbug.4..8** Five sites, single root cause: `sqlite3WritableSchema` mask bit was `0x20` (SQLITE_CacheSpill) instead of `0x01` (SQLITE_WriteSchema, sqliteInt.h:1829). Fix: codegen.pas:36421 + shell.c.in:2964 toggle.
 
-- [ ] **9.1.5** Tag corpus categories by status: `pas-strict`
-  (byte-identical), `pas-soft` (output identical, db differs in
-  documented mask), `pas-skip` (gated on an open Phase 6/7/8 bullet —
-  must cite the bullet).  Strict tag is the CI gate; soft/skip are
-  tracked but non-blocking.
+- [X] **9.1.5** Corpus status tags landed in `src/tests/corpus/STATUS.txt` (`pas-strict`/`pas-soft`/`pas-skip` with cite); strict gate fires `Halt(1)` on any pas-strict divergence. Current: 35 pas-strict / 0 diverge.
 
-- [ ] **9.1.6** Coverage check.  Re-run with `--coverage` against the
-  port's opcode dispatcher; assert every executed opcode in
-  `passqlite3vdbe.pas` is hit at least once.  Any cold opcode means
-  the corpus has a gap — add a targeted `.sql`.
+- [X] **9.1.6** Coverage check — `bin/TestSQLCorpus --coverage` + `gVdbeOpCoverage[]`. Snapshot: 145 hot / 47 catalogued in `src/tests/corpus/COVERAGE_GAPS.md` / 0 real cold. Archive.
 
 ### 9.2 `TestReferenceVectors.pas` — canonical `.db` snapshots
 
-- [ ] **9.2.1** Vector inventory.  `src/tests/vectors/` currently
-  holds `simple.db` + `multipage.db`.  Add: `wal.db` (journal_mode
-  WAL mid-checkpoint), `autovacuum.db`, `incrvacuum.db`, `fts5.db`,
-  `rtree.db` (skip-tagged until extension ports land), `utf16.db`,
-  `withoutrowid.db`, `generated-column.db`, `triggers.db`,
-  `view-cte.db`, `partial-index.db`.  Each one generated by a
-  scripted `.sql` checked in next to it so the blob is reproducible.
+- [X] **9.2.1** Vector inventory — 9 new `.sql`+`.db` pairs under `src/tests/vectors/` (autovacuum, incrvacuum, utf16, withoutrowid, generated-column, triggers, view-cte, partial-index, wal); fts5+rtree `.sql`-only [SKIP]; legacy simple/multipage tagged [~] (3.45.x vintage, EQUIV_LIST in regen.sh). wal.db carries journal_mode=WAL in header bytes 18..19; .db-wal sidecar non-deterministic (random salt) and not committed. See `src/tests/vectors/MANIFEST.txt`.
 
-- [ ] **9.2.2** Read-only parity probe.  For each `*.db`, run a fixed
-  query script (`*.queries.sql`) under both oracles, diff stdout +
-  rc.  No writes — this gate is about read-side compatibility with
-  files the port did not author.
+- [~] **9.2.2** Read-only parity probe — `bin/TestVectorReadOnly` + per-vector `*.queries.sql` (11 vectors). Bucket-A FIXED in 9.2.divbug.A (btreeBeginTrans wrflag gate); the unioned pas-skip list now covers bucket-F (autovacuum/incrvacuum), bucket-G (utf16), bucket-H (withoutrowid), bucket-I (wal/multipage/generated-column round-trip drift) and bucket-J (triggers round-trip crash) plus bucket-C/E for view-cte/partial-index — but those buckets affect 9.2.3/9.2.4 only.  RO probe today: gated=1 ok=1 diverged=0 skipped=10 rc=0; the actual fix lifted SQLITE_READONLY for every vector and the remaining skips are pre-existing non-RO bugs surfaced after bucket-A was lifted.
 
-- [ ] **9.2.3** Round-trip probe.  Open vector, run a fixed mutator
-  script (`*.mutate.sql`: a handful of INSERT/UPDATE/DELETE inside
-  a single txn), close, byte-diff the resulting blob against the C
-  oracle's output.  Skip vectors flagged `read-only` in the
-  manifest.
+- [~] **9.2.3** Round-trip probe — `bin/TestVectorRoundTrip` + per-vector `<name>.mutate.sql` (11 mutators each exercising the vector's feature). Re-uses `CorpusOracle.ApplyHeaderMask`. Today (post-9.2.3.followup, cite-aware RT filter): gated=8 ok=8 diverged=0 skipped=3 rc=0.  Remaining skips: autovacuum (bucket-L, also bucket-B for schema-change), incrvacuum (bucket-L), utf16 (bucket-M, also bucket-K for RO).  Bucket-A umbrella lifted; bucket-I (4-vector RT cell-layout drift) closed; bucket-J (triggers RT crash) closed.
 
-- [ ] **9.2.4** Schema-change probe.  Subset where ALTER / CREATE
-  INDEX / VACUUM is exercised.  Validates Phase 6 OP_ParseSchema +
-  AddColumn paths (see memory entries) under non-synthetic schemas.
+- [~] **9.2.4** Schema-change probe — `bin/TestVectorSchemaChange` + per-vector `<name>.schema.sql` (8 vectors). Opens RW so does NOT inherit bucket-A; surfaced 4 new buckets (B/C/D/E — see 9.2.divbug.* below). 9.2.divbug.C closed (view-cte rename arm), 9.2.divbug.E closed (partial-index RENAME COLUMN aColExpr pin), but both view-cte and partial-index still hit bucket-B at the trailing VACUUM so they stay pas-skip. Today: gated=1 ok=1 diverged=0 skipped=7 rc=0.
 
-- [ ] **9.2.5** Vector regen script.  `src/tests/vectors/regen.sh`
-  rebuilds every `.db` from its companion `.sql` using the C
-  reference.  Committed blobs are derived artefacts; running the
-  script must produce a byte-identical tree.
+- [X] **9.2.5** Vector regen script — `src/tests/vectors/regen.sh` walks every `*.sql`, regenerates via C oracle, `cmp`s against committed blob. Skip-tagged (fts5/rtree) skipped; legacy simple/multipage fall back to .dump equivalence (EQUIV_LIST, 3.45.x vintage). Clean run: 11 OK + 2 skipped + 0 mismatch, rc=0.
+
+- Triage of `src/tests/vectors/DIVERGENCES.md` clusters surfaced by
+  9.2.2 / 9.2.3 / 9.2.4 (5 buckets, each a Pascal-only port bug
+  bisectable against the C oracle — skip-and-cite per the corpus
+  contract; mirrors the `9.1.divbug.*` pattern):
+  - [X] **9.2.divbug.A** RO-open trips `SQLITE_READONLY` — `btreeBeginTrans` missing `wrflag<>0` conjunct (btree.c:3622). Memory: `feedback_btree_readonly_wrflag_gate`. Lifting this umbrella surfaced buckets F/G/H/I/J. Archive.
+  - [X] **9.2.divbug.F** PRAGMA auto_vacuum returns 0 on RO-open — `sqlite3Pragma` stubbed auto_vacuum as constant `OP_Integer 0`; fix calls `sqlite3BtreeGetAutoVacuum(pBt)` per pragma.c:801. Archive.
+  - [X] **9.2.divbug.G** PRAGMA encoding garbled on UTF-16 RO — two causes: encoding arm hardwired 'UTF-8'; OP_String8 mis-tagged literal bytes. Fix per vdbe.c:1419..1436. Archive.
+  - [X] **9.2.divbug.H** WITHOUT ROWID count(*) fast path → CORRUPT — codegen missing P4_KEYINFO on the PK index cursor (select.c:8793..8814). Archive.
+  - [X] **9.2.divbug.I** Round-trip cell-layout drift (4 sites: wal/multipage/generated-column/triggers) — TWO bugs: (1) generated-column STORED expr referencing IPK column read SoftNull slot, fix aliases `iColumn==iPKey` to rowid reg (codegen.pas:5689, expr.c:5026..5074); (2) `printf('%.*c',N,'X')` ignored precision-as-repeat-count, fix in printf.pas:1255 + codegen.pas:50334 (printf.c:769..790). Archive.
+  - [X] **9.2.divbug.J** Round-trip trigger-fire EAV — `sqlite3VdbeClearObject` released aMem/aVar/pVList/pFree on sub-vdbes still in VDBE_INIT_STATE (raw-malloc garbage). Gate on `eVdbeState != VDBE_INIT_STATE` per vdbeaux.c:3747..3751. Archive.
+  - [X] **9.2.divbug.B** Bare `VACUUM;` `EAccessViolation` — root cause was `sqlite3_config` writing the address of a stack parameter slot into `GlobalConfig.xLog`, plus three `SQLITE_OMIT_AUTOVACUUM`-stubbed btree arms (`btreeCreateTable` root relocation, `allocateBtreePage` ptrmap-page skip, `sqlite3BtreeInsert` PTRMAP_OVERFLOW1).  VACUUM no longer crashes.  See vectors/DIVERGENCES.md bucket-B.
+  - [X] **9.2.divbug.C** ALTER TABLE RENAME on VIEW-dependent table → EAV — `sqlite3CreateView` reduced pSelect under IN_RENAME_OBJECT; resolver wrote past EP_TokenOnly/EP_Reduced allocations. Fix per build.c:3041..3046 + walker.c:71 + parse.y:1166. Memory: `feedback_view_body_in_rename_object_must_be_full`. Archive.
+  - [X] **9.2.divbug.D** CREATE INDEX on WITHOUT ROWID byte-different — `sqlite3CreateIndex` missing pPk arm (build.c:4278..4292) that copies PK columns into index-key suffix. Archive.
+  - [X] **9.2.divbug.E** RENAME COLUMN on partial-index byte-different — missing IN_RENAME_OBJECT arm pinning `pIndex^.aColExpr` (build.c:4209, alter.c:1639). Archive.
+  - [X] **9.2.divbug.K** UTF-16 `hex()` byte-swapped — `sqlite3_result_text*`/`_blob*` skipped `sqlite3VdbeChangeEncoding(pOut, pCtx->enc)` from `setResultStrOrError` (vdbeapi.c:387..427). Fix routes all result setters through ported `setResultStrOrError`. Archive.
+  - [X] **9.2.divbug.L** Auto-vacuum round-trip page-count drift — fixed `finalDbSize` (exact `ptrmapPageno` walk + `PTRMAP_ISPAGE` guard, btree.c:4135) and ported the missing `PRAGMA incremental_vacuum` codegen arm (pragma.c:854).  autovacuum/incrvacuum vectors now round-trip byte-identical; `TestVectorRoundTrip`/`SchemaChange`/`ReadOnly` skipped=0.  See vectors/DIVERGENCES.md bucket-L.
+  - [X] **9.2.divbug.L.1** Port `incrVacuumStep` (btree.c:4034..4128) + prerequisite ptrmap stubs (`ptrmapPageno`/`Put`/`Get`, `setChildPtrmaps`). Wired into `sqlite3BtreeIncrVacuum`. Archive.
+  - [X] **9.2.divbug.L.2** Port `relocatePage` + `modifyPagePointer` (btree.c:3876..4012). Archive.
+  - [X] **9.2.divbug.L.3** Wire `autoVacuumCommit` body (btree.c:4194..4277) + CommitPhaseOne caller. incrvacuum.db now truncates freelist correctly; autovacuum.db still drifts on page-cleanup hygiene (bucket-L stays open on narrowed symptom). Archive.
+  - [X] **9.2.divbug.M** ~~UTF-16 INSERT raw-UTF-8~~ CLOSED — subsumed by divbug.K (commit 6fd9ec2). Re-filed residual as divbug.N. Archive.
+  - [X] **9.2.divbug.N** ~~Freeblock zeroing~~ CLOSED — audit artefact, not a defect. Distro libsqlite3 has SECURE_DELETE; harness needs `LD_LIBRARY_PATH=src`. After fix: gated=9 ok=9 diverged=0 skipped=2. Archive.
+
+- [X] **9.2.3.followup** Round-trip parser cite-aware — only RT-relevant bucket cites trigger skips. 3 vectors un-masked (partial-index, view-cte, withoutrowid); 3 RT-only divergences triaged into buckets L and M. Final: gated=8 ok=8 diverged=0 skipped=3. Archive.
+
+- [X] **9.1.6.followup** Categorize 47 cold opcodes — split: 45 (a)-gated + 2 (b)-drivable + 4 newly-discovered real-cold all closed. Coverage drivers 14 → 18. Final: 147 hot / 45 cold-allow / 0 cold-real. Archive.
 
 ### 9.3 `TestFuzzDiff.pas` — differential fuzzer
 
-- [ ] **9.3.1** In-process harness.  `TestFuzzDiff.pas` reads a single
-  `dbsqlfuzz`-format input (db prefix + SQL tail per upstream
-  `test/fuzzcheck.c` — read its `ossfuzz_set_data` / db-prefix parser
-  for the exact frame layout before implementing), runs it under both
-  oracles in isolated workdirs, byte-diffs all four output channels
-  (stdout, stderr, rc, db-blob — reuse `src/tests/CorpusOracle.pas`
-  plumbing rather than re-implementing).  Apply the existing
-  `ApplyHeaderMask` from 9.1.4 to the db-blob channel.  No AFL yet —
-  just the one-shot driver that AFL will later call.
+- [X] **9.3.1** In-process harness — `bin/TestFuzzDiff <input.dbsqlfuzz>` 1:1 ports `fuzzcheck.c:decodeDatabase` (hex/`[NNNN]`/`\n--\n` frame). Four-channel diff via `CorpusOracle` + `ApplyHeaderMask`. Exit codes: 0/1/2/3. Smoke gate PASS. Archive.
 
-- [ ] **9.3.2** Seed corpus import.  Pull the upstream `dbsqlfuzz`
-  seed set from `../sqlite3/test/fuzzdata*.db` (8 seed files as of
-  2026-05-12) into `src/tests/fuzz/seeds/`.  Run the one-shot driver
-  across every seed.  Any divergence is catalogued in
-  `src/tests/DIVERGENCES.md` per the skip-and-cite contract
-  established by 9.1.3.followup — do **not** chase fixes during this
-  task; just surface and bucket each cluster.  Each cluster then
-  becomes a `9.3.divbug.N` follow-up bullet (mirroring the
-  `9.1.divbug.*` pattern).
+- [X] **9.3.2** Seed corpus import — 8 seeds (`fuzzdata1..8.db`, ~62 MiB) imported to `src/tests/fuzz/seeds/`. Sweep: **8/8 PASS, 0 divergences, 0 buckets**. Multi-frame archive splitting (treating each archive row as a frame) deferred to 13.1. Archive.
 
-- [ ] **9.3.3** AFL wiring.  `src/tests/fuzz/afl-driver.pas` wraps
-  9.3.1 for `afl-fuzz` (read input from stdin, write to a tmp file,
-  invoke the in-process harness, return AFL-compatible exit codes).
-  **FPC-AFL gotcha:** FPC has no `afl-clang-fast` equivalent (no LLVM
-  instrumentation pass).  Realistic options: (a) `afl-gcc` with
-  deferred instrumentation via FPC's `{$LINKLIB}` + a small C
-  shim that hosts the `__AFL_LOOP` macro; (b) black-box
-  `afl-fuzz -n` (no instrumentation, dumb-fuzz only — much lower
-  coverage but always works); (c) port the persistent-mode entry
-  to a thin C wrapper that calls into the Pascal harness via
-  `cdecl`.  Pick whichever the first agent can stand up cleanly;
-  document the choice in `src/tests/fuzz/README.md`.  Skip
-  gracefully if AFL isn't installed — script must self-report.
-
-- [ ] **9.3.4** Crash-vs-divergence classifier.  Triage helper that
-  separates (a) Pascal crash, (b) C crash, (c) silent divergence,
-  (d) timeout.  Each gets its own bucket under `src/tests/fuzz/crashes/`.
-
-- [ ] **9.3.5** ≥24 h soak target.  Wrapper script `fuzz-soak.sh`
-  with `--duration` (default 24h) and stop-on-first-divergence.
-  Not a CI gate — a manual gate documented in README.  Each clean
-  soak bumps a counter in `src/tests/fuzz/SOAK_LOG.md` so we can
-  prove the wallclock budget over time.
-
-- [ ] **9.3.6** Coverage-guided seed minimisation.  `afl-cmin` +
-  `afl-tmin` pipeline pruning the seed set to the smallest input set
-  that still hits every covered branch.  Re-commit the minimised
-  seeds when they shrink.
+AFL wiring and downstream coverage-guided fuzzing work moved to
+**Phase 13** (post-acceptance, parallel with Phase 12).  9.3.1 and
+9.3.2 (in-process harness + seed corpus) remain the Phase-9
+acceptance gate for this section.
 
 ### 9.4 SQLite Tcl test suite as alternate target
 
-- [ ] **9.4.1** Inventory.  Walk `../sqlite3/test/*.test` and tag each
+> Reorganised 2026-05-13: each umbrella bullet (9.4.1 .. 9.4.5) is
+> immediately followed by its decomposed sub-arms; trailing
+> `9.4.divbug.N` cluster bullets sit at the end in numeric order
+> (matching `src/tests/tcl/DIVERGENCES.md`).
+
+- [X] **9.4.1** Inventory.  Walk `../sqlite3/test/*.test` and tag each
   file `tcl-feature` (uses only public API — candidate), `tcl-internal`
   (touches `sqlite3_test_control` / private symbols — skip), or
   `tcl-perf` (defer to Phase 11).  Land `src/tests/tcl/MANIFEST.txt`.
+  - [X] **9.4.1.a** Inventory script — `src/tests/tcl/inventory.sh`
+    walks `../sqlite3/test/*.test`, greps each file for
+    `sqlite3_test_control` / `db_test_init` / `register_dbstat_vtab`
+    /etc. (full tag list: tcl-internal markers, tcl-perf markers),
+    emits `src/tests/tcl/MANIFEST.txt` one line per file:
+    `<tag>\t<path>`.  Snapshot: 946 tcl-feature / 225 tcl-internal /
+    17 tcl-perf (total 1188).
 
-- [ ] **9.4.2** Tcl binding shim.  Reuse / port the minimum of
+- [~] **9.4.2** Tcl binding shim.  Reuse / port the minimum of
   `../sqlite3/src/tclsqlite.c` (~6000 C lines total, but only a
   small subset is needed) so the upstream `interp` can attach to
   passqlite3 via the same `sqlite3` Tcl command.  Realistic complexity:
@@ -431,8 +278,259 @@ regressions without human triage.
   every `.test` file loads via `source $testdir/tester.tcl`, and it
   pulls in `do_test` / `do_execsql_test` / `expected` / etc.  Without
   tester.tcl no `.test` file runs.
+  - [X] **9.4.2.0** Plan doc — `src/tests/tcl/PLAN.md` summarises
+    the FPC↔Tcl bridge approach, list of Tcl C ABI symbols needed
+    (Tcl_CreateInterp, Tcl_Eval, Tcl_CreateObjCommand, Tcl_GetStringResult,
+    Tcl_DeleteInterp, Tcl_NewStringObj, Tcl_SetObjResult, Tcl_GetString,
+    Tcl_ListObjAppendElement, Tcl_NewListObj, Tcl_PkgProvide,
+    Tcl_FindExecutable), and the staged plan 9.4.2.a..9.4.2.g.
+  - [X] **9.4.2.a** Bridge unit — `src/tests/tcl/PasTclBridge.pas`
+    with cdecl externs for the symbols listed in 9.4.2.0 PLAN
+    (link via `-k-ltcl8.6` or `-k-ltcl`).  Smoke gate
+    `src/tests/TestTclBridgeSmoke.pas` creates a Tcl interp,
+    evals `expr 2+2`, asserts result == "4", deletes interp.
+    C ref: `tclsqlite.c:4276` (Tclsqlite3_Init shape) — this task
+    is only the bare bridge, no sqlite3 command yet.
+  - [X] **9.4.2.b** `Sqlite3_Init` exporter — minimal port of
+    `tclsqlite.c:Sqlite3_Init` (registers the `sqlite3` Tcl object
+    command and calls `Tcl_PkgProvide`).  Body still routes through
+    `DbMain` (constructor) and `DbObjCmd` (per-instance dispatcher),
+    both of which were stubs at this stage that returned TCL_ERROR with
+    "not implemented".  Built as `bin/libpassqlite3tcl.so` so
+    `load ./bin/libpassqlite3tcl.so Sqlite3` works in tclsh.
+    Smoke gate `bin/TestTclSqliteInit` confirms the load+package-require
+    cycle.
+  - [X] **9.4.2.c** `sqlite3 db1 :memory:` constructor — implemented
+    `DbMain` arm that calls `sqlite3_open_v2` against passqlite3 and
+    stores the resulting handle on a `SqliteDb*`-equivalent struct
+    attached to the Tcl object command.  `db close` arm of DbObjCmd
+    (only).  Smoke gate `bin/TestTclSqliteOpen` evals
+    `sqlite3 db1 :memory:; db1 close` and asserts no error.
+    C ref: `tclsqlite.c:DbMain` (4253..), `DbObjCmd close` (2480..).
+  - [X] **9.4.2.d** `db eval $sql` — minimum arm of DbObjCmd that
+    prepares/steps/finalises and returns rows as a flat Tcl list
+    (no column-name binding, no var-bind callback, no script-body
+    arg).  Smoke: `sqlite3 db1 :memory:; db1 eval {create table t(x);
+    insert into t values (1),(2),(3); select x from t}` returns
+    `1 2 3`.  C ref: `tclsqlite.c:dbEvalStep` (1766..) +
+    `DbObjCmd eval` arm (2700..).
+  - [X] **9.4.2.e** `db version`, `db changes`, `db last_insert_rowid`,
+    `db errorcode`, `db nullvalue ?value?` — trivial passthroughs to
+    sqlite3_libversion / sqlite3_changes / sqlite3_last_insert_rowid /
+    sqlite3_errcode plus the `zNull` field on SqliteDb.  Smoke gate
+    `bin/TestTclSqliteMeta`.  C ref: respective arms of DbObjCmd.
+  - [X] **9.4.2.f** `db function NAME ?-argcount N? proc` — registered
+    a scalar UDF via sqlite3_create_function_v2 with a Tcl trampoline
+    (DbSqlFunc).  Required by ~30% of tcl-feature tests including
+    the simplest ones in tester.tcl bootstrap.  C ref:
+    `tclsqlite.c:DbSqlFunc` (~1118) + `function` arm of DbObjCmd
+    (~2730).
+  - [~] **9.4.2.g** `tester_min.tcl` — `src/tests/tcl/tester_min.tcl`
+    re-exports just `do_test`, `do_execsql_test`, `execsql`,
+    `expected`, `set_test_counter`, `finalize_testing`, and the global
+    `db` handle — enough to source a hand-picked simple `.test` file.
+    Body adapted from `../sqlite3/test/tester.tcl:703..` and `941..`.
+    Smoke gate `bin/TestTclTesterMin` sources tester_min.tcl + runs
+    `do_test foo-1.0 {expr 1+1} 2`.  Remaining helpers tracked in
+    9.4.2.g.1.
+  - [X] **9.4.2.g.1** `ifcapable` — gates a test (file-level or
+    block-level) on `SQLITE_OMIT_*` / `SQLITE_ENABLE_*` compile flags.
+    Single biggest unlock — ~70% of tcl-feature tests open with
+    `ifcapable !foreignkey { finish_test ; return }` or similar.
+    Landed as an unconditional `uplevel 1 $code` stub matching our
+    default build (all caps enabled); real `sqlite3_compileoption_used` /
+    `sqlite3_compileoption_get` wiring deferred to 9.4.6.a.  Smoke gate
+    extended in `TestTclTesterMin` (foo-4.0 verifies BODY runs even on
+    a bogus EXPR).  C ref: `tester.tcl:1725..1739`.
+  - [X] **9.4.2.g.2** `catchsql` + `do_catchsql_test` — runs SQL,
+    captures `(rc, errmsg)` as a 2-list.  Unblocks every error-path
+    test (~30% of total).  C ref: `tester.tcl:1460..1465`, `973..976`.
+    Verbatim port; smoke gate in `TestTclTesterMin` (`catchsql
+    {select 1+1}` -> `0 2`, `catchsql {select * from nosuchtable}`
+    -> `1 {no such table: nosuchtable}`, `do_catchsql_test fail-1`
+    PASS).
+  - [X] **9.4.2.g.3** `finish_test` + `forcedelete` + `delete_file` —
+    per-test teardown convention; tests source-include them at the
+    end.  C ref: `tester.tcl:1234..1280`, `1696..1714`.  Landed:
+    `finish_test` collapses to `catch {db close}` + `finalize_testing`
+    (no test-VFS deregistration, no $argv extra-script loop, no
+    ::SLAVE gate beyond the `info exists` skip); `delete_file` /
+    `forcedelete` share `do_delete_file` with Linux fast-path (zero
+    retries by default, overridable via TEST_FILE_RETRIES /
+    TEST_FILE_RETRY_DELAY env vars).  Smoke gated by
+    `bin/TestTclTesterMin` (in-proc forcedelete + missing-path
+    delete_file) plus a sub-tclsh run that exercises finish_test ->
+    finalize_testing -> exit 0.
+  - [X] **9.4.2.g.4** `integrity_check` — wrapper that runs
+    `PRAGMA integrity_check` and asserts "ok".  C ref:
+    `tester.tcl:1674..1678` (verbatim port: `ifcapable integrityck`
+    guard + `do_test NAME [list execsql {PRAGMA integrity_check} $db]
+    {ok}`).  Smoke gated by `bin/TestTclTesterMin` ic-1 case (create
+    table + insert + integrity_check; nTest+=1, nErr unchanged on
+    healthy db).
+  - [X] **9.4.2.g.5** `working_64bit_int` + `presql` + `omit_test` —
+    capability/permutation helpers.  C ref: `tester.tcl:593..599`
+    (`omit_test`), `tester.tcl:2334..2338` (`presql`), and the C-side
+    build-cap probe in tclsqlite.c (`working_64bit_int`; no
+    `proc working_64bit_int` exists in upstream tester.tcl — the
+    probe is registered native and always returns 1 on x86_64).
+    Ported as: `working_64bit_int` -> constant `return 1` (probe is
+    always true on x86_64), `presql` -> verbatim catch around
+    `::G(perm:presql)`, `omit_test` -> verbatim append to TC(omit_list).
+    Smoke gated by `bin/TestTclTesterMin` step 9c (working_64bit_int=1,
+    presql=[] when unset, omit_test myskip records
+    `{myskip {reason text}}`).
+  - [X] **9.4.2.g.6** `do_eqp_test` — EXPLAIN QUERY PLAN comparison;
+    needs `db eval` 3-arg form (9.4.2.h) for row→list flattening.
+    C ref: `tester.tcl:1064..1098`.
+  - [X] **9.4.2.g.7** `do_test` glob/regexp/numeric-range forms
+    + `do_realnum_test`.  Ported the upstream prefix-driven match
+    dispatch (`/RE/`, `~/RE/`, `#A..B#`, `*GLOB*`, `~*GLOB*`, else
+    exact compare) into tester_min.tcl's do_test, plus verbatim
+    `realnum_normalize` / `do_realnum_test`.  Smoke gated by
+    `bin/TestTclTesterMin` step 9d/9e (glob-1, re-1/re-2, num-1,
+    exact-1, rn-1, all expected to PASS with nErr unchanged at 1).
+    C ref: `tester.tcl:739..793`, `888..896`.
+    `do_test_with_ansi_output` (tester.tcl:815..819) is a Windows-only
+    slave-interp gate; pas-sqlite3 targets Linux so it remains
+    deliberately unported.
+  - [X] **9.4.2.g.8** `permutations.tcl` skip-shim — tester.tcl's
+    permutation matrix re-runs each test under ~30 build-flag
+    combinations.  For full-corpus first cut, land a stub that
+    runs *only* the baseline permutation; full matrix gated under
+    9.4.7.e.  C ref: `permutations.tcl:1..400`.
+  - [X] **9.4.2.g.9** `do_malloc_test` ported verbatim into `tester_min.tcl` (malloc_common.tcl:416..538); drives the memdebug `sqlite3_memdebug_fail` / `install_malloc_faultsim` primitives.  Runs clean when no fault fires; an actual injected malloc failure segfaults the engine OOM-recovery path — tracked as **9.4.divbug.27**.
+  - [X] **9.4.2.g.10** `do_ioerr_test` + `run_ioerr_prep` ported verbatim into `tester_min.tcl` (tester.tcl:1890..2118); drives the 9.4.7.c counters.  Runs end-to-end (fault fires, engine recovers, terminates cleanly).
+  - [ ] **9.4.2.g.11** `crashsql` — spawns child process that aborts
+    mid-write; parent verifies WAL/journal recovery.  Requires crash
+    harness (9.4.7.d).  C ref: `crash.tcl:1..200`,
+    `tester.tcl:1893..1968`.
+  - [X] **9.4.2.g.12** `db_save_and_close` / `db_restore_and_reopen`
+    + `forcecopy` — snapshot helpers for tests that mutate then
+    revert.  C ref: `tester.tcl:1714..1760`.
+  - [X] **9.4.2.g.13** `*_common.tcl` source-include shims —
+    `malloc_common.tcl`, `lock_common.tcl`, `incrblob_common.tcl`,
+    `wal_common.tcl`, `fts3_common.tcl`.  Each is a shared helper
+    file sourced by tens of tests.  Audit each; copy verbatim where
+    no internal hooks; SKIP-cite per file where they call
+    `sqlite3_test_control` opcodes we haven't wired.
+    Outcome: audited all 7 `../sqlite3/test/*_common.tcl` (no
+    `incrblob_common.tcl` exists upstream).  Driver sets `::testdir`
+    at `src/tests/tcl/`, so copies ARE needed.  Copied verbatim:
+    `wal_common.tcl`, `fuzz_common.tcl` (pure Tcl, no internal
+    hooks).  SKIP-cited: `malloc_common.tcl`, `lock_common.tcl`,
+    `bc_common.tcl`, `fts3_common.tcl`, `pg_common.tcl`,
+    `thread_common.tcl` (need testvfs / testfixture / sqlthread /
+    sqlite3_memdebug_* / Pgtcl — unported).
+  - [X] **9.4.2.g.14** `tester_min.tcl` config vars — added `AUTOVACUUM 0`, `TEMP_STORE 1`, `SQLITE_DEFAULT_SYNCHRONOUS 2`, `SQLITE_DEFAULT_WAL_SYNCHRONOUS 2`, `SQLITE_DEFAULT_FILE_FORMAT 4`, `MEMORY_MANAGEMENT 0` + a minimal `sqlite_options()` array, all derived from this port's actual build config.
+  - [X] **9.4.2.h** `db eval` 3-arg form (`db eval $sql arrayName
+    { script }`) — per-row callback with column-name `Tcl_TraceVar`
+    binding into the named array.  Used by ~30% of tcl-feature tests.
+    Also: typed-Obj marshalling for column values (Int via
+    sqlite3_column_int64 → Tcl_NewWideIntObj; Real → Tcl_NewDoubleObj;
+    Blob → Tcl_NewByteArrayObj).  C ref: `tclsqlite.c:dbEvalStep`
+    (1766..) + 4-arg eval arm.
+  - [X] **9.4.2.i** `db trace` / `db trace_v2` / `db profile` —
+    callbacks fired on each prepared statement.  Many error-path
+    tests diff against the trace stream.  C ref: `tclsqlite.c:737..833`
+    (DbTraceV2Handler) + `2900..2970` (dispatch).
+  - [X] **9.4.2.j** `db authorizer` — Tcl callback invoked by
+    sqlite3_set_authorizer with 5-tuple action codes.  Engine port
+    in 9.4.6.e.  C ref: `tclsqlite.c:984..1070` (auth_callback) +
+    `2740..2780` (dispatch).
+  - [X] **9.4.2.k** `db busy` + `db progress` + `db interrupt` —
+    busy-handler / progress-callback / interrupt wiring.  C ref:
+    `tclsqlite.c:681..737` (DbBusyHandler, DbProgressHandler) +
+    `2810..2860` (dispatch).
+  - [X] **9.4.2.l** `db update_hook` / `db commit_hook` /
+    `db rollback_hook` / `db wal_hook` — change-notification
+    callbacks.  C ref: `tclsqlite.c:834..980` (4 handlers) +
+    `2980..3070` (dispatch).
+  - [X] **9.4.2.m** `db collate` + `db collation_needed` — Tcl
+    callback registered via sqlite3_create_collation_v2.  Engine
+    port already exists (8.x.colneed in tasklist); Tcl shim needs
+    DbCollateNeeded + per-collation trampoline.  C ref:
+    `tclsqlite.c:1175..1240` + `3100..3140` (dispatch).
+  - [X] **9.4.2.n** `db transaction { script }` — savepoint-nested
+    transaction with rollback-on-error.  C ref:
+    `tclsqlite.c:1308..1410` (DbTransPostCmd, NRE arm) +
+    `3170..3240` (dispatch).
+  - [X] **9.4.2.o** `db total_changes` / `db onecolumn` /
+    `db exists` / `db status` / `db cache flush|size` /
+    `db enable_load_extension` / `db config` / `db timeout` /
+    `db copy` — the remaining ~10 trivial-passthrough arms.
+    C ref: respective `tclsqlite.c` arms.
+  - [X] **9.4.2.p** `db incrblob` — incremental blob I/O subcommand.
+    Engine port in 9.4.6.g (sqlite3_blob_open/read/write/close).
+    Tcl shim creates a child object command `dbX_blobN` with
+    read/write/seek/tell/close methods.  C ref:
+    `tclsqlite.c:2520..2645` (DbIncrblobHandler) +
+    `3290..3330` (dispatch).
+  - [X] **9.4.2.q** `db backup` / `db restore` — sqlite3_backup_*
+    family (engine already ported under 10.1.43..45).  Tcl shim is
+    a 1-arg form (`db backup file.db` / `db restore file.db`).
+    C ref: `tclsqlite.c:3340..3410` + `3420..3470`.
+  - [X] **9.4.2.r** `db serialize` / `db deserialize` —
+    sqlite3_serialize / _deserialize.  Engine `_deserialize` already
+    ported under 10.1.102; `_serialize` audit + Tcl shim.  C ref:
+    `tclsqlite.c:3490..3550`.
+  - [X] **9.4.2.s** `db function` enhancements: `-returntype`,
+    `-directonly`, `-innocuous` flags + result-type routing (eType),
+    full typed argv marshalling (blob branch + int/wideint split).
+    NOTE: there is no aggregate UDF in `tclsqlite.c` — the `DB_FUNCTION`
+    arm only ever calls `sqlite3_create_function(... tclSqlFunc,0,0)`;
+    no `DbFuncStep`/`DbFuncFinal` exist.  Nothing C-faithful to port
+    for an aggregate `db function` form.  C ref: `tclsqlite.c:1013..1163`
+    (tclSqlFunc), `:3386..3460` (DB_FUNCTION arm).
+  - [X] **9.4.2.s.1** `DbSqlFunc` script-body forms — the ported
+    `tclSqlFunc` always dispatches the callback via `Tcl_EvalObjv`
+    when argc>0, so a `db function` whose proc body is anything but
+    a bare command name (e.g. `{apply {{x} ...}}` or a multi-word
+    script) fails.  Port C's `useEvalObjv` decision + the
+    list-copy / `Tcl_EvalObjEx` fallback path (`tclsqlite.c` in
+    `tclSqlFunc`).  Surfaced by the 9.4.2.s agent.
+  - [X] **9.4.2.t** `db nullvalue` follow-ups + `db errorcode`
+    extended-code arm (sqlite3_extended_errcode).  Coupled with
+    9.4.6.j.
+  - [X] **9.4.2.u** `db preupdate_hook` (`-DSQLITE_ENABLE_PREUPDATE_HOOK`
+    build only).  Used by ~10 tests.  Gate on env-var build flag in
+    `build_tcl_lib.sh`.  C ref: `tclsqlite.c:880..980` (DbPreUpdateHook).
+    Done: engine plumbing (`sqlite3VdbePreUpdateHook` + OP_Insert/
+    OP_Delete call sites + 6 public `sqlite3_preupdate_*`) and the
+    Tcl shim, both behind `{$ifdef SQLITE_ENABLE_PREUPDATE_HOOK}`;
+    `PREUPDATE=1` env toggle in `build_tcl_lib.sh`.  Compiles flag
+    on/off; NOT yet runtime-exercised — see 9.4.2.u.1.
+  - [X] **9.4.2.u.1** Runtime-exercise the preupdate hook — ported `src/tests/tcl/preupdate.test` (subset of upstream `hook.test` hook-7.*; this SQLite version has no standalone preupdate.test).  14/14 PASS under a `PREUPDATE=1` build.  Found+fixed 6 codegen/compile bugs behind the `{$ifdef}`: xferOptimization `OP_RowData`, DELETE-truncate disable when hook registered, UPDATE `OPFLAG_ISUPDATE` OP_Delete, REPLACE rowid-conflict `OPFLAG_ISNOOP`, `columnNullValue`, plus const-fixups.
+  - [X] **9.4.2.v** `db unlock_notify` (`-DSQLITE_ENABLE_UNLOCK_NOTIFY`
+    build only).  Engine port in 9.4.6.k.  Tcl shim is a 1-arg
+    callback registration.  C ref: `tclsqlite.c:2820..2870`.
+  - [X] **9.4.2.w** Bridge symbol-table audit — re-grep `tclsqlite.c`
+    after 9.4.2.h..v all land; verify every `Tcl_*` symbol it calls
+    has an extern in `PasTclBridge.pas`.  Close gaps.
+    Audit result: no gaps — every `Tcl_*` symbol used by ported arms is
+    declared with a `cdecl` signature matching the Tcl 8.6 C ABI
+    (`int`-width length params correct for 8.6; varargs on
+    `Tcl_AppendResult`; refcount macros bound via `Tcl_Db*RefCount`).
+    Unported-arm symbols (NRE, channels-create, dict, GetVersion,
+    InitStubs, etc.) correctly left undeclared.
+  - [~] **9.4.2.x** NRE (Non-Recursive Eval) support — `db eval`
+    with a script body and `db transaction` need
+    `Tcl_NRCreateCommand` + `Tcl_NREvalObj` arms to interrupt
+    cleanly across nested `vwait`.  Optional for first cut; many
+    tests pass without it.  C ref: `tclsqlite.c:1888..1915`
+    Done: command-dispatch NRE trampoline (`Tcl_NRCreateCommand` +
+    `DbObjCmdNRE` + `DbUseNre` version probe) + the NRE externs in
+    `PasTclBridge.pas`.  Non-NRE paths left intact.
+  - [ ] **9.4.2.x.1** NRE continuations — convert `DbEvalArm` and
+    `DbTransactionArm` script bodies from the recursive
+    `Tcl_EvalObjEx` path to genuine `Tcl_NRAddCallback` /
+    `Tcl_NREvalObj` continuations (`DbEvalNextCmd` / `DbTransPostCmd`
+    as `TTclNRPostProc`s).  Requires first rewriting the Pascal eval
+    loop into the `DbEvalContext` continuation machinery.  C ref:
+    `tclsqlite.c` `DbEvalNextCmd` / `DbTransPostCmd`.
+    (DbUseNre, DbEvalNextCmd).
 
-- [ ] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
+- [~] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
   `tclsh` against each manifest entry with the port's shim
   preloaded; collects pass/fail/skip per test.  Output format:
   one line per test (`PASS|FAIL|SKIP <path> <assertions> <duration>`),
@@ -442,16 +540,323 @@ regressions without human triage.
   surface into `src/tests/tcl/DIVERGENCES.md` rather than blocking
   the driver — each cluster becomes a `9.4.divbug.N` follow-up
   bullet for triage.
+  - [X] **9.4.3.a** Driver skeleton `src/tests/TclTestDriver.pas` —
+    reads `src/tests/tcl/MANIFEST.txt`, for each `tcl-feature` entry
+    forks `tclsh` with `-c "load .../libpassqlite3tcl.so Sqlite3;
+    source .../tester_min.tcl; source <path>"`, captures rc + timing,
+    emits `PASS|FAIL|SKIP <path> <assertions> <duration>` to stdout.
+    `bin/TclTestDriver` lands (no gate yet — gate comes in 9.4.4.a).
+  - [X] **9.4.3.b** Fix the driver polling race — `TclTestDriver`
+    under-reports per-test duration (noted in the 9.4.4.b sweep,
+    which fell back to direct `tclsh + tester_min` invocations with
+    a `timeout` wrapper).  Audit the child-process wait/poll loop in
+    `TclTestDriver.pas`; replace the busy-poll with a blocking
+    `WaitOnExit` + a wall-clock delta captured around it.  Also
+    rebuild `bin/TclTestDriver` (the binary was stale after the
+    9.4.divbug.3 `:memory:`→`./test.db` edit landed in the source).
+  - [X] **9.4.3.c** Per-test `testdir` wiring — confirm the driver
+    sets `::testdir` to `src/tests/tcl` so the `*_common.tcl` shims
+    copied under 9.4.2.g.13 (`wal_common.tcl`, `fuzz_common.tcl`)
+    resolve, and upstream `source $testdir/<x>_common.tcl` lines
+    find them.  Smoke a test that source-includes one.
 
-- [ ] **9.4.4** Skip-list curation.  Tests that depend on
+- [~] **9.4.4** Skip-list curation.  Tests that depend on
   `sqlite3_test_control`, `PRAGMA legacy_*`, or other internal
   knobs land in `src/tests/tcl/SKIP.md` with a citation to the
   Phase 6/7/8 bullet that gates them.  Empty skip-list is the
   long-term goal; closed bullets prune entries here.
+  - [X] **9.4.4.a** First 10-test sweep — 10 simplest tcl-feature
+    tests run via TclTestDriver, classified into PASS / FAIL /
+    SKIP; populated `src/tests/tcl/SKIP.md` (with citations to existing
+    Phase-6/7/8 bullets) and `src/tests/tcl/DIVERGENCES.md` (new
+    `9.4.divbug.*` bucket per cluster).  Triage convention bootstrapped.
+  - [X] **9.4.4.b** Re-ran 10-test sweep after g.1..g.5 + g.7 +
+    divbug.6 landed: PASS 2 / FAIL 5 / CRASH 3.  cast.test +
+    reindex.test promoted to PASS (shim-skip via `ifcapable !cast`
+    / `!reindex` running BODY); pruned from SKIP.md.  Surfaced
+    four new divbug buckets: **9.4.divbug.7** insert.test hang,
+    **9.4.divbug.8** index-3.3 crash, **9.4.divbug.9** lastinsert
+    rowid-after-INSERT crash, **9.4.divbug.10** boundary1.test
+    SELECT returning empty for large rowid ranges.  delete /
+    update / boundary1 now run further (helpers landed) but still
+    fail on existing divbug.2/3/4 + missing `db one` / `reset_db`
+    sub-commands.
+  - [X] **9.4.4.b.2** Re-sweep the same 10 tests after the
+    2026-05-14 landing wave: divbug.1/3/4/7/8/9/10 all FIXED, plus
+    14 bridge arms (`db eval` 3-arg, function/typed-argv,
+    trace/profile, authorizer, busy/progress/interrupt, the four
+    change hooks, collate, transaction, the trivial-passthrough
+    arms incl. `db one`/`onecolumn`/`exists`, `db status`,
+    `reset_db`).  Expectation: most of the 10 flip to PASS; record
+    the new PASS/FAIL/CRASH split, prune SKIP.md entries that the
+    landed arms unblocked, and open any genuinely new
+    `9.4.divbug.N`.  Prerequisite for 9.4.4.c being meaningful.
+    Use direct `tclsh + tester_min` with a `timeout` wrapper until
+    9.4.3.b fixes the driver.
+  - [X] **9.4.4.c** Broaden sweep to first 50 tcl-feature tests
+    (ranked by filesize / probable simplicity).  Continue
+    skip-and-cite convention.  Triage new divbug.* clusters.
+    Do this only after 9.4.4.b.2 confirms the 10-test baseline.
+  - [X] **9.4.4.d** Broaden sweep to first 100 tcl-feature tests — **72 PASS / 28 FAIL / 0 SKIP** (`bin/TclTestDriver --limit 100`).  First-50 subset improved 41→43 PASS vs 9.4.4.c (atof2 + atomic flipped via 9.4.6.q).  Surfaced new engine divbugs **9.4.divbug.19..24** and harness-gap follow-ups **9.4.6.q.1 / 9.4.6.q.2**.  See `src/tests/tcl/DIVERGENCES.md` "Run summary (9.4.4.d sweep)" + `STATUS.txt`.
+  - [ ] **9.4.4.e** Broaden sweep to 250 tests (~25% of corpus).
+    Expected to surface the bulk of port-side divbugs.
+  - [ ] **9.4.4.f** Broaden sweep to 500 tests.
+  - [ ] **9.4.4.g** Full 946 tcl-feature sweep; gate aims for
+    `pas-strict diverged == 0` per 9.4.8.c.
+  - [ ] **9.4.4.h** tcl-internal re-evaluation — the 225 tagged
+    `tcl-internal` may include false-positives (heuristic grep
+    flagged on a single occurrence).  Re-walk after 9.4.6 lands;
+    promote any that no longer touch private symbols to
+    `tcl-feature`.
 
 - [ ] **9.4.5** Linux-only nightly.  Wire into CI as a *nightly*
   job (not per-commit — the Tcl suite is ~hours).  PR gate stays
   on 9.1 / 9.2 / 9.3.1's seed-set sweep.
+  - [ ] **9.4.5.a** CI config — `.github/workflows/tcl-nightly.yml`
+    (or matching CI surface) that runs `bin/TclTestDriver` against
+    the full MANIFEST + diff against `STATUS.txt` (9.4.8.b).
+  - [ ] **9.4.5.b** Sharding — split the 946-test sweep across N
+    parallel workers (each worker takes a slice of MANIFEST).
+    Driver-side flag `--shard I/N`.  Reduces wall-time from ~hours
+    to ~tens of minutes.
+  - [ ] **9.4.5.c** Failure-report artefact — upload
+    DIVERGENCES.md diff + per-test stdout/stderr capture of any
+    new failure as a CI artefact for triage.
+
+- [~] **9.4.6** Test-only public-API export delta.  Many `.test`
+  files call into the C ABI beyond the "publicly documented" subset.
+  Each bullet here adds the engine port + Tcl shim required by some
+  number of `.test` files.  Audit current `src/*.pas` first — many
+  of these already exist with partial coverage.
+  - [X] **9.4.6.a** `sqlite3_compileoption_used` /
+    `sqlite3_compileoption_get` — backend for `ifcapable` (9.4.2.g.1).
+    Probably already partly exported; audit + ensure every
+    `SQLITE_OMIT_*` / `SQLITE_ENABLE_*` compile-time symbol on the
+    Pascal side reports correctly via the runtime API.  C ref:
+    `../sqlite3/src/main.c:sqlite3_compileoption_*`.
+  - [X] **9.4.6.b** `register_dbstat_vtab` — Tcl-side registration
+    of the dbstat eponymous vtab.  Engine likely already ported
+    under 10.1.7x.  Add Tcl bridge call.  C ref:
+    `../sqlite3/src/dbstat.c`.
+  - [X] **9.4.6.c** `sqlite3_db_status` / `sqlite3_stmt_status` /
+    `sqlite3_status64` audit — extend export coverage so every
+    `_STATUS_*` opcode used by tests works.  C ref:
+    `../sqlite3/src/status.c`.
+  - [X] **9.4.6.d** `sqlite3_table_column_metadata` — used by ~20
+    tests + by `.expert`.  Audit if already exported.  C ref:
+    `../sqlite3/src/main.c:sqlite3_table_column_metadata`.
+  - [X] **9.4.6.e** `sqlite3_set_authorizer` — engine port +
+    pairs with 9.4.2.j Tcl shim.  C ref:
+    `../sqlite3/src/auth.c` (entire file, ~250 lines).
+  - [X] **9.4.6.f** `sqlite3_create_collation` /
+    `sqlite3_create_collation_v2` — engine surface audit
+    (`8.x.colneed` already partial).  Pairs with 9.4.2.m.
+  - [X] **9.4.6.g** `sqlite3_blob_open` / `_read` / `_write` /
+    `_close` / `_bytes` / `_reopen` — incrblob engine port.
+    Substantial: ~800 lines from `../sqlite3/src/vdbeblob.c`.
+    Pairs with 9.4.2.p.
+  - [X] **9.4.6.h** `sqlite3_soft_heap_limit64` /
+    `sqlite3_hard_heap_limit64` / `sqlite3_db_release_memory` /
+    `sqlite3_release_memory` — memory-pressure entry points.
+    C ref: `../sqlite3/src/malloc.c`.
+  - [X] **9.4.6.i** `sqlite3_user_data` / `sqlite3_aggregate_context`
+    / `sqlite3_get_auxdata` / `sqlite3_set_auxdata` — UDF helpers.
+    Many already exported; audit + close gaps.  C ref:
+    `../sqlite3/src/vdbeapi.c`.
+  - [X] **9.4.6.j** `sqlite3_extended_result_codes` /
+    `sqlite3_extended_errcode` — extended-rc plumbing audit; some
+    error tests assert on the extended (3-byte) form.  C ref:
+    `../sqlite3/src/main.c:sqlite3_extended_*`.
+  - [X] **9.4.6.k** `sqlite3_unlock_notify` — engine port.
+    Gated on `SQLITE_ENABLE_UNLOCK_NOTIFY` build flag.  Pairs
+    with 9.4.2.v.  C ref: `../sqlite3/src/notify.c`.
+  - [~] **9.4.6.l** Test-only modules — landed as
+    `src/tests/tcl/testmodules/` unit per file.
+    Done: `register_tcl_module` (test_tclvar.c → `TestModuleTclvar.pas`),
+    `Md5_Register` + md5/md5file Tcl cmds (test_md5.c →
+    `TestModuleMd5.pas`).  `register_wholenumber_module` already
+    done in 10.1.69.  Remaining sub-tasks below.
+    - [X] **9.4.6.l.1** `register_echo_module` — 1:1 port of `test8.c` into `src/tests/tcl/testmodules/TestModuleEcho.pas` (full read/write proxy vtab: xCreate/xConnect/xBestIndex/xFilter/xUpdate/xFindFunction/xRename/savepoints; registers `echo` + `echo_v2`).  SELECT/DELETE/UPDATE proxy correctly; INSERT residue tracked as **9.4.divbug.26**.
+    - [X] **9.4.6.l.4** `registerTestFunction` — ported `test_func.c` scalar/aggregate test UDFs + `autoinstall_test_functions` into `src/tests/tcl/testmodules/TestModuleFunc.pas`.  Prereqs done: ported `sqlite3AutoLoadExtensions` and wired it into `openDatabase` (the auto-extension registry was never run); `sqlite3VdbeSerialGet` was already in the interface section.
+    - [X] **9.4.6.l.5** `register_async_vtab` — DROPPED.  Investigation confirmed `test_async.c` is absent from this SQLite version (the async VFS was deprecated/removed upstream); no `.test` file references `register_async_vtab`.  See `src/tests/tcl/DIVERGENCES.md`.
+  - [X] **9.4.6.m** `sqlite3_log` (already wired in 10.1.36) +
+    `sqlite3_io_trace` — Tcl bindings + assert hooks.
+  - [X] **9.4.6.n** `sqlite3_memdebug_*` set — ported the `test_malloc.c` fault-injection allocator + Tcl commands (`sqlite3_memdebug_fail`/`_pending`/`_settitle`/`_backtrace`/`_malloc_count`, `install_malloc_faultsim`, …) into `src/tests/tcl/testmodules/TestModuleMalloc.pas`.  Debug-only arms gated `{$ifdef SQLITE_MEMDEBUG}`.  Deferred: `SQLITE_TESTCTRL_BENIGN_MALLOC_HOOKS` (op 10) not yet in the engine's `sqlite3_test_control` — only affects `-benigncnt` reporting.
+  - [X] **9.4.6.o** File-control opcodes — PERSIST_WAL, LOCKSTATE,
+    CHUNK_SIZE, SIZE_LIMIT, POWERSAFE_OVERWRITE, ZIPVFS, BUSYHANDLER,
+    TEMPFILENAME, MMAP_SIZE.  Many already partly wired via Phase
+    10.1f.8 (.filectrl).  Audit + close gaps.  C ref:
+    `../sqlite3/src/os_unix.c:unixFileControl`.
+  - [X] **9.4.6.p** `sqlite3_busy_timeout` / `sqlite3_busy_handler` —
+    audit; pair with 9.4.2.k.
+  - [X] **9.4.6.q** Unported test-only Tcl commands — ported the `test1.c` subset (`sqlite3_connection_pointer`, `sqlite3_db_config`, `atomic_batch_write`, `load_static_extension`) into `src/tests/tcl/testmodules/TestModuleTest1.pas`; `real2hex` SQL func + `faultsim_save_and_close` family into the test modules / `tester_min.tcl`.  `hex2real` does not exist upstream (spurious cite).  atof2.test + atomic.test flipped to PASS.
+    - [ ] **9.4.6.q.1** test1.c prepared-statement C-API subset — `sqlite3_prepare(_v2)`, `sqlite3_exec`, `sqlite3_backup`, `sqlite3_errmsg`, `sqlite3_transfer_bindings`.  Biggest single unlock from the 9.4.4.d sweep: 7 tests (bind, bind2, bindxfer, capi2, badutf, badutf2, backup5).  C ref: `../sqlite3/src/test1.c`.
+    - [ ] **9.4.6.q.2** Remaining 9.4.4.d-surfaced test commands — `do_not_use_codec`, `wal_set/check_journal_mode`, `test_set_config_pagecache`, `sqlite3_create_aggregate` (Tcl), `do_faultsim_test`.  Plus missing harness file `permutations.test` (all.test).  C ref: `test1.c` / `tester.tcl`.
+  - [X] **9.4.6.r** Faithful `fcntlSizeHint` port — ported `fcntlSizeHint` (os_unix.c:4049) into `src/passqlite3os.pas`: `SQLITE_FCNTL_SIZE_HINT` now pre-grows via `posix_fallocate` with chunk-size rounding instead of being a no-op.
+
+- [~] **9.4.7** Build-matrix / harness infrastructure.  Many tests
+  require a *different* build of libpassqlite3 than the default.
+  Each profile lives as its own `bin/libpassqlite3tcl-<profile>.so`
+  and the driver picks one via `--build`.
+  - [X] **9.4.7.a** Compile-flag introspection finishing — for
+    `ifcapable` to work, every `SQLITE_OMIT_*` / `SQLITE_ENABLE_*`
+    symbol on the Pascal side must report through
+    `sqlite3_compileoption_used`.  Walk `src/passqlite3.inc` to
+    enumerate them; add to the registry.  Pairs with 9.4.6.a.
+  - [X] **9.4.7.b** Memdebug build profile — `src/tests/build_tcl_lib_memdebug.sh` adds `-dSQLITE_MEMDEBUG` and produces `bin/libpassqlite3tcl-memdebug.so` (private staging dir so its `.ppu`/`.o` don't clobber the default build).  Fault allocator + exports landed in 9.4.6.n.  `--build` driver selection still pending (9.4.7).
+  - [X] **9.4.7.c** I/O-error injection — ported the `os_common.h` `SQLITE_TEST` machinery (the `SimulateIOError`/`SimulateDiskfullError` counter checks) directly into the Pascal unix VFS read/write/sync/truncate rather than a `test_devsym.c` wrapper VFS (the wrong tool — `do_ioerr_test` drives global counters).  `src/tests/tcl/testmodules/TestModuleIoerr.pas` (`test2.c` port) `Tcl_LinkVar`s the counters.  All `{$ifdef SQLITE_TEST}`-gated; default build byte-unaffected.
+  - [~] **9.4.7.c.old** ~~test_devsym.c wrapper VFS~~ — superseded by the counter-instrumentation approach above; kept only if a future test needs a real device-characteristics shim.  Registers via
+    `sqlite3_vfs_register`.
+  - [ ] **9.4.7.d** Crash-test harness — `crashsql` (9.4.2.g.11)
+    spawns a child `tclsh` invocation that `_exit`'s mid-write.
+    Parent re-opens the db, runs `PRAGMA integrity_check`.
+    Requires: crash-injection VFS that aborts after N writes
+    (`../sqlite3/src/test_onefile.c` shape), + parent/child
+    process plumbing in `TclTestDriver.pas` (TProcess with
+    SIGKILL).  Substantial — estimate 1-2 weeks.  C ref:
+    `../sqlite3/src/test_thread.c` + `crash.tcl`.
+  - [ ] **9.4.7.e** `permutations.tcl` matrix — full upstream re-runs
+    each test under ~30 build-flag combinations.  Land as
+    optional second-tier gate (not in baseline CI).  Requires:
+    a build matrix generator script that emits one .so per
+    permutation + driver flag `--permutation NAME` to pick.
+    C ref: `../sqlite3/test/permutations.tcl`.
+  - [X] **9.4.7.f** Per-test isolation — currently `TclTestDriver`
+    runs every test against the same CWD.  Refactor to:
+    (1) create a tmpdir per test, (2) `cd` tclsh there before
+    sourcing, (3) cleanup on exit.  Prevents test cross-pollution
+    via leaked `test.db`.
+  - [ ] **9.4.7.g** Driver concurrency — `--jobs N` flag spawns
+    N tclsh processes in parallel; aggregates results.  Mirrors
+    upstream's `make -j` testing.
+  - [X] **9.4.7.h** `tclsqlite3_Init` package-config — drop our
+    `Sqlite3_Init` so `package require sqlite3` works without
+    the explicit `load` line.  Generate a Tcl `pkgIndex.tcl`
+    pointing at `libpassqlite3tcl.so` and install into
+    `auto_path`.  Quality-of-life; lets us run upstream tests
+    verbatim (which assume the package is loadable by name).
+  - [ ] **9.4.7.i** Threading build (`-dSQLITE_THREADSAFE=1`) —
+    some tests assume the threadsafe build.  Audit which tests
+    + which sqlite3 mutex hooks need real implementations vs.
+    no-op stubs.  Gate this profile behind its own .so.
+
+- [~] **9.4.8** Full-corpus parity gate.
+  - [X] **9.4.8.a** Per-test status tags — adopt the pas-strict /
+    pas-soft / pas-skip convention from 9.1.5.  Land
+    `src/tests/tcl/STATUS.txt` with one line per MANIFEST entry:
+    `<status>\t<path>\t<cite>`.
+  - [X] **9.4.8.b** STATUS.txt seeded from current sweeps —
+    populate after 9.4.4.g lands.  Default: every test that
+    PASSes is pas-strict; FAIL with citation is pas-soft;
+    SKIP is pas-skip with mandatory cite.
+  - [ ] **9.4.8.c** Strict gate — `bin/TclTestDriver --gate strict`
+    exits non-zero if any pas-strict test diverges.  Mirrors
+    9.1.5's strict gate.  This is the long-term PR gate.
+  - [ ] **9.4.8.d** Coverage check — analogous to 9.1.6:
+    track which VDBE opcodes / codegen arms are exercised by
+    the tcl-feature corpus that aren't already covered by 9.1/9.2.
+    Identify "cold" opcodes that *only* tcl-feature catches.
+  - [ ] **9.4.8.e** Regression archive — once full-corpus green,
+    every divergence reopening counts as a regression; auto-bisect
+    via `git bisect` driver.  Long-term.
+
+#### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
+
+- [X] **9.4.divbug.1** `select1.test select1-4.4` (`ORDER BY min(f1)`)
+  triggered a Pascal-side segfault.  Root cause: the pas resolver never
+  rewrote aggregate `TK_FUNCTION` calls in ORDER BY of a non-aggregate
+  query to `TK_AGG_FUNCTION` (resolve.c:1330), so codegen emitted a
+  scalar `OP_Function` and `minStep` crashed in `sqlite3_aggregate_context`.
+  Fixed by tagging those nodes in `sqlite3ResolveSelectNames` after
+  ORDER BY resolution; codegen's `TK_AGG_FUNCTION` misuse arm now raises
+  `misuse of aggregate: min()` matching the C oracle.
+- [X] **9.4.divbug.2** SQL error messages drop their format-arg
+  tails: `misuse of aggregate function` should read
+  `misuse of aggregate function min()`; `table has wrong number
+  of values for INSERT` should carry the column counts.  Likely
+  cause: a `sqlite3ErrorMsg` call site in the port isn't threading
+  through `sqlite3VMPrintf` and `%s` / `%d` substitutions are
+  swallowed.  Audit all `sqlite3ErrorMsg` call sites in `src/*.pas`
+  against `../sqlite3/src/parse.y` / `resolve.c` shaped error texts.
+- [X] **9.4.divbug.3** Schema introspection result columns reordered
+  / missing — `index.test` sub-tests `index-1.1c` / `index-1.1d`.
+  Not an engine bug: `tester_min.tcl` never opened `db`, and the
+  driver hardcoded `sqlite3 db :memory:`, so sub-tests that do
+  `db close; sqlite3 db test.db` to re-read the schema from disk
+  saw an empty database.  Fix: add a `reset_db` proc to
+  `tester_min.tcl` (forcedelete test.db family + `sqlite3 db
+  ./test.db`), call it at shim load, and drop the driver's
+  `:memory:` open.  index-1.1c/1.1d/1.2 now PASS.
+- [X] **9.4.divbug.4** `update.test` sub-test `update-10.1` reported
+  spurious `out of memory`.  Real root cause: `sqlite3CreateIndex`
+  auto-name path hardcoded `sqlite_autoindex_<tab>_1` instead of
+  counting `pTab^.pIndex` (build.c:4097..4101).  A table with two
+  implicit UNIQUE indexes got two identically-named auto-indexes,
+  and the schema-hash collision surfaced as NOMEM.  Fixed by porting
+  the C `for(pLoop=pTab->pIndex,n=1; ...)` count loop.
+- [X] **9.4.divbug.5** `numcast.test` 0/51 → 51/51 Ok.  Root cause was
+  *not* engine-side: `sqlite3VdbeMemCast` / `MemRealValueRC` slow path
+  already handle UTF-16LE/BE.  Two bridge-side bugs: (a) `DbEvalArm` in
+  `PasTclSqlite.pas` never bound `$var`/`:var`/`@var` placeholders, so
+  every CAST input arrived NULL → `{}`; (b) `PRAGMA encoding='...'` in
+  `passqlite3codegen.pas` lacked a write arm, so the test's encoding
+  preamble silently no-op'd.  Fix: minimal port of `dbPrepareAndBind`'s
+  param loop + the `PragTyp_ENCODING` write arm (pragma.c:2267..2286).
+- [X] **9.4.divbug.6** Doubled error string in `db1 eval`'s error
+  return — surfaced by 9.4.2.f gate `tcl_err()` returning
+  `boomboom` instead of `boom`.  Root cause: `DbEvalArm`
+  (PasTclSqlite.pas) appended `sqlite3_errmsg(db)` on top of the
+  already-populated Tcl interp result string (the UDF trampoline
+  already routed `error "boom"` to `sqlite3_result_error`, which
+  propagates verbatim).  Fix: both error tails in `DbEvalArm` now
+  call `Tcl_SetObjResult(interp, Tcl_NewStringObj(sqlite3_errmsg(db),-1))`,
+  matching upstream `tclsqlite.c:dbEvalStep` line 1812.
+  `bin/TestTclSqliteFunction` now reports
+  `PASS: tcl_err -> rc=1 msg=[boom]` (was `[boomboom]`).
+- [X] **9.4.divbug.7** `insert.test` hangs (tclsh wedges past 60s)
+  shortly after `insert-1.3`.  9.4.4.a saw it crash here; 9.4.4.b
+  re-sweep promoted the symptom to a hang.  Likely an infinite
+  loop in INSERT codegen / VDBE step for the larger-table variant
+  the sub-test exercises.  See `src/tests/tcl/DIVERGENCES.md`.
+- [X] **9.4.divbug.8** `index.test` segfaults at `index-3.3` — the
+  sub-test is `DROP TABLE test1` after 99 indexes were created.
+  Root cause: `sqlite3BtreeDelete` set `bPreserve := flags and
+  BTREE_SAVEPOSITION` (= 2) instead of C's boolean
+  `(flags & BTREE_SAVEPOSITION)!=0` (= 1).  On the saveCursorKey
+  rebalance path the stale `2` made the final `bPreserve > 1` arm
+  wrongly take the CURSOR_SKIPNEXT branch (instead of moveToRoot +
+  CURSOR_REQUIRESEEK), leaving the schema-table cursor on a
+  balanced-away page → OP_Column fetched a NULL payload → SIGSEGV.
+  Fixed by coercing bPreserve to a 0/1 boolean.  See DIVERGENCES.md.
+- [X] **9.4.divbug.9** `lastinsert.test` segfaults right after
+  `lastinsert-1.1` (the `1.1w` variant uses a 64-bit rowid).
+  Likely overflow in `sqlite3_last_insert_rowid` path or a stale
+  pointer in the `db last_insert_rowid` sub-command shim.
+  See DIVERGENCES.md.
+- [X] **9.4.divbug.10** `boundary1.test` SELECTs returned `{}` not
+  because of WhereCode, but because `boundary1-1.1`'s 64 `INSERT INTO
+  t1(oid,a,x) VALUES(...)` rows all failed: sqlite3Insert's IDLIST
+  loop errored on any name not a real column, never honouring the
+  rowid-alias branch (C insert.c:1097).  Table stayed empty so every
+  downstream query returned `{}`.  Fixed by porting the `ipkColumn`
+  rowid-alias arm.  See DIVERGENCES.md.
+- [X] **9.4.divbug.11** Compound `SELECT ... ORDER BY` `iOrderByCol<=0` assert — ported `resolveCompoundOrderBy` (resolve.c:1589); select1.test runs past 6.22.
+- [X] **9.4.divbug.12** `update-17.10` segfault — actually a constant-expr `CREATE INDEX` crash; gated `sqlite3CreateIndex` column lookup to identifier tokens (build.c:4220).
+- [X] **9.4.divbug.13** Inequality-scan row ordering — gated `whereShortCut` `nOBSat:=nExpr` to `WHERE_ONEROW` plans so IPK range scans get a sorter; boundary1.test 1511/1511.
+- [X] **9.4.divbug.14** SQL errors drop object name — routed scattered `sqlite3ErrorMsg` sites through upstream `%s`/`%S`/`%T` formats (build.c / resolve.c).
+- [X] **9.4.divbug.15** `no such function` not raised at prepare — ported the `resolveExprStep` TK_FUNCTION error arm (resolve.c:1129..1276).
+- [X] **9.4.divbug.16** `affinity3.test` segfault — `sqlite3WhereBegin` skipped opening a RIGHT JOIN table cursor scanned index-only; ported the `JT_LTORJ|JT_RIGHT` gate (where.c:7252).
+- [X] **9.4.divbug.17** Subquery-nested aggregate evaluated row-wise — ported the resolver's outward AggInfo-binding arm (resolve.c:1337..1352).  aggnested-3.x residue tracked as divbug.24.
+- [X] **9.4.divbug.18** WITHOUT ROWID vtab `xUpdate` — DELETE now emits `OP_Column` for argv[0]; `updateVirtualTable` routed through `sqlite3WhereBegin` so `xBestIndex` runs.
+- [ ] **9.4.divbug.19** Table-qualified `rowid` alias (`t1.rowid`, `sp.rowid`) not resolved → `no such column` (boundary3, autoindex5).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.20** BETWEEN-on-indexed-column planner picks `nosort` and also drops matching rows (between).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.21** Cross-connection EXCLUSIVE lock not detected; `BEGIN IMMEDIATE` succeeds instead of `database is locked` (busy).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.22** Large row payload / `PRAGMA page_size=65536` overflow handling segfaults (bigrow, btree01).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.23** Correlated FROM-subquery not materialised into a co-routine; EXPLAIN QUERY PLAN drift (autoindex3).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.24** `sqlite_sequence` double-created for AUTOINCREMENT + aggregate mis-fold + segfault — aggnested-3.x residue of divbug.17 (aggnested).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.25** `update-19.10` `AssertH FAILED: idxColIsBeingUpdated rowid` — surfaced by the divbug.12 fix once update.test ran further.  See DIVERGENCES.md.
+- [ ] **9.4.divbug.26** Echo vtab INSERT fails — `echoUpdate` emits `%Q`-quoted column names and the Pascal parser rejects single-quoted column identifiers that upstream SQLite accepts.  Surfaced porting `register_echo_module` (9.4.6.l.1).  See DIVERGENCES.md.
+- [ ] **9.4.divbug.27** Engine OOM-recovery path segfaults under an injected malloc failure (memdebug build) — blocks `do_malloc_test` from being fully useful.  Surfaced by 9.4.2.g.9.  See DIVERGENCES.md.
 
 ---
 
@@ -507,352 +912,31 @@ partial landings cannot silently no-op.
 - [X] **10.1.28..10.1.35, 10.1.37** `.stats`, `.timer`, `.eqp`, `.explain`, `.show`, `.help`, `.cd`, `.shell`/`.system`, `.trace` landed.
 - [X] **10.1.36** `.log` — destination recorded and SQLITE_CONFIG_LOG xLog trampoline installed (8.1.1 landed).
 - [X] **10.1.38** `.iotrace` — stub; full sqlite3IoTrace fanout gated on sqlite3VdbeIOTraceSql arm (currently a stub at passqlite3vdbe.pas:4122).
-- [~] **10.1.39** `.scanstats` — basic per-loop dump landed (8.2.1: aScan[] +
-  sqlite3_stmt_scanstatus_v2 reader + WhereAddScanStatus producer wired).  Output
-  shows NAME/EXPLAIN/EST/SELECTID/PARENTID correctly.  Remaining subtasks:
-  - [X] **10.1.39.a** TWhereLevel.addrVisit field added (sizeof bumps to 128);
-    stamped in sqlite3WhereCodeOneLoopStart mirror of wherecode.c:2584 and fed
-    through sqlite3VdbeScanStatus + ScanStatusRange in WhereAddScanStatus
-    (full port of wherecode.c:333..374).  Unblocks NVISIT.
-  - [X] **10.1.39.b** NLOOP/nExec confirmed: vdbe.pas:7618 increments every
-    opcode (matches vdbe.c:940), and main.pas:3860..3870 dispatches NLOOP→
-    addrLoop, NVISIT→addrVisit (matches vdbeapi.c:2516..2530).  Also removed
-    two stale `pLevel^.addrBody := sqlite3VdbeCurrentAddr(v)` overrides inside
-    sqlite3WhereCodeOneLoopStart that were re-pointing addrBody into the loop
-    body — C only stamps addrBody once at where.c:7467.
-  - [X] **10.1.39.c** qrfEqpStats EQP-tree formatter port (ext/qrf/qrf.c
-    :162..454).  Pascal `displayScanstats` now builds an iEqpId/iParentId
-    linked-list graph, renders with `|--`/``--` connectors, and stamps each
-    row with NLOOP/NVISIT via a faithful qrfApproxInt64 port (4-digit base,
-    K/M/G/T/P/E suffix).  Limitation: prefers zName over `aOp[addrExplain]
-    .p4.z` because the v2 reader currently returns p4.z without an
-    opcode-type check (the addrExplain stamp may land on non-Explain ops);
-    upgrading the reader to gate on p4type=P4_DYNAMIC and re-routing through
-    sqlite3VdbeExplainParent would let us re-enable EXPLAIN text — tracked
-    as 10.1.39.e if needed.  TestShellMeta `.scanstats` arm stays shape-only
-    (no SELECT runs in the script) so a byte-diff bump is not actionable in
-    this subtask.
-  - [X] **10.1.39.d** NCYCLE / hwtime sampling landed (d.1..d.4 all closed
-    in one chained commit).  build.sh gained a `SQLITE_ENABLE_STMT_SCANSTATUS`
-    env-var gate mirroring 10.1.42.d's `SQLITE_DEBUG=1` pattern; default
-    build leaves the bracket compiled out so per-op rdtsc overhead is zero.
-    - [X] **10.1.39.d.1** Added `nCycle: u64` to TVdbeOp (sizeof 32→40,
-      x86_64); zero-init covered in sqlite3VdbeAddOp3, sqlite3VdbeAddOp4Int,
-      sqlite3VdbeAddOpList and gVdbeOpDummy FillChar paths.  Also extended
-      sqlite3_stmt_scanstatus_reset to clear nCycle (vdbeapi.c:2629).
-    - [X] **10.1.39.d.2** Ported `sqlite3Hwtime` to passqlite3os.pas as
-      a CPUX86_64 `asm/rdtsc` assembler routine (Intel syntax, FPC default),
-      CPUAARCH64 `mrs cntvct_el0` arm, and a clock_gettime(CLOCK_MONOTONIC)
-      fallback for everything else.  Faithful 1:1 with `../sqlite3/src/hwtime.h`.
-    - [X] **10.1.39.d.3** Bracketed the dispatch loop in passqlite3vdbe.pas
-      under `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}` with a
-      `pCycleOp/t0Cycle` pair captured at top-of-iteration and credited at
-      the next iteration (or at `vdbe_return` on abort).  This pattern
-      avoids per-`continue` stamping at the cost of one extra check per
-      step — equivalent to the C `pnCycle` epilogue at vdbe.c:9249..9251.
-    - [X] **10.1.39.d.4** Wired SCANSTAT_NCYCLE in passqlite3main.pas:
-      iScan<0 aggregate arm sums `aOp[].nCycle` across the whole program
-      (vdbeapi.c:2485..2495); per-scan arm walks `pSc^.aAddrRange[]` with
-      both inclusive-range and negative-start (cursor-id, OPFLG_NCYCLE)
-      protocols (vdbeapi.c:2574..2606).
-  - [X] **10.1.39.d.5** `TestShellScanstatsVm2` (src/tests/) — Pascal-only
-    smoke that gates on `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}`: under
-    the default build it self-reports SKIPPED with rc=0; under
-    `SQLITE_ENABLE_STMT_SCANSTATUS=2 src/tests/build.sh` it pipes a
-    fixed CREATE+INSERT+SELECT+`.scanstats vm`+SELECT script through
-    `bin/passqlite3` and asserts (rc=0, SELECT result rows land in
-    stdout, "QUERY PLAN" header from displayScanstats appears).  Closes
-    the d-chain loop end-to-end — proves the d.1..d.4 nCycle credit and
-    SCANSTAT_NCYCLE plumbing survive a real query through the shell.
-    A byte-diff against upstream `sqlite3` was descoped: the stock
-    upstream binary at ../sqlite3/sqlite3 is not built with
-    SQLITE_ENABLE_STMT_SCANSTATUS and rebuilding it under the flag is
-    out of scope.  Result: PASS scanstats-vm-smoke (rc=0, ~32KB stdout)
-    under SCANSTATUS=2 build; SKIP under default.
-  - [X] **10.1.39.e** EXPLAIN text re-enabled: SCANSTAT_EXPLAIN arm in
-    passqlite3main.pas now gates on `aOp[addrExplain].p4type=P4_DYNAMIC`
-    before dereferencing p4.z (sqlite3VdbeExplainParent already wired via
-    8.2.1).  `displayScanstats` in passqlite3shell.pas prefers the raw
-    EXPLAIN string over zName, falling back to "SCAN <zName>" when the
-    addrExplain stamp is absent or non-DYNAMIC.  Removes the zName
-    preference doc'd in 10.1.39.c.
+- [~] **10.1.39** `.scanstats` — basic per-loop dump landed via 8.2.1 (NAME/EXPLAIN/EST/SELECTID/PARENTID emitted). Sub-arms a..e all closed:
+  - [X] **10.1.39.a** TWhereLevel.addrVisit field added; NVISIT unblocked (port of wherecode.c:333..374).
+  - [X] **10.1.39.b** NLOOP/nExec confirmed; removed two stale addrBody overrides inside sqlite3WhereCodeOneLoopStart.
+  - [X] **10.1.39.c** qrfEqpStats EQP-tree formatter ported (ext/qrf/qrf.c:162..454); `|--`/`` `--`` connectors + qrfApproxInt64 K/M/G/T/P/E suffix.
+  - [X] **10.1.39.d** NCYCLE / hwtime sampling — `nCycle: u64` on TVdbeOp; `sqlite3Hwtime` ported (rdtsc on x86_64, mrs cntvct_el0 on aarch64, clock_gettime fallback); dispatch-loop bracket gated on `{$IFDEF SQLITE_ENABLE_STMT_SCANSTATUS}` (env-var enabled in build.sh; default-off zero overhead). Sub-arms d.1..d.5 closed.
+  - [X] **10.1.39.e** EXPLAIN text re-enabled: SCANSTAT_EXPLAIN gates on p4type=P4_DYNAMIC; displayScanstats prefers EXPLAIN string over zName.
 
-  Upstream's "Warning: .scanstats not available in this build." is still echoed
-  verbatim to keep TestShellMeta golden diff clean while a..c land.
-- [X] **10.1.40** `.testcase NAME` / `.check ANSWER` — capture via fd-level
-  dup2 onto a temp file (same plumbing as `.output`); `.check` reads it
-  back and compares under default (CR/LF-stripped memcmp) / --glob /
-  --notglob / --exact.  Fail diagnostic and shellMain summary line
-  ("%d test(s) run with %d error(s)\n") match upstream byte-for-byte;
-  rc becomes nTestErr>0.  Tested by TestShellMeta `check-*` arms.
-  Deferred: dotCmdError caret-formatted location prefix (richer than our
-  "Error: ...\n") — kept out of the byte-diff for the error paths, and
-  the "<<ENDMARK" multi-line PATTERN form (needs seekable PFILE input).
-  Doable follow-up subtasks:
-  - [X] **10.1.40.a** `shellDotError` helper landed (passqlite3shell.pas)
-    mirroring dotCmdError (shell.c.in:1815..1844): emits
-    `<loc> <zOrig>\n<loc> <spaces>^--- <brief>\n` with the location prefix
-    from a new `shellErrorLocation` port (shell.c.in:1779).  splitDotArgs
-    now captures per-arg offsets into gDotOfst[] (slot 0 = cmd-name) plus
-    the trimmed zOrig into gDotOrig, matching parseDotCmdArgs (shell.c.in
-    :8925..8973).  Two `.check` error sites (no-testcase-active, no-
-    PATTERN-specified) routed through the helper; cmdCheck now returns
-    rc so option-malformed paths bump the dispatcher errCnt.
-    TestShellMeta `dotcmd-error-caret` arm flipped from shape-only to
-    byte-diff against upstream sqlite3 :memory: (passes byte-for-byte).
-    Remaining `.check`/`.testcase` cluster sites (incompatible-options,
-    unknown-option, missing-argument) still emit the legacy "Error: ...\n"
-    form — promoting them is mechanical follow-up; not blocking 10.1.40
-    closure.
-  - [X] **10.1.40.a.followup** Routed the remaining `.check`/`.testcase`
-    cluster Error sites through `shellDotError` — cmdCheck now caret-
-    formats incompatible-with-prior-options (×3: --glob/--notglob/--exact
-    branches) and unknown-option-after-PATTERN; cmdTestcase caret-formats
-    missing-argument and unknown-option, and now returns i32 so the
-    dispatcher propagates rc=1.  TestShellMeta gained two new arms
-    (`dotcmd-error-caret-tc-unknown`, `dotcmd-error-caret-tc-missing`)
-    byte-diffed against upstream sqlite3 :memory:.  The cmdCheck cluster
-    sites are wired but not byte-diffed: upstream's cli_output_capture
-    swallows both stdout AND stderr while a testcase is armed; our
-    fd-level capture only redirects fd 1, so those error strings leak to
-    real stderr.  Extending the capture to fd 2 is left as separate
-    follow-up (the shellDotError wiring is already correct for when
-    that lands).
-  - [X] **10.1.40.b** `<<MARK` heredoc PATTERN form for `.check`
-    landed in cmdCheck (shell.c.in:8790..8802).  When the parsed
-    PATTERN argv starts with `<<`, the trailing text is the marker;
-    subsequent REPL lines are pulled via oneInputLine, each appended
-    (with the consumed `\n` restored), until a line whose first
-    nMark bytes match the marker — that line is consumed but not
-    appended.  EOF without marker is silently accepted, mirroring
-    upstream's while-loop fallthrough.  TestShellMeta gained three
-    new arms: `check-heredoc-pass` (multi-line PATTERN, default
-    compare), `check-heredoc-fail` (PATTERN-vs-Got diagnostic),
-    `check-heredoc-eof` (EOF without marker is silent).  Each
-    byte-diffs against upstream sqlite3 :memory:.
-- [X] **10.1.41** `.testctrl` — dispatcher routes through 8.4.1 overloads
-  for OPTIMIZATIONS, FK_NO_ACTION, PRNG_SEED, PENDING_BYTE, SORTER_MMAP,
-  ASSERT/ALWAYS, LOCALTIME_FAULT, NEVER_CORRUPT, EXTRA_SCHEMA_CHECKS,
-  INTERNAL_FUNCTIONS, JSON_SELFCHECK, plus the existing PRNG/BYTEORDER.
-  Remaining opcodes (BITVEC_TEST, FAULT_INSTALL, IMPOSTER, TUNE,
-  PARSER_COVERAGE) fall through to the generic isOk=3 stub — those need
-  callback / coverage infrastructure not yet ported.
-- [~] **10.1.42** `.selecttrace`/`.wheretrace`/`.treetrace` — command
-  shape + TRACEFLAGS toggle landed: sqlite3TreeTrace/sqlite3WhereTrace
-  u32 globals now mutate through sqlite3_test_control(TRACEFLAGS, …).
-  Trace-emission still gated on consumer-side blocks in codegen.
-  **Mask hint convention (verified the hard way across the b.* / a.*
-  rounds):** mask numbers written into the subtask bodies below are
-  HINTS only — they are often bundle IDs (the planning grouping)
-  rather than the literal C bit.  Always verify against
-  `../sqlite3/src/sqliteInt.h` (`TREETRACE_*`) or
-  `../sqlite3/src/whereInt.h` (`WHERETRACE_*`) before stamping a new
-  arm, and note divergences in the commit body.
-  Remaining subtasks:
-  - [X] **10.1.42.a** TREETRACE consumer macros in select.c → passqlite3codegen.pas.
-    First batch landed: `begin processing` / `end processing` (mask 0x1),
-    `after name resolution` (0x10), `generating column names` (0x80),
-    `flatten %u.%p from term %d` (0x4), `After/not helpful constant
-    propagation` (0x2000), plus the four `WhereBegin` / `WhereEnd`
-    breadcrumbs (0x2) wrapping each sqlite3WhereBegin / sqlite3WhereEnd
-    call inside the productive sqlite3Select body.  All gated by
-    `{$IFDEF SQLITE_DEBUG}` so non-debug builds stay silent.  Smoke gate:
-    `.treetrace 0xFFFF` followed by a SELECT produces non-empty output
-    (verified against `bin/passqlite3` with `SQLITE_DEBUG=1`).  Deferred
-    sub-arms (multiSelect UNION-ALL, compound flattener peer, post-flatten
-    tree, wildcard expansion, AggInfo adjustments, HAVING→WHERE,
-    count-of-view, EXISTS→JOIN, dropping ORDER BY, window rewrite,
-    FULL/LEFT/RIGHT-JOIN simplifies, omit FROM-subquery ORDER BY,
-    end compound-select, WHERE-clause push-down, all-FROM analysis,
-    DISTINCT→GROUP BY, post-aggregate analysis, Finished with AggInfo) —
-    full enumeration documented inline at the tail of sqlite3Select.
-    Doable follow-up subtasks (each is a small grep+port batch in
-    `../sqlite3/src/select.c`, all gated by `{$IFDEF SQLITE_DEBUG}`):
-    - [X] **10.1.42.a.1** multiSelect / compound flattener TREETRACE
-      arms (mask 0x200): `compound-select` begin/peer/end breadcrumbs
-      in `multiSelect`.  Landed: UNION ALL left/right (select.c:3011,
-      3030).  Pas's multiSelect is inlined into sqlite3Select; the
-      compound-end breadcrumb (select.c:7887, mask 0x400) lives on the
-      sqlite3Select dispatch path and lands as part of 10.1.42.a.3.
-    - [X] **10.1.42.a.2** Post-flatten / wildcard-expansion TREETRACE
-      (mask 0x4 / 0x100): `after flattening`, `after wildcard expansion`
-      in `sqlite3Select` body.  Landed: select.c:4706 ("After
-      flattening:", mask 0x4) on flattenSubquery success-tail, and
-      select.c:6339 ("After result-set wildcard expansion:", mask 0x8
-      — upstream uses 0x8, not 0x100) on the star-expansion pass tail.
-    - [~] **10.1.42.a.3** AggInfo / HAVING→WHERE / count-of-view /
-      EXISTS→JOIN TREETRACE arms (mask 0x40 / 0x400): `AggInfo`
-      adjustments, `HAVING moves to WHERE`, count-of-view rewrite,
-      `EXISTS-to-IN` and `EXISTS-to-JOIN` traces in optimizer arms.
-      Landed: select.c:7368 ("After EXISTS-to-JOIN optimization:",
-      mask 0x100000) inside existsToJoin's hoist tail, and
-      select.c:8442 ("After aggregate analysis %p:", mask 0x20) at
-      the tail of the main GROUP BY analyzeAggFuncArgs.  Upstream
-      C masks are 0x20 / 0x100 / 0x200 / 0x100000 (the tasklist's
-      "0x40 / 0x400" referred to the bundle ID, not C bits).
-      Deferred (no Pas counterpart yet): havingToWhere (select.c:7047,
-      mask 0x100), countOfViewOptimization (select.c:7199, mask 0x200),
-      "AggInfo adjusted for Indexed Exprs" (6572) /
-      "function expressions converted to reference index" (8609) /
-      "Finished with AggInfo" (8937) — none of
-      optimizeAggregateUseOfIndexedExpr /
-      aggregateConvertIndexedExprRefToColumn / late select_end
-      AggInfo teardown are ported yet.
-    - [~] **10.1.42.a.4** ORDER BY / window-rewrite / DISTINCT→GROUP BY
-      TREETRACE arms (mask 0x1000 / 0x8000 — VERIFIED divergent vs C:
-      upstream uses 0x800 for "dropping ORDER BY" select.c:7631, 0x40 for
-      "after window rewrite" select.c:7693, 0x20000 for "Transform
-      DISTINCT into GROUP BY" select.c:8192).  Landed: "after window
-      rewrite" (mask 0x40) at codegen.pas after the sqlite3WindowRewrite
-      call in the window-arm gate.  Deferred (no Pas host yet):
-      "dropping superfluous ORDER BY" (select.c:7631) — the
-      IgnorableDistinct(pDest) pOrderBy-drop arm has no Pas counterpart
-      (sqlite3SelectPrep runs unconditionally with pOrderBy attached);
-      "Transform DISTINCT into GROUP BY" (select.c:8192) — the SF_Distinct
-      → pGroupBy optimizer arm (post-FROM-clause analysis) is not ported.
-      Both land when the surrounding optimizer arms land.
-    - [~] **10.1.42.a.5** Outer-join simplification + FROM-subquery
-      TREETRACE arms (VERIFIED C masks: 0x1000 FULL/LEFT/RIGHT
-      simplifies select.c:7737..7756; 0x800 omit FROM-subquery
-      ORDER BY :7832; 0x4000 WHERE push-down :8011 and Change-unused-
-      result-columns :8030; 0x8000 all-FROM analysis :8146; 0x20
-      Finished-with-AggInfo :8937).  All five arms are entirely
-      deferred — none of the host optimizer passes are ported yet:
-      - select.c:7708..7877 outer FROM-clause optimization loop
-        (JT_LEFT/RIGHT/LTORJ simplifier + IgnorableOrderby
-        FROM-subquery pOrderBy drop) is not ported; Pas's sqlite3Select
-        runs `existsToJoin` + `propagateConstants` then jumps straight
-        into the per-shape codegen, without the per-FROM-item walk.
-      - pushDownWhereTerms (where.c) and
-        disableUnusedSubqueryResultColumns (select.c) are not ported,
-        so the 0x4000 push-down/null-out arms have no callsite to
-        attach to.
-      - select.c:8136..8149 (the post-FROM-loop snapshot, mask 0x8000)
-        has no Pas anchor — the snapshot point doesn't exist because
-        the loop it terminates doesn't exist.
-      - "Finished with AggInfo" (select.c:8937, mask 0x20) lives in
-        the late select_end AggInfo teardown that's already listed
-        deferred under 10.1.42.a.6 (a.6.5).
-      Land in lock-step with the host ports under 10.1.42.a.6 / future
-      optimizer-pass batches.
-    - [ ] **10.1.42.a.6** Port the host optimizer helpers gating the
-      remaining 10.1.42.a.3 sub-arms: `havingToWhere` (select.c:7047),
-      `countOfViewOptimization` (:7199), `optimizeAggregateUseOfIndexedExpr`
-      (:6572), `aggregateConvertIndexedExprRefToColumn` (:8609), and the
-      `select_end` AggInfo teardown print (:8937).  Each is a host function
-      not yet ported; once any one lands, drop its `{$IFDEF SQLITE_DEBUG}`
-      TREETRACE arm at the same call site.  Treat as 5 independent
-      micro-tasks (a.6.1..a.6.5) when work begins — file as needed.
-  - [~] **10.1.42.b** WHERETRACE consumer macros in where.c / whereexpr.c /
-    wherecode.c → passqlite3codegen.pas.  First batch landed: BEGIN/END
-    `addBtreeIdx(%s)` in `whereLoopAddBtreeIndex` (mask 0x800), BEGIN/END
-    `addVirtual()` in `whereLoopAddVirtual` (0x800), Begin/End processing
-    OR-clause in `whereLoopAddOr` (0x400).  All gated by
-    `{$IFDEF SQLITE_DEBUG}`.  Smoke gate: `.wheretrace 0xffffffff` plus
-    `SELECT … WHERE a=1 OR b=2` over an indexed table emits the BEGIN/END
-    addBtreeIdx + OR-clause walk (verified against bin/passqlite3 built
-    with SQLITE_DEBUG=1).  Deferred sub-arms (~25 callsites in
-    range-scan/STAT4 cost estimation, subset cost adjustments, query
-    planner search-limit, OR/AND-vs-pseudo-index decisions, virtual-table
-    constraint enumeration, solver/optimizer progress, DISTINCT row-count
-    reduction, optimizer-finished marker) — enumerated inline at the
-    tail of `whereLoopAddOr`; land in follow-up commits as each pas
-    counterpart is confidently anchored.  Doable follow-up subtasks
-    (each is a small grep+port in `../sqlite3/src/where*.c`, all gated
-    by `{$IFDEF SQLITE_DEBUG}`):
-    - [~] **10.1.42.b.1** Range-scan cost-estimate WHERETRACE arms in
-      `whereRangeScanEst` / `whereRangeSkipScanEst` (target tasklist mask
-      0x10; upstream actual mask 0x20).  Landed: `Range scan lowers nOut
-      from %d to %d` (where.c:2247..2250) at the tail of the Pas
-      `whereRangeScanEst` — the only WHERETRACE arm reachable in the
-      no-STAT4 build that this project compiles against.  Deferred
-      (STAT4-only, no Pas counterpart): `range skip-scan regions`
-      (where.c:2036), `STAT4 range scan` (2215), `equality scan regions`
-      (2313), `IN row estimate` (2363) — these live inside
-      `whereRangeSkipScanEst` / `whereEqualScanEst` / `whereInScanEst`
-      which are gated behind `SQLITE_ENABLE_STAT4` and have no Pascal
-      port.  Will fold them in once the STAT4 family is ported.
-    - [X] **10.1.42.b.2** Subset-cost adjustment WHERETRACE in
-      `whereLoopAdjustCost` and covering-index decision arms in
-      `whereLoopAddBtree` (target tasklist mask 0x800 — upstream actual
-      masks are 0x80 for subset adjustments and 0x200 for covering-index
-      decisions; verified against where.c).  Landed:
-        * `subset cost adjustment %d,%d to %d,%d` x2 (where.c:2711..2714
-          and 2720..2723, mask 0x80) inside `whereLoopAdjustCost` —
-          symmetric arms for proper-subset / proper-superset cases.
-        * `-> %s is not a covering index according to
-          whereIsCoveringIndex()` (where.c:4203, 0x200).
-        * `-> %s is a covering expression index according to
-          whereIsCoveringIndex()` (where.c:4210, 0x200).
-        * `-> %s might be a covering expression index according to
-          whereIsCoveringIndex()` (where.c:4216, 0x200).
-        * `-> %s is a covering index according to bitmasks`
-          (where.c:4224, 0x200).
-      All inside whereLoopAddBtree's covering-index analysis switch.
-      `whereLoopInsert` itself has no plain "cost" / "not helpful" arms
-      under WHERETRACE — the only WHERETRACE in whereLoopInsert family
-      is the 0xffffffff non-viable-vtab-plan reject (where.c:4416) which
-      lives in `whereLoopAddVirtualOne` and is tracked under b.3.
-    - [X] **10.1.42.b.3** Virtual-table constraint enumeration WHERETRACE
-      arms.  Target tasklist mask 0x40 in `whereLoopAddVirtualOne`;
-      verified against where.c the actual host is the driver
-      `whereLoopAddVirtual` (not `whereLoopAddVirtualOne`) and the
-      mask is **0x800** for the four constraint-walk prints (matches
-      the BEGIN/END addVirtual mask already wired in commit ec9413f).
-      Landed inside the Pas driver:
-        * `  VirtualOne: all usable`            (where.c:4720, 0x800)
-        * `  VirtualOne: all usable w/o IN`     (4745, 0x800)
-        * `  VirtualOne: mPrev=%04llx mNext=%04llx` (4770, 0x800)
-        * `  VirtualOne: all disabled`          (4784, 0x800)
-        * `  VirtualOne: all disabled and w/o IN` (4794, 0x800)
-      Plus the two arms inside `whereLoopAddVirtualOne` itself:
-        * `  ^^^^--- non-viable plan rejected!` (4416, 0xffffffff)
-          on SQLITE_CONSTRAINT short-circuit.
-        * `  bIn=%d prereqIn=%04llx prereqOut=%04llx` (4531, 0xffffffff)
-          on every successful exit.
-      All gated by `{$IFDEF SQLITE_DEBUG}`.
-    - [~] **10.1.42.b.4** Query-planner solver progress WHERETRACE in
-      `wherePathSolver` (mask **0x002 / 0x004**, NOT 0x80 — verified against
-      sqliteInt.h:1181 / where.c:5857 / :5988 / :6032 / :6129).  Landed the
-      two mask-0x002 arms: "---- begin solver" (where.c:5857) and the
-      sort-cost increase line (where.c:5988..5991).  The four mask-0x004
-      candidate prints (Skip / New / Update / `vs`) at where.c:6032..6101
-      and the mask-0x002 "---- after round %d" summary at where.c:6129
-      are deferred behind a `TODO 10.1.42.b.4` marker in
-      passqlite3codegen.pas — they consume `wherePathName(WherePath*,iLoop,
-      WhereLoop*)` which is not yet ported.  Land once wherePathName drops.
-    - [~] **10.1.42.b.5** OR-vs-AND / pseudo-index decision WHERETRACE
-      in `whereLoopAddOr` (mask **0x400** verified, matches tasklist hint
-      and sqliteInt.h:1191 — OR optimization).  Landed the per-subterm
-      breadcrumb at where.c:4866..4867: `"OR-term %d of %p has %d
-      subterms:"`.  The "Begin processing OR-clause" / "End processing
-      OR-clause" arms were already ported in batch 10.1.42.b.
-      Deferral note: the tasklist title mentioned "cost compares, pseudo-
-      index selection" but where.c review shows whereLoopAddOr itself
-      carries only mask-0x400 breadcrumbs — no cost-compare or pseudo-
-      index 0x400 arms exist in this function.  The 0x40 (IN-operator)
-      and 0x80 (cost-adjustment) arms live in `whereLoopAddBtreeIndex`,
-      not `whereLoopAddOr`, and are tracked separately under earlier
-      10.1.42.b sub-tasks.  Also deferred behind a `TODO 10.1.42.b.5`
-      marker: the companion mask-0x20000 sub-arm `sqlite3WhereClausePrint
-      (sSubBuild.pWC)` at where.c:4868..4870 — host helper not yet ported.
-    - [~] **10.1.42.b.6** DISTINCT reduction + optimizer-finished
-      trailing WHERETRACE in `sqlite3WhereBegin` epilogue.  Mask divergence
-      vs tasklist hint: tasklist suggested 0x1 (code generation per
-      sqliteInt.h:1180); the actual upstream literals are
-      **0x0080** (WhereLoop cost adjustments, sqliteInt.h:1188) for the
-      DISTINCT-reduction print at where.c:7118 and **0xffffffff**
-      (any-trace) for the "*** Optimizer Finished ***" line at
-      where.c:7195.  Both landed in passqlite3codegen.pas — the DISTINCT
-      block also carries the `nRowOut -= 30` body that the WHERETRACE
-      bracket calls out (tag-20250414a).  Build green pre/post both
-      ways: -30 nRowOut shift does not change any TestExplainParity or
-      TestWhereCorpus row.  Deferred behind `TODO 10.1.42.b.6`:
-        * "---- Solution cost=%d, nRow=%d ... DISTINCT=..." summary
-          block at where.c:7132..7157 (consumes sqlite3WhereLoopPrint).
-        * mask-0x4000 "---- WHERE clause at end of analysis:" dump at
-          where.c:7190..7194 (consumes sqlite3WhereClausePrint).
-      Land both once their host printers drop.
+  Upstream's "Warning: .scanstats not available in this build." is still echoed verbatim to keep TestShellMeta golden diff clean.
+- [X] **10.1.40** `.testcase NAME` / `.check ANSWER` — fd-level capture, --glob/--notglob/--exact; shellMain summary byte-identical; rc = nTestErr>0. Sub-arms a/a.followup/b closed. Archive.
+- [X] **10.1.41** `.testctrl` — dispatcher routes 12 opcodes through 8.4.1 overloads; BITVEC_TEST/FAULT_INSTALL/IMPOSTER/TUNE/PARSER_COVERAGE fall through to isOk=3 stub (need callback/coverage infra). Archive.
+- [~] **10.1.42** `.selecttrace`/`.wheretrace`/`.treetrace` — TRACEFLAGS toggle landed (via sqlite3_test_control). Mask-hint convention: subtask hints are bundle IDs, **always verify against** `sqliteInt.h:TREETRACE_*` / `whereInt.h:WHERETRACE_*`. Subtasks:
+  - [X] **10.1.42.a** TREETRACE batch 1: begin/end (0x1), name resolution (0x10), column names (0x80), flatten (0x4), constant propagation (0x2000), WhereBegin/End (0x2). Archive.
+    - [X] **10.1.42.a.1** UNION ALL left/right (select.c:3011/3030, 0x200).
+    - [X] **10.1.42.a.2** Post-flatten (4706, 0x4) + wildcard expansion (6339, 0x8).
+    - [~] **10.1.42.a.3** EXISTS-to-JOIN (7368, 0x100000) + aggregate analysis (8442, 0x20). Deferred: havingToWhere/countOfView/AggInfo-adjusted prints (closed under a.6). Archive.
+    - [X] **10.1.42.a.4** "after window rewrite" (0x40), "dropping ORDER BY" (0x800, via a.11), "DISTINCT→GROUP BY" (0x20000, via a.12). Archive.
+    - [~] **10.1.42.a.5** Outer-join + FROM-subquery (verified masks 0x1000/0x800/0x4000/0x8000/0x20); landed via a.7/a.8/a.9/a.10/a.6.5. Remaining: flattenSubquery + IgnorableOrderby drop. Archive.
+    - [X] **10.1.42.a.6** All 5 sub-arms (a.6.1..a.6.5) landed 2026-05-13. Archive has individual citations.
+  - [~] **10.1.42.b** WHERETRACE batch 1: addBtreeIdx (0x800), addVirtual (0x800), OR-clause Begin/End (0x400). Subtasks:
+    - [~] **10.1.42.b.1** Range-scan cost estimate — landed `Range scan lowers nOut` (where.c:2247, 0x20) in `whereRangeScanEst`. Other 4 arms STAT4-only, gated on b.7. Archive.
+    - [X] **10.1.42.b.2** Subset-cost in `whereLoopAdjustCost` (0x80, where.c:2711/2720) + 4 covering-index arms in `whereLoopAddBtree` (0x200, 4203/4210/4216/4224).
+    - [X] **10.1.42.b.3** Vtab constraint enumeration — 5 arms in `whereLoopAddVirtual` (0x800, 4720..4794) + 2 in `whereLoopAddVirtualOne` (0xffffffff, 4416/4531).
+    - [X] **10.1.42.b.4** Solver progress in `wherePathSolver` (masks **0x002/0x004**, NOT 0x80; sqliteInt.h:1181). Landed 0x002 arms; 0x004 + round-summary re-enabled in b.8. Archive.
+    - [X] **10.1.42.b.5** OR-vs-AND per-subterm in `whereLoopAddOr` (0x400, where.c:4866). 0x20000 companion re-enabled in b.8. Archive.
+    - [X] **10.1.42.b.6** DISTINCT reduction (0x0080, where.c:7118 + `nRowOut -= 30`) + optimizer-finished (0xffffffff, 7195). Trailing arms re-enabled in b.8. Archive.
     - [ ] **10.1.42.b.7** Port the STAT4 cost-estimator helpers that
       gate the 4 deferred 10.1.42.b.1 arms: `whereRangeSkipScanEst`
       (where.c:2036), `whereEqualScanEst` (:2215 / :2313),
@@ -861,71 +945,42 @@ partial landings cannot silently no-op.
       against whereInt.h, NOT 0x10 as tasklist initially suggested).
       Treat as 3 independent micro-tasks; drop the WHERETRACE call at
       each host function as it lands.
-    - [ ] **10.1.42.b.8** Port the WHERE-clause / where-loop / path
-      debug-printer helpers that gate ~7 deferred WHERETRACE arms
-      across 10.1.42.b.4/5/6: `wherePathName` (where.c — grep for the
-      definition, prints `wherePath` letters), `sqlite3WhereLoopPrint`
-      (where.c), `sqlite3WhereClausePrint` (where.c).  All three are
-      `#ifdef WHERETRACE_ENABLED` helpers in C.  Port under
-      `{$IFDEF SQLITE_DEBUG}` into passqlite3codegen.pas.  High
-      leverage: lands `Skip/New/Update/vs` rows in solver progress,
-      `Solution cost=` summary, `OR-term sub-WHERE-clause` print,
-      `WHERE clause at end of analysis` print.
-    - [X] **10.1.42.a.6.1** Port `havingToWhere` (select.c:7047) so the
-      0x100 TREETRACE arm at the same site (10.1.42.a.3 deferred) can land.
-      Landed: `havingToWhere` + `havingToWhereExprCb` in
-      passqlite3codegen.pas (with the prerequisite
-      `sqlite3ExprIsConstantOrGroupBy` + `exprNodeIsConstantOrGroupBy`
-      pair just above sqlite3ExprIsSingleTableConstraint).  Wired at
-      the SF_Aggregate+GROUP-BY main path, between
-      `sqlite3ExprAnalyzeAggList(pEList)` and
-      `sqlite3ExprAnalyzeAggregates(pHaving)` (mirrors select.c:8422..8431).
-      0x100 TREETRACE arm landed `{$IFDEF SQLITE_DEBUG}` at the tail of
-      havingToWhere (select.c:7045..7050).  Builds clean default +
-      SQLITE_DEBUG=1; TestExplainParity 1026/1026, TestSQLCorpus 2259/2259.
-    - [ ] **10.1.42.a.6.2** Port `countOfViewOptimization` (select.c:7199)
-      so the 0x200 TREETRACE arm can land.
-    - [ ] **10.1.42.a.6.3** Port `optimizeAggregateUseOfIndexedExpr`
-      (select.c:6572) so the AggInfo-adjusted-for-indexed-exprs print can land.
-    - [ ] **10.1.42.a.6.4** Port `aggregateConvertIndexedExprRefToColumn`
-      (select.c:8609) so the function-expr-converted print can land.
-    - [ ] **10.1.42.a.6.5** Port the `select_end` AggInfo teardown
-      (select.c:8937) so the "Finished with AggInfo" trailing print can land.
-    - [ ] **10.1.42.a.7** Port `simplifyOuterJoins` outer-join simplifier
-      loop (select.c:7737..7756) so the 0x1000 FULL/LEFT/RIGHT-JOIN
-      simplification TREETRACE arms (10.1.42.a.5 deferred) can land.
-    - [ ] **10.1.42.a.8** Port the omit-FROM-subquery-ORDER-BY arm
-      (select.c:7832) so the 0x800 TREETRACE arm can land.
-    - [ ] **10.1.42.a.9** Port `pushDownWhereTerms` +
-      `disableUnusedSubqueryResultColumns` (select.c:8011/8030) so the
-      0x4000 WHERE-clause push-down and unused-col NULL TREETRACE arms can land.
-    - [ ] **10.1.42.a.10** Port the all-FROM-clause final analysis loop
-      (select.c:8146) so the 0x8000 TREETRACE arm can land.
-    - [ ] **10.1.42.a.11** Port the optimizer arm that drops superfluous
-      ORDER BY (select.c:7631, mask 0x800) so the deferred 10.1.42.a.4
-      arm can land.
-    - [ ] **10.1.42.a.12** Port the DISTINCT→GROUP BY transform
-      (select.c:8192, mask 0x20000) so the deferred 10.1.42.a.4 arm can land.
-  - [X] **10.1.42.c** sqlite3DebugPrintf — ported from printf.c:1514..1532 as
-    `procedure sqlite3DebugPrintf(zFormat: PAnsiChar; const args: array of const)`
-    in passqlite3printf.pas.  Renders via the existing sqlite3FormatStr core,
-    writes to stdout and flushes — same observable behaviour as upstream's
-    `fprintf(stdout, "%s", zBuf); fflush(stdout);`.  No earlier shim existed
-    (grep returned no Pascal-side definition).  Callable from every unit that
-    already imports passqlite3printf (codegen, where, ...).
-  - [X] **10.1.42.d** Build-flag gating landed.  `src/tests/build.sh` now
-    honours an `SQLITE_DEBUG=1` env var by forwarding `-dSQLITE_DEBUG` to
-    fpc; default invocations (`./src/tests/build.sh`) leave it undefined so
-    every `{$IFDEF SQLITE_DEBUG}` consumer block compiles out to a silent
-    no-op — preserves non-debug parity with upstream's plain
-    `./configure && make`.  Gate documented in `src/passqlite3.inc`.  Both
-    default and `SQLITE_DEBUG=1` variants now compile cleanly (only
-    pre-existing range/ptr-conv warnings); the future 10.1.42.a/b
-    TREETRACE/WHERETRACE arms drop straight into this gate.
+      **BLOCKED 2026-05-13** on prerequisite **10.1.42.b.7.prereq** —
+      the three helpers consume `sqlite3Stat4ProbeSetValue` (where.c:2002, 2169, 2306)
+      and `sqlite3Stat4ValueFromExpr` (where.c:2006, 2186) which are
+      unported in passqlite3.  Audit found zero references to either symbol
+      in `src/*.pas`; only `sqlite3Stat4Column` (vdbe.pas:13356) and
+      `sqlite3Stat4ProbeFree` (vdbe.pas:13409) exist as Phase-6 stubs.
+      `SQLITE_ENABLE_STAT4` is not set in `src/passqlite3.inc` /
+      `src/tests/build.sh`; pas-sqlite3 is a default non-STAT4 build.
+    - [ ] **10.1.42.b.7.prereq** Port `sqlite3Stat4ProbeSetValue` and
+      `sqlite3Stat4ValueFromExpr` (consumers of `IndexSample` /
+      `sqlite3VdbeRecordCompare`) plus any sample-vector machinery they
+      depend on (`sqlite3Stat4Init`, `analyzeOneTable` STAT4 arm, etc.).
+      C ref: `../sqlite3/src/analyze.c` (STAT4 sample collection) +
+      `../sqlite3/src/vdbeapi.c` (`sqlite3Stat4ProbeSetValue`).  Once
+      landed, gate the new helpers + 10.1.42.b.7 behind
+      `{$IFDEF SQLITE_ENABLE_STAT4}` and add the env-var wiring in
+      `build.sh` (mirror the `SQLITE_ENABLE_STMT_SCANSTATUS` pattern).
+      Complexity: L.
+    - [X] **10.1.42.b.8** Port `wherePathName` + `sqlite3Where{Term,Clause,Loop}Print` + `showAllWhereLoops` (where.c:2375..2520/5512..5519/6469..6488). Debug-only `cId`+`rStarDelta` carved from pre-existing _pad58..63 in TWhereLoop. Re-enabled 7 deferred arms (closes b.4/b.5/b.6 + WHERETRACE_ALL_LOOPS at where.c:7103). Archive.
+    - [X] **10.1.42.a.6.1** `havingToWhere` + `havingToWhereExprCb` (select.c:7047) + `sqlite3ExprIsConstantOrGroupBy`; wired SF_Aggregate+GROUP-BY (8422..8431). 0x100.
+    - [X] **10.1.42.a.6.2** `countOfViewOptimization` (select.c:7128..7204); wired after propagateConstants (7924..7930). 0x200. SQLITE_CountOfView added.
+    - [X] **10.1.42.a.6.3** `optimizeAggregateUseOfIndexedExpr` (select.c:6549..6586); wired pre assignAggregateRegisters (8527..8529). 0x20.
+    - [X] **10.1.42.a.6.4** `aggregateConvertIndexedExprRefToColumn` + walker (select.c:6591..6623); wired after sqlite3WhereEnd (8600..8615). 0x20.
+    - [X] **10.1.42.a.6.5** "Finished with AggInfo" at sqlite3Select tail (select.c:8933..8945). 0x20.
+    - [X] **10.1.42.a.7** Outer-join strength-reduction loop (select.c:7708..7770) + `sqlite3ExprImpliesNonNullRow`/`impliesNotNullRow`/`bothImplyNotNullRow` (expr.c:6857..7031) + `unsetJoinExpr` (471..494). All 4× 0x1000 arms. SQLITE_SimplifyJoin (0x2000). Archive.
+    - [X] **10.1.42.a.8** FROM-subquery superfluous-ORDER-BY drop (select.c:7822..7838, tag-select-0230). SQLITE_OmitOrderBy ($40000). 0x800. Archive.
+    - [X] **10.1.42.a.9** `pushDownWhereTerms` (5125..5286) + `disableUnusedSubqueryResultColumns` (5296..5358). 0x4000. SQLITE_PushDown ($1000) + SQLITE_NullUnusedCols ($04000000). Restriction 6c (partition-less window) conservatively bailed. Archive.
+    - [X] **10.1.42.a.10** all-FROM snapshot (select.c:8144..8149, 0x8000).
+    - [X] **10.1.42.a.11** top-level ORDER-BY drop (select.c:7625..7644, 0x800).
+    - [X] **10.1.42.a.12** DISTINCT→GROUP BY (select.c:8151..8196, 0x20000). Gates on selFlags == SF_Distinct + pWin=nil + ExprListCompare=0. Closes a.4. Archive.
+  - [X] **10.1.42.c** `sqlite3DebugPrintf` (printf.c:1514..1532) → passqlite3printf.pas.
+  - [X] **10.1.42.d** Build-flag gating: `build.sh` honours `SQLITE_DEBUG=1` → `-dSQLITE_DEBUG`. Documented in `src/passqlite3.inc`.
 
 ### 10.1f Long-tail / specialised dot-commands
 
-- [ ] **10.1f** Out-of-scope dependencies (session, archive, recover) may stub with the upstream `SQLITE_OMIT_*` "feature not compiled in" message. Gate: `tests/cli/10f_misc/`.
+- [X] **10.1f** Closed 2026-05-13 — every 10.1f.0..10.1f.16 sub-arm landed (.backup/.restore/.clone, .archive/.ar, .session stub, .recover, .dbinfo, .dbconfig, .filectrl, .sha3sum, .crnl/.binary/.connection/.unmodule, .vfsinfo/.vfslist/.vfsname).  Out-of-scope deps stubbed faithfully per upstream `SQLITE_OMIT_*` shape.
   - [X] **10.1f.0..10.1f.2** `.backup` / `.restore` / `.clone` — gated by `src/tests/TestShellBackup.pas`.
   - [X] **10.1f.3** `.archive`/`.ar` — gated by `src/tests/TestShellArchive.pas`.
   - [X] **10.1f.4** `.session` — gated by `src/tests/TestShellArchive.pas` shape arm (stub per 10.1.47).
@@ -1139,6 +1194,62 @@ functions with `asm` content cannot be inlined.
 
 ---
 
+## Phase 13 — Coverage-guided fuzzing (AFL)
+
+Enter after Phase 9 green; independent of Phase 12.  9.3.1 +
+9.3.2 already provide the one-shot differential harness and an
+8-seed clean sweep — this phase adds coverage-guided mutation on
+top.  **FPC-AFL gotcha:** FPC has no `afl-clang-fast` equivalent
+(no LLVM instrumentation pass).  Three viable instrumentation
+routes — pick in this order:
+
+1. **`afl-as` assembler wedge (preferred).**  Tell FPC to emit
+   text assembly and route it through AFL's GAS wrapper:
+   `fpc -al -Aas -FD<afl-bin-dir> ...`.  `-al` keeps `.s` files,
+   `-Aas` selects GNU `as`, `-FD` points at the directory holding
+   `afl-as`.  `afl-as` rewrites every branch site with the AFL
+   tramp + shared-memory bitmap update — same mechanism `afl-gcc`
+   used before `afl-clang-fast` existed.  ~2x slowdown.  May need
+   minor tweaks if FPC's GAS dialect trips the wrapper's pattern
+   matcher (older AFL versions assume gcc-style local labels).
+2. **QEMU mode (`afl-fuzz -Q`).**  No compiler cooperation;
+   instruments at translation time inside patched user-mode QEMU.
+   ~5–10x slowdown but bulletproof.  Fallback if (1) fails.
+3. **Black-box `afl-fuzz -n`.**  No instrumentation, dumb-fuzz
+   only.  Last resort; documented for completeness.
+
+Not viable: pure C shim with `afl-clang-fast` — the shim gets
+instrumented but the Pascal callee doesn't, so the bitmap is
+empty for the code under test.
+
+Persistent-mode `__AFL_LOOP` is orthogonal to the choice above
+and can be added later via a small C entry stub.
+
+- [ ] **13.1** AFL wiring.  `src/tests/fuzz/afl-driver.pas` wraps
+  9.3.1 for `afl-fuzz` (read input from stdin, write to a tmp
+  file, invoke the in-process harness, return AFL-compatible exit
+  codes).  Stand up instrumentation route (1), (2), or (3) above;
+  document the choice in `src/tests/fuzz/README.md`.  Skip
+  gracefully if AFL isn't installed — script must self-report.
+
+- [ ] **13.2** Crash-vs-divergence classifier.  Triage helper
+  that separates (a) Pascal crash, (b) C crash, (c) silent
+  divergence, (d) timeout.  Each gets its own bucket under
+  `src/tests/fuzz/crashes/`.
+
+- [ ] **13.3** ≥24 h soak target.  Wrapper script `fuzz-soak.sh`
+  with `--duration` (default 24h) and stop-on-first-divergence.
+  Not a CI gate — a manual gate documented in README.  Each
+  clean soak bumps a counter in `src/tests/fuzz/SOAK_LOG.md` so
+  we can prove the wallclock budget over time.
+
+- [ ] **13.4** Coverage-guided seed minimisation.  `afl-cmin` +
+  `afl-tmin` pipeline pruning the seed set to the smallest input
+  set that still hits every covered branch.  Re-commit the
+  minimised seeds when they shrink.
+
+---
+
 ## Out of scope until core is green (carry-over from history.md)
 
 These remain explicitly deferred and are **not** part of finishing
@@ -1326,3 +1437,140 @@ the port unless a user requests them after Phases 0–9 are green:
     iterations → instant crash. In C, `for(i=0; i<N; i++)` skips cleanly.
     **Rule**: always guard with `if N > 0 then` before such a loop, or rewrite
     as `i := 0; while i < N do begin ... Inc(i); end`.
+
+---
+
+## Finding code duplication (port-introduced vs. upstream)
+
+Goal: identify Pascal blocks that repeat without an equivalent repetition in
+the upstream C reference. The faithful-port rule means any duplication present
+in C is allowed (it lives there for a reason), but duplication that exists
+*only* in the Pascal tree is a refactor candidate.
+
+Tooling: `jscpd` (Node-based, token-aware, supports Pascal and C). Requires
+`node` + `npm`; no install needed if invoked via `npx`.
+
+### Step 1 — generate JSON reports for both trees
+
+Run from any directory; outputs land in `/tmp/jscpd-out/`.
+
+```
+npx --yes jscpd /home/bpsa/app/pas-sqlite3/src \
+  --pattern "**/*.pas" \
+  --min-tokens 50 --reporters json --output /tmp/jscpd-out/pas
+
+npx --yes jscpd /home/bpsa/app/sqlite3 \
+  --pattern "{src,ext}/**/*.{c,h}" \
+  --ignore "**/sqlite3.c,**/sqlite3.h,**/tsrc/**,**/parse.c,**/opcodes.c,**/fts5.c,**/fts5parse.c,**/keywordhash.h" \
+  --min-tokens 50 --reporters json --output /tmp/jscpd-out/c
+```
+
+Notes on the C invocation:
+- The amalgamation (`sqlite3.c/h`, `tsrc/`) is excluded — it is a concatenation
+  of the split sources and inflates duplication artificially.
+- Lemon/awk-generated files (`parse.c`, `opcodes.c`, `fts5.c`, `fts5parse.c`,
+  `keywordhash.h`) are excluded — their repetition is mechanical, not human.
+- `--min-tokens 50` matches roughly 6–10 lines of body code; raise it to 80–100
+  to focus only on substantial clones.
+
+### Step 2 — cross-reference Pascal clones against C
+
+A Pascal file `passqlite3<stem>.pas` is considered to have a C analogue at
+`<stem>.c` or `<stem>.h`. A Pascal clone pair `(A.pas, B.pas)` has a "C
+analogue" if the corresponding C files also clone with each other (or, for
+intra-file clones, if the same C file clones against itself).
+
+Script (paste into `python3 -`):
+
+```python
+import json, os, re
+from collections import defaultdict
+
+c = json.load(open('/tmp/jscpd-out/c/jscpd-report.json'))
+p = json.load(open('/tmp/jscpd-out/pas/jscpd-report.json'))
+
+c_pairs = defaultdict(set)
+for d in c['duplicates']:
+    a = os.path.basename(d['firstFile']['name'])
+    b = os.path.basename(d['secondFile']['name'])
+    c_pairs[a].add(b); c_pairs[b].add(a)
+
+def pas_to_c(n):
+    m = re.match(r'passqlite3(.+)\.pas$', n)
+    return {m.group(1)+'.c', m.group(1)+'.h'} if m else set()
+
+def is_test(path): return '/tests/' in path
+
+tests_only=[]; port_only=[]; cross=[]
+for d in p['duplicates']:
+    fa, fb = d['firstFile']['name'], d['secondFile']['name']
+    a, b   = os.path.basename(fa), os.path.basename(fb)
+    ln     = d['lines']
+    ta, tb = is_test(fa), is_test(fb)
+    if ta and tb:        tests_only.append((ln,a,b)); continue
+    if ta or tb:         cross.append((ln,a,b));      continue
+    ca, cb = pas_to_c(a), pas_to_c(b)
+    hit = any(y in c_pairs.get(x,set()) for x in ca for y in cb)
+    if not hit: port_only.append((ln,a,b))
+
+for lst in (tests_only, port_only, cross): lst.sort(reverse=True)
+print("test<->test :", len(tests_only), "clones,", sum(x[0] for x in tests_only), "lines")
+print("port<->port :", len(port_only),  "clones,", sum(x[0] for x in port_only),  "lines  (no C analogue)")
+print("test<->port :", len(cross),      "clones,", sum(x[0] for x in cross),      "lines")
+print("\nTop 20 port<->port (port-introduced):")
+for ln,a,b in port_only[:20]: print(f"  {ln:3}  {a} <-> {b}")
+print("\nTop 20 test<->test (refactor candidates):")
+for ln,a,b in tests_only[:20]: print(f"  {ln:3}  {a} <-> {b}")
+```
+
+### Step 3 — interpret the output
+
+Three buckets, each with a different meaning:
+
+1. **`port <-> port` with no C analogue** — genuine port-introduced
+   duplication. Open the listed line ranges (`jscpd` JSON has `firstFile.start`
+   / `firstFile.end`) and check the corresponding C function. Common causes:
+   - C used a macro that the Pascal port inlined two or three times.
+   - C used a `static inline` helper that the port copy-pasted instead of
+     hoisting into a top-level routine.
+   Fix by extracting a shared procedure inside the same unit, mirroring the C
+   macro/helper.
+
+2. **`test <-> test`** — the test harness has no upstream counterpart, so any
+   clone here is by definition port-only. These are the biggest deletion wins.
+   Look for families that share boilerplate (open `:memory:`, prep, step,
+   compare against `csq_*`); collapse them into a common unit under
+   `src/tests/` (e.g. a `DiagCommon.pas` exposing `ProbeOne` / `ProbeRows`).
+
+3. **`test <-> port`** — should be empty. If non-empty, a test is probably
+   inlining production code rather than calling it; fix the test.
+
+### Step 4 — don't refactor blindly
+
+Before extracting a helper:
+
+- Confirm the upstream C really has no equivalent repetition. Sometimes the C
+  source uses a macro that `jscpd` did not flag because it expands at compile
+  time; a Pascal extraction is still correct, but the framing changes from
+  "port-introduced" to "missing macro analogue."
+- Avoid eliminating duplication that exists because the two Pascal sites are
+  intentionally allowed to diverge later (e.g. an extension VFS that may grow
+  features the core VFS will not). When in doubt, leave a `// see also <other
+  site>` comment instead of extracting.
+- Never refactor across the port↔test boundary: tests must stay independent of
+  internal helpers to remain a useful oracle.
+
+### Current snapshot (informational, recompute before acting)
+
+At the time this section was written:
+
+| Bucket                              | Clones | Dup lines |
+| ----------------------------------- | -----: | --------: |
+| Pascal total (`src/**/*.pas`)       |    319 |     6 143 |
+| C total (split sources, no amalg.)  |    166 |       — (2.73% of 83k) |
+| Pascal `test <-> test`              |    256 |     5 725 |
+| Pascal `port <-> port` (no C analog)|     22 |       259 |
+| Pascal `test <-> port`              |      0 |         0 |
+
+Headline: ~96% of Pascal's excess duplication lives in the test harness; core
+port code only carries ~259 unjustified duplicated lines out of 67 k.

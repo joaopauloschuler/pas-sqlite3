@@ -49,72 +49,8 @@ uses
   passqlite3pager,
   passqlite3wal,
   passqlite3btree,
-  passqlite3vdbe;
-
-{ ===== helpers ============================================================== }
-
-var
-  gPass: i32 = 0;
-  gFail: i32 = 0;
-
-procedure Check(name: string; cond: Boolean);
-begin
-  if cond then begin
-    WriteLn('  PASS ', name);
-    Inc(gPass);
-  end else begin
-    WriteLn('  FAIL ', name);
-    Inc(gFail);
-  end;
-end;
-
-{ ===== Infrastructure ======================================================= }
-
-const
-  PARSE_SZ = 256;
-
-type
-  TMinDb = record
-    db:        Tsqlite3;
-    parseArea: array[0..PARSE_SZ-1] of Byte;
-  end;
-
-procedure InitMinDb(var md: TMinDb);
-begin
-  FillChar(md, SizeOf(md), 0);
-  md.db.enc        := SQLITE_UTF8;
-  md.db.nDb        := 0;
-  md.db.aLimit[5]  := 250000000;
-  md.db.aLimit[0]  := 1000000000;
-end;
-
-function CreateMinVdbe(pDb: PTsqlite3; nMem: i32): PVdbe;
-var
-  pParse: Pointer;
-  v:      PVdbe;
-  sz:     u64;
-begin
-  pParse := sqlite3DbMallocZero(pDb, PARSE_SZ);
-  if pParse = nil then begin Result := nil; Exit; end;
-  PPointer(pParse)^ := pDb;
-  Pi32(PByte(pParse) + 156)^ := 250000000;
-
-  v := sqlite3VdbeCreate(pParse);
-  sqlite3DbFree(pDb, pParse);
-  if v = nil then begin Result := nil; Exit; end;
-
-  v^.nOp := 0;
-  sz := u64(nMem) * SizeOf(TMem);
-  v^.aMem  := PMem(sqlite3DbMallocZero(pDb, sz));
-  v^.nMem  := nMem;
-  v^.apCsr   := nil;
-  v^.nCursor := 0;
-  v^.eVdbeState         := VDBE_READY_STATE;
-  v^.minWriteFileFormat := 4;
-  v^.pc                 := 0;
-  v^.cacheCtr           := 1;
-  Result := v;
-end;
+  passqlite3vdbe,
+  TestVdbeCommon;
 
 { Build a VDBE that emits one row: r[1]=int, r[2]=double, r[3]=null, r[4]=text
   Uses ResultRow to yield a row, then Halt. }
@@ -124,7 +60,7 @@ var
   zStr: PAnsiChar;
 begin
   zStr := 'hello';
-  v := CreateMinVdbe(pDb, 6);
+  v := VdbeCreateMinReady(pDb, 6);
   if v = nil then begin Result := nil; Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
@@ -144,21 +80,21 @@ end;
 
 procedure TestColumnCount;
 var
-  md: TMinDb;
+  md: TVdbeMinDb;
   v:  PVdbe;
   rc: i32;
 begin
   WriteLn('T1: sqlite3_column_count / data_count');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   v := BuildOneRowVdbe(@md.db);
-  if v = nil then begin Check('T1 vdbe', False); Exit; end;
+  if v = nil then begin VdbeCheck('T1 vdbe', False); Exit; end;
 
-  Check('T1 col_count=4', sqlite3_column_count(v) = 4);
-  Check('T1 data_count=0 before step', sqlite3_data_count(v) = 0);
+  VdbeCheck('T1 col_count=4', sqlite3_column_count(v) = 4);
+  VdbeCheck('T1 data_count=0 before step', sqlite3_data_count(v) = 0);
 
   rc := sqlite3_step(v);
-  Check('T1 rc=ROW', rc = SQLITE_ROW);
-  Check('T1 data_count=4 after step', sqlite3_data_count(v) = 4);
+  VdbeCheck('T1 rc=ROW', rc = SQLITE_ROW);
+  VdbeCheck('T1 data_count=4 after step', sqlite3_data_count(v) = 4);
 
   sqlite3_finalize(v);
 end;
@@ -167,23 +103,23 @@ end;
 
 procedure TestColumnNumeric;
 var
-  md: TMinDb;
+  md: TVdbeMinDb;
   v:  PVdbe;
   rc: i32;
 begin
   WriteLn('T2: column_type / int / int64 / double');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   v := BuildOneRowVdbe(@md.db);
-  if v = nil then begin Check('T2 vdbe', False); Exit; end;
+  if v = nil then begin VdbeCheck('T2 vdbe', False); Exit; end;
 
   rc := sqlite3_step(v);
-  Check('T2 rc=ROW', rc = SQLITE_ROW);
-  Check('T2 col0 type=INTEGER', sqlite3_column_type(v, 0) = SQLITE_INTEGER);
-  Check('T2 col0 int=42',       sqlite3_column_int(v, 0) = 42);
-  Check('T2 col0 int64=42',     sqlite3_column_int64(v, 0) = 42);
-  Check('T2 col1 type=FLOAT',   sqlite3_column_type(v, 1) = SQLITE_FLOAT);
-  Check('T2 col1 double=314',   sqlite3_column_double(v, 1) = 314.0);
-  Check('T2 col2 type=NULL',    sqlite3_column_type(v, 2) = SQLITE_NULL);
+  VdbeCheck('T2 rc=ROW', rc = SQLITE_ROW);
+  VdbeCheck('T2 col0 type=INTEGER', sqlite3_column_type(v, 0) = SQLITE_INTEGER);
+  VdbeCheck('T2 col0 int=42',       sqlite3_column_int(v, 0) = 42);
+  VdbeCheck('T2 col0 int64=42',     sqlite3_column_int64(v, 0) = 42);
+  VdbeCheck('T2 col1 type=FLOAT',   sqlite3_column_type(v, 1) = SQLITE_FLOAT);
+  VdbeCheck('T2 col1 double=314',   sqlite3_column_double(v, 1) = 314.0);
+  VdbeCheck('T2 col2 type=NULL',    sqlite3_column_type(v, 2) = SQLITE_NULL);
 
   sqlite3_finalize(v);
 end;
@@ -192,22 +128,22 @@ end;
 
 procedure TestColumnText;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
   txt: PAnsiChar;
 begin
   WriteLn('T3: column_text');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   v := BuildOneRowVdbe(@md.db);
-  if v = nil then begin Check('T3 vdbe', False); Exit; end;
+  if v = nil then begin VdbeCheck('T3 vdbe', False); Exit; end;
 
   rc := sqlite3_step(v);
-  Check('T3 rc=ROW', rc = SQLITE_ROW);
+  VdbeCheck('T3 rc=ROW', rc = SQLITE_ROW);
   txt := sqlite3_column_text(v, 3);  { col 3 (0-based) = 'hello' }
-  Check('T3 col3 text<>nil', txt <> nil);
+  VdbeCheck('T3 col3 text<>nil', txt <> nil);
   if txt <> nil then
-    Check('T3 col3 text=hello', StrComp(txt, 'hello') = 0);
+    VdbeCheck('T3 col3 text=hello', StrComp(txt, 'hello') = 0);
 
   sqlite3_finalize(v);
 end;
@@ -216,16 +152,16 @@ end;
 
 procedure TestColumnBlob;
 var
-  md:   TMinDb;
+  md:   TVdbeMinDb;
   v:    PVdbe;
   rc:   i32;
   blob: Pointer;
 begin
   WriteLn('T4: column_blob / bytes');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { Build a VDBE that stores blob data in r[1] }
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T4 vdbe', False); Exit; end;
+  v := VdbeCreateMinReady(@md.db, 3);
+  if v = nil then begin VdbeCheck('T4 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp4(v, OP_Blob, 3, 1, 0, PAnsiChar('abc'), P4_STATIC);
@@ -235,13 +171,13 @@ begin
   v^.eVdbeState := VDBE_READY_STATE;
 
   rc := sqlite3_step(v);
-  Check('T4 rc=ROW', rc = SQLITE_ROW);
-  Check('T4 col0 type=BLOB',  sqlite3_column_type(v, 0) = SQLITE_BLOB);
-  Check('T4 col0 bytes=3',    sqlite3_column_bytes(v, 0) = 3);
+  VdbeCheck('T4 rc=ROW', rc = SQLITE_ROW);
+  VdbeCheck('T4 col0 type=BLOB',  sqlite3_column_type(v, 0) = SQLITE_BLOB);
+  VdbeCheck('T4 col0 bytes=3',    sqlite3_column_bytes(v, 0) = 3);
   blob := sqlite3_column_blob(v, 0);
-  Check('T4 col0 blob<>nil',  blob <> nil);
+  VdbeCheck('T4 col0 blob<>nil',  blob <> nil);
   if blob <> nil then
-    Check('T4 blob[0]=a', PAnsiChar(blob)[0] = 'a');
+    VdbeCheck('T4 blob[0]=a', PAnsiChar(blob)[0] = 'a');
 
   sqlite3_finalize(v);
 end;
@@ -250,24 +186,24 @@ end;
 
 procedure TestReset;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T5: sqlite3_reset → re-step same result');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   v := BuildOneRowVdbe(@md.db);
-  if v = nil then begin Check('T5 vdbe', False); Exit; end;
+  if v = nil then begin VdbeCheck('T5 vdbe', False); Exit; end;
 
   rc := sqlite3_step(v);
-  Check('T5 first step=ROW', rc = SQLITE_ROW);
-  Check('T5 col0=42 first',  sqlite3_column_int(v, 0) = 42);
+  VdbeCheck('T5 first step=ROW', rc = SQLITE_ROW);
+  VdbeCheck('T5 col0=42 first',  sqlite3_column_int(v, 0) = 42);
 
   sqlite3_reset(v);
 
   rc := sqlite3_step(v);
-  Check('T5 second step=ROW', rc = SQLITE_ROW);
-  Check('T5 col0=42 second',  sqlite3_column_int(v, 0) = 42);
+  VdbeCheck('T5 second step=ROW', rc = SQLITE_ROW);
+  VdbeCheck('T5 col0=42 second',  sqlite3_column_int(v, 0) = 42);
 
   sqlite3_finalize(v);
 end;
@@ -276,20 +212,20 @@ end;
 
 procedure TestBindNumeric;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T6: sqlite3_bind_int / double / null → column reads');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { Build VDBE with 3 variables, ResultRow them }
-  v := CreateMinVdbe(@md.db, 5);
-  if v = nil then begin Check('T6 vdbe', False); Exit; end;
+  v := VdbeCreateMinReady(@md.db, 5);
+  if v = nil then begin VdbeCheck('T6 vdbe', False); Exit; end;
 
   { Allocate aVar array (3 params) }
   v^.nVar := 3;
   v^.aVar := PMem(sqlite3DbMallocZero(@md.db, 3 * SizeOf(TMem)));
-  if v^.aVar = nil then begin Check('T6 aVar', False); sqlite3_finalize(v); Exit; end;
+  if v^.aVar = nil then begin VdbeCheck('T6 aVar', False); sqlite3_finalize(v); Exit; end;
   (v^.aVar + 0)^.flags := MEM_Null;
   (v^.aVar + 1)^.flags := MEM_Null;
   (v^.aVar + 2)^.flags := MEM_Null;
@@ -303,15 +239,15 @@ begin
   sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
   sqlite3VdbeSetNumCols(v, 3);
 
-  Check('T6 bind_int',    sqlite3_bind_int(v, 1, 99) = SQLITE_OK);
-  Check('T6 bind_double', sqlite3_bind_double(v, 2, 2.71828) = SQLITE_OK);
-  Check('T6 bind_null',   sqlite3_bind_null(v, 3) = SQLITE_OK);
+  VdbeCheck('T6 bind_int',    sqlite3_bind_int(v, 1, 99) = SQLITE_OK);
+  VdbeCheck('T6 bind_double', sqlite3_bind_double(v, 2, 2.71828) = SQLITE_OK);
+  VdbeCheck('T6 bind_null',   sqlite3_bind_null(v, 3) = SQLITE_OK);
 
   rc := sqlite3_step(v);
-  Check('T6 rc=ROW',      rc = SQLITE_ROW);
-  Check('T6 col0=99',     sqlite3_column_int(v, 0) = 99);
-  Check('T6 col1≈2.718',  Abs(sqlite3_column_double(v, 1) - 2.71828) < 1e-5);
-  Check('T6 col2=NULL',   sqlite3_column_type(v, 2) = SQLITE_NULL);
+  VdbeCheck('T6 rc=ROW',      rc = SQLITE_ROW);
+  VdbeCheck('T6 col0=99',     sqlite3_column_int(v, 0) = 99);
+  VdbeCheck('T6 col1≈2.718',  Abs(sqlite3_column_double(v, 1) - 2.71828) < 1e-5);
+  VdbeCheck('T6 col2=NULL',   sqlite3_column_type(v, 2) = SQLITE_NULL);
 
   sqlite3_finalize(v);
 end;
@@ -320,19 +256,19 @@ end;
 
 procedure TestBindText;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
   txt: PAnsiChar;
 begin
   WriteLn('T7: sqlite3_bind_text → column_text');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T7 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinReady(@md.db, 3);
+  if v = nil then begin VdbeCheck('T7 vdbe', False); Exit; end;
 
   v^.nVar := 1;
   v^.aVar := PMem(sqlite3DbMallocZero(@md.db, SizeOf(TMem)));
-  if v^.aVar = nil then begin Check('T7 aVar', False); sqlite3_finalize(v); Exit; end;
+  if v^.aVar = nil then begin VdbeCheck('T7 aVar', False); sqlite3_finalize(v); Exit; end;
   v^.aVar^.flags := MEM_Null;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
@@ -341,14 +277,14 @@ begin
   sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
   sqlite3VdbeSetNumCols(v, 1);
 
-  Check('T7 bind_text', sqlite3_bind_text(v, 1, 'world', 5, SQLITE_STATIC) = SQLITE_OK);
+  VdbeCheck('T7 bind_text', sqlite3_bind_text(v, 1, 'world', 5, SQLITE_STATIC) = SQLITE_OK);
 
   rc := sqlite3_step(v);
-  Check('T7 rc=ROW',    rc = SQLITE_ROW);
+  VdbeCheck('T7 rc=ROW',    rc = SQLITE_ROW);
   txt := sqlite3_column_text(v, 0);
-  Check('T7 text<>nil', txt <> nil);
+  VdbeCheck('T7 text<>nil', txt <> nil);
   if txt <> nil then
-    Check('T7 text=world', StrComp(txt, 'world') = 0);
+    VdbeCheck('T7 text=world', StrComp(txt, 'world') = 0);
 
   sqlite3_finalize(v);
 end;
@@ -357,19 +293,19 @@ end;
 
 procedure TestBindBlob;
 var
-  md:    TMinDb;
+  md:    TVdbeMinDb;
   v:     PVdbe;
   rc:    i32;
   blob:  Pointer;
 begin
   WriteLn('T8: sqlite3_bind_blob → column_blob / bytes');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T8 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinReady(@md.db, 3);
+  if v = nil then begin VdbeCheck('T8 vdbe', False); Exit; end;
 
   v^.nVar := 1;
   v^.aVar := PMem(sqlite3DbMallocZero(@md.db, SizeOf(TMem)));
-  if v^.aVar = nil then begin Check('T8 aVar', False); sqlite3_finalize(v); Exit; end;
+  if v^.aVar = nil then begin VdbeCheck('T8 aVar', False); sqlite3_finalize(v); Exit; end;
   v^.aVar^.flags := MEM_Null;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
@@ -378,17 +314,17 @@ begin
   sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
   sqlite3VdbeSetNumCols(v, 1);
 
-  Check('T8 bind_blob', sqlite3_bind_blob(v, 1, PAnsiChar('xyz'), 3,
+  VdbeCheck('T8 bind_blob', sqlite3_bind_blob(v, 1, PAnsiChar('xyz'), 3,
                                           SQLITE_STATIC) = SQLITE_OK);
 
   rc := sqlite3_step(v);
-  Check('T8 rc=ROW',   rc = SQLITE_ROW);
-  Check('T8 type=BLOB', sqlite3_column_type(v, 0) = SQLITE_BLOB);
-  Check('T8 bytes=3',  sqlite3_column_bytes(v, 0) = 3);
+  VdbeCheck('T8 rc=ROW',   rc = SQLITE_ROW);
+  VdbeCheck('T8 type=BLOB', sqlite3_column_type(v, 0) = SQLITE_BLOB);
+  VdbeCheck('T8 bytes=3',  sqlite3_column_bytes(v, 0) = 3);
   blob := sqlite3_column_blob(v, 0);
-  Check('T8 blob<>nil', blob <> nil);
+  VdbeCheck('T8 blob<>nil', blob <> nil);
   if blob <> nil then
-    Check('T8 blob[1]=y', PAnsiChar(blob)[1] = 'y');
+    VdbeCheck('T8 blob[1]=y', PAnsiChar(blob)[1] = 'y');
 
   sqlite3_finalize(v);
 end;
@@ -397,19 +333,19 @@ end;
 
 procedure TestBindValue;
 var
-  md:   TMinDb;
+  md:   TVdbeMinDb;
   v:    PVdbe;
   src:  TMem;
   rc:   i32;
 begin
   WriteLn('T9: sqlite3_bind_value (copy integer 7)');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T9 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinReady(@md.db, 3);
+  if v = nil then begin VdbeCheck('T9 vdbe', False); Exit; end;
 
   v^.nVar := 1;
   v^.aVar := PMem(sqlite3DbMallocZero(@md.db, SizeOf(TMem)));
-  if v^.aVar = nil then begin Check('T9 aVar', False); sqlite3_finalize(v); Exit; end;
+  if v^.aVar = nil then begin VdbeCheck('T9 aVar', False); sqlite3_finalize(v); Exit; end;
   v^.aVar^.flags := MEM_Null;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
@@ -421,10 +357,10 @@ begin
   FillChar(src, SizeOf(src), 0);
   sqlite3VdbeMemSetInt64(@src, 7);
 
-  Check('T9 bind_value', sqlite3_bind_value(v, 1, @src) = SQLITE_OK);
+  VdbeCheck('T9 bind_value', sqlite3_bind_value(v, 1, @src) = SQLITE_OK);
   rc := sqlite3_step(v);
-  Check('T9 rc=ROW',   rc = SQLITE_ROW);
-  Check('T9 col=7',    sqlite3_column_int(v, 0) = 7);
+  VdbeCheck('T9 rc=ROW',   rc = SQLITE_ROW);
+  VdbeCheck('T9 col=7',    sqlite3_column_int(v, 0) = 7);
 
   sqlite3_finalize(v);
 end;
@@ -433,18 +369,18 @@ end;
 
 procedure TestClearBindings;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T10: sqlite3_clear_bindings → columns become NULL');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T10 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinReady(@md.db, 3);
+  if v = nil then begin VdbeCheck('T10 vdbe', False); Exit; end;
 
   v^.nVar := 1;
   v^.aVar := PMem(sqlite3DbMallocZero(@md.db, SizeOf(TMem)));
-  if v^.aVar = nil then begin Check('T10 aVar', False); sqlite3_finalize(v); Exit; end;
+  if v^.aVar = nil then begin VdbeCheck('T10 aVar', False); sqlite3_finalize(v); Exit; end;
   v^.aVar^.flags := MEM_Null;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
@@ -454,11 +390,11 @@ begin
   sqlite3VdbeSetNumCols(v, 1);
 
   sqlite3_bind_int(v, 1, 55);
-  Check('T10 clear', sqlite3_clear_bindings(v) = SQLITE_OK);
+  VdbeCheck('T10 clear', sqlite3_clear_bindings(v) = SQLITE_OK);
 
   rc := sqlite3_step(v);
-  Check('T10 rc=ROW',      rc = SQLITE_ROW);
-  Check('T10 col=NULL', sqlite3_column_type(v, 0) = SQLITE_NULL);
+  VdbeCheck('T10 rc=ROW',      rc = SQLITE_ROW);
+  VdbeCheck('T10 col=NULL', sqlite3_column_type(v, 0) = SQLITE_NULL);
 
   sqlite3_finalize(v);
 end;
@@ -473,16 +409,16 @@ begin
   FillChar(m, SizeOf(m), 0);
 
   sqlite3VdbeMemSetInt64(@m, 123);
-  Check('T11 type INT',  sqlite3_value_type(@m) = SQLITE_INTEGER);
-  Check('T11 int=123',   sqlite3_value_int(@m) = 123);
-  Check('T11 int64=123', sqlite3_value_int64(@m) = 123);
+  VdbeCheck('T11 type INT',  sqlite3_value_type(@m) = SQLITE_INTEGER);
+  VdbeCheck('T11 int=123',   sqlite3_value_int(@m) = 123);
+  VdbeCheck('T11 int64=123', sqlite3_value_int64(@m) = 123);
 
   sqlite3VdbeMemSetDouble(@m, 3.14);
-  Check('T11 type FLOAT', sqlite3_value_type(@m) = SQLITE_FLOAT);
-  Check('T11 double≈3.14', Abs(sqlite3_value_double(@m) - 3.14) < 1e-10);
+  VdbeCheck('T11 type FLOAT', sqlite3_value_type(@m) = SQLITE_FLOAT);
+  VdbeCheck('T11 double≈3.14', Abs(sqlite3_value_double(@m) - 3.14) < 1e-10);
 
   sqlite3VdbeMemSetNull(@m);
-  Check('T11 type NULL', sqlite3_value_type(@m) = SQLITE_NULL);
+  VdbeCheck('T11 type NULL', sqlite3_value_type(@m) = SQLITE_NULL);
 
   sqlite3VdbeMemRelease(@m);
 end;
@@ -499,12 +435,12 @@ begin
   sqlite3VdbeMemSetInt64(@orig, 42);
 
   pDup := sqlite3_value_dup(@orig);
-  Check('T12 dup<>nil',   pDup <> nil);
+  VdbeCheck('T12 dup<>nil',   pDup <> nil);
   if pDup <> nil then begin
-    Check('T12 dup type=INT', sqlite3_value_type(pDup) = SQLITE_INTEGER);
-    Check('T12 dup val=42',   sqlite3_value_int(pDup) = 42);
+    VdbeCheck('T12 dup type=INT', sqlite3_value_type(pDup) = SQLITE_INTEGER);
+    VdbeCheck('T12 dup val=42',   sqlite3_value_int(pDup) = 42);
     sqlite3_value_free(pDup);
-    Check('T12 freed',        True);
+    VdbeCheck('T12 freed',        True);
   end;
   sqlite3VdbeMemRelease(@orig);
 end;
@@ -513,18 +449,18 @@ end;
 
 procedure TestFinalize;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T13: sqlite3_finalize returns SQLITE_OK');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   v := BuildOneRowVdbe(@md.db);
-  if v = nil then begin Check('T13 vdbe', False); Exit; end;
+  if v = nil then begin VdbeCheck('T13 vdbe', False); Exit; end;
 
   sqlite3_step(v);
   rc := sqlite3_finalize(v);
-  Check('T13 finalize=OK', rc = SQLITE_OK);
+  VdbeCheck('T13 finalize=OK', rc = SQLITE_OK);
 end;
 
 { ===== main ================================================================= }
@@ -550,6 +486,6 @@ begin
   TestValueDup;      WriteLn;
   TestFinalize;      WriteLn;
 
-  WriteLn(Format('Results: %d passed, %d failed', [gPass, gFail]));
-  if gFail > 0 then Halt(1);
+  WriteLn(Format('Results: %d passed, %d failed', [gVdbePass, gVdbeFail]));
+  if gVdbeFail > 0 then Halt(1);
 end.

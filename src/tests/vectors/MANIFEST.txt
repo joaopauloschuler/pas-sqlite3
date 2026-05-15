@@ -1,0 +1,141 @@
+Reference vector inventory (tasklist 9.2.1).
+=============================================
+
+Each vector is a `.db` blob produced from a sibling `.sql` script by
+the C reference shell (`../sqlite3/sqlite3`).  Re-running
+`./regen.sh` (tasklist 9.2.5) must reproduce every committed `.db`
+byte-identically.  All blobs were generated against:
+
+    SQLite 3.53.0 2026-04-09 (../sqlite3/sqlite3)
+
+Status legend: [X] complete  [~] partial / known-limited  [SKIP] script
+only, no .db committed (extension not yet ported).  `pas-skip` (column
+3) marks vectors the Pascal port currently fails on under the 9.2.x
+parity probes — see `DIVERGENCES.md` for the bucket and citation.
+The 9.2.x gates skip pas-skip vectors so the binary still rc=0.
+
+Phase-6/7/8 column links each vector to the Phase tasklist bullet that
+will (or already does) consume it.  Vectors without a direct gate are
+marked "general".
+
+vector                  status  phase-gate                summary
+----------------------  ------  ------------------------  ----------------------------------------
+simple.db               [~]     general (Phase 3 pager)   2-row rowid table; 3 separate write txns.
+                                                          Committed blob predates the current C
+                                                          oracle (3.53.0): byte 96..99 carry an
+                                                          older sqlite_version_number stamp.
+                                                          regen.sh checks this vector by .dump
+                                                          equivalence, not byte-identity (see
+                                                          EQUIV_LIST in regen.sh).  Per the Phase
+                                                          9.2.1 hard rule the blob is left
+                                                          untouched.
+multipage.db            [~]     general (Phase 3 pager)   199-row rowid table.  Same vintage
+                                                          caveat as simple.db; the per-page cell
+                                                          packing also drifted between SQLite
+                                                          3.45.x and 3.53.x, so byte-identity is
+                                                          impossible and regen.sh falls back to
+                                                          .dump equivalence.
+wal.db                  [~]     general / 9.2.x (WAL)     journal_mode=WAL; passive-checkpointed.
+                                                          Limit: .db-wal sidecar embeds a random
+                                                          salt so it cannot be made deterministic
+                                                          via the shell — only the .db is committed.
+                                                          See wal.sql header for the full note.
+autovacuum.db           [X]     6.27 / 9.2.4              auto_vacuum=FULL with a freelist-creating delete.
+incrvacuum.db           [X]     6.27 / 9.2.4              auto_vacuum=INCREMENTAL + PRAGMA incremental_vacuum.
+fts5.db                 [SKIP]  Phase 8 / out-of-scope    FTS5 ext not ported; .sql kept for future regen.
+rtree.db                [SKIP]  Phase 8 / out-of-scope    R*Tree ext not ported; .sql kept for future regen.
+utf16.db                [X]     general / 9.2.2           PRAGMA encoding='UTF-16le' incl. non-BMP code points.
+withoutrowid.db         [X]     6.x / 9.2.2               Composite-PK WITHOUT ROWID table.
+generated-column.db     [X]     6.x / 9.2.2               VIRTUAL + STORED generated columns.
+triggers.db             [X]     6.x / 9.2.4               BEFORE/AFTER row triggers + INSTEAD OF on view.
+view-cte.db             [X]     6.x / 9.2.2               Plain VIEW + WITH RECURSIVE materialised into a table.
+partial-index.db        [X]     6.x / 9.2.4               Partial index `WHERE status='active'`.
+
+Notes for future agents
+-----------------------
+
+* Do NOT regenerate `simple.db` / `multipage.db` casually — they pin
+  Phase 3 pager-test expectations.  If the C oracle ever changes the
+  on-disk layout for these schemas, bump the test fixtures together.
+
+* `wal.db` carries WAL mode in its header (bytes 18..19 = 02 02) but
+  has no live frames; the C shell's clean shutdown final-checkpoints
+  and removes the .db-wal sidecar.  A truly mid-checkpoint vector
+  would require crashing the writer between PASSIVE checkpoint and
+  exit, which is not portable across kernels — flagged here so the
+  Phase 9 read-only probe can still exercise the WAL header path
+  without depending on the sidecar.
+
+* `fts5.db` and `rtree.db` are intentionally absent.  The Phase 8
+  tasklist marks the matching extensions as out-of-scope until the
+  upstream `ext/fts5/` and `ext/rtree/` trees are ported.  When those
+  ports land, drop the [SKIP] tag here, run `./regen.sh`, and commit
+  the new blobs alongside.
+
+* All scripts must remain executable by `sqlite3 file.db < file.sql`
+  with no extra flags.  Shell-only directives (`.filectrl`, `.read`)
+  are allowed because the script flows through the shell, not raw
+  libsqlite.
+
+9.2.x pas-skip overrides
+------------------------
+
+Vectors listed below are tagged `pas-skip` for the 9.2.x parity probes
+(read-only / round-trip / schema-change).  The probes (e.g.
+`bin/TestVectorReadOnly`) skip these so the binary still exits rc=0;
+each line cites the divergence bucket in `DIVERGENCES.md`.
+
+Bucket A (read-only schema-init) was fixed in 9.2.divbug.A: btreeBeginTrans
+no longer short-circuits SQLITE_READONLY when wrflag=0 (faithful port of
+btree.c:3622).  See DIVERGENCES.md.  Removing the bucket-A umbrella
+surfaced four read-only divergences the umbrella was previously hiding;
+they are tracked as bucket-F / bucket-G / bucket-H below.
+
+  # autovacuum.db: bucket-B lifted by 9.2.divbug.B (btreeCreateTable +
+  #   allocateBtreePage autovacuum arms ported; bare VACUUM no longer
+  #   EAccessViolations and round-trips byte-identical).  bucket-L lifted
+  #   by 9.2.divbug.L (auto-vacuum-at-COMMIT round-trip now byte-identical).
+  #   bucket-F lifted by 9.2.divbug.F.  Fully gated.
+  # incrvacuum.db: bucket-L lifted by 9.2.divbug.L (incremental_vacuum
+  #   pragma now emits OP_IncrVacuum; round-trip mutator byte-identical
+  #   incl. stdout).  bucket-F lifted by 9.2.divbug.F.  Fully gated.
+  # view-cte.db: bucket-B lifted by 9.2.divbug.B (script-trailing VACUUM
+  #   no longer EAccessViolations); bucket-C cleared in 9.2.divbug.C.
+  #   Fully gated.
+  # utf16.db: bucket-M lifted by 9.2.divbug.M (vdbeapi setResultStrOrError)
+  #           bucket-N lifted by 9.2.divbug.N (round-trip mutator now
+  #           byte-identical against the in-tree libsqlite3.so oracle that
+  #           the regression links via LD_LIBRARY_PATH; the prior
+  #           freeblock-ghost symptom was an audit artefact from running
+  #           against the system /lib/x86_64-linux-gnu/libsqlite3.so.0
+  #           which is compiled with SQLITE_SECURE_DELETE — see btree.c:1992
+  #           freeSpace memset gated on BTS_FAST_SECURE.  Upstream
+  #           ./configure && make (the in-tree oracle) leaves SECURE_DELETE
+  #           off, matching the Pas port's default.
+  # withoutrowid.db: bucket-B lifted by 9.2.divbug.B (trailing VACUUM in
+  #   the 9.2.4 schema-change script no longer EAccessViolations and
+  #   round-trips byte-identical); bucket-D lifted by 9.2.divbug.D;
+  #   bucket-H lifted by 9.2.divbug.H.  Fully gated.
+  # bucket-I (round-trip cell-layout drift) lifted by 9.2.divbug.I:
+  #   (1) IPK column refs inside generated-column expressions read from the
+  #       row-storage slot (SoftNull) instead of the rowid register, so
+  #       STORED columns persisted NULL.  Fixed in codegen.pas:5689 by
+  #       treating iColumn == pTab^.iPKey as the rowid alias under
+  #       iSelfTab<0 (matches lookupName's IPK→-1 remap in resolve.c).
+  #   (2) printf('%.*c',n,'X') ignored precision and emitted 1 character;
+  #       fixed in printf.pas + printfFunc in codegen.pas:50334 to mirror
+  #       printf.c:769..790 (precision >1 acts as a repeat count).  WAL /
+  #       multipage / triggers vectors stored 1-byte rows where the C
+  #       oracle stored 1000-byte rows, blowing up the cell-content area.
+  # All four round-trip vectors now byte-identical against upstream
+  # ../sqlite3/sqlite3 (same lib the probe links against).
+  # partial-index.db: bucket-B lifted by 9.2.divbug.B (script-trailing
+  #   VACUUM no longer EAccessViolations); bucket-E lifted by
+  #   9.2.divbug.E.  Fully gated.
+
+Reproducibility gate
+--------------------
+
+`./regen.sh` (tasklist 9.2.5) iterates every `*.sql` here, regenerates
+the `.db` into a tempdir, and `cmp`s against the committed blob.  Any
+mismatch (other than for [SKIP] entries) is a hard failure.

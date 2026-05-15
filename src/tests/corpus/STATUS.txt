@@ -1,0 +1,103 @@
+# corpus/STATUS.txt — task 9.1.5 (Phase 9 corpus status tagging)
+#
+# Per-source status tags for the MANIFEST entries iterated by
+# bin/TestSQLCorpus.  This file is the CI gate's source of truth:
+# `bin/TestSQLCorpus` reads it at startup and resolves each entry to
+# one of three statuses.
+#
+# Format (one row per source, leading `#` comments ignored):
+#
+#   path<TAB>status<TAB>cite<TAB>note
+#
+# `path`   relative to repo root, must match an entry in MANIFEST.txt.
+# `status` one of:
+#   pas-strict  byte-identical across stdout, stderr, rc, and (after
+#               ApplyHeaderMask) db-blob.  This is the CI gate — any
+#               divergence in a pas-strict row fails the binary.
+#   pas-soft    output identical (stdout/stderr/rc match) but the
+#               db-blob differs in bytes covered by a documented
+#               MASK.md range.  Tracked but non-blocking.  `cite`
+#               must point at MASK.md (e.g. `MASK.md:offset=24`).
+#   pas-skip    gated on an open Phase 6/7/8 bullet that the corpus
+#               cannot legitimately exercise yet.  `cite` must name
+#               the open tasklist bullet (e.g. `tasklist:6.26`).
+#
+# `cite`   citation token; must be non-empty for pas-soft / pas-skip
+#          and must be `-` for pas-strict.
+# `note`   one short clause (free text).
+#
+# Status snapshot — generated 2026-05-12 against current corpus run.
+# All 35 currently extracted sources pass byte-identical (mask
+# applied), so every row below is `pas-strict`.  The 16 sources
+# that ExtractSQLLiterals returns 0 rows for are listed as
+# `pas-skip` with a cite of `9.1.3.followup` (extractor coverage
+# gap — they don't use Add(...)/Probe(...) helpers).  When the
+# extractor is widened to cover Diag*Run / inline ExecCheck
+# patterns those entries will flip back to pas-strict.
+#
+# When extending: do NOT silently downgrade a pas-strict to pas-soft
+# without first proving the divergence is mask-covered (re-run
+# bin/TestSQLCorpus and verify the only diff is in the masked byte
+# ranges of MASK.md).  Do NOT downgrade to pas-skip without an
+# open tasklist bullet.
+
+# ─────────────────────────────────────────────────────────────────
+# Tier 1 — parity spines
+# ─────────────────────────────────────────────────────────────────
+src/tests/TestExplainParity.pas	pas-strict	-	1024 scripts, all byte-identical post-mask.
+src/tests/TestWhereCorpus.pas	pas-strict	-	92 scripts, all byte-identical post-mask.
+src/tests/TestBytecodeParity.pas	pas-strict	-	32 scripts, all byte-identical post-mask.
+src/tests/TestParser.pas	pas-strict	-	40 scripts, all byte-identical post-mask.
+src/tests/TestParserSmoke.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/TestTokenizer.pas	pas-strict	-	25 scripts, all byte-identical post-mask.
+
+# ─────────────────────────────────────────────────────────────────
+# Tier 2 — feature-corner Diag* files
+# ─────────────────────────────────────────────────────────────────
+src/tests/DiagArith.pas	pas-strict	-	131 scripts, all byte-identical post-mask.
+src/tests/DiagFeatureProbe.pas	pas-strict	-	34 scripts, all byte-identical post-mask.
+src/tests/DiagPredicates.pas	pas-strict	-	87 scripts, all byte-identical post-mask.
+src/tests/DiagScalarFunc.pas	pas-strict	-	85 scripts, all byte-identical post-mask.
+src/tests/DiagOps.pas	pas-strict	-	64 scripts, all byte-identical post-mask.
+src/tests/DiagMoreFunc.pas	pas-strict	-	73 scripts, all byte-identical post-mask.
+src/tests/DiagIndexing.pas	pas-strict	-	42 scripts, all byte-identical post-mask.
+src/tests/DiagFunctions.pas	pas-strict	-	72 scripts, all byte-identical post-mask.
+src/tests/DiagPragma.pas	pas-strict	-	62 scripts, all byte-identical post-mask.
+src/tests/DiagMisc.pas	pas-strict	-	18 scripts, all byte-identical post-mask.
+src/tests/DiagLikeGlob.pas	pas-strict	-	55 scripts, all byte-identical post-mask.
+src/tests/DiagDate.pas	pas-strict	-	55 scripts, all byte-identical post-mask.
+src/tests/DiagCast.pas	pas-strict	-	55 scripts, all byte-identical post-mask.
+src/tests/DiagWindow.pas	pas-strict	-	43 scripts, all byte-identical post-mask.
+src/tests/DiagTxn.pas	pas-strict	-	40 scripts, all byte-identical post-mask.
+src/tests/DiagPrintfFmt.pas	pas-strict	-	38 scripts, all byte-identical post-mask.
+src/tests/DiagDml.pas	pas-strict	-	14 scripts, all byte-identical post-mask.
+src/tests/DiagDropTable.pas	pas-strict	-	6 scripts, all byte-identical post-mask.
+src/tests/DiagSumOverflow.pas	pas-strict	-	12 scripts, all byte-identical post-mask.
+src/tests/DiagSampleProg.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagRecover.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagInsertSelectGroupBy.pas	pas-strict	-	8 scripts, all byte-identical post-mask.
+src/tests/DiagPubApi.pas	pas-strict	-	1 script, byte-identical post-mask.
+src/tests/DiagAnalyze.pas	pas-strict	-	3 scripts, all byte-identical post-mask.
+src/tests/DiagTempTbl.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagOrderLimitTopN.pas	pas-strict	-	11 scripts, all byte-identical post-mask.
+src/tests/DiagJoinTrace.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagDbdump.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagFloatRender.pas	pas-strict	-	11 scripts, all byte-identical post-mask.
+src/tests/DiagBloom.pas	pas-strict	-	9 scripts, all byte-identical post-mask.
+src/tests/DiagTrig.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used; bug 6.23 trigger fire path tracked separately).
+src/tests/DiagInRecursive.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagGroupOrder.pas	pas-strict	-	3 scripts, all byte-identical post-mask.
+src/tests/DiagErrMsg.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagCovering.pas	pas-strict	-	4 scripts, all byte-identical post-mask.
+src/tests/DiagInnerJoin.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagCreateIdx.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagVacuum.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagConcat.pas	pas-strict	-	6 scripts, all byte-identical post-mask.
+src/tests/DiagMultiValues.pas	pas-strict	-	1 script, byte-identical post-mask.
+src/tests/DiagColName.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagAutoIdx.pas	pas-strict	-	3 scripts, all byte-identical post-mask.
+src/tests/DiagAggWhere.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagSubsel.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+src/tests/DiagMaxGroupBy.pas	pas-skip	9.1.3.followup	extractor yields 0 rows (no Add/Probe helper used).
+
+# end of STATUS.txt

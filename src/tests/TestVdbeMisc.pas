@@ -49,94 +49,27 @@ uses
   passqlite3pager,
   passqlite3wal,
   passqlite3btree,
-  passqlite3vdbe;
-
-{ ===== helpers ============================================================== }
-
-var
-  gPass: i32 = 0;
-  gFail: i32 = 0;
-
-procedure Check(name: string; cond: Boolean);
-begin
-  if cond then begin
-    WriteLn('  PASS ', name);
-    Inc(gPass);
-  end else begin
-    WriteLn('  FAIL ', name);
-    Inc(gFail);
-  end;
-end;
-
-{ ===== Infrastructure ======================================================= }
-
-const
-  PARSE_SZ = 256;
-
-type
-  TMinDb = record
-    db:        Tsqlite3;
-    parseArea: array[0..PARSE_SZ-1] of Byte;
-  end;
-
-procedure InitMinDb(var md: TMinDb);
-begin
-  FillChar(md, SizeOf(md), 0);
-  md.db.enc        := SQLITE_UTF8;
-  md.db.nDb        := 0;
-  md.db.aLimit[5]  := 250000000;
-  md.db.aLimit[0]  := 1000000000;
-end;
-
-function CreateMinVdbe(pDb: PTsqlite3; nMem: i32): PVdbe;
-var
-  pParse: Pointer;
-  v:      PVdbe;
-  sz:     u64;
-begin
-  pParse := sqlite3DbMallocZero(pDb, PARSE_SZ);
-  if pParse = nil then begin Result := nil; Exit; end;
-  PPointer(pParse)^ := pDb;
-  Pi32(PByte(pParse) + 156)^ := 250000000;
-
-  v := sqlite3VdbeCreate(pParse);
-  sqlite3DbFree(pDb, pParse);
-  if v = nil then begin Result := nil; Exit; end;
-
-  v^.nOp := 0;
-
-  sz := u64(nMem) * SizeOf(TMem);
-  v^.aMem  := PMem(sqlite3DbMallocZero(pDb, sz));
-  v^.nMem  := nMem;
-  v^.apCsr   := nil;
-  v^.nCursor := 0;
-
-  v^.eVdbeState         := VDBE_RUN_STATE;
-  v^.minWriteFileFormat := 4;
-  v^.pc                 := 0;
-  v^.cacheCtr           := 1;
-
-  Result := v;
-end;
+  passqlite3vdbe,
+  TestVdbeCommon;
 
 { ===== T1: OP_Real ========================================================= }
 
 procedure TestReal;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
   rValPtr: PDouble;
 begin
   WriteLn('T1: OP_Real → r[1] = 3.14');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { P4_REAL pointer is freed by VdbeDelete — must be heap-allocated }
   rValPtr := PDouble(sqlite3DbMallocZero(@md.db, SizeOf(Double)));
-  if rValPtr = nil then begin Check('T1 alloc', False); Exit; end;
+  if rValPtr = nil then begin VdbeCheck('T1 alloc', False); Exit; end;
   rValPtr^ := 3.14;
 
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T1 vdbe', False); sqlite3DbFree(@md.db, rValPtr); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 3);
+  if v = nil then begin VdbeCheck('T1 vdbe', False); sqlite3DbFree(@md.db, rValPtr); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp4(v, OP_Real, 0, 1, 0, PAnsiChar(rValPtr), P4_REAL);
@@ -145,9 +78,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T1 rc', rc = SQLITE_DONE);
-  Check('T1 MEM_Real', (v^.aMem[1].flags and MEM_Real) <> 0);
-  Check('T1 r=3.14', Abs(v^.aMem[1].u.r - 3.14) < 1e-10);
+  VdbeCheck('T1 rc', rc = SQLITE_DONE);
+  VdbeCheck('T1 MEM_Real', (v^.aMem[1].flags and MEM_Real) <> 0);
+  VdbeCheck('T1 r=3.14', Abs(v^.aMem[1].u.r - 3.14) < 1e-10);
 
   sqlite3VdbeDelete(v);
 end;
@@ -156,16 +89,16 @@ end;
 
 procedure TestNot;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T2: OP_Not: !1=0, !0=1, !NULL=NULL');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=1(true), r[2]=0(false), r[3]=NULL
     r[4]=!r[1], r[5]=!r[2], r[6]=!r[3] }
-  v := CreateMinVdbe(@md.db, 8);
-  if v = nil then begin Check('T2 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 8);
+  if v = nil then begin VdbeCheck('T2 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 1, 1);
@@ -178,10 +111,10 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T2 rc', rc = SQLITE_DONE);
-  Check('T2 !1=0', v^.aMem[4].u.i = 0);
-  Check('T2 !0=1', v^.aMem[5].u.i = 1);
-  Check('T2 !NULL=NULL', (v^.aMem[6].flags and MEM_Null) <> 0);
+  VdbeCheck('T2 rc', rc = SQLITE_DONE);
+  VdbeCheck('T2 !1=0', v^.aMem[4].u.i = 0);
+  VdbeCheck('T2 !0=1', v^.aMem[5].u.i = 1);
+  VdbeCheck('T2 !NULL=NULL', (v^.aMem[6].flags and MEM_Null) <> 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -190,14 +123,14 @@ end;
 
 procedure TestBitNot;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T3: OP_BitNot: ~5=-6, ~NULL=NULL');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 5);
-  if v = nil then begin Check('T3 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinRun(@md.db, 5);
+  if v = nil then begin VdbeCheck('T3 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 5, 1);
@@ -208,9 +141,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T3 rc', rc = SQLITE_DONE);
-  Check('T3 ~5=-6', v^.aMem[3].u.i = -6);
-  Check('T3 ~NULL', (v^.aMem[4].flags and MEM_Null) <> 0);
+  VdbeCheck('T3 rc', rc = SQLITE_DONE);
+  VdbeCheck('T3 ~5=-6', v^.aMem[3].u.i = -6);
+  VdbeCheck('T3 ~NULL', (v^.aMem[4].flags and MEM_Null) <> 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -219,16 +152,16 @@ end;
 
 procedure TestAndOr;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T4: OP_And/Or: F∧T=0, T∨N=1, N∧F=0');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=F(0), r[2]=T(1), r[3]=NULL
     r[4]=r[1] AND r[2]=0, r[5]=r[2] OR r[3]=1, r[6]=r[3] AND r[1]=0 }
-  v := CreateMinVdbe(@md.db, 8);
-  if v = nil then begin Check('T4 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 8);
+  if v = nil then begin VdbeCheck('T4 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 0, 1);
@@ -241,11 +174,11 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T4 rc', rc = SQLITE_DONE);
-  Check('T4 F∧T=0', (v^.aMem[4].flags and MEM_Int) <> 0);
-  Check('T4 F∧T=0 val', v^.aMem[4].u.i = 0);
-  Check('T4 T∨N=1', v^.aMem[5].u.i = 1);
-  Check('T4 N∧F=0', v^.aMem[6].u.i = 0);
+  VdbeCheck('T4 rc', rc = SQLITE_DONE);
+  VdbeCheck('T4 F∧T=0', (v^.aMem[4].flags and MEM_Int) <> 0);
+  VdbeCheck('T4 F∧T=0 val', v^.aMem[4].u.i = 0);
+  VdbeCheck('T4 T∨N=1', v^.aMem[5].u.i = 1);
+  VdbeCheck('T4 N∧F=0', v^.aMem[6].u.i = 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -254,17 +187,17 @@ end;
 
 procedure TestNullJumps;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T5: OP_IsNull / OP_NotNull conditional jumps');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=NULL, r[2]=42, r[3]=0(marker)
     OP_IsNull r[1] → jump to set r[3]=1
     OP_NotNull r[2] → jump to set r[3]=r[3]+1 }
-  v := CreateMinVdbe(@md.db, 5);
-  if v = nil then begin Check('T5 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 5);
+  if v = nil then begin VdbeCheck('T5 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);            { 0: jump to addr 1 }
   sqlite3VdbeAddOp2(v, OP_Null, 0, 1);            { 1: r[1]=NULL }
@@ -280,8 +213,8 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T5 rc', rc = SQLITE_DONE);
-  Check('T5 r[3]=11', v^.aMem[3].u.i = 11);
+  VdbeCheck('T5 rc', rc = SQLITE_DONE);
+  VdbeCheck('T5 r[3]=11', v^.aMem[3].u.i = 11);
 
   sqlite3VdbeDelete(v);
 end;
@@ -290,14 +223,14 @@ end;
 
 procedure TestCast;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T6: OP_Cast integer 42 → TEXT "42"');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T6 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinRun(@md.db, 3);
+  if v = nil then begin VdbeCheck('T6 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 42, 1);
@@ -307,9 +240,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T6 rc', rc = SQLITE_DONE);
-  Check('T6 MEM_Str', (v^.aMem[1].flags and MEM_Str) <> 0);
-  Check('T6 "42"', StrLComp(v^.aMem[1].z, '42', 2) = 0);
+  VdbeCheck('T6 rc', rc = SQLITE_DONE);
+  VdbeCheck('T6 MEM_Str', (v^.aMem[1].flags and MEM_Str) <> 0);
+  VdbeCheck('T6 "42"', StrLComp(v^.aMem[1].z, '42', 2) = 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -318,16 +251,16 @@ end;
 
 procedure TestAffinity;
 var
-  md:    TMinDb;
+  md:    TVdbeMinDb;
   v:     PVdbe;
   rc:    i32;
   zAff:  PAnsiChar;
 begin
   WriteLn('T7: OP_Affinity: NUMERIC on "42" → integer 42');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   zAff := PAnsiChar('C');  { SQLITE_AFF_NUMERIC = ord('C') }
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T7 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 3);
+  if v = nil then begin VdbeCheck('T7 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp4(v, OP_String, 2, 1, 0, PAnsiChar('42'), P4_STATIC);
@@ -337,9 +270,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T7 rc', rc = SQLITE_DONE);
-  Check('T7 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
-  Check('T7 val=42', v^.aMem[1].u.i = 42);
+  VdbeCheck('T7 rc', rc = SQLITE_DONE);
+  VdbeCheck('T7 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
+  VdbeCheck('T7 val=42', v^.aMem[1].u.i = 42);
 
   sqlite3VdbeDelete(v);
 end;
@@ -348,18 +281,18 @@ end;
 
 procedure TestIsTrue;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T8: OP_IsTrue: IS TRUE, IS NOT TRUE');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=1(true), r[2]=0(false), r[3]=NULL
     r[4]=r[1] IS TRUE = 1
     r[5]=r[2] IS NOT TRUE = 1 (NOT TRUE → P3=0, P4=1)
     r[6]=r[3] IS TRUE = 0 (NULL→P3=0 XOR P4=0) }
-  v := CreateMinVdbe(@md.db, 8);
-  if v = nil then begin Check('T8 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 8);
+  if v = nil then begin VdbeCheck('T8 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 1, 1);
@@ -376,10 +309,10 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T8 rc', rc = SQLITE_DONE);
-  Check('T8 TRUE IS TRUE=1',     v^.aMem[4].u.i = 1);
-  Check('T8 FALSE IS NOT TRUE=1',v^.aMem[5].u.i = 1);
-  Check('T8 NULL IS TRUE=0',     v^.aMem[6].u.i = 0);
+  VdbeCheck('T8 rc', rc = SQLITE_DONE);
+  VdbeCheck('T8 TRUE IS TRUE=1',     v^.aMem[4].u.i = 1);
+  VdbeCheck('T8 FALSE IS NOT TRUE=1',v^.aMem[5].u.i = 1);
+  VdbeCheck('T8 NULL IS TRUE=0',     v^.aMem[6].u.i = 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -388,17 +321,17 @@ end;
 
 procedure TestZeroOrNull;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T9: OP_ZeroOrNull: both non-NULL→0; one NULL→NULL');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=5, r[2]=NULL, r[3]=7
     r[4] = ZeroOrNull(r[1], r[3]) = 0  (both non-NULL)
     r[5] = ZeroOrNull(r[1], r[2]) = NULL  (r[2]=NULL) }
-  v := CreateMinVdbe(@md.db, 7);
-  if v = nil then begin Check('T9 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 7);
+  if v = nil then begin VdbeCheck('T9 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 5, 1);
@@ -411,9 +344,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T9 rc', rc = SQLITE_DONE);
-  Check('T9 nonNULL=0', v^.aMem[4].u.i = 0);
-  Check('T9 oneNULL=NULL', (v^.aMem[5].flags and MEM_Null) <> 0);
+  VdbeCheck('T9 rc', rc = SQLITE_DONE);
+  VdbeCheck('T9 nonNULL=0', v^.aMem[4].u.i = 0);
+  VdbeCheck('T9 oneNULL=NULL', (v^.aMem[5].flags and MEM_Null) <> 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -422,15 +355,15 @@ end;
 
 procedure TestHaltIfNull;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T10: OP_HaltIfNull: non-NULL falls through; NULL halts');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=42: HaltIfNull should NOT halt; r[2] gets set to 99 }
-  v := CreateMinVdbe(@md.db, 4);
-  if v = nil then begin Check('T10a vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 4);
+  if v = nil then begin VdbeCheck('T10a vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 42, 1);
@@ -440,15 +373,15 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T10a rc', rc = SQLITE_DONE);
-  Check('T10a r[2]=99', v^.aMem[2].u.i = 99);
+  VdbeCheck('T10a rc', rc = SQLITE_DONE);
+  VdbeCheck('T10a r[2]=99', v^.aMem[2].u.i = 99);
   sqlite3VdbeDelete(v);
   WriteLn;
 
   { r[1]=NULL: HaltIfNull SHOULD halt; r[2] should NOT get set }
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 4);
-  if v = nil then begin Check('T10b vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinRun(@md.db, 4);
+  if v = nil then begin VdbeCheck('T10b vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Null, 0, 1);
@@ -458,8 +391,8 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T10b rc=DONE', rc = SQLITE_DONE);
-  Check('T10b r[2]=0', v^.aMem[2].u.i = 0);  { not set → stays 0 }
+  VdbeCheck('T10b rc=DONE', rc = SQLITE_DONE);
+  VdbeCheck('T10b r[2]=0', v^.aMem[2].u.i = 0);  { not set → stays 0 }
   sqlite3VdbeDelete(v);
 end;
 
@@ -467,14 +400,14 @@ end;
 
 procedure TestNoop;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T11: OP_Noop → execution continues');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 3);
-  if v = nil then begin Check('T11 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinRun(@md.db, 3);
+  if v = nil then begin VdbeCheck('T11 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 77, 1);
@@ -484,8 +417,8 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T11 rc', rc = SQLITE_DONE);
-  Check('T11 r[1]=77', v^.aMem[1].u.i = 77);
+  VdbeCheck('T11 rc', rc = SQLITE_DONE);
+  VdbeCheck('T11 r[1]=77', v^.aMem[1].u.i = 77);
 
   sqlite3VdbeDelete(v);
 end;
@@ -494,15 +427,15 @@ end;
 
 procedure TestMustBeInt;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T12: OP_MustBeInt: "7"→7; "x"→jump');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { Part A: "7" coerces to 7 (no jump) }
-  v := CreateMinVdbe(@md.db, 4);
-  if v = nil then begin Check('T12a vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 4);
+  if v = nil then begin VdbeCheck('T12a vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp4(v, OP_String, 1, 1, 0, PAnsiChar('7'), P4_STATIC);
@@ -512,16 +445,16 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T12a rc', rc = SQLITE_DONE);
-  Check('T12a r[1]=7', v^.aMem[1].u.i = 7);
-  Check('T12a no-jump', v^.aMem[2].u.i = 1);
+  VdbeCheck('T12a rc', rc = SQLITE_DONE);
+  VdbeCheck('T12a r[1]=7', v^.aMem[1].u.i = 7);
+  VdbeCheck('T12a no-jump', v^.aMem[2].u.i = 1);
   sqlite3VdbeDelete(v);
   WriteLn;
 
   { Part B: "abc" can't be int → jump to addr 4 }
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 4);
-  if v = nil then begin Check('T12b vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinRun(@md.db, 4);
+  if v = nil then begin VdbeCheck('T12b vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp4(v, OP_String, 3, 1, 0, PAnsiChar('abc'), P4_STATIC);
@@ -533,9 +466,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T12b rc', rc = SQLITE_DONE);
-  Check('T12b jumped', v^.aMem[3].u.i = 42);
-  Check('T12b skipped', v^.aMem[2].u.i = 0);
+  VdbeCheck('T12b rc', rc = SQLITE_DONE);
+  VdbeCheck('T12b jumped', v^.aMem[3].u.i = 42);
+  VdbeCheck('T12b skipped', v^.aMem[2].u.i = 0);
   sqlite3VdbeDelete(v);
 end;
 
@@ -543,18 +476,18 @@ end;
 
 procedure TestSubtype;
 var
-  md:  TMinDb;
+  md:  TVdbeMinDb;
   v:   PVdbe;
   rc:  i32;
 begin
   WriteLn('T13: OP_SetSubtype/GetSubtype/ClrSubtype');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
   { r[1]=any, set subtype=7 via r[2]=7
     r[3]=GetSubtype(r[1]) = 7
     ClrSubtype(r[1])
     r[4]=GetSubtype(r[1]) = NULL }
-  v := CreateMinVdbe(@md.db, 6);
-  if v = nil then begin Check('T13 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 6);
+  if v = nil then begin VdbeCheck('T13 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 42, 1);   { r[1]=42 }
@@ -567,9 +500,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T13 rc', rc = SQLITE_DONE);
-  Check('T13 subtype=7', v^.aMem[3].u.i = 7);
-  Check('T13 cleared=NULL', (v^.aMem[4].flags and MEM_Null) <> 0);
+  VdbeCheck('T13 rc', rc = SQLITE_DONE);
+  VdbeCheck('T13 subtype=7', v^.aMem[3].u.i = 7);
+  VdbeCheck('T13 cleared=NULL', (v^.aMem[4].flags and MEM_Null) <> 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -599,6 +532,6 @@ begin
   WriteLn;
   TestSubtype;     WriteLn;
 
-  WriteLn(Format('Results: %d passed, %d failed', [gPass, gFail]));
-  if gFail > 0 then Halt(1);
+  WriteLn(Format('Results: %d passed, %d failed', [gVdbePass, gVdbeFail]));
+  if gVdbeFail > 0 then Halt(1);
 end.

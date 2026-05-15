@@ -37,59 +37,12 @@ program TestShellArchive;
 
 uses
   SysUtils, BaseUnix, Unix,
-  passqlite3types, passqlite3util;
+  passqlite3types, passqlite3util,
+  TestShellCommon;
 
 var
   failCount: i32 = 0;
   passCount: i32 = 0;
-
-function readAll(const path: AnsiString): AnsiString;
-var
-  f: file of Byte;
-  n: SizeInt;
-  buf: array[0..4095] of Byte;
-  i: SizeInt;
-begin
-  Result := '';
-  AssignFile(f, path); {$I-} Reset(f); {$I+}
-  if IOResult <> 0 then Exit;
-  while not Eof(f) do begin
-    BlockRead(f, buf[0], SizeOf(buf), n);
-    if n <= 0 then Break;
-    i := Length(Result);
-    SetLength(Result, i + n);
-    Move(buf[0], Result[i + 1], n);
-  end;
-  CloseFile(f);
-end;
-
-procedure writeFileBytes(const path, body: AnsiString);
-var
-  f: file of Byte;
-begin
-  AssignFile(f, path); Rewrite(f);
-  if Length(body) > 0 then
-    BlockWrite(f, body[1], Length(body));
-  CloseFile(f);
-end;
-
-function findUpstreamSqlite3: AnsiString;
-var
-  z: AnsiString;
-  candidates: array[0..3] of AnsiString;
-  i: SizeInt;
-begin
-  z := GetEnvironmentVariable('UPSTREAM_SQLITE3');
-  if (z <> '') and FileExists(z) then begin Result := z; Exit; end;
-  candidates[0] := '/home/bpsa/app/sqlite3/sqlite3';
-  candidates[1] := ExtractFilePath(ExpandFileName(ParamStr(0))) +
-                   '../../sqlite3/sqlite3';
-  candidates[2] := '/usr/local/bin/sqlite3';
-  candidates[3] := '/usr/bin/sqlite3';
-  for i := 0 to High(candidates) do
-    if FileExists(candidates[i]) then begin Result := candidates[i]; Exit; end;
-  Result := '';
-end;
 
 var
   upstream: AnsiString;
@@ -128,9 +81,9 @@ end;
 procedure SeedFixture(const root: AnsiString);
 begin
   ForceDirectories(root + '/src/dir1');
-  writeFileBytes(root + '/src/a.txt',      'alpha'#10);
-  writeFileBytes(root + '/src/dir1/b.txt', 'beta'#10);
-  writeFileBytes(root + '/c.txt',          'gamma'#10);
+  ShellWriteFileBytes(root + '/src/a.txt',      'alpha'#10);
+  ShellWriteFileBytes(root + '/src/dir1/b.txt', 'beta'#10);
+  ShellWriteFileBytes(root + '/c.txt',          'gamma'#10);
   { Pin mtimes so .ar -tvf rendering is deterministic. }
   fpsystem('touch -d "2024-01-02 03:04:05" "' + root + '/src/a.txt" "' +
            root + '/src/dir1/b.txt" "' + root + '/c.txt" "' +
@@ -153,8 +106,8 @@ begin
   expOut := workDirExp + '/' + name + '.out';
   actOut := workDirAct + '/' + name + '.out';
 
-  writeFileBytes(sqlExp, script);
-  writeFileBytes(sqlAct, script);
+  ShellWriteFileBytes(sqlExp, script);
+  ShellWriteFileBytes(sqlAct, script);
 
   cmd := 'cd "' + workDirExp + '" && "' + upstream + '" ' + argTail +
          ' <"' + sqlExp + '" >"' + expOut + '" 2>&1';
@@ -165,8 +118,8 @@ begin
          ' <"' + sqlAct + '" >"' + actOut + '" 2>&1';
   rcAct := fpsystem(cmd);
 
-  eOut := readAll(expOut);
-  aOut := readAll(actOut);
+  eOut := ShellReadAll(expOut);
+  aOut := ShellReadAll(actOut);
 
   ok := (rcExp = rcAct) and (eOut = aOut);
   if ok then begin
@@ -200,8 +153,8 @@ begin
          binPath + '" ' + argTail +
          ' >"' + actOut + '" 2>&1';
   rcAct := fpsystem(cmd);
-  eOut := readAll(expOut);
-  aOut := readAll(actOut);
+  eOut := ShellReadAll(expOut);
+  aOut := ShellReadAll(actOut);
   ok := (rcExp = rcAct) and (eOut = aOut);
   if ok then begin
     WriteLn('PASS    ', name, ' (rc=', rcAct,
@@ -255,13 +208,13 @@ begin
   DiffArgv('archive-extract', ':memory: ".ar -xvf foo.sqlar"');
 
   { Verify extracted bytes match across binaries. }
-  if (readAll(workDirExp + '/src/a.txt') =
-      readAll(workDirAct + '/src/a.txt')) and
-     (readAll(workDirExp + '/src/dir1/b.txt') =
-      readAll(workDirAct + '/src/dir1/b.txt')) and
-     (readAll(workDirExp + '/c.txt') =
-      readAll(workDirAct + '/c.txt')) and
-     (readAll(workDirAct + '/src/a.txt') = 'alpha'#10) then begin
+  if (ShellReadAll(workDirExp + '/src/a.txt') =
+      ShellReadAll(workDirAct + '/src/a.txt')) and
+     (ShellReadAll(workDirExp + '/src/dir1/b.txt') =
+      ShellReadAll(workDirAct + '/src/dir1/b.txt')) and
+     (ShellReadAll(workDirExp + '/c.txt') =
+      ShellReadAll(workDirAct + '/c.txt')) and
+     (ShellReadAll(workDirAct + '/src/a.txt') = 'alpha'#10) then begin
     WriteLn('PASS    archive-extract-bytes');
     Inc(passCount);
   end else begin
@@ -284,7 +237,7 @@ begin
   cmd := 'LD_LIBRARY_PATH="' + libDir + '" "' + binPath +
          '" :memory: ".session" >"' + outPath + '" 2>&1';
   rc := fpsystem(cmd);
-  body := readAll(outPath);
+  body := ShellReadAll(outPath);
   needle := 'session extension not compiled in';
   if Pos(needle, body) > 0 then begin
     WriteLn('PASS    session-stub (rc=', rc, ' stdout=', Length(body), 'B)');
@@ -306,8 +259,8 @@ begin
     'CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);'#10 +
     'INSERT INTO t VALUES(1,''alpha''),(2,''beta''),(3,''gamma'');'#10 +
     'CREATE INDEX ti ON t(b);'#10;
-  writeFileBytes(workDirExp + '/seed.sql', seedSql);
-  writeFileBytes(workDirAct + '/seed.sql', seedSql);
+  ShellWriteFileBytes(workDirExp + '/seed.sql', seedSql);
+  ShellWriteFileBytes(workDirAct + '/seed.sql', seedSql);
   dbExp := workDirExp + '/recover.db';
   dbAct := workDirAct + '/recover.db';
   fpsystem('"' + upstream + '" "' + dbExp + '" <"' + workDirExp +
@@ -327,7 +280,7 @@ begin
 end;
 
 begin
-  upstream := findUpstreamSqlite3;
+  upstream := FindUpstreamSqlite3;
   InitPaths;
   if upstream = '' then begin
     WriteLn('SKIP    archive/recover: no upstream sqlite3 binary found');

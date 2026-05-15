@@ -43,24 +43,8 @@ uses
   passqlite3pager,
   passqlite3wal,
   passqlite3btree,
-  passqlite3vdbe;
-
-{ ===== helpers ============================================================== }
-
-var
-  gPass: i32 = 0;
-  gFail: i32 = 0;
-
-procedure Check(name: string; cond: Boolean);
-begin
-  if cond then begin
-    WriteLn('  PASS ', name);
-    Inc(gPass);
-  end else begin
-    WriteLn('  FAIL ', name);
-    Inc(gFail);
-  end;
-end;
+  passqlite3vdbe,
+  TestVdbeCommon;
 
 { ===== Simple SUM aggregate ================================================= }
 {
@@ -101,57 +85,6 @@ begin
   end;
 end;
 
-{ ===== Infrastructure ======================================================= }
-
-const
-  PARSE_SZ = 256;
-
-type
-  TMinDb = record
-    db:        Tsqlite3;
-    parseArea: array[0..PARSE_SZ-1] of Byte;
-  end;
-
-procedure InitMinDb(var md: TMinDb);
-begin
-  FillChar(md, SizeOf(md), 0);
-  md.db.enc        := SQLITE_UTF8;
-  md.db.nDb        := 0;
-  md.db.aLimit[5]  := 250000000;
-  md.db.aLimit[0]  := 1000000000;
-end;
-
-function CreateMinVdbe(pDb: PTsqlite3; nMem: i32): PVdbe;
-var
-  pParse: Pointer;
-  v:      PVdbe;
-  sz:     u64;
-begin
-  pParse := sqlite3DbMallocZero(pDb, PARSE_SZ);
-  if pParse = nil then begin Result := nil; Exit; end;
-  PPointer(pParse)^ := pDb;
-  Pi32(PByte(pParse) + 156)^ := 250000000;
-
-  v := sqlite3VdbeCreate(pParse);
-  sqlite3DbFree(pDb, pParse);
-  if v = nil then begin Result := nil; Exit; end;
-
-  v^.nOp := 0;
-
-  sz := u64(nMem) * SizeOf(TMem);
-  v^.aMem  := PMem(sqlite3DbMallocZero(pDb, sz));
-  v^.nMem  := nMem;
-  v^.apCsr   := nil;
-  v^.nCursor := 0;
-
-  v^.eVdbeState         := VDBE_RUN_STATE;
-  v^.minWriteFileFormat := 4;
-  v^.pc                 := 0;
-  v^.cacheCtr           := 1;
-
-  Result := v;
-end;
-
 { ===== Build a minimal TFuncDef for SUM ===================================== }
 
 var
@@ -170,20 +103,20 @@ end;
 
 procedure TestSumBasic;
 var
-  md:   TMinDb;
+  md:   TVdbeMinDb;
   v:    PVdbe;
   rc:   i32;
   idx:  i32;
 begin
   WriteLn('T1: OP_AggStep×3 + OP_AggFinal → SUM(1,2,3)=6');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
 
   { Register layout:
     r[1] = accumulator (MEM_Agg slot, p3 for AggStep)
     r[2] = input value (p2 for AggStep, argv[0])
     r[3] = spare }
-  v := CreateMinVdbe(@md.db, 5);
-  if v = nil then begin Check('T1 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 5);
+  if v = nil then begin VdbeCheck('T1 vdbe', False); Exit; end;
 
   {  0: Init 0,1,0
      1: Integer 1,2,0          → r[2]=1
@@ -213,9 +146,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T1 rc', rc = SQLITE_DONE);
-  Check('T1 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
-  Check('T1 sum=6', v^.aMem[1].u.i = 6);
+  VdbeCheck('T1 rc', rc = SQLITE_DONE);
+  VdbeCheck('T1 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
+  VdbeCheck('T1 sum=6', v^.aMem[1].u.i = 6);
 
   sqlite3VdbeDelete(v);
 end;
@@ -224,15 +157,15 @@ end;
 
 procedure TestSumEmpty;
 var
-  md:   TMinDb;
+  md:   TVdbeMinDb;
   v:    PVdbe;
   rc:   i32;
   idx:  i32;
 begin
   WriteLn('T2: OP_AggFinal on fresh accum → 0');
-  InitMinDb(md);
-  v := CreateMinVdbe(@md.db, 4);
-  if v = nil then begin Check('T2 vdbe', False); Exit; end;
+  VdbeInitMinDb(md, nil);
+  v := VdbeCreateMinRun(@md.db, 4);
+  if v = nil then begin VdbeCheck('T2 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   idx := sqlite3VdbeAddOp3(v, OP_AggFinal, 1, 1, 0);
@@ -242,10 +175,10 @@ begin
   v^.aMem[1].flags := MEM_Null;
 
   rc := sqlite3VdbeExec(v);
-  Check('T2 rc', rc = SQLITE_DONE);
+  VdbeCheck('T2 rc', rc = SQLITE_DONE);
   { Finalize on NULL acc: SumFinalFunc returns 0 }
-  Check('T2 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
-  Check('T2 sum=0', v^.aMem[1].u.i = 0);
+  VdbeCheck('T2 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
+  VdbeCheck('T2 sum=0', v^.aMem[1].u.i = 0);
 
   sqlite3VdbeDelete(v);
 end;
@@ -254,17 +187,17 @@ end;
 
 procedure TestSumWithNull;
 var
-  md:   TMinDb;
+  md:   TVdbeMinDb;
   v:    PVdbe;
   rc:   i32;
   idx:  i32;
 begin
   WriteLn('T3: OP_AggStep with NULL + 5 → SUM=5');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
 
   { r[2] starts NULL, then we set r[2]=5 for second step }
-  v := CreateMinVdbe(@md.db, 5);
-  if v = nil then begin Check('T3 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 5);
+  if v = nil then begin VdbeCheck('T3 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);               { 0 }
   { r[2] = NULL → skip in SumStepFunc }
@@ -282,9 +215,9 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T3 rc', rc = SQLITE_DONE);
-  Check('T3 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
-  Check('T3 sum=5', v^.aMem[1].u.i = 5);
+  VdbeCheck('T3 rc', rc = SQLITE_DONE);
+  VdbeCheck('T3 MEM_Int', (v^.aMem[1].flags and MEM_Int) <> 0);
+  VdbeCheck('T3 sum=5', v^.aMem[1].u.i = 5);
 
   sqlite3VdbeDelete(v);
 end;
@@ -293,17 +226,17 @@ end;
 
 procedure TestAggValue;
 var
-  md:   TMinDb;
+  md:   TVdbeMinDb;
   v:    PVdbe;
   rc:   i32;
   idx:  i32;
 begin
   WriteLn('T4: OP_AggValue → intermediate window value in r[3]');
-  InitMinDb(md);
+  VdbeInitMinDb(md, nil);
 
   { r[1]=accum, r[2]=input, r[3]=AggValue output }
-  v := CreateMinVdbe(@md.db, 5);
-  if v = nil then begin Check('T4 vdbe', False); Exit; end;
+  v := VdbeCreateMinRun(@md.db, 5);
+  if v = nil then begin VdbeCheck('T4 vdbe', False); Exit; end;
 
   sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
   sqlite3VdbeAddOp2(v, OP_Integer, 7, 2);
@@ -317,8 +250,8 @@ begin
   v^.eVdbeState := VDBE_RUN_STATE;
 
   rc := sqlite3VdbeExec(v);
-  Check('T4 rc', rc = SQLITE_DONE);
-  Check('T4 sum=7', v^.aMem[1].u.i = 7);
+  VdbeCheck('T4 rc', rc = SQLITE_DONE);
+  VdbeCheck('T4 sum=7', v^.aMem[1].u.i = 7);
 
   sqlite3VdbeDelete(v);
 end;
@@ -338,6 +271,6 @@ begin
   TestSumWithNull; WriteLn;
   TestAggValue;    WriteLn;
 
-  WriteLn(Format('Results: %d passed, %d failed', [gPass, gFail]));
-  if gFail > 0 then Halt(1);
+  WriteLn(Format('Results: %d passed, %d failed', [gVdbePass, gVdbeFail]));
+  if gVdbeFail > 0 then Halt(1);
 end.
