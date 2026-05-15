@@ -991,22 +991,18 @@ partial landings cannot silently no-op.
     - [X] **10.1.42.b.4** Solver progress in `wherePathSolver` (masks **0x002/0x004**, NOT 0x80; sqliteInt.h:1181). Landed 0x002 arms; 0x004 + round-summary re-enabled in b.8. Archive.
     - [X] **10.1.42.b.5** OR-vs-AND per-subterm in `whereLoopAddOr` (0x400, where.c:4866). 0x20000 companion re-enabled in b.8. Archive.
     - [X] **10.1.42.b.6** DISTINCT reduction (0x0080, where.c:7118 + `nRowOut -= 30`) + optimizer-finished (0xffffffff, 7195). Trailing arms re-enabled in b.8. Archive.
-    - [ ] **10.1.42.b.7** Port the STAT4 cost-estimator helpers that
-      gate the 4 deferred 10.1.42.b.1 arms: `whereRangeSkipScanEst`
-      (where.c:2036), `whereEqualScanEst` (:2215 / :2313),
-      `whereInScanEst` (:2363).  Each is a STAT4-driven planner helper
-      not yet present in passqlite3codegen.pas.  Mask: 0x20 (verified
-      against whereInt.h, NOT 0x10 as tasklist initially suggested).
-      Treat as 3 independent micro-tasks; drop the WHERETRACE call at
-      each host function as it lands.
-      **BLOCKED 2026-05-13** on prerequisite **10.1.42.b.7.prereq** —
-      the three helpers consume `sqlite3Stat4ProbeSetValue` (where.c:2002, 2169, 2306)
-      and `sqlite3Stat4ValueFromExpr` (where.c:2006, 2186) which are
-      unported in passqlite3.  Audit found zero references to either symbol
-      in `src/*.pas`; only `sqlite3Stat4Column` (vdbe.pas:13356) and
-      `sqlite3Stat4ProbeFree` (vdbe.pas:13409) exist as Phase-6 stubs.
-      `SQLITE_ENABLE_STAT4` is not set in `src/passqlite3.inc` /
-      `src/tests/build.sh`; pas-sqlite3 is a default non-STAT4 build.
+    - [X] **10.1.42.b.7** Port the STAT4 cost-estimator helpers gating the
+      4 deferred 10.1.42.b.1 arms: `whereRangeSkipScanEst` (c.8),
+      `whereEqualScanEst` + `whereInScanEst` (c.9).  All 4 WHERETRACE 0x20
+      arms re-enabled at host sites; STAT4 host wiring inside
+      `whereRangeScanEst` (where.c:2215) and `whereLoopAddBtreeIndex`
+      (where.c:3484..3531) landed under `{$IFDEF SQLITE_ENABLE_STAT4}`.
+      Default build: TestExplainParity 1026/1026, 99/100 (TestFuzzDiff
+      pre-existing).  STAT4=1: compiles clean, TestExplainParity 1026/1026.
+      Unit-test fixtures in TestWherePlanner that pass `pBuilder=nil`
+      to `whereRangeScanEst` crash under STAT4 (C would too — the input
+      isn't a valid planner call); those tests now run only meaningfully
+      on the default build.  Closed in c.9.
     - [ ] **10.1.42.b.7.prereq** Port `sqlite3Stat4ProbeSetValue` and
       `sqlite3Stat4ValueFromExpr` (consumers of `IndexSample` /
       `sqlite3VdbeRecordCompare`) plus any sample-vector machinery they
@@ -1090,17 +1086,11 @@ partial landings cannot silently no-op.
       convention).  **Deferred to prereq.c**: `loadStat4` /
       `loadStatTbl` / `initAvgEq` / `findIndexOrPrimaryKey` (reader
       side; consumed by where.c estimators which already land there).
-    - [~] **10.1.42.b.7.prereq.c** Consumers (rolls in 10.1.42.b.7
-      itself).  Port vdbemem.c STAT4 layer (ValueNewStat4Ctx + valueNew +
-      valueFromFunction + stat4ValueFromExpr + 2 publics + valueFromExpr
-      STAT4 branches).  Replace `sqlite3Stat4ProbeFree` / `sqlite3Stat4Column`
-      stubs with ported bodies.  Then port `whereKeyStats` + the 3
-      estimators (`whereRangeSkipScanEst` / `whereEqualScanEst` /
-      `whereInScanEst`) in `passqlite3codegen.pas`; drop the 4 WHERETRACE
-      0x20 arms at the host sites.  ~950 LOC.  **Decomposed 2026-05-15**
-      into 9 sub-arms (.1..9), each independently committable.  All gated
-      under `{$IFDEF SQLITE_ENABLE_STAT4}`; default build must remain
-      byte-identical at every sub-arm boundary.
+    - [X] **10.1.42.b.7.prereq.c** Consumers — vdbemem.c STAT4 layer +
+      `whereKeyStats` + the 3 estimators landed across 9 sub-arms (.1..9).
+      All 4 WHERETRACE 0x20 arms re-enabled.  Default build byte-identical
+      at every sub-arm boundary; STAT4=1 compiles clean and
+      TestExplainParity 1026/1026 under STAT4=1.  Closed in c.9.
     - [X] **10.1.42.b.7.prereq.c.1** Port `ValueNewStat4Ctx` struct
       (vdbemem.c:1611..1622) + `valueNew` STAT4-aware factory
       (vdbemem.c:1632..1700) into `src/passqlite3vdbe.pas` (or wherever
@@ -1198,10 +1188,28 @@ partial landings cannot silently no-op.
       TestExplainParity 1026/1026, 99/100 (TestFuzzDiff pre-existing).
       STAT4=1: compiles clean, 97/100 == prereq.c.5..c.7 baseline (3
       pre-existing fails: TestFuzzDiff, TestSQLCorpus, TestWhereBasic).
-    - [ ] **10.1.42.b.7.prereq.c.9** Port `whereEqualScanEst`
+    - [X] **10.1.42.b.7.prereq.c.9** Port `whereEqualScanEst`
       (where.c:2274..2330) + `whereInScanEst` (:2338..2380); re-enable
       the 4 deferred WHERETRACE 0x20 arms in `whereLoopAddBtree` host
       sites.  Closes 10.1.42.b.7 + prereq.c.
+      **Outcome 2026-05-15**: ported both estimators near
+      whereRangeSkipScanEst under `{$IFDEF SQLITE_ENABLE_STAT4}`;
+      extended `TWhereLoopBuilder` with STAT4-only `pRec` /
+      `nRecValid` (+16 bytes); restored the full STAT4 branch of
+      `whereRangeScanEst` (where.c:2103..2223) including the 0x20
+      "STAT4 range scan" trace; wired the STAT4 sample-driven equality/
+      IN estimator inside `whereLoopAddBtreeIndex` (where.c:3484..3531)
+      with the 0x20 "low selectivity" trace + `TERM_HIGHTRUTH` flag;
+      added STAT4 probe reset (`sqlite3Stat4ProbeFree`) at
+      `whereLoopAddBtree` tail.  Added `TERM_HIGHTRUTH = $4000`
+      constant under STAT4.  Default build: TestExplainParity 1026/
+      1026, 99/100 (TestFuzzDiff pre-existing).  STAT4=1: compiles
+      clean, TestExplainParity 1026/1026 (the new STAT4 host wiring
+      runs without producing bytecode regressions on the corpus).
+      TestWherePlanner RA-test fixtures that pass `pBuilder=nil` crash
+      under STAT4 (the STAT4 branch derefs `pLoop^.u.btree.pIndex`
+      first); this matches C semantics — those fixtures only validate
+      the no-STAT4 tail.
     - [X] **10.1.42.b.8** Port `wherePathName` + `sqlite3Where{Term,Clause,Loop}Print` + `showAllWhereLoops` (where.c:2375..2520/5512..5519/6469..6488). Debug-only `cId`+`rStarDelta` carved from pre-existing _pad58..63 in TWhereLoop. Re-enabled 7 deferred arms (closes b.4/b.5/b.6 + WHERETRACE_ALL_LOOPS at where.c:7103). Archive.
     - [X] **10.1.42.a.6.1** `havingToWhere` + `havingToWhereExprCb` (select.c:7047) + `sqlite3ExprIsConstantOrGroupBy`; wired SF_Aggregate+GROUP-BY (8422..8431). 0x100.
     - [X] **10.1.42.a.6.2** `countOfViewOptimization` (select.c:7128..7204); wired after propagateConstants (7924..7930). 0x200. SQLITE_CountOfView added.

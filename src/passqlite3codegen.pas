@@ -408,6 +408,7 @@ type
   { tRowcnt u64-array view; impl-section duplicate is preserved as-is. }
   TRowCntArr = array[0..1024*1024-1] of u64;
   PRowCntArr = ^TRowCntArr;
+  PRowcnt    = ^u64;             { tRowcnt scalar pointer — used by Stat4 estimators }
   {$ENDIF}
   PColumn   = ^TColumn;
   PPColumn  = ^PColumn;
@@ -1461,7 +1462,7 @@ type
     _padScan:    i32;          { 4 bytes @ 124 (8-byte align of trailer) }
   end;
 
-  { --- TWhereLoopBuilder (sizeof=40) --- }
+  { --- TWhereLoopBuilder (sizeof=40 base; +16 under STAT4 for pRec/nRecValid) --- }
   TWhereLoopBuilder = record
     pWInfo:     PWhereInfo;    { 8 bytes @ 0 }
     pWC:        PWhereClause;  { 8 bytes @ 8 }
@@ -1471,6 +1472,16 @@ type
     bldFlags2:  u8;            { 1 byte  @ 33 }
     _pad34:     u16;           { 2 bytes @ 34 }
     iPlanLimit: u32;           { 4 bytes @ 36 }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { 10.1.42.b.7.prereq.c.9 — STAT4 probe state carried across the
+      whereLoopAddBtreeIndex recursion.  pRec is the UnpackedRecord
+      progressively populated by sqlite3Stat4ProbeSetValue; nRecValid is
+      the number of leading index columns for which pRec carries an
+      extracted value (where.c whereInt.h:330..331). }
+    pRec:       PUnpackedRecord;  { 8 bytes @ 40 }
+    nRecValid:  i32;              { 4 bytes @ 48 }
+    _padSTAT4:  i32;              { 4 bytes @ 52 — alignment }
+    {$ENDIF}
   end;
 
   { --- TWhereInfo (sizeof=856 base; a[FLEXARRAY] of TWhereLevel follows) --- }
@@ -1689,6 +1700,9 @@ const
   TERM_IS        = u16($0800);
   TERM_VARSELECT = u16($1000);
   TERM_HEURTRUTH = u16($2000);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  TERM_HIGHTRUTH = u16($4000);  { whereInt.h:317 — only defined under STAT4 }
+  {$ENDIF}
   TERM_SLICE     = u16($8000);
 
   { SQLITE_BLDF* (WhereLoopBuilder bldFlags) }
@@ -1932,10 +1946,21 @@ function  whereRangeSkipScanEst(pParse: PParse;
                                 pLower, pUpper: PWhereTerm;
                                 pLoop: PWhereLoop;
                                 pbDone: Pi32): i32;
+{ 10.1.42.b.7.prereq.c.9 — equality / IN sample-driven estimators
+  (where.c:2274..2330 and 2338..2380). }
+function  whereEqualScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                            pExpr: PExpr; pnRow: PRowcnt): i32;
+function  whereInScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                         pList: PExprList; pnRow: PRowcnt): i32;
 { Interface forward — body lives later in implementation (vdbemem.c:2127). }
 function  sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
                                     aff: u8;
                                     apVal: PPointer): i32;
+{ Interface forward — body at vdbemem.c:2082..2115 port (impl section). }
+function  sqlite3Stat4ProbeSetValue(pParse: PParse; pIdx: PIndex;
+                                    ppRec: PPointer; pExpr: PExpr;
+                                    nElem, iVal: i32;
+                                    pnExtract: Pi32): i32;
 {$ENDIF}
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — UNIQUE-index DISTINCT cluster
@@ -15364,6 +15389,112 @@ begin
   sqlite3ValueFree(pVal);
   Result := rc;
 end;
+
+{ 10.1.42.b.7.prereq.c.9 — whereEqualScanEst (where.c:2274..2318).
+  Estimate the number of rows matched by x=VALUE (or x IS NULL when pExpr=nil)
+  for the left-most column of pBuilder^.pNew^.u.btree.pIndex that has not yet
+  been probed.  Returns SQLITE_OK on success and writes the count into pnRow^;
+  returns SQLITE_NOTFOUND when an estimate cannot be produced. }
+function whereEqualScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                           pExpr: PExpr; pnRow: PRowcnt): i32;
+var
+  p:    PIndex2;
+  nEq:  i32;
+  pRec: PUnpackedRecord;
+  rc:   i32;
+  a:    array[0..1] of u64;
+  bOk:  i32;
+begin
+  p    := pBuilder^.pNew^.u.btree.pIndex;
+  nEq  := i32(pBuilder^.pNew^.u.btree.nEq);
+  pRec := pBuilder^.pRec;
+
+  Assert(nEq >= 1);
+  Assert(nEq <= i32(p^.nColumn));
+  Assert(p^.aSample <> nil);
+  Assert(p^.nSample > 0);
+  Assert(pBuilder^.nRecValid < nEq);
+
+  { No estimate possible without all preceding-column values. }
+  if pBuilder^.nRecValid < (nEq - 1) then
+  begin
+    Result := SQLITE_NOTFOUND;
+    Exit;
+  end;
+
+  { Optimization: a probe past the right edge always matches exactly one row. }
+  if nEq >= i32(p^.nColumn) then
+  begin
+    pnRow^ := 1;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  rc := sqlite3Stat4ProbeSetValue(pParse, PIndex(p), PPointer(@pRec), pExpr,
+                                  1, nEq - 1, @bOk);
+  pBuilder^.pRec := pRec;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  if bOk = 0 then begin Result := SQLITE_NOTFOUND; Exit; end;
+  pBuilder^.nRecValid := nEq;
+
+  whereKeyStats(pParse, p, pRec, 0, PRowCntArr(@a[0]));
+  {$IFDEF SQLITE_DEBUG}
+  { WHERETRACE(0x20, "equality scan regions %s(%d): %d") — where.c:2313. }
+  if (sqlite3WhereTrace and $20) <> 0 then
+    sqlite3DebugPrintf('equality scan regions %s(%d): %d'#10,
+                       [p^.zName, nEq - 1, i32(a[1])]);
+  {$ENDIF}
+  pnRow^ := a[1];
+  Result := rc;
+end;
+
+{ 10.1.42.b.7.prereq.c.9 — whereInScanEst (where.c:2338..2367).
+  Estimate rows matched by x IN (v1,v2,...) by summing the per-value estimates
+  from whereEqualScanEst.  Cap the result at the index's nRowEst0. }
+function whereInScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                        pList: PExprList; pnRow: PRowcnt): i32;
+var
+  p:         PIndex2;
+  nRow0:     i64;
+  nRecValid: i32;
+  rc:        i32;
+  nEst:      u64;
+  nRowEst:   u64;
+  i:         i32;
+  pItem:     PExprListItem;
+begin
+  p         := pBuilder^.pNew^.u.btree.pIndex;
+  nRow0     := sqlite3LogEstToInt(p^.aiRowLogEst[0]);
+  nRecValid := pBuilder^.nRecValid;
+  rc        := SQLITE_OK;
+  nRowEst   := 0;
+
+  Assert(p^.aSample <> nil);
+  pItem := ExprListItems(pList);
+  i := 0;
+  while (rc = SQLITE_OK) and (i < pList^.nExpr) do
+  begin
+    nEst := u64(nRow0);
+    rc := whereEqualScanEst(pParse, pBuilder,
+            PExprListItem(PByte(pItem) + PtrUInt(i) * SZ_EXPRLIST_ITEM)^.pExpr,
+            @nEst);
+    nRowEst := nRowEst + nEst;
+    pBuilder^.nRecValid := nRecValid;
+    Inc(i);
+  end;
+
+  if rc = SQLITE_OK then
+  begin
+    if nRowEst > u64(nRow0) then nRowEst := u64(nRow0);
+    pnRow^ := nRowEst;
+    {$IFDEF SQLITE_DEBUG}
+    if (sqlite3WhereTrace and $20) <> 0 then
+      sqlite3DebugPrintf('IN row estimate: est=%d'#10, [i32(nRowEst)]);
+    {$ENDIF}
+  end;
+  Assert(pBuilder^.nRecValid = nRecValid);
+  Result := rc;
+end;
 {$ENDIF}
 
 function whereRangeAdjust(pTerm: PWhereTerm; nNew: i16): i16;
@@ -15687,14 +15818,152 @@ var
   rc:    i32;
   nOut:  i32;
   nNew:  i32;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  p:        PIndex2;
+  nEq:      i32;
+  pRec:     PUnpackedRecord;
+  a:        array[0..1] of u64;
+  nBtm:     i32;
+  nTop:     i32;
+  iLower:   u64;
+  iUpper:   u64;
+  iLwrIdx:  i32;
+  iUprIdx:  i32;
+  pExprX:   PExpr;
+  n:        i32;
+  iNew:     u64;
+  mask:     u16;
+  bDone:    i32;
+  tmpW:     PWhereTerm;
+  tmpI:     i32;
+  {$ENDIF}
 begin
   rc   := SQLITE_OK;
   nOut := pLoop^.nOut;
 
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { 10.1.42.b.7.prereq.c.9 — STAT4 sample-driven range estimator
+    (where.c:2103..2223).  When nEq matches pBuilder^.nRecValid the existing
+    pRec key prefix can be probed against the histogram; otherwise fall
+    through to whereRangeSkipScanEst. }
+  p   := pLoop^.u.btree.pIndex;
+  nEq := i32(pLoop^.u.btree.nEq);
+  if (p^.nSample > 0) and (nEq < p^.nSampleCol)
+     and OptimizationEnabled(pParse^.db, SQLITE_Stat4) then
+  begin
+    if nEq = pBuilder^.nRecValid then
+    begin
+      pRec := pBuilder^.pRec;
+      nBtm := i32(pLoop^.u.btree.nBtm);
+      nTop := i32(pLoop^.u.btree.nTop);
+
+      iLwrIdx := -2;
+      iUprIdx := -1;
+
+      if pRec <> nil then
+        pRec^.nField := u16(pBuilder^.nRecValid);
+
+      if nEq = 0 then
+      begin
+        iLower := 0;
+        iUpper := p^.nRowEst0;
+      end
+      else
+      begin
+        whereKeyStats(pParse, p, pRec, 0, PRowCntArr(@a[0]));
+        iLower := a[0];
+        iUpper := a[0] + a[1];
+      end;
+
+      Assert((pLower = nil) or ((pLower^.eOperator and (WO_GT_WO or WO_GE)) <> 0));
+      Assert((pUpper = nil) or ((pUpper^.eOperator and (WO_LT or WO_LE)) <> 0));
+      Assert(p^.aSortOrder <> nil);
+      if p^.aSortOrder[nEq] <> 0 then
+      begin
+        { DESC index — swap pLower<->pUpper and nBtm<->nTop. }
+        tmpW := pLower; pLower := pUpper; pUpper := tmpW;
+        tmpI := nBtm;   nBtm   := nTop;    nTop   := tmpI;
+      end;
+
+      if pLower <> nil then
+      begin
+        pExprX := pLower^.pExpr^.pRight;
+        rc := sqlite3Stat4ProbeSetValue(pParse, PIndex(p), PPointer(@pRec),
+                                        pExprX, nBtm, nEq, @n);
+        if (rc = SQLITE_OK) and (n <> 0) then
+        begin
+          mask := WO_GT_WO or WO_LE;
+          if sqlite3ExprVectorSize(pExprX) > n then
+            mask := WO_LE or WO_LT;
+          iLwrIdx := whereKeyStats(pParse, p, pRec, 0, PRowCntArr(@a[0]));
+          if (pLower^.eOperator and mask) <> 0 then
+            iNew := a[0] + a[1]
+          else
+            iNew := a[0];
+          if iNew > iLower then iLower := iNew;
+          Dec(nOut);
+          pLower := nil;
+        end;
+      end;
+
+      if pUpper <> nil then
+      begin
+        pExprX := pUpper^.pExpr^.pRight;
+        rc := sqlite3Stat4ProbeSetValue(pParse, PIndex(p), PPointer(@pRec),
+                                        pExprX, nTop, nEq, @n);
+        if (rc = SQLITE_OK) and (n <> 0) then
+        begin
+          mask := WO_GT_WO or WO_LE;
+          if sqlite3ExprVectorSize(pExprX) > n then
+            mask := WO_LE or WO_LT;
+          iUprIdx := whereKeyStats(pParse, p, pRec, 1, PRowCntArr(@a[0]));
+          if (pUpper^.eOperator and mask) <> 0 then
+            iNew := a[0] + a[1]
+          else
+            iNew := a[0];
+          if iNew < iUpper then iUpper := iNew;
+          Dec(nOut);
+          pUpper := nil;
+        end;
+      end;
+
+      pBuilder^.pRec := pRec;
+      if rc = SQLITE_OK then
+      begin
+        if iUpper > iLower then
+        begin
+          nNew := i32(sqlite3LogEst(iUpper - iLower));
+          { Same-sample 4x discount (TUNING: where.c:2203..2208). }
+          if iLwrIdx = iUprIdx then nNew := nNew - 20;
+          Assert(20 = sqlite3LogEst(4));
+        end
+        else
+        begin
+          nNew := 10; Assert(10 = sqlite3LogEst(2));
+        end;
+        if nNew < nOut then nOut := nNew;
+        {$IFDEF SQLITE_DEBUG}
+        { 10.1.42.b.7.prereq.c.9 — re-enabled WHERETRACE 0x20 arm
+          (where.c:2215..2216). }
+        if (sqlite3WhereTrace and $20) <> 0 then
+          sqlite3DebugPrintf('STAT4 range scan: %u..%u  est=%d'#10,
+                             [u32(iLower), u32(iUpper), nOut]);
+        {$ENDIF}
+      end;
+    end
+    else
+    begin
+      bDone := 0;
+      rc := whereRangeSkipScanEst(pParse, pLower, pUpper, pLoop, @bDone);
+      if bDone <> 0 then begin Result := rc; Exit; end;
+    end;
+  end;
+  {$ELSE}
   { No-STAT4 build — pParse / pBuilder unused on this branch (matches
     UNUSED_PARAMETER at where.c:2225..2226). }
   if pParse = nil then ; { silence "unused" hint }
   if pBuilder = nil then ;
+  {$ENDIF}
 
   Assert((pLower <> nil) or (pUpper <> nil));
   Assert((pUpper = nil) or ((pUpper^.wtFlags and TERM_VNULL) = 0)
@@ -15797,6 +16066,10 @@ var
   nIter:         i16;
   aLTermArr:     PPWhereTerm;
   aLTermSlot:    PWhereTerm;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  nOutTRow:      u64;
+  pExprStat:     PExpr;
+  {$ENDIF}
 begin
   pWInfo := pBuilder^.pWInfo;
   pPrs   := pWInfo^.pParse;
@@ -16046,11 +16319,57 @@ begin
       end
       else
       begin
-        { No-STAT4 path — use stat1 row counts. }
-        pNew^.nOut := i16(pNew^.nOut
-                          + (pProbe^.aiRowLogEst[nEq] - pProbe^.aiRowLogEst[nEq - 1]));
-        if (eOp and WO_ISNULL) <> 0 then
-          pNew^.nOut := i16(pNew^.nOut + 10);
+        {$IFDEF SQLITE_ENABLE_STAT4}
+        { 10.1.42.b.7.prereq.c.9 — STAT4 sample-driven equality / IN estimator
+          (where.c:3484..3531).  Falls through to stat1 below when the sample
+          probe yields no estimate (nOutTRow == 0). }
+        nOutTRow := 0;
+        if (nInMul = 0)
+           and (pProbe^.nSample > 0)
+           and (pNew^.u.btree.nEq <= u16(pProbe^.nSampleCol))
+           and (((eOp and WO_IN) = 0) or ExprUseXList(pTerm^.pExpr))
+           and OptimizationEnabled(db, SQLITE_Stat4) then
+        begin
+          pExprStat := pTerm^.pExpr;
+          if (eOp and (WO_EQ or WO_ISNULL or WO_IS)) <> 0 then
+            rc := whereEqualScanEst(pPrs, pBuilder, pExprStat^.pRight, @nOutTRow)
+          else
+            rc := whereInScanEst(pPrs, pBuilder, pExprStat^.x.pList, @nOutTRow);
+          if rc = SQLITE_NOTFOUND then rc := SQLITE_OK;
+          if rc <> SQLITE_OK then Break;
+          if nOutTRow <> 0 then
+          begin
+            pNew^.nOut := sqlite3LogEst(nOutTRow);
+            if (nEq = 1)
+               and (pNew^.nOut + 10 > pProbe^.aiRowLogEst[0]) then
+            begin
+              {$IFDEF SQLITE_DEBUG}
+              { 10.1.42.b.7.prereq.c.9 — WHERETRACE 0x20 (where.c:3512..3517). }
+              if (sqlite3WhereTrace and $20) <> 0 then
+              begin
+                sqlite3DebugPrintf(
+                  'STAT4 determines term has low selectivity:'#10, []);
+                sqlite3WhereTermPrint(pTerm, 999);
+              end;
+              {$ENDIF}
+              pTerm^.wtFlags := pTerm^.wtFlags or TERM_HIGHTRUTH;
+              if (pTerm^.wtFlags and TERM_HEURTRUTH) <> 0 then
+                pBuilder^.bldFlags2 := pBuilder^.bldFlags2
+                                       or u8(SQLITE_BLDF2_2NDPASS);
+            end;
+            if pNew^.nOut > saved_nOut then pNew^.nOut := saved_nOut;
+            pNew^.nOut := i16(pNew^.nOut - nIn);
+          end;
+        end;
+        if nOutTRow = 0 then
+        {$ENDIF}
+        begin
+          { stat1 fallback. }
+          pNew^.nOut := i16(pNew^.nOut
+                            + (pProbe^.aiRowLogEst[nEq] - pProbe^.aiRowLogEst[nEq - 1]));
+          if (eOp and WO_ISNULL) <> 0 then
+            pNew^.nOut := i16(pNew^.nOut + 10);
+        end;
       end;
     end;
 
@@ -16626,7 +16945,13 @@ begin
     rc := whereLoopAddBtreeIndex(pBuilder, pSrc, pProbe, 0);
     if pBuilder^.bldFlags1 = SQLITE_BLDF1_INDEXED then
       pTab^.tabFlags := pTab^.tabFlags or TF_MaybeReanalyze;
-    { No STAT4 reset (sqlite3Stat4ProbeFree) — non-STAT4 build. }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { 10.1.42.b.7.prereq.c.9 — reset STAT4 probe state between candidate
+      indexes (where.c:4302..4306). }
+    passqlite3vdbe.sqlite3Stat4ProbeFree(pBuilder^.pRec);
+    pBuilder^.nRecValid := 0;
+    pBuilder^.pRec      := nil;
+    {$ENDIF}
 
   NextProbe:
     if (fgBits and u8($02)) <> 0 then  { isIndexedBy → only one probe }
