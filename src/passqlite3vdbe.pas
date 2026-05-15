@@ -1668,6 +1668,21 @@ type
     ppRec:  ^PUnpackedRecord;
     iVal:   i32;
   end;
+{$IFDEF SQLITE_ENABLE_STAT4}
+  { Trampoline for valueFromFunction (vdbemem.c:1701..1799).  The C body
+    reads PExpr internals (flags / x.pList / u.zToken) and calls
+    sqlite3FindFunction + sqlite3Stat4ValueFromExpr + sqlite3ErrorMsg —
+    all of which live in passqlite3codegen.  Real body wired at init. }
+type
+  TValueFromFunctionFn = function(db: Psqlite3; pExpr: Pointer;
+                                  enc: u8; aff: u8;
+                                  out ppVal: Psqlite3_value;
+                                  pCtx: PValueNewStat4Ctx): i32;
+var
+  gValueFromFunctionImpl: TValueFromFunctionFn;
+{ valueNew exposed for codegen's valueFromFunctionImpl (STAT4 only). }
+function valueNew(db: Psqlite3; p: PValueNewStat4Ctx): Psqlite3_value;
+{$ENDIF}
 function  sqlite3VdbeChangeEncoding(pMem: PMem; desiredEnc: i32): i32;
 function  sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
 function  sqlite3VdbeMemHandleBom(pMem: PMem): i32;
@@ -13618,6 +13633,30 @@ begin
   { Non-STAT4 path mirrors `return sqlite3ValueNew(db)` (vdbemem.c:1671).
     p is unreferenced in this build; FPC tolerates unused param. }
   Result := sqlite3ValueNew(db);
+end;
+
+{ valueFromFunction — port of vdbemem.c:1701..1799.  Pre-evaluates a
+  deterministic scalar function call at planner time so its constant result
+  becomes a probe value into pIdx^.aSample[].  Body lives in
+  passqlite3codegen.valueFromFunctionImpl (needs PExpr layout and
+  sqlite3FindFunction / sqlite3Stat4ValueFromExpr / sqlite3ErrorMsg, all
+  codegen-owned).  Default build collapses to SQLITE_OK with *ppVal=nil,
+  matching the C `#define valueFromFunction(...) SQLITE_OK` non-STAT4 arm
+  at vdbemem.c:1782. }
+function valueFromFunction(db: Psqlite3; pExpr: Pointer;
+                           enc: u8; aff: u8;
+                           out ppVal: Psqlite3_value;
+                           pCtx: PValueNewStat4Ctx): i32;
+begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+  if Assigned(gValueFromFunctionImpl) then
+  begin
+    Result := gValueFromFunctionImpl(db, pExpr, enc, aff, ppVal, pCtx);
+    Exit;
+  end;
+{$ENDIF}
+  ppVal  := nil;
+  Result := SQLITE_OK;
 end;
 
 procedure sqlite3ValueSetStr(v: Psqlite3_value; n: i32; z: Pointer;

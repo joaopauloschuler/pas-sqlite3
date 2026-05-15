@@ -60908,6 +60908,148 @@ begin
   Result := rc;
 end;
 
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ -----------------------------------------------------------------------
+  sqlite3Stat4ValueFromExpr — forward stub for prereq.c.4 (vdbemem.c:2127).
+  Real port lands in prereq.c.4; until then this stub mirrors the
+  "expression cannot be converted to a sqlite3_value" fallback:
+  *apVal := nil, return SQLITE_OK.  Keeps valueFromFunctionImpl below
+  callable in STAT4=1 builds without dragging in the full Expr->sample
+  pipeline.
+  ----------------------------------------------------------------------- }
+function sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
+                                   aff: u8;
+                                   apVal: PPointer): i32; forward;
+
+{ -----------------------------------------------------------------------
+  valueFromFunctionImpl — port of vdbemem.c:1701..1799.  STAT4 helper that
+  pre-evaluates a deterministic scalar function call at planner time so
+  its constant result can be used as a probe value into pIdx^.aSample[].
+
+  Called via passqlite3vdbe.valueFromFunction (which delegates through
+  gValueFromFunctionImpl when STAT4 is on).  Wired in initialization.
+
+  Faithful line-by-line port; the only deviation from C is using the
+  Pascal `apVal` dynamic helper array instead of pointer-cast malloc
+  (functionally equivalent — both are zero-init arrays of sqlite3_value*).
+  ----------------------------------------------------------------------- }
+function valueFromFunctionImpl(db: Psqlite3; pInExpr: Pointer;
+                               enc: u8; aff: u8;
+                               out ppVal: Psqlite3_value;
+                               pCtx: PValueNewStat4Ctx): i32;
+label
+  value_from_function_out;
+var
+  p:      PExpr;
+  ctx:    Tsqlite3_context;        { context object for function invocation }
+  apVal:  array of Psqlite3_value; { function arguments (zero-init by SetLength) }
+  nVal:   i32;                     { number of function arguments }
+  pFn:    PTFuncDef;               { function definition (FPC: avoid pFunc shadow) }
+  pVal:   Psqlite3_value;          { new value }
+  rc:     i32;                     { return code }
+  pList:  PExprList;               { function argument list }
+  pItem:  PExprListItem;           { iterator over pList items (flex-array access) }
+  i:      i32;                     { iterator }
+begin
+  ppVal := nil;
+  pVal  := nil;
+  nVal  := 0;
+  rc    := SQLITE_OK;
+  p     := PExpr(pInExpr);
+
+  Assert(pCtx <> nil);
+  Assert((p^.flags and EP_TokenOnly) = 0);
+  Assert(ExprUseXList(p));
+  pList := p^.x.pList;
+  if pList <> nil then nVal := pList^.nExpr;
+  Assert(not ExprHasProperty(p, EP_IntValue));
+  pFn := sqlite3FindFunction(PTsqlite3(db), p^.u.zToken, nVal, enc, 0);
+{$IFDEF SQLITE_ENABLE_UNKNOWN_SQL_FUNCTION}
+  if pFn = nil then begin Result := SQLITE_OK; Exit; end;
+{$ENDIF}
+  Assert(pFn <> nil);
+  if ((pFn^.funcFlags and (SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG)) = 0)
+     or ((pFn^.funcFlags and (SQLITE_FUNC_NEEDCOLL or SQLITE_FUNC_RUNONLY)) <> 0) then
+  begin
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  if pList <> nil then
+  begin
+    SetLength(apVal, nVal);  { zero-initialised; mirrors sqlite3DbMallocZero }
+    if (nVal > 0) and (apVal = nil) then
+    begin
+      rc := SQLITE_NOMEM;
+      goto value_from_function_out;
+    end;
+    pItem := ExprListItems(pList);
+    for i := 0 to nVal - 1 do
+    begin
+      rc := sqlite3Stat4ValueFromExpr(PParse(pCtx^.pParse), pItem[i].pExpr, aff,
+                                      PPointer(@apVal[i]));
+      if (apVal[i] = nil) or (rc <> SQLITE_OK) then goto value_from_function_out;
+    end;
+  end;
+
+  pVal := passqlite3vdbe.valueNew(db, pCtx);
+  if pVal = nil then
+  begin
+    rc := SQLITE_NOMEM;
+    goto value_from_function_out;
+  end;
+
+  FillChar(ctx, SizeOf(ctx), 0);
+  ctx.pOut  := PMem(pVal);
+  ctx.pFunc := PFuncDef(pFn);
+  ctx.enc   := PTsqlite3(db)^.enc;
+  if apVal <> nil then
+    pFn^.xSFunc(@ctx, nVal, PPMem(@apVal[0]))
+  else
+    pFn^.xSFunc(@ctx, nVal, nil);
+  if ctx.isError <> 0 then
+  begin
+    rc := ctx.isError;
+    sqlite3ErrorMsg(PParse(pCtx^.pParse), PAnsiChar(sqlite3_value_text(pVal)));
+  end else
+  begin
+    sqlite3ValueApplyAffinity(pVal, aff, SQLITE_UTF8);
+    Assert(rc = SQLITE_OK);
+    rc := sqlite3VdbeChangeEncoding(PMem(pVal), enc);
+    if (rc = SQLITE_OK) and (sqlite3VdbeMemTooBig(PMem(pVal)) <> 0) then
+    begin
+      rc := SQLITE_TOOBIG;
+      Inc(PParse(pCtx^.pParse)^.nErr);
+    end;
+  end;
+
+value_from_function_out:
+  if rc <> SQLITE_OK then
+  begin
+    pVal := nil;
+    PParse(pCtx^.pParse)^.rc := rc;
+  end;
+  if apVal <> nil then
+  begin
+    for i := 0 to nVal - 1 do
+      sqlite3ValueFree(apVal[i]);
+    SetLength(apVal, 0);
+  end;
+  ppVal  := pVal;
+  Result := rc;
+end;
+
+{ Stub body for the forward declared sqlite3Stat4ValueFromExpr — real port
+  lives in prereq.c.4.  Keeps the compiler happy in STAT4=1 builds. }
+function sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
+                                   aff: u8;
+                                   apVal: PPointer): i32;
+begin
+  if apVal <> nil then apVal^ := nil;
+  Result := SQLITE_OK;
+end;
+{$ENDIF}
+
 { -----------------------------------------------------------------------
   valueFromExprTrampoline — port of vdbemem.c:1795 valueFromExpr() (with
   the public-API wrapper sqlite3ValueFromExpr at vdbemem.c:1978 inlined).
@@ -61757,6 +61899,10 @@ initialization
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
   passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  passqlite3vdbe.gValueFromFunctionImpl  :=
+    passqlite3vdbe.TValueFromFunctionFn(@valueFromFunctionImpl);
+{$ENDIF}
 {$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
   passqlite3vdbe.gVdbePreUpdateHook      :=
     passqlite3vdbe.TVdbePreUpdateHookFn(@sqlite3VdbePreUpdateHook);

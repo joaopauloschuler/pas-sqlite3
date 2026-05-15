@@ -1119,10 +1119,20 @@ partial landings cannot silently no-op.
       three known STAT4=1 regressions (T28 TIndex sizeof, TestFuzzDiff,
       TestSQLCorpus) are pre-existing from prereq.a/b, not introduced
       here.
-    - [ ] **10.1.42.b.7.prereq.c.2** Port `valueFromFunction` STAT4 arm
+    - [X] **10.1.42.b.7.prereq.c.2** Port `valueFromFunction` STAT4 arm
       (vdbemem.c:1701..1799) — recursive const-folding through
       `sqlite3VdbeMemSetStr`/`sqlite3ValueApplyAffinity` to pre-evaluate
       function calls in stat4 probe inputs.
+      **Outcome 2026-05-15**: landed via STAT4-gated trampoline —
+      `valueFromFunction` shell + `gValueFromFunctionImpl` hook in
+      `src/passqlite3vdbe.pas` (near `valueNew`), real body
+      `valueFromFunctionImpl` in `src/passqlite3codegen.pas` (needs
+      PExpr / PParse layout + `sqlite3FindFunction`).
+      `sqlite3Stat4ValueFromExpr` forward-stubbed (real port = prereq.c.4).
+      `valueNew` exposed in vdbe interface for the codegen call.  Default
+      build: TestExplainParity 1026/1026, only pre-existing TestFuzzDiff
+      fails.  STAT4=1: compiles clean; pre-existing 3 regressions only
+      (T28 TIndex sizeof, TestFuzzDiff, TestSQLCorpus).
     - [ ] **10.1.42.b.7.prereq.c.3** Port `valueFromExpr` STAT4 branches
       + `stat4ValueFromExpr` helper (vdbemem.c:1800..2080) — the dispatch
       that turns a constant Expr tree into a `sqlite3_value*` usable by
