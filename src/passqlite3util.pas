@@ -2529,16 +2529,28 @@ end;
 function sqlite3DbMallocZero(db: Psqlite3db; n: u64): Pointer;
 begin
   Result := sqlite3MallocZero(csize_t(n));
+  { malloc.c:dbMallocRawFinish (line 604..612) — propagate the OOM flag to
+    the db connection so that downstream call sites which guard on
+    db->mallocFailed (e.g. vdbeaux.c:2902 sqlite3VdbeSetColName) take the
+    NOMEM early-out and skip the nil aColName deref.  Without this, an
+    injected sqlite3_memdebug_fail allocation failure leaves mallocFailed
+    clear and the engine crashes during OOM unwind (divbug.27). }
+  if (Result = nil) and (db <> nil) then sqlite3OomFault(db);
 end;
 
 function sqlite3DbMallocRaw(db: Psqlite3db; n: u64): Pointer;
 begin
   Result := sqlite3_malloc64(n);
+  { malloc.c:636..642 / dbMallocRawFinish:608 — set db->mallocFailed on OOM. }
+  if (Result = nil) and (db <> nil) then sqlite3OomFault(db);
 end;
 
 function sqlite3DbMallocRawNN(db: Psqlite3db; n: u64): Pointer;
 begin
   Result := sqlite3_malloc64(n);
+  { malloc.c:643..690 routes through dbMallocRawFinish (line 608) which
+    invokes sqlite3OomFault(db) on allocation failure. }
+  if (Result = nil) and (db <> nil) then sqlite3OomFault(db);
 end;
 
 { Port of malloc.c:586 sqlite3DbFreeNN.  When db^.pnBytesFreed is set,
@@ -2581,13 +2593,22 @@ begin
   if p <> nil then begin
     libc_memcpy(p, z, csize_t(n));
     p[n] := #0;
-  end;
+  end else if db <> nil then
+    { malloc.c:774..785 sqlite3DbStrNDup routes the alloc through
+      sqlite3DbMallocRawNN, which sets db->mallocFailed on failure
+      (dbMallocRawFinish:608).  Mirror that here so the wrapper's caller
+      sees the flag (divbug.27). }
+    sqlite3OomFault(db);
   Result := p;
 end;
 
 function sqlite3DbRealloc(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 begin
   Result := sqlite3_realloc64(p, n);
+  { malloc.c:dbReallocFinish (line 731..733) — set db->mallocFailed when the
+    realloc fails so callers that read the flag (insert.c:1097 etc.) bail
+    cleanly instead of dereferencing the unchanged stale pointer. }
+  if (Result = nil) and (db <> nil) then sqlite3OomFault(db);
 end;
 
 function sqlite3DbMallocSize(db: Psqlite3db; p: Pointer): i32;
@@ -2649,6 +2670,12 @@ end;
 procedure sqlite3OomFault(db: Psqlite3db);
 var
   p: PTsqlite3;
+  pPse, pOuter: PByte;
+  pnErr, prc:  Pi32;
+const
+  PARSE_OFF_RC          = 24;   { TParse.rc i32 }
+  PARSE_OFF_NERR        = 52;   { TParse.nErr i32 }
+  PARSE_OFF_OUTERPARSE  = 216;  { TParse.pOuterParse PParse }
 begin
   if db = nil then Exit;
   p := PTsqlite3(db);
@@ -2659,9 +2686,33 @@ begin
     { DisableLookaside: bump bDisable and clear sz }
     Inc(p^.lookaside.bDisable);
     p^.lookaside.sz := 0;
-    { Note: the C version also calls sqlite3ErrorMsg(db->pParse, ...) and
-      walks pOuterParse to bump nErr/rc.  That requires codegen and is
-      handled by callers via the per-API mallocFailed checks. }
+    { malloc.c:827..844 — propagate the fault to the active Parse chain.
+      C calls sqlite3ErrorMsg(db->pParse, "out of memory") which bumps
+      pParse->nErr and sets pParse->rc, then walks pOuterParse bumping
+      nErr/rc on each.  Without this, codegen paths like
+      sqlite3FinishCoding (build.c:267, codegen.pas:43177) reach
+      sqlite3VdbeMakeReady(NULL, pParse) with nErr=0 and segfault.
+
+      We can't link sqlite3ErrorMsg here (codegen unit), so bump the
+      fields directly via the offsets cited in TParse.  Skipping the
+      zErrMsg formatting is harmless — callers that care about the
+      message read it from sqlite3_errmsg(), which falls back to
+      "out of memory" when rc is SQLITE_NOMEM. }
+    pPse := PByte(p^.pParse);
+    if pPse <> nil then begin
+      pnErr := Pi32(pPse + PARSE_OFF_NERR);
+      prc   := Pi32(pPse + PARSE_OFF_RC);
+      Inc(pnErr^);
+      prc^ := SQLITE_NOMEM;
+      pOuter := PByte(PPointer(pPse + PARSE_OFF_OUTERPARSE)^);
+      while pOuter <> nil do begin
+        pnErr := Pi32(pOuter + PARSE_OFF_NERR);
+        prc   := Pi32(pOuter + PARSE_OFF_RC);
+        Inc(pnErr^);
+        prc^ := SQLITE_NOMEM;
+        pOuter := PByte(PPointer(pOuter + PARSE_OFF_OUTERPARSE)^);
+      end;
+    end;
   end;
 end;
 
