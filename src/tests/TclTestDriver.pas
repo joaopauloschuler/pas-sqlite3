@@ -144,6 +144,14 @@ begin
     sb.Add('  if {$tail eq "tester.tcl"} {');
     sb.Add('    return [uplevel 1 [list __orig_source $::pas_shim_dir/tester_min.tcl]]');
     sb.Add('  }');
+    { 9.4.6.q.2: route `source $testdir/permutations.test` to our baseline-only
+      stub.  Upstream all.test does `source $testdir/permutations.test`, but
+      $testdir for the upstream layout resolves to `./` relative to the
+      per-test tmpdir, so the upstream file is unreachable.  Send the lookup
+      to our stub instead. }
+    sb.Add('  if {$tail eq "permutations.test"} {');
+    sb.Add('    return [uplevel 1 [list __orig_source $::pas_shim_dir/permutations.test]]');
+    sb.Add('  }');
     sb.Add('  return [uplevel 1 __orig_source [list $path] $args]');
     sb.Add('}');
     { 9.4.divbug.3: tester_min.tcl now opens `db` on a fresh on-disk

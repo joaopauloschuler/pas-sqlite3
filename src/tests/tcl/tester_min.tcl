@@ -1028,6 +1028,118 @@ set ::MEMORY_MANAGEMENT 0
 # C ref: src/test_config.c:309..313.
 array set ::sqlite_options {default_autovacuum 0}
 
+# --------------------------------------------------------------------------
+# 9.4.6.q.2 — remaining tester.tcl / malloc_common.tcl procs surfaced by
+# the 9.4.4.d 100-test sweep.
+# --------------------------------------------------------------------------
+
+# do_not_use_codec — upstream tester.tcl:323..326.  Gates tests that are
+# incompatible with encryption codecs.  pas-sqlite3 has no codec build
+# variant, so the proc just sets the marker and resets the db (verbatim
+# port — matches upstream byte-for-byte).
+proc do_not_use_codec {} {
+  set ::do_not_use_codec 1
+  reset_db
+}
+catch {unset -nocomplain do_not_use_codec}
+
+# wal_is_wal_mode / wal_set_journal_mode / wal_check_journal_mode —
+# upstream tester.tcl:2308..2321.  Used by avtrans.test (and others) to
+# auto-promote the connection to WAL when running under the `wal`
+# permutation.  We baseline-only (permutation matrix deferred —
+# 9.4.7.e), so `wal_is_wal_mode` always returns 0 and the two callers
+# silently no-op — which is correct for the baseline run.
+proc wal_is_wal_mode {} {
+  expr {[permutation] eq "wal"}
+}
+proc wal_set_journal_mode {{db db}} {
+  if { [wal_is_wal_mode] } {
+    $db eval "PRAGMA journal_mode = WAL"
+  }
+}
+proc wal_check_journal_mode {testname {db db}} {
+  if { [wal_is_wal_mode] } {
+    $db eval { SELECT * FROM sqlite_master }
+    do_test $testname [list $db eval "PRAGMA main.journal_mode"] {wal}
+  }
+}
+# wal_is_capable — upstream tester.tcl:2323..2327.  Returns 1 if the
+# current build/permutation can drive a WAL test arm.  pas-sqlite3 has
+# WAL enabled and runs only the baseline permutation, so the guard
+# always permits.
+proc wal_is_capable {} {
+  ifcapable !wal { return 0 }
+  if {[permutation]=="journaltest"} { return 0 }
+  return 1
+}
+
+# test_set_config_pagecache / test_restore_config_pagecache — upstream
+# tester.tcl:2496..2530.  Reconfigures the SQLITE_CONFIG_PAGECACHE
+# parameters around a test and restores them afterwards.  Engine
+# support: passqlite3main.pas:2033..2036; the `sqlite3_config_pagecache`
+# Tcl shim is registered by Sqlitetest1_Init (9.4.6.q.2).
+# The upstream proc also calls `autoinstall_test_functions`; that is
+# already wired via TestModuleFunc (9.4.6.l.4) so we keep the call.
+proc test_set_config_pagecache {sz nPg} {
+  catch {db close}
+  catch {db2 close}
+  catch {db3 close}
+  sqlite3_shutdown
+  set ::old_pagecache_config [sqlite3_config_pagecache $sz $nPg]
+  sqlite3_initialize
+  catch { autoinstall_test_functions }
+  reset_db
+}
+proc test_restore_config_pagecache {} {
+  catch {db close}
+  catch {db2 close}
+  catch {db3 close}
+  sqlite3_shutdown
+  if {[info exists ::old_pagecache_config]} {
+    eval sqlite3_config_pagecache $::old_pagecache_config
+    unset ::old_pagecache_config
+  }
+  sqlite3_initialize
+  catch { autoinstall_test_functions }
+  reset_db
+}
+
+# do_faultsim_test — upstream malloc_common.tcl:121..157.  Drives a
+# matrix of fault-injection runs (oom, ioerr, cantopen, ...) of the same
+# body+test pair.  pas-sqlite3 has only the snapshot-aliases for the
+# faultsim helpers (9.4.2.g.13 SKIP); the full malloc/io fault matrix is
+# not yet wired.  Verbatim shape of the upstream proc is preserved but
+# the matrix collapses to ONE no-fault baseline pass (`-faults baseline`)
+# so tests that wrap their body in `do_faultsim_test` exercise their
+# happy-path body at least once — matching the way `aggfault.test`
+# verifies its non-error arms.  Real matrix DEFERRED to 9.4.2.g.13.
+# C ref: malloc_common.tcl:121..157.
+proc do_faultsim_test {name args} {
+  set DEFAULT(-prep)      ""
+  set DEFAULT(-body)      ""
+  set DEFAULT(-test)      ""
+  set DEFAULT(-install)   ""
+  set DEFAULT(-uninstall) ""
+  set DEFAULT(-faults)    "*"
+  set DEFAULT(-start)     1
+  set DEFAULT(-end)       0
+  fix_testname name
+  array set O [array get DEFAULT]
+  array set O $args
+  # Baseline-only fault: run prep + body once, check that body succeeds
+  # and that -test (if any) passes.  This mirrors `do_one_faultsim_test`
+  # with iFail=0 (no injection).  Errors in -body propagate as test
+  # failures via do_test.
+  uplevel #0 $O(-prep)
+  set ::testrc [catch [list uplevel #0 $O(-body)] ::testresult]
+  set ::testnfail 0
+  if {$O(-test) ne ""} {
+    do_test $name.baseline [list uplevel #0 $O(-test) \; set {}] {}
+  } else {
+    do_test $name.baseline [list set ::testrc] 0
+  }
+}
+
 # Open `db` on a fresh on-disk ./test.db at shim load time, mirroring
 # upstream tester.tcl:553..556.  The driver no longer issues its own
 # `sqlite3 db :memory:`.

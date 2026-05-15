@@ -783,6 +783,187 @@ begin
   Result := TCL_OK;
 end;
 
+{ --------------------------------------------------------------------------
+  9.4.6.q.2 — additional test1.c / test_malloc.c Tcl commands.
+
+    * sqlite3_create_aggregate DB     test1.c:1318..1367  (test_create_aggregate)
+        Registers `x_count` (0/1-arg) and `legacy_count` aggregate UDFs.
+        Step/finalize bodies port test1.c:1270..1315 verbatim — including
+        the "value of 40 handed to x_count" UTF-8 step-error and the
+        "x_count totals to 42" finalize-error used by aggerror.test.
+    * sqlite3_config_pagecache SIZE N test_malloc.c:874..915 (test_config_pagecache)
+        Calls sqlite3_config(SQLITE_CONFIG_PAGECACHE, …); returns the
+        prior {szPage nPage} pair.  Engine support already in place
+        (passqlite3main.pas:2033..2036).
+    * sqlite3_initialize              test_config.c — thin wrapper.
+    * sqlite3_shutdown                test_config.c — thin wrapper.
+  -------------------------------------------------------------------------- }
+
+{ test1.c:1266..1268 — aggregate context for x_count. }
+type
+  Pt1CountCtx = ^Tt1CountCtx;
+  Tt1CountCtx = record
+    n: cint;
+  end;
+
+{ test1.c:1270..1291 — t1CountStep.  Argless: bump n.  1-arg: bump n
+  unless arg is NULL; emit SQLITE_ERROR if v=40 (UTF-8). }
+procedure t1CountStep(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  p: Pt1CountCtx;
+  v: cint;
+begin
+  p := Pt1CountCtx(sqlite3_aggregate_context(pCtx, SizeOf(Tt1CountCtx)));
+  if ((argc = 0) or (sqlite3_value_type(argv^) <> SQLITE_NULL))
+     and (p <> nil) then
+    Inc(p^.n);
+  if argc > 0 then
+  begin
+    v := sqlite3_value_int(argv^);
+    if v = 40 then
+      sqlite3_result_error(pCtx,
+        PChar('value of 40 handed to x_count'), -1);
+    { v=41 UTF-16 arm omitted — SQLITE_OMIT_UTF16 not exercised here. }
+  end;
+end;
+
+{ test1.c:1292..1302 — t1CountFinalize.  Emit error on total=42. }
+procedure t1CountFinalize(pCtx: Psqlite3_context); cdecl;
+var
+  p: Pt1CountCtx;
+begin
+  p := Pt1CountCtx(sqlite3_aggregate_context(pCtx, SizeOf(Tt1CountCtx)));
+  if p <> nil then
+  begin
+    if p^.n = 42 then
+      sqlite3_result_error(pCtx, PChar('x_count totals to 42'), -1)
+    else
+      sqlite3_result_int(pCtx, p^.n);
+  end;
+end;
+
+{ test1.c:1305..1315 — legacy_count step (no-op) + finalize using
+  the deprecated sqlite3_aggregate_count() API. }
+procedure legacyCountStep(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+begin
+  { no-op — matches test1.c:1310. }
+  if (pCtx = nil) or (argc < 0) or (argv = nil) then ;
+end;
+
+procedure legacyCountFinalize(pCtx: Psqlite3_context); cdecl;
+begin
+  sqlite3_result_int(pCtx, sqlite3_aggregate_count(pCtx));
+end;
+
+{ test1.c:1337..1367 — test_create_aggregate: register x_count (0/1 arg)
+  and legacy_count(0 arg) on DB.  Surfaces the rc symbolic name. }
+function test_create_aggregate(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+type
+  TArgvArr = array[0..16] of PAnsiChar;
+  PArgvArr = ^TArgvArr;
+var
+  db: PTsqlite3;
+  rc: cint;
+  av: PArgvArr;
+begin
+  av := PArgvArr(argv);
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av^[0], PChar(' FILENAME"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av^[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_function(db, PChar('x_count'), 0, SQLITE_UTF8, nil,
+          nil, @t1CountStep, @t1CountFinalize);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('x_count'), 1, SQLITE_UTF8, nil,
+            nil, @t1CountStep, @t1CountFinalize);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('legacy_count'), 0, SQLITE_ANY,
+            nil, nil, @legacyCountStep, @legacyCountFinalize);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
+{ test_malloc.c:884..915 — sqlite3_config_pagecache SIZE N.
+  Sets the page-cache memory buffer.  The "static buf" trick from C is
+  preserved via a unit-level var so successive calls do not leak.
+  Negative SIZE → buffer=NULL (sets sz=0, cnt=0).  Returns the prior
+  {szPage nPage} pair as a list. }
+var
+  g_PagecacheBuf: Pointer = nil;
+
+function test_config_pagecache(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  sz, N: cint;
+  pRes:  PTclObj;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('SIZE N'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @sz) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @N) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if g_PagecacheBuf <> nil then
+  begin
+    FreeMem(g_PagecacheBuf);
+    g_PagecacheBuf := nil;
+  end;
+  { Return prior values BEFORE applying new ones (matches C order). }
+  pRes := Tcl_NewObj;
+  Tcl_ListObjAppendElement(nil, pRes,
+    Tcl_NewIntObj(sqlite3GlobalConfig.szPage));
+  Tcl_ListObjAppendElement(nil, pRes,
+    Tcl_NewIntObj(sqlite3GlobalConfig.nPage));
+  Tcl_SetObjResult(interp, pRes);
+  if sz < 0 then
+    sqlite3_config(SQLITE_CONFIG_PAGECACHE, Pointer(nil), 0, 0)
+  else
+  begin
+    if (sz > 0) and (N > 0) then
+    begin
+      GetMem(g_PagecacheBuf, PtrUInt(sz) * PtrUInt(N));
+      sqlite3_config(SQLITE_CONFIG_PAGECACHE, g_PagecacheBuf, sz, N);
+    end
+    else
+      sqlite3_config(SQLITE_CONFIG_PAGECACHE, Pointer(nil), sz, N);
+  end;
+  Result := TCL_OK;
+end;
+
+{ test_config.c / tclsqlite.c — thin wrappers around the engine
+  lifecycle entry points; used by test_set_config_pagecache. }
+function test_initialize(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_initialize;
+  Result := TCL_OK;
+  if (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+function test_shutdown(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_shutdown;
+  Result := TCL_OK;
+  if (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -808,6 +989,16 @@ begin
     @test_transfer_bind, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_backup'),
     @backupTestInit, nil, nil);
+  { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
+    test1.c:9082 / test_malloc.c:1487. }
+  Tcl_CreateCommand(interp, PChar('sqlite3_create_aggregate'),
+    @test_create_aggregate, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pagecache'),
+    @test_config_pagecache, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_initialize'),
+    @test_initialize, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_shutdown'),
+    @test_shutdown, nil, nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
     regression tests (between.test's `queryplan` proc, etc.) can
     verify the optimizer correctly elides ORDER BY sorts. }
