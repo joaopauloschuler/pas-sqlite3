@@ -521,14 +521,40 @@ acceptance gate for this section.
     Done: command-dispatch NRE trampoline (`Tcl_NRCreateCommand` +
     `DbObjCmdNRE` + `DbUseNre` version probe) + the NRE externs in
     `PasTclBridge.pas`.  Non-NRE paths left intact.
-  - [ ] **9.4.2.x.1** NRE continuations — convert `DbEvalArm` and
+  - [~] **9.4.2.x.1** NRE continuations — convert `DbEvalArm` and
     `DbTransactionArm` script bodies from the recursive
     `Tcl_EvalObjEx` path to genuine `Tcl_NRAddCallback` /
     `Tcl_NREvalObj` continuations (`DbEvalNextCmd` / `DbTransPostCmd`
-    as `TTclNRPostProc`s).  Requires first rewriting the Pascal eval
-    loop into the `DbEvalContext` continuation machinery.  C ref:
-    `tclsqlite.c` `DbEvalNextCmd` / `DbTransPostCmd`.
-    (DbUseNre, DbEvalNextCmd).
+    as `TTclNRPostProc`s).  C ref: `tclsqlite.c` `DbEvalNextCmd` /
+    `DbTransPostCmd`.
+    Done (transaction half): added `DbTransPostCmdNRE` matching the
+    `TTclNRPostProc` shape (tclsqlite.c:1308..1348) and wired
+    `DbTransactionArm` to take the NRE branch (tclsqlite.c:4002..4004)
+    when `DbUseNre` is true.  Recursive `Tcl_EvalObjEx` path retained as
+    the `!DbUseNre` fallback (tclsqlite.c:4005..4006).
+    Eval half left as sub-arms because the Pascal `DbEvalArm` differs
+    structurally from upstream and cannot be wholesale-converted (per
+    9.4.2.x.1's "surface the gap" guidance):
+    - [ ] **9.4.2.x.1.a** Port `SqlPreparedStmt` cache +
+      `dbPrepareAndBind` / `dbReleaseStmt` / `dbReleaseStmtCache`
+      (tclsqlite.c:1356..1614).  Required so the eval continuation
+      can own a long-lived `pPreStmt` across NRE re-entries instead of
+      finalising at the end of each Pascal stack frame.
+    - [ ] **9.4.2.x.1.b** Port `addDatabaseRef` / `delDatabaseRef`
+      (tclsqlite.c around 1308/1686/1842) — the continuation
+      lifecycle straddles arbitrary nested `vwait`s so the SqliteDb*
+      must be refcount-pinned.
+    - [ ] **9.4.2.x.1.c** Introduce a Pascal `TDbEvalContext` record
+      mirroring tclsqlite.c:1626..1636 and split the existing
+      `DbEvalArm` row loop into `dbEvalInit` / `dbEvalStep` /
+      `dbEvalRowInfo` / `dbEvalFinalize` / `dbEvalColumnValue`
+      (tclsqlite.c:1669..1876) keeping behaviour identical.
+    - [ ] **9.4.2.x.1.d** Implement `DbEvalNextCmd: TTclNRPostProc`
+      (tclsqlite.c:1915..2005) and wire the 3/4/5-arg
+      script-body branch of `DbEvalArm` (tclsqlite.c:3340..3360)
+      through `Tcl_NRAddCallback` + `Tcl_NREvalObj`.  Keep the
+      2-arg (`db eval SQL`) flat-list path on the direct
+      `sEval`-on-stack code (tclsqlite.c:3262..3320).
 
 - [~] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
   `tclsh` against each manifest entry with the port's shim

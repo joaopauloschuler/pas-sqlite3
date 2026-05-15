@@ -146,6 +146,7 @@ procedure DbDeleteCmd(clientData: TClientData); cdecl; forward;
 procedure DbSqlFunc(pCtx: Psqlite3_context; argc: cint;
   argv: PPointer); cdecl; forward;
 procedure DbSqlFuncDelete(pUser: Pointer); cdecl; forward;
+function DbUseNre: Boolean; forward;
 
 { Pointer-arithmetic helper: objv is a flat `Tcl_Obj* const* `; treat
   it as a base pointer + index*sizeof(pointer).  Equivalent to objv[i]
@@ -2415,12 +2416,27 @@ begin
   Result := rc;
 end;
 
+{ DbTransPostCmdNRE — NRE-shaped wrapper around DbTransPostCmd.  Matches
+  upstream's DbTransPostCmd Tcl_NRPostProc signature (tclsqlite.c:1308..1348)
+  used as a continuation by tclsqlite.c:4003.  data[0] is the SqliteDb*;
+  `result` is the body-eval rc supplied by the NRE trampoline. }
+function DbTransPostCmdNRE(data: PClientDataArray; interp: PTclInterp;
+  result: cint): cint; cdecl;
+var
+  pDb: PSqliteDb;
+begin
+  pDb := PSqliteDb(data^);
+  Result := DbTransPostCmd(pDb, interp, result);
+end;
+
 { DbTransactionArm — port of the DB_TRANSACTION arm (tclsqlite.c:3958..4009).
   `db transaction ?TYPE? SCRIPT` — opens a transaction (or, if nested,
   a SAVEPOINT), evaluates SCRIPT, then commits/releases on success or
   rolls back on error.  Nesting depth tracked via pDb^.nTransaction.
-  The NRE machinery from upstream is out of scope; we use the simple
-  recursive Tcl_EvalObjEx form. }
+  When the linked Tcl supports NRE we wire the body via
+  Tcl_NRAddCallback(DbTransPostCmdNRE, …) + Tcl_NREvalObj
+  (tclsqlite.c:4002..4004); otherwise we keep the simple recursive
+  Tcl_EvalObjEx form (tclsqlite.c:4005..4006). }
 function DbTransactionArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
 const
@@ -2467,9 +2483,19 @@ begin
   end;
   Inc(pDb^.nTransaction);
 
-  { Evaluate the body, then commit (or rollback) the transaction. }
+  { Evaluate the body, then commit (or rollback) the transaction.  Port of
+    tclsqlite.c:3996..4007 — under NRE, schedule DbTransPostCmd as a
+    continuation and hand the body off to Tcl_NREvalObj so nested vwait
+    can unwind cleanly; otherwise fall back to the recursive form. }
   pDb^.interp := interp;
-  Result := DbTransPostCmd(pDb, interp, Tcl_EvalObjEx(interp, pScript, 0));
+  if DbUseNre then
+  begin
+    Tcl_NRAddCallback(interp, @DbTransPostCmdNRE,
+      TClientData(pDb), nil, nil, nil);
+    Result := Tcl_NREvalObj(interp, pScript, 0);
+  end
+  else
+    Result := DbTransPostCmd(pDb, interp, Tcl_EvalObjEx(interp, pScript, 0));
 end;
 
 { DbOneColumnExistsArm — port of the shared DB_EXISTS / DB_ONECOLUMN arm
