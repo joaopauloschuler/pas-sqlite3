@@ -9764,6 +9764,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                                    bNestedAgg);
           FindNestedAggToOuter(pInner^.pHaving, p^.pSrc, pInner^.pSrc,
                                bNestedAgg);
+          { 9.4.divbug.24.b.3 — aggregate function may also live in the
+            inner subquery's WHERE clause, e.g. aggnested-3.11:
+              (SELECT count(*) FROM t2 WHERE value2=max(value1))
+            without this scan, max(value1) stays TK_FUNCTION and the
+            inner codegen emits OP_Function dispatch on an aggregate
+            FuncDef whose xFunc=NULL → SIGSEGV. }
+          FindNestedAggToOuter(pInner^.pWhere, p^.pSrc, pInner^.pSrc,
+                               bNestedAgg);
           if bNestedAgg then
             p^.selFlags := p^.selFlags or SF_Aggregate;
         end;
@@ -26479,6 +26487,8 @@ begin
   Assert(pAggInfo^.iFirstReg > 0);
   if pParse^.nErr <> 0 then Exit;
   pAggInfo^.directMode := 1;
+  regHit := 0;
+  addrHitTest := 0;
   for i := 0 to pAggInfo^.nFunc - 1 do
   begin
     addrNext := 0;
@@ -26605,7 +26615,20 @@ begin
           if pCollAgg <> nil then break;
         end;
         if pCollAgg = nil then pCollAgg := pParse^.db^.pDfltColl;
-        sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
+        { select.c:6929 — allocate a fresh regHit before OP_CollSeq when
+          we have accumulator columns to populate.  Min/max AggStep sets
+          r[regHit]=1 when this row is NOT the new min/max; the
+          accumulator-column re-read loop below gates on regHit so the
+          bare-column captures fire only on the row that becomes the
+          new min/max (otherwise we'd capture a column from the last
+          row scanned, mis-pairing it with the aggregate value — bug
+          9.4.divbug.24.b: aggnested-3.3). }
+        if (regHit = 0) and (pAggInfo^.nAccumulator > 0) then
+        begin
+          Inc(pParse^.nMem);
+          regHit := pParse^.nMem;
+        end;
+        sqlite3VdbeAddOp4(v, OP_CollSeq, regHit, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
       end;
       sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
         pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
@@ -26616,13 +26639,12 @@ begin
     if addrNext <> 0 then sqlite3VdbeResolveLabel(v, addrNext);
     if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
   end;
-  { regHit guard — select.c:6943..6951.  When the caller passes regAcc
-    (the GROUP BY arm's iUseFlag), and there is at least one accumulator
-    column to populate, emit OP_If regHit, addrHitTest so the column
-    re-evaluation is skipped on subsequent rows of the same group (the
-    accumulator already holds the values from the first row). }
-  regHit := 0;
-  addrHitTest := 0;
+  { regHit guard — select.c:6943..6951.  If a NEEDCOLL (min/max) arm
+    above already allocated a dedicated regHit, use it (so the bare
+    column read fires only on the row that becomes the new min/max).
+    Otherwise fall back to regAcc — the GROUP BY iUseFlag — so the
+    column re-evaluation is skipped on subsequent rows of the same
+    group (accumulator already holds first-row values). }
   if (regHit = 0) and (pAggInfo^.nAccumulator > 0) then regHit := regAcc;
   if regHit <> 0 then
     addrHitTest := sqlite3VdbeAddOp1(v, OP_If, regHit);
