@@ -848,7 +848,7 @@ acceptance gate for this section.
 - [X] **9.4.divbug.16** `affinity3.test` segfault — `sqlite3WhereBegin` skipped opening a RIGHT JOIN table cursor scanned index-only; ported the `JT_LTORJ|JT_RIGHT` gate (where.c:7252).
 - [X] **9.4.divbug.17** Subquery-nested aggregate evaluated row-wise — ported the resolver's outward AggInfo-binding arm (resolve.c:1337..1352).  aggnested-3.x residue tracked as divbug.24.
 - [X] **9.4.divbug.18** WITHOUT ROWID vtab `xUpdate` — DELETE now emits `OP_Column` for argv[0]; `updateVirtualTable` routed through `sqlite3WhereBegin` so `xBestIndex` runs.
-- [ ] **9.4.divbug.19** Table-qualified `rowid` alias (`t1.rowid`, `sp.rowid`) not resolved → `no such column` (boundary3, autoindex5).  See DIVERGENCES.md.
+- [X] **9.4.divbug.19** Table-qualified `rowid` alias (`t1.rowid`, `sp.rowid`) — ported the qualified-case rowid arm from lookupName (resolve.c:471..503 + 623..638) into the TK_DOT branch of `ResolveExpr`: when `sqlite3ColumnIndex` misses and `zCol` ∈ {rowid,oid,_rowid_} and the matched source `HasRowid`, bind `iColumn=-1` / AFF_INTEGER.  boundary3.test now PASSES (1896 sub-tests).  Commit `3fd04ef`.
 - [ ] **9.4.divbug.20** BETWEEN-on-indexed-column planner picks `nosort` and also drops matching rows (between).  See DIVERGENCES.md.
 - [ ] **9.4.divbug.21** Cross-connection EXCLUSIVE lock not detected; `BEGIN IMMEDIATE` succeeds instead of `database is locked` (busy).  See DIVERGENCES.md.
 - [ ] **9.4.divbug.22** Large row payload / `PRAGMA page_size=65536` overflow handling segfaults (bigrow, btree01).  See DIVERGENCES.md.
