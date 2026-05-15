@@ -1153,16 +1153,18 @@ type
     idxFlags:      u32;         { 4 bytes @ 100: packed bitfields }
     colNotIdxed:   Bitmask;     { 8 bytes @ 104 }
     {$IFDEF SQLITE_ENABLE_STAT4}
-    { 10.1.42.b.7.prereq.a — STAT4 tail (sqliteInt.h:2819..2825).
+    { 10.1.42.b.7.prereq.a/c.6 — STAT4 tail (sqliteInt.h:2819..2826).
       Layout: nSample/mxSample/nSampleCol pack into 12 bytes (with 4-byte
-      tail pad), aAvgEq and aSample are 8-byte pointers — total 32 bytes
-      contributed at default 8-byte struct alignment. }
+      tail pad), then 4x 8-byte pointers/u64 — total 48 bytes contributed
+      at default 8-byte struct alignment. }
     nSample:     i32;            { 4 bytes — # elements in aSample[] }
     mxSample:    i32;            { 4 bytes — slots allocated to aSample[] }
     nSampleCol:  i32;            { 4 bytes — width of IndexSample.anEq[] etc. }
     _padStat4:   i32;            { 4 bytes — natural alignment before pointers }
     aAvgEq:      ^u64;           { 8 bytes — tRowcnt avg-nEq for keys not in aSample }
     aSample:     PIndexSample;   { 8 bytes — left-most-key sample vector }
+    aiRowEst:    ^u64;           { 8 bytes — non-log stat1 row counts per prefix (prereq.c.6) }
+    nRowEst0:    u64;            { 8 bytes — non-log total rows in index (prereq.c.6) }
     {$ENDIF}
   end;
 
@@ -39221,6 +39223,292 @@ begin
   end;
 end;
 
+{$IFDEF SQLITE_ENABLE_STAT4}
+type
+  PRowCntArr = ^TRowCntArr;
+  TRowCntArr = array[0..1024*1024-1] of u64;
+
+{ Local tRowcnt array decoder — variant of decodeIntArray that writes
+  raw u64 counts (not LogEst) into a tRowcnt vector.  Mirrors the
+  STAT4 arm of analyze.c:decodeIntArray() (decodeIntArray with non-nil
+  aOut and nil pIndex). }
+procedure decodeStat4IntArray(z: PAnsiChar; nOut: i32; aOut: PRowCntArr);
+var
+  i: i32;
+  v: u64;
+  c: AnsiChar;
+begin
+  if (z = nil) or (aOut = nil) then Exit;
+  i := 0;
+  while (z^ <> #0) and (i < nOut) do
+  begin
+    v := 0;
+    while True do
+    begin
+      c := z^;
+      if (c < '0') or (c > '9') then Break;
+      v := v * 10 + u64(Ord(c) - Ord('0'));
+      Inc(z);
+    end;
+    aOut^[i] := v;
+    if z^ = ' ' then Inc(z);
+    Inc(i);
+  end;
+end;
+
+{ findIndexOrPrimaryKey — port of analyze.c:1742.
+  Look up an index by name; if none found and zName names a WITHOUT ROWID
+  table, return its synthesised PRIMARY KEY index. }
+function findIndexOrPrimaryKey(db: PTsqlite3; zName: PAnsiChar;
+                               zDb: PAnsiChar): PIndex2;
+var
+  pIxFind: PIndex2;
+  pTabFind: PTable2;
+begin
+  pIxFind := sqlite3FindIndex(db, zName, zDb);
+  if pIxFind = nil then
+  begin
+    pTabFind := sqlite3FindTable(db, zName, zDb);
+    if (pTabFind <> nil) and (not HasRowid(pTabFind)) then
+      pIxFind := sqlite3PrimaryKeyIndex(pTabFind);
+  end;
+  Result := pIxFind;
+end;
+
+{ initAvgEq — port of analyze.c:1683.
+  Populate pIdx^.aAvgEq[] from the per-sample anEq/anDLt vectors. }
+procedure initAvgEq(pIxAvg: PIndex2);
+var
+  aSampleArr: PIndexSample;
+  pFinal:     PIndexSample;
+  pSampI:     PIndexSample;
+  pSampIp1:   PIndexSample;
+  iCol:       i32;
+  nCol:       i32;
+  nSampleEx:  i32;
+  iLoop:      i32;
+  sumEq:      u64;
+  avgEq:      u64;
+  nRow:       u64;
+  nSum100:    i64;
+  nDist100:   i64;
+begin
+  if pIxAvg = nil then Exit;
+  aSampleArr := pIxAvg^.aSample;
+  if aSampleArr = nil then Exit;
+  pFinal := PIndexSample(PByte(aSampleArr) +
+              (pIxAvg^.nSample - 1) * SizeOf(TIndexSample));
+  nCol := 1;
+  if pIxAvg^.nSampleCol > 1 then
+  begin
+    { stat4 data: aAvgEq[nCol] for the last column is always 1. }
+    nCol := pIxAvg^.nSampleCol - 1;
+    pIxAvg^.aAvgEq[nCol] := 1;
+  end;
+  for iCol := 0 to nCol - 1 do
+  begin
+    nSampleEx := pIxAvg^.nSample;
+    sumEq := 0;
+    avgEq := 0;
+    if (pIxAvg^.aiRowEst = nil)
+       or (iCol >= pIxAvg^.nKeyCol)
+       or (pIxAvg^.aiRowEst[iCol + 1] = 0) then
+    begin
+      nRow := pFinal^.anLt[iCol];
+      nDist100 := i64(100) * i64(pFinal^.anDLt[iCol]);
+      Dec(nSampleEx);
+    end
+    else
+    begin
+      nRow := pIxAvg^.aiRowEst[0];
+      nDist100 := (i64(100) * i64(pIxAvg^.aiRowEst[0])) div
+                  i64(pIxAvg^.aiRowEst[iCol + 1]);
+    end;
+    pIxAvg^.nRowEst0 := nRow;
+
+    nSum100 := 0;
+    for iLoop := 0 to nSampleEx - 1 do
+    begin
+      pSampI := PIndexSample(PByte(aSampleArr) + iLoop * SizeOf(TIndexSample));
+      if iLoop = pIxAvg^.nSample - 1 then
+      begin
+        sumEq := sumEq + pSampI^.anEq[iCol];
+        nSum100 := nSum100 + 100;
+      end
+      else
+      begin
+        pSampIp1 := PIndexSample(PByte(aSampleArr) +
+                     (iLoop + 1) * SizeOf(TIndexSample));
+        if pSampI^.anDLt[iCol] <> pSampIp1^.anDLt[iCol] then
+        begin
+          sumEq := sumEq + pSampI^.anEq[iCol];
+          nSum100 := nSum100 + 100;
+        end;
+      end;
+    end;
+
+    if (nDist100 > nSum100) and (sumEq < nRow) then
+      avgEq := u64((i64(100) * i64(nRow - sumEq)) div (nDist100 - nSum100));
+    if avgEq = 0 then avgEq := 1;
+    pIxAvg^.aAvgEq[iCol] := avgEq;
+  end;
+end;
+
+{ loadStatTbl — port of analyze.c:1767.
+  Two-pass loader of sqlite_stat4: first pass counts samples per index and
+  allocates aSample[]+aAvgEq[] in one block; second pass decodes neq/nlt/
+  ndlt vectors and copies the sample blob. }
+function loadStatTbl(db: PTsqlite3; zSql1: PAnsiChar; zSql2: PAnsiChar;
+                     zDb: PAnsiChar): i32;
+var
+  rc:        i32;
+  pStmt:     PVdbe;
+  zSql:      PAnsiChar;
+  pPrevIdx:  PIndex2;
+  pSampSlot: PIndexSample;
+  zIndex:    PAnsiChar;
+  pIxL:      PIndex2;
+  nSamp:     i32;
+  nIdxCol:   i32;
+  nCol:      i32;
+  nByte:     u64;
+  iLoop:     u64;
+  pSpace:    ^u64;
+  pPtr:      PByte;
+  nBlob:     i32;
+  pBlobSrc:  Pointer;
+begin
+  pStmt := nil;
+  pPrevIdx := nil;
+
+  if not Assigned(passqlite3vdbe.gPrepareV2) then
+  begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
+  zSql := sqlite3MPrintf(db, zSql1, [Pointer(zDb)]);
+  if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  rc := passqlite3vdbe.gPrepareV2(db, zSql, -1, PPointer(@pStmt), nil);
+  sqlite3DbFree(db, zSql);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  while sqlite3_step(pStmt) = SQLITE_ROW do
+  begin
+    nIdxCol := 1;
+    zIndex := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zIndex = nil then Continue;
+    nSamp := sqlite3_column_int(pStmt, 1);
+    pIxL := findIndexOrPrimaryKey(db, zIndex, zDb);
+    if pIxL = nil then Continue;
+    if pIxL^.aSample <> nil then
+      Continue;  { same index named twice }
+    if (not HasRowid(pIxL^.pTable))
+       and ((pIxL^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY) then
+      nIdxCol := pIxL^.nKeyCol
+    else
+      nIdxCol := pIxL^.nColumn;
+    pIxL^.nSampleCol := nIdxCol;
+    pIxL^.mxSample   := nSamp;
+    { ROUND8(sizeof(IndexSample) * nSamp) + 3*nIdxCol*nSamp*tRowcnt
+      + nIdxCol*tRowcnt (for aAvgEq).  tRowcnt = u64. }
+    nByte := (u64(SizeOf(TIndexSample)) * u64(nSamp) + 7) and not u64(7);
+    nByte := nByte + u64(SizeOf(u64)) * u64(nIdxCol) * 3 * u64(nSamp);
+    nByte := nByte + u64(nIdxCol) * u64(SizeOf(u64));
+    pIxL^.aSample := PIndexSample(sqlite3DbMallocZero(db, nByte));
+    if pIxL^.aSample = nil then
+    begin
+      sqlite3_finalize(pStmt);
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    pPtr := PByte(pIxL^.aSample);
+    Inc(pPtr, (u64(SizeOf(TIndexSample)) * u64(nSamp) + 7) and not u64(7));
+    pSpace := Pointer(pPtr);
+    pIxL^.aAvgEq := pSpace;
+    Inc(pSpace, nIdxCol);
+    pIxL^.pTable^.tabFlags := pIxL^.pTable^.tabFlags or TF_HasStat4;
+    for iLoop := 0 to u64(nSamp) - 1 do
+    begin
+      pSampSlot := PIndexSample(PByte(pIxL^.aSample) +
+                     iLoop * SizeOf(TIndexSample));
+      pSampSlot^.anEq := pSpace;  Inc(pSpace, nIdxCol);
+      pSampSlot^.anLt := pSpace;  Inc(pSpace, nIdxCol);
+      pSampSlot^.anDLt := pSpace; Inc(pSpace, nIdxCol);
+    end;
+  end;
+  rc := sqlite3_finalize(pStmt);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  zSql := sqlite3MPrintf(db, zSql2, [Pointer(zDb)]);
+  if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  pStmt := nil;
+  rc := passqlite3vdbe.gPrepareV2(db, zSql, -1, PPointer(@pStmt), nil);
+  sqlite3DbFree(db, zSql);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  while sqlite3_step(pStmt) = SQLITE_ROW do
+  begin
+    zIndex := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zIndex = nil then Continue;
+    pIxL := findIndexOrPrimaryKey(db, zIndex, zDb);
+    if pIxL = nil then Continue;
+    if pIxL^.nSample >= pIxL^.mxSample then
+      Continue;  { duplicate-named index overflowed allocation }
+    nCol := pIxL^.nSampleCol;
+    if pIxL <> pPrevIdx then
+    begin
+      initAvgEq(pPrevIdx);
+      pPrevIdx := pIxL;
+    end;
+    pSampSlot := PIndexSample(PByte(pIxL^.aSample) +
+                   u64(pIxL^.nSample) * SizeOf(TIndexSample));
+    decodeStat4IntArray(PAnsiChar(sqlite3_column_text(pStmt, 1)),
+                        nCol, PRowCntArr(pSampSlot^.anEq));
+    decodeStat4IntArray(PAnsiChar(sqlite3_column_text(pStmt, 2)),
+                        nCol, PRowCntArr(pSampSlot^.anLt));
+    decodeStat4IntArray(PAnsiChar(sqlite3_column_text(pStmt, 3)),
+                        nCol, PRowCntArr(pSampSlot^.anDLt));
+
+    { Copy sample blob + 8 trailing zero bytes (per analyze.c:1876..1891). }
+    nBlob := sqlite3_column_bytes(pStmt, 4);
+    pSampSlot^.n := nBlob;
+    pSampSlot^.p := sqlite3DbMallocZero(db, u64(nBlob) + 8);
+    if pSampSlot^.p = nil then
+    begin
+      sqlite3_finalize(pStmt);
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    if nBlob > 0 then
+    begin
+      pBlobSrc := sqlite3_column_blob(pStmt, 4);
+      if pBlobSrc <> nil then
+        Move(pBlobSrc^, pSampSlot^.p^, nBlob);
+    end;
+    Inc(pIxL^.nSample);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  if rc = SQLITE_OK then initAvgEq(pPrevIdx);
+  Result := rc;
+end;
+
+{ loadStat4 — port of analyze.c:1903.
+  Drive loadStatTbl with the two stat4 SELECTs when sqlite_stat4 exists
+  and the SQLITE_Stat4 optimisation is enabled. }
+function loadStat4(db: PTsqlite3; zDb: PAnsiChar): i32;
+var
+  pStat4Tab: PTable2;
+begin
+  Result := SQLITE_OK;
+  if not OptimizationEnabled(db, SQLITE_Stat4) then Exit;
+  pStat4Tab := sqlite3FindTable(db, 'sqlite_stat4', zDb);
+  if pStat4Tab = nil then Exit;
+  if pStat4Tab^.eTabType <> TABTYP_NORM then Exit;
+  Result := loadStatTbl(db,
+    'SELECT idx,count(*) FROM %Q.sqlite_stat4 GROUP BY idx COLLATE nocase',
+    'SELECT idx,neq,nlt,ndlt,sample FROM %Q.sqlite_stat4',
+    zDb);
+end;
+{$ENDIF}
+
 { sqlite3AnalysisLoad — port of analyze.c:1942.
   Clear any prior stat1 flags on every Table/Index in pSchema, drive the
   sqlite_stat1 SELECT through gStat1Exec when the table exists, then
@@ -39252,13 +39540,20 @@ begin
     pElem := PHashElem(pElem^.next);
   end;
 
-  { Clear hasStat1 (bit 7 of idxFlags) on every index. }
+  { Clear hasStat1 (bit 7 of idxFlags) on every index.  Under STAT4 also
+    drop any cached sample arrays before reloading. }
   pElem := pSchema^.idxHash.first;
   while pElem <> nil do
   begin
     pIdx := PIndex2(pElem^.data);
     if pIdx <> nil then
+    begin
       pIdx^.idxFlags := pIdx^.idxFlags and (not u16(1 shl 7));
+      {$IFDEF SQLITE_ENABLE_STAT4}
+      sqlite3DeleteIndexSamples(db, pIdx);
+      pIdx^.aSample := nil;
+      {$ENDIF}
+    end;
     pElem := PHashElem(pElem^.next);
   end;
 
@@ -39292,6 +39587,32 @@ begin
       sqlite3DefaultRowEst(pIdx);
     pElem := PHashElem(pElem^.next);
   end;
+
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { Load STAT4 samples (analyze.c:1992..2003).  DisableLookaside is the
+    Inc(bDisable) macro pair in C; loadStatTbl asserts it.  After the
+    load, aiRowEst (the per-prefix non-log row-count vector used only by
+    initAvgEq) is released — it's owned by sqlite3_malloc, not lookaside. }
+  if Result = SQLITE_OK then
+  begin
+    Inc(db^.lookaside.bDisable);
+    Result := loadStat4(db, db^.aDb[iDb].zDbSName);
+    Dec(db^.lookaside.bDisable);
+  end;
+  pElem := pSchema^.idxHash.first;
+  while pElem <> nil do
+  begin
+    pIdx := PIndex2(pElem^.data);
+    if (pIdx <> nil) and (pIdx^.aiRowEst <> nil) then
+    begin
+      sqlite3_free(pIdx^.aiRowEst);
+      pIdx^.aiRowEst := nil;
+    end;
+    pElem := PHashElem(pElem^.next);
+  end;
+
+  if Result = SQLITE_NOMEM then sqlite3OomFault(db);
+  {$ENDIF}
 end;
 
 { build.c:599 — collapse the aDb[] array, dropping any detached entries

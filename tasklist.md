@@ -1157,10 +1157,21 @@ partial landings cannot silently no-op.
       with non-STAT4 stub arms preserving the unit-interface signatures.
       Default: 99/100 (TestFuzzDiff pre-existing). STAT4=1: compiles clean
       (3 pre-existing fails unchanged).
-    - [ ] **10.1.42.b.7.prereq.c.6** Port `loadStat4` / `loadStatTbl` /
+    - [X] **10.1.42.b.7.prereq.c.6** Port `loadStat4` / `loadStatTbl` /
       `initAvgEq` / `findIndexOrPrimaryKey` reader side (analyze.c, the
       deferred half of prereq.b).  Required so STAT4 samples written by
       ANALYZE are loaded into `pIdx^.aSample[]` at schema-init.
+      Outcome: landed in src/passqlite3codegen.pas with the four reader
+      fns + `decodeStat4IntArray` raw-tRowcnt helper, all gated under
+      `{$IFDEF SQLITE_ENABLE_STAT4}`.  Extended TIndex STAT4 tail by 16
+      bytes to add `aiRowEst` / `nRowEst0` (sqliteInt.h:2825..2826) — pre-
+      existing T28 SizeOf(TIndex)=112 assertion in TestWhereBasic remains
+      stale under STAT4 (same FAIL count as baseline: 3).  Wired into
+      `analysisLoadTrampoline`: clears `aSample` per index on entry,
+      bumps `lookaside.bDisable` around `loadStat4`, then frees per-idx
+      `aiRowEst`.  Default build: TestExplainParity 1026/1026, 99/100
+      (TestFuzzDiff pre-existing).  STAT4=1: compiles clean, regression
+      identical to prereq.c.5 baseline (3 pre-existing fails).
     - [ ] **10.1.42.b.7.prereq.c.7** Port `whereKeyStats`
       (where.c:1718..1978) into `src/passqlite3codegen.pas`.  Binary
       search over `aSample[]` returning interpolated `aStat[3]`.
