@@ -13728,10 +13728,13 @@ begin
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3Stat4Column / sqlite3Stat4ProbeFree — STAT4 stubs (Phase 6)
+  sqlite3Stat4Column / sqlite3Stat4ProbeFree — real bodies (vdbemem.c:2149..2210)
+  STAT4-gated in C; non-STAT4 build keeps a stub form so the unit-interface
+  forward decls (vdbe.pas:1655..1657) and the codegen call site link cleanly.
   ----------------------------------------------------------------------- }
 function sqlite3Stat4Column(db: Psqlite3; pRec: Pointer; nRec: i32;
                             iCol: i32; var ppVal: Psqlite3_value): i32;
+{$IFDEF SQLITE_ENABLE_STAT4}
 var
   t:     u32;
   nHdr:  u32;
@@ -13741,7 +13744,9 @@ var
   i:     i32;
   a:     Pu8;
   pM:    PMem;
+{$ENDIF}
 begin
+{$IFDEF SQLITE_ENABLE_STAT4}
   t := 0; nHdr := 0; iHdr := 0; szField := 0;
   a := Pu8(pRec);
   pM := PMem(ppVal);
@@ -13774,6 +13779,13 @@ begin
   sqlite3VdbeSerialGet(@a[iFstield - szField], t, pM);
   pM^.enc := vdbeDbEnc(db);
   Result := SQLITE_OK;
+{$ELSE}
+  { Non-STAT4 build: stat4 sample blobs are never produced, so this is
+    unreachable in practice.  Return OK with *ppVal untouched. }
+  ppVal := ppVal; { silence FPC unused-out hint }
+  if (db = nil) or (pRec = nil) or (nRec = 0) or (iCol = 0) then ;
+  Result := SQLITE_OK;
+{$ENDIF}
 end;
 
 { sqlite3Stat4ProbeFree — port of vdbemem.c:2194.
@@ -13784,6 +13796,7 @@ end;
   record itself.  Dead-code in the default build (gated on SQLITE_ENABLE_STAT4
   in the C reference) but matches C 1:1 once where.c stat4 paths are wired. }
 procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+{$IFDEF SQLITE_ENABLE_STAT4}
 var
   p:        PUnpackedRecord;
   nCol:     i32;
@@ -13792,7 +13805,9 @@ var
   i:        i32;
   db:       Psqlite3;
   pKeyInfo: Pointer;
+{$ENDIF}
 begin
+{$IFDEF SQLITE_ENABLE_STAT4}
   if pRec = nil then Exit;
   p := PUnpackedRecord(pRec);
   pKeyInfo := p^.pKeyInfo;
@@ -13817,6 +13832,12 @@ begin
     sqlite3DbFreeNN(db, pRec)
   else
     sqlite3DbFree(nil, pRec);
+{$ELSE}
+  { Non-STAT4 build: STAT4 probe records are never built so the only callers
+    (where.c:4303 path, gated in C) never reach this in practice.  Keep a
+    NULL-tolerant stub so the where.c port can call it unconditionally. }
+  if pRec = nil then ;
+{$ENDIF}
 end;
 
 { btreeMovetoIndexImpl — registered into btree.pas as the index-cursor arm

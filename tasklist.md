@@ -1150,9 +1150,13 @@ partial landings cannot silently no-op.
       per-column zColAff lookup mirror C inlined IndexColumnAffinity.
       Default build: 99/100 (TestFuzzDiff pre-existing).
       STAT4=1: compiles clean.
-    - [ ] **10.1.42.b.7.prereq.c.5** Replace `sqlite3Stat4Column`
+    - [X] **10.1.42.b.7.prereq.c.5** Replace `sqlite3Stat4Column`
       (vdbemem.c:2149..2190) + `sqlite3Stat4ProbeFree` (:2194..2210)
       Phase-6 stubs in `src/passqlite3vdbe.pas` with real bodies.
+      Bodies were already real-form; gated under `{$IFDEF SQLITE_ENABLE_STAT4}`
+      with non-STAT4 stub arms preserving the unit-interface signatures.
+      Default: 99/100 (TestFuzzDiff pre-existing). STAT4=1: compiles clean
+      (3 pre-existing fails unchanged).
     - [ ] **10.1.42.b.7.prereq.c.6** Port `loadStat4` / `loadStatTbl` /
       `initAvgEq` / `findIndexOrPrimaryKey` reader side (analyze.c, the
       deferred half of prereq.b).  Required so STAT4 samples written by
