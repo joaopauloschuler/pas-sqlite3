@@ -1090,14 +1090,52 @@ partial landings cannot silently no-op.
       convention).  **Deferred to prereq.c**: `loadStat4` /
       `loadStatTbl` / `initAvgEq` / `findIndexOrPrimaryKey` (reader
       side; consumed by where.c estimators which already land there).
-    - [ ] **10.1.42.b.7.prereq.c** Consumers (rolls in 10.1.42.b.7
+    - [~] **10.1.42.b.7.prereq.c** Consumers (rolls in 10.1.42.b.7
       itself).  Port vdbemem.c STAT4 layer (ValueNewStat4Ctx + valueNew +
       valueFromFunction + stat4ValueFromExpr + 2 publics + valueFromExpr
       STAT4 branches).  Replace `sqlite3Stat4ProbeFree` / `sqlite3Stat4Column`
       stubs with ported bodies.  Then port `whereKeyStats` + the 3
       estimators (`whereRangeSkipScanEst` / `whereEqualScanEst` /
       `whereInScanEst`) in `passqlite3codegen.pas`; drop the 4 WHERETRACE
-      0x20 arms at the host sites.  ~950 LOC.
+      0x20 arms at the host sites.  ~950 LOC.  **Decomposed 2026-05-15**
+      into 9 sub-arms (.1..9), each independently committable.  All gated
+      under `{$IFDEF SQLITE_ENABLE_STAT4}`; default build must remain
+      byte-identical at every sub-arm boundary.
+    - [ ] **10.1.42.b.7.prereq.c.1** Port `ValueNewStat4Ctx` struct
+      (vdbemem.c:1611..1622) + `valueNew` STAT4-aware factory
+      (vdbemem.c:1632..1700) into `src/passqlite3vdbe.pas` (or wherever
+      `sqlite3ValueNew` already lives).  Default build untouched (STAT4
+      branch hidden behind ifdef).  Smoke: STAT4=1 build still compiles +
+      regression 99/100 green.
+    - [ ] **10.1.42.b.7.prereq.c.2** Port `valueFromFunction` STAT4 arm
+      (vdbemem.c:1701..1799) — recursive const-folding through
+      `sqlite3VdbeMemSetStr`/`sqlite3ValueApplyAffinity` to pre-evaluate
+      function calls in stat4 probe inputs.
+    - [ ] **10.1.42.b.7.prereq.c.3** Port `valueFromExpr` STAT4 branches
+      + `stat4ValueFromExpr` helper (vdbemem.c:1800..2080) — the dispatch
+      that turns a constant Expr tree into a `sqlite3_value*` usable by
+      whereKeyStats.
+    - [ ] **10.1.42.b.7.prereq.c.4** Port public entries
+      `sqlite3Stat4ProbeSetValue` (vdbemem.c:2082..2117) +
+      `sqlite3Stat4ValueFromExpr` (:2127..2147).  These are the API
+      surface where.c calls.
+    - [ ] **10.1.42.b.7.prereq.c.5** Replace `sqlite3Stat4Column`
+      (vdbemem.c:2149..2190) + `sqlite3Stat4ProbeFree` (:2194..2210)
+      Phase-6 stubs in `src/passqlite3vdbe.pas` with real bodies.
+    - [ ] **10.1.42.b.7.prereq.c.6** Port `loadStat4` / `loadStatTbl` /
+      `initAvgEq` / `findIndexOrPrimaryKey` reader side (analyze.c, the
+      deferred half of prereq.b).  Required so STAT4 samples written by
+      ANALYZE are loaded into `pIdx^.aSample[]` at schema-init.
+    - [ ] **10.1.42.b.7.prereq.c.7** Port `whereKeyStats`
+      (where.c:1718..1978) into `src/passqlite3codegen.pas`.  Binary
+      search over `aSample[]` returning interpolated `aStat[3]`.
+    - [ ] **10.1.42.b.7.prereq.c.8** Port `whereRangeSkipScanEst`
+      (where.c:1980..2030) + re-enable its WHERETRACE 0x20 arm at host
+      site (where.c:2002, 2006).
+    - [ ] **10.1.42.b.7.prereq.c.9** Port `whereEqualScanEst`
+      (where.c:2274..2330) + `whereInScanEst` (:2338..2380); re-enable
+      the 4 deferred WHERETRACE 0x20 arms in `whereLoopAddBtree` host
+      sites.  Closes 10.1.42.b.7 + prereq.c.
     - [X] **10.1.42.b.8** Port `wherePathName` + `sqlite3Where{Term,Clause,Loop}Print` + `showAllWhereLoops` (where.c:2375..2520/5512..5519/6469..6488). Debug-only `cId`+`rStarDelta` carved from pre-existing _pad58..63 in TWhereLoop. Re-enabled 7 deferred arms (closes b.4/b.5/b.6 + WHERETRACE_ALL_LOOPS at where.c:7103). Archive.
     - [X] **10.1.42.a.6.1** `havingToWhere` + `havingToWhereExprCb` (select.c:7047) + `sqlite3ExprIsConstantOrGroupBy`; wired SF_Aggregate+GROUP-BY (8422..8431). 0x100.
     - [X] **10.1.42.a.6.2** `countOfViewOptimization` (select.c:7128..7204); wired after propagateConstants (7924..7930). 0x200. SQLITE_CountOfView added.
