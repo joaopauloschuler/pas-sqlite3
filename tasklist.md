@@ -996,7 +996,33 @@ partial landings cannot silently no-op.
       landed, gate the new helpers + 10.1.42.b.7 behind
       `{$IFDEF SQLITE_ENABLE_STAT4}` and add the env-var wiring in
       `build.sh` (mirror the `SQLITE_ENABLE_STMT_SCANSTATUS` pattern).
-      Complexity: L.
+      Complexity: L.  **Decomposed 2026-05-15** into three sub-arms
+      (a/b/c) — survey commit none, ~2000-2500 LOC total; default-build
+      byte-identical parity preserved at every sub-arm boundary.
+    - [ ] **10.1.42.b.7.prereq.a** Record-shape + scaffolding.  Add
+      `SQLITE_ENABLE_STAT4` to `src/passqlite3.inc` (default off) +
+      `STAT4=1` arm to `src/tests/build.sh`.  Port the bare `IndexSample`
+      record (analyze.c near :1660) and the 5 `Index2` STAT4 fields
+      (`aSample`, `nSample`, `mxSample`, `nSampleCol`, `aAvgEq`), all
+      `{$IFDEF SQLITE_ENABLE_STAT4}`-gated.  Audit `SizeOf(Index2)` /
+      `FillChar(pIdx^, SizeOf...)` call sites (`sqlite3AllocateIndexObject`
+      central).  Verify byte-identical default-build TestExplainParity +
+      TestSQLCorpus.  ~250 LOC + audit.
+    - [ ] **10.1.42.b.7.prereq.b** analyze.c STAT4 collection.  Port
+      StatSample/StatAccum STAT4 fields, sampleClear / SetRowid×2 /
+      Copy, sampleIsBetter, sampleInsert STAT4 branches, statInit STAT4
+      alloc arm, statPush / statGet STAT4 branches, sqlite3DeleteIndexSamples
+      real body, loadStat4 reader, analyzeOneTable STAT4 column wiring.
+      ~900 LOC.  STAT4 build smoke: `STAT4=1 src/tests/build.sh` + ANALYZE
+      on test table emits sqlite_stat4 rows.
+    - [ ] **10.1.42.b.7.prereq.c** Consumers (rolls in 10.1.42.b.7
+      itself).  Port vdbemem.c STAT4 layer (ValueNewStat4Ctx + valueNew +
+      valueFromFunction + stat4ValueFromExpr + 2 publics + valueFromExpr
+      STAT4 branches).  Replace `sqlite3Stat4ProbeFree` / `sqlite3Stat4Column`
+      stubs with ported bodies.  Then port `whereKeyStats` + the 3
+      estimators (`whereRangeSkipScanEst` / `whereEqualScanEst` /
+      `whereInScanEst`) in `passqlite3codegen.pas`; drop the 4 WHERETRACE
+      0x20 arms at the host sites.  ~950 LOC.
     - [X] **10.1.42.b.8** Port `wherePathName` + `sqlite3Where{Term,Clause,Loop}Print` + `showAllWhereLoops` (where.c:2375..2520/5512..5519/6469..6488). Debug-only `cId`+`rStarDelta` carved from pre-existing _pad58..63 in TWhereLoop. Re-enabled 7 deferred arms (closes b.4/b.5/b.6 + WHERETRACE_ALL_LOOPS at where.c:7103). Archive.
     - [X] **10.1.42.a.6.1** `havingToWhere` + `havingToWhereExprCb` (select.c:7047) + `sqlite3ExprIsConstantOrGroupBy`; wired SF_Aggregate+GROUP-BY (8422..8431). 0x100.
     - [X] **10.1.42.a.6.2** `countOfViewOptimization` (select.c:7128..7204); wired after propagateConstants (7924..7930). 0x200. SQLITE_CountOfView added.
