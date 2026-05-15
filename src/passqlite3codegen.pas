@@ -403,6 +403,9 @@ type
   PWhereMaskSet = ^TWhereMaskSet;
   PTable2   = ^TTable;   { upgraded from Pointer stub — TTable defined below }
   PIndex2   = ^TIndex;   { upgraded from Pointer stub — TIndex defined below }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  PIndexSample = ^TIndexSample;   { 10.1.42.b.7.prereq.a — STAT4 sample header }
+  {$ENDIF}
   PColumn   = ^TColumn;
   PPColumn  = ^PColumn;
   PKeyInfo2 = ^TKeyInfo;  { TKeyInfo defined below; avoids shadowing vdbe.pas PKeyInfo=Pointer }
@@ -1102,10 +1105,33 @@ type
     aHx:        array[0..15] of u8; { 16 bytes @ 104 }
   end;
 
-  { --- TIndex (sizeof=112) --- }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { --- TIndexSample (analyze.c:2856..2862; sizeof=32 with tRowcnt=u64) ---
+    10.1.42.b.7.prereq.a — bare record only; collection arms in prereq.b.
+      void    *p          @ 0    sampled record bytes (sqlite3DbMalloc'd)
+      int      n          @ 8    record length
+      tRowcnt *anEq       @ 16   per-prefix equality counts  (tRowcnt = u64)
+      tRowcnt *anLt       @ 24   per-prefix less-than counts
+      tRowcnt *anDLt      @ 32   per-prefix distinct-less-than counts
+    Trailing pointer triplet (anEq/anLt/anDLt) lives in a single allocation
+    sized 3*nSampleCol*sizeof(tRowcnt); prereq.b wires that. }
+  TIndexSample = record
+    p:     Pointer;   { 8 bytes @ 0  — sampled record blob }
+    n:     i32;       { 4 bytes @ 8  — record length }
+    _pad12: i32;      { 4 bytes @ 12 — natural alignment before pointer trio }
+    anEq:  ^u64;      { 8 bytes @ 16 — tRowcnt = u64 in this build }
+    anLt:  ^u64;      { 8 bytes @ 24 }
+    anDLt: ^u64;      { 8 bytes @ 32 }
+  end;
+  {$ENDIF}
+
+  { --- TIndex (sizeof=112 default; +40 under SQLITE_ENABLE_STAT4) --- }
   { Bitfield group at offset 100 (4-byte bitfield storage unit):
     idxType(2)+bUnordered(1)+uniqNotNull(1)+isResized(1)+isCovering(1)+
-    noSkipScan(1)+hasStat1(1)+bNoQuery(1)+bAscKeyBug(1)+bHasVCol(1)+bHasExpr(1) }
+    noSkipScan(1)+hasStat1(1)+bNoQuery(1)+bAscKeyBug(1)+bHasVCol(1)+bHasExpr(1)
+    STAT4 tail (sqliteInt.h:2819..2825) appears after colNotIdxed when
+    -dSQLITE_ENABLE_STAT4 is in flight; default-off keeps the layout at
+    exactly 112 bytes (TestWhereBasic T28). }
   TIndex = record
     zName:         PAnsiChar;   { 8 bytes @ 0 }
     aiColumn:      Pi16;        { 8 bytes @ 8 }
@@ -1126,6 +1152,18 @@ type
     _pad99:        u8;          { 1 byte  @ 99 (padding before bitfield unit) }
     idxFlags:      u32;         { 4 bytes @ 100: packed bitfields }
     colNotIdxed:   Bitmask;     { 8 bytes @ 104 }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { 10.1.42.b.7.prereq.a — STAT4 tail (sqliteInt.h:2819..2825).
+      Layout: nSample/mxSample/nSampleCol pack into 12 bytes (with 4-byte
+      tail pad), aAvgEq and aSample are 8-byte pointers — total 32 bytes
+      contributed at default 8-byte struct alignment. }
+    nSample:     i32;            { 4 bytes — # elements in aSample[] }
+    mxSample:    i32;            { 4 bytes — slots allocated to aSample[] }
+    nSampleCol:  i32;            { 4 bytes — width of IndexSample.anEq[] etc. }
+    _padStat4:   i32;            { 4 bytes — natural alignment before pointers }
+    aAvgEq:      ^u64;           { 8 bytes — tRowcnt avg-nEq for keys not in aSample }
+    aSample:     PIndexSample;   { 8 bytes — left-most-key sample vector }
+    {$ENDIF}
   end;
 
   { --- TKeyInfo (sizeof=32; aColl[FLEXARRAY] follows) --- }

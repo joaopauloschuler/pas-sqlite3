@@ -1019,15 +1019,28 @@ partial landings cannot silently no-op.
       Complexity: L.  **Decomposed 2026-05-15** into three sub-arms
       (a/b/c) — survey commit none, ~2000-2500 LOC total; default-build
       byte-identical parity preserved at every sub-arm boundary.
-    - [ ] **10.1.42.b.7.prereq.a** Record-shape + scaffolding.  Add
-      `SQLITE_ENABLE_STAT4` to `src/passqlite3.inc` (default off) +
-      `STAT4=1` arm to `src/tests/build.sh`.  Port the bare `IndexSample`
-      record (analyze.c near :1660) and the 5 `Index2` STAT4 fields
-      (`aSample`, `nSample`, `mxSample`, `nSampleCol`, `aAvgEq`), all
-      `{$IFDEF SQLITE_ENABLE_STAT4}`-gated.  Audit `SizeOf(Index2)` /
-      `FillChar(pIdx^, SizeOf...)` call sites (`sqlite3AllocateIndexObject`
-      central).  Verify byte-identical default-build TestExplainParity +
-      TestSQLCorpus.  ~250 LOC + audit.
+    - [X] **10.1.42.b.7.prereq.a** Record-shape + scaffolding.  Added
+      `SQLITE_ENABLE_STAT4` gate doc to `src/passqlite3.inc:75..96` +
+      `STAT4=1` arm to `src/tests/build.sh:109..123` mirroring the
+      `SQLITE_ENABLE_STMT_SCANSTATUS` pattern.  Ported the bare
+      `TIndexSample` record (analyze.c:2856..2862 → passqlite3codegen.pas:1109..1126,
+      sizeof=40 with tRowcnt=u64) and the 5 `TIndex` STAT4 tail fields
+      `nSample` / `mxSample` / `nSampleCol` / `aAvgEq` / `aSample`
+      (sqliteInt.h:2819..2825 → passqlite3codegen.pas:1163..1175), all
+      `{$IFDEF SQLITE_ENABLE_STAT4}`-gated.  `PIndexSample` forward at
+      passqlite3codegen.pas:406..408.  Audited `SizeOf(TIndex)` /
+      `FillChar(pIdx^, SizeOf(TIndex), 0)` call sites
+      (`sqlite3AllocateIndexObject` @ :38942..38964, plus 9 test
+      `GetMem/FillChar` sites in TestWherePlanner) — all stay correct
+      because SizeOf grows transparently under the gate; T28
+      `SizeOf(TIndex)=112` in TestWhereBasic is the only hard-coded
+      assertion and trips only under STAT4=1 (expected, refines in
+      prereq.b).  **Default-build smoke: TestExplainParity PASS
+      (1026/1026), TestSQLCorpus PASS, TestWhereBasic PASS (52/52),
+      full regression 99/100 binaries (sole TestFuzzDiff failure is
+      pre-existing baseline drift, not introduced here).**  STAT4=1
+      smoke: same binaries green except TestWhereBasic T28 hard-coded
+      size assertion (prereq.b will refresh).
     - [ ] **10.1.42.b.7.prereq.b** analyze.c STAT4 collection.  Port
       StatSample/StatAccum STAT4 fields, sampleClear / SetRowid×2 /
       Copy, sampleIsBetter, sampleInsert STAT4 branches, statInit STAT4

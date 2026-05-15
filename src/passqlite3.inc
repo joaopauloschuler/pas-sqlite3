@@ -71,3 +71,25 @@
   WHERETRACE bodies are themselves `#ifdef SQLITE_DEBUG`; defining the
   macro here flips them on, leaving it undefined leaves them inert.
 }
+
+{
+  10.1.42.b.7.prereq.a — SQLITE_ENABLE_STAT4 gate for the Pascal port.
+
+  Default builds (src/tests/build.sh without STAT4=1 in the environment)
+  leave SQLITE_ENABLE_STAT4 *undefined*, so every
+  `{$IFDEF SQLITE_ENABLE_STAT4} ... {$ENDIF}` consumer block compiles
+  out to a silent no-op — preserving non-STAT4 parity with upstream's
+  plain `./configure && make` build.  In particular TIndex stays
+  exactly 112 bytes and TestWhereBasic's T28 assertion still passes.
+
+  To opt in, run:
+
+      STAT4=1 ./src/tests/build.sh
+
+  build.sh forwards that to fpc as `-dSQLITE_ENABLE_STAT4`, which
+  flips on the IndexSample-aware TIndex layout plus (once landed in
+  prereq.b/.c) the analyze.c collection arms and where.c estimators.
+
+  Mirrors upstream sqliteInt.h:2819..2825 (TIndex STAT4 tail) and
+  analyze.c:2856..2862 (IndexSample record).
+}
