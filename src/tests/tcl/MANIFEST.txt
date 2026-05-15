@@ -133,7 +133,7 @@ tcl-feature	../sqlite3/test/changes2.test
 tcl-feature	../sqlite3/test/check.test
 tcl-internal	../sqlite3/test/checkfault.test
 tcl-feature	../sqlite3/test/chunksize.test
-tcl-internal	../sqlite3/test/cksumvfs.test
+tcl-feature	../sqlite3/test/cksumvfs.test
 tcl-feature	../sqlite3/test/close.test
 tcl-feature	../sqlite3/test/closure01.test
 tcl-feature	../sqlite3/test/coalesce.test
@@ -169,7 +169,7 @@ tcl-feature	../sqlite3/test/corruptB.test
 tcl-feature	../sqlite3/test/corruptC.test
 tcl-perf	../sqlite3/test/corruptD.test
 tcl-feature	../sqlite3/test/corruptE.test
-tcl-internal	../sqlite3/test/corruptF.test
+tcl-feature	../sqlite3/test/corruptF.test
 tcl-feature	../sqlite3/test/corruptG.test
 tcl-feature	../sqlite3/test/corruptH.test
 tcl-feature	../sqlite3/test/corruptI.test
@@ -188,7 +188,7 @@ tcl-feature	../sqlite3/test/crash3.test
 tcl-feature	../sqlite3/test/crash4.test
 tcl-feature	../sqlite3/test/crash5.test
 tcl-feature	../sqlite3/test/crash6.test
-tcl-internal	../sqlite3/test/crash7.test
+tcl-feature	../sqlite3/test/crash7.test
 tcl-feature	../sqlite3/test/crash8.test
 tcl-feature	../sqlite3/test/crashM.test
 tcl-feature	../sqlite3/test/createtab.test
@@ -316,7 +316,7 @@ tcl-feature	../sqlite3/test/fts3aux2.test
 tcl-feature	../sqlite3/test/fts3b.test
 tcl-feature	../sqlite3/test/fts3c.test
 tcl-feature	../sqlite3/test/fts3comp1.test
-tcl-internal	../sqlite3/test/fts3conf.test
+tcl-feature	../sqlite3/test/fts3conf.test
 tcl-feature	../sqlite3/test/fts3corrupt.test
 tcl-feature	../sqlite3/test/fts3corrupt2.test
 tcl-feature	../sqlite3/test/fts3corrupt3.test
@@ -429,7 +429,7 @@ tcl-feature	../sqlite3/test/incrblob3.test
 tcl-feature	../sqlite3/test/incrblob4.test
 tcl-internal	../sqlite3/test/incrblob_err.test
 tcl-feature	../sqlite3/test/incrblobfault.test
-tcl-internal	../sqlite3/test/incrcorrupt.test
+tcl-feature	../sqlite3/test/incrcorrupt.test
 tcl-feature	../sqlite3/test/incrvacuum.test
 tcl-feature	../sqlite3/test/incrvacuum2.test
 tcl-feature	../sqlite3/test/incrvacuum3.test
@@ -460,10 +460,10 @@ tcl-feature	../sqlite3/test/instr.test
 tcl-feature	../sqlite3/test/instrfault.test
 tcl-feature	../sqlite3/test/intarray.test
 tcl-feature	../sqlite3/test/interrupt.test
-tcl-internal	../sqlite3/test/interrupt2.test
+tcl-feature	../sqlite3/test/interrupt2.test
 tcl-feature	../sqlite3/test/intpkey.test
 tcl-feature	../sqlite3/test/intreal.test
-tcl-internal	../sqlite3/test/io.test
+tcl-feature	../sqlite3/test/io.test
 tcl-feature	../sqlite3/test/ioerr.test
 tcl-feature	../sqlite3/test/ioerr2.test
 tcl-feature	../sqlite3/test/ioerr3.test
@@ -628,7 +628,7 @@ tcl-feature	../sqlite3/test/pagesize.test
 tcl-feature	../sqlite3/test/parser1.test
 tcl-feature	../sqlite3/test/pcache.test
 tcl-feature	../sqlite3/test/pcache2.test
-tcl-internal	../sqlite3/test/pendingrace.test
+tcl-feature	../sqlite3/test/pendingrace.test
 tcl-feature	../sqlite3/test/percentile.test
 tcl-internal	../sqlite3/test/permutations.test
 tcl-feature	../sqlite3/test/pragma.test
@@ -763,7 +763,7 @@ tcl-feature	../sqlite3/test/snapshot.test
 tcl-feature	../sqlite3/test/snapshot2.test
 tcl-feature	../sqlite3/test/snapshot3.test
 tcl-feature	../sqlite3/test/snapshot4.test
-tcl-internal	../sqlite3/test/snapshot_fault.test
+tcl-feature	../sqlite3/test/snapshot_fault.test
 tcl-feature	../sqlite3/test/snapshot_up.test
 tcl-feature	../sqlite3/test/soak.test
 tcl-feature	../sqlite3/test/softheap1.test
@@ -780,7 +780,7 @@ tcl-perf	../sqlite3/test/speed2.test
 tcl-perf	../sqlite3/test/speed3.test
 tcl-perf	../sqlite3/test/speed4.test
 tcl-perf	../sqlite3/test/speed4p.test
-tcl-internal	../sqlite3/test/spellfix.test
+tcl-feature	../sqlite3/test/spellfix.test
 tcl-feature	../sqlite3/test/spellfix2.test
 tcl-feature	../sqlite3/test/spellfix3.test
 tcl-feature	../sqlite3/test/spellfix4.test
@@ -788,7 +788,7 @@ tcl-feature	../sqlite3/test/sqldiff1.test
 tcl-feature	../sqlite3/test/sqllimits1.test
 tcl-feature	../sqlite3/test/sqllog.test
 tcl-feature	../sqlite3/test/starschema1.test
-tcl-internal	../sqlite3/test/stat.test
+tcl-feature	../sqlite3/test/stat.test
 tcl-internal	../sqlite3/test/statfault.test
 tcl-feature	../sqlite3/test/stmt.test
 tcl-feature	../sqlite3/test/stmtrand.test
@@ -1090,7 +1090,7 @@ tcl-internal	../sqlite3/test/walckptnoop.test
 tcl-internal	../sqlite3/test/walcksum.test
 tcl-feature	../sqlite3/test/walcrash.test
 tcl-internal	../sqlite3/test/walcrash2.test
-tcl-internal	../sqlite3/test/walcrash3.test
+tcl-feature	../sqlite3/test/walcrash3.test
 tcl-internal	../sqlite3/test/walcrash4.test
 tcl-internal	../sqlite3/test/walfault.test
 tcl-internal	../sqlite3/test/walfault2.test

@@ -35,7 +35,11 @@ TEST_DIR=$(CDPATH= cd -- "$TEST_DIR" && pwd)
 # Note: the *_common.tcl source-lines are flagged because those harnesses
 # themselves wrap private hooks (malloc fault-injection, lock primitives,
 # incremental-blob test ops).
-INTERNAL_PATTERN='sqlite3_test_control|register_dbstat_vtab|sqlite3_db_status|optimization_control|sqlite3_stmt_status|db_save|db_save_and_close|sqlite3InvokeBusyHandler|sqlite3_test_|malloc_common\.tcl|lock_common\.tcl|incrblob_common\.tcl'
+#
+# 9.4.4.h retag: dropped `register_dbstat_vtab`, `db_save`, `db_save_and_close`
+# from the trigger set — they landed via 9.4.6.b (dbstat Tcl registration) and
+# 9.4.6.q.2 (db_save / db_save_and_close procs in tester_min.tcl).
+INTERNAL_PATTERN='sqlite3_test_control|sqlite3_db_status|optimization_control|sqlite3_stmt_status|sqlite3InvokeBusyHandler|sqlite3_test_|malloc_common\.tcl|lock_common\.tcl|incrblob_common\.tcl'
 
 # Perf-content markers (looked at file body, not just name).
 PERF_PATTERN='set BIG |bigtest|performance'

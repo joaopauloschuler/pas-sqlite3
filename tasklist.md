@@ -603,11 +603,18 @@ acceptance gate for this section.
   - [ ] **9.4.4.f** Broaden sweep to 500 tests.
   - [ ] **9.4.4.g** Full 946 tcl-feature sweep; gate aims for
     `pas-strict diverged == 0` per 9.4.8.c.
-  - [ ] **9.4.4.h** tcl-internal re-evaluation — the 225 tagged
-    `tcl-internal` may include false-positives (heuristic grep
-    flagged on a single occurrence).  Re-walk after 9.4.6 lands;
-    promote any that no longer touch private symbols to
-    `tcl-feature`.
+  - [X] **9.4.4.h** tcl-internal re-evaluation — re-walked the 225
+    `tcl-internal` rows against the trimmed trigger set (dropped
+    `register_dbstat_vtab` / `db_save` / `db_save_and_close`, now
+    ported via 9.4.6.b + 9.4.6.q.2).  Promoted **12** tests to
+    `tcl-feature` (cksumvfs, corruptF, crash7, fts3conf,
+    incrcorrupt, interrupt2, io, pendingrace, snapshot_fault,
+    spellfix, stat, walcrash3).  10-test smoke probe under
+    `bin/TclTestDriver`: 5 PASS / 5 FAIL / 0 CRASH (FAILs
+    are deeper-layer divergences, not the missing-symbol short-
+    circuits that earned the original `tcl-internal` tag).
+    Updated `inventory.sh` INTERNAL_PATTERN to match.  Manifest
+    totals: 947→959 tcl-feature, 225→213 tcl-internal, 17 tcl-perf.
 
 - [ ] **9.4.5** Linux-only nightly.  Wire into CI as a *nightly*
   job (not per-commit — the Tcl suite is ~hours).  PR gate stays
