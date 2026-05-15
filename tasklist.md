@@ -1101,12 +1101,24 @@ partial landings cannot silently no-op.
       into 9 sub-arms (.1..9), each independently committable.  All gated
       under `{$IFDEF SQLITE_ENABLE_STAT4}`; default build must remain
       byte-identical at every sub-arm boundary.
-    - [ ] **10.1.42.b.7.prereq.c.1** Port `ValueNewStat4Ctx` struct
+    - [X] **10.1.42.b.7.prereq.c.1** Port `ValueNewStat4Ctx` struct
       (vdbemem.c:1611..1622) + `valueNew` STAT4-aware factory
       (vdbemem.c:1632..1700) into `src/passqlite3vdbe.pas` (or wherever
       `sqlite3ValueNew` already lives).  Default build untouched (STAT4
       branch hidden behind ifdef).  Smoke: STAT4=1 build still compiles +
       regression 99/100 green.
+      **Outcome 2026-05-15**: landed at `src/passqlite3vdbe.pas` —
+      `TValueNewStat4Ctx`/`PValueNewStat4Ctx` declared unconditionally
+      (so signatures compile in both builds; only the STAT4 body
+      consumes them), private `valueNew` placed right after
+      `sqlite3ValueNew`.  Codegen-private dependencies (`pIdx^.nColumn`
+      + `sqlite3KeyInfoOfIndex`) reached via new `gKeyInfoOfIndex` hook
+      (declared under `{$IFDEF SQLITE_ENABLE_STAT4}`); trampoline wiring
+      lands in c.5.  Default build: TestExplainParity 1026/1026, only
+      pre-existing TestFuzzDiff fails.  STAT4=1: compiles clean; the
+      three known STAT4=1 regressions (T28 TIndex sizeof, TestFuzzDiff,
+      TestSQLCorpus) are pre-existing from prereq.a/b, not introduced
+      here.
     - [ ] **10.1.42.b.7.prereq.c.2** Port `valueFromFunction` STAT4 arm
       (vdbemem.c:1701..1799) — recursive const-folding through
       `sqlite3VdbeMemSetStr`/`sqlite3ValueApplyAffinity` to pre-evaluate

@@ -1578,6 +1578,14 @@ type
                                 enc: u8; affinity: u8;
                                 out ppVal: Psqlite3_value): i32;
   TKeyInfoUnrefFn    = procedure(p: Pointer);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  { Trampoline for the codegen-private pair (pIdx^.nColumn + sqlite3KeyInfoOfIndex)
+    used by valueNew()'s STAT4 arm.  Returns the index's nColumn (rowid included);
+    writes the *unreffed* KeyInfo pointer (or nil on OOM) into ppKeyInfo.  vdbe.pas
+    cannot reach PIndex2/PKeyInfo2 layouts directly. }
+  TKeyInfoOfIndexFn  = function(pParse: PParse; pIdx: PIndex;
+                                out ppKeyInfo: Pointer): i32;
+{$ENDIF}
   TPrepareV2Fn       = function(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                                 ppStmt: PPointer;
                                 pzTail: PPointer): i32; cdecl;
@@ -1601,6 +1609,12 @@ var
                                                  needs PExpr layout. }
   gKeyInfoUnref:           TKeyInfoUnrefFn;  { wired by passqlite3codegen —
                                                 releases per-BtShared KeyInfo cache. }
+{$IFDEF SQLITE_ENABLE_STAT4}
+  gKeyInfoOfIndex:         TKeyInfoOfIndexFn;  { wired by passqlite3codegen —
+                                                  STAT4 valueNew dependency.
+                                                  Returns pIdx^.nColumn; out
+                                                  ppKeyInfo := KeyInfo (unref'd). }
+{$ENDIF}
   gPrepareV2:              TPrepareV2Fn;     { wired by passqlite3main — used
                                                 by pragmaVtab xFilter to prepare
                                                 the synthesised "PRAGMA name(arg)"
@@ -1638,6 +1652,22 @@ function  sqlite3ValueFromExpr(db: Psqlite3; pExpr: Pointer;
 function  sqlite3Stat4Column(db: Psqlite3; pRec: Pointer; nRec: i32;
                              iCol: i32; var ppVal: Psqlite3_value): i32;
 procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+
+type
+  { ValueNewStat4Ctx — vdbemem.c:1614..1619.  Context object passed by
+    sqlite3Stat4ProbeSetValue() through to valueNew().  ppRec points to the
+    caller's UnpackedRecord* slot so valueNew can allocate-on-first-use.
+    iVal is the column index within that record being populated.
+    Type declared unconditionally so valueNew()'s signature compiles in both
+    builds; the body's STAT4 arm is the only consumer (non-STAT4 path passes
+    nil and falls through to sqlite3ValueNew). }
+  PValueNewStat4Ctx = ^TValueNewStat4Ctx;
+  TValueNewStat4Ctx = record
+    pParse: PParse;
+    pIdx:   PIndex;
+    ppRec:  ^PUnpackedRecord;
+    iVal:   i32;
+  end;
 function  sqlite3VdbeChangeEncoding(pMem: PMem; desiredEnc: i32): i32;
 function  sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
 function  sqlite3VdbeMemHandleBom(pMem: PMem): i32;
@@ -13523,6 +13553,71 @@ begin
     p^.db    := db;
   end;
   Result := Psqlite3_value(p);
+end;
+
+{ valueNew — port of vdbemem.c:1632..1672.  STAT4-aware factory: if pCtx is
+  nil, falls through to sqlite3ValueNew(db); otherwise allocates (on first
+  call) the UnpackedRecord that will be returned to the caller of
+  sqlite3Stat4ProbeSetValue, and returns a pointer to its iVal'th aMem cell.
+  Static in C — kept file-private here too.  STAT4 body gated behind the
+  ifdef; default build collapses to the plain sqlite3ValueNew path. }
+function valueNew(db: Psqlite3; p: PValueNewStat4Ctx): Psqlite3_value;
+{$IFDEF SQLITE_ENABLE_STAT4}
+var
+  pRec:     PUnpackedRecord;
+  pIdx:     PIndex;
+  nByte:    i64;
+  i:        i32;
+  nCol:     i32;
+  pKeyInfo: Pointer;
+  aMm:      PMem;
+{$ENDIF}
+begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+  if p <> nil then begin
+    pRec := p^.ppRec^;
+    if pRec = nil then begin
+      pIdx := p^.pIdx;
+      if Assigned(gKeyInfoOfIndex) then
+        nCol := gKeyInfoOfIndex(p^.pParse, pIdx, pKeyInfo)
+      else begin
+        pKeyInfo := nil;
+        nCol := 0;
+      end;
+      nByte := i64(SizeOf(TMem)) * nCol + ROUND8(SizeOf(TUnpackedRecord));
+      pRec := PUnpackedRecord(sqlite3DbMallocZero(db, u64(nByte)));
+      if pRec <> nil then begin
+        pRec^.pKeyInfo := pKeyInfo;
+        if pRec^.pKeyInfo <> nil then begin
+          { C asserts pKeyInfo->nAllField==nCol and pKeyInfo->enc==ENC(db);
+            elided here (codegen owns those fields). }
+          aMm := PMem(PByte(pRec) + ROUND8(SizeOf(TUnpackedRecord)));
+          pRec^.aMem := aMm;
+          for i := 0 to nCol - 1 do begin
+            aMm[i].flags := MEM_Null;
+            aMm[i].db    := db;
+          end;
+        end else begin
+          sqlite3DbFreeNN(db, pRec);
+          pRec := nil;
+        end;
+      end;
+      if pRec = nil then begin
+        Result := nil;
+        Exit;
+      end;
+      p^.ppRec^ := pRec;
+    end;
+    pRec^.nField := u16(p^.iVal + 1);
+    aMm := PMem(pRec^.aMem);
+    sqlite3VdbeMemSetNull(@aMm[p^.iVal]);
+    Result := Psqlite3_value(@aMm[p^.iVal]);
+    Exit;
+  end;
+{$ENDIF}
+  { Non-STAT4 path mirrors `return sqlite3ValueNew(db)` (vdbemem.c:1671).
+    p is unreferenced in this build; FPC tolerates unused param. }
+  Result := sqlite3ValueNew(db);
 end;
 
 procedure sqlite3ValueSetStr(v: Psqlite3_value; n: i32; z: Pointer;
