@@ -1574,9 +1574,12 @@ type
                                 out ppBlob: Psqlite3_blob): i32;
   TBlobReopenFn      = function(pBlob: Psqlite3_blob; iRow: i64): i32;
   TGetTokenFn        = function(z: PByte; tokenType: Pi32): i64;
+  { pCtx is PValueNewStat4Ctx (declared later in this unit).  Typed as
+    raw Pointer here because TValueFromExprFn precedes that declaration. }
   TValueFromExprFn   = function(db: Psqlite3; pExpr: Pointer;
                                 enc: u8; affinity: u8;
-                                out ppVal: Psqlite3_value): i32;
+                                out ppVal: Psqlite3_value;
+                                pCtx: Pointer): i32;
   TKeyInfoUnrefFn    = procedure(p: Pointer);
 {$IFDEF SQLITE_ENABLE_STAT4}
   { Trampoline for the codegen-private pair (pIdx^.nColumn + sqlite3KeyInfoOfIndex)
@@ -1682,6 +1685,12 @@ var
   gValueFromFunctionImpl: TValueFromFunctionFn;
 { valueNew exposed for codegen's valueFromFunctionImpl (STAT4 only). }
 function valueNew(db: Psqlite3; p: PValueNewStat4Ctx): Psqlite3_value;
+{ valueFromFunction exposed for codegen's valueFromExprTrampoline TK_FUNCTION
+  arm (STAT4 only).  See implementation at line ~13646. }
+function valueFromFunction(db: Psqlite3; pExpr: Pointer;
+                           enc: u8; aff: u8;
+                           out ppVal: Psqlite3_value;
+                           pCtx: PValueNewStat4Ctx): i32;
 {$ENDIF}
 function  sqlite3VdbeChangeEncoding(pMem: PMem; desiredEnc: i32): i32;
 function  sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
@@ -13713,7 +13722,7 @@ begin
   ppVal := nil;
   if pExpr = nil then begin Result := 0; Exit; end;
   if Assigned(gValueFromExprImpl) then
-    Result := gValueFromExprImpl(db, pExpr, enc, affinity, ppVal)
+    Result := gValueFromExprImpl(db, pExpr, enc, affinity, ppVal, nil)
   else
     Result := SQLITE_OK;
 end;

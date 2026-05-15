@@ -61039,14 +61039,80 @@ value_from_function_out:
   Result := rc;
 end;
 
-{ Stub body for the forward declared sqlite3Stat4ValueFromExpr — real port
-  lives in prereq.c.4.  Keeps the compiler happy in STAT4=1 builds. }
+{ Forward decl — stat4ValueFromExpr below calls into the trampoline
+  defined further down in this same file. }
+function valueFromExprTrampoline(db: Psqlite3; pInExpr: Pointer;
+                                 enc: u8; affinity: u8;
+                                 out ppVal: passqlite3vdbe.Psqlite3_value;
+                                 pCtx: Pointer): i32; forward;
+
+{ -----------------------------------------------------------------------
+  stat4ValueFromExpr — port of vdbemem.c:2007..2046.  Internal helper used
+  by sqlite3Stat4ValueFromExpr (pAlloc=nil) and sqlite3Stat4ProbeSetValue
+  (pAlloc != nil; landing in prereq.c.4).  Skips TK_COLLATE wrappers, then
+  routes TK_VARIABLE through the reprepare bound-value path and any other
+  expression through valueFromExprTrampoline.
+  ----------------------------------------------------------------------- }
+function stat4ValueFromExpr(pParse: PParse; pExpr: PExpr; affinity: u8;
+                            pAlloc: PValueNewStat4Ctx;
+                            out ppVal: passqlite3vdbe.Psqlite3_value): i32;
+var
+  rc:       i32;
+  pVal:     passqlite3vdbe.Psqlite3_value;
+  db:       PTsqlite3;
+  v:        PVdbe;
+  iBindVar: i32;
+begin
+  rc   := SQLITE_OK;
+  pVal := nil;
+  db   := pParse^.db;
+
+  { Skip over any TK_COLLATE nodes. }
+  pExpr := sqlite3ExprSkipCollate(pExpr);
+
+  Assert((pExpr = nil) or (pExpr^.op <> TK_REGISTER) or (pExpr^.op2 <> TK_VARIABLE));
+
+  if pExpr = nil then begin
+    pVal := passqlite3vdbe.Psqlite3_value(
+              passqlite3vdbe.valueNew(Psqlite3(db), pAlloc));
+    if pVal <> nil then sqlite3VdbeMemSetNull(PMem(pVal));
+  end else if (pExpr^.op = TK_VARIABLE)
+              and ((db^.flags and u64($00800000)) = 0) then  { SQLITE_EnableQPSG }
+  begin
+    iBindVar := pExpr^.iColumn;
+    sqlite3VdbeSetVarmask(pParse^.pVdbe, iBindVar);
+    v := pParse^.pReprepare;
+    if v <> nil then begin
+      pVal := passqlite3vdbe.Psqlite3_value(
+                passqlite3vdbe.valueNew(Psqlite3(db), pAlloc));
+      if pVal <> nil then begin
+        rc := sqlite3VdbeMemCopy(PMem(pVal),
+                                 PMem(@PMem(v^.aVar)[iBindVar - 1]));
+        sqlite3ValueApplyAffinity(pVal, affinity, db^.enc);
+        PMem(pVal)^.db := Psqlite3(db);
+      end;
+    end;
+  end else begin
+    rc := valueFromExprTrampoline(Psqlite3(db), pExpr, db^.enc, affinity,
+                                  pVal, pAlloc);
+  end;
+
+  Assert((pVal = nil) or (PMem(pVal)^.db = Psqlite3(db)));
+  ppVal  := pVal;
+  Result := rc;
+end;
+
+{ sqlite3Stat4ValueFromExpr — vdbemem.c:2127..2134.  Public entry that
+  delegates to stat4ValueFromExpr with pAlloc=nil. }
 function sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
                                    aff: u8;
                                    apVal: PPointer): i32;
+var
+  pV: passqlite3vdbe.Psqlite3_value;
 begin
-  if apVal <> nil then apVal^ := nil;
-  Result := SQLITE_OK;
+  pV := nil;
+  Result := stat4ValueFromExpr(pParse, pExpr, aff, nil, pV);
+  if apVal <> nil then apVal^ := pV;
 end;
 {$ENDIF}
 
@@ -61060,7 +61126,8 @@ end;
   ----------------------------------------------------------------------- }
 function valueFromExprTrampoline(db: Psqlite3; pInExpr: Pointer;
                                  enc: u8; affinity: u8;
-                                 out ppVal: passqlite3vdbe.Psqlite3_value): i32;
+                                 out ppVal: passqlite3vdbe.Psqlite3_value;
+                                 pCtx: Pointer): i32;
 label
   no_mem;
 var
@@ -61076,6 +61143,17 @@ var
   aff:    u8;
   zTok:   PAnsiChar;
   nVal:   i32;
+
+  function NewValue: PMem; inline;
+  begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+    Result := PMem(passqlite3vdbe.valueNew(db, PValueNewStat4Ctx(pCtx)));
+{$ELSE}
+    Assert(pCtx = nil);
+    Result := PMem(sqlite3ValueNew(db));
+{$ENDIF}
+  end;
+
 begin
   ppVal := nil;
   pVal  := nil;
@@ -61094,12 +61172,22 @@ begin
   end;
   if op = TK_REGISTER then op := i32(e^.op2);
 
+  { Compressed (EP_TokenOnly) expressions only appear via DEFAULT-clause
+    parses, which never carry a STAT4 ctx.  vdbemem.c:1817..1818. }
+  Assert(((e^.flags and EP_TokenOnly) = 0) or (pCtx = nil));
+
   if op = TK_CAST then begin
     Assert(not ExprHasProperty(e, EP_IntValue));
     aff := u8(sqlite3AffinityType(e^.u.zToken, nil));
-    rc := valueFromExprTrampoline(db, e^.pLeft, enc, aff, ppVal);
+    rc := valueFromExprTrampoline(db, e^.pLeft, enc, aff, ppVal, pCtx);
     if ppVal <> nil then begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+      rc := sqlite3VdbeMemExpandBlob(PMem(ppVal));
+{$ELSE}
+      { Zero-blobs only come from functions; functions are only processed
+        under STAT4. }
       Assert((PMem(ppVal)^.flags and MEM_Zero) = 0);
+{$ENDIF}
       sqlite3VdbeMemCast(PMem(ppVal), aff, enc);
       sqlite3ValueApplyAffinity(ppVal, affinity, enc);
     end;
@@ -61126,7 +61214,7 @@ begin
   end;
 
   if (op = TK_STRING) or (op = TK_FLOAT) or (op = TK_INTEGER) then begin
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal = nil then goto no_mem;
     if ExprHasProperty(e, EP_IntValue) then begin
       sqlite3VdbeMemSetInt64(pVal, i64(e^.u.iValue) * negInt);
@@ -61161,7 +61249,7 @@ begin
       rc := sqlite3VdbeChangeEncoding(pVal, enc);
   end else if op = TK_UMINUS then begin
     { Multiple negative signs: -(-5). }
-    if (valueFromExprTrampoline(db, e^.pLeft, enc, affinity, ppVal) = SQLITE_OK)
+    if (valueFromExprTrampoline(db, e^.pLeft, enc, affinity, ppVal, pCtx) = SQLITE_OK)
        and (ppVal <> nil) then begin
       pVal := PMem(ppVal);
       sqlite3VdbeMemNumerify(pVal);
@@ -61178,23 +61266,31 @@ begin
       Exit;  { ppVal already set by recursive call }
     end;
   end else if op = TK_NULL then begin
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal = nil then goto no_mem;
     sqlite3VdbeMemSetNull(pVal);
   end else if op = TK_BLOB then begin
     Assert(not ExprHasProperty(e, EP_IntValue));
     Assert((e^.u.zToken[0] = 'x') or (e^.u.zToken[0] = 'X'));
     Assert(e^.u.zToken[1] = '''');
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal = nil then goto no_mem;
     zTok := e^.u.zToken + 2;
     nVal := sqlite3Strlen30(zTok) - 1;
     Assert(zTok[nVal] = '''');
     sqlite3VdbeMemSetStr(pVal, PAnsiChar(sqlite3HexToBlob(db, zTok, nVal)),
                          nVal div 2, 0, SQLITE_DYNAMIC);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  end else if (op = TK_FUNCTION) and (pCtx <> nil) then begin
+    { STAT4-only: pre-evaluate deterministic scalar functions so their
+      constant results land in the sample probe.  vdbemem.c:1935..1939. }
+    rc := passqlite3vdbe.valueFromFunction(db, e, enc, affinity,
+                                           ppVal, PValueNewStat4Ctx(pCtx));
+    pVal := PMem(ppVal);
+{$ENDIF}
   end else if op = TK_TRUEFALSE then begin
     Assert(not ExprHasProperty(e, EP_IntValue));
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal <> nil then begin
       pVal^.flags := MEM_Int;
       { TRUE.zToken = "TRUE" (len 4, [4]==NUL → 1); FALSE has [4]='E' → 0. }
@@ -61208,10 +61304,23 @@ begin
   Exit;
 
 no_mem:
+{$IFDEF SQLITE_ENABLE_STAT4}
+  if (pCtx = nil)
+     or (PParse(PValueNewStat4Ctx(pCtx)^.pParse)^.nErr = 0) then
+    sqlite3OomFault(db);
+{$ELSE}
   sqlite3OomFault(db);
+{$ENDIF}
   if zVal <> nil then sqlite3DbFree(db, zVal);
   Assert(ppVal = nil);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  { Under STAT4, when pCtx != 0 the pVal is owned by the UnpackedRecord
+    arena and must NOT be freed here.  vdbemem.c:1960..1963. }
+  if pCtx = nil then sqlite3ValueFree(Psqlite3_value(pVal));
+{$ELSE}
+  Assert(pCtx = nil);
   sqlite3ValueFree(Psqlite3_value(pVal));
+{$ENDIF}
   Result := SQLITE_NOMEM_BKPT;
 end;
 

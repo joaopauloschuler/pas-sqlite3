@@ -1133,10 +1133,15 @@ partial landings cannot silently no-op.
       build: TestExplainParity 1026/1026, only pre-existing TestFuzzDiff
       fails.  STAT4=1: compiles clean; pre-existing 3 regressions only
       (T28 TIndex sizeof, TestFuzzDiff, TestSQLCorpus).
-    - [ ] **10.1.42.b.7.prereq.c.3** Port `valueFromExpr` STAT4 branches
+    - [X] **10.1.42.b.7.prereq.c.3** Port `valueFromExpr` STAT4 branches
       + `stat4ValueFromExpr` helper (vdbemem.c:1800..2080) — the dispatch
       that turns a constant Expr tree into a `sqlite3_value*` usable by
       whereKeyStats.
+      Outcome: trampoline extended with pCtx (TK_CAST ExpandBlob, TK_FUNCTION
+      arm, valueNew over sqlite3ValueNew, no_mem STAT4 ctx-aware branch);
+      `stat4ValueFromExpr` static added + sqlite3Stat4ValueFromExpr now
+      delegates to it.  Default build: TestExplainParity 1026/1026, no new
+      regressions.  STAT4=1: compiles clean; same 3 pre-existing failures.
     - [ ] **10.1.42.b.7.prereq.c.4** Port public entries
       `sqlite3Stat4ProbeSetValue` (vdbemem.c:2082..2117) +
       `sqlite3Stat4ValueFromExpr` (:2127..2147).  These are the API
