@@ -61114,6 +61114,79 @@ begin
   Result := stat4ValueFromExpr(pParse, pExpr, aff, nil, pV);
   if apVal <> nil then apVal^ := pV;
 end;
+
+{ -----------------------------------------------------------------------
+  sqlite3Stat4ProbeSetValue — port of vdbemem.c:2082..2115.
+
+  Build an UnpackedRecord* incrementally for the STAT4 sample probe.
+  For each of the nElem subexpressions of pExpr (or pExpr itself when it
+  is scalar / nil), call stat4ValueFromExpr with a ValueNewStat4Ctx that
+  carries the caller's *ppRec slot.  valueNew() allocates the record on
+  first successful extract and fills aMem[iVal+i] in place.
+
+  ppRec is IN/OUT: nil on first call, non-nil thereafter.  *pnExtract
+  receives the count of successfully populated cells (may be < nElem).
+
+  The TK_SELECT short-circuit at the top mirrors the C: row-valued
+  subqueries are handled elsewhere and skipped here (nExtract stays 0).
+  ----------------------------------------------------------------------- }
+function sqlite3Stat4ProbeSetValue(pParse: PParse; pIdx: PIndex;
+                                   ppRec: PPointer; pExpr: PExpr;
+                                   nElem, iVal: i32;
+                                   pnExtract: Pi32): i32;
+var
+  rc:       i32;
+  nExtract: i32;
+  i:        i32;
+  pVal:     passqlite3vdbe.Psqlite3_value;
+  pElem:    PExpr;
+  aff:      u8;
+  zAff:     PAnsiChar;
+  pIx:      PIndex2;
+  alloc:    passqlite3vdbe.TValueNewStat4Ctx;
+begin
+  rc       := SQLITE_OK;
+  nExtract := 0;
+
+  if (pExpr = nil) or (pExpr^.op <> TK_SELECT) then
+  begin
+    pIx          := PIndex2(pIdx);
+    alloc.pParse := pParse;
+    alloc.pIdx   := Pointer(pIx);
+    alloc.ppRec  := Pointer(ppRec);
+    alloc.iVal   := 0;
+
+    { Materialize zColAff once so per-column lookups don't recompute.
+      Mirrors sqlite3IndexColumnAffinity inlined: zColAff[iCol]. }
+    zAff := nil;
+    if pIx <> nil then
+    begin
+      if pIx^.zColAff = nil then zAff := sqlite3IndexAffinityStr(pParse^.db, pIx)
+      else                       zAff := pIx^.zColAff;
+    end;
+
+    i := 0;
+    while i < nElem do
+    begin
+      pVal := nil;
+      if pExpr <> nil then pElem := sqlite3VectorFieldSubexpr(pExpr, i)
+      else                 pElem := nil;
+
+      if zAff <> nil then aff := u8(zAff[iVal + i])
+      else                aff := u8(SQLITE_AFF_BLOB);
+
+      alloc.iVal := iVal + i;
+      rc := stat4ValueFromExpr(pParse, pElem, aff,
+                               @alloc, pVal);
+      if pVal = nil then break;
+      Inc(nExtract);
+      Inc(i);
+    end;
+  end;
+
+  if pnExtract <> nil then pnExtract^ := nExtract;
+  Result := rc;
+end;
 {$ENDIF}
 
 { -----------------------------------------------------------------------

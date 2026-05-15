@@ -1142,10 +1142,14 @@ partial landings cannot silently no-op.
       `stat4ValueFromExpr` static added + sqlite3Stat4ValueFromExpr now
       delegates to it.  Default build: TestExplainParity 1026/1026, no new
       regressions.  STAT4=1: compiles clean; same 3 pre-existing failures.
-    - [ ] **10.1.42.b.7.prereq.c.4** Port public entries
+    - [X] **10.1.42.b.7.prereq.c.4** Port public entries
       `sqlite3Stat4ProbeSetValue` (vdbemem.c:2082..2117) +
       `sqlite3Stat4ValueFromExpr` (:2127..2147).  These are the API
-      surface where.c calls.
+      surface where.c calls.  Done: ProbeSetValue ported in
+      passqlite3codegen.pas next to Stat4ValueFromExpr; alloc.ctx +
+      per-column zColAff lookup mirror C inlined IndexColumnAffinity.
+      Default build: 99/100 (TestFuzzDiff pre-existing).
+      STAT4=1: compiles clean.
     - [ ] **10.1.42.b.7.prereq.c.5** Replace `sqlite3Stat4Column`
       (vdbemem.c:2149..2190) + `sqlite3Stat4ProbeFree` (:2194..2210)
       Phase-6 stubs in `src/passqlite3vdbe.pas` with real bodies.
