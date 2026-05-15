@@ -38,6 +38,7 @@ uses
   passqlite3os,
   passqlite3util,
   passqlite3vdbe,
+  passqlite3backup,
   passqlite3codegen,
   passqlite3ieee754,
   passqlite3main;
@@ -394,6 +395,394 @@ begin
   Result := TCL_OK;
 end;
 
+{ ----------------------------------------------------------------------
+  9.4.6.q.1 — test1.c prepared-statement Tcl wrappers.
+
+  Test1.c references (line ranges):
+    * sqlite3_exec                test1.c:417..460   (test_exec)
+    * sqlite3_errmsg              test1.c:4904..4929 (test_errmsg)
+    * sqlite3_prepare             test1.c:5027..5082 (test_prepare)
+    * sqlite3_prepare_v2          test1.c:5084..5156 (test_prepare_v2)
+    * sqlite3_transfer_bindings   test1.c:3140..3164 (test_transfer_bind)
+    * sqlite3_backup family       test_backup.c:26..150 (backupTest*)
+  ---------------------------------------------------------------------- }
+
+{ main.c — sqlite3ErrName: enum-name table for the rc codes the backup
+  Tcl commands surface.  Minimal subset, mirrors echoErrName but covers
+  every code sqlite3_backup_step / _finish can return. }
+function t1ErrName(rc: cint): PAnsiChar;
+begin
+  case rc of
+    SQLITE_OK:         Result := PChar('SQLITE_OK');
+    SQLITE_ERROR:      Result := PChar('SQLITE_ERROR');
+    SQLITE_INTERNAL:   Result := PChar('SQLITE_INTERNAL');
+    SQLITE_PERM:       Result := PChar('SQLITE_PERM');
+    SQLITE_ABORT:      Result := PChar('SQLITE_ABORT');
+    SQLITE_BUSY:       Result := PChar('SQLITE_BUSY');
+    SQLITE_LOCKED:     Result := PChar('SQLITE_LOCKED');
+    SQLITE_NOMEM:      Result := PChar('SQLITE_NOMEM');
+    SQLITE_READONLY:   Result := PChar('SQLITE_READONLY');
+    SQLITE_INTERRUPT:  Result := PChar('SQLITE_INTERRUPT');
+    SQLITE_IOERR:      Result := PChar('SQLITE_IOERR');
+    SQLITE_CORRUPT:    Result := PChar('SQLITE_CORRUPT');
+    SQLITE_NOTFOUND:   Result := PChar('SQLITE_NOTFOUND');
+    SQLITE_FULL:       Result := PChar('SQLITE_FULL');
+    SQLITE_CANTOPEN:   Result := PChar('SQLITE_CANTOPEN');
+    SQLITE_PROTOCOL:   Result := PChar('SQLITE_PROTOCOL');
+    SQLITE_EMPTY:      Result := PChar('SQLITE_EMPTY');
+    SQLITE_SCHEMA:     Result := PChar('SQLITE_SCHEMA');
+    SQLITE_TOOBIG:     Result := PChar('SQLITE_TOOBIG');
+    SQLITE_CONSTRAINT: Result := PChar('SQLITE_CONSTRAINT');
+    SQLITE_MISMATCH:   Result := PChar('SQLITE_MISMATCH');
+    SQLITE_MISUSE:     Result := PChar('SQLITE_MISUSE');
+    SQLITE_NOLFS:      Result := PChar('SQLITE_NOLFS');
+    SQLITE_AUTH:       Result := PChar('SQLITE_AUTH');
+    SQLITE_FORMAT:     Result := PChar('SQLITE_FORMAT');
+    SQLITE_RANGE:      Result := PChar('SQLITE_RANGE');
+    SQLITE_NOTADB:     Result := PChar('SQLITE_NOTADB');
+    SQLITE_ROW:        Result := PChar('SQLITE_ROW');
+    SQLITE_DONE:       Result := PChar('SQLITE_DONE');
+  else
+    Result := PChar('SQLITE_Unknown');
+  end;
+end;
+
+{ Format a pointer as the "%p"-flavoured hex test1.c hands to Tcl. }
+procedure ptrToHex(p: Pointer; out zBuf: AnsiString);
+begin
+  zBuf := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+end;
+
+{ test1.c:419..460 — test_exec.
+  Usage: sqlite3_exec DB SQL  (string-arg form).
+  The Pascal port collapses the result to a single-list: "{rc} {result-or-err}",
+  matching what Tcl_AppendElement produces.  We skip the % hex-decode pass
+  (it's only used by a handful of obscure tests) — straight passthrough. }
+type
+  TExecCtx = record
+    rows: AnsiString;
+  end;
+  PExecCtx = ^TExecCtx;
+
+function execPrintfCb(pArg: Pointer; nCol: i32;
+  argv: PPAnsiChar; colv: PPAnsiChar): i32; cdecl;
+var
+  ctx: PExecCtx;
+  i:   i32;
+  z:   PAnsiChar;
+begin
+  ctx := PExecCtx(pArg);
+  for i := 0 to nCol - 1 do
+  begin
+    if Length(ctx^.rows) > 0 then ctx^.rows := ctx^.rows + ' ';
+    z := PPAnsiChar(PtrUInt(argv) + PtrUInt(i) * SizeOf(Pointer))^;
+    if z = nil then
+      ctx^.rows := ctx^.rows + '{}'
+    else
+      ctx^.rows := ctx^.rows + '{' + AnsiString(z) + '}';
+  end;
+  Result := 0;
+end;
+
+function test_exec(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  rc:    i32;
+  zErr:  PAnsiChar;
+  ctx:   TExecCtx;
+  zBuf:  array[0..31] of AnsiChar;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB SQL'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  ctx.rows := '';
+  zErr := nil;
+  rc := sqlite3_exec(db, Tcl_GetString(objv[2]), @execPrintfCb, @ctx, @zErr);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  StrPCopy(zBuf, IntToStr(rc));
+  Tcl_AppendElement(interp, @zBuf[0]);
+  if rc = SQLITE_OK then
+    Tcl_AppendElement(interp, PChar(ctx.rows))
+  else if zErr <> nil then
+    Tcl_AppendElement(interp, zErr)
+  else
+    Tcl_AppendElement(interp, PChar(''));
+  if zErr <> nil then sqlite3_free(zErr);
+  Result := TCL_OK;
+end;
+
+{ test1.c:4910..4929 — test_errmsg.
+  Usage: sqlite3_errmsg DB. }
+function test_errmsg(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:   PTsqlite3;
+  zErr: PAnsiChar;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zErr := sqlite3_errmsg(db);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(zErr, -1));
+  Result := TCL_OK;
+end;
+
+{ test1.c:5035..5082 — test_prepare.
+  Usage: sqlite3_prepare DB sql bytes ?tailvar? }
+function test_prepare(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  zSql:  PAnsiChar;
+  zTail: PAnsiChar;
+  pStmt: Pointer;
+  bytes, nTail: cint;
+  rc:    i32;
+  hex:   AnsiString;
+  zBuf:  array[0..63] of AnsiChar;
+begin
+  if (objc <> 5) and (objc <> 4) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB sql bytes ?tailvar?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zSql := Tcl_GetString(objv[2]);
+  if Tcl_GetIntFromObj(interp, objv[3], @bytes) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zTail := nil;
+  pStmt := nil;
+  if objc >= 5 then
+    rc := sqlite3_prepare(db, zSql, bytes, @pStmt, @zTail)
+  else
+    rc := sqlite3_prepare(db, zSql, bytes, @pStmt, nil);
+  Tcl_ResetResult(interp);
+  if (zTail <> nil) and (objc >= 5) then
+  begin
+    if bytes >= 0 then
+      bytes := bytes - cint(PtrUInt(zTail) - PtrUInt(zSql));
+    nTail := StrLen(zTail);
+    if nTail < bytes then bytes := nTail;
+    Tcl_ObjSetVar2(interp, objv[4], nil,
+      Tcl_NewStringObj(zTail, bytes), 0);
+  end;
+  if rc <> SQLITE_OK then
+  begin
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    StrPCopy(zBuf, '(' + IntToStr(rc) + ') ');
+    Tcl_AppendResult(interp, @zBuf[0], sqlite3_errmsg(db), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if pStmt <> nil then
+  begin
+    ptrToHex(pStmt, hex);
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    Move(hex[1], zBuf[0], Length(hex));
+    Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:5092..5156 — test_prepare_v2.
+  Usage: sqlite3_prepare_v2 DB sql bytes ?tailvar?  The test1.c version
+  malloc-copies the SQL to make valgrind happier; we skip the copy (still
+  exercises the same engine path). }
+function test_prepare_v2(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  zSql:  PAnsiChar;
+  zTail: PAnsiChar;
+  pStmt: Pointer;
+  bytes: cint;
+  rc:    i32;
+  hex:   AnsiString;
+  zBuf:  array[0..63] of AnsiChar;
+begin
+  if (objc <> 5) and (objc <> 4) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB sql bytes ?tailvar?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zSql := Tcl_GetString(objv[2]);
+  if Tcl_GetIntFromObj(interp, objv[3], @bytes) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zTail := nil;
+  pStmt := nil;
+  if objc >= 5 then
+    rc := sqlite3_prepare_v2(db, zSql, bytes, @pStmt, @zTail)
+  else
+    rc := sqlite3_prepare_v2(db, zSql, bytes, @pStmt, nil);
+  Tcl_ResetResult(interp);
+  if (rc = SQLITE_OK) and (objc >= 5) and (zTail <> nil) then
+  begin
+    if bytes >= 0 then
+      bytes := bytes - cint(PtrUInt(zTail) - PtrUInt(zSql));
+    Tcl_ObjSetVar2(interp, objv[4], nil,
+      Tcl_NewStringObj(zTail, bytes), 0);
+  end;
+  if rc <> SQLITE_OK then
+  begin
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    StrPCopy(zBuf, '(' + IntToStr(rc) + ') ');
+    Tcl_AppendResult(interp, @zBuf[0], sqlite3_errmsg(db), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if pStmt <> nil then
+  begin
+    ptrToHex(pStmt, hex);
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    Move(hex[1], zBuf[0], Length(hex));
+    Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:3145..3164 — test_transfer_bind.
+  Usage: sqlite3_transfer_bindings FROM-STMT TO-STMT }
+function test_transfer_bind(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt1, pStmt2: Pointer;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FROM-STMT TO-STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt1 := sqlite3TestTextToPtr(Tcl_GetString(objv[1]));
+  pStmt2 := sqlite3TestTextToPtr(Tcl_GetString(objv[2]));
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(sqlite3_transfer_bindings(PVdbe(pStmt1), PVdbe(pStmt2))));
+  Result := TCL_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  test_backup.c — backupTestInit + backupTestCmd.
+  Usage: sqlite3_backup CMDNAME DESTHANDLE DESTNAME SRCHANDLE SRCNAME
+         CMDNAME step npage | finish | remaining | pagecount
+  ---------------------------------------------------------------------- }
+procedure backupTestFinish(clientData: TClientData); cdecl;
+begin
+  sqlite3_backup_finish(PSqlite3Backup(clientData));
+end;
+
+function backupTestCmd(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  p:       PSqlite3Backup;
+  zSub:    PAnsiChar;
+  nPage:   cint;
+  rc:      i32;
+  info:    TTclCmdInfo;
+  zCmdName:PAnsiChar;
+begin
+  p := PSqlite3Backup(clientData);
+  if objc < 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('option ?arg?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zSub := Tcl_GetString(objv[1]);
+  if StrComp(zSub, 'step') = 0 then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('npage'));
+      Result := TCL_ERROR; Exit;
+    end;
+    if Tcl_GetIntFromObj(interp, objv[2], @nPage) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+    rc := sqlite3_backup_step(p, nPage);
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  end
+  else if StrComp(zSub, 'finish') = 0 then
+  begin
+    zCmdName := Tcl_GetString(objv[0]);
+    if Tcl_GetCommandInfo(interp, zCmdName, @info) <> 0 then
+    begin
+      info.deleteProc := nil;
+      Tcl_SetCommandInfo(interp, zCmdName, @info);
+    end;
+    Tcl_DeleteCommand(interp, zCmdName);
+    rc := sqlite3_backup_finish(p);
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  end
+  else if StrComp(zSub, 'remaining') = 0 then
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_backup_remaining(p)))
+  else if StrComp(zSub, 'pagecount') = 0 then
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_backup_pagecount(p)))
+  else
+  begin
+    Tcl_AppendResult(interp, PChar('bad option "'), zSub,
+      PChar('": must be step, finish, remaining or pagecount'),
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+function backupTestInit(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pBackup:   PSqlite3Backup;
+  pDestDb:   PTsqlite3;
+  pSrcDb:    PTsqlite3;
+  zDestName: PAnsiChar;
+  zSrcName:  PAnsiChar;
+  zCmd:      PAnsiChar;
+begin
+  if objc <> 6 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('CMDNAME DESTHANDLE DESTNAME SRCHANDLE SRCNAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zCmd := Tcl_GetString(objv[1]);
+  getDbPointer(interp, Tcl_GetString(objv[2]), @pDestDb);
+  zDestName := Tcl_GetString(objv[3]);
+  getDbPointer(interp, Tcl_GetString(objv[4]), @pSrcDb);
+  zSrcName := Tcl_GetString(objv[5]);
+  pBackup := sqlite3_backup_init(pDestDb, zDestName, pSrcDb, zSrcName);
+  if pBackup = nil then
+  begin
+    Tcl_AppendResult(interp, PChar('sqlite3_backup_init() failed'),
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_CreateObjCommand(interp, zCmd, @backupTestCmd, pBackup,
+    @backupTestFinish);
+  Tcl_SetObjResult(interp, objv[1]);
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -406,6 +795,19 @@ begin
     @test_atomic_batch_write, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('load_static_extension'),
     @tclLoadStaticExtensionCmd, nil, nil);
+  { 9.4.6.q.1 — prepared-statement / errmsg / exec / transfer / backup. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
+    @test_exec, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg'),
+    @test_errmsg, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare'),
+    @test_prepare, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare_v2'),
+    @test_prepare_v2, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_transfer_bindings'),
+    @test_transfer_bind, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_backup'),
+    @backupTestInit, nil, nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
     regression tests (between.test's `queryplan` proc, etc.) can
     verify the optimizer correctly elides ORDER BY sorts. }

@@ -159,6 +159,11 @@ procedure Tcl_GetVersion(major, minor, patchLevel, releaseType: pcint);
   Used by register_dbstat_vtab (test1.c:8601) to recover the SqliteDb*. }
 function Tcl_GetCommandInfo(interp: PTclInterp; cmdName: PChar;
   infoPtr: PTclCmdInfo): cint; cdecl; external 'tcl8.6';
+function Tcl_SetCommandInfo(interp: PTclInterp; cmdName: PChar;
+  infoPtr: PTclCmdInfo): cint; cdecl; external 'tcl8.6';
+{ tcl.h — Tcl_AppendElement appends a properly-list-quoted element. }
+procedure Tcl_AppendElement(interp: PTclInterp; element: PChar);
+  cdecl; external 'tcl8.6';
 
 { Command teardown.  tclsqlite.c:2744 (Tcl_DeleteCommand by name in
   the DB_CLOSE arm of DbObjCmd); token form is the modern API.  Both
