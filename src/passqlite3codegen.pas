@@ -29741,6 +29741,16 @@ begin
        and (pItem^.u4.pSubq <> nil)
        and (pItem^.u4.pSubq^.pSelect <> nil)
        and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Aggregate) = 0)
+       { 9.4.divbug.24.b — also reject when the inner carries GROUP BY,
+         HAVING, or SF_HasAgg.  C asserts pSub->pGroupBy==0 at select.c:7797
+         under the assumption that SF_Aggregate is always set whenever
+         pGroupBy is present; Pas selectMarkAggregate is not guaranteed
+         to tag every aggregate subquery, so the explicit pGroupBy/
+         pHaving/SF_HasAgg check is required to keep flatten from
+         silently dropping GROUP BY (aggnested-3.2 / 3.3). }
+       and (pItem^.u4.pSubq^.pSelect^.pGroupBy = nil)
+       and (pItem^.u4.pSubq^.pSelect^.pHaving = nil)
+       and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_HasAgg) = 0)
     then
     begin
       if flattenSubquery(pParse, p, 0, 0) <> 0 then
