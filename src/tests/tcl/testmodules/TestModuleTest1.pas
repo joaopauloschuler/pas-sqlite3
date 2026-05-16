@@ -46,6 +46,30 @@ uses
   passqlite3printf,
   passqlite3main;
 
+{ 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
+  bindings unit and the test_hexio.c port (lines 2189..2266) needs them).
+  Pinned to libc the same way passqlite3zipfile.pas:225 does for fopen. }
+type
+  PFile = Pointer;
+function fopen(path, mode: PAnsiChar): PFile; cdecl;
+  external 'c' name 'fopen';
+function fclose(stream: PFile): cint; cdecl;
+  external 'c' name 'fclose';
+function fread(ptr: Pointer; size, nmemb: csize_t; stream: PFile): csize_t; cdecl;
+  external 'c' name 'fread';
+function fwrite(ptr: Pointer; size, nmemb: csize_t; stream: PFile): csize_t; cdecl;
+  external 'c' name 'fwrite';
+function fseek(stream: PFile; offset: clong; whence: cint): cint; cdecl;
+  external 'c' name 'fseek';
+
+const
+  { sqliteInt.h — index 12, defined in C but not yet exposed in this port. }
+  SQLITE_LIMIT_PARSER_DEPTH = 12;
+  { sqlite3.h — opcode 20.  Defined in passqlite3main implementation but
+    not re-exported in the unit's interface; mirror locally. }
+  SQLITE_TESTCTRL_NEVER_CORRUPT_OP = 20;
+  SEEK_SET = 0;
+
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
 
 implementation
@@ -2616,7 +2640,7 @@ begin
   begin
     zCopy := PAnsiChar(sqlite3_malloc(nText));
     Move(zText1^, zCopy^, nText);
-    sqlite3_result_text(pCtx, zCopy, nText, Pointer(@sqlite3_free));
+    sqlite3_result_text(pCtx, zCopy, nText, TxDelProc(@sqlite3_free));
   end;
   if argc = 0 then ;
 end;
@@ -3066,7 +3090,7 @@ begin
   end;
   rc := sqlite3_file_control(db, PAnsiChar('main'),
     SQLITE_FCNTL_RESERVE_BYTES, @n);
-  Tcl_SetObjResult(interp, Tcl_NewStringObj(sqlite3ErrName(rc), -1));
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
   Result := TCL_OK;
   if clientData = nil then ;
 end;
