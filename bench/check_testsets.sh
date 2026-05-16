@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Phase 11.3 — gate for testset_cte / testset_fp / testset_parsenumber.
+# Phase 11.3/11.4 — gate for testset_cte / testset_fp / testset_parsenumber
+#                                 testset_star / testset_orm / testset_trigger.
 #
 # Diffs the stripped (wall-clock-free) output of each testset against the
 # checked-in baselines under bench/baseline/.
@@ -8,6 +9,17 @@
 # divergence: recursive-CTE sudoku at line 100 triggers an EAccessViolation
 # in the Pas engine.  Once the engine is fixed, this gate should be flipped
 # back to execution mode (drop --sqlonly, re-baseline).
+#
+# testset_star runs in --sqlonly mode because of a deferred engine divergence:
+# the "130 Star query with LEFT JOINs" exec triggers a heap double-free
+# (glibc "double free or corruption (!prev)") in the Pas engine.  Once the
+# engine is fixed, drop --sqlonly and re-baseline.
+#
+# testset_trigger runs in --sqlonly because the upstream C testset itself
+# references tables t1/t2 that were never created (the schema names z1/z2
+# instead — see speedtest1.c:2548..2556).  A real SQLite would also fatal
+# out at prepare time.  Keeping --sqlonly captures the canonical SQL stream
+# so the gate is meaningful.
 #
 # Exit 0 = identical, exit 1 = drift.
 
@@ -62,5 +74,10 @@ run_one() {
 run_one cte         --testset cte         --size 1 --sqlonly
 run_one fp          --testset fp          --size 1
 run_one parsenumber --testset parsenumber
+# star: deferred double-free on LEFT-JOIN star query (see header).
+run_one star        --testset star        --size 1 --sqlonly
+run_one orm         --testset orm         --size 1
+# trigger: upstream C bug — t1/t2 missing (header).
+run_one trigger     --testset trigger     --size 1 --sqlonly
 
 exit $fail

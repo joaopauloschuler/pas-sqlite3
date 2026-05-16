@@ -1457,9 +1457,592 @@ begin
     sqlite3_exec(g.db, zSql4, nil, nil, nil);
   speedtest1_end_test;
 end;
-procedure testset_star;        begin testset_not_yet('star',        'Phase 11.4'); end;
-procedure testset_orm;         begin testset_not_yet('orm',         'Phase 11.4'); end;
-procedure testset_trigger;     begin testset_not_yet('trigger',     'Phase 11.4'); end;
+{ ----------------------------- testset_star ----------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 1487..1590. }
+
+procedure testset_star;
+var
+  n, i: Integer;
+begin
+  n := g.szTest * 50;
+  speedtest1_begin_test(100, 'Create a fact table with %d entries', [n]);
+  speedtest1_exec(
+    'CREATE TABLE facttab(' +
+     ' attr01 INT,' +
+     ' attr02 INT,' +
+     ' attr03 INT,' +
+     ' data01 TEXT,' +
+     ' attr04 INT,' +
+     ' attr05 INT,' +
+     ' attr06 INT,' +
+     ' attr07 INT,' +
+     ' attr08 INT,' +
+     ' factid INTEGER PRIMARY KEY,' +
+     ' data02 TEXT' +
+    ');'
+  );
+  speedtest1_exec(
+    'WITH RECURSIVE counter(nnn) AS' +
+       '(VALUES(1) UNION ALL SELECT nnn+1 FROM counter WHERE nnn<%d)' +
+    'INSERT INTO facttab(attr01,attr02,attr03,attr04,attr05,' +
+                        'attr06,attr07,attr08,data01,data02)' +
+    'SELECT random()%%12, random()%%13, random()%%14, random()%%15,' +
+           'random()%%16, random()%%17, random()%%18, random()%%19,' +
+           'concat(''data-'',nnn), format(''%%x'',random()) FROM counter;',
+    [n]
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(110, 'Create indexes on all attributes columns');
+  for i := 1 to 8 do begin
+    speedtest1_exec(
+      'CREATE INDEX fact_attr%02d ON facttab(attr%02d)', [i, i]
+    );
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(120, 'Create dimension tables');
+  for i := 1 to 8 do begin
+    speedtest1_exec(
+      'CREATE TABLE dimension%02d(' +
+        'beta%02d INT, ' +
+        'content%02d TEXT, ' +
+        'rate%02d REAL)',
+      [i, i, i, i]
+    );
+    speedtest1_exec(
+      'WITH RECURSIVE ctr(nn) AS' +
+      ' (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<%d)' +
+      ' INSERT INTO dimension%02d' +
+      '   SELECT nn%%(%d), concat(''content-%02d-'',nn),' +
+               ' (random()%%10000)*0.125 FROM ctr;',
+      [4 * (i + 1), i, 2 * (i + 1), i]
+    );
+    if (i and 2) <> 0 then begin
+      speedtest1_exec(
+         'CREATE INDEX dim%02d ON dimension%02d(beta%02d);',
+         [i, i, i]
+      );
+    end else begin
+      speedtest1_exec(
+         'CREATE INDEX dim%02d ON dimension%02d(beta%02d,content%02d);',
+         [i, i, i, i]
+      );
+    end;
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(130, 'Star query over the entire fact table');
+  speedtest1_exec(
+    'SELECT count(*), max(content04), min(content03), sum(rate04), avg(rate05)' +
+    ' FROM facttab, dimension01, dimension02, dimension03, dimension04,' +
+                  ' dimension05, dimension06, dimension07, dimension08' +
+    ' WHERE attr01=beta01' +
+      ' AND attr02=beta02' +
+      ' AND attr03=beta03' +
+      ' AND attr04=beta04' +
+      ' AND attr05=beta05' +
+      ' AND attr06=beta06' +
+      ' AND attr07=beta07' +
+      ' AND attr08=beta08' +
+    ';'
+   );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(130, 'Star query with LEFT JOINs');
+  speedtest1_exec(
+    'SELECT count(*), max(content04), min(content03), sum(rate04), avg(rate05)' +
+    ' FROM facttab LEFT JOIN dimension01 ON attr01=beta01' +
+                 ' LEFT JOIN dimension02 ON attr02=beta02' +
+                 ' JOIN dimension03 ON attr03=beta03' +
+                 ' JOIN dimension04 ON attr04=beta04' +
+                 ' JOIN dimension05 ON attr05=beta05' +
+                 ' LEFT JOIN dimension06 ON attr06=beta06' +
+                 ' JOIN dimension07 ON attr07=beta07' +
+                 ' JOIN dimension08 ON attr08=beta08' +
+    ' WHERE facttab.data01 LIKE ''data-9%%''' +
+    ';'
+   );
+  speedtest1_end_test;
+end;
+
+{ ----------------------------- testset_orm ------------------------------ }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 2272..2535. }
+
+const
+  zOrmType: AnsiString =
+    'IBBIIITIVVITBTBFBFITTFBTBVBVIFTBBFITFFVBIFIVBVVVBTVTIBBFFIVIBTB' +
+    'TVTTFTVTVFFIITIFBITFTTFFFVBIIBTTITFTFFVVVFIIITVBBVFFTVVB';
+
+procedure testset_orm;
+var
+  i, j, n: LongWord;
+  nRow: LongWord;
+  x1, len: LongWord;
+  zNum: AnsiString;
+  c: AnsiChar;
+begin
+  n := LongWord(g.szTest) * 250;
+  nRow := n;
+  speedtest1_begin_test(100, 'Fill %d rows', [n]);
+  speedtest1_exec(
+    'BEGIN;' +
+    'CREATE TABLE ZLOOKSLIKECOREDATA (' +
+    '  ZPK INTEGER PRIMARY KEY,' +
+    '  ZTERMFITTINGHOUSINGCOMMAND INTEGER,' +
+    '  ZBRIEFGOBYDODGERHEIGHT BLOB,' +
+    '  ZCAPABLETRIPDOORALMOND BLOB,' +
+    '  ZDEPOSITPAIRCOLLEGECOMET INTEGER,' +
+    '  ZFRAMEENTERSIMPLEMOUTH INTEGER,' +
+    '  ZHOPEFULGATEHOLECHALK INTEGER,' +
+    '  ZSLEEPYUSERGRANDBOWL TIMESTAMP,' +
+    '  ZDEWPEACHCAREERCELERY INTEGER,' +
+    '  ZHANGERLITHIUMDINNERMEET VARCHAR,' +
+    '  ZCLUBRELEASELIZARDADVICE VARCHAR,' +
+    '  ZCHARGECLICKHUMANEHIRE INTEGER,' +
+    '  ZFINGERDUEPIZZAOPTION TIMESTAMP,' +
+    '  ZFLYINGDOCTORTABLEMELODY BLOB,' +
+    '  ZLONGFINLEAVEIMAGEOIL TIMESTAMP,' +
+    '  ZFAMILYVISUALOWNERMATTER BLOB,' +
+    '  ZGOLDYOUNGINITIALNOSE FLOAT,' +
+    '  ZCAUSESALAMITERMCYAN BLOB,' +
+    '  ZSPREADMOTORBISCUITBACON FLOAT,' +
+    '  ZGIFTICEFISHGLUEHAIR INTEGER,' +
+    '  ZNOTICEPEARPOLICYJUICE TIMESTAMP,' +
+    '  ZBANKBUFFALORECOVERORBIT TIMESTAMP,' +
+    '  ZLONGDIETESSAYNATURE FLOAT,' +
+    '  ZACTIONRANGEELEGANTNEUTRON BLOB,' +
+    '  ZCADETBRIGHTPLANETBANK TIMESTAMP,' +
+    '  ZAIRFORGIVEHEADFROG BLOB,' +
+    '  ZSHARKJUSTFRUITMOVIE VARCHAR,' +
+    '  ZFARMERMORNINGMIRRORCONCERN BLOB,' +
+    '  ZWOODPOETRYCOBBLERBENCH VARCHAR,' +
+    '  ZHAFNIUMSCRIPTSALADMOTOR INTEGER,' +
+    '  ZPROBLEMCLUBPOPOVERJELLY FLOAT,' +
+    '  ZEIGHTLEADERWORKERMOST TIMESTAMP,' +
+    '  ZGLASSRESERVEBARIUMMEAL BLOB,' +
+    '  ZCLAMBITARUGULAFAJITA BLOB,' +
+    '  ZDECADEJOYOUSWAVEHABIT FLOAT,' +
+    '  ZCOMPANYSUMMERFIBERELF INTEGER,' +
+    '  ZTREATTESTQUILLCHARGE TIMESTAMP,' +
+    '  ZBROWBALANCEKEYCHOWDER FLOAT,' +
+    '  ZPEACHCOPPERDINNERLAKE FLOAT,' +
+    '  ZDRYWALLBEYONDBROWNBOWL VARCHAR,' +
+    '  ZBELLYCRASHITEMLACK BLOB,' +
+    '  ZTENNISCYCLEBILLOFFICER INTEGER,' +
+    '  ZMALLEQUIPTHANKSGLUE FLOAT,' +
+    '  ZMISSREPLYHUMANLIVING INTEGER,' +
+    '  ZKIWIVISUALPRIDEAPPLE VARCHAR,' +
+    '  ZWISHHITSKINMOTOR BLOB,' +
+    '  ZCALMRACCOONPROGRAMDEBIT VARCHAR,' +
+    '  ZSHINYASSISTLIVINGCRAB VARCHAR,' +
+    '  ZRESOLVEWRISTWRAPAPPLE VARCHAR,' +
+    '  ZAPPEALSIMPLESECONDHOUSING BLOB,' +
+    '  ZCORNERANCHORTAPEDIVER TIMESTAMP,' +
+    '  ZMEMORYREQUESTSOURCEBIG VARCHAR,' +
+    '  ZTRYFACTKEEPMILK TIMESTAMP,' +
+    '  ZDIVERPAINTLEATHEREASY INTEGER,' +
+    '  ZSORTMISTYQUOTECABBAGE BLOB,' +
+    '  ZTUNEGASBUFFALOCAPITAL BLOB,' +
+    '  ZFILLSTOPLAWJOYFUL FLOAT,' +
+    '  ZSTEELCAREFULPLATENUMBER FLOAT,' +
+    '  ZGIVEVIVIDDIVINEMEANING INTEGER,' +
+    '  ZTREATPACKFUTURECONVERT VARCHAR,' +
+    '  ZCALMLYGEMFINISHEFFECT INTEGER,' +
+    '  ZCABBAGESOCKEASEMINUTE BLOB,' +
+    '  ZPLANETFAMILYPUREMEMORY TIMESTAMP,' +
+    '  ZMERRYCRACKTRAINLEADER BLOB,' +
+    '  ZMINORWAYPAPERCLASSY TIMESTAMP,' +
+    '  ZEAGLELINEMINEMAIL VARCHAR,' +
+    '  ZRESORTYARDGREENLET TIMESTAMP,' +
+    '  ZYARDOREGANOVIVIDJEWEL TIMESTAMP,' +
+    '  ZPURECAKEVIVIDNEATLY FLOAT,' +
+    '  ZASKCONTACTMONITORFUN TIMESTAMP,' +
+    '  ZMOVEWHOGAMMAINCH VARCHAR,' +
+    '  ZLETTUCEBIRDMEETDEBATE TIMESTAMP,' +
+    '  ZGENENATURALHEARINGKITE VARCHAR,' +
+    '  ZMUFFINDRYERDRAWFORTUNE FLOAT,' +
+    '  ZGRAYSURVEYWIRELOVE FLOAT,' +
+    '  ZPLIERSPRINTASKOREGANO INTEGER,' +
+    '  ZTRAVELDRIVERCONTESTLILY INTEGER,' +
+    '  ZHUMORSPICESANDKIDNEY TIMESTAMP,' +
+    '  ZARSENICSAMPLEWAITMUON INTEGER,' +
+    '  ZLACEADDRESSGROUNDCAREFUL FLOAT,' +
+    '  ZBAMBOOMESSWASABIEVENING BLOB,' +
+    '  ZONERELEASEAVERAGENURSE INTEGER,' +
+    '  ZRADIANTWHENTRYCARD TIMESTAMP,' +
+    '  ZREWARDINSIDEMANGOINTENSE FLOAT,' +
+    '  ZNEATSTEWPARTIRON TIMESTAMP,' +
+    '  ZOUTSIDEPEAHENCOUNTICE TIMESTAMP,' +
+    '  ZCREAMEVENINGLIPBRANCH FLOAT,' +
+    '  ZWHALEMATHAVOCADOCOPPER FLOAT,' +
+    '  ZLIFEUSELEAFYBELL FLOAT,' +
+    '  ZWEALTHLINENGLEEFULDAY VARCHAR,' +
+    '  ZFACEINVITETALKGOLD BLOB,' +
+    '  ZWESTAMOUNTAFFECTHEARING INTEGER,' +
+    '  ZDELAYOUTCOMEHORNAGENCY INTEGER,' +
+    '  ZBIGTHINKCONVERTECONOMY BLOB,' +
+    '  ZBASEGOUDAREGULARFORGIVE TIMESTAMP,' +
+    '  ZPATTERNCLORINEGRANDCOLBY TIMESTAMP,' +
+    '  ZCYANBASEFEEDADROIT INTEGER,' +
+    '  ZCARRYFLOORMINNOWDRAGON TIMESTAMP,' +
+    '  ZIMAGEPENCILOTHERBOTTOM FLOAT,' +
+    '  ZXENONFLIGHTPALEAPPLE TIMESTAMP,' +
+    '  ZHERRINGJOKEFEATUREHOPEFUL FLOAT,' +
+    '  ZCAPYEARLYRIVETBRUSH FLOAT,' +
+    '  ZAGEREEDFROGBASKET VARCHAR,' +
+    '  ZUSUALBODYHALIBUTDIAMOND VARCHAR,' +
+    '  ZFOOTTAPWORDENTRY VARCHAR,' +
+    '  ZDISHKEEPBLESTMONITOR FLOAT,' +
+    '  ZBROADABLESOLIDCASUAL INTEGER,' +
+    '  ZSQUAREGLEEFULCHILDLIGHT INTEGER,' +
+    '  ZHOLIDAYHEADPONYDETAIL INTEGER,' +
+    '  ZGENERALRESORTSKYOPEN TIMESTAMP,' +
+    '  ZGLADSPRAYKIDNEYGUPPY VARCHAR,' +
+    '  ZSWIMHEAVYMENTIONKIND BLOB,' +
+    '  ZMESSYSULFURDREAMFESTIVE BLOB,' +
+    '  ZSKYSKYCLASSICBRIEF VARCHAR,' +
+    '  ZDILLASKHOKILEMON FLOAT,' +
+    '  ZJUNIORSHOWPRESSNOVA FLOAT,' +
+    '  ZSIZETOEAWARDFRESH TIMESTAMP,' +
+    '  ZKEYFAILAPRICOTMETAL VARCHAR,' +
+    '  ZHANDYREPAIRPROTONAIRPORT VARCHAR,' +
+    '  ZPOSTPROTEINHANDLEACTOR BLOB' +
+    ');'
+  );
+  speedtest1_prepare(
+    'INSERT INTO ZLOOKSLIKECOREDATA(ZPK,ZAIRFORGIVEHEADFROG,' +
+    'ZGIFTICEFISHGLUEHAIR,ZDELAYOUTCOMEHORNAGENCY,ZSLEEPYUSERGRANDBOWL,' +
+    'ZGLASSRESERVEBARIUMMEAL,ZBRIEFGOBYDODGERHEIGHT,' +
+    'ZBAMBOOMESSWASABIEVENING,ZFARMERMORNINGMIRRORCONCERN,' +
+    'ZTREATPACKFUTURECONVERT,ZCAUSESALAMITERMCYAN,ZCALMRACCOONPROGRAMDEBIT,' +
+    'ZHOLIDAYHEADPONYDETAIL,ZWOODPOETRYCOBBLERBENCH,ZHAFNIUMSCRIPTSALADMOTOR,' +
+    'ZUSUALBODYHALIBUTDIAMOND,ZOUTSIDEPEAHENCOUNTICE,ZDIVERPAINTLEATHEREASY,' +
+    'ZWESTAMOUNTAFFECTHEARING,ZSIZETOEAWARDFRESH,ZDEWPEACHCAREERCELERY,' +
+    'ZSTEELCAREFULPLATENUMBER,ZCYANBASEFEEDADROIT,ZCALMLYGEMFINISHEFFECT,' +
+    'ZHANDYREPAIRPROTONAIRPORT,ZGENENATURALHEARINGKITE,ZBROADABLESOLIDCASUAL,' +
+    'ZPOSTPROTEINHANDLEACTOR,ZLACEADDRESSGROUNDCAREFUL,ZIMAGEPENCILOTHERBOTTOM,' +
+    'ZPROBLEMCLUBPOPOVERJELLY,ZPATTERNCLORINEGRANDCOLBY,ZNEATSTEWPARTIRON,' +
+    'ZAPPEALSIMPLESECONDHOUSING,ZMOVEWHOGAMMAINCH,ZTENNISCYCLEBILLOFFICER,' +
+    'ZSHARKJUSTFRUITMOVIE,ZKEYFAILAPRICOTMETAL,ZCOMPANYSUMMERFIBERELF,' +
+    'ZTERMFITTINGHOUSINGCOMMAND,ZRESORTYARDGREENLET,ZCABBAGESOCKEASEMINUTE,' +
+    'ZSQUAREGLEEFULCHILDLIGHT,ZONERELEASEAVERAGENURSE,ZBIGTHINKCONVERTECONOMY,' +
+    'ZPLIERSPRINTASKOREGANO,ZDECADEJOYOUSWAVEHABIT,ZDRYWALLBEYONDBROWNBOWL,' +
+    'ZCLUBRELEASELIZARDADVICE,ZWHALEMATHAVOCADOCOPPER,ZBELLYCRASHITEMLACK,' +
+    'ZLETTUCEBIRDMEETDEBATE,ZCAPABLETRIPDOORALMOND,ZRADIANTWHENTRYCARD,' +
+    'ZCAPYEARLYRIVETBRUSH,ZAGEREEDFROGBASKET,ZSWIMHEAVYMENTIONKIND,' +
+    'ZTRAVELDRIVERCONTESTLILY,ZGLADSPRAYKIDNEYGUPPY,ZBANKBUFFALORECOVERORBIT,' +
+    'ZFINGERDUEPIZZAOPTION,ZCLAMBITARUGULAFAJITA,ZLONGFINLEAVEIMAGEOIL,' +
+    'ZLONGDIETESSAYNATURE,ZJUNIORSHOWPRESSNOVA,ZHOPEFULGATEHOLECHALK,' +
+    'ZDEPOSITPAIRCOLLEGECOMET,ZWEALTHLINENGLEEFULDAY,ZFILLSTOPLAWJOYFUL,' +
+    'ZTUNEGASBUFFALOCAPITAL,ZGRAYSURVEYWIRELOVE,ZCORNERANCHORTAPEDIVER,' +
+    'ZREWARDINSIDEMANGOINTENSE,ZCADETBRIGHTPLANETBANK,ZPLANETFAMILYPUREMEMORY,' +
+    'ZTREATTESTQUILLCHARGE,ZCREAMEVENINGLIPBRANCH,ZSKYSKYCLASSICBRIEF,' +
+    'ZARSENICSAMPLEWAITMUON,ZBROWBALANCEKEYCHOWDER,ZFLYINGDOCTORTABLEMELODY,' +
+    'ZHANGERLITHIUMDINNERMEET,ZNOTICEPEARPOLICYJUICE,ZSHINYASSISTLIVINGCRAB,' +
+    'ZLIFEUSELEAFYBELL,ZFACEINVITETALKGOLD,ZGENERALRESORTSKYOPEN,' +
+    'ZPURECAKEVIVIDNEATLY,ZKIWIVISUALPRIDEAPPLE,ZMESSYSULFURDREAMFESTIVE,' +
+    'ZCHARGECLICKHUMANEHIRE,ZHERRINGJOKEFEATUREHOPEFUL,ZYARDOREGANOVIVIDJEWEL,' +
+    'ZFOOTTAPWORDENTRY,ZWISHHITSKINMOTOR,ZBASEGOUDAREGULARFORGIVE,' +
+    'ZMUFFINDRYERDRAWFORTUNE,ZACTIONRANGEELEGANTNEUTRON,ZTRYFACTKEEPMILK,' +
+    'ZPEACHCOPPERDINNERLAKE,ZFRAMEENTERSIMPLEMOUTH,ZMERRYCRACKTRAINLEADER,' +
+    'ZMEMORYREQUESTSOURCEBIG,ZCARRYFLOORMINNOWDRAGON,ZMINORWAYPAPERCLASSY,' +
+    'ZDILLASKHOKILEMON,ZRESOLVEWRISTWRAPAPPLE,ZASKCONTACTMONITORFUN,' +
+    'ZGIVEVIVIDDIVINEMEANING,ZEIGHTLEADERWORKERMOST,ZMISSREPLYHUMANLIVING,' +
+    'ZXENONFLIGHTPALEAPPLE,ZSORTMISTYQUOTECABBAGE,ZEAGLELINEMINEMAIL,' +
+    'ZFAMILYVISUALOWNERMATTER,ZSPREADMOTORBISCUITBACON,ZDISHKEEPBLESTMONITOR,' +
+    'ZMALLEQUIPTHANKSGLUE,ZGOLDYOUNGINITIALNOSE,ZHUMORSPICESANDKIDNEY)' +
+    'VALUES(?1,?26,?20,?93,?8,?33,?3,?81,?28,?60,?18,?47,?109,?29,?30,?104,?86,' +
+    '?54,?92,?117,?9,?58,?97,?61,?119,?73,?107,?120,?80,?99,?31,?96,?85,?50,?71,' +
+    '?42,?27,?118,?36,?2,?67,?62,?108,?82,?94,?76,?35,?40,?11,?88,?41,?72,?4,' +
+    '?83,?102,?103,?112,?77,?111,?22,?13,?34,?15,?23,?116,?7,?5,?90,?57,?56,' +
+    '?75,?51,?84,?25,?63,?37,?87,?114,?79,?38,?14,?10,?21,?48,?89,?91,?110,' +
+    '?69,?45,?113,?12,?101,?68,?105,?46,?95,?74,?24,?53,?39,?6,?64,?52,?98,' +
+    '?65,?115,?49,?70,?59,?32,?44,?100,?55,?66,?16,?19,?106,?43,?17,?78);'
+  );
+  for i := 0 to n - 1 do begin
+    x1 := speedtest1_random;
+    zNum := speedtest1_numbername(x1 mod 1000);
+    len := LongWord(Length(zNum));
+    sqlite3_bind_int(g.pStmt, 1, Integer(i xor $f));
+    j := 0;
+    while j < LongWord(Length(zOrmType)) do begin
+      c := zOrmType[j + 1]; { Pascal AnsiString is 1-based }
+      case c of
+        'I', 'T':
+          sqlite3_bind_int64(g.pStmt, Integer(j) + 2, i64(x1));
+        'F':
+          sqlite3_bind_double(g.pStmt, Integer(j) + 2, Double(x1));
+        'V', 'B':
+          sqlite3_bind_text64(g.pStmt, Integer(j) + 2, PAnsiChar(zNum),
+                              u64(len), TxDelProc(SQLITE_STATIC), SQLITE_UTF8);
+      end;
+      Inc(j);
+    end;
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT;');
+  speedtest1_end_test;
+
+  n := LongWord(g.szTest) * 250;
+  speedtest1_begin_test(110, 'Query %d rows by rowid', [n]);
+  speedtest1_prepare(
+    'SELECT ZCYANBASEFEEDADROIT,ZJUNIORSHOWPRESSNOVA,ZCAUSESALAMITERMCYAN,' +
+    'ZHOPEFULGATEHOLECHALK,ZHUMORSPICESANDKIDNEY,ZSWIMHEAVYMENTIONKIND,' +
+    'ZMOVEWHOGAMMAINCH,ZAPPEALSIMPLESECONDHOUSING,ZHAFNIUMSCRIPTSALADMOTOR,' +
+    'ZNEATSTEWPARTIRON,ZLONGFINLEAVEIMAGEOIL,ZDEWPEACHCAREERCELERY,' +
+    'ZXENONFLIGHTPALEAPPLE,ZCALMRACCOONPROGRAMDEBIT,ZUSUALBODYHALIBUTDIAMOND,' +
+    'ZTRYFACTKEEPMILK,ZWEALTHLINENGLEEFULDAY,ZLONGDIETESSAYNATURE,' +
+    'ZLIFEUSELEAFYBELL,ZTREATPACKFUTURECONVERT,ZMEMORYREQUESTSOURCEBIG,' +
+    'ZYARDOREGANOVIVIDJEWEL,ZDEPOSITPAIRCOLLEGECOMET,ZSLEEPYUSERGRANDBOWL,' +
+    'ZBRIEFGOBYDODGERHEIGHT,ZCLUBRELEASELIZARDADVICE,ZCAPABLETRIPDOORALMOND,' +
+    'ZDRYWALLBEYONDBROWNBOWL,ZASKCONTACTMONITORFUN,ZKIWIVISUALPRIDEAPPLE,' +
+    'ZNOTICEPEARPOLICYJUICE,ZPEACHCOPPERDINNERLAKE,ZSTEELCAREFULPLATENUMBER,' +
+    'ZGLADSPRAYKIDNEYGUPPY,ZCOMPANYSUMMERFIBERELF,ZTENNISCYCLEBILLOFFICER,' +
+    'ZIMAGEPENCILOTHERBOTTOM,ZWESTAMOUNTAFFECTHEARING,ZDIVERPAINTLEATHEREASY,' +
+    'ZSKYSKYCLASSICBRIEF,ZMESSYSULFURDREAMFESTIVE,ZMERRYCRACKTRAINLEADER,' +
+    'ZBROADABLESOLIDCASUAL,ZGLASSRESERVEBARIUMMEAL,ZTUNEGASBUFFALOCAPITAL,' +
+    'ZBANKBUFFALORECOVERORBIT,ZTREATTESTQUILLCHARGE,ZBAMBOOMESSWASABIEVENING,' +
+    'ZREWARDINSIDEMANGOINTENSE,ZEAGLELINEMINEMAIL,ZCALMLYGEMFINISHEFFECT,' +
+    'ZKEYFAILAPRICOTMETAL,ZFINGERDUEPIZZAOPTION,ZCADETBRIGHTPLANETBANK,' +
+    'ZGOLDYOUNGINITIALNOSE,ZMISSREPLYHUMANLIVING,ZEIGHTLEADERWORKERMOST,' +
+    'ZFRAMEENTERSIMPLEMOUTH,ZBIGTHINKCONVERTECONOMY,ZFACEINVITETALKGOLD,' +
+    'ZPOSTPROTEINHANDLEACTOR,ZHERRINGJOKEFEATUREHOPEFUL,ZCABBAGESOCKEASEMINUTE,' +
+    'ZMUFFINDRYERDRAWFORTUNE,ZPROBLEMCLUBPOPOVERJELLY,ZGIVEVIVIDDIVINEMEANING,' +
+    'ZGENENATURALHEARINGKITE,ZGENERALRESORTSKYOPEN,ZLETTUCEBIRDMEETDEBATE,' +
+    'ZBASEGOUDAREGULARFORGIVE,ZCHARGECLICKHUMANEHIRE,ZPLANETFAMILYPUREMEMORY,' +
+    'ZMINORWAYPAPERCLASSY,ZCAPYEARLYRIVETBRUSH,ZSIZETOEAWARDFRESH,' +
+    'ZARSENICSAMPLEWAITMUON,ZSQUAREGLEEFULCHILDLIGHT,ZSHINYASSISTLIVINGCRAB,' +
+    'ZCORNERANCHORTAPEDIVER,ZDECADEJOYOUSWAVEHABIT,ZTRAVELDRIVERCONTESTLILY,' +
+    'ZFLYINGDOCTORTABLEMELODY,ZSHARKJUSTFRUITMOVIE,ZFAMILYVISUALOWNERMATTER,' +
+    'ZFARMERMORNINGMIRRORCONCERN,ZGIFTICEFISHGLUEHAIR,ZOUTSIDEPEAHENCOUNTICE,' +
+    'ZSPREADMOTORBISCUITBACON,ZWISHHITSKINMOTOR,ZHOLIDAYHEADPONYDETAIL,' +
+    'ZWOODPOETRYCOBBLERBENCH,ZAIRFORGIVEHEADFROG,ZBROWBALANCEKEYCHOWDER,' +
+    'ZDISHKEEPBLESTMONITOR,ZCLAMBITARUGULAFAJITA,ZPLIERSPRINTASKOREGANO,' +
+    'ZRADIANTWHENTRYCARD,ZDELAYOUTCOMEHORNAGENCY,ZPURECAKEVIVIDNEATLY,' +
+    'ZPATTERNCLORINEGRANDCOLBY,ZHANDYREPAIRPROTONAIRPORT,ZAGEREEDFROGBASKET,' +
+    'ZSORTMISTYQUOTECABBAGE,ZFOOTTAPWORDENTRY,ZRESOLVEWRISTWRAPAPPLE,' +
+    'ZDILLASKHOKILEMON,ZFILLSTOPLAWJOYFUL,ZACTIONRANGEELEGANTNEUTRON,' +
+    'ZRESORTYARDGREENLET,ZCREAMEVENINGLIPBRANCH,ZWHALEMATHAVOCADOCOPPER,' +
+    'ZGRAYSURVEYWIRELOVE,ZBELLYCRASHITEMLACK,ZHANGERLITHIUMDINNERMEET,' +
+    'ZCARRYFLOORMINNOWDRAGON,ZMALLEQUIPTHANKSGLUE,ZTERMFITTINGHOUSINGCOMMAND,' +
+    'ZONERELEASEAVERAGENURSE,ZLACEADDRESSGROUNDCAREFUL' +
+    ' FROM ZLOOKSLIKECOREDATA WHERE ZPK=?1;'
+  );
+  for i := 0 to n - 1 do begin
+    x1 := speedtest1_random mod nRow;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    speedtest1_run;
+  end;
+  speedtest1_end_test;
+end;
+
+{ --------------------------- testset_trigger ---------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 2539..2736. }
+
+procedure testset_trigger;
+var
+  jj, ii: Integer;
+  zNum: AnsiString;
+  x1: Integer;
+  NROW, NROW2: Integer;
+begin
+  NROW  := 500 * g.szTest;
+  NROW2 := 100 * g.szTest;
+
+  speedtest1_exec(
+      'BEGIN;' +
+      'CREATE TABLE z1(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);' +
+      'CREATE TABLE z2(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);' +
+      'CREATE TABLE t3(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);' +
+      'CREATE VIEW v1 AS SELECT rowid, i, t FROM z1;' +
+      'CREATE VIEW v2 AS SELECT rowid, i, t FROM z2;' +
+      'CREATE VIEW v3 AS SELECT rowid, i, t FROM t3;'
+  );
+  for jj := 1 to 3 do begin
+    speedtest1_prepare('INSERT INTO t%d VALUES(NULL,?1,?2)', [jj]);
+    for ii := 0 to NROW - 1 do begin
+      x1 := Integer(speedtest1_random mod LongWord(NROW));
+      zNum := speedtest1_numbername(LongWord(x1));
+      sqlite3_bind_int(g.pStmt, 1, x1);
+      sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zNum), -1, SQLITE_STATIC);
+      speedtest1_run;
+    end;
+  end;
+  speedtest1_exec(
+      'CREATE INDEX i1 ON z1(t);' +
+      'CREATE INDEX i2 ON z2(t);' +
+      'CREATE INDEX i3 ON t3(t);' +
+      'COMMIT;'
+  );
+
+  speedtest1_begin_test(100, 'speed4p-join1');
+  speedtest1_prepare(
+      'SELECT * FROM z1, z2, t3 WHERE z1.oid = z2.oid AND z2.oid = t3.oid'
+  );
+  speedtest1_run;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(110, 'speed4p-join2');
+  speedtest1_prepare(
+      'SELECT * FROM z1, z2, t3 WHERE z1.t = z2.t AND z2.t = t3.t'
+  );
+  speedtest1_run;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(120, 'speed4p-view1');
+  for jj := 1 to 3 do begin
+    speedtest1_prepare('SELECT * FROM v%d WHERE rowid = ?', [jj]);
+    ii := 0;
+    while ii < NROW2 do begin
+      sqlite3_bind_int(g.pStmt, 1, ii * 3);
+      speedtest1_run;
+      Inc(ii, 3);
+    end;
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(130, 'speed4p-table1');
+  for jj := 1 to 3 do begin
+    speedtest1_prepare('SELECT * FROM t%d WHERE rowid = ?', [jj]);
+    ii := 0;
+    while ii < NROW2 do begin
+      sqlite3_bind_int(g.pStmt, 1, ii * 3);
+      speedtest1_run;
+      Inc(ii, 3);
+    end;
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(140, 'speed4p-table1');
+  for jj := 1 to 3 do begin
+    speedtest1_prepare('SELECT * FROM t%d WHERE rowid = ?', [jj]);
+    ii := 0;
+    while ii < NROW2 do begin
+      sqlite3_bind_int(g.pStmt, 1, ii * 3);
+      speedtest1_run;
+      Inc(ii, 3);
+    end;
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(150, 'speed4p-subselect1');
+  speedtest1_prepare('SELECT ' +
+      '(SELECT t FROM z1 WHERE rowid = ?1),' +
+      '(SELECT t FROM z2 WHERE rowid = ?1),' +
+      '(SELECT t FROM t3 WHERE rowid = ?1)'
+  );
+  for jj := 0 to NROW2 - 1 do begin
+    sqlite3_bind_int(g.pStmt, 1, jj * 3);
+    speedtest1_run;
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(160, 'speed4p-rowid-update');
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare('UPDATE z1 SET i=i+1 WHERE rowid=?1');
+  for jj := 0 to NROW2 - 1 do begin
+    sqlite3_bind_int(g.pStmt, 1, jj);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  speedtest1_exec('CREATE TABLE t5(t TEXT PRIMARY KEY, i INTEGER);');
+  speedtest1_begin_test(170, 'speed4p-insert-ignore');
+  speedtest1_exec('INSERT OR IGNORE INTO t5 SELECT t, i FROM z1');
+  speedtest1_end_test;
+
+  speedtest1_exec(
+      'CREATE TABLE log(op TEXT, r INTEGER, i INTEGER, t TEXT);' +
+      'CREATE TABLE t4(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);' +
+      'CREATE TRIGGER t4_trigger1 AFTER INSERT ON t4 BEGIN' +
+      '  INSERT INTO log VALUES(''INSERT INTO t4'', new.rowid, new.i, new.t);' +
+      'END;' +
+      'CREATE TRIGGER t4_trigger2 AFTER UPDATE ON t4 BEGIN' +
+      '  INSERT INTO log VALUES(''UPDATE OF t4'', new.rowid, new.i, new.t);' +
+      'END;' +
+      'CREATE TRIGGER t4_trigger3 AFTER DELETE ON t4 BEGIN' +
+      '  INSERT INTO log VALUES(''DELETE OF t4'', old.rowid, old.i, old.t);' +
+      'END;' +
+      'BEGIN;'
+  );
+
+  speedtest1_begin_test(180, 'speed4p-trigger1');
+  speedtest1_prepare('INSERT INTO t4 VALUES(NULL, ?1, ?2)');
+  for jj := 0 to NROW2 - 1 do begin
+    zNum := speedtest1_numbername(LongWord(jj));
+    sqlite3_bind_int(g.pStmt, 1, jj);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_end_test;
+
+  { Note: Of the queries, only half actually update a row. }
+  speedtest1_begin_test(190, 'speed4p-trigger2');
+  speedtest1_prepare('UPDATE t4 SET i = ?1, t = ?2 WHERE rowid = ?3');
+  jj := 1;
+  while jj <= NROW2 * 2 do begin
+    zNum := speedtest1_numbername(LongWord(jj * 2));
+    sqlite3_bind_int(g.pStmt, 1, jj * 2);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    sqlite3_bind_int(g.pStmt, 3, jj);
+    speedtest1_run;
+    Inc(jj, 2);
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(200, 'speed4p-trigger3');
+  speedtest1_prepare('DELETE FROM t4 WHERE rowid = ?1');
+  jj := 1;
+  while jj <= NROW2 * 2 do begin
+    sqlite3_bind_int(g.pStmt, 1, jj * 2);
+    speedtest1_run;
+    Inc(jj, 2);
+  end;
+  speedtest1_end_test;
+  speedtest1_exec('COMMIT');
+
+  { Same tests but without triggers — measures trigger overhead. }
+  speedtest1_exec(
+      'DROP TABLE t4;' +
+      'DROP TABLE log;' +
+      'VACUUM;' +
+      'CREATE TABLE t4(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);' +
+      'BEGIN;'
+  );
+  speedtest1_begin_test(210, 'speed4p-notrigger1');
+  speedtest1_prepare('INSERT INTO t4 VALUES(NULL, ?1, ?2)');
+  for jj := 0 to NROW2 - 1 do begin
+    zNum := speedtest1_numbername(LongWord(jj));
+    sqlite3_bind_int(g.pStmt, 1, jj);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_end_test;
+  speedtest1_begin_test(210, 'speed4p-notrigger2');
+  speedtest1_prepare('UPDATE t4 SET i = ?1, t = ?2 WHERE rowid = ?3');
+  jj := 1;
+  while jj <= NROW2 * 2 do begin
+    zNum := speedtest1_numbername(LongWord(jj * 2));
+    sqlite3_bind_int(g.pStmt, 1, jj * 2);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    sqlite3_bind_int(g.pStmt, 3, jj);
+    speedtest1_run;
+    Inc(jj, 2);
+  end;
+  speedtest1_end_test;
+  speedtest1_begin_test(220, 'speed4p-notrigger3');
+  speedtest1_prepare('DELETE FROM t4 WHERE rowid = ?1');
+  jj := 1;
+  while jj <= NROW2 * 2 do begin
+    sqlite3_bind_int(g.pStmt, 1, jj * 2);
+    speedtest1_run;
+    Inc(jj, 2);
+  end;
+  speedtest1_end_test;
+  speedtest1_exec('COMMIT');
+end;
 procedure testset_debug1;      begin testset_not_yet('debug1',      'Phase 11.5'); end;
 procedure testset_json;        begin testset_not_yet('json',        'Phase 11.5'); end;
 procedure testset_app;         begin testset_not_yet('app',         'Phase 11.5'); end;

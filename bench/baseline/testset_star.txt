@@ -1,0 +1,43 @@
+PRAGMA threads=0;
+       Begin testset "star"
+/*  100 - Create a fact table with 50 entries......................... */
+CREATE TABLE facttab( attr01 INT, attr02 INT, attr03 INT, data01 TEXT, attr04 INT, attr05 INT, attr06 INT, attr07 INT, attr08 INT, factid INTEGER PRIMARY KEY, data02 TEXT);
+WITH RECURSIVE counter(nnn) AS(VALUES(1) UNION ALL SELECT nnn+1 FROM counter WHERE nnn<50)INSERT INTO facttab(attr01,attr02,attr03,attr04,attr05,attr06,attr07,attr08,data01,data02)SELECT random()%12, random()%13, random()%14, random()%15,random()%16, random()%17, random()%18, random()%19,concat('data-',nnn), format('%x',random()) FROM counter;
+/*  110 - Create indexes on all attributes columns.................... */
+CREATE INDEX fact_attr01 ON facttab(attr01);
+CREATE INDEX fact_attr02 ON facttab(attr02);
+CREATE INDEX fact_attr03 ON facttab(attr03);
+CREATE INDEX fact_attr04 ON facttab(attr04);
+CREATE INDEX fact_attr05 ON facttab(attr05);
+CREATE INDEX fact_attr06 ON facttab(attr06);
+CREATE INDEX fact_attr07 ON facttab(attr07);
+CREATE INDEX fact_attr08 ON facttab(attr08);
+/*  120 - Create dimension tables..................................... */
+CREATE TABLE dimension01(beta01 INT, content01 TEXT, rate01 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<8) INSERT INTO dimension01   SELECT nn%(4), concat('content-01-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim01 ON dimension01(beta01,content01);
+CREATE TABLE dimension02(beta02 INT, content02 TEXT, rate02 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<12) INSERT INTO dimension02   SELECT nn%(6), concat('content-02-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim02 ON dimension02(beta02);
+CREATE TABLE dimension03(beta03 INT, content03 TEXT, rate03 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<16) INSERT INTO dimension03   SELECT nn%(8), concat('content-03-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim03 ON dimension03(beta03);
+CREATE TABLE dimension04(beta04 INT, content04 TEXT, rate04 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<20) INSERT INTO dimension04   SELECT nn%(10), concat('content-04-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim04 ON dimension04(beta04,content04);
+CREATE TABLE dimension05(beta05 INT, content05 TEXT, rate05 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<24) INSERT INTO dimension05   SELECT nn%(12), concat('content-05-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim05 ON dimension05(beta05,content05);
+CREATE TABLE dimension06(beta06 INT, content06 TEXT, rate06 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<28) INSERT INTO dimension06   SELECT nn%(14), concat('content-06-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim06 ON dimension06(beta06);
+CREATE TABLE dimension07(beta07 INT, content07 TEXT, rate07 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<32) INSERT INTO dimension07   SELECT nn%(16), concat('content-07-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim07 ON dimension07(beta07);
+CREATE TABLE dimension08(beta08 INT, content08 TEXT, rate08 REAL);
+WITH RECURSIVE ctr(nn) AS (VALUES(1) UNION ALL SELECT nn+1 FROM ctr WHERE nn<36) INSERT INTO dimension08   SELECT nn%(18), concat('content-08-',nn), (random()%10000)*0.125 FROM ctr;
+CREATE INDEX dim08 ON dimension08(beta08,content08);
+/*  130 - Star query over the entire fact table....................... */
+SELECT count(*), max(content04), min(content03), sum(rate04), avg(rate05) FROM facttab, dimension01, dimension02, dimension03, dimension04, dimension05, dimension06, dimension07, dimension08 WHERE attr01=beta01 AND attr02=beta02 AND attr03=beta03 AND attr04=beta04 AND attr05=beta05 AND attr06=beta06 AND attr07=beta07 AND attr08=beta08;
+/*  130 - Star query with LEFT JOINs.................................. */
+SELECT count(*), max(content04), min(content03), sum(rate04), avg(rate05) FROM facttab LEFT JOIN dimension01 ON attr01=beta01 LEFT JOIN dimension02 ON attr02=beta02 JOIN dimension03 ON attr03=beta03 JOIN dimension04 ON attr04=beta04 JOIN dimension05 ON attr05=beta05 LEFT JOIN dimension06 ON attr06=beta06 JOIN dimension07 ON attr07=beta07 JOIN dimension08 ON attr08=beta08 WHERE facttab.data01 LIKE 'data-9%%';

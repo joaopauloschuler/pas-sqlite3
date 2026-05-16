@@ -1,0 +1,48 @@
+PRAGMA threads=0;
+       Begin testset "trigger"
+BEGIN;CREATE TABLE z1(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);CREATE TABLE z2(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);CREATE TABLE t3(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);CREATE VIEW v1 AS SELECT rowid, i, t FROM z1;CREATE VIEW v2 AS SELECT rowid, i, t FROM z2;CREATE VIEW v3 AS SELECT rowid, i, t FROM t3;
+INSERT INTO t1 VALUES(NULL,?1,?2);
+INSERT INTO t2 VALUES(NULL,?1,?2);
+INSERT INTO t3 VALUES(NULL,?1,?2);
+CREATE INDEX i1 ON z1(t);CREATE INDEX i2 ON z2(t);CREATE INDEX i3 ON t3(t);COMMIT;
+/*  100 - speed4p-join1............................................... */
+SELECT * FROM z1, z2, t3 WHERE z1.oid = z2.oid AND z2.oid = t3.oid;
+/*  110 - speed4p-join2............................................... */
+SELECT * FROM z1, z2, t3 WHERE z1.t = z2.t AND z2.t = t3.t;
+/*  120 - speed4p-view1............................................... */
+SELECT * FROM v1 WHERE rowid = ?;
+SELECT * FROM v2 WHERE rowid = ?;
+SELECT * FROM v3 WHERE rowid = ?;
+/*  130 - speed4p-table1.............................................. */
+SELECT * FROM t1 WHERE rowid = ?;
+SELECT * FROM t2 WHERE rowid = ?;
+SELECT * FROM t3 WHERE rowid = ?;
+/*  140 - speed4p-table1.............................................. */
+SELECT * FROM t1 WHERE rowid = ?;
+SELECT * FROM t2 WHERE rowid = ?;
+SELECT * FROM t3 WHERE rowid = ?;
+/*  150 - speed4p-subselect1.......................................... */
+SELECT (SELECT t FROM z1 WHERE rowid = ?1),(SELECT t FROM z2 WHERE rowid = ?1),(SELECT t FROM t3 WHERE rowid = ?1);
+/*  160 - speed4p-rowid-update........................................ */
+BEGIN;
+UPDATE z1 SET i=i+1 WHERE rowid=?1;
+COMMIT;
+CREATE TABLE t5(t TEXT PRIMARY KEY, i INTEGER);
+/*  170 - speed4p-insert-ignore....................................... */
+INSERT OR IGNORE INTO t5 SELECT t, i FROM z1;
+CREATE TABLE log(op TEXT, r INTEGER, i INTEGER, t TEXT);CREATE TABLE t4(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);CREATE TRIGGER t4_trigger1 AFTER INSERT ON t4 BEGIN  INSERT INTO log VALUES('INSERT INTO t4', new.rowid, new.i, new.t);END;CREATE TRIGGER t4_trigger2 AFTER UPDATE ON t4 BEGIN  INSERT INTO log VALUES('UPDATE OF t4', new.rowid, new.i, new.t);END;CREATE TRIGGER t4_trigger3 AFTER DELETE ON t4 BEGIN  INSERT INTO log VALUES('DELETE OF t4', old.rowid, old.i, old.t);END;BEGIN;
+/*  180 - speed4p-trigger1............................................ */
+INSERT INTO t4 VALUES(NULL, ?1, ?2);
+/*  190 - speed4p-trigger2............................................ */
+UPDATE t4 SET i = ?1, t = ?2 WHERE rowid = ?3;
+/*  200 - speed4p-trigger3............................................ */
+DELETE FROM t4 WHERE rowid = ?1;
+COMMIT;
+DROP TABLE t4;DROP TABLE log;VACUUM;CREATE TABLE t4(rowid INTEGER PRIMARY KEY, i INTEGER, t TEXT);BEGIN;
+/*  210 - speed4p-notrigger1.......................................... */
+INSERT INTO t4 VALUES(NULL, ?1, ?2);
+/*  210 - speed4p-notrigger2.......................................... */
+UPDATE t4 SET i = ?1, t = ?2 WHERE rowid = ?3;
+/*  220 - speed4p-notrigger3.......................................... */
+DELETE FROM t4 WHERE rowid = ?1;
+COMMIT;
