@@ -2134,8 +2134,18 @@ begin
      and (sqlite3GlobalConfig.inProgress = 0) then begin
     sqlite3GlobalConfig.inProgress := 1;
 
-    { Reset the global builtin-functions hash and re-populate. }
-    FillChar(sqlite3BuiltinFunctions, SizeOf(sqlite3BuiltinFunctions), 0);
+    { Populate the global builtin-functions hash.  Unlike C main.c:286..287
+      we do NOT FillChar(sqlite3BuiltinFunctions, ...) here: the Pascal
+      port's sqlite3RegisterBuiltinFunctions is idempotent (guarded by
+      registerBuiltinFunctionsDone and equivalents for date/json/window/
+      alter/analyze) because the bucket-chain links live in the static
+      aBuiltinFuncs[] / aBuiltinAgg[] FuncDef arrays themselves.  Zeroing
+      the hash heads then bailing out of the idempotent register would
+      leave an empty hash — every subsequent sqlite3FindFunction returns
+      nil and the connection sees "no such function: length", "zeroblob",
+      etc. after a sqlite3_shutdown / sqlite3_initialize cycle
+      (9.4.divbug.66 — exposed by test_set_config_pagecache invoked by
+      zeroblob.test, percentile, regexp1/2, tkt3918, without_rowid1/6/7). }
     sqlite3RegisterBuiltinFunctions;
 
     if sqlite3GlobalConfig.isPCacheInit = 0 then
