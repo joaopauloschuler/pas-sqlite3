@@ -1861,7 +1861,8 @@ function  sqlite3VdbeExec(v: PVdbe): i32;
   ---------------------------------------------------------------------- }
 type
   TVdbeParseSchemaExec = function(db: PTsqlite3; iDb: i32;
-                                  zWhere: PAnsiChar; p5: u16): i32;
+                                  zWhere: PAnsiChar; p5: u16;
+                                  pzErrMsg: PPAnsiChar): i32;
 var
   vdbeParseSchemaExec: TVdbeParseSchemaExec = nil;
 
@@ -10720,7 +10721,7 @@ begin
           through the hook.  vdbe.c:7136..7144 clears the schema and
           re-runs sqlite3InitOne when p4 is nil; the hook implementation
           in main.pas mirrors that distinction by detecting nil zWhere. }
-        rc := vdbeParseSchemaExec(db, pOp^.p1, pOp^.p4.z, pOp^.p5);
+        rc := vdbeParseSchemaExec(db, pOp^.p1, pOp^.p4.z, pOp^.p5, @v^.zErrMsg);
         if rc <> SQLITE_OK then begin
           sqlite3ResetAllSchemasOfConnection(db);
           if rc = SQLITE_NOMEM then goto no_mem;

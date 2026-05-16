@@ -3005,13 +3005,44 @@ end;
   for now any caller-side error simply sets pData^.rc to a corruption
   code, which is exactly what the surrounding sqlite3InitCallback
   branches need to ferry the failure out through OP_ParseSchema. }
-procedure initCorruptSchema(pData: PInitData; {%H-}argv: PPAnsiChar;
-                            {%H-}zExtra: PAnsiChar);
+procedure initCorruptSchema(pData: PInitData; argv: PPAnsiChar;
+                            zExtra: PAnsiChar);
+var
+  db    : PTsqlite3;
+  zObj  : PAnsiChar;
+  z, z2 : PAnsiChar;
 begin
-  if pData^.db^.mallocFailed <> 0 then
-    pData^.rc := SQLITE_NOMEM
-  else
-    pData^.rc := SQLITE_CORRUPT;
+  db := pData^.db;
+  if db^.mallocFailed <> 0 then begin
+    pData^.rc := SQLITE_NOMEM;
+    Exit;
+  end;
+  { Faithful port of prepare.c:22 corruptSchema.
+    - keep any pre-existing message (prepare.c:30..31);
+    - SQLITE_WriteSchema swallows the message and forces CORRUPT
+      (prepare.c:45..46);
+    - otherwise format "malformed database schema (<NAME>) [- <extra>]"
+      into pData^.pzErrMsg^ (prepare.c:47..52). }
+  if (pData^.pzErrMsg <> nil) and (pData^.pzErrMsg^ <> nil)
+     and (pData^.pzErrMsg^[0] <> #0) then begin
+    { prior message wins }
+  end else if (db^.flags and SQLITE_WriteSchema) <> 0 then begin
+    { writable_schema → no formatted message }
+  end else if pData^.pzErrMsg <> nil then begin
+    if (argv <> nil) and ((argv + 1)^ <> nil) then
+      zObj := (argv + 1)^
+    else
+      zObj := PAnsiChar('?');
+    z := sqlite3MPrintf(db, 'malformed database schema (%s)', [zObj]);
+    if (zExtra <> nil) and (zExtra[0] <> #0) then begin
+      z2 := sqlite3MPrintf(db, '%s - %s', [z, zExtra]);
+      sqlite3DbFree(db, z);
+      z := z2;
+    end;
+    sqlite3DbFree(db, pData^.pzErrMsg^);
+    pData^.pzErrMsg^ := z;
+  end;
+  pData^.rc := SQLITE_CORRUPT;
 end;
 
 { Faithful port of prepare.c:96 sqlite3InitCallback.
@@ -3166,7 +3197,8 @@ function sqlite3InitOne(db: PTsqlite3; iDb: i32; pzErrMsg: PPAnsiChar;
                         mFlags: u32): i32; forward;
 
 function execParseSchemaImpl(db: PTsqlite3; iDb: i32;
-                             zWhere: PAnsiChar; {%H-}p5: u16): i32;
+                             zWhere: PAnsiChar; {%H-}p5: u16;
+                             pzErrMsg: PPAnsiChar): i32;
 var
   initData : TInitData;
   zSql     : PAnsiChar;
@@ -3188,7 +3220,7 @@ begin
   if zWhere = nil then begin
     sqlite3SchemaClear(db^.aDb[iDb].pSchema);
     db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
-    rc := sqlite3InitOne(db, iDb, nil, p5);
+    rc := sqlite3InitOne(db, iDb, pzErrMsg, p5);
     if rc = SQLITE_OK then
       db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
     Result := rc;
@@ -3231,7 +3263,7 @@ begin
   end;
   initData.db         := db;
   initData.iDb        := iDb;
-  initData.pzErrMsg   := nil;
+  initData.pzErrMsg   := pzErrMsg;
   initData.rc         := SQLITE_OK;
   initData.mInitFlags := 0;
   initData.nInitRow   := 0;
