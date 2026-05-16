@@ -252,3 +252,77 @@ TEXT columns (>=512 bytes) appearing in HOT10, OR when
 would make `IndexByte` cheap to wire in.
 
 Closed as: evaluated, no implementation.
+
+## 12.2.candidate.6 audit findings
+
+Audited zero-fill churn in three hot allocator paths against the
+C source-of-truth.  Result: **no FillChar removed; risk-vs-gain
+not justified for any candidate.**
+
+### 1. `sqlite3DbMallocZero` (passqlite3util.pas:2529)
+Already routes through `sqlite3MallocZero` -> `libc_calloc`
+(passqlite3os.pas:852).  C does `memset(p,0,n)` in
+`malloc.c:592..598`.  **PARITY — no churn to remove.**
+
+### 2. `sqlite3VdbeMakeReady` (passqlite3vdbe.pas:3863)
+Pas uses `sqlite3DbMallocZero` for the `aMem` / `aVar` / `apCsr`
+allocations.  C (`vdbeaux.c:2718..2742`) uses raw
+`sqlite3DbMallocRawNN` and follows with `initMemArray` (which
+writes only `flags` + `db` + `szMalloc` per slot) and
+`memset(apCsr, 0, nCursor*sizeof(VdbeCursor*))`.
+
+- `apCsr`: Pas zero-fill == C memset.  **PARITY.**
+- `aMem` / `aVar`: Pas zero-fills the whole `nMem*SizeOf(TMem)`
+  (~72 bytes/slot today) where C only writes 3 fields per slot
+  and leaves the rest under MEM_Undefined / MEM_Null gating.
+
+The `aMem` / `aVar` paths are **technically over-zeroing**, but
+removing the FillChar would require switching to
+`sqlite3DbMallocRawNN` and writing `flags`+`db`+`szMalloc`
+per-slot exactly as `initMemArray` does.  Two memories raise
+strong cautions:
+
+- `vdbemakeready_zero_init` (bug 6.16) — every nCursor/aMem/nMem
+  field MUST be set unconditionally; missing init crashes
+  closeAllCursors via stale pointers.  Already obeyed in current
+  code (see lines 3913..3950 comments).
+- `unpacked_default_rc` (bug 6.13 sub-bug C) — a sibling pattern
+  (UnpackedRecord allocated raw, `default_rc` left uninit) caused
+  heap-layout-dependent GROUP BY ordering.  The exact same class
+  of bug would re-emerge if any consumer reads a TMem field that
+  the C path leaves "trusted-uninit" without first checking
+  flags.  Pas's own `pAggMem`, `Mem.uTemp` (transient),
+  `Mem.zMalloc` and `Mem.xDel` are read in places (e.g.
+  vdbeMemRelease) that *do* gate on flags — but only audit-by-
+  audit can prove safety; one missing gate = silent flake.
+
+Expected gain: ~0.3 % of total self-time at most
+(MakeReady's share of the global 1.58 % FillChar bucket).
+Decision: **DO NOT remove.**  The conservative full zero-fill
+is a defence-in-depth against the same class of bug we already
+fixed twice (6.13C, 6.16).  Re-evaluate only with a dedicated
+valgrind/uninit-read pass.
+
+### 3. `pcache1FetchNoMutex` (passqlite3pcache.pas:1193)
+The function itself contains no FillChar.  Its callee
+`pcache1AllocPage` (passqlite3pcache.pas:852) matches
+`pcache1.c:429..465` byte-for-byte — three pointer writes plus
+`isBulkLocal=0; isAnchor=0; pLruPrev=nil` (C comment confirms
+the last is a valgrind-quiet write, not a memset).  **PARITY.**
+
+The hot pcache FillChar profiled here is actually the
+`FillChar(pPage1^.pBuf^, pCache^.szPage, 0)` at
+passqlite3pcache.pas:571 — that's `sqlite3PcacheTruncate`'s
+page-1 zero, paired with `pcache.c:718` `memset`.  Parity.
+
+### Cross-cuts left in place per memory
+- `vdbeaux.c:4941` `FillChar(p[136], SizeOf(TVdbe)-136, 0)` in
+  `sqlite3VdbeCreate` — required by 6.16 (zero from `aOp`
+  onward; do NOT shrink the range).
+- `new_record_ansistring` — no `New(record-with-managed-field)`
+  pattern was found in the three audited functions.
+- `unpacked_default_rc` — unaffected; the UnpackedRecord raw
+  alloc is in `sqlite3VdbeAllocUnpackedRecord`, not in scope
+  here.
+
+Closed as: audited, no implementation.
