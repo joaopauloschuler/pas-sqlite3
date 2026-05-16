@@ -54383,6 +54383,14 @@ end;
 const
   FUNC_ENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
+  { 9.4.divbug.45 — VFUNCTION (volatile/non-deterministic) and DFUNCTION
+    (slow-change) macros from sqliteInt.h:2134..2159.  VFUNCTION omits
+    SQLITE_FUNC_CONSTANT entirely; DFUNCTION substitutes SQLITE_FUNC_SLOCHNG
+    for SQLITE_FUNC_CONSTANT.  Both must be distinguishable from FUNCTION so
+    havingToWhere / sqlite3ExprIsConstantOrGroupBy reject random*(), changes(),
+    last_insert_rowid(), etc. as non-promotable HAVING terms (expr.c:2502..2510). }
+  FUNC_VENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
+  FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
   aBuiltinFuncs: array[0..81] of TFuncDef;
@@ -54432,13 +54440,18 @@ begin
     the C oracle bytecode exactly (func.c: FUNCTION(nullif, 2, 0, 1, nullifFunc)). }
   MakeFD(aBuiltinFuncs[15], 2, FUNC_ENC or SQLITE_FUNC_NEEDCOLL,
     @nullifFunc, nil, 'nullif');
-  MakeFD(aBuiltinFuncs[16], 0, FUNC_ENC,  @versionFunc,    nil, 'sqlite_version');
-  MakeFD(aBuiltinFuncs[17], 0, FUNC_ENC,  @sourceidFunc,   nil, 'sqlite_source_id');
-  MakeFD(aBuiltinFuncs[18], 0, FUNC_ENC,  @randomFunc,     nil, 'random');
-  MakeFD(aBuiltinFuncs[19], 1, FUNC_ENC,  @randomBlobFunc, nil, 'randomblob');
-  MakeFD(aBuiltinFuncs[20], 0, FUNC_ENC,  @lastInsertRowid,nil, 'last_insert_rowid');
-  MakeFD(aBuiltinFuncs[21], 0, FUNC_ENC,  @changesFunc,    nil, 'changes');
-  MakeFD(aBuiltinFuncs[22], 0, FUNC_ENC,  @totalChangesFunc,nil,'total_changes');
+  { 9.4.divbug.45 — sqlite_version/sqlite_source_id are DFUNCTION (SLOCHNG,
+    not CONSTANT); random/randomblob/last_insert_rowid/changes/total_changes
+    are VFUNCTION (volatile — neither CONSTANT nor SLOCHNG).  Distinguishing
+    these from regular FUNCTION lets exprNodeIsConstantFunction reject them
+    so havingToWhere does not hoist HAVING randomblob(...) into WHERE. }
+  MakeFD(aBuiltinFuncs[16], 0, FUNC_DENC, @versionFunc,    nil, 'sqlite_version');
+  MakeFD(aBuiltinFuncs[17], 0, FUNC_DENC, @sourceidFunc,   nil, 'sqlite_source_id');
+  MakeFD(aBuiltinFuncs[18], 0, FUNC_VENC, @randomFunc,     nil, 'random');
+  MakeFD(aBuiltinFuncs[19], 1, FUNC_VENC, @randomBlobFunc, nil, 'randomblob');
+  MakeFD(aBuiltinFuncs[20], 0, FUNC_VENC, @lastInsertRowid,nil, 'last_insert_rowid');
+  MakeFD(aBuiltinFuncs[21], 0, FUNC_VENC, @changesFunc,    nil, 'changes');
+  MakeFD(aBuiltinFuncs[22], 0, FUNC_VENC, @totalChangesFunc,nil,'total_changes');
   MakeFD(aBuiltinFuncs[23],-1, FUNC_ENC or SQLITE_FUNC_INLINE,  @coalesceFunc,   nil, 'coalesce');
   aBuiltinFuncs[23].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
   MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC or SQLITE_FUNC_INLINE,  @ifnullFunc,     nil, 'ifnull');
