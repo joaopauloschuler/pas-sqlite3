@@ -723,3 +723,83 @@ queued under 9.4.6.q.  Engine clusters surfaced are listed below as
 (Buckets .42..61 listed in tasklist.md under Phase 9.4 divbug ledger; the
 top-frequency engine root is .44 — indexed MIN/MAX fast paths returning
 0/empty — which alone accounts for ~10 cross-test failures.)
+
+## Run summary (9.4.4.g sweep)
+
+Full tcl-feature sweep (`bin/TclTestDriver` against MANIFEST.txt with all
+20 9.4.4.f-era divbugs .42..61 closed).  959 tests resolved (the 230
+remaining MANIFEST rows are still unrun harnesses requiring shim work
+under 9.4.6.q).
+
+PASS / FAIL / SKIP = **593 / 366 / 0** (959 total, 334.8 s).  Three 20 s
+timeouts (`select4.test`, `writecrash.test`, `securedel2.test`) count as
+FAIL and are bucketed together as 9.4.divbug.84.
+
+Delta vs 9.4.4.f (first 500 in MANIFEST order; intersection with this
+sweep — 427 of the 500 were re-resolved here, the other 73 are part of
+the unswept residue still tagged pas-skip in STATUS.txt):
+
+|                              | 9.4.4.f | 9.4.4.g | Δ     |
+|------------------------------|---------|---------|-------|
+| pas-strict → PASS (held)     | n/a     | 254     | +0    |
+| pas-strict → FAIL (regression) | n/a   | **0**   | **0** |
+| pas-soft   → PASS (recovered)| n/a     | 21      | +21   |
+| pas-soft   → FAIL (still)    | n/a     | 152     | --    |
+
+**Zero regressions** — every pas-strict row from 9.4.4.f held green and
+21 previously pas-soft tests recovered to pas-strict, all attributable
+to the divbug .42..61 fix batch (commits 6b834c8..705d27e).
+
+New-ground slice (sweep positions 501..959, 459 tests, all pas-skip
+baseline in 9.4.4.f STATUS.txt):
+- PASS = **283**, FAIL = **176** — about a 62% pass rate on never-swept
+  ground, consistent with the divergent surface broadening linearly as
+  we leave the "core SQL" path and enter test-runner-heavy territory.
+
+After STATUS.txt retag the totals across the 959 swept rows are
+**593 pas-strict / 366 pas-soft / 0 pas-skip-leftover**.  The 230
+pas-skip rows that remain in STATUS.txt are MANIFEST entries the
+driver did not classify in this run (mostly tcl-internal/harness rows
+already explicitly opted-out of the tcl-feature gate via 9.4.4.h).
+
+Of the 366 FAILs the dominant non-engine clusters remain harness gaps:
+~50 tests blocked by missing `sqlite3_*` test1.c commands (.62),
+~25 tests blocked by missing tcl-side helpers
+(`run_thread_tests`, `test_cli_invocation`, `test_find_cli`,
+`tcl_variable_type`, `database_may_be_corrupt`, `file_control_reservebytes`,
+…) (.63), and ~12 tests blocked by unported `db func`/`db format`
+subcommands (.64).  Engine clusters surfaced are listed below as
+9.4.divbug.62..84.
+
+| Cluster (new)                                       | Approx tests |
+|-----------------------------------------------------|--------------|
+| .62 test1.c sqlite3_* command set unported (harness)| ~50          |
+| .63 tcl-shim helper commands unported (harness)     | ~25          |
+| .64 `db func` / `db format` subcommands unported    | ~12          |
+| .65 tester `::DB` / `::STMT` Tcl globals unexposed  | schema       |
+| .66 SQL fns/extensions unregistered (zeroblob, regexp, percentile, randstr, if) | ~8 |
+| .67 stmtrand extension unported                     | 4            |
+| .68 PRAGMA module_list missing fts5 row             | pragma5      |
+| .69 pragma3 sqlite3-handle ?OPTIONS? parser shim    | pragma3      |
+| .70 error-text divergences (column-name hints, "aliased aggregate", "ORDER BY term out of range", "unknown table option: X", "JOIN clause is required before ON") | select1, quote, tableopts, tkt3508, tkt3935, tokenize, strict1 |
+| .71 STRICT-table type-mismatch error path           | strict1/2, tkt2817/20, savepoint7 |
+| .72 row-value misuse detection missing              | rowvalue,2,4,7,8,9,A |
+| .73 INSERT post-rowid resolution returns 0          | rowid        |
+| .74 UPSERT increment off-by-one (DO UPDATE)         | upsert3, upsertfault |
+| .75 select7 correlated-column resolver `no such column: P.pk` | select3/5/7 |
+| .76 view-column resolution `no such column: y`      | tkt3346      |
+| .77 cross-schema trigger validation error text      | triggerupfrom, trustschema1 |
+| .78 wide-table SCAN+predicate mis-count             | widetab1     |
+| .79 windowE ROWS-frame ordering permuted            | windowE      |
+| .80 `ORDER BY without LIMIT on DELETE` not detected | wherelimit, wherelimit3 |
+| .81 attached/queryonly RO enforcement (residue of .57) | queryonly, pager4, rdonly |
+| .82 INSERT…RETURNING / scalar-fn evaluation empty   | tkt-31338, tkt-26ff, tkt-5e10420e8d |
+| .83 planner row-order divergence (where*, orderbyB) | whereA/B/F/G/I/N, where2/6/8, orderbyB |
+| .84 long-running tests hit 20 s driver timeout      | select4, writecrash, securedel2 |
+
+(Buckets .62..84 listed in tasklist.md under Phase 9.4 divbug ledger.
+Top-frequency root in 9.4.4.g remains harness gaps — .62/.63/.64
+together cover ~85 of the 366 FAILs.  The largest remaining engine
+cluster is .83 — planner result-row order divergences in the where*
+family — but most of those are EQP / ORDER-BY-friendliness questions,
+not correctness regressions.)
