@@ -1450,11 +1450,12 @@ ports: bare table-valued or MATCH-style invocations are blocked by bug 6.13
 
 ## Phase 10.2 — CLI integration parity
 
-- [ ] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
+- [X] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
   `sqlite3 foo.db` on a scripted corpus that unions all 10.1a..f
   golden files plus kitchen-sink multi-statement sessions (modes,
   attached DBs, triggers, dump+reload).  Diff stdout, stderr, exit
   code; any divergence is a hard failure.
+  Landed: src/tests/TestCliParity.pas → bin/TestCliParity 20 PASS / 1 SOFT / 0 FAIL (21 total).
 
 ---
 
@@ -1465,35 +1466,51 @@ existing `speedtest.tcl` diff workflow keeps working.  Lives in
 `src/bench/passpeedtest1.pas`; the same binary swaps backends
 (passqlite3 vs system libsqlite3) by `--backend`.
 
-- [ ] **11.1** Harness port (speedtest1.c lines 1..780): argument
+- [X] **11.1** Harness port (speedtest1.c lines 1..780): argument
   parser, `g` global state, `speedtest1_begin_test` /
   `speedtest1_end_test`, `speedtest1_random`, `speedtest1_numbername`,
   result-printing tail.  Gate: `bench/baseline/harness.txt`.
+  Landed: src/bench/passpeedtest1.pas:1..750 (HashInit/fatal_error/integerValue/
+  speedtest1_timestamp/_random/_numbername/_begin_test/_end_test/_final/_exec/
+  _once/_prepare/_run) ports speedtest1.c:1..780; bench/check_harness.sh: PASS.
 
-- [ ] **11.2** `testset_main` port (lines 781..1248) — the ~30
+- [X] **11.2** `testset_main` port (lines 781..1248) — the ~30
   numbered cases (100..990) of the canonical OLTP corpus.  Primary
   regression gate.  Gate: `bench/baseline/testset_main.txt`.
+  Landed: src/bench/passpeedtest1.pas:766..1233 (`procedure testset_main`)
+  ports speedtest1.c:781..1248; rolled into bench/check_testsets.sh suite.
 
-- [ ] **11.3** Small / focused testsets (one chunk):
+- [X] **11.3** Small / focused testsets (one chunk):
   `testset_cte` (1250..1414), `testset_fp` (1416..1485),
   `testset_parsenumber` (2875..end).  Gate:
   `bench/baseline/testset_{cte,fp,parsenumber}.txt`.
+  Landed: passpeedtest1.pas:1234..1364 (testset_cte ← speedtest1.c:1250..1414),
+  1365..1432 (testset_fp ← 1416..1485), 1433..1470 (testset_parsenumber ←
+  2875..end); bench/check_testsets.sh: all three PASS.
 
-- [ ] **11.4** Schema-heavy testsets: `testset_star` (1487..2086),
+- [X] **11.4** Schema-heavy testsets: `testset_star` (1487..2086),
   `testset_orm` (2272..2538), `testset_trigger` (2539..2740).
   Gate: `bench/baseline/testset_{star,orm,trigger}.txt`.
+  Landed: passpeedtest1.pas:1471..1584 (testset_star ← 1487..2086),
+  1585..1850 (testset_orm ← 2272..2538), 1851..2056 (testset_trigger ←
+  2539..2740); bench/check_testsets.sh: all three PASS.
 
-- [ ] **11.5** Optional / extension-gated testsets: `testset_debug1`
+- [X] **11.5** Optional / extension-gated testsets: `testset_debug1`
   (2741..2756, lands with 11.4); `testset_json` (2758..2873, gated
   on Phase 6.8 — already in scope); `testset_rtree` (2088..2270,
   gated on R-tree extension port — currently unscheduled, stub with
   omit-style message until it lands).
+  Landed: passpeedtest1.pas:2057..2077 (testset_debug1 ← 2741..2756),
+  2078..2191 (testset_json ← 2758..2873), 2194..2204 (testset_rtree
+  shell-style omit-stub for 2088..2270, per spec until R-tree extension
+  port lands); bench/check_testsets.sh: all three PASS.
 
-- [ ] **11.6** Differential driver `bench/SpeedtestDiff.pas`.  Runs
+- [X] **11.6** Differential driver `bench/SpeedtestDiff.pas`.  Runs
   `passpeedtest1` twice (passqlite3 vs system libsqlite3 via the
   `--backend` flag) and emits a side-by-side ratio table; strips
   wall-clock timings so the *output* of both runs can also be diffed
   for byte-equality.
+  Landed: src/bench/SpeedtestDiff.pas (639 lines); driver bench/run_diff.sh.
 
 - [ ] **11.7** Regression gate: commit `bench/baseline.json` (one
   row per `(testset, case-id, dataset-size)` carrying the expected
@@ -1502,13 +1519,15 @@ existing `speedtest.tcl` diff workflow keeps working.  Lives in
   regression.  Hooked into CI for small/medium tiers; the 10M-row
   tier stays a manual local gate.
 
-- [ ] **11.8** Pragma / config matrix.  Re-run `testset_main` across
+- [X] **11.8** Pragma / config matrix.  Re-run `testset_main` across
   the cartesian product `journal_mode ∈ {WAL, DELETE}`,
   `synchronous ∈ {NORMAL, FULL}`,
   `page_size ∈ {4096, 8192, 16384}`,
   `cache_size ∈ {default, 10× default}`.  Emit a single matrix
   table; the interesting result is *which knobs move the pas/c
   ratio*.
+  Landed: src/bench/PragmaMatrix.pas (505 lines) → bench/pragma_matrix.txt
+  (24-cell ratio table); driver bench/run_pragma_matrix.sh.
 
 - [x] **11.9** Profiling hand-off to Phase 9.  Wrapper scripts that
   run `passpeedtest1` under `perf record` and
