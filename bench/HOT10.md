@@ -326,3 +326,58 @@ page-1 zero, paired with `pcache.c:718` `memset`.  Parity.
   here.
 
 Closed as: audited, no implementation.
+
+---
+
+## 12.2.candidate.9 — fillInCell / insertCellFast Move audit
+
+Targets:
+- `fillInCell`  (passqlite3btree.pas:5001 ↔ btree.c:7059)
+- `insertCellFast`  (passqlite3btree.pas:1871 ↔ btree.c:7413)
+
+### fillInCell — short (non-overflow) path
+C btree.c:7114..7115:
+```c
+memcpy(pPayload, pSrc, nSrc);
+memset(pPayload+nSrc, 0, nPayload-nSrc);
+```
+Pas passqlite3btree.pas:5040..5041:
+```pas
+Move(pSrc^, pPayload^, nSrc);
+FillChar((pPayload + nSrc)^, nPayload - nSrc, 0);
+```
+**PARITY.**  The Move covers `[pPayload, pPayload+nSrc)`; the
+FillChar covers the disjoint `[pPayload+nSrc, pPayload+nPayload)`
+hole (only relevant when `nSrc<nPayload`, i.e. nZero>0).  The two
+ranges do not overlap and neither is wasted.  Removing the
+FillChar would leak uninitialised stack/heap bytes into the leaf
+cell when `pX^.nZero > 0` (INSERT … zeroblob() path).
+
+### fillInCell — overflow path
+C btree.c:7171..7178 has a three-way `if/else if/else`:
+memcpy nSrc≥n, partial-memcpy nSrc>0, or memset.  Pas
+:5060..5066 mirrors it arm-for-arm.  **PARITY.**
+
+### insertCellFast
+C btree.c:7465..7467:
+```c
+memcpy(&data[idx], pCell, sz);
+pIns = pPage->aCellIdx + i*2;
+memmove(pIns+2, pIns, 2*(pPage->nCell - i));
+```
+Pas passqlite3btree.pas:1897..1899:
+```pas
+Move(pCell^, (data + idx)^, sz);
+pIns := pPage^.aCellIdx + i * 2;
+Move(pIns^, (pIns + 2)^, 2 * (pPage^.nCell - i));
+```
+**PARITY.**  Two distinct ranges (cell payload at `data[idx]`,
+slot index in `aCellIdx`).  No redundant zero-then-overwrite.
+
+### Verdict
+No removable Move / FillChar in either function.  The Pas ports
+match the C source memcpy/memmove/memset counts byte-for-byte.
+The 0.x % self-time of these helpers comes from the legitimate
+payload-copy work, not from spurious zero-fills.
+
+Closed as: **audited, no implementation.**
