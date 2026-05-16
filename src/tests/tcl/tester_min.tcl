@@ -430,6 +430,134 @@ proc faultsim_delete_and_reopen {args} {
   uplevel db_delete_and_reopen $args
 }
 
+# crashsql — upstream tester.tcl:1752..1840 (port, task 9.4.2.g.11).
+# Spawns a child tclsh that opens db via the "crash" VFS (provided by
+# TestModuleCrash, task 9.4.7.d), configures sqlite3_crashparams DELAY
+# CRASHFILE, runs $sql under `db eval {...}` and is then killed by
+# _exit(-1) inside the crash VFS's xSync.  The parent returns the
+# two-element list [list R MSG] where R is the catch rc (non-zero on
+# crash) and MSG is the error string — the upstream sigil is
+# "child process exited abnormally", which `exec` produces verbatim
+# when the spawned process is killed by a signal / non-zero exit.
+#
+# Options (subset of upstream — the full upstream surface is supported
+# down to "-tclbody" with the same defaults as tester.tcl:1754..1761):
+#   -delay  N        : crash on the Nth xSync of CRASHFILE (default 1)
+#   -file   PATH     : the crash filename (required by upstream)
+#   -seed   N        : seed the PRNG via a randomblob(N%10007+1)
+#   -opendb CMD      : command to open the db (default `sqlite3 db test.db -vfs crash`)
+#   -tclbody  SCRIPT : extra Tcl to run in the child before $sql
+#   -dfltvfs BOOL    : 2nd arg to sqlite3_crash_enable (default 0)
+#   -blocksize / -characteristics : forwarded as `-s N` / `-c LIST` flags
+#                       to sqlite3_crashparams (delegated to TestModuleCrash).
+#
+# The auxiliary commands that tester.tcl's crashsql writes into the
+# child script (install_malloc_faultsim, sqlite3_test_control_pending_byte,
+# btree_from_db, btree_set_cache_size, autoinstall_test_functions) are
+# either present in this build (autoinstall_test_functions via
+# TestModuleFunc, install_malloc_faultsim via TestModuleMalloc) or are
+# wrapped in `catch { ... }` so a missing command does not abort the
+# child before the SQL runs.  Same protective `catch` discipline as the
+# `catch {install_malloc_faultsim 1}` arm in tester.tcl:1791.
+#
+# C oracle: /home/bpsa/app/sqlite3/test/tester.tcl:1752..1840.
+proc crashsql {args} {
+  set blocksize ""
+  set crashdelay 1
+  set prngseed 0
+  set opendb {sqlite3 db test.db -vfs crash}
+  set tclbody {}
+  set crashfile ""
+  set dc ""
+  set dfltvfs 0
+  set sql [lindex $args end]
+
+  for {set ii 0} {$ii < [llength $args]-1} {incr ii 2} {
+    set z [lindex $args $ii]
+    set n [string length $z]
+    set z2 [lindex $args [expr $ii+1]]
+    if     {$n>1 && [string first $z -delay]==0}     {set crashdelay $z2} \
+    elseif {$n>1 && [string first $z -opendb]==0}    {set opendb $z2} \
+    elseif {$n>1 && [string first $z -seed]==0}      {set prngseed $z2} \
+    elseif {$n>1 && [string first $z -file]==0}      {set crashfile $z2} \
+    elseif {$n>1 && [string first $z -tclbody]==0}   {set tclbody $z2} \
+    elseif {$n>1 && [string first $z -blocksize]==0} {set blocksize "-s $z2"} \
+    elseif {$n>1 && [string first $z -characteristics]==0} {set dc "-c {$z2}"} \
+    elseif {$n>1 && [string first $z -dfltvfs]==0}   {set dfltvfs $z2} \
+    else   { error "Unrecognized option: $z" }
+  }
+
+  if {$crashfile eq ""} {
+    error "Compulsory option -file missing"
+  }
+
+  set cfile [string map {\\ \\\\} [file nativename [file join [pwd] $crashfile]]]
+
+  # 9.4.7.d — the child script must `load` libpassqlite3tcl.so to gain
+  # the `sqlite3` command and the crash-VFS bindings.  Our parent test
+  # process was started by TclTestDriver which puts bin/ on ::auto_path,
+  # but the child is a bare `[info nameofexec]` (tclsh), so we re-emit
+  # the package require here.  PASLIB env var lets the driver override
+  # the resolved .so path if it diverges from ::auto_path.
+  set libdir [file dirname [info script]]
+  # walk up to find bin/ — tester_min.tcl sits at src/tests/tcl/
+  set bindir [file normalize [file join $libdir .. .. .. bin]]
+
+  set f [open crash.tcl w]
+  puts $f "if {\[info exists ::env(PAS_TCL_PKG_DIR)\]} {"
+  puts $f "  lappend ::auto_path \$::env(PAS_TCL_PKG_DIR)"
+  puts $f "} else {"
+  puts $f "  lappend ::auto_path {$bindir}"
+  puts $f "}"
+  puts $f "package require sqlite3"
+  puts $f "sqlite3_initialize ; sqlite3_shutdown"
+  puts $f "catch { install_malloc_faultsim 1 }"
+  puts $f "sqlite3_crash_enable 1 $dfltvfs"
+  puts $f "sqlite3_crashparams $blocksize $dc $crashdelay $cfile"
+  puts $f "catch { sqlite3_test_control_pending_byte \$::sqlite_pending_byte }"
+  puts $f "catch { autoinstall_test_functions }"
+
+  if {$opendb ne ""} {
+    puts $f $opendb
+    puts $f {catch { db eval {SELECT * FROM sqlite_master;} }}
+    puts $f {catch {set bt [btree_from_db db]; btree_set_cache_size $bt 10}}
+  }
+
+  if {$prngseed} {
+    set seed [expr {$prngseed%10007+1}]
+    puts $f "db eval {SELECT randomblob($seed)}"
+  }
+
+  if {[string length $tclbody]>0} {
+    puts $f $tclbody
+  }
+  if {[string length $sql]>0} {
+    puts $f "db eval {"
+    puts $f   "$sql"
+    puts $f "}"
+  }
+  close $f
+
+  set r [catch {
+    exec [info nameofexec] crash.tcl >@stdout 2>@stdout
+  } msg]
+
+  if {$r && [string match {*ERROR: LeakSanitizer*} $msg]} {
+    set msg "child process exited abnormally"
+  }
+
+  lappend r $msg
+}
+
+# Initialise the global pending-byte that tester.tcl normally sets from
+# C-side test_config.  Upstream default is 0x40000000 (1 GiB) — the
+# child crashsql script catch-guards the call, so this is purely a
+# convenience so callers that read $::sqlite_pending_byte don't trip on
+# `can't read "sqlite_pending_byte": no such variable`.
+if {![info exists ::sqlite_pending_byte]} {
+  set ::sqlite_pending_byte 0x40000000
+}
+
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
 # runs finish_test_precleanup (deregisters test VFSes), optionally
 # sources extra scripts from $argv, closes `db`, then defers to

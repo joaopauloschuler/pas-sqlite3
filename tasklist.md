@@ -401,10 +401,31 @@ acceptance gate for this section.
     9.4.7.e.  C ref: `permutations.tcl:1..400`.
   - [X] **9.4.2.g.9** `do_malloc_test` ported verbatim into `tester_min.tcl` (malloc_common.tcl:416..538); drives the memdebug `sqlite3_memdebug_fail` / `install_malloc_faultsim` primitives.  Runs clean when no fault fires; an injected malloc failure used to segfault the engine OOM-recovery path (tracked + fixed as **9.4.divbug.27**) — `do_malloc_test` now completes without SIGSEGV.
   - [X] **9.4.2.g.10** `do_ioerr_test` + `run_ioerr_prep` ported verbatim into `tester_min.tcl` (tester.tcl:1890..2118); drives the 9.4.7.c counters.  Runs end-to-end (fault fires, engine recovers, terminates cleanly).
-  - [ ] **9.4.2.g.11** `crashsql` — spawns child process that aborts
-    mid-write; parent verifies WAL/journal recovery.  Requires crash
-    harness (9.4.7.d).  C ref: `crash.tcl:1..200`,
-    `tester.tcl:1893..1968`.
+  - [X] **9.4.2.g.11** `crashsql` Tcl proc — verbatim port of
+    `tester.tcl:1752..1840` into `tester_min.tcl` (Agent 6, 2026-05-16).
+    Spawns a child `tclsh` that loads the pas library, registers the
+    crash VFS (9.4.7.d), runs the supplied SQL under `-vfs crash`, and
+    is killed by `_exit(-1)` inside `cfSync` once `iCrash` decrements
+    to 0; parent catches `child process exited abnormally`, reopens db,
+    integrity is preserved (verified end-to-end in driver via a
+    hand-rolled manifest entry).  Followups:
+    * **9.4.7.d.followup.1** flip the `ifcapable` shim to honour
+      `crashtest` so the upstream `crash{,2..8,M}.test` files
+      transition from "early-return PASS" to actually exercising the
+      harness.  Held back here to avoid pulling unrelated divbug
+      regressions into this agent's change-set.
+    * **9.4.7.d.followup.2** WAL crash support (`xShm*` methods on
+      `CrashFileVtab` are currently nil — sufficient for rollback-
+      journal `crash.test`, insufficient for `walcrash*.test`).
+    * **9.4.7.d.followup.3** `unixVfsObjFoo := unixVfsObj` in
+      `passqlite3os.pas:2890..2891` clobbers a wrapper VFS's `pNext`
+      when one is interleaved between unix and unix-none across an
+      init/shutdown cycle.  Worked around in `crashEnableCmd` by
+      forcing `sqlite3_initialize` before `sqlite3_vfs_register`, so
+      no later open re-runs `sqlite3_os_init`; the upstream pattern
+      should still be tightened (record-copy of an in-list singleton
+      mutates its `pNext` to whatever the source's `pNext` currently
+      points at).
   - [X] **9.4.2.g.12** `db_save_and_close` / `db_restore_and_reopen`
     + `forcecopy` — snapshot helpers for tests that mutate then
     revert.  C ref: `tester.tcl:1714..1760`.
@@ -749,14 +770,23 @@ acceptance gate for this section.
   - [X] **9.4.7.c** I/O-error injection — ported the `os_common.h` `SQLITE_TEST` machinery (the `SimulateIOError`/`SimulateDiskfullError` counter checks) directly into the Pascal unix VFS read/write/sync/truncate rather than a `test_devsym.c` wrapper VFS (the wrong tool — `do_ioerr_test` drives global counters).  `src/tests/tcl/testmodules/TestModuleIoerr.pas` (`test2.c` port) `Tcl_LinkVar`s the counters.  All `{$ifdef SQLITE_TEST}`-gated; default build byte-unaffected.
   - [~] **9.4.7.c.old** ~~test_devsym.c wrapper VFS~~ — superseded by the counter-instrumentation approach above; kept only if a future test needs a real device-characteristics shim.  Registers via
     `sqlite3_vfs_register`.
-  - [ ] **9.4.7.d** Crash-test harness — `crashsql` (9.4.2.g.11)
-    spawns a child `tclsh` invocation that `_exit`'s mid-write.
-    Parent re-opens the db, runs `PRAGMA integrity_check`.
-    Requires: crash-injection VFS that aborts after N writes
-    (`../sqlite3/src/test_onefile.c` shape), + parent/child
-    process plumbing in `TclTestDriver.pas` (TProcess with
-    SIGKILL).  Substantial — estimate 1-2 weeks.  C ref:
-    `../sqlite3/src/test_thread.c` + `crash.tcl`.
+  - [~] **9.4.7.d** Crash-test harness — faithful port of `test6.c`
+    landed as `src/tests/tcl/testmodules/TestModuleCrash.pas` (Agent
+    6, 2026-05-16).  The "crash" VFS wraps the system default unix
+    VFS, queues every `xWrite`/`xTruncate` in an in-memory write
+    list, and on the `iCrash`'th `xSync` of the configured
+    `zCrashFile` calls `_exit(-1)` — exactly the upstream power-loss
+    semantics.  Tcl bindings `sqlite3_crash_enable`,
+    `sqlite3_crash_now`, `sqlite3_crashparams` registered via
+    `Sqlitetest6_Init` from `PasTclSqlite.pas:Sqlite3_Init`.
+    `crashsql` Tcl proc landed under 9.4.2.g.11.  Verified
+    end-to-end through `bin/TclTestDriver`: a hand-rolled .test
+    using `crashsql -delay 1 -file test.db-journal { INSERT ... }`
+    runs, the child crashes mid-journal-sync, the parent reopens
+    and confirms recovery + integrity_check ok.  Marked [~] (not
+    [X]) because three followups remain — see 9.4.2.g.11 for the
+    list (`ifcapable crashtest`, WAL shm methods, the upstream
+    `unixVfsObjFoo := unixVfsObj` record-copy issue).
   - [ ] **9.4.7.e** `permutations.tcl` matrix — full upstream re-runs
     each test under ~30 build-flag combinations.  Land as
     optional second-tier gate (not in baseline CI).  Requires:
