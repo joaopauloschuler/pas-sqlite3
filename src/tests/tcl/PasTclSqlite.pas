@@ -4330,21 +4330,35 @@ begin
                               clientData, objc, objv);
 end;
 
-{ DbMain — constructor for the `sqlite3 db1 FILE` Tcl command.
-  Minimal port of tclsqlite.c:4253..4570: skips flag parsing, key
-  options, busy/encoding setup; just defaults RW+CREATE which is the
-  documented behaviour for `:memory:`.
+{ DbMain — constructor for the `sqlite3 db1 FILE ?OPTIONS?` Tcl command.
+  Port of tclsqlite.c:4253..4410.  9.4.divbug.57: previously hard-coded
+  RW|CREATE which silently ignored `-readonly 1` / `-create 0` so
+  openv2-1.1 (missing file under -create 0) and openv2-1.4 (write to
+  RO open of a writable file) returned OK instead of the documented
+  errors.  Now parses -readonly/-create/-vfs/-nofollow/-nomutex/
+  -fullmutex/-uri and propagates sqlite3_errmsg / sqlite3_errstr in the
+  failure arm.
 
-  objv[0]="sqlite3", objv[1]=dbname (e.g. "db1"), objv[2]=zFile. }
+  objv[0]="sqlite3", objv[1]=dbname (e.g. "db1"), objv[2..]=FILE+OPTIONS. }
 function DbMain(clientData: TClientData; interp: PTclInterp;
                 objc: cint; objv: PPTclObj): cint; cdecl;
 var
-  pDb:     PSqliteDb;
-  zDbName: PAnsiChar;
-  zFile:   PAnsiChar;
-  rc:      cint;
-  pHandle: PTsqlite3;
+  pDb:      PSqliteDb;
+  zDbName:  PAnsiChar;
+  zFile:    PAnsiChar;
+  zVfs:     PAnsiChar;
+  zArg:     PAnsiChar;
+  zErr:     PAnsiChar;
+  rc:       cint;
+  pHandle:  PTsqlite3;
+  flags:    cint;
+  i:        cint;
+  b:        cint;
 begin
+  flags   := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or SQLITE_OPEN_NOMUTEX;
+  zFile   := nil;
+  zVfs    := nil;
+
   if objc < 3 then
   begin
     Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE FILENAME ?OPTIONS?'));
@@ -4353,19 +4367,133 @@ begin
   end;
 
   zDbName := Tcl_GetStringFromObj(ObjvAt(objv, 1), nil);
-  zFile   := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
+
+  { Port of tclsqlite.c:4299..4372 — parse positional FILE plus key/value
+    options. }
+  i := 2;
+  while i < objc do
+  begin
+    zArg := Tcl_GetString(ObjvAt(objv, i));
+    if (zArg = nil) or (zArg[0] <> '-') then
+    begin
+      if zFile <> nil then
+      begin
+        Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE FILENAME ?OPTIONS?'));
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      zFile := zArg;
+      Inc(i);
+      Continue;
+    end;
+    if i = objc - 1 then
+    begin
+      Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE FILENAME ?OPTIONS?'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Inc(i);
+    if StrComp(zArg, '-key') = 0 then
+    begin
+      { no-op — encryption not supported }
+    end
+    else if StrComp(zArg, '-vfs') = 0 then
+      zVfs := Tcl_GetString(ObjvAt(objv, i))
+    else if StrComp(zArg, '-readonly') = 0 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @b) <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+      if b <> 0 then
+      begin
+        flags := flags and not (SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE);
+        flags := flags or SQLITE_OPEN_READONLY;
+      end
+      else
+      begin
+        flags := flags and not SQLITE_OPEN_READONLY;
+        flags := flags or SQLITE_OPEN_READWRITE;
+      end;
+    end
+    else if StrComp(zArg, '-create') = 0 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @b) <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+      if (b <> 0) and ((flags and SQLITE_OPEN_READONLY) = 0) then
+        flags := flags or SQLITE_OPEN_CREATE
+      else
+        flags := flags and not SQLITE_OPEN_CREATE;
+    end
+    else if StrComp(zArg, '-nofollow') = 0 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @b) <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+      if b <> 0 then
+        flags := flags or SQLITE_OPEN_NOFOLLOW
+      else
+        flags := flags and not SQLITE_OPEN_NOFOLLOW;
+    end
+    else if StrComp(zArg, '-nomutex') = 0 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @b) <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+      if b <> 0 then
+      begin
+        flags := flags or SQLITE_OPEN_NOMUTEX;
+        flags := flags and not SQLITE_OPEN_FULLMUTEX;
+      end
+      else
+        flags := flags and not SQLITE_OPEN_NOMUTEX;
+    end
+    else if StrComp(zArg, '-fullmutex') = 0 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @b) <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+      if b <> 0 then
+      begin
+        flags := flags or SQLITE_OPEN_FULLMUTEX;
+        flags := flags and not SQLITE_OPEN_NOMUTEX;
+      end
+      else
+        flags := flags and not SQLITE_OPEN_FULLMUTEX;
+    end
+    else if StrComp(zArg, '-uri') = 0 then
+    begin
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @b) <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+      if b <> 0 then
+        flags := flags or SQLITE_OPEN_URI
+      else
+        flags := flags and not SQLITE_OPEN_URI;
+    end
+    else
+    begin
+      Tcl_AppendResult(interp, PChar('unknown option: '), zArg, Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Inc(i);
+  end;
+
+  if zFile = nil then zFile := '';
 
   pHandle := nil;
-  rc := sqlite3_open_v2(zFile, @pHandle,
-                        SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE,
-                        nil);
-  if rc <> SQLITE_OK then
+  rc := sqlite3_open_v2(zFile, @pHandle, flags, zVfs);
+  if (rc <> SQLITE_OK) or (pHandle = nil) or
+     (sqlite3_errcode(pHandle) <> SQLITE_OK) then
   begin
+    { Port of tclsqlite.c:4384..4397 error arm: prefer sqlite3_errmsg
+      when a handle exists, else fall back to sqlite3_errstr. }
     if pHandle <> nil then
+    begin
+      zErr := sqlite3_errmsg(pHandle);
+      Tcl_AppendResult(interp, zErr, Pointer(nil));
       sqlite3_close_v2(pHandle);
-    Tcl_AppendResult(interp,
-      PChar('sqlite3_open_v2 failed'),
-      Pointer(nil));
+    end
+    else
+    begin
+      zErr := sqlite3_errstr(rc);
+      Tcl_AppendResult(interp, zErr, Pointer(nil));
+    end;
     Result := TCL_ERROR;
     Exit;
   end;
@@ -4376,10 +4504,8 @@ begin
   New(pDb);
   pDb^.db       := pHandle;
   pDb^.interp   := interp;
-  { This minimal DbMain opens with fixed RW|CREATE flags and parses no
-    ?OPTIONS?, so the SQLITE_OPEN_URI-masked openFlags is always 0.
-    Kept as a field for the backup/restore arms (tclsqlite.c:4400). }
-  pDb^.openFlags := 0;
+  { tclsqlite.c:4400 — preserve the URI bit for backup/restore arms. }
+  pDb^.openFlags := flags and SQLITE_OPEN_URI;
   pDb^.zNull    := nil;
   pDb^.pFunc    := nil;
   pDb^.zTrace   := nil;
