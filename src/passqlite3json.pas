@@ -641,7 +641,7 @@ procedure jsonGroupInverse(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdec
 implementation
 
 uses
-  SysUtils;
+  SysUtils, passqlite3printf;
 
 function jsonIsspace(c: AnsiChar): i32; inline;
 begin
@@ -3607,10 +3607,11 @@ end;
 { json.c:803 — append an sqlite3_value to the JSON string under construction. }
 procedure jsonAppendSqlValue(p: PJsonString; pValue: Pointer);
 var
-  pVal: Psqlite3_value;
-  z:    PAnsiChar;
-  n:    u32;
-  px:   TJsonParse;
+  pVal:   Psqlite3_value;
+  z:      PAnsiChar;
+  n:      u32;
+  px:     TJsonParse;
+  sFloat: AnsiString;
 begin
   pVal := Psqlite3_value(pValue);
   case sqlite3_value_type(pVal) of
@@ -3618,10 +3619,14 @@ begin
       jsonAppendRawNZ(p, PAnsiChar('null'), 4);
     SQLITE_FLOAT:
       begin
-        { json.c uses jsonPrintf(100, p, "%!0.15g", …); RealStr is good
-          enough until 6.8.h.x ports the json-flavoured printf. }
-        z := PAnsiChar(AnsiString(FloatToStr(sqlite3_value_double(pVal))));
-        jsonAppendRaw(p, z, u32(StrLen(z)));
+        { json.c:813 — jsonPrintf(100, p, "%!0.15g", sqlite3_value_double(pValue)).
+          The '!' altform2 flag forces a `.0` suffix on integer-valued
+          doubles and an `e+NN` form on large/small magnitudes (printf.c:528..713,
+          flag_rtz/altform2 branch at :687..697).  9.4.divbug.50. }
+        sFloat := sqlite3FormatStr(PAnsiChar('%!0.15g'),
+          [sqlite3_value_double(pVal)]);
+        z := PAnsiChar(sFloat);
+        jsonAppendRaw(p, z, u32(Length(sFloat)));
       end;
     SQLITE_INTEGER:
       begin
