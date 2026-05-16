@@ -1,0 +1,3 @@
+       Begin testset "main"
+speedtest1: testset "main" not yet ported (Phase 11.2)
+rc=2
