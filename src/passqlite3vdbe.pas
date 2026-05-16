@@ -6587,6 +6587,12 @@ begin
     Without this, tied records sort to a random side and group_concat /
     aggregate row order becomes heap-layout-dependent (bug 6.13 residual). }
   pUR^.default_rc := 0;
+  { 9.4.divbug.30 — match vdbesort.c:1358 vdbeSortAllocUnpacked: cap nField
+    at pKeyInfo->nKeyField so RecordUnpack/RecordCompare only walk the key
+    columns, leaving the data columns untouched.  Otherwise ORDER BY ties
+    under a non-default collation (e.g. NOCASE) fall through to BINARY
+    memcmp on the data column and lose insertion-order stability. }
+  pUR^.nField := i32(Pu16(PByte(pSorter^.pKeyInfo) + 6)^);  { TKeyInfo.nKeyField @6 }
   aLen   := Pi32(PByte(pA) + 8)^;
   bLen   := Pi32(PByte(pB) + 8)^;
   aBytes := PByte(pA) + SORTER_REC_HDR;

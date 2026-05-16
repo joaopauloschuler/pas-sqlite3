@@ -475,20 +475,20 @@ case instead of returning.  C reference: vdbeaux.c `applyAffinity`
 ~vdbe.c:209.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders
+## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders — FIXED
 
-Affects: 3 tests (`collate2.test`, `collate9.test`, `collate8.test`).
-Symptom: `SELECT … ORDER BY x COLLATE NOCASE` returns rows in a
-case-segregated order (`AB Ab aB ab BA …`) instead of upstream's
-case-folded order (`ab aB Ab AB ba …`).  collate9-1.6/4.5 also report
-`sort` where EQP should say `nosort` (index-uses-collation gate fails),
-and collate8-1.15 fails resolution of an alias column under a custom
-collation.  Probably the `xCmp` callback registered for NOCASE in the
-TCL bridge differs from upstream's, OR sqlite3 picks the wrong index
-when an ORDER BY collation is different from the index's intrinsic.
-Likely cause: `sqlite3FindCollSeq` / collating-sequence pinning at
-ORDER-BY-resolve.  C reference: callback.c `sqlite3FindCollSeq`,
-where.c `wherePathSatisfiesOrderBy`.
+Root cause: `vdbeSorterCompareRec` (passqlite3vdbe.pas) left the unpacked
+record's `nField` at the allocator default of `nKeyField+1`, so
+`sqlite3VdbeRecordUnpack` + `sqlite3VdbeRecordCompare` walked into the
+data column after the key column tied under NOCASE.  The aColl[i] slot
+for the data column is `nil` → fell to BINARY `memcmp`, resorting
+NOCASE-equal rows by raw bytes (uppercase-first).  Upstream caps the
+unpacked record's `nField` to `pKeyInfo->nKeyField` in
+`vdbeSortAllocUnpacked` (vdbesort.c:1358), so its comparator stops at
+the key columns and the stable merge preserves insertion order.
+Fix: assign `pUR^.nField := pKeyInfo^.nKeyField` after
+sqlite3VdbeAllocUnpackedRecord, matching the C oracle.
+Cite: vdbesort.c:1358 vdbeSortAllocUnpacked.
 Surfaced by: 9.4.4.e sweep.
 
 ## 9.4.divbug.31 — Spurious `database disk image is malformed` for non-corrupt errors
