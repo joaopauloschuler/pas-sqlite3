@@ -320,9 +320,9 @@ function  CORRUPT_PAGE(pPage: PMemPage): i32; inline;
 { Cell parsing }
 procedure btreeParseCellAdjustSizeForOverflow(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
 function  btreePayloadToLocal(pPage: PMemPage; nPayload: i64): i32;
-procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
-procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
-procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
+procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
+procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 procedure btreeParseCell(pPage: PMemPage; iCell: i32; pInfo: PCellInfo);
 
 { Cell size }
@@ -897,7 +897,7 @@ end;
   btreeParseCellPtrNoPayload  — table btree interior nodes
   btree.c lines 1242-1258
   =========================================================================== }
-procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 var
   nBytes: i32;
   iKey  : u64;
@@ -915,7 +915,11 @@ end;
   btreeParseCellPtr  — table btree leaf nodes
   btree.c lines 1259-1346
   =========================================================================== }
-procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+{ NOTE: every hot call site dispatches through pPage^.xParseCell function
+  pointer; FPC cannot inline through indirect calls.  The `inline;` directive
+  is harmless (FPC emits an out-of-line body for the @-taken procvar at
+  setup time) and lets any future direct caller benefit. }
+procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 var
   pIter   : Pu8;
   nPayload: u64;
@@ -993,7 +997,7 @@ end;
   btreeParseCellPtrIndex  — index btree nodes (interior and leaf)
   btree.c lines 1347-1385
   =========================================================================== }
-procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 var
   pIter   : Pu8;
   nPayload: u32;
