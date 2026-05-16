@@ -2045,7 +2045,13 @@ begin
   p := sqlite3ExprListAppend(pPse, pPrior, nil);
   if ((hasCollate <> 0) or (sortOrder <> SQLITE_SO_UNDEFINED))
      and (pPse^.db^.init.busy = 0) then
-    sqlite3ErrorMsg(pPse, 'syntax error after column name');
+    { parse.y:1671 — include the offending column name (quoted) so the
+      tokenize/parser1 diagnostic matches C.  sqlite3ErrorMsg() here is
+      non-varargs so we inline the format via Copy(). }
+    sqlite3ErrorMsg(pPse,
+      PAnsiChar('syntax error after column name "'
+                + Copy(AnsiString(PAnsiChar(pIdToken^.z)), 1, pIdToken^.n)
+                + '"'));
   sqlite3ExprListSetName(pPse, p, pIdToken, 1);
   Result := p;
 end;
@@ -2850,7 +2856,11 @@ begin
            yymsp[-1].minor.yy391 := TF_WithoutRowid or TF_NoVisibleRowid
          else begin
            yymsp[-1].minor.yy391 := 0;
-           sqlite3ErrorMsg(pPse, 'unknown table option');
+           { parse.y:240 — include the offending option token. }
+           sqlite3ErrorMsg(pPse,
+             PAnsiChar('unknown table option: '
+                       + Copy(AnsiString(PAnsiChar(yymsp[0].minor.yy0.z)),
+                              1, yymsp[0].minor.yy0.n)));
          end;
        end;
     24: { table_option ::= nm }
@@ -2860,7 +2870,11 @@ begin
            yylhsminor.yy391 := TF_Strict
          else begin
            yylhsminor.yy391 := 0;
-           sqlite3ErrorMsg(pPse, 'unknown table option');
+           { parse.y:248 — include the offending option token. }
+           sqlite3ErrorMsg(pPse,
+             PAnsiChar('unknown table option: '
+                       + Copy(AnsiString(PAnsiChar(yymsp[0].minor.yy0.z)),
+                              1, yymsp[0].minor.yy0.n)));
          end;
          yymsp[0].minor.yy391 := yylhsminor.yy391;
        end;

@@ -8598,8 +8598,16 @@ begin
     begin
       if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
       begin
-        sqlite3ErrorMsg(pParse,
-          PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+        { resolve.c:789..793 — append "should this be a string literal in
+          single-quotes?" hint when the bare identifier was double-quoted. }
+        if (pE^.flags and EP_DblQuoted) <> 0 then
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: "'
+                      + AnsiString(pE^.u.zToken)
+                      + '" - should this be a string literal in single-quotes?'))
+        else
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
       end;
     end;
@@ -9128,6 +9136,9 @@ end;
       error in that case. }
 procedure resolveAlias(pParse: PParse; pEList: PExprList; iCol: i32;
   pExpr: PExpr; nSubquery: i32); forward;
+
+procedure resolveOutOfRangeError(pParse: PParse; zType: PAnsiChar;
+  i: i32; mx: i32; pError: PExpr); forward;
 
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
@@ -9934,8 +9945,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
         begin
-          sqlite3ErrorMsg(pParse,
-            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+          { resolve.c:789..793 — when the bare identifier was a
+            double-quoted string literal that failed column lookup,
+            append the "should this be a string literal in single-
+            quotes?" hint.  Otherwise plain "no such column: X". }
+          if (pE^.flags and EP_DblQuoted) <> 0 then
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: "'
+                        + AnsiString(pE^.u.zToken)
+                        + '" - should this be a string literal in single-quotes?'))
+          else
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
           { resolve.c:796 — record the offending token offset so the CLI
             caret marker can anchor under the column name. }
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
@@ -9952,8 +9973,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
         begin
-          sqlite3ErrorMsg(pParse,
-            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+          if (pE^.flags and EP_DblQuoted) <> 0 then
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: "'
+                        + AnsiString(pE^.u.zToken)
+                        + '" - should this be a string literal in single-quotes?'))
+          else
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
         end;
         Exit;
@@ -10303,14 +10330,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     sqlite3ResolveOrderGroupBy call rewrites it into a copy of the iCol-th
     result-set expression.  Without this, "ORDER BY 1" codes a literal
     Integer 1 and the sort becomes a no-op. }
-  procedure ResolveIntegerOrderByCol(pList: PExprList);
+  procedure ResolveIntegerOrderByCol(pList: PExprList; zType: PAnsiChar);
   var
     i, iCol: i32;
     items: PExprListItem;
     pE2: PExpr;
+    nResult: i32;
   begin
     if (pList = nil) or (p^.pEList = nil) then Exit;
     items := ExprListItems(pList);
+    nResult := p^.pEList^.nExpr;
     for i := 0 to pList^.nExpr - 1 do
     begin
       if items[i].u.x.iOrderByCol <> 0 then Continue;
@@ -10318,11 +10347,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if pE2 = nil then Continue;
       if sqlite3ExprIsInteger(pE2, @iCol, nil) <> 0 then
       begin
-        if (iCol >= 1) and (iCol <= $FFFF) then
-          items[i].u.x.iOrderByCol := u16(iCol);
-        { Out-of-range integers are left for sqlite3ResolveOrderGroupBy /
-          downstream codegen to flag; iOrderByCol stays 0 so the term keeps
-          its literal-Integer form. }
+        { resolve.c:1812..1818 — integer ORDER BY/GROUP BY term out of the
+          1..0xffff window is an error.  Without this gate negative-integer
+          terms like `ORDER BY -1` silently produce empty iOrderByCol and
+          the term is left as a constant expression (select1-4.10.2 wants
+          the diagnostic). }
+        if (iCol < 1) or (iCol > $FFFF) then
+        begin
+          resolveOutOfRangeError(pParse, zType, i + 1, nResult, pE2);
+          Exit;
+        end;
+        items[i].u.x.iOrderByCol := u16(iCol);
       end;
     end;
   end;
@@ -10826,7 +10861,7 @@ begin
     is not overridden by a coincidental structural match. }
   if (p^.pOrderBy <> nil) and (not deferOB) then
   begin
-    ResolveIntegerOrderByCol(p^.pOrderBy);
+    ResolveIntegerOrderByCol(p^.pOrderBy, 'ORDER');
     ResolveStructuralOrderByCol(p^.pOrderBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pOrderBy, 'ORDER');
   end;
@@ -10841,7 +10876,7 @@ begin
     ResolveCompoundOrderBy(pTopSel);
   if p^.pGroupBy <> nil then
   begin
-    ResolveIntegerOrderByCol(p^.pGroupBy);
+    ResolveIntegerOrderByCol(p^.pGroupBy, 'GROUP');
     ResolveStructuralOrderByCol(p^.pGroupBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pGroupBy, 'GROUP');
   end;
@@ -44063,6 +44098,21 @@ var
   pItem: PSrcItem;
 begin
   db := pParse^.db;
+  { build.c:5079..5083 — `<src1> JOIN <src2> ON ...` with no <src1> (e.g.
+    a CTE/select where the first FROM-term has been folded away leaving the
+    JOIN with no LHS) must error rather than attach the ON/USING to the
+    first append.  Without this gate tkt3935.5/.7 silently parse. }
+  if (p = nil) and ((pOn <> nil) or (pUsing <> nil)) then begin
+    if pOn <> nil then
+      sqlite3ErrorMsg(pParse, 'a JOIN clause is required before ON')
+    else
+      sqlite3ErrorMsg(pParse, 'a JOIN clause is required before USING');
+    sqlite3ExprDelete(db, pOn);
+    sqlite3IdListDelete(db, pUsing);
+    if pSubquery <> nil then sqlite3SelectDelete(db, pSubquery);
+    Result := nil;
+    Exit;
+  end;
   p := sqlite3SrcListAppend(pParse, p, pTable, pDatabase);
   if p <> nil then begin
     pItem := PSrcItem(PByte(SrcListItems(p)) +
