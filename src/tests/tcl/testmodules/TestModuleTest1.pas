@@ -3411,6 +3411,418 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.62.e — test1.c:1947..1972 CreateFunctionV2 trampoline
+  record + cf2Func / cf2Step / cf2Final / cf2Destroy helpers.  cf2Func /
+  cf2Step / cf2Final are intentional no-ops (upstream uses these only to
+  exercise the create_function_v2 registration / xDestroy path; the
+  affected tests — autoext, fts3matchinfo edges — don't read function
+  results).  cf2Destroy fires the optional -destroy Tcl script. }
+type
+  PCreateFunctionV2 = ^TCreateFunctionV2;
+  TCreateFunctionV2 = record
+    interp: PTclInterp;
+    pFunc, pStep, pFinal, pDestroy: PTclObj;
+  end;
+
+procedure cf2Func(pCtx: Psqlite3_context; nArg: cint;
+  apArg: PPsqlite3_value); cdecl;
+begin
+  if (pCtx = nil) or (nArg < 0) or (apArg = nil) then ;
+end;
+procedure cf2Step(pCtx: Psqlite3_context; nArg: cint;
+  apArg: PPsqlite3_value); cdecl;
+begin
+  if (pCtx = nil) or (nArg < 0) or (apArg = nil) then ;
+end;
+procedure cf2Final(pCtx: Psqlite3_context); cdecl;
+begin
+  if pCtx = nil then ;
+end;
+procedure cf2Destroy(pUser: Pointer); cdecl;
+var
+  p: PCreateFunctionV2;
+  rc: cint;
+begin
+  p := PCreateFunctionV2(pUser);
+  if p = nil then Exit;
+  if (p^.interp <> nil) and (p^.pDestroy <> nil) then
+  begin
+    rc := Tcl_EvalObjEx(p^.interp, p^.pDestroy, 0);
+    if rc <> TCL_OK then Tcl_BackgroundError(p^.interp);
+  end;
+  if p^.pFunc    <> nil then Tcl_DecrRefCount(p^.pFunc);
+  if p^.pStep    <> nil then Tcl_DecrRefCount(p^.pStep);
+  if p^.pFinal   <> nil then Tcl_DecrRefCount(p^.pFinal);
+  if p^.pDestroy <> nil then Tcl_DecrRefCount(p^.pDestroy);
+  sqlite3_free(p);
+end;
+
+{ 9.4.divbug.62.e — test1.c:1975..2059 test_create_function_v2.
+  Usage: sqlite3_create_function_v2 DB NAME NARG ENC ?-func/-step/-final/-destroy SCRIPT?...
+  Encoding strings recognised: utf8, utf16, utf16le, utf16be, any, 0. }
+function tcl_test_create_function_v2(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  aEncName: array[0..6] of PChar =
+    ('utf8', 'utf16', 'utf16le', 'utf16be', 'any', '0', nil);
+  aEncVal: array[0..5] of cint =
+    (SQLITE_UTF8, SQLITE_UTF16, SQLITE_UTF16LE, SQLITE_UTF16BE,
+     SQLITE_ANY, 0);
+  aSwitch: array[0..4] of PChar =
+    ('-func', '-step', '-final', '-destroy', nil);
+var
+  db: PTsqlite3;
+  zFunc: PChar;
+  nArg, enc, iEnc, iSwitch, i, rc: cint;
+  p: PCreateFunctionV2;
+  xFn, xSt, xFn2: Pointer;
+begin
+  if (objc < 5) or ((objc mod 2) = 0) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('DB NAME NARG ENC SWITCHES...'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zFunc := Tcl_GetString(objv[2]);
+  if Tcl_GetIntFromObj(interp, objv[3], @nArg) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIndexFromObj(interp, objv[4], @aEncName[0], PChar('encoding'),
+    0, @iEnc) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  enc := aEncVal[iEnc];
+
+  p := PCreateFunctionV2(sqlite3_malloc(SizeOf(TCreateFunctionV2)));
+  if p = nil then begin Result := TCL_ERROR; Exit; end;
+  FillChar(p^, SizeOf(p^), 0);
+  p^.interp := interp;
+
+  i := 5;
+  while i < objc do
+  begin
+    if Tcl_GetIndexFromObj(interp, objv[i], @aSwitch[0], PChar('switch'),
+      0, @iSwitch) <> 0 then
+    begin
+      sqlite3_free(p); Result := TCL_ERROR; Exit;
+    end;
+    case iSwitch of
+      0: p^.pFunc    := objv[i + 1];
+      1: p^.pStep    := objv[i + 1];
+      2: p^.pFinal   := objv[i + 1];
+      3: p^.pDestroy := objv[i + 1];
+    end;
+    Inc(i, 2);
+  end;
+  if p^.pFunc    <> nil then p^.pFunc    := Tcl_DuplicateObj(p^.pFunc);
+  if p^.pStep    <> nil then p^.pStep    := Tcl_DuplicateObj(p^.pStep);
+  if p^.pFinal   <> nil then p^.pFinal   := Tcl_DuplicateObj(p^.pFinal);
+  if p^.pDestroy <> nil then p^.pDestroy := Tcl_DuplicateObj(p^.pDestroy);
+  if p^.pFunc    <> nil then Tcl_IncrRefCount(p^.pFunc);
+  if p^.pStep    <> nil then Tcl_IncrRefCount(p^.pStep);
+  if p^.pFinal   <> nil then Tcl_IncrRefCount(p^.pFinal);
+  if p^.pDestroy <> nil then Tcl_IncrRefCount(p^.pDestroy);
+
+  if p^.pFunc  <> nil then xFn  := @cf2Func  else xFn  := nil;
+  if p^.pStep  <> nil then xSt  := @cf2Step  else xSt  := nil;
+  if p^.pFinal <> nil then xFn2 := @cf2Final else xFn2 := nil;
+  rc := sqlite3_create_function_v2(db, zFunc, nArg, enc, p,
+    xFn, xSt, xFn2, @cf2Destroy);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_ResetResult(interp);
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.e — test_window.c:24..177 TestWindow trampoline +
+  test_create_window.  Usage:
+    sqlite3_create_window_function DB NAME XSTEP XFINAL XVALUE XINVERSE
+  Each callback receives the accumulator + nArg arg strings appended;
+  callback's result becomes the new accumulator (final / value emit it). }
+type
+  PTestWindow = ^TTestWindow;
+  TTestWindow = record
+    xStep, xFinal, xValue, xInverse: PTclObj;
+    interp: PTclInterp;
+  end;
+  PTestWindowCtx = ^TTestWindowCtx;
+  TTestWindowCtx = record
+    pVal: PTclObj;
+  end;
+
+procedure doTestWindowStep(bInverse: cint; ctx: Psqlite3_context;
+  nArg: cint; apArg: PPsqlite3_value);
+var
+  p: PTestWindow;
+  pEval, pArg: PTclObj;
+  pCtx: PTestWindowCtx;
+  i, rc: cint;
+  zResult: PChar;
+begin
+  p := PTestWindow(sqlite3_user_data(ctx));
+  if bInverse <> 0 then pEval := Tcl_DuplicateObj(p^.xInverse)
+  else                  pEval := Tcl_DuplicateObj(p^.xStep);
+  pCtx := PTestWindowCtx(sqlite3_aggregate_context(ctx,
+    SizeOf(TTestWindowCtx)));
+  Tcl_IncrRefCount(pEval);
+  if pCtx <> nil then
+  begin
+    if pCtx^.pVal <> nil then
+      Tcl_ListObjAppendElement(p^.interp, pEval,
+        Tcl_DuplicateObj(pCtx^.pVal))
+    else
+      Tcl_ListObjAppendElement(p^.interp, pEval,
+        Tcl_NewStringObj(PChar(''), -1));
+    for i := 0 to nArg - 1 do
+    begin
+      pArg := Tcl_NewStringObj(PChar(sqlite3_value_text(apArg[i])), -1);
+      Tcl_ListObjAppendElement(p^.interp, pEval, pArg);
+    end;
+    rc := Tcl_EvalObjEx(p^.interp, pEval, TCL_EVAL_GLOBAL);
+    if rc <> TCL_OK then
+    begin
+      zResult := Tcl_GetStringResult(p^.interp);
+      sqlite3_result_error(ctx, zResult, -1);
+    end else
+    begin
+      if pCtx^.pVal <> nil then Tcl_DecrRefCount(pCtx^.pVal);
+      pCtx^.pVal := Tcl_DuplicateObj(Tcl_GetObjResult(p^.interp));
+      Tcl_IncrRefCount(pCtx^.pVal);
+    end;
+  end;
+  Tcl_DecrRefCount(pEval);
+end;
+
+procedure doTestWindowFinalize(bValue: cint; ctx: Psqlite3_context);
+var
+  p: PTestWindow;
+  pEval: PTclObj;
+  pCtx: PTestWindowCtx;
+  rc: cint;
+  zResult: PChar;
+begin
+  p := PTestWindow(sqlite3_user_data(ctx));
+  if bValue <> 0 then pEval := Tcl_DuplicateObj(p^.xValue)
+  else                pEval := Tcl_DuplicateObj(p^.xFinal);
+  pCtx := PTestWindowCtx(sqlite3_aggregate_context(ctx,
+    SizeOf(TTestWindowCtx)));
+  Tcl_IncrRefCount(pEval);
+  if pCtx <> nil then
+  begin
+    if pCtx^.pVal <> nil then
+      Tcl_ListObjAppendElement(p^.interp, pEval,
+        Tcl_DuplicateObj(pCtx^.pVal))
+    else
+      Tcl_ListObjAppendElement(p^.interp, pEval,
+        Tcl_NewStringObj(PChar(''), -1));
+    rc := Tcl_EvalObjEx(p^.interp, pEval, TCL_EVAL_GLOBAL);
+    zResult := Tcl_GetStringResult(p^.interp);
+    if rc <> TCL_OK then
+      sqlite3_result_error(ctx, zResult, -1)
+    else
+      sqlite3_result_text(ctx, zResult, -1, SQLITE_TRANSIENT);
+    if bValue = 0 then
+    begin
+      if pCtx^.pVal <> nil then Tcl_DecrRefCount(pCtx^.pVal);
+      pCtx^.pVal := nil;
+    end;
+  end;
+  Tcl_DecrRefCount(pEval);
+end;
+
+procedure testWindowStep(ctx: Psqlite3_context; nArg: cint;
+  apArg: PPsqlite3_value); cdecl;
+begin
+  doTestWindowStep(0, ctx, nArg, apArg);
+end;
+procedure testWindowInverse(ctx: Psqlite3_context; nArg: cint;
+  apArg: PPsqlite3_value); cdecl;
+begin
+  doTestWindowStep(1, ctx, nArg, apArg);
+end;
+procedure testWindowFinal(ctx: Psqlite3_context); cdecl;
+begin
+  doTestWindowFinalize(0, ctx);
+end;
+procedure testWindowValue(ctx: Psqlite3_context); cdecl;
+begin
+  doTestWindowFinalize(1, ctx);
+end;
+procedure testWindowDestroy(pCtx: Pointer); cdecl;
+var
+  p: PTestWindow;
+begin
+  p := PTestWindow(pCtx);
+  if p = nil then Exit;
+  if p^.xStep    <> nil then Tcl_DecrRefCount(p^.xStep);
+  if p^.xFinal   <> nil then Tcl_DecrRefCount(p^.xFinal);
+  if p^.xValue   <> nil then Tcl_DecrRefCount(p^.xValue);
+  if p^.xInverse <> nil then Tcl_DecrRefCount(p^.xInverse);
+  sqlite3_free(p);
+end;
+
+{ test_window.c:136..177 test_create_window. }
+function tcl_test_create_window(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pNew: PTestWindow;
+  db: PTsqlite3;
+  zName: PChar;
+  rc: cint;
+begin
+  if objc <> 7 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('DB NAME XSTEP XFINAL XVALUE XINVERSE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zName := Tcl_GetString(objv[2]);
+  pNew := PTestWindow(sqlite3_malloc(SizeOf(TTestWindow)));
+  if pNew = nil then begin Result := TCL_ERROR; Exit; end;
+  FillChar(pNew^, SizeOf(pNew^), 0);
+  pNew^.xStep    := Tcl_DuplicateObj(objv[3]);
+  pNew^.xFinal   := Tcl_DuplicateObj(objv[4]);
+  pNew^.xValue   := Tcl_DuplicateObj(objv[5]);
+  pNew^.xInverse := Tcl_DuplicateObj(objv[6]);
+  pNew^.interp   := interp;
+  Tcl_IncrRefCount(pNew^.xStep);
+  Tcl_IncrRefCount(pNew^.xFinal);
+  Tcl_IncrRefCount(pNew^.xValue);
+  Tcl_IncrRefCount(pNew^.xInverse);
+  rc := sqlite3_create_window_function(db, zName, -1, SQLITE_UTF8, pNew,
+    @testWindowStep, @testWindowFinal, @testWindowValue,
+    @testWindowInverse, @testWindowDestroy);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewStringObj(t1ErrName(rc), -1));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.e — test1.c:2064..2117 test_load_extension.
+  Usage: sqlite3_load_extension DB-HANDLE FILE ?PROC?
+  The Pascal port's sqlite3_load_extension (passqlite3main.pas:2840)
+  always returns SQLITE_ERROR with the canned "extension loading is
+  disabled" message — matches upstream's SQLITE_OMIT_LOAD_EXTENSION
+  arm.  The Tcl shim mirrors test1.c's error surface: it reports the
+  engine's pzErrMsg verbatim to the caller. }
+function tcl_test_load_extension(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  cmdInfo: TTclCmdInfo;
+  db: PTsqlite3;
+  rc: cint;
+  zDb, zFile, zProc: PChar;
+  zErr: PAnsiChar;
+begin
+  zProc := nil;
+  if (objc <> 4) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB-HANDLE FILE ?PROC?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zDb := Tcl_GetString(objv[1]);
+  zFile := Tcl_GetString(objv[2]);
+  if objc = 4 then zProc := Tcl_GetString(objv[3]);
+  FillChar(cmdInfo, SizeOf(cmdInfo), 0);
+  if Tcl_GetCommandInfo(interp, zDb, @cmdInfo) = 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('command not found: '), zDb,
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := PTestSqliteDb(cmdInfo.objClientData)^.db;
+  zErr := nil;
+  rc := sqlite3_load_extension(db, zFile, zProc, @zErr);
+  if rc <> SQLITE_OK then
+  begin
+    if zErr <> nil then
+      Tcl_SetResult(interp, zErr, TCL_VOLATILE)
+    else
+      Tcl_SetResult(interp, PChar(''), TCL_VOLATILE);
+    Result := TCL_ERROR;
+  end else
+    Result := TCL_OK;
+  sqlite3_free(zErr);
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.e — test_devsym.c:1095 devSymObjCmd stub.
+  The full device-simulation VFS (test_devsym.c) is NOT ported; tests
+  that rely on observable I/O-error injection through this VFS will
+  still mis-behave.  This shim accepts the upstream arg shape and
+  returns OK so tests that merely *register* a simulated device (or
+  toggle it back off) don't abort with `invalid command name`. }
+function tcl_test_simulate_device(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or
+     (objv = nil) then ;
+end;
+
+{ 9.4.divbug.62.e — `sqlite3_user_version` has no upstream Tcl-command
+  counterpart (it is exposed only as `PRAGMA user_version`).  Provide a
+  thin shim: `sqlite3_user_version DB ?VALUE?` returns / sets the
+  user_version cookie via the existing PRAGMA, so any test that calls
+  the Tcl form stops aborting. }
+function tcl_test_user_version(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  iVal: cint;
+  zSql: AnsiString;
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB ?VALUE?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 3 then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[2], @iVal) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+    zSql := 'PRAGMA user_version=' + IntToStr(iVal);
+  end else
+    zSql := 'PRAGMA user_version';
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(db, PAnsiChar(zSql), -1, @pStmt, nil);
+  if rc = SQLITE_OK then
+  begin
+    if sqlite3_step(pStmt) = SQLITE_ROW then
+      Tcl_SetObjResult(interp,
+        Tcl_NewIntObj(sqlite3_column_int(pStmt, 0)));
+    sqlite3_finalize(pStmt);
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -3618,6 +4030,19 @@ begin
   { 9.4.divbug.63.b — file_control_reservebytes (test1.c:9258 / 7249..7276). }
   Tcl_CreateObjCommand(interp, PChar('file_control_reservebytes'),
     @file_control_reservebytes, nil, nil);
+  { 9.4.divbug.62.e — sqlite3_create_function_v2 / _create_window_function /
+    _load_extension / _simulate_device / _user_version
+    (test1.c:9262 + 9183 + test_window.c:337). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_create_function_v2'),
+    @tcl_test_create_function_v2, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_create_window_function'),
+    @tcl_test_create_window, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_load_extension'),
+    @tcl_test_load_extension, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_simulate_device'),
+    @tcl_test_simulate_device, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_user_version'),
+    @tcl_test_user_version, nil, nil);
   Result := TCL_OK;
 end;
 
