@@ -2732,6 +2732,140 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.62.d — sqlite3_db_status DB OPCODE RESETFLAG.
+  test_malloc.c:1338..1397 — accepts SQLITE_DBSTATUS_* or DBSTATUS_*
+  or unprefixed name, falls back to integer parse. }
+function tcl_test_db_status(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+type
+  TDbStatOp = record
+    zName: PAnsiChar;
+    op: cint;
+  end;
+const
+  aOp: array[0..13] of TDbStatOp = (
+    (zName: 'LOOKASIDE_USED';      op: 0  { SQLITE_DBSTATUS_LOOKASIDE_USED }),
+    (zName: 'CACHE_USED';          op: 1  { SQLITE_DBSTATUS_CACHE_USED }),
+    (zName: 'SCHEMA_USED';         op: 2  { SQLITE_DBSTATUS_SCHEMA_USED }),
+    (zName: 'STMT_USED';           op: 3  { SQLITE_DBSTATUS_STMT_USED }),
+    (zName: 'LOOKASIDE_HIT';       op: 4  { SQLITE_DBSTATUS_LOOKASIDE_HIT }),
+    (zName: 'LOOKASIDE_MISS_SIZE'; op: 5  { SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE }),
+    (zName: 'LOOKASIDE_MISS_FULL'; op: 6  { SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL }),
+    (zName: 'CACHE_HIT';           op: 7  { SQLITE_DBSTATUS_CACHE_HIT }),
+    (zName: 'CACHE_MISS';          op: 8  { SQLITE_DBSTATUS_CACHE_MISS }),
+    (zName: 'CACHE_WRITE';         op: 9  { SQLITE_DBSTATUS_CACHE_WRITE }),
+    (zName: 'DEFERRED_FKS';        op: 10 { SQLITE_DBSTATUS_DEFERRED_FKS }),
+    (zName: 'CACHE_USED_SHARED';   op: 11 { SQLITE_DBSTATUS_CACHE_USED_SHARED }),
+    (zName: 'CACHE_SPILL';         op: 12 { SQLITE_DBSTATUS_CACHE_SPILL }),
+    (zName: 'TEMPBUF_SPILL';       op: 13 { SQLITE_DBSTATUS_TEMPBUF_SPILL })
+  );
+var
+  db: PTsqlite3;
+  rc, iValue, mxValue, i, op, resetFlag: cint;
+  zOpName: PAnsiChar;
+  pResult: PTclObj;
+begin
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB PARAMETER RESETFLAG'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zOpName := Tcl_GetString(objv[2]);
+  { test_malloc.c:1378..1379 — strip optional SQLITE_ / DBSTATUS_ prefix. }
+  if (StrLen(zOpName) >= 7) and (StrLComp(zOpName, 'SQLITE_', 7) = 0) then
+    Inc(zOpName, 7);
+  if (StrLen(zOpName) >= 9) and (StrLComp(zOpName, 'DBSTATUS_', 9) = 0) then
+    Inc(zOpName, 9);
+  op := 0;
+  i := 0;
+  while i <= High(aOp) do
+  begin
+    if StrComp(aOp[i].zName, zOpName) = 0 then
+    begin
+      op := aOp[i].op;
+      Break;
+    end;
+    Inc(i);
+  end;
+  if i > High(aOp) then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[2], @op) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[3], @resetFlag) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  iValue  := 0;
+  mxValue := 0;
+  rc := sqlite3_db_status(db, op, @iValue, @mxValue, resetFlag);
+  pResult := Tcl_NewObj;
+  Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(rc));
+  Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(iValue));
+  Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(mxValue));
+  Tcl_SetObjResult(interp, pResult);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.d — sqlite3_soft_heap_limit ?N? / sqlite3_soft_heap_limit64.
+  test1.c:6482..6506 — both registrations route through this handler. }
+function tcl_test_soft_heap_limit(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  N, amt: Int64;
+begin
+  N := -1;
+  if (objc <> 1) and (objc <> 2) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?N?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 2 then
+  begin
+    if Tcl_GetWideIntFromObj(interp, objv[1], @N) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+  amt := sqlite3_soft_heap_limit64(N);
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(amt));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.d — sqlite3_hard_heap_limit64 ?N?.
+  test1.c:6508..6533. }
+function tcl_test_hard_heap_limit(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  N, amt: Int64;
+begin
+  N := -1;
+  if (objc <> 1) and (objc <> 2) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?N?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 2 then
+  begin
+    if Tcl_GetWideIntFromObj(interp, objv[1], @N) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+  amt := sqlite3_hard_heap_limit64(N);
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(amt));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:665..677 — sqlite3_rekey DB KEY.  SQLite without the SEE
   extension simply returns TCL_OK (codec is a no-op). }
 function tcl_test_rekey(clientData: TClientData; interp: PTclInterp;
@@ -3440,6 +3574,16 @@ begin
     @tcl_test_release_memory, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_limit'),
     @tcl_test_limit, nil, nil);
+  { 9.4.divbug.62.d — sqlite3_db_status / _soft_heap_limit[64] /
+    _hard_heap_limit64 (test_malloc.c:1489..1490 + test1.c:9177..9179). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_db_status'),
+    @tcl_test_db_status, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_soft_heap_limit'),
+    @tcl_test_soft_heap_limit, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_soft_heap_limit64'),
+    @tcl_test_soft_heap_limit, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_hard_heap_limit64'),
+    @tcl_test_hard_heap_limit, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_rekey'),
     @tcl_test_rekey, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_create_function'),
