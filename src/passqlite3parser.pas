@@ -892,19 +892,32 @@ begin
         tokenType^ := TK_DOT;
         Result := 1; Exit;
       end;
-      { z[0]='.' followed by digits — a float like .5 }
+      { z[0]='.' followed by digits — a float like .5.
+        Port of tokenize.c:421..497 (CC_DOT fall-through into CC_DIGIT).
+        '_' between digits flips tokenType to TK_QNUMBER (SQLite 3.46+). }
       tokenType^ := TK_FLOAT;
       i := 1;
-      while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+      while True do begin
+        if sqlite3Isdigit(z[i]) = 0 then begin
+          if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+          else Break;
+        end;
+        Inc(i);
+      end;
       { optional exponent }
       if (z[i] = Ord('e')) or (z[i] = Ord('E')) then begin
-        if sqlite3Isdigit(z[i+1]) <> 0 then begin
-          Inc(i, 2);
-          while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
-        end else if ((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
-                    (sqlite3Isdigit(z[i+2]) <> 0) then begin
-          Inc(i, 3);
-          while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+        if (sqlite3Isdigit(z[i+1]) <> 0)
+           or (((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
+               (sqlite3Isdigit(z[i+2]) <> 0)) then begin
+          if sqlite3Isdigit(z[i+1]) <> 0 then Inc(i, 2)
+          else Inc(i, 3);
+          while True do begin
+            if sqlite3Isdigit(z[i]) = 0 then begin
+              if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+              else Break;
+            end;
+            Inc(i);
+          end;
         end;
       end;
       while sqlite3IsIdChar(z[i]) <> 0 do begin
@@ -915,33 +928,58 @@ begin
     end;
 
     CC_DIGIT: begin
+      { Port of tokenize.c:433..497.  '_' digit-separator (SQLite 3.46+)
+        between digits/xdigits flips tokenType to TK_QNUMBER.  The literal
+        is later dequoted via sqlite3DequoteNumber before AtoF/AtoI. }
       tokenType^ := TK_INTEGER;
       { Hex literal? }
       if (z[0] = Ord('0')) and
          ((z[1] = Ord('x')) or (z[1] = Ord('X'))) and
          (sqlite3Isxdigit(z[2]) <> 0) then begin
         i := 3;
-        while sqlite3Isxdigit(z[i]) <> 0 do Inc(i);
+        while True do begin
+          if sqlite3Isxdigit(z[i]) = 0 then begin
+            if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+            else Break;
+          end;
+          Inc(i);
+        end;
       end else begin
         i := 0;
-        while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+        while True do begin
+          if sqlite3Isdigit(z[i]) = 0 then begin
+            if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+            else Break;
+          end;
+          Inc(i);
+        end;
         { Decimal point? }
         if z[i] = Ord('.') then begin
-          tokenType^ := TK_FLOAT;
+          if tokenType^ = TK_INTEGER then tokenType^ := TK_FLOAT;
           Inc(i);
-          while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+          while True do begin
+            if sqlite3Isdigit(z[i]) = 0 then begin
+              if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+              else Break;
+            end;
+            Inc(i);
+          end;
         end;
         { Exponent? }
         if ((z[i] = Ord('e')) or (z[i] = Ord('E'))) then begin
-          if sqlite3Isdigit(z[i+1]) <> 0 then begin
+          if (sqlite3Isdigit(z[i+1]) <> 0)
+             or (((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
+                 (sqlite3Isdigit(z[i+2]) <> 0)) then begin
             if tokenType^ = TK_INTEGER then tokenType^ := TK_FLOAT;
-            Inc(i, 2);
-            while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
-          end else if ((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
-                      (sqlite3Isdigit(z[i+2]) <> 0) then begin
-            if tokenType^ = TK_INTEGER then tokenType^ := TK_FLOAT;
-            Inc(i, 3);
-            while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+            if sqlite3Isdigit(z[i+1]) <> 0 then Inc(i, 2)
+            else Inc(i, 3);
+            while True do begin
+              if sqlite3Isdigit(z[i]) = 0 then begin
+                if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+                else Break;
+              end;
+              Inc(i);
+            end;
           end;
         end;
       end;
@@ -2603,6 +2641,7 @@ var
   bHex:      Boolean;
   iValue:    i32;
   c, prev, next: AnsiChar;
+  zMsg:      PAnsiChar;
 begin
   Assert((pExpr <> nil) or (pPse^.db^.mallocFailed <> 0));
   if pExpr = nil then Exit;
@@ -2621,12 +2660,17 @@ begin
       { '_' must lie between two digits (or hex digits when bHex). }
       prev := (pIn - 1)^;
       next := (pIn + 1)^;
-      if (not bHex) and ((sqlite3Isdigit(u8(prev)) = 0)
-                         or (sqlite3Isdigit(u8(next)) = 0)) then
-        sqlite3ErrorMsg(pPse, 'unrecognized token')
-      else if bHex and ((sqlite3Isxdigit(u8(prev)) = 0)
-                         or (sqlite3Isxdigit(u8(next)) = 0)) then
-        sqlite3ErrorMsg(pPse, 'unrecognized token');
+      if ((not bHex) and ((sqlite3Isdigit(u8(prev)) = 0)
+                          or (sqlite3Isdigit(u8(next)) = 0)))
+         or (bHex and ((sqlite3Isxdigit(u8(prev)) = 0)
+                       or (sqlite3Isxdigit(u8(next)) = 0))) then begin
+        zMsg := sqlite3MPrintf(pPse^.db, 'unrecognized token: "%s"',
+                               [pExpr^.u.zToken]);
+        if zMsg <> nil then begin
+          sqlite3ErrorMsg(pPse, zMsg);
+          sqlite3DbFree(pPse^.db, zMsg);
+        end;
+      end;
     end;
     Inc(pIn);
   until c = #0;
