@@ -1,0 +1,58 @@
+# Pragma / config matrix (testset_main, --size 1)
+
+pas/C TOTAL ratio per cell.  Numbers below the ratio are raw pas_ms / c_ms.
+
+| journal | sync | page_size | cache_size | pas_ms | c_ms | ratio |
+|---------|------|-----------|------------|--------|------|-------|
+| WAL | NORMAL | 4096 | default | 359 | 31 | 11.58x |
+| WAL | NORMAL | 4096 | 10x | 299 | 39 | 7.67x |
+| WAL | NORMAL | 8192 | default | 325 | 29 | 11.21x |
+| WAL | NORMAL | 8192 | 10x | 243 | 30 | 8.10x |
+| WAL | NORMAL | 16384 | default | 349 | 40 | 8.72x |
+| WAL | NORMAL | 16384 | 10x | 259 | 32 | 8.09x |
+| WAL | FULL | 4096 | default | 188 | 83 | 2.27x |
+| WAL | FULL | 4096 | 10x | 227 | 100 | 2.27x |
+| WAL | FULL | 8192 | default | 242 | 137 | 1.77x |
+| WAL | FULL | 8192 | 10x | 178 | 80 | 2.23x |
+| WAL | FULL | 16384 | default | 189 | 100 | 1.89x |
+| WAL | FULL | 16384 | 10x | 312 | 93 | 3.35x |
+| DELETE | NORMAL | 4096 | default | 181 | 125 | 1.45x |
+| DELETE | NORMAL | 4096 | 10x | 248 | 142 | 1.75x |
+| DELETE | NORMAL | 8192 | default | 242 | 118 | 2.05x |
+| DELETE | NORMAL | 8192 | 10x | 169 | 149 | 1.13x |
+| DELETE | NORMAL | 16384 | default | 264 | 202 | 1.31x |
+| DELETE | NORMAL | 16384 | 10x | 216 | 165 | 1.31x |
+| DELETE | FULL | 4096 | default | 241 | 304 | 0.79x |
+| DELETE | FULL | 4096 | 10x | 279 | 220 | 1.27x |
+| DELETE | FULL | 8192 | default | 360 | 233 | 1.55x |
+| DELETE | FULL | 8192 | 10x | 278 | 190 | 1.46x |
+| DELETE | FULL | 16384 | default | 240 | 260 | 0.92x |
+| DELETE | FULL | 16384 | 10x | 357 | 504 | 0.71x |
+
+## Summary
+
+- cells with both totals: 24/24
+- ratio min: 0.71x, max: 11.58x, mean: 3.54x
+
+### Mean pas/C ratio by axis
+
+| axis | value | mean ratio |
+|------|-------|------------|
+| journal_mode | WAL | 5.76x |
+| journal_mode | DELETE | 1.31x |
+| synchronous | NORMAL | 5.36x |
+| synchronous | FULL | 1.71x |
+| page_size | 4096 | 3.63x |
+| page_size | 8192 | 3.69x |
+| page_size | 16384 | 3.29x |
+| cache_size | default | 3.79x |
+| cache_size | 10x | 3.28x |
+
+### Knob impact (max-min mean ratio across axis values)
+
+- journal_mode swing: 4.45x
+- synchronous  swing: 3.66x
+- page_size    swing: 0.40x
+- cache_size   swing: 0.51x
+
+Cells flagged `crash` / `rc=N` / `no-total` indicate the corresponding binary failed in that configuration.

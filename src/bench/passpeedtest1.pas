@@ -2220,6 +2220,7 @@ var
   nLook: Integer = -1;
   szLook: Integer = 0;
   noSync: Integer = 0;
+  zSyncMode: AnsiString = '';
   pageSize: Integer = 0;
   nPCache: Integer = 0;
   szPCache: Integer = 0;
@@ -2327,6 +2328,7 @@ begin
       end
       else if z = 'nomutex' then openFlags := openFlags or SQLITE_OPEN_NOMUTEX
       else if z = 'nosync'  then noSync := 1
+      else if z = 'synchronous' then begin ArgcCheck(1); Inc(i); zSyncMode := GetArg(i); end
       else if z = 'notnull' then g.zNN := 'NOT NULL'
       else if z = 'output'  then
         fatal_error('--output option not supported in skeleton harness (Phase 11.x)'#10)
@@ -2459,6 +2461,7 @@ begin
   if cacheSize <> 0 then speedtest1_exec('PRAGMA cache_size=%d', [cacheSize]);
   if noSync <> 0 then speedtest1_exec('PRAGMA synchronous=OFF')
   else if doFullFSync <> 0 then speedtest1_exec('PRAGMA fullfsync=ON');
+  if zSyncMode <> '' then speedtest1_exec('PRAGMA synchronous=%s', [PAnsiChar(zSyncMode)]);
   if doExclusive <> 0 then speedtest1_exec('PRAGMA locking_mode=EXCLUSIVE');
   if zJMode <> '' then speedtest1_exec('PRAGMA journal_mode=%s', [PAnsiChar(zJMode)]);
   if nHardHeapLmt > 0 then speedtest1_exec('PRAGMA hard_heap_limit=%d', [nHardHeapLmt]);

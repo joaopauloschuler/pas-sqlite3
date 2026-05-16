@@ -52,6 +52,12 @@ fi
 fpc -O2 -Fu"$FCLJSON_DIR" -FE$BIN_DIR "$SCRIPT_DIR/CheckRegression.pas"
 echo "CheckRegression compiled -> $BIN_DIR/CheckRegression"
 
+echo "Compiling PragmaMatrix.pas ..."
+# PragmaMatrix is a plain TProcess driver — spawns passpeedtest1 and the C
+# oracle per cell, parses TOTAL, emits bench/pragma_matrix.txt.
+fpc -O2 -FE$BIN_DIR "$SCRIPT_DIR/PragmaMatrix.pas"
+echo "PragmaMatrix compiled -> $BIN_DIR/PragmaMatrix"
+
 # Clean compiled artefacts
 find "$SCRIPT_DIR" -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
 find "$BIN_DIR"    -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
