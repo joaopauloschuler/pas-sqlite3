@@ -50552,6 +50552,16 @@ begin
     Exit;
   end;
 
+  { PragTyp_CASE_SENSITIVE_LIKE (pragma.c:1654..1664).  Reinstall the
+    per-connection 'like' shim with the requested case-sensitivity.  No
+    result row is emitted (write-only pragma, like_match_blob etc.).
+    9.4.divbug.56 — like-1.5.2 expected only 'abc' but got both 'ABC abc'
+    because PRAGMA case_sensitive_like=on was a silent no-op. }
+  if SameText(zName, 'case_sensitive_like') and (pValue <> nil) then begin
+    sqlite3RegisterLikeFunctions(db, sqlite3GetBoolean(PChar(zRight), 0));
+    Exit;
+  end;
+
   { PragTyp_AUTO_VACUUM read arm (pragma.c:801).  Calls into the btree
     layer which reads pBt^.autoVacuum / pBt^.incrVacuum (populated from
     page-1 header meta[4]/meta[7] in lockBtree).  Returns 0=NONE,
@@ -53374,22 +53384,62 @@ begin
                  nSep, zSep);
 end;
 
+{ TCompareInfo / globInfo / likeInfoNorm / likeInfoAlt — hoisted from the
+  patternCompare block further down so likeFunc (next), globFunc and
+  aBuiltinFuncs[].pUserData (set in InitBuiltinFuncs) can reference them.
+  Carries the matchAll/matchOne/matchSet wildcards used by the LIKE/GLOB
+  optimisation in sqlite3IsLikeFunction (func.c:2407). }
+type
+  TCompareInfo = record
+    matchAll, matchOne, matchSet, noCase: u8;
+  end;
+  PCompareInfo = ^TCompareInfo;
+
+const
+  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
+  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
+  { func.c:681 likeInfoAlt — case-sensitive LIKE (PRAGMA case_sensitive_like=on
+    or SQLITE_CASE_SENSITIVE_LIKE build).  Bound by sqlite3RegisterLikeFunctions. }
+  likeInfoAlt:  TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 0);
+
+{ Forward decl: patternCompare is defined far below near sqlite3_strlike,
+  but likeFunc (next) needs to call it directly with the per-connection
+  pInfo (9.4.divbug.56). }
+function patternCompare(
+  zPattern, zString: Pu8;
+  const pInfo: TCompareInfo;
+  matchOther: u32
+): i32; forward;
+
 procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   zPat, zStr, zE: PAnsiChar;
-  esc: u32;
-  rc: i32;
+  zEU8: Pu8;
+  escape: u32;
+  nPat: i32;
+  db: PTsqlite3;
+  pInfo, pInfoOrig: PCompareInfo;
+  backupInfo: TCompareInfo;
 begin
-  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
-     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
-    sqlite3_result_null(pCtx); Exit;
+  { Port of func.c:907..971 likeFunc.  Reads its compareInfo from
+    sqlite3_user_data(pCtx) — which sqlite3RegisterLikeFunctions flips
+    between likeInfoNorm (noCase=1) and likeInfoAlt (noCase=0) when
+    PRAGMA case_sensitive_like fires.  Calls patternCompare directly:
+    sqlite3_strlike hardcodes likeInfoNorm so the per-connection
+    case-sensitivity would never reach the engine.  9.4.divbug.56. }
+  db := sqlite3_context_db_handle(pCtx);
+  pInfo := PCompareInfo(sqlite3_user_data(pCtx));
+  if pInfo = nil then pInfo := @likeInfoNorm;
+  pInfoOrig := pInfo;
+
+  { Pattern-length limit (func.c:931..940). }
+  nPat := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if (db <> nil) and (nPat > db^.aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]) then
+  begin
+    sqlite3_result_error(pCtx, 'LIKE or GLOB pattern too complex', -1);
+    Exit;
   end;
-  zPat := sqlite3_value_text(Psqlite3_value(argv^));
-  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if (zPat = nil) or (zStr = nil) then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
-  esc := 0;
+
   if argc = 3 then begin
     zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
     if zE = nil then Exit;
@@ -53398,10 +53448,22 @@ begin
         'ESCAPE expression must be a single character', -1);
       Exit;
     end;
-    if zE^ <> #0 then esc := Ord(zE^);
-  end;
-  rc := sqlite3_strlike(zPat, zStr, esc);
-  sqlite3_result_int(pCtx, i32(rc = 0));
+    zEU8 := Pu8(zE);
+    escape := sqlite3Utf8Read(PPChar(@zEU8));
+    if (escape = pInfo^.matchAll) or (escape = pInfo^.matchOne) then begin
+      backupInfo := pInfoOrig^;
+      pInfo := @backupInfo;
+      if escape = pInfo^.matchAll then pInfo^.matchAll := 0;
+      if escape = pInfo^.matchOne then pInfo^.matchOne := 0;
+    end;
+  end else
+    escape := pInfo^.matchSet;
+
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat <> nil) and (zStr <> nil) then
+    sqlite3_result_int(pCtx,
+      i32(patternCompare(Pu8(zPat), Pu8(zStr), pInfo^, escape) = 0));
 end;
 
 procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -54583,19 +54645,6 @@ const
 var
   aBuiltinFuncs: array[0..82] of TFuncDef;
 
-{ TCompareInfo / globInfo / likeInfoNorm — hoisted from the patternCompare
-  block further down so aBuiltinFuncs[].pUserData (set in InitBuiltinFuncs)
-  can reference them.  Carries the matchAll/matchOne/matchSet wildcards used
-  by the LIKE/GLOB optimisation in sqlite3IsLikeFunction (func.c:2407). }
-type
-  TCompareInfo = record
-    matchAll, matchOne, matchSet, noCase: u8;
-  end;
-
-const
-  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
-  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
-
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
   sfunc: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar); inline;
@@ -55020,9 +55069,40 @@ begin
 end;
 
 procedure sqlite3RegisterLikeFunctions(db: PTsqlite3; caseSensitive: i32);
+var
+  pDef: PTFuncDef;
+  pInfo: Pointer;
+  flags: u32;
+  nArg: i32;
 begin
-  { The like/glob functions are already in the built-in table.
-    Per-connection case-sensitivity can be changed via funcFlags later. }
+  { Port of func.c:2344..2365 sqlite3RegisterLikeFunctions.  Re-register the
+    built-in like(B,A) and like(B,A,esc) shims for this connection with the
+    requested case-sensitivity.  Called by PRAGMA case_sensitive_like and
+    once at open with the SQLITE_CaseSensitiveLike DBFLAG state.  Without
+    this port, PRAGMA case_sensitive_like=on was a silent no-op: the global
+    likeInfoNorm (noCase=1) stayed wired and 'ABC' LIKE 'abc' kept matching
+    (9.4.divbug.56 — like-1.5.2). }
+  if caseSensitive <> 0 then
+  begin
+    pInfo := @likeInfoAlt;
+    flags := SQLITE_FUNC_LIKE or SQLITE_FUNC_CASE;
+  end
+  else
+  begin
+    pInfo := @likeInfoNorm;
+    flags := SQLITE_FUNC_LIKE;
+  end;
+  for nArg := 2 to 3 do
+  begin
+    sqlite3CreateFunc(db, 'like', nArg, SQLITE_UTF8, pInfo,
+      @likeFunc, nil, nil, nil, nil, nil);
+    pDef := sqlite3FindFunction(db, 'like', nArg, SQLITE_UTF8, 0);
+    if pDef <> nil then
+    begin
+      pDef^.funcFlags := pDef^.funcFlags or flags;
+      pDef^.funcFlags := pDef^.funcFlags and (not u32(SQLITE_FUNC_UNSAFE));
+    end;
+  end;
 end;
 
 function sqlite3IsLikeFunction(db: PTsqlite3; pExpr: PExpr;
