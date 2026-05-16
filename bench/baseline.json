@@ -1,0 +1,70 @@
+{
+  "_comment": "Phase 11.7 baseline. Generated from bin/SpeedtestDiff runs. ratio = pas_ms / c_ms. Per-case ms = seconds * 1000. CheckRegression compares new ratio to baseline ratio; fails if (new-baseline)/baseline > REGRESSION_THRESHOLD_PCT/100 (default 0.10).",
+  "_format": {
+    "cells": "list of {testset,args,case_id,label,size,pas_ms,c_ms,ratio,skipped?}"
+  },
+  "cells": [
+    {"testset":"main","args":"--testset main --size 1","case_id":100,"label":"500 INSERTs into table with no index","size":1,"pas_ms":10,"c_ms":13,"ratio":0.77},
+    {"testset":"main","args":"--testset main --size 1","case_id":110,"label":"500 ordered INSERTS with one index/PK","size":1,"pas_ms":7,"c_ms":21,"ratio":0.33},
+    {"testset":"main","args":"--testset main --size 1","case_id":120,"label":"500 unordered INSERTS with one index/PK","size":1,"pas_ms":13,"c_ms":13,"ratio":1.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":130,"label":"25 SELECTS, numeric BETWEEN, unindexed","size":1,"pas_ms":1,"c_ms":8,"ratio":0.13},
+    {"testset":"main","args":"--testset main --size 1","case_id":140,"label":"10 SELECTS, LIKE, unindexed","size":1,"pas_ms":1,"c_ms":3,"ratio":0.33},
+    {"testset":"main","args":"--testset main --size 1","case_id":142,"label":"10 SELECTS w/ORDER BY, unindexed","size":1,"pas_ms":1,"c_ms":7,"ratio":0.14},
+    {"testset":"main","args":"--testset main --size 1","case_id":145,"label":"10 SELECTS w/ORDER BY and LIMIT, unindexed","size":1,"pas_ms":1,"c_ms":7,"ratio":0.14},
+    {"testset":"main","args":"--testset main --size 1","case_id":150,"label":"CREATE INDEX five times","size":1,"pas_ms":14,"c_ms":20,"ratio":0.70},
+    {"testset":"main","args":"--testset main --size 1","case_id":160,"label":"100 SELECTS, numeric BETWEEN, indexed","size":1,"pas_ms":3,"c_ms":1,"ratio":3.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":161,"label":"100 SELECTS, numeric BETWEEN, PK","size":1,"pas_ms":2,"c_ms":1,"ratio":2.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":180,"label":"500 INSERTS with three indexes","size":1,"pas_ms":21,"c_ms":13,"ratio":1.62},
+    {"testset":"main","args":"--testset main --size 1","case_id":190,"label":"DELETE and REFILL one table","size":1,"pas_ms":32,"c_ms":18,"ratio":1.78},
+    {"testset":"main","args":"--testset main --size 1","case_id":200,"label":"VACUUM","size":1,"pas_ms":17,"c_ms":16,"ratio":1.06},
+    {"testset":"main","args":"--testset main --size 1","case_id":210,"label":"ALTER TABLE ADD COLUMN, and query","size":1,"pas_ms":14,"c_ms":11,"ratio":1.27},
+    {"testset":"main","args":"--testset main --size 1","case_id":230,"label":"100 UPDATES, numeric BETWEEN, indexed","size":1,"pas_ms":7,"c_ms":13,"ratio":0.54},
+    {"testset":"main","args":"--testset main --size 1","case_id":240,"label":"500 UPDATES of individual rows","size":1,"pas_ms":10,"c_ms":10,"ratio":1.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":250,"label":"One big UPDATE of the whole 500-row table","size":1,"pas_ms":25,"c_ms":8,"ratio":3.13},
+    {"testset":"main","args":"--testset main --size 1","case_id":270,"label":"100 DELETEs, numeric BETWEEN, indexed","size":1,"pas_ms":18,"c_ms":6,"ratio":3.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":280,"label":"500 DELETEs of individual rows","size":1,"pas_ms":31,"c_ms":6,"ratio":5.17},
+    {"testset":"main","args":"--testset main --size 1","case_id":290,"label":"Refill two 500-row tables using REPLACE","size":1,"pas_ms":35,"c_ms":20,"ratio":1.75},
+    {"testset":"main","args":"--testset main --size 1","case_id":300,"label":"Refill a 500-row table using (b&1)==(a&1)","size":1,"pas_ms":38,"c_ms":26,"ratio":1.46},
+    {"testset":"main","args":"--testset main --size 1","case_id":310,"label":"100 four-ways joins","size":1,"pas_ms":2,"c_ms":3,"ratio":0.67},
+    {"testset":"main","args":"--testset main --size 1","case_id":400,"label":"700 REPLACE ops on an IPK","size":1,"pas_ms":15,"c_ms":8,"ratio":1.88},
+    {"testset":"main","args":"--testset main --size 1","case_id":410,"label":"700 SELECTS on an IPK","size":1,"pas_ms":2,"c_ms":3,"ratio":0.67},
+    {"testset":"main","args":"--testset main --size 1","case_id":500,"label":"700 REPLACE on TEXT PK","size":1,"pas_ms":16,"c_ms":7,"ratio":2.29},
+    {"testset":"main","args":"--testset main --size 1","case_id":510,"label":"700 SELECTS on a TEXT PK","size":1,"pas_ms":3,"c_ms":3,"ratio":1.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":980,"label":"PRAGMA integrity_check","size":1,"pas_ms":2,"c_ms":2,"ratio":1.00},
+    {"testset":"main","args":"--testset main --size 1","case_id":990,"label":"ANALYZE","size":1,"pas_ms":12,"c_ms":14,"ratio":0.86},
+    {"testset":"main","args":"--testset main --size 1","case_id":0,"label":"TOTAL","size":1,"pas_ms":354,"c_ms":281,"ratio":1.26},
+
+    {"testset":"main","args":"--testset main --size 5","case_id":0,"label":"TOTAL","size":5,"pas_ms":null,"c_ms":null,"ratio":null,"skipped":"engine bug: SQLITE_CORRUPT 'database disk image is malformed' during INSERT INTO t3 at size 5"},
+
+    {"testset":"cte","args":"--testset cte --size 1 --sqlonly","case_id":0,"label":"WALL_TOTAL","size":1,"pas_ms":5,"c_ms":6,"ratio":0.83,"_note":"sqlonly mode emits no per-case timings; cell tracks total harness wall-clock only"},
+
+    {"testset":"fp","args":"--testset fp --size 1","case_id":100,"label":"Fill a table with 10000 FP values","size":1,"pas_ms":33,"c_ms":24,"ratio":1.38},
+    {"testset":"fp","args":"--testset fp --size 1","case_id":110,"label":"2 range queries","size":1,"pas_ms":3,"c_ms":6,"ratio":0.50},
+    {"testset":"fp","args":"--testset fp --size 1","case_id":120,"label":"CREATE INDEX three times","size":1,"pas_ms":19,"c_ms":13,"ratio":1.46},
+    {"testset":"fp","args":"--testset fp --size 1","case_id":130,"label":"2 indexed range queries","size":1,"pas_ms":1,"c_ms":1,"ratio":1.00},
+    {"testset":"fp","args":"--testset fp --size 1","case_id":140,"label":"5000 calls to round()","size":1,"pas_ms":4,"c_ms":2,"ratio":2.00},
+    {"testset":"fp","args":"--testset fp --size 1","case_id":0,"label":"TOTAL","size":1,"pas_ms":60,"c_ms":51,"ratio":1.18},
+
+    {"testset":"parsenumber","args":"--testset parsenumber","case_id":100,"label":"parsing 10000 small integers","size":1,"pas_ms":40,"c_ms":21,"ratio":1.90},
+    {"testset":"parsenumber","args":"--testset parsenumber","case_id":110,"label":"parsing 10000 large integers","size":1,"pas_ms":48,"c_ms":26,"ratio":1.85},
+    {"testset":"parsenumber","args":"--testset parsenumber","case_id":200,"label":"parsing 10000 small reals","size":1,"pas_ms":49,"c_ms":29,"ratio":1.69},
+    {"testset":"parsenumber","args":"--testset parsenumber","case_id":210,"label":"parsing 10000 large reals","size":1,"pas_ms":54,"c_ms":70,"ratio":0.77},
+    {"testset":"parsenumber","args":"--testset parsenumber","case_id":0,"label":"TOTAL","size":1,"pas_ms":191,"c_ms":146,"ratio":1.31},
+
+    {"testset":"star","args":"--testset star --sqlonly --size 1","case_id":0,"label":"WALL_TOTAL","size":1,"pas_ms":null,"c_ms":null,"ratio":null,"skipped":"engine bug: SpeedtestDiff reports CORRECTNESS DIVERGENCE in --sqlonly star emission vs C oracle"},
+
+    {"testset":"orm","args":"--testset orm --size 1","case_id":100,"label":"Fill 250 rows","size":1,"pas_ms":26,"c_ms":10,"ratio":2.60},
+    {"testset":"orm","args":"--testset orm --size 1","case_id":110,"label":"Query 250 rows by rowid","size":1,"pas_ms":9,"c_ms":5,"ratio":1.80},
+    {"testset":"orm","args":"--testset orm --size 1","case_id":0,"label":"TOTAL","size":1,"pas_ms":35,"c_ms":15,"ratio":2.33},
+
+    {"testset":"trigger","args":"--testset trigger --sqlonly --size 1","case_id":0,"label":"WALL_TOTAL","size":1,"pas_ms":12,"c_ms":6,"ratio":2.00,"_note":"sqlonly mode emits no per-case timings; cell tracks total harness wall-clock only"},
+
+    {"testset":"debug1","args":"--testset debug1","case_id":0,"label":"WALL_TOTAL","size":1,"pas_ms":6,"c_ms":5,"ratio":1.20,"_note":"debug1 emits no per-case timings; cell tracks total harness wall-clock only"},
+
+    {"testset":"json","args":"--testset json --size 1","case_id":100,"label":"table J1 is 5 rows of JSONB","size":1,"pas_ms":19,"c_ms":26,"ratio":0.73},
+    {"testset":"json","args":"--testset json --size 1","case_id":110,"label":"table J2 is 1 rows from J1 converted to text","size":1,"pas_ms":9,"c_ms":12,"ratio":0.75},
+    {"testset":"json","args":"--testset json --size 1","case_id":120,"label":"create indexes on JSON expressions on J1","size":1,"pas_ms":12,"c_ms":9,"ratio":1.33},
+    {"testset":"json","args":"--testset json --size 1","case_id":130,"label":"create indexes on JSON expressions on J2","size":1,"pas_ms":10,"c_ms":11,"ratio":0.91},
+    {"testset":"json","args":"--testset json --size 1","case_id":0,"label":"TOTAL","size":1,"pas_ms":50,"c_ms":89,"ratio":0.56}
+  ]
+}

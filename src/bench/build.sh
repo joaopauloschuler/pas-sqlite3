@@ -38,6 +38,20 @@ echo "Compiling SpeedtestDiff.pas ..."
 fpc -O2 -FE$BIN_DIR "$SCRIPT_DIR/SpeedtestDiff.pas"
 echo "SpeedtestDiff compiled -> $BIN_DIR/SpeedtestDiff"
 
+echo "Compiling CheckRegression.pas ..."
+# CheckRegression also a plain driver; uses FPC's fcl-json (fpjson + jsonparser).
+FCLJSON_DIR=""
+for d in /usr/lib/fpc/*/units/*/fcl-json /usr/lib64/fpc/*/units/*/fcl-json; do
+  if [ -f "$d/fpjson.ppu" ]; then FCLJSON_DIR="$d"; break; fi
+done
+if [ -z "$FCLJSON_DIR" ]; then
+  echo "ERROR: fcl-json units not found (need fpjson + jsonparser)."
+  echo "       apt install fp-units-fcl  (or equivalent)."
+  exit 1
+fi
+fpc -O2 -Fu"$FCLJSON_DIR" -FE$BIN_DIR "$SCRIPT_DIR/CheckRegression.pas"
+echo "CheckRegression compiled -> $BIN_DIR/CheckRegression"
+
 # Clean compiled artefacts
 find "$SCRIPT_DIR" -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
 find "$BIN_DIR"    -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
