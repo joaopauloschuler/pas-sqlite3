@@ -9088,7 +9088,17 @@ begin
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
       resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr);
-    if pNC^.pParse <> nil then
+    { 9.4.divbug.76 — when the current NameContext has no pSrcList (i.e. the
+      enclosing SELECT has no FROM clause, e.g. tkt3346-1.1's inner
+      `(SELECT x.b='alice' AS y)`), any leftover TK_DOT / bare TK_ID does
+      NOT necessarily mean the reference is bad — it may bind to an outer
+      NameContext.  Mirror resolve.c lookupName (resolve.c:341..706) which
+      walks pNC->pNext before raising the error.  Skip the leftover-sweep
+      here; the outer resolver (codegen.pas:10145..10162) will run
+      ResolveOuterRefs against the outer pSrc, and any genuinely unbound
+      reference is reported by the outer level's flagUnresolvedTKID. }
+    if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil)
+       and (pNC^.pSrcList^.nSrc > 0) then
     begin
       flagUnresolvedTKID(pNC^.pParse, pExpr);
       if pNC^.pParse^.nErr > 0 then
@@ -9796,6 +9806,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     matchCol: i32;
     cnt:    i32;
     pCompArm: PSelect;   { 9.4.divbug.75 — walks pInner^.pPrior chain }
+    pDeep: PSelect;      { 9.4.divbug.76 — walks FROM-subquery interior selects }
   begin
     if pE = nil then Exit;
     { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
@@ -9897,8 +9908,22 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       end;
       { Unresolved TK_DOT — mirror resolve.c lookupName cnt==0 tail:
         emit "no such column: zTab.zCol" and stamp the offset so the
-        CLI caret marker can anchor under the qualifier. }
-      if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+        CLI caret marker can anchor under the qualifier.
+
+        9.4.divbug.76 — when this SELECT has no FROM clause (p^.pSrc=nil)
+        we cannot tell whether the qualifier names an outer table; the C
+        resolver in this case walks NC->pNext until a match is found or
+        until pNC is null and only then raises the error (resolve.c
+        lookupName loop @341..706).  The Pascal port's recursive
+        sqlite3SelectPrep at codegen.pas:26252 invokes us without an outer
+        NameContext, so we cannot resolve the qualifier here.  Defer the
+        error: leave the TK_DOT intact so the parent level's resolver
+        (which DOES see the outer pSrc via ResolveOuterRefs at
+        codegen.pas:10145..10162) gets a chance to bind it.  If it remains
+        unresolved at codegen time the codegen path (sqlite3ExprCodeTarget)
+        raises the same "no such column" error against the parent. }
+      if (p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0)
+         and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
          and (pE^.pLeft^.u.zToken <> nil)
          and (pE^.pRight^.u.zToken <> nil) then
@@ -10156,6 +10181,49 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             ResolveOuterIDs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
             ResolveOuterIDsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
             ResolveOuterIDsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
+        end;
+        { 9.4.divbug.76 — when the inner subquery has a FROM-clause subquery
+          (deeper-level nesting like tkt3346-1.1's
+            `(SELECT y FROM (SELECT x.b='alice' AS y))` inside the OUTER's
+            pEList), the deeper SELECT may carry outer-table references that
+          could not be resolved at SelectExpand time (no outer NameContext
+          was available via codegen.pas:26252).  Walk each FROM-subquery
+          item's interior expressions and apply ResolveOuterRefs /
+          ResolveOuterIDs against the OUTER pSrc.  Mirrors resolve.c's
+          NameContext-chain walk in lookupName (resolve.c:341..706) which
+          climbs pNC->pNext until it finds a binding. }
+        if p^.pSrc <> nil then
+        begin
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            if pCompArm^.pSrc <> nil then
+            begin
+              base := SrcListItems(pCompArm^.pSrc);
+              for i := 0 to pCompArm^.pSrc^.nSrc - 1 do
+              begin
+                pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+                if (pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
+                if pItem^.u4.pSubq = nil then Continue;
+                pDeep := pItem^.u4.pSubq^.pSelect;
+                while pDeep <> nil do
+                begin
+                  ResolveOuterRefsInList(pDeep^.pEList,   p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterRefs(pDeep^.pWhere,         p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterRefs(pDeep^.pHaving,        p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterRefsInList(pDeep^.pGroupBy, p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterRefsInList(pDeep^.pOrderBy, p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterIDsInList(pDeep^.pEList,    p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterIDs(pDeep^.pWhere,          p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterIDs(pDeep^.pHaving,         p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterIDsInList(pDeep^.pGroupBy,  p^.pSrc, pDeep^.pSrc);
+                  ResolveOuterIDsInList(pDeep^.pOrderBy,  p^.pSrc, pDeep^.pSrc);
+                  pDeep := pDeep^.pPrior;
+                end;
+              end;
+            end;
             pCompArm := pCompArm^.pPrior;
           end;
         end;
