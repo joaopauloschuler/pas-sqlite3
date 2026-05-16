@@ -4776,6 +4776,14 @@ begin
     (sqlite_io_error_pending / _persist / _hit / _hardhit / _benign,
     sqlite_diskfull_pending / sqlite_diskfull) driven by do_ioerr_test. }
   Sqlitetest2_Init(interp);
+  { 9.4.divbug.73 — test1.c:9366..9371 Tcl_LinkVar the optimiser/B-tree
+    visit counters so regression tests (rowid-4.5/.5.1, where*/in*/minmax,
+    between's `queryplan`) can read them.  Without this, $sqlite_search_count
+    is undefined → Tcl reads 0 → expected {4 3} comes back as {4 0}. }
+  Tcl_LinkVar(interp, PChar('sqlite_search_count'),
+              @sqlite3_search_count, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
+              @sqlite3_sort_count, TCL_LINK_INT);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;

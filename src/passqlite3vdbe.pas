@@ -1909,6 +1909,14 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 var
   sqlite3_sort_count: i32 = 0;
 
+{ 9.4.divbug.73 — Test-only global incremented by OP_SeekGE/GT/LT/LE on
+  success (vdbe.c:4975), by OP_Next/Prev/SorterNext on success (vdbe.c:6532),
+  and decremented by OP_Sort/OP_SorterSort (vdbe.c:6351).  Read by regression
+  tests via the Tcl-linked `sqlite_search_count` variable (test1.c:9366) to
+  count B-tree-driven row visits.  rowid-4.5 / rowid-4.5.1 expect 3 here. }
+var
+  sqlite3_search_count: i32 = 0;
+
 implementation
 
 uses
@@ -5045,6 +5053,8 @@ begin
   rc := sqlite3BtreeTableMoveto(p^.uc.pCursor, u64(p^.movetoTarget), 0, @resMoveto);
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
   if resMoveto <> 0 then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+  { 9.4.divbug.73 — vdbeaux.c:3812..3814 SQLITE_TEST counter (lazy seek lands) }
+  Inc(sqlite3_search_count);
   p^.deferredMoveto := 0;
   p^.cacheStatus := CACHE_STALE;
   Result := SQLITE_OK;
@@ -8435,6 +8445,8 @@ begin
         if rc <> SQLITE_OK then goto abort_due_to_error;
         if (eqOnly <> 0) and (rSeek.eqSeen = 0) then goto seek_not_found;
       end;
+      { 9.4.divbug.73 — vdbe.c:4974..4976 SQLITE_TEST counter (table+index arms) }
+      Inc(sqlite3_search_count);
       if oc >= OP_SeekGE then begin
         if (res < 0) or ((res = 0) and (oc = OP_SeekGT)) then begin
           res := 0;
@@ -10523,6 +10535,8 @@ begin
       { vdbe.c:6349..6351 — SQLITE_TEST-guarded sort counter, read by
         regression tests to confirm sorts are elided when possible. }
       Inc(sqlite3_sort_count);
+      { 9.4.divbug.73 — vdbe.c:6351 dec search_count (Sort masquerades as Rewind) }
+      Dec(sqlite3_search_count);
       Inc(v^.aCounter[SQLITE_STMTSTATUS_SORT]);
       { Fall through to OP_Rewind logic }
       pCur  := v^.apCsr[pOp^.p1];
@@ -11795,6 +11809,8 @@ begin
     if rc = SQLITE_OK then begin
       pCur^.nullRow := 0;
       Inc(v^.aCounter[pOp^.p5]);
+      { 9.4.divbug.73 — vdbe.c:6531..6533 SQLITE_TEST counter on Next/Prev/SorterNext }
+      Inc(sqlite3_search_count);
       goto jump_to_p2_and_check_for_interrupt;
     end;
     if rc <> SQLITE_DONE then goto abort_due_to_error;
