@@ -7793,6 +7793,7 @@ var
   iSet:     i32;              { OP_RowSetTest: batch number }
   exists:   i32;              { OP_RowSetTest: membership result }
   xLim:     i64;              { OP_OffsetLimit: combined limit }
+  xOfs:     i64;              { OP_OffsetLimit: clamped offset (max(0,r[P3])) }
   newMax:   Pgno;             { OP_MaxPgcnt: new max page count }
   pBtArg:   PBtree;           { OP_MaxPgcnt/Pagecount: btree }
   { 6.bis.3a locals — vtab opcode wiring }
@@ -10792,13 +10793,19 @@ begin
       if pIn1^.u.i = 0 then goto jump_to_p2;
     end;
 
-    { ────── OP_OffsetLimit ────── (vdbe.c:7740) }
+    { ────── OP_OffsetLimit ────── (vdbe.c:7740)
+      Synopsis: if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1)
+      9.4.divbug.46: must clamp r[P3] (OFFSET) to 0 before adding —
+      C does `pIn3->u.i>0?pIn3->u.i:0`.  A negative OFFSET (e.g.
+      `LIMIT 5 OFFSET -2`) otherwise shrinks the Top-N B-tree cap
+      from LIMIT to LIMIT+OFFSET, returning fewer rows than expected. }
     OP_OffsetLimit: begin
       pIn1  := @aMem[pOp^.p1];
       pIn3  := @aMem[pOp^.p3];
       pOut  := out2Prerelease(v, pOp);
       xLim  := pIn1^.u.i;
-      if (xLim <= 0) or (sqlite3AddInt64(@xLim, pIn3^.u.i) <> 0) then
+      if pIn3^.u.i > 0 then xOfs := pIn3^.u.i else xOfs := 0;
+      if (xLim <= 0) or (sqlite3AddInt64(@xLim, xOfs) <> 0) then
         pOut^.u.i := -1
       else
         pOut^.u.i := xLim;

@@ -31834,6 +31834,22 @@ begin
           pDest^.iSdst, nResultCol);
       sqlite3ReleaseTempReg(pParse, i);
     end;
+
+    { 9.4.divbug.46 — post-disposal LIMIT decrement (select.c:1522..1524):
+      `if (pSort==0 && p->iLimit) sqlite3VdbeAddOp2(v, OP_DecrJumpZero,
+      p->iLimit, iBreak)`.  The SRT_Output, SRT_Mem and SRT_Coroutine
+      disposal arms above already emit their own DecrJumpZero, so guard
+      against double-emit.  Without this, FROM-subqueries materialised
+      via SRT_EphemTab (e.g. `SELECT count(*) FROM (SELECT * FROM t LIMIT 2)`)
+      ingest ALL inner rows — the LIMIT register is allocated by
+      computeLimitRegisters but never consulted.  bSort=0 is implicit
+      here: the bSort=1 paths above pushed into the sorter, which caps
+      the cardinality via the Top-N gate / SorterInsert sort tail. }
+    if (p^.iLimit <> 0) and (not isExists) and (bSort = 0)
+       and (pDest^.eDest <> SRT_Output)
+       and (pDest^.eDest <> SRT_Mem)
+       and (pDest^.eDest <> SRT_Coroutine) then
+      sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
   end;
 
   { Close the loop — emits OP_Next and resolves the iBreak label. }
