@@ -10393,6 +10393,165 @@ begin
   Result := 0;
 end;
 
+{ 10.1a.1.6  `.limit ?NAME? ?VAL?`      shell.c.in:10002..10061
+  13-entry name/code table; case-insensitive prefix match; on success
+  print "%20s %d\n" current value (or set then print on `.limit NAME VAL`).
+  Ambiguous prefix and unknown name both emit C-parity errors on stderr. }
+type
+  TLimitEntry = record
+    name: AnsiString;
+    code: i32;
+  end;
+const
+  aLimit: array[0..12] of TLimitEntry = (
+    (name: 'length';              code: SQLITE_LIMIT_LENGTH),
+    (name: 'sql_length';          code: SQLITE_LIMIT_SQL_LENGTH),
+    (name: 'column';              code: SQLITE_LIMIT_COLUMN),
+    (name: 'expr_depth';          code: SQLITE_LIMIT_EXPR_DEPTH),
+    (name: 'parser_depth';        code: 12 { SQLITE_LIMIT_PARSER_DEPTH }),
+    (name: 'compound_select';     code: SQLITE_LIMIT_COMPOUND_SELECT),
+    (name: 'vdbe_op';             code: SQLITE_LIMIT_VDBE_OP),
+    (name: 'function_arg';        code: SQLITE_LIMIT_FUNCTION_ARG),
+    (name: 'attached';            code: SQLITE_LIMIT_ATTACHED),
+    (name: 'like_pattern_length'; code: SQLITE_LIMIT_LIKE_PATTERN_LENGTH),
+    (name: 'variable_number';     code: SQLITE_LIMIT_VARIABLE_NUMBER),
+    (name: 'trigger_depth';       code: SQLITE_LIMIT_TRIGGER_DEPTH),
+    (name: 'worker_threads';      code: SQLITE_LIMIT_WORKER_THREADS)
+  );
+
+function cmdLimit(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
+var
+  i, iLimit, n2, newVal: i32;
+  zArgLc: AnsiString;
+begin
+  Result := 0;
+  openDb(p, 0);
+  if nArg = 0 then begin
+    for i := 0 to High(aLimit) do
+      shellSPutZ(Format('%20s %d'#10,
+        [aLimit[i].name, sqlite3_limit(p^.db, aLimit[i].code, -1)]));
+    Exit;
+  end;
+  if nArg > 2 then begin
+    shellEPutZ('Usage: .limit NAME ?NEW-VALUE?'#10);
+    Result := 1;
+    Exit;
+  end;
+  iLimit := -1;
+  zArgLc := LowerCase(args[0]);
+  n2 := Length(zArgLc);
+  for i := 0 to High(aLimit) do begin
+    if (Length(aLimit[i].name) >= n2)
+       and (Copy(LowerCase(aLimit[i].name), 1, n2) = zArgLc) then
+    begin
+      if iLimit < 0 then iLimit := i
+      else begin
+        shellEPutZ(Format('ambiguous limit: "%s"'#10, [args[0]]));
+        Result := 1;
+        Exit;
+      end;
+    end;
+  end;
+  if iLimit < 0 then begin
+    shellEPutZ(Format('unknown limit: "%s"'#10 +
+      'enter ".limits" with no arguments for a list.'#10, [args[0]]));
+    Result := 1;
+    Exit;
+  end;
+  if nArg = 2 then begin
+    newVal := StrToIntDef(args[1], 0);
+    sqlite3_limit(p^.db, aLimit[iLimit].code, newVal);
+  end else
+    shellSPutZ(Format('%20s %d'#10,
+      [aLimit[iLimit].name,
+       sqlite3_limit(p^.db, aLimit[iLimit].code, -1)]));
+end;
+
+{ 10.1a.1.10 `.intck ?STEPS_PER_UNLOCK?` shell.c.in:9964..9978 + 7091..7121
+  Wraps the already-ported passqlite3intck. STEPS_PER_UNLOCK=0 → no
+  periodic unlock; negative is rejected with the C usage banner. }
+function cmdIntck(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
+var
+  iArg, nStep, nError: Int64;
+  pCk: PIntck;
+  zMsg, zErr: PAnsiChar;
+  rc: i32;
+begin
+  Result := 0;
+  iArg := 0;
+  if nArg = 1 then begin
+    iArg := StrToInt64Def(args[0], 0);
+    if iArg = 0 then iArg := -1;
+  end;
+  if ((nArg <> 0) and (nArg <> 1)) or (iArg < 0) then begin
+    shellEPutZ('Usage: .intck STEPS_PER_UNLOCK'#10);
+    Result := 1;
+    Exit;
+  end;
+  if nArg = 0 then iArg := 0;
+  openDb(p, 0);
+  pCk := nil;
+  rc := sqlite3_intck_open(p^.db, 'main', @pCk);
+  if rc = SQLITE_OK then begin
+    nStep := 0;
+    nError := 0;
+    while sqlite3_intck_step(pCk) = SQLITE_OK do begin
+      zMsg := sqlite3_intck_message(pCk);
+      if zMsg <> nil then begin
+        shellSPutZ(AnsiString(zMsg) + #10);
+        Inc(nError);
+      end;
+      Inc(nStep);
+      if (iArg <> 0) and ((nStep mod iArg) = 0) then
+        sqlite3_intck_unlock(pCk);
+    end;
+    zErr := nil;
+    rc := sqlite3_intck_error(pCk, @zErr);
+    if zErr <> nil then
+      shellEPutZ(AnsiString(zErr) + #10);
+    sqlite3_intck_close(pCk);
+    shellSPutZ(Format('%d steps, %d errors'#10, [nStep, nError]));
+  end;
+  Result := rc;
+end;
+
+{ 10.1a.1.9  `.load FILE ?ENTRY?`        shell.c.in:10069..10088
+  Wraps sqlite3_load_extension. Pas engine is built with
+  SQLITE_OMIT_LOAD_EXTENSION (main.pas:332) — sqlite3_load_extension
+  returns SQLITE_ERROR + "extension loading is disabled" which we
+  surface verbatim, matching upstream OMIT build behaviour. }
+function cmdLoad(p: PShellState; const args: array of AnsiString;
+                 nArg: SizeInt): i32;
+var
+  zFile, zProc: PAnsiChar;
+  zErrMsg: PAnsiChar;
+  rc: i32;
+begin
+  Result := 0;
+  failIfSafeMode(p, 'cannot run .load in safe mode');
+  if (nArg < 1) or (Length(args[0]) = 0) then begin
+    shellEPutZ('Usage: .load FILE ?ENTRYPOINT?'#10);
+    Result := 1;
+    Exit;
+  end;
+  zFile := PAnsiChar(args[0]);
+  if nArg >= 2 then zProc := PAnsiChar(args[1]) else zProc := nil;
+  openDb(p, 0);
+  zErrMsg := nil;
+  rc := sqlite3_load_extension(p^.db, zFile, zProc, @zErrMsg);
+  if rc <> SQLITE_OK then begin
+    if zErrMsg <> nil then
+      shellEPutZ(AnsiString(zErrMsg) + #10)
+    else
+      shellEPutZ(Format('Error: %s'#10,
+        [AnsiString(sqlite3_errmsg(p^.db))]));
+    sqlite3_free(zErrMsg);
+    Result := 1;
+  end;
+end;
+
 { 10.1a.1.5  `.nonce STRING`            shell.c.in:10116..10128
   When ShellState.zNonce matches, clear bSafeMode for the *next*
   command and return 0 immediately (caller-side bSafeMode reset
@@ -10519,6 +10678,12 @@ begin
   if zCmd = 'version'   then begin Result := cmdVersion(p); Exit; end;
   if zCmd = 'prompt'    then begin Result := cmdPrompt(args, nArg); Exit; end;
   if zCmd = 'nonce'     then begin Result := cmdNonce(p, args, nArg); Exit; end;
+  { 10.1a.1.6/.9/.10  .limit / .load / .intck — dot-command wrappers. }
+  if (zCmd = 'limit') or (zCmd = 'limits') then begin
+    Result := cmdLimit(p, args, nArg); Exit;
+  end;
+  if zCmd = 'intck'     then begin Result := cmdIntck(p, args, nArg); Exit; end;
+  if zCmd = 'load'      then begin Result := cmdLoad(p, args, nArg); Exit; end;
 
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));
