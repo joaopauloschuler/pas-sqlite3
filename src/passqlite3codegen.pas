@@ -50257,6 +50257,13 @@ begin
   end
   else
     iDb := 0;
+  { pragma.c:454..459 — if the temp database is explicitly named, open it
+    now so OP_ReadCookie/OP_Transaction emitted below see a non-nil pBt.
+    Without this `PRAGMA temp.data_version` (and any other temp.* pragma
+    that hits HEADER_VALUE/auto_vacuum/etc.) SIGSEGV in OP_ReadCookie
+    because db^.aDb[1].pBt is nil for :memory: connections that have
+    never had a temp table.  9.4.divbug.69. }
+  if (iDb = 1) and (sqlite3OpenTempDatabase(pParse) <> 0) then Exit;
   SetString(zName, pPragmaId^.z, pPragmaId^.n);
   if pValue <> nil then SetString(zRight, pValue^.z, pValue^.n) else zRight := '';
   { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466).
