@@ -43,6 +43,7 @@ uses
   passqlite3ieee754,
   passqlite3regexp,
   passqlite3stmtrand,
+  passqlite3printf,
   passqlite3main;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -1113,6 +1114,542 @@ begin
   if (interp = nil) or (objc < 0) or (objv = nil) then ;
 end;
 
+{ ----------------------------------------------------------------------
+  9.4.divbug.62.a — test1.c sqlite3_mprintf_* / step / finalize / reset
+  and the sqlite3_column_* family.
+
+  Test1.c references (line ranges):
+    * sqlite3_mprintf_int           test1.c:1400..1420
+    * sqlite3_mprintf_int64         test1.c:1427..1451
+    * sqlite3_mprintf_long          test1.c:1460..1484
+    * sqlite3_mprintf_str           test1.c:1491..1511
+    * sqlite3_mprintf_double        test1.c:1552..1574
+    * sqlite3_mprintf_scaled        test1.c:1583..1604
+    * sqlite3_mprintf_stronly       test1.c:1613..1629
+    * sqlite3_mprintf_hexdouble     test1.c:1637..1663
+    * sqlite3_mprintf_z_test        test1.c:495..510   (test_mprintf_z)
+    * sqlite3_mprintf_n_test        test1.c:518..530   (test_mprintf_n)
+    * sqlite3_step                  test1.c:5579..5600 (test_step)
+    * sqlite3_finalize              test1.c:2256..2281 (test_finalize)
+    * sqlite3_reset                 test1.c:3086..3117 (test_reset)
+    * sqlite3_column_count          test1.c:5664..5682
+    * sqlite3_data_count            test1.c:5826..5844
+    * sqlite3_column_type           test1.c:5689..5730
+    * sqlite3_column_int64          test1.c:5738..5760
+    * sqlite3_column_blob           test1.c:5765..5790
+    * sqlite3_column_double         test1.c:5797..5819
+    * sqlite3_column_text / _name / _decltype /
+      _database_name / _table_name / _origin_name
+                                    test1.c:5853..5884 (test_stmt_utf8)
+    * sqlite3_column_int / _bytes   test1.c:5955..5977 (test_stmt_int)
+
+  Pascal's sqlite3_mprintf entry (passqlite3util.pas:2931) ignores
+  varargs; we route the mprintf-Tcl-command bodies through
+  sqlite3PfMprintf (passqlite3printf.pas:1499), the Pascal-array-of-
+  const flavoured renderer.  Same engine the SQL `printf()` builtin
+  uses — handles %d/%x/%o/%X/%s/%g/%e/%f/%p with width/precision flags.
+  ---------------------------------------------------------------------- }
+
+{ argv: PPAnsiCharArr  (defined in PasTclBridge as ^PAnsiChar) — index
+  via argv[i] for old-style argc/argv handlers. }
+
+{ test1.c:1400..1420 — sqlite3_mprintf_int FORMAT INT INT INT.
+  Old-style (string argc/argv) handler. }
+function tcl_mprintf_int(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  a: array[0..2] of cint;
+  i: cint;
+  z: PAnsiChar;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 5 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT INT INT INT"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 2 to 4 do
+    if Tcl_GetInt(interp, av[i], @a[i-2]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  z := sqlite3PfMprintf(av[1], [a[0], a[1], a[2]]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1427..1451 — sqlite3_mprintf_int64. }
+function tcl_mprintf_int64(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  a: array[0..2] of i64;
+  i: cint;
+  z: PAnsiChar;
+  av: PPAnsiCharArr;
+  v: Int64;
+  code: Integer;
+begin
+  av := argv;
+  if argc <> 5 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT INT INT INT"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 2 to 4 do begin
+    Val(AnsiString(av[i]), v, code);
+    if code <> 0 then begin
+      Tcl_AppendResult(interp,
+        PChar('argument is not a valid 64-bit integer'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    a[i-2] := v;
+  end;
+  z := sqlite3PfMprintf(av[1], [a[0], a[1], a[2]]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1460..1484 — sqlite3_mprintf_long.  On LP64 long==int64; the C
+  body also masks to int-width.  Port literally. }
+function tcl_mprintf_long(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  b: array[0..2] of cint;
+  a: array[0..2] of i64;
+  i: cint;
+  z: PAnsiChar;
+  av: PPAnsiCharArr;
+  mask: i64;
+begin
+  av := argv;
+  if argc <> 5 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT INT INT INT"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 2 to 4 do
+    if Tcl_GetInt(interp, av[i], @b[i-2]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  mask := (i64(1) shl (SizeOf(cint) * 8)) - 1;
+  for i := 0 to 2 do a[i] := i64(b[i]) and mask;
+  z := sqlite3PfMprintf(av[1], [a[0], a[1], a[2]]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1491..1511 — sqlite3_mprintf_str FORMAT INT INT ?STRING?. }
+function tcl_mprintf_str(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  a: array[0..1] of cint;
+  i: cint;
+  z: PAnsiChar;
+  zStr: PAnsiChar;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if (argc < 4) or (argc > 5) then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT INT INT ?STRING?"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 2 to 3 do
+    if Tcl_GetInt(interp, av[i], @a[i-2]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  if argc > 4 then zStr := av[4] else zStr := nil;
+  z := sqlite3PfMprintf(av[1], [a[0], a[1], zStr]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1552..1574 — sqlite3_mprintf_double FORMAT INT INT DOUBLE. }
+function tcl_mprintf_double(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  a: array[0..1] of cint;
+  r: Double;
+  i: cint;
+  z: PAnsiChar;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 5 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT INT INT DOUBLE"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 2 to 3 do
+    if Tcl_GetInt(interp, av[i], @a[i-2]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  if Tcl_GetDouble(interp, av[4], @r) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  z := sqlite3PfMprintf(av[1], [a[0], a[1], r]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1583..1604 — sqlite3_mprintf_scaled FORMAT DOUBLE DOUBLE. }
+function tcl_mprintf_scaled(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  r: array[0..1] of Double;
+  i: cint;
+  z: PAnsiChar;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 4 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT DOUBLE DOUBLE"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 2 to 3 do
+    if Tcl_GetDouble(interp, av[i], @r[i-2]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  z := sqlite3PfMprintf(av[1], [r[0] * r[1]]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1613..1629 — sqlite3_mprintf_stronly FORMAT STRING. }
+function tcl_mprintf_stronly(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  z: PAnsiChar;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 3 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT STRING"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  z := sqlite3PfMprintf(av[1], [av[2]]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:1637..1663 — sqlite3_mprintf_hexdouble FORMAT HEX(16). }
+function tcl_mprintf_hexdouble(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  z:   PAnsiChar;
+  r:   Double;
+  d:   QWord;
+  hex: AnsiString;
+  i:   cint;
+  c:   AnsiChar;
+  v:   cint;
+  av:  PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 3 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' FORMAT STRING"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  hex := AnsiString(av[2]);
+  if Length(hex) <> 16 then begin
+    Tcl_AppendResult(interp,
+      PChar('2nd argument should be 16-characters of hex'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  d := 0;
+  for i := 1 to 16 do begin
+    c := hex[i];
+    case c of
+      '0'..'9': v := Ord(c) - Ord('0');
+      'a'..'f': v := Ord(c) - Ord('a') + 10;
+      'A'..'F': v := Ord(c) - Ord('A') + 10;
+    else
+      Tcl_AppendResult(interp,
+        PChar('2nd argument should be 16-characters of hex'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    d := (d shl 4) or QWord(v);
+  end;
+  Move(d, r, SizeOf(r));
+  z := sqlite3PfMprintf(av[1], [r]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:495..510 — sqlite3_mprintf_z_test SEPARATOR ARG0 ARG1 ...
+  Tests %z by repeated concatenation. }
+function tcl_mprintf_z_test(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  zResult: PAnsiChar;
+  i:       cint;
+  av:      PPAnsiCharArr;
+begin
+  av := argv;
+  zResult := nil;
+  i := 2;
+  while (i < argc) and ((i = 2) or (zResult <> nil)) do begin
+    zResult := sqlite3PfMprintf(PAnsiChar('%z%s%s'),
+      [zResult, av[1], av[i]]);
+    Inc(i);
+  end;
+  Tcl_AppendResult(interp, zResult, Pointer(nil));
+  sqlite3_free(zResult);
+  Result := TCL_OK;
+end;
+
+{ test1.c:518..530 — sqlite3_mprintf_n_test STRING. %n returns chars written. }
+function tcl_mprintf_n_test(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  zStr: PAnsiChar;
+  av:   PPAnsiCharArr;
+  n:    cint;
+begin
+  av := argv;
+  n := 0;
+  zStr := sqlite3PfMprintf(PAnsiChar('%s%n'), [av[1], @n]);
+  sqlite3_free(zStr);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(n));
+  Result := TCL_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  test1.c:5579..5600 / 2256..2281 / 3086..3117 — sqlite3_step / _finalize /
+  _reset.  All take a single STMT pointer formatted by test_prepare /
+  test_prepare_v2 (a "0xABCD..." hex string).  Decoded via
+  sqlite3TestTextToPtr (already in this unit).
+  ---------------------------------------------------------------------- }
+function tcl_test_step(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  rc:    cint;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  rc := sqlite3_step(pStmt);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
+function tcl_test_finalize(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  rc:    cint;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' <STMT>'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  rc := sqlite3_finalize(pStmt);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
+function tcl_test_reset(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  rc:    cint;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' <STMT>'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  rc := sqlite3_reset(pStmt);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  test1.c:5664..5844 + 5853..5977 — sqlite3_column_* family.
+  ---------------------------------------------------------------------- }
+function tcl_column_count(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_column_count(pStmt)));
+  Result := TCL_OK;
+end;
+
+function tcl_data_count(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_data_count(pStmt)));
+  Result := TCL_OK;
+end;
+
+function tcl_column_type(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  col, tp: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  tp := sqlite3_column_type(pStmt, col);
+  case tp of
+    SQLITE_INTEGER: Tcl_SetResult(interp, PChar('INTEGER'), TCL_STATIC);
+    SQLITE_NULL:    Tcl_SetResult(interp, PChar('NULL'),    TCL_STATIC);
+    SQLITE_FLOAT:   Tcl_SetResult(interp, PChar('FLOAT'),   TCL_STATIC);
+    SQLITE_TEXT:    Tcl_SetResult(interp, PChar('TEXT'),    TCL_STATIC);
+    SQLITE_BLOB:    Tcl_SetResult(interp, PChar('BLOB'),    TCL_STATIC);
+  end;
+  Result := TCL_OK;
+end;
+
+function tcl_column_int(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe; col: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_column_int(pStmt, col)));
+  Result := TCL_OK;
+end;
+
+function tcl_column_int64(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe; col: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp,
+    Tcl_NewWideIntObj(sqlite3_column_int64(pStmt, col)));
+  Result := TCL_OK;
+end;
+
+function tcl_column_double(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe; col: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp,
+    Tcl_NewDoubleObj(sqlite3_column_double(pStmt, col)));
+  Result := TCL_OK;
+end;
+
+function tcl_column_bytes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe; col: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(sqlite3_column_bytes(pStmt, col)));
+  Result := TCL_OK;
+end;
+
+function tcl_column_blob(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  col, len: cint;
+  pBlob: Pointer;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  len := sqlite3_column_bytes(pStmt, col);
+  pBlob := sqlite3_column_blob(pStmt, col);
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(pBlob, len));
+  Result := TCL_OK;
+end;
+
+{ Shared dispatcher for the six "STMT column → PAnsiChar" entrypoints —
+  test_stmt_utf8 in test1.c.  clientData is the function pointer. }
+type
+  Tt1ColTextFn = function(pStmt: PVdbe; i: i32): PAnsiChar; cdecl;
+
+function tcl_stmt_utf8(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  col:   cint;
+  zRet:  PAnsiChar;
+  fn:    Tt1ColTextFn;
+begin
+  fn := Tt1ColTextFn(clientData);
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zRet := fn(pStmt, col);
+  if zRet <> nil then Tcl_SetResult(interp, zRet, Pointer(nil));
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -1152,6 +1689,64 @@ begin
     @test_initialize, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_shutdown'),
     @test_shutdown, nil, nil);
+  { 9.4.divbug.62.a — sqlite3_mprintf_* / step / finalize / reset /
+    column_*.  Old-style argc/argv handlers for the mprintf cluster
+    (test1.c:9059..9069) — Tcl_CreateCommand for those, objCommand
+    for the rest. }
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_int'),
+    @tcl_mprintf_int, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_int64'),
+    @tcl_mprintf_int64, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_long'),
+    @tcl_mprintf_long, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_str'),
+    @tcl_mprintf_str, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_double'),
+    @tcl_mprintf_double, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_scaled'),
+    @tcl_mprintf_scaled, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_stronly'),
+    @tcl_mprintf_stronly, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_hexdouble'),
+    @tcl_mprintf_hexdouble, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_z_test'),
+    @tcl_mprintf_z_test, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_n_test'),
+    @tcl_mprintf_n_test, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_step'),
+    @tcl_test_step, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_finalize'),
+    @tcl_test_finalize, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_reset'),
+    @tcl_test_reset, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_count'),
+    @tcl_column_count, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_data_count'),
+    @tcl_data_count, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_type'),
+    @tcl_column_type, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_int'),
+    @tcl_column_int, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_int64'),
+    @tcl_column_int64, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_double'),
+    @tcl_column_double, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_bytes'),
+    @tcl_column_bytes, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_blob'),
+    @tcl_column_blob, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_text'),
+    @tcl_stmt_utf8, Pointer(@sqlite3_column_text), nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_name'),
+    @tcl_stmt_utf8, Pointer(@sqlite3_column_name), nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_decltype'),
+    @tcl_stmt_utf8, Pointer(@sqlite3_column_decltype), nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_database_name'),
+    @tcl_stmt_utf8, Pointer(@sqlite3_column_database_name), nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_table_name'),
+    @tcl_stmt_utf8, Pointer(@sqlite3_column_table_name), nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_origin_name'),
+    @tcl_stmt_utf8, Pointer(@sqlite3_column_origin_name), nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
     regression tests (between.test's `queryplan` proc, etc.) can
     verify the optimizer correctly elides ORDER BY sorts. }
