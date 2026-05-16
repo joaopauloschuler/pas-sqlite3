@@ -660,19 +660,10 @@ acceptance gate for this section.
     Updated `inventory.sh` INTERNAL_PATTERN to match.  Manifest
     totals: 947→959 tcl-feature, 225→213 tcl-internal, 17 tcl-perf.
 
-- [ ] **9.4.5** Linux-only nightly.  Wire into CI as a *nightly*
-  job (not per-commit — the Tcl suite is ~hours).  PR gate stays
-  on 9.1 / 9.2 / 9.3.1's seed-set sweep.
-  - [ ] **9.4.5.a** CI config — `.github/workflows/tcl-nightly.yml`
-    (or matching CI surface) that runs `bin/TclTestDriver` against
-    the full MANIFEST + diff against `STATUS.txt` (9.4.8.b).
-  - [ ] **9.4.5.b** Sharding — split the 946-test sweep across N
-    parallel workers (each worker takes a slice of MANIFEST).
-    Driver-side flag `--shard I/N`.  Reduces wall-time from ~hours
-    to ~tens of minutes.
-  - [ ] **9.4.5.c** Failure-report artefact — upload
-    DIVERGENCES.md diff + per-test stdout/stderr capture of any
-    new failure as a CI artefact for triage.
+- [X] **9.4.5** Linux-only nightly.  Landed via commit 3b0b96a: `.github/workflows/tcl-nightly.yml` runs nightly (04:00 UTC + `workflow_dispatch`), 4-way sharded, with per-shard failure-log artefact upload + aggregate `check_status_regression.sh` gate.
+  - [X] **9.4.5.a** CI config — `.github/workflows/tcl-nightly.yml` runs `bin/TclTestDriver --gate strict` against full MANIFEST, exits non-zero on any pas-strict regression vs `STATUS.txt`.
+  - [X] **9.4.5.b** Sharding — driver flag `--shard I/N` (TclTestDriver.pas) slices the filtered manifest into N contiguous chunks; 4 parallel shard jobs in `tcl-nightly.yml`.
+  - [X] **9.4.5.c** Failure-report artefact — per-shard `--fail-log-dir` captures `<basename>.{out,err}` for every FAIL; uploaded as `tcl-failure-logs-shard-N` artefact; aggregate job concatenates + diffs against STATUS.txt via `src/tests/tcl/check_status_regression.sh`.
 
 - [~] **9.4.6** Test-only public-API export delta.  Many `.test`
   files call into the C ABI beyond the "publicly documented" subset.
