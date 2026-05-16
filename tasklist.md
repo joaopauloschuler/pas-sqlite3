@@ -777,10 +777,23 @@ acceptance gate for this section.
     pointing at `libpassqlite3tcl.so` and install into
     `auto_path`.  Quality-of-life; lets us run upstream tests
     verbatim (which assume the package is loadable by name).
-  - [ ] **9.4.7.i** Threading build (`-dSQLITE_THREADSAFE=1`) —
+  - [X] **9.4.7.i** Threading build (`-dSQLITE_THREADSAFE=1`) —
     some tests assume the threadsafe build.  Audit which tests
     + which sqlite3 mutex hooks need real implementations vs.
     no-op stubs.  Gate this profile behind its own .so.
+    Outcome: pas-sqlite3 is pinned threadsafe-by-default
+    (`SQLITE_THREADSAFE = 1` const in passqlite3internal.pas:59,
+    unconditional pthread backend in passqlite3os.pas), so the
+    `-dSQLITE_THREADSAFE` define is a no-op for generated code.
+    Landed `src/tests/build_tcl_lib_threadsafe.sh` producing
+    `bin/libpassqlite3tcl-threadsafe.so` plus a `--build PROFILE`
+    flag in TclTestDriver.pas that loads
+    `bin/libpassqlite3tcl-<profile>.so` via explicit `load`
+    bypassing pkgIndex.tcl.  Full audit + C-reference comparison +
+    test inventory (ctime/mutex1/mutex2/tkt3793 pas-strict;
+    sort/sortfault pas-skip-unswept) in
+    `src/tests/tcl/THREADSAFE_AUDIT.md`.  Smoke: mutex1, mutex2,
+    tkt3793 PASS against the threadsafe .so via `--build threadsafe`.
 
 - [~] **9.4.8** Full-corpus parity gate.
   - [X] **9.4.8.a** Per-test status tags — adopt the pas-strict /

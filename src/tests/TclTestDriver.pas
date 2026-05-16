@@ -24,6 +24,15 @@
       --shard I/N         (9.4.5.b) run only entries in slice I of N
                           where entries are sliced AFTER --filter but
                           BEFORE --limit.  I is 0-based, 0<=I<N.
+      --build PROFILE     (9.4.7.i) select which engine shared-object to
+                          load.  PROFILE is appended as a suffix:
+                            default   -> bin/libpassqlite3tcl.so
+                            <name>    -> bin/libpassqlite3tcl-<name>.so
+                          (e.g. `--build threadsafe` loads
+                          libpassqlite3tcl-threadsafe.so; `--build memdebug`
+                          loads libpassqlite3tcl-memdebug.so).  Forces the
+                          explicit-load fallback path so the pkgIndex.tcl
+                          default .so is bypassed for this run.
       --fail-log-dir DIR  (9.4.5.c) on FAIL, write per-test
                           <basename>.out / .err under DIR.  Default is
                           <bin>/tcl-failure-logs/ when unset.
@@ -124,6 +133,7 @@ var
   gFilter     : string  = '';
   gShardI     : Integer = -1;       { 9.4.5.b — -1 = no sharding }
   gShardN     : Integer = -1;
+  gBuildProf  : string  = '';       { 9.4.7.i — '' = default .so via pkgIndex }
   gFailLogDir : string  = '';       { 9.4.5.c — empty = default <bin>/tcl-failure-logs }
   gGateStrict : Boolean = False;    { 9.4.8.c — strict gate on STATUS.txt pas-strict rows }
   gCoverage   : Boolean = False;    { 9.4.8.d — opcode coverage harvest }
@@ -205,6 +215,9 @@ begin
       Inc(i); gManifest := ExpandFileName(ParamStr(i));
     end else if a = '--shard' then begin
       Inc(i); ParseShardSpec(ParamStr(i));
+    end else if a = '--build' then begin
+      Inc(i); gBuildProf := LowerCase(Trim(ParamStr(i)));
+      if gBuildProf = 'default' then gBuildProf := '';
     end else if a = '--fail-log-dir' then begin
       Inc(i); gFailLogDir := ExpandFileName(ParamStr(i));
     end else if a = '--gate' then begin
@@ -241,11 +254,19 @@ begin
       the generated pkgIndex.tcl and loads libpassqlite3tcl.so itself.
       Fall back to an explicit `load` if the pkgIndex isn't present (e.g.
       bin/ built before 9.4.7.h landed). }
-    sb.Add('lappend ::auto_path {' + gBinDir + '}');
-    sb.Add('if {[catch {package require sqlite3}]} {');
-    sb.Add('  load {' + gSoPath + '} Sqlite3');
-    sb.Add('  package require sqlite3');
-    sb.Add('}');
+    if gBuildProf = '' then begin
+      sb.Add('lappend ::auto_path {' + gBinDir + '}');
+      sb.Add('if {[catch {package require sqlite3}]} {');
+      sb.Add('  load {' + gSoPath + '} Sqlite3');
+      sb.Add('  package require sqlite3');
+      sb.Add('}');
+    end else begin
+      { 9.4.7.i: --build PROFILE bypasses pkgIndex.tcl so the requested
+        .so is the one that loads, then registers the package alias so
+        any subsequent `package require sqlite3` is a no-op. }
+      sb.Add('load {' + gSoPath + '} Sqlite3');
+      sb.Add('package provide sqlite3 3.53.0');
+    end;
     { 9.4.7.f: cd into the per-test tmpdir so any test.db / -journal / -wal
       the test leaks lands in a throwaway directory the driver deletes
       afterwards — tests can no longer cross-pollinate each other.
@@ -925,6 +946,15 @@ begin
   gManifest := IncludeTrailingPathDelimiter(gTclDir) + 'MANIFEST.txt';
 
   ParseArgs;
+
+  { 9.4.7.i — --build PROFILE remaps gSoPath to libpassqlite3tcl-<profile>.so.
+    BuildScript will skip the pkgIndex.tcl path when gBuildProf<>'' so the
+    explicit load of this .so is what reaches the child interpreter. }
+  if gBuildProf <> '' then begin
+    gSoPath := IncludeTrailingPathDelimiter(gBinDir)
+               + 'libpassqlite3tcl-' + gBuildProf + '.so';
+    Writeln(StdErr, 'TclTestDriver: --build ', gBuildProf, ' -> ', gSoPath);
+  end;
 
   if gFailLogDir = '' then
     gFailLogDir := IncludeTrailingPathDelimiter(gBinDir) + 'tcl-failure-logs';
