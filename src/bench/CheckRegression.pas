@@ -588,11 +588,23 @@ begin
       Continue;
     end;
 
-    { Sub-resolution timer noise filter: per-case cells where the baseline
-      pas_ms < 10 AND c_ms < 10 are dominated by GetTickCount64 quantisation
-      (typically 1ms-grained); skip them rather than fail on noise.  Does
-      not apply to WALL_TOTAL cells. }
-    if (not isWallTotal) and (c.PasMs < 10.0) and (c.CMs < 10.0) then
+    { Sub-resolution timer noise filter: cells where EITHER the baseline OR
+      the new run is dominated by 1ms-grained GetTickCount64 quantisation
+      are reported as NOISE rather than FAIL.  Threshold raised from 10 ms
+      to 25 ms — a 10 ms measurement has +/-10% intrinsic noise per side
+      (combined ratio swing ~20%); 25 ms drops that to <=4%.  Does not
+      apply to WALL_TOTAL cells.  Cells still failing past this filter are
+      gated by REGRESSION_THRESHOLD_PCT (see check_regression.sh + tasklist
+      11.7 for the size=1 noise rationale that picks the threshold). }
+    pasMsNew := 0; cMsNew := 0;
+    if not isWallTotal then
+    begin
+      pasMsNew := runs[runIdx].Parsed[idx].PasMs;
+      cMsNew := runs[runIdx].Parsed[idx].CMs;
+    end;
+    if (not isWallTotal) and
+       (((c.PasMs < 25.0) and (c.CMs < 25.0)) or
+        ((pasMsNew < 25.0) and (cMsNew < 25.0))) then
     begin
       Writeln(Format('%-12s  %-44s  %-6s  %8.2f  %8.2f  %7s',
         [c.Testset, Copy(Format('%s(%d)', [c.Label_, c.CaseId]), 1, 44),
