@@ -61837,12 +61837,20 @@ var
   addrBloom:   i32;
   regBloom:    i32;
   pOpRef:      PVdbeOp;
+  pCoroSrc:    PSrcItem;       { 9.4.divbug.78 }
+  addrCoroYield: i32;
+  rCoroBase, rCoroRec, iCoro: i32;
 begin
   v := pParse^.pVdbe;
   Assert(v <> nil);
   if v = nil then Exit;
 
   addrOnce := 0;
+  pCoroSrc := nil;
+  addrCoroYield := 0;
+  rCoroBase := 0;
+  rCoroRec := 0;
+  iCoro := 0;
 
   { Wrap in a Once-gated subroutine when neither EP_VarSelect nor a CHECK
     constraint context (iSelfTab) forces re-evaluation per row. }
@@ -61890,12 +61898,68 @@ begin
         addrBloom := sqlite3VdbeAddOp2(v, OP_Blob, 10000, regBloom);
         destSet.iSDParm2 := regBloom;
       end;
-      pCopy := sqlite3SelectDup(pParse^.db, pSel, 0);
-      if pParse^.db^.mallocFailed <> 0 then
-        rcSelect := 1
-      else
-        rcSelect := sqlite3Select(pParse, pCopy, @destSet);
-      sqlite3SelectDelete(pParse^.db, pCopy);
+      { 9.4.divbug.78 — multi-VALUES wrapper fast path.  When pSel is
+        the wrapper produced by sqlite3MultiValues (pSrc[0] carries
+        SRCITEM_FG_VIA_COROUTINE; the coroutine body was already emitted
+        during parse and addresses are stashed on pSubq), the recursive
+        sqlite3SelectDup+sqlite3Select would walk only the residual
+        single-row pLeft (the C parser stripped the rest off when
+        attaching the coroutine), yielding just one row into iTab.  C
+        select.c handles this by recognising viaCoroutine in WhereBegin
+        and emitting OP_InitCoroutine + per-row OP_Yield drain that
+        feeds SRT_Set.  Reproduce that shape directly here: re-prime the
+        existing coroutine and drain it into the eph cursor opened by
+        the OP_OpenEphemeral above, mirroring the C 3.53 layout
+        addrs 17..26 for `WHERE c IN (VALUES(x),(y),...)`. }
+      rcSelect := -1;
+      if (pSel^.pSrc <> nil) and (pSel^.pSrc^.nSrc = 1) then
+      begin
+        pCoroSrc := SrcListItems(pSel^.pSrc);
+        if ((pCoroSrc^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0)
+           and (pCoroSrc^.u4.pSubq <> nil)
+           and (pCoroSrc^.u4.pSubq^.regReturn <> 0)
+           and (pCoroSrc^.u4.pSubq^.regResult <> 0)
+           and (pCoroSrc^.u4.pSubq^.addrFillSub > 0) then
+        begin
+          { Emit "SCAN N-ROW VALUES CLAUSE" explain narrator at the
+            destination (mirrors select.c viaCoroutine handling). }
+          sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+            pCoroSrc^.u4.pSubq^.regReturn, 0,
+            pCoroSrc^.u4.pSubq^.addrFillSub);
+          addrCoroYield := sqlite3VdbeAddOp2(v, OP_Yield,
+            pCoroSrc^.u4.pSubq^.regReturn, 0);
+          { Copy the coroutine result block to a fresh contiguous block
+            so OP_MakeRecord can apply the per-column affinity safely
+            without mutating the coroutine's regResult slots. }
+          rCoroBase := pParse^.nMem + 1;
+          pParse^.nMem := pParse^.nMem + nVal;
+          for iCoro := 0 to nVal - 1 do
+            sqlite3VdbeAddOp2(v, OP_Copy,
+              pCoroSrc^.u4.pSubq^.regResult + iCoro,
+              rCoroBase + iCoro);
+          rCoroRec := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp4(v, OP_MakeRecord, rCoroBase, nVal, rCoroRec,
+            destSet.zAffSdst, nVal);
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iTab, rCoroRec,
+            rCoroBase, nVal);
+          if destSet.iSDParm2 <> 0 then
+            sqlite3VdbeAddOp4Int(v, OP_FilterAdd, destSet.iSDParm2, 0,
+              rCoroBase, nVal);
+          sqlite3ReleaseTempReg(pParse, rCoroRec);
+          sqlite3VdbeAddOp2(v, OP_Goto, 0, addrCoroYield);
+          sqlite3VdbeJumpHere(v, addrCoroYield);
+          rcSelect := 0;
+        end;
+      end;
+      if rcSelect = -1 then
+      begin
+        pCopy := sqlite3SelectDup(pParse^.db, pSel, 0);
+        if pParse^.db^.mallocFailed <> 0 then
+          rcSelect := 1
+        else
+          rcSelect := sqlite3Select(pParse, pCopy, @destSet);
+        sqlite3SelectDelete(pParse^.db, pCopy);
+      end;
       sqlite3DbFree(pParse^.db, destSet.zAffSdst);
       if addrBloom <> 0 then
       begin
