@@ -10042,6 +10042,17 @@ begin
       P1=db-index, P2=wrflag(0=read,1=write,2=exclusive), P3=cookie, P4=gen, P5=scheckflag }
     OP_Transaction: begin
       iMeta5g := 0;
+      { vdbe.c:4113..4123 — PRAGMA query_only / prior CORRUPT in txn
+        prohibit a write-transaction open. }
+      if (pOp^.p2 <> 0) and
+         ((db^.flags and (SQLITE_QueryOnly or SQLITE_CorruptRdOnly)) <> 0) then
+      begin
+        if (db^.flags and SQLITE_QueryOnly) <> 0 then
+          rc := SQLITE_READONLY
+        else
+          rc := SQLITE_CORRUPT;
+        goto abort_due_to_error;
+      end;
       if pOp^.p1 >= 0 then begin
         pDbb := @db^.aDb[pOp^.p1];
         pX   := PBtree(pDbb^.pBt);
