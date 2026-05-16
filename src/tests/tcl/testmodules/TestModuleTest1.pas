@@ -41,6 +41,7 @@ uses
   passqlite3backup,
   passqlite3codegen,
   passqlite3ieee754,
+  passqlite3regexp,
   passqlite3main;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -459,12 +460,22 @@ begin
     SQLITE_UTF8, nil, @real2hex, nil, nil);
 end;
 
+{ regexp — already-ported passqlite3regexp unit (ext/misc/regexp.c).
+  Wrapped to the C extension-init ABI for load_static_extension.
+  Needed by regexp1.test/regexp2.test which load it explicitly.
+  9.4.divbug.66. }
+function regexp_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3RegexpInit(db);
+end;
+
 function tclLoadStaticExtensionCmd(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
 const
   SQLITE_OK_LOAD_PERMANENTLY = 256;  { sqlite3.h — SQLITE_OK | (8<<8) }
 var
-  aExtension: array[0..1] of TStaticExt;
+  aExtension: array[0..2] of TStaticExt;
   db:         PTsqlite3;
   zName:      PAnsiChar;
   i, j, rc:   cint;
@@ -472,6 +483,7 @@ var
 begin
   aExtension[0].zExtName := 'ieee754';  aExtension[0].pInit := @ieee754_ext_init;
   aExtension[1].zExtName := 'real2hex'; aExtension[1].pInit := @realhex_ext_init;
+  aExtension[2].zExtName := 'regexp';   aExtension[2].pInit := @regexp_ext_init;
   zErrMsg := nil;
   if objc < 3 then
   begin

@@ -1155,6 +1155,14 @@ proc do_faultsim_test {name args} {
   }
 }
 
+# Install the test scalar UDFs (randstr, test_*, real2hex, ...) as an
+# auto-extension so every freshly-opened connection picks them up.
+# Mirrors upstream tester.tcl:512 (one-shot at shim load).  Without this,
+# tests like tkt3918.test fail with `no such function: randstr` because
+# the auto-extension is only otherwise registered inside
+# test_set_config_pagecache.  9.4.divbug.66.
+catch { autoinstall_test_functions }
+
 # Open `db` on a fresh on-disk ./test.db at shim load time, mirroring
 # upstream tester.tcl:553..556.  The driver no longer issues its own
 # `sqlite3 db :memory:`.
