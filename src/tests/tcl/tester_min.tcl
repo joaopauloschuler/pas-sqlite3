@@ -687,6 +687,13 @@ proc reset_db {} {
   forcedelete test.db-shm
   sqlite3 db ./test.db
   set ::DB [sqlite3_connection_pointer db]
+  # 9.4.7.e: apply the active permutation's presql (e.g. PRAGMA journal_mode=WAL)
+  # after each fresh handle.  When no --permutation is active, [presql] returns
+  # "" and this is a no-op.  C ref: tester.tcl:557..560 (sqlitetest_init).
+  set __presql [presql]
+  if {$__presql ne ""} {
+    catch { db eval $__presql }
+  }
 }
 
 # query_plan_graph — upstream tester.tcl:990..1001.  Renders the

@@ -41,6 +41,22 @@
                           in src/tests/tcl/STATUS.txt; exit non-zero
                           if any pas-strict row regressed to FAIL.
                           Mirrors check_status_regression.sh inline.
+      --permutation NAME  (9.4.7.e) apply a named permutation (a runtime
+                          pragma or pre-built .so) to every test in the
+                          run.  Recognised names (first cut):
+                            wal                journal_mode=WAL
+                            inmemory_journal   journal_mode=MEMORY
+                            persistent_journal journal_mode=PERSIST
+                            truncate_journal   journal_mode=TRUNCATE
+                            no_journal         journal_mode=OFF
+                            exclusive          locking_mode=EXCLUSIVE
+                            exclusive-truncate locking_mode=EXCLUSIVE +
+                                               journal_mode=TRUNCATE
+                            utf16              encoding='UTF-16'
+                            serialized         alias for --build threadsafe
+                            multithread        alias for --build threadsafe
+                          See src/tests/tcl/PERMUTATIONS.md for the full
+                          taxonomy + which permutations are deferred.
       --jobs N            (9.4.7.g) fan out N tclsh processes in
                           parallel (default 1 = legacy serial path).
                           Sharding (--shard I/N) is applied first,
@@ -143,6 +159,8 @@ var
   gShardN     : Integer = -1;
   gJobs       : Integer = 1;        { 9.4.7.g — parallel worker count, 1 = serial }
   gBuildProf  : string  = '';       { 9.4.7.i — '' = default .so via pkgIndex }
+  gPermName   : string  = '';       { 9.4.7.e — '' = no permutation (baseline) }
+  gPermPresql : string  = '';       { 9.4.7.e — pragma string applied in reset_db }
   gFailLogDir : string  = '';       { 9.4.5.c — empty = default <bin>/tcl-failure-logs }
   gGateStrict : Boolean = False;    { 9.4.8.c — strict gate on STATUS.txt pas-strict rows }
   gCoverage   : Boolean = False;    { 9.4.8.d — opcode coverage harvest }
@@ -189,6 +207,71 @@ begin
   end;
 end;
 
+{----------------------------------------------------------------------------
+  9.4.7.e — permutation table.  Maps a permutation NAME to:
+    * a presql pragma string (applied by reset_db in tester_min.tcl), AND
+    * optionally a build profile alias (e.g. 'serialized' → 'threadsafe').
+
+  C ref: sqlite3/test/permutations.test test_suite blocks.  Only the
+  cleanest runtime-pragma / pre-built-.so permutations are wired in this
+  first cut — the full ~30-permutation matrix (memsubsys1/2, memsys3/5,
+  nofaultsim, journaltest, ...) is queued as a follow-up.
+
+  Permutations whose -initialize block calls sqlite3_config_* (singlethread,
+  multithread, fullmutex, memsys3, memsys5, nolookaside, ...) require
+  test_malloc/test_config Tcl commands we don't yet expose; those are
+  deferred.  Permutations whose -presql is a single PRAGMA chain are wired
+  here because reset_db can run them verbatim.
+----------------------------------------------------------------------------}
+type
+  TPermSpec = record
+    Name    : string;     { permutation alias, lowercase }
+    Presql  : string;     { SQL applied by reset_db; empty = none }
+    Build   : string;     { build profile alias; empty = no override }
+    CRef    : string;     { upstream test_suite line in permutations.test }
+  end;
+const
+  PERMUTATIONS: array[0..9] of TPermSpec = (
+    (Name: 'wal';                Presql: 'PRAGMA journal_mode=WAL;';
+     Build: ''; CRef: 'permutations.test:1019'),
+    (Name: 'inmemory_journal';   Presql: 'PRAGMA journal_mode=MEMORY;';
+     Build: ''; CRef: 'permutations.test:774'),
+    (Name: 'persistent_journal'; Presql: 'PRAGMA journal_mode=PERSIST;';
+     Build: ''; CRef: 'permutations.test:704'),
+    (Name: 'truncate_journal';   Presql: 'PRAGMA journal_mode=TRUNCATE;';
+     Build: ''; CRef: 'permutations.test:715'),
+    (Name: 'no_journal';         Presql: 'PRAGMA journal_mode=OFF;';
+     Build: ''; CRef: 'permutations.test:737'),
+    (Name: 'exclusive';          Presql: 'PRAGMA locking_mode=EXCLUSIVE;';
+     Build: ''; CRef: 'permutations.test:681'),
+    (Name: 'exclusive-truncate';
+     Presql: 'PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=TRUNCATE;';
+     Build: ''; CRef: 'permutations.test:692'),
+    (Name: 'utf16';              Presql: 'PRAGMA encoding=''UTF-16'';';
+     Build: ''; CRef: 'permutations.test:655'),
+    (Name: 'serialized';         Presql: '';
+     Build: 'threadsafe'; CRef: 'permutations.test:578 (alias)'),
+    (Name: 'multithread';        Presql: '';
+     Build: 'threadsafe'; CRef: 'permutations.test:610 (alias)')
+  );
+
+function ResolvePermutation(const name: string; out presql, build: string): Boolean;
+var
+  i: Integer;
+  lname: string;
+begin
+  presql := ''; build := '';
+  lname := LowerCase(Trim(name));
+  if lname = '' then Exit(False);
+  for i := Low(PERMUTATIONS) to High(PERMUTATIONS) do
+    if PERMUTATIONS[i].Name = lname then begin
+      presql := PERMUTATIONS[i].Presql;
+      build  := PERMUTATIONS[i].Build;
+      Exit(True);
+    end;
+  Result := False;
+end;
+
 procedure ParseShardSpec(const spec: string);
 var
   slash: Integer;
@@ -227,6 +310,9 @@ begin
     end else if a = '--build' then begin
       Inc(i); gBuildProf := LowerCase(Trim(ParamStr(i)));
       if gBuildProf = 'default' then gBuildProf := '';
+    end else if a = '--permutation' then begin
+      Inc(i); gPermName := LowerCase(Trim(ParamStr(i)));
+      if gPermName = 'baseline' then gPermName := '';
     end else if a = '--fail-log-dir' then begin
       Inc(i); gFailLogDir := ExpandFileName(ParamStr(i));
     end else if a = '--gate' then begin
@@ -294,6 +380,15 @@ begin
       the interpreter's current working directory (which 9.4.7.f changes to
       a per-test tmpdir).  Brace-quoted to survive spaces in the path. }
     sb.Add('set ::testdir {' + gTclDir + '}');
+    { 9.4.7.e: seed ::G(perm:name) / ::G(perm:presql) BEFORE sourcing
+      tester_min.tcl, so the very first reset_db (the one at the bottom
+      of tester_min.tcl that opens ./test.db) already applies the perm
+      pragma chain. }
+    if gPermName <> '' then begin
+      sb.Add('set ::G(perm:name) {' + gPermName + '}');
+      if gPermPresql <> '' then
+        sb.Add('set ::G(perm:presql) {' + gPermPresql + '}');
+    end;
     sb.Add('source $::testdir/tester_min.tcl');
     { 9.4.4.a: monkey-patch [source] so upstream .test files that begin with
       `source $testdir/tester.tcl` transparently re-route to our tester_min
@@ -1172,6 +1267,32 @@ begin
   gManifest := IncludeTrailingPathDelimiter(gTclDir) + 'MANIFEST.txt';
 
   ParseArgs;
+
+  { 9.4.7.e — resolve --permutation NAME to a presql pragma string and
+    (optionally) a build-profile alias.  An unrecognised name aborts the
+    run with the list of wired permutations so CI doesn't silently skip a
+    typo'd permutation.  When a permutation forces a build profile
+    (e.g. 'serialized' → 'threadsafe'), an explicit --build must not
+    contradict it. }
+  if gPermName <> '' then begin
+    if not ResolvePermutation(gPermName, gPermPresql, p) then begin
+      Writeln(StdErr, 'TclTestDriver: unknown --permutation ', gPermName);
+      Writeln(StdErr, '  wired permutations:');
+      for i := Low(PERMUTATIONS) to High(PERMUTATIONS) do
+        Writeln(StdErr, '    ', PERMUTATIONS[i].Name);
+      Halt(2);
+    end;
+    if p <> '' then begin
+      if (gBuildProf <> '') and (gBuildProf <> p) then begin
+        Writeln(StdErr, 'TclTestDriver: --permutation ', gPermName,
+                ' forces --build ', p, ' but ', gBuildProf, ' was passed');
+        Halt(2);
+      end;
+      gBuildProf := p;
+    end;
+    Writeln(StdErr, 'TclTestDriver: --permutation ', gPermName,
+            ' presql=', gPermPresql, ' build=', gBuildProf);
+  end;
 
   { 9.4.7.i — --build PROFILE remaps gSoPath to libpassqlite3tcl-<profile>.so.
     BuildScript will skip the pkgIndex.tcl path when gBuildProf<>'' so the
