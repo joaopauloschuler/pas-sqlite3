@@ -10,15 +10,15 @@ belongs to Phase 6 / 7 / 8 follow-ups.  Format:
     Symptom: ...
     Likely cause: ...
 
-## 9.4.divbug.1 — `select1.test` segfaults inside libpassqlite3tcl.so — FIXED
-## 9.4.divbug.2 — Truncated SQL error messages drop the function name — FIXED
-## 9.4.divbug.3 — Schema introspection result columns reordered / missing — FIXED
-## 9.4.divbug.4 — auto-index name collision yields `out of memory` — FIXED
-## 9.4.divbug.5 — UTF-16 numcast (`numcast-utf16*`) returns empty string — FIXED
-## 9.4.divbug.7 — `insert.test` wedges past `insert-1.3` — FIXED (9.4.divbug.7)
-## 9.4.divbug.8 — `index.test` segfaults at `index-3.3` — FIXED
-## 9.4.divbug.9 — `lastinsert.test` segfaults at `lastinsert-1.1w` — FIXED
-## 9.4.divbug.10 — `boundary1.test` empty results — FIXED
+- [X] ## 9.4.divbug.1 — `select1.test` segfaults inside libpassqlite3tcl.so — FIXED
+- [X] ## 9.4.divbug.2 — Truncated SQL error messages drop the function name — FIXED
+- [X] ## 9.4.divbug.3 — Schema introspection result columns reordered / missing — FIXED
+- [X] ## 9.4.divbug.4 — auto-index name collision yields `out of memory` — FIXED
+- [X] ## 9.4.divbug.5 — UTF-16 numcast (`numcast-utf16*`) returns empty string — FIXED
+- [X] ## 9.4.divbug.7 — `insert.test` wedges past `insert-1.3` — FIXED (9.4.divbug.7)
+- [X] ## 9.4.divbug.8 — `index.test` segfaults at `index-3.3` — FIXED
+- [X] ## 9.4.divbug.9 — `lastinsert.test` segfaults at `lastinsert-1.1w` — FIXED
+- [X] ## 9.4.divbug.10 — `boundary1.test` empty results — FIXED
 ## Run summary (9.4.4.a sweep)
 
 10 tests swept via `bin/TclTestDriver` after the
@@ -81,17 +81,17 @@ lastinsert), which in turn exposes four new engine divergences
 (divbug.7..10).  The two unchanged FAIL buckets (numcast,
 delete-ish remaining) remain on divbug.5 and missing `db one`.
 
-## 9.4.divbug.11 — `multiSelectByMerge: iOrderByCol<=0` assert (compound SELECT ORDER BY) — FIXED
-## 9.4.divbug.12 — `update.test` segfaults at `update-17.10` — FIXED
-## 9.4.divbug.13 — Result-set row ORDER for inequality scans is unstable — FIXED
-## 9.4.divbug.14 — SQL error messages still drop the object name — FIXED
-## 9.4.divbug.15 — `no such function` not raised at prepare time — FIXED
-## 9.4.divbug.16 — `affinity3.test` segfaults — FIXED
-## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — FIXED
-## 9.4.divbug.18 — WITHOUT ROWID virtual-table xUpdate codegen mis-handles DELETE (no-op) and UPDATE (segfault) — FIXED
+- [X] ## 9.4.divbug.11 — `multiSelectByMerge: iOrderByCol<=0` assert (compound SELECT ORDER BY) — FIXED
+- [X] ## 9.4.divbug.12 — `update.test` segfaults at `update-17.10` — FIXED
+- [X] ## 9.4.divbug.13 — Result-set row ORDER for inequality scans is unstable — FIXED
+- [X] ## 9.4.divbug.14 — SQL error messages still drop the object name — FIXED
+- [X] ## 9.4.divbug.15 — `no such function` not raised at prepare time — FIXED
+- [X] ## 9.4.divbug.16 — `affinity3.test` segfaults — FIXED
+- [X] ## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — FIXED
+- [X] ## 9.4.divbug.18 — WITHOUT ROWID virtual-table xUpdate codegen mis-handles DELETE (no-op) and UPDATE (segfault) — FIXED
 ### 9.4.6.q follow-up — test1.c command subset ported
 ### 9.4.6.l.5 follow-up — `register_async_vtab` investigated → drop the bullet
-## 9.4.divbug.19 — table-qualified `rowid` alias not resolved
+- [X] ## 9.4.divbug.19 — table-qualified `rowid` alias not resolved — FIXED (tasklist.md:954, commit 3fd04ef)
 
 Affects: 2 tests (`../sqlite3/test/boundary3.test`,
 `../sqlite3/test/autoindex5.test`).
@@ -109,7 +109,7 @@ cases the bare-identifier path.  A `Tab.rowid` term therefore falls
 through to the ordinary column lookup, which fails.
 Surfaced by: 9.4.4.d sweep.
 
-## 9.4.divbug.20 — BETWEEN-on-indexed-column planner picks `nosort` / drops rows
+- [X] ## 9.4.divbug.20 — BETWEEN-on-indexed-column planner picks `nosort` / drops rows — FIXED (tasklist.md:955, commits 2f8d92a/d7ceaf3/5dba89a)
 
 Affects: 1 test (`../sqlite3/test/between.test`, 13/22 sub-tests).
 Symptom: `between-1.x` EXPLAIN-style assertions expect `sort t1 i1w`
@@ -124,7 +124,7 @@ range-pair bounds appear to exclude valid rows.  Two related symptoms
 under one BETWEEN-codegen root.
 Surfaced by: 9.4.4.d sweep.
 
-## 9.4.divbug.21 — cross-connection EXCLUSIVE lock not detected
+- [X] ## 9.4.divbug.21 — cross-connection EXCLUSIVE lock not detected — FIXED (tasklist.md:956, commits 45593de/a8e63c3)
 
 Affects: 1 test (`../sqlite3/test/busy.test`).
 Symptom: with `db2` holding `BEGIN EXCLUSIVE` on `test.db`, a
@@ -140,7 +140,7 @@ is correctly wired (`DbBusyArm` / `sqlite3_busy_handler`) — the gap
 is in lock detection, not the Tcl shim.
 Surfaced by: 9.4.4.d sweep.
 
-## 9.4.divbug.22 — large row payload / 64KB page_size overflow handling segfaults
+- [X] ## 9.4.divbug.22 — large row payload / 64KB page_size overflow handling segfaults — FIXED (tasklist.md:957, commits 45a1fbb/9744b0f)
 
 Affects: 2 tests (`../sqlite3/test/bigrow.test`,
 `../sqlite3/test/btree01.test`).
@@ -156,7 +156,7 @@ when `page_size == 65536` (the only power-of-two page size that does
 not fit a `u16`).  Needs Phase 7/8 b-tree follow-up.
 Surfaced by: 9.4.4.d sweep.
 
-## 9.4.divbug.23 — co-routine materialisation of correlated subquery not chosen (EXPLAIN QUERY PLAN drift)
+- [X] ## 9.4.divbug.23 — co-routine materialisation of correlated subquery not chosen (EXPLAIN QUERY PLAN drift) — FIXED (tasklist.md:958)
 
 Affects: 1 test (`../sqlite3/test/autoindex3.test`, `autoindex3-310`).
 Symptom: upstream's EQP for the query is a `CO-ROUTINE children`
@@ -171,8 +171,8 @@ is a plan-shape divergence; the query still returns correct rows, so
 the impact is limited to EQP-asserting tests.
 Surfaced by: 9.4.4.d sweep.
 
-## 9.4.divbug.24 — AUTOINCREMENT / `sqlite_sequence` double-create — FIXED
-## 9.4.divbug.24.b — aggregate sub-query in correlated GROUP BY mis-folds + segfault
+- [X] ## 9.4.divbug.24 — AUTOINCREMENT / `sqlite_sequence` double-create — FIXED
+- [X] ## 9.4.divbug.24.b — aggregate sub-query in correlated GROUP BY mis-folds + segfault — FIXED (tasklist.md:960)
 
 Affects: `../sqlite3/test/aggnested.test` `aggnested-3.1` (after .24
 fix, returns 4 rows `{1 1 1 1}` instead of `{1 1}`), `aggnested-3.2`
@@ -295,11 +295,11 @@ unblock the whole `corrupt*` family for triage.
 
 Newly assigned engine divbug clusters:
 
-## 9.4.divbug.28 — EXPLAIN QUERY PLAN multi-table segfault — FIXED
-## 9.4.divbug.41 — EQP "TEMP B-TREE FOR ORDER BY" omits LAST-N-TERMS — FIXED
-## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER — FIXED
-## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders — FIXED
-## 9.4.divbug.31 — Spurious `database disk image is malformed` for non-corrupt errors
+- [X] ## 9.4.divbug.28 — EXPLAIN QUERY PLAN multi-table segfault — FIXED
+- [X] ## 9.4.divbug.41 — EQP "TEMP B-TREE FOR ORDER BY" omits LAST-N-TERMS — FIXED
+- [X] ## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER — FIXED
+- [X] ## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders — FIXED
+- [X] ## 9.4.divbug.31 — Spurious `database disk image is malformed` for non-corrupt errors — FIXED (tasklist.md:968)
 
 Affects: 2 tests (`collate3.test`, `count.test`).  Symptom:
 `SELECT … COLLATE caseless` where `caseless` is not registered should
@@ -313,7 +313,7 @@ through `SQLITE_CORRUPT` somewhere upstream of `setErrorMsg`.  Check
 `sqlite3LocateCollSeq` / `sqlite3CheckCollSeq` return-path.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.32 — readonly DB write returns `unknown error`
+- [X] ## 9.4.divbug.32 — readonly DB write returns `unknown error`
 
 Affects: 1 test (`delete.test`, delete-8.x; same shape may show in
 backup/io tests once their harness lands).
@@ -325,7 +325,7 @@ without the corresponding error-message lookup table being primed
 C reference: main.c `sqlite3ErrStr`, btreeBeginTrans RO arm.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.33 — `count(DISTINCT …)` wrong result
+- [X] ## 9.4.divbug.33 — `count(DISTINCT …)` wrong result
 
 Affects: 1 test (`distinctagg.test`, distinctagg-3.x).
 Symptom: `SELECT count(DISTINCT …)` returns 1 where upstream returns 0
@@ -335,10 +335,10 @@ NULL gate fires).  C reference: func.c `countStep` distinct path,
 select.c `updateAccumulator` DISTINCT loop.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.34 — `PRAGMA page_size` default mismatch — RESOLVED
-## 9.4.divbug.35 — Float-to-text precision artifacts — FIXED
-## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored — FIXED
-## 9.4.divbug.37 — WAL `wal_hook` callback count = 0
+- [X] ## 9.4.divbug.34 — `PRAGMA page_size` default mismatch — RESOLVED
+- [X] ## 9.4.divbug.35 — Float-to-text precision artifacts — FIXED
+- [X] ## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored — FIXED
+- [X] ## 9.4.divbug.37 — WAL `wal_hook` callback count = 0
 
 Affects: 1 test (`e_walhook.test`, e_walhook-1.3+).
 Symptom: after `db wal_hook { … }` is set and the connection commits a
@@ -349,7 +349,7 @@ WAL frame-count argument arrives 0 (the test checks
 `sqlite3WalCallback` / pager.c walCommit invocation point.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.38 — FK ON-clause syntax error not raised + row mis-pick
+- [X] ## 9.4.divbug.38 — FK ON-clause syntax error not raised + row mis-pick — FIXED (tasklist.md:975-976, split into 38.a/38.b)
 
 Affects: 1 test (`e_fkey.test`, e_fkey-2.1 / 3.1).
 Symptom: e_fkey-3.1 expects `near "ON": syntax error` for malformed
@@ -360,8 +360,8 @@ C reference: parse.y refargs grammar; fkey.c
 `sqlite3FkActionTrigger`.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.39 — `CREATE TABLE AS SELECT` unsupported — FIXED
-## 9.4.divbug.40 — `DEFAULT` literal type + error-msg column-name drop
+- [X] ## 9.4.divbug.39 — `CREATE TABLE AS SELECT` unsupported — FIXED
+- [X] ## 9.4.divbug.40 — `DEFAULT` literal type + error-msg column-name drop
 
 Affects: 1 test (`default.test`, default-1.3, default-3.1).
 Symptom: default-1.3 expected
