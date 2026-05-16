@@ -3670,6 +3670,12 @@ var
   pCellBody     : Pu8;
   nOverrun      : i32;
   bOvfl         : Boolean;
+  { 12.2.candidate.3: cache hot pPage^ fields in locals; refreshed each
+    outer iteration immediately after pPage := pCur^.pPage. }
+  aData   : Pu8;
+  aDataO  : Pu8;
+  aCellI  : Pu8;
+  mskPage : u16;
 label
   bypass_moveto_root, moveto_index_finish;
 begin
@@ -3737,12 +3743,18 @@ bypass_moveto_root:
   c := 0;
   while True do begin
     pPage := pCur^.pPage;
+    { Refresh cached locals — pPage may change when descending into a child. }
+    aData   := pPage^.aData;
+    aDataO  := pPage^.aDataOfst;
+    aCellI  := pPage^.aCellIdx;
+    mskPage := pPage^.maskPage;
     lwr := 0;
     upr := pPage^.nCell - 1;
     idx := upr shr 1;
 
     while True do begin
-      pCell := findCellPastPtr(pPage, idx);
+      { Inlined findCellPastPtr(pPage, idx) using cached locals. }
+      pCell := aDataO + (mskPage and u16(get2byteAligned(aCellI + 2*idx)));
       nCell := pCell[0];
       bOvfl := False;
       if nCell <= pPage^.max1bytePayload then begin
@@ -3804,9 +3816,10 @@ bypass_moveto_root:
     end;
 
     if lwr >= pPage^.nCell then
-      chldPg := get4byte(pPage^.aData + pPage^.hdrOffset + 8)
+      chldPg := get4byte(aData + pPage^.hdrOffset + 8)
     else
-      chldPg := get4byte(findCell(pPage, lwr));
+      { Inlined findCell(pPage, lwr) using cached locals. }
+      chldPg := get4byte(aData + (mskPage and u16(get2byteAligned(aCellI + 2*lwr))));
 
     pCur^.info.nSize := 0;
     pCur^.curFlags := pCur^.curFlags and (not (BTCF_ValidNKey or BTCF_ValidOvfl));
