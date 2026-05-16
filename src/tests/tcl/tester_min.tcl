@@ -1186,6 +1186,96 @@ proc faultsim_test_result {args} {
   uplevel faultsim_test_result_int $args [list {0 {}}]
 }
 
+# 9.4.divbug.63.b — test_binary_name / test_find_binary / test_find_cli /
+# test_cli_invocation / test_find_sqldiff.  Verbatim ports of
+# tester.tcl:2529..2596.  shell*.test and sqldiff*.test call these to
+# locate the on-disk CLI binary; if missing they `finish_test ; return`
+# in the caller's context (via `return -code return`).  pas-sqlite3 builds
+# its CLI at bin/passqlite3 — but we leave the upstream lookup verbatim
+# so .test files transparently skip when the upstream name isn't present
+# on PATH.  Individual tests may override these procs to point at our
+# binary if/when wired.  Engine FCNTL/test1.c file_control_reservebytes
+# is paired with this in TestModuleTest1.pas (test1.c:9258 / 7249..7276).
+proc test_binary_name {nm} {
+  if {$::tcl_platform(platform) eq "windows"} {
+    set ret "$nm.exe"
+  } else {
+    set ret $nm
+  }
+  if {[info exists ::cmdlinearg(TESTFIXTURE_HOME)]} {
+    file normalize [file join $::cmdlinearg(TESTFIXTURE_HOME) $ret]
+  } else {
+    file normalize $ret
+  }
+}
+proc test_find_binary {nm} {
+  set ret [test_binary_name $nm]
+  if {![file executable $ret]} {
+    finish_test
+    return ""
+  }
+  return $ret
+}
+proc test_find_cli {} {
+  set prog [test_find_binary sqlite3]
+  if {$prog==""} { return -code return }
+  return $prog
+}
+proc test_cli_invocation {} {
+  set prog [test_find_binary sqlite3]
+  if {$prog==""} { return -code return }
+  set vgrun [expr {[permutation]=="valgrind"}]
+  if {$vgrun || [info exists ::env(SQLITE_CLI_VALGRIND_OPT)]} {
+    if {$vgrun} {
+      set vgo "--quiet"
+    } else {
+      set vgo $::env(SQLITE_CLI_VALGRIND_OPT)
+    }
+    if {$vgo == 0 || $vgo eq ""} {
+      return $prog
+    } elseif {$vgo == 1} {
+      return "valgrind --quiet --leak-check=yes $prog"
+    } else {
+      return "valgrind $vgo $prog"
+    }
+  } else {
+    return $prog
+  }
+}
+proc test_find_sqldiff {} {
+  set prog [test_find_binary sqldiff]
+  if {$prog==""} { return -code return }
+  return $prog
+}
+
+# 9.4.divbug.63.b — run_thread_tests (thread_common.tcl:88..107).
+# Returns 1 iff this build can run the multi-threaded test arms; 0
+# otherwise (with a "WARNING: ..." note on stdout).  pas-sqlite3's
+# default build is not threadsafe (no `sqlthread` Tcl command is
+# registered — TestModuleSqlthread is not in build.sh), so the
+# `info commands sqlthread` arm fires and the predicate naturally
+# returns 0.  Verbatim port; tests gated on this take their skip arm.
+proc run_thread_tests {{print_warning 0}} {
+  ifcapable !mutex {
+    set zProblem "SQLite build is not threadsafe"
+  }
+  ifcapable mutex_noop {
+    set zProblem "SQLite build uses SQLITE_MUTEX_NOOP"
+  }
+  if {[info commands sqlthread] eq ""} {
+    set zProblem "SQLite build is not threadsafe"
+  }
+  if {![tcl::pkgconfig get threaded]} {
+    set zProblem "Linked against a non-threadsafe Tcl build"
+  }
+  if {[info exists zProblem]} {
+    puts "WARNING: Multi-threaded tests skipped: $zProblem"
+    return 0
+  }
+  set ::run_thread_tests_called 1
+  return 1
+}
+
 # Install the test scalar UDFs (randstr, test_*, real2hex, ...) as an
 # auto-extension so every freshly-opened connection picks them up.
 # Mirrors upstream tester.tcl:512 (one-shot at shim load).  Without this,
