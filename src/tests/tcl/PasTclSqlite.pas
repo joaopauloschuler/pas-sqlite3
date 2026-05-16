@@ -1108,15 +1108,15 @@ begin
         Tcl_ObjSetVar2(interp, pVarName, pColName, pColVal, 0);
     end;
 
-    if DbUseNre then
-    begin
-      Tcl_NRAddCallback(interp, TTclNRPostProc(@DbEvalNextCmd),
-        TClientData(p), TClientData(pScript), nil, nil);
-      Result := Tcl_NREvalObj(interp, pScript, 0);
-      Exit;
-    end
-    else
-      rc := Tcl_EvalObjEx(interp, pScript, 0);
+    { 9.4.divbug.28 — the NRE per-row continuation path crashes (Tcl
+      jumps to a stale function-pointer in TclNRRunCallbacks) once the
+      first row of any multi-row EXPLAIN QUERY PLAN / SELECT is consumed
+      from inside the script body.  Until the NRE plumbing is fully
+      audited (the comment block at DbObjCmdNRE flags this as a
+      follow-up to 9.4.2.x), evaluate the per-row script recursively —
+      this is upstream's !DbUseNre() branch (tclsqlite.c:1992) and
+      passes eqp2/cost/fordelete/delete2 cleanly. }
+    rc := Tcl_EvalObjEx(interp, pScript, 0);
   end;
 
   Tcl_DecrRefCount(pScript);

@@ -206,7 +206,7 @@ pas-soft	../sqlite3/test/corruptK.test	database_may_be_corrupt-unported
 pas-skip	../sqlite3/test/corruptL.test	unswept
 pas-soft	../sqlite3/test/corruptM.test	database_may_be_corrupt-unported
 pas-soft	../sqlite3/test/corruptN.test	database_may_be_corrupt-unported
-pas-soft	../sqlite3/test/cost.test	9.4.divbug.28
+pas-soft	../sqlite3/test/cost.test	9.4.divbug.41
 pas-soft	../sqlite3/test/count.test	9.4.divbug.31
 pas-skip	../sqlite3/test/countofview.test	unswept
 pas-skip	../sqlite3/test/coveridxscan.test	unswept
@@ -240,7 +240,7 @@ pas-skip	../sqlite3/test/dbstatus2.test	unswept
 pas-strict	../sqlite3/test/decimal.test	-
 pas-soft	../sqlite3/test/default.test	9.4.divbug.40
 pas-soft	../sqlite3/test/delete.test	9.4.divbug.32
-pas-soft	../sqlite3/test/delete2.test	9.4.divbug.28
+pas-soft	../sqlite3/test/delete2.test	9.4.divbug.41
 pas-strict	../sqlite3/test/delete3.test	-
 pas-soft	../sqlite3/test/delete4.test	sqlite3_step-unported
 pas-soft	../sqlite3/test/delete_db.test	sqlite3_delete_database-unported
@@ -282,7 +282,7 @@ pas-strict	../sqlite3/test/enc2.test	-
 pas-soft	../sqlite3/test/enc3.test	sqlite3_step-unported
 pas-strict	../sqlite3/test/enc4.test	-
 pas-skip	../sqlite3/test/eqp.test	unswept
-pas-soft	../sqlite3/test/eqp2.test	9.4.divbug.28
+pas-soft	../sqlite3/test/eqp2.test	9.4.divbug.41
 pas-soft	../sqlite3/test/errmsg.test	db-func-subcommand-unported
 pas-soft	../sqlite3/test/errofst1.test	9.4.divbug.39
 pas-soft	../sqlite3/test/eval.test	test_eval-func-unported
@@ -316,7 +316,7 @@ pas-skip	../sqlite3/test/fkey6.test	unswept
 pas-strict	../sqlite3/test/fkey7.test	-
 pas-strict	../sqlite3/test/fkey8.test	-
 pas-skip	../sqlite3/test/fkey_malloc.test	unswept
-pas-soft	../sqlite3/test/fordelete.test	9.4.divbug.28
+pas-soft	../sqlite3/test/fordelete.test	9.4.divbug.41
 pas-soft	../sqlite3/test/format4.test	9.4.divbug.34
 pas-soft	../sqlite3/test/fpconv1.test	9.4.divbug.35
 pas-strict	../sqlite3/test/fts-9fd058691.test	-

@@ -429,28 +429,37 @@ unblock the whole `corrupt*` family for triage.
 
 Newly assigned engine divbug clusters:
 
-## 9.4.divbug.28 — EXPLAIN QUERY PLAN multi-table segfault
+## 9.4.divbug.28 — EXPLAIN QUERY PLAN multi-table segfault — FIXED
 
-Affects: 4 tests (`eqp2.test`, `cost.test`, `fordelete.test`,
-`delete2.test`).
-Symptom: `EXPLAIN QUERY PLAN` on a query that touches two or more
-tables / indexes returns the first row correctly, then SIGSEGVs when
-the EQP cursor advances to subsequent rows.  Reproducer:
-```
-CREATE TABLE t3(id INTEGER PRIMARY KEY, b NOT NULL);
-CREATE TABLE t4(c, d, e);
-CREATE UNIQUE INDEX i3 ON t3(b);
-CREATE UNIQUE INDEX i4 ON t4(c, d);
-EXPLAIN QUERY PLAN SELECT e FROM t3, t4 WHERE b=c ORDER BY b, d;
-```
-First row (`SCAN t3 USING COVERING INDEX i3`) is emitted, then segfault.
-Likely cause: `sqlite3VdbeExplain` / `OP_Explain` formatter walks a
-parent/child id chain whose Pascal port doesn't terminate the
-`pParse->aExplain` array tail (or doesn't track `parent==0` sentinel
-correctly).  Probably a single missing termination in `addExplainTrace`
-or a stale `pNext` pointer after the first emit.  C reference:
-vdbe.c `OP_Explain` ~7100, vdbeaux.c `sqlite3VdbeExplain`.
-Surfaced by: 9.4.4.e sweep.
+Fixed by gating the NRE per-row continuation path in DbEvalNextCmd
+(PasTclSqlite.pas:1111..1120) — the Tcl_NRAddCallback +
+Tcl_NREvalObj loop was the root cause, not the engine.  Once the
+script body for the first row returned, Tcl's NRE trampoline
+jumped to a stale function-pointer (rip landed in the stack page
+0x7fffffffXXXX), crashing every multi-row `db eval $sql { ... }`
+that the upstream `query_plan_graph` helper depends on.  Per the
+follow-up note at PasTclSqlite.pas:4269..4274, the per-row body
+was always meant to evaluate on the !DbUseNre() recursive
+Tcl_EvalObjEx path until the NRE continuation machinery is fully
+audited; the broken NRE branch was hot only because 9.4.2.x.1.d
+also wrote the inline NRE arm.  Forcing the recursive arm restores
+upstream's pre-NRE behaviour (tclsqlite.c:1992).  Archive.
+Surviving divergence in the same 4 tests is the ORDER BY EQP
+detail text — Pas always emits "USE TEMP B-TREE FOR ORDER BY"
+where C emits "FOR LAST [N] TERMS OF ORDER BY" when nOBSat>0
+(select.c:1705..1709 vs codegen.pas:31665); tracked separately
+as 9.4.divbug.41 below.
+
+## 9.4.divbug.41 — EQP "TEMP B-TREE FOR ORDER BY" omits LAST-N-TERMS
+
+Affects: residual sub-tests of eqp2.test, cost.test, fordelete.test,
+delete2.test (post-9.4.divbug.28).
+Symptom: Pas emits `USE TEMP B-TREE FOR ORDER BY` where C emits
+`USE TEMP B-TREE FOR LAST TERM OF ORDER BY` (or
+`FOR LAST <n> TERMS OF ORDER BY` when nOBSat>0).
+Cause: codegen.pas:31663..31667 hard-codes the literal `'ORDER BY'`
+without consulting pSort->nOBSat / nKey.  Port the C arm from
+select.c:1704..1710.  Surfaced 9.4.divbug.28 archive.
 
 ## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER
 
