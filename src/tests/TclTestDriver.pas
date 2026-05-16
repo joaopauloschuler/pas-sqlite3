@@ -41,6 +41,13 @@
                           in src/tests/tcl/STATUS.txt; exit non-zero
                           if any pas-strict row regressed to FAIL.
                           Mirrors check_status_regression.sh inline.
+      --jobs N            (9.4.7.g) fan out N tclsh processes in
+                          parallel (default 1 = legacy serial path).
+                          Sharding (--shard I/N) is applied first,
+                          then this shard is processed by N workers.
+                          Output is buffered per-test and emitted in
+                          MANIFEST order so PASS/FAIL counts and the
+                          strict gate remain deterministic.
       --coverage          (9.4.8.d) opt-in opcode-coverage mode.
                           Injects pas_opcode_coverage_enable into the
                           child tclsh script, dumps per-test hit
@@ -59,7 +66,8 @@ program TclTestDriver;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, Process, Pipes;
+  {$IFDEF UNIX}cthreads,{$ENDIF}
+  SysUtils, Classes, Process, Pipes, SyncObjs;
 
 const
   PER_TEST_TIMEOUT_MS = 30000;
@@ -133,6 +141,7 @@ var
   gFilter     : string  = '';
   gShardI     : Integer = -1;       { 9.4.5.b — -1 = no sharding }
   gShardN     : Integer = -1;
+  gJobs       : Integer = 1;        { 9.4.7.g — parallel worker count, 1 = serial }
   gBuildProf  : string  = '';       { 9.4.7.i — '' = default .so via pkgIndex }
   gFailLogDir : string  = '';       { 9.4.5.c — empty = default <bin>/tcl-failure-logs }
   gGateStrict : Boolean = False;    { 9.4.8.c — strict gate on STATUS.txt pas-strict rows }
@@ -230,6 +239,12 @@ begin
       end;
     end else if a = '--coverage' then begin
       gCoverage := True;
+    end else if a = '--jobs' then begin
+      Inc(i); gJobs := StrToIntDef(ParamStr(i), 1);
+      if gJobs < 1 then begin
+        Writeln(StdErr, 'TclTestDriver: --jobs expects positive integer, got: ', ParamStr(i));
+        Halt(2);
+      end;
     end else begin
       Writeln(StdErr, 'TclTestDriver: unknown arg: ', a);
       Halt(2);
@@ -472,9 +487,15 @@ begin
   end;
 end;
 
-function RunOne(const testAbsPath: string;
-                out sOut, sErr: AnsiString;
-                out durationMs: Int64): Integer;
+{ 9.4.7.g: RunOneCapture is the parallel-safe core — caller passes the
+  coverage dump path (pre-allocated under gCovTmpDir, indexed by slot
+  ordinal not nTotal) and the caller is responsible for the
+  MergeCoverageDump + DeleteFile pass after the worker pool joins.
+  RunOne wraps this for the serial path and keeps the legacy nTotal-
+  indexed cov path + immediate merge semantics intact. }
+function RunOneCapture(const testAbsPath: string; const covDump: string;
+                       out sOut, sErr: AnsiString;
+                       out durationMs: Int64): Integer;
 var
   p          : TProcess;
   script     : AnsiString;
@@ -483,7 +504,6 @@ var
   endTick    : QWord;
   cwd        : string;
   tmpDir     : string;
-  covDump    : string;
 begin
   sOut := '';
   sErr := '';
@@ -491,15 +511,6 @@ begin
 
   { 9.4.7.f: spin up an isolated working directory for this test. }
   tmpDir := MakeTestTmpDir(testAbsPath);
-  { 9.4.8.d: per-test coverage dump path lives under the global cov
-    tmpdir, NOT the per-test tmpdir (which is wiped before we can read
-    it back).  Empty when --coverage not set: BuildScript skips the
-    pas_opcode_coverage_* injections in that case. }
-  covDump := '';
-  if gCoverage and (gCovTmpDir <> '') then
-    covDump := IncludeTrailingPathDelimiter(gCovTmpDir)
-               + 'cov_' + IntToStr(nTotal) + '_'
-               + ChangeFileExt(ExtractFileName(testAbsPath), '') + '.txt';
   script := BuildScript(testAbsPath, tmpDir, covDump);
 
   p := TProcess.Create(nil);
@@ -570,18 +581,33 @@ begin
     Result := p.ExitStatus;
   finally
     p.Free;
-    { 9.4.8.d: harvest the per-test opcode-coverage dump (if any) BEFORE
-      we tear down anything else.  Dump lives under gCovTmpDir, not the
-      per-test tmpdir, so it survives the recursive remove below. }
-    if covDump <> '' then begin
-      MergeCoverageDump(covDump);
-      DeleteFile(covDump);
-    end;
     { 9.4.7.f: tear down the per-test tmpdir (and any test.db / journals
       / WAL files the test left behind).  Done in finally so it also
-      runs on the timeout and spawn-fail early-exit paths. }
+      runs on the timeout and spawn-fail early-exit paths.  Coverage
+      dump under gCovTmpDir survives (different directory). }
     if tmpDir <> '' then
       RemoveDirRecursive(tmpDir);
+  end;
+end;
+
+{ 9.4.7.g: serial RunOne wrapper — preserves the legacy semantics so the
+  --jobs 1 path remains byte-identical (covDump indexed by nTotal,
+  merged + deleted immediately on return). }
+function RunOne(const testAbsPath: string;
+                out sOut, sErr: AnsiString;
+                out durationMs: Int64): Integer;
+var
+  covDump: string;
+begin
+  covDump := '';
+  if gCoverage and (gCovTmpDir <> '') then
+    covDump := IncludeTrailingPathDelimiter(gCovTmpDir)
+               + 'cov_' + IntToStr(nTotal) + '_'
+               + ChangeFileExt(ExtractFileName(testAbsPath), '') + '.txt';
+  Result := RunOneCapture(testAbsPath, covDump, sOut, sErr, durationMs);
+  if covDump <> '' then begin
+    MergeCoverageDump(covDump);
+    DeleteFile(covDump);
   end;
 end;
 
@@ -927,6 +953,206 @@ begin
 end;
 
 {----------------------------------------------------------------------------
+  9.4.7.g — parallel worker pool.
+
+  When --jobs N>1, the serial `for i := shardLo to shardHi-1` loop is
+  replaced with N worker threads that pull the next pending test index
+  from a shared cursor (guarded by a critical section).  Each worker
+  runs a test to completion via RunOne (which spawns its own tclsh
+  process via TProcess — true OS-level parallelism), then stashes the
+  PASS|FAIL|SKIP line, stderr (for --fail-log-dir), and stdout (for
+  ParseNTest / classification trace) into its slot in a shared results
+  array.  The main thread, after joining all workers, walks the array
+  in MANIFEST order and emits the per-test lines + side-effects
+  (WriteFailLogs, counter updates, gResults.Add).  This keeps output
+  byte-identical to the serial path *modulo* ordering of stderr
+  diagnostics (timeout: ...) — those are buffered per-slot too.
+
+  Per-test isolation (9.4.7.f) already creates a fresh tmpdir per
+  RunOne call, so workers do not race on CWD.  Coverage merge
+  (MergeCoverageDump) is still single-threaded: workers leave dump
+  files on disk and the main thread merges them post-join (or per slot
+  during emit), avoiding a race on gCovUnion.
+----------------------------------------------------------------------------}
+type
+  TJobSlot = record
+    Path        : string;
+    Classified  : string;     { 'PASS' | 'FAIL' | 'SKIP' }
+    Line        : string;     { "<cls> <relPath> <nT> <durMs>" }
+    StdOut      : AnsiString;
+    StdErr      : AnsiString;
+    DurMs       : Int64;
+    NTest       : Integer;
+    Rc          : Integer;
+    Skipped     : Boolean;    { skipped-or-missing, no RunOne issued }
+    Done        : Boolean;
+    CovDumpPath : string;     { non-empty iff coverage harvest pending }
+  end;
+  PJobSlot = ^TJobSlot;
+
+  TJobWorker = class(TThread)
+  private
+    FSlots   : PJobSlot;       { points to first element of slot array }
+    FCount   : Integer;
+    FCursor  : ^Integer;       { shared next-index counter }
+    FLock    : TCriticalSection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(slots: PJobSlot; count: Integer;
+                       cursor: PInteger; lock: TCriticalSection);
+  end;
+
+constructor TJobWorker.Create(slots: PJobSlot; count: Integer;
+                              cursor: PInteger; lock: TCriticalSection);
+begin
+  inherited Create(True);   { suspended }
+  FreeOnTerminate := False;
+  FSlots := slots;
+  FCount := count;
+  FCursor := cursor;
+  FLock := lock;
+end;
+
+procedure TJobWorker.Execute;
+var
+  myIdx   : Integer;
+  slot    : PJobSlot;
+  absPath : string;
+begin
+  while True do begin
+    FLock.Enter;
+    try
+      myIdx := FCursor^;
+      if myIdx >= FCount then begin
+        FLock.Leave;
+        Exit;
+      end;
+      Inc(FCursor^);
+    except
+      FLock.Leave;
+      raise;
+    end;
+    FLock.Leave;
+
+    { Pointer arithmetic over the slot array. }
+    slot := PJobSlot(PtrUInt(FSlots) + PtrUInt(myIdx) * SizeOf(TJobSlot));
+
+    absPath := ExpandFileName(slot^.Path);
+    if not FileExists(absPath) then
+      absPath := ExpandFileName(IncludeTrailingPathDelimiter(gRoot) + slot^.Path);
+    if not FileExists(absPath) then
+      absPath := ExpandFileName(IncludeTrailingPathDelimiter(gRoot) + '..' + DirectorySeparator + slot^.Path);
+
+    if IsSkipped(slot^.Path) or (not FileExists(absPath)) then begin
+      slot^.Skipped    := True;
+      slot^.Classified := 'SKIP';
+      slot^.Line       := 'SKIP ' + slot^.Path + ' 0 0';
+      slot^.DurMs      := 0;
+      slot^.NTest      := 0;
+      slot^.Rc         := 0;
+      slot^.Done       := True;
+      Continue;
+    end;
+
+    { 9.4.8.d: stage a coverage dump path for this slot when --coverage
+      is on; main thread merges it post-join.  Indexing by myIdx (slot
+      ordinal) keeps the per-test filename collision-free across
+      workers without needing the global nTotal counter. }
+    if gCoverage and (gCovTmpDir <> '') then
+      slot^.CovDumpPath := IncludeTrailingPathDelimiter(gCovTmpDir)
+                           + 'cov_' + IntToStr(myIdx) + '_'
+                           + ChangeFileExt(ExtractFileName(slot^.Path), '') + '.txt'
+    else
+      slot^.CovDumpPath := '';
+
+    slot^.Rc := RunOneCapture(absPath, slot^.CovDumpPath,
+                              slot^.StdOut, slot^.StdErr, slot^.DurMs);
+    slot^.NTest      := ParseNTest(slot^.StdOut);
+    slot^.Classified := Classify(slot^.Rc, slot^.StdOut, slot^.StdErr);
+    slot^.Line       := slot^.Classified + ' ' + slot^.Path + ' '
+                        + IntToStr(slot^.NTest) + ' ' + IntToStr(slot^.DurMs);
+    slot^.Skipped    := False;
+    slot^.Done       := True;
+  end;
+end;
+
+procedure RunParallel(filtered: TStringList; shardLo, shardHi: Integer;
+                      var nDone: Integer);
+var
+  slotCount : Integer;
+  slots     : array of TJobSlot;
+  workers   : array of TJobWorker;
+  lock      : TCriticalSection;
+  cursor    : Integer;
+  k, w      : Integer;
+  s         : PJobSlot;
+begin
+  slotCount := shardHi - shardLo;
+  if slotCount <= 0 then Exit;
+
+  SetLength(slots, slotCount);
+  for k := 0 to slotCount - 1 do begin
+    slots[k].Path        := filtered[shardLo + k];
+    slots[k].Classified  := '';
+    slots[k].Line        := '';
+    slots[k].StdOut      := '';
+    slots[k].StdErr      := '';
+    slots[k].DurMs       := 0;
+    slots[k].NTest       := 0;
+    slots[k].Rc          := 0;
+    slots[k].Skipped     := False;
+    slots[k].Done        := False;
+    slots[k].CovDumpPath := '';
+  end;
+
+  cursor := 0;
+  lock := TCriticalSection.Create;
+  SetLength(workers, gJobs);
+  try
+    for w := 0 to gJobs - 1 do begin
+      workers[w] := TJobWorker.Create(@slots[0], slotCount, @cursor, lock);
+      workers[w].Start;
+    end;
+    for w := 0 to gJobs - 1 do begin
+      workers[w].WaitFor;
+      workers[w].Free;
+    end;
+  finally
+    lock.Free;
+  end;
+
+  { Emit per-test results in MANIFEST order; perform side-effects
+    (Inc(nTotal) / counters, WriteFailLogs, gResults.Add, coverage
+    merge) single-threaded on the main thread. }
+  for k := 0 to slotCount - 1 do begin
+    s := @slots[k];
+    Inc(nTotal);
+    Inc(nDone);
+    { Surface any stderr captured during the run that the serial path
+      would have printed live (timeout diagnostics, spawn fail msgs).
+      Workers don't write to StdErr directly, but RunOneCapture's
+      `Writeln(StdErr, 'timeout: ...')` will have been emitted from
+      the worker thread already; that's a best-effort interleave and
+      doesn't affect the gate. }
+    Writeln(s^.Line);
+    Flush(Output);
+    if gResults <> nil then
+      gResults.Add(s^.Classified + #9 + s^.Path);
+    if s^.Classified = 'PASS' then Inc(nPass)
+    else if s^.Classified = 'SKIP' then Inc(nSkip)
+    else begin
+      Inc(nFail);
+      WriteFailLogs(s^.Path, s^.StdOut, s^.StdErr);
+    end;
+    if s^.CovDumpPath <> '' then begin
+      MergeCoverageDump(s^.CovDumpPath);
+      DeleteFile(s^.CovDumpPath);
+    end;
+  end;
+end;
+
+{----------------------------------------------------------------------------
   Main.
 ----------------------------------------------------------------------------}
 var
@@ -961,6 +1187,8 @@ begin
 
   if gGateStrict then
     Writeln(StdErr, 'TclTestDriver: --gate strict enabled (9.4.8.c)');
+  if gJobs > 1 then
+    Writeln(StdErr, 'TclTestDriver: --jobs ', gJobs, ' (9.4.7.g parallel pool)');
   if gCoverage then begin
     { 9.4.8.d: stage a persistent tmpdir for per-test dumps that
       survives the per-test tmpdir wipe in RunOne's finally. }
@@ -1031,9 +1259,14 @@ begin
       Writeln(StdErr, Format('Shard slice: [%d, %d) of %d (post-filter, post-limit) entries',
         [shardLo, shardHi, filtered.Count]));
 
-      for i := shardLo to shardHi - 1 do begin
-        Inc(nDone);
-        ProcessEntry(filtered[i]);
+      if gJobs <= 1 then begin
+        { Serial path — byte-identical to pre-9.4.7.g behaviour. }
+        for i := shardLo to shardHi - 1 do begin
+          Inc(nDone);
+          ProcessEntry(filtered[i]);
+        end;
+      end else begin
+        RunParallel(filtered, shardLo, shardHi, nDone);
       end;
     finally
       filtered.Free;

@@ -768,9 +768,17 @@ acceptance gate for this section.
     (1) create a tmpdir per test, (2) `cd` tclsh there before
     sourcing, (3) cleanup on exit.  Prevents test cross-pollution
     via leaked `test.db`.
-  - [ ] **9.4.7.g** Driver concurrency — `--jobs N` flag spawns
+  - [X] **9.4.7.g** Driver concurrency — `--jobs N` flag spawns
     N tclsh processes in parallel; aggregates results.  Mirrors
     upstream's `make -j` testing.
+    Outcome: cthreads + TCriticalSection worker pool in
+    `src/tests/TclTestDriver.pas:993..1156` (TJobSlot/TJobWorker
+    types + RunParallel) with parallel-safe `RunOneCapture` core
+    extracted from RunOne (lines 481..594); serial `--jobs 1`
+    path stays byte-identical (modulo per-test ms timing).
+    50-test smoke: 11010 ms serial vs 4812 ms with `--jobs 4`
+    (~2.3x), identical 45 pass / 5 fail counts.  Per-test
+    isolation (9.4.7.f tmpdir) already prevents CWD races.
   - [X] **9.4.7.h** `tclsqlite3_Init` package-config — drop our
     `Sqlite3_Init` so `package require sqlite3` works without
     the explicit `load` line.  Generate a Tcl `pkgIndex.tcl`
