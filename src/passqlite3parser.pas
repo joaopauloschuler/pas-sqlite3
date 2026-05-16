@@ -363,6 +363,13 @@ type
     pParse:     Pointer;                               { %extra_context — PParse }
     yystackEnd: PyyStackEntry;                         { last entry in stack }
     yystack:    PyyStackEntry;                         { the parser stack base }
+    { 9.4.divbug.80 — Track the most-recently-reduced DELETE/UPDATE arm
+      so yy_syntax_error can emit the SQLite "ORDER BY without LIMIT on
+      DELETE/UPDATE" message instead of a bare "near ORDER" when the
+      grammar (built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT) rejects
+      a trailing ORDER BY / LIMIT.  0 = none; 152 = DELETE arm,
+      159 = UPDATE arm.  Cleared on shift. }
+    lastDmlRule: u32;
     yystk0:     array[0..YYSTACKDEPTH-1] of yyStackEntry; { initial stack space }
   end;
   PyyParser = ^yyParser;
@@ -1606,6 +1613,38 @@ begin
   pPse := PParse(yypParser^.pParse);
   if pPse = nil then Exit;
   db := pPse^.db;
+  { 9.4.divbug.80 — when the immediately-preceding reduction was the
+    DELETE arm (rule 152) or the UPDATE arm (rule 159) and the offending
+    lookahead is ORDER or LIMIT, replicate the message that delete.c:201
+    / update.c:212 emit when SQLITE_ENABLE_UPDATE_DELETE_LIMIT is built
+    (wherelimit-0.1 / 0.2 / 0.3 expect "ORDER BY without LIMIT on …").
+    Our Lemon tables are generated without that conditional arm, so the
+    only signal is at error time. }
+  if ((yymajor = TK_ORDER) or (yymajor = TK_LIMIT))
+     and (yypParser^.lastDmlRule <> 0) then begin
+    if yymajor = TK_ORDER then begin
+      if yypParser^.lastDmlRule = 152 then
+        zMsg := sqlite3MPrintf(db, 'ORDER BY without LIMIT on DELETE', [])
+      else
+        zMsg := sqlite3MPrintf(db, 'ORDER BY without LIMIT on UPDATE', []);
+    end else begin
+      if yypParser^.lastDmlRule = 152 then
+        zMsg := sqlite3MPrintf(db, 'LIMIT clause should come after %s not before',
+          [PAnsiChar('DELETE')])
+      else
+        zMsg := sqlite3MPrintf(db, 'LIMIT clause should come after %s not before',
+          [PAnsiChar('UPDATE')]);
+    end;
+    Inc(pPse^.nErr);
+    pPse^.rc := SQLITE_ERROR;
+    if zMsg <> nil then begin
+      if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+      pPse^.zErrMsg := zMsg;
+    end;
+    yypParser^.lastDmlRule := 0;
+    if yymajor = 0 then ;
+    Exit;
+  end;
   if (yyminor.z <> nil) and (yyminor.z^ <> #0) then begin
     { parse.c yy_syntax_error: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", &TOKEN);
       sqlite3ErrorMsg in this codebase has no varargs overload — inline
@@ -3433,6 +3472,8 @@ begin
            @yymsp[-1].minor.yy0);
          sqlite3DeleteFrom(pPse, PSrcList(yymsp[-2].minor.yy203),
            PExpr(yymsp[0].minor.yy454), nil, nil);
+         { 9.4.divbug.80 — flag DELETE arm for wherelimit-0.1 error path. }
+         yypParser^.lastDmlRule := 152;
        end;
     153, 155, 232, 233, 252, 268, 286:
        { where_opt ::=;  where_opt_ret ::=;  case_else ::=;
@@ -3475,6 +3516,8 @@ begin
          sqlite3Update(pPse, PSrcList(yymsp[-5].minor.yy203),
            PExprList(yymsp[-2].minor.yy14), PExpr(yymsp[0].minor.yy454),
            yymsp[-6].minor.yy144, nil, nil, nil);
+         { 9.4.divbug.80 — flag UPDATE arm for wherelimit-0.3 error path. }
+         yypParser^.lastDmlRule := 159;
        end;
     160: { setlist ::= setlist COMMA nm EQ expr }
        begin
