@@ -660,12 +660,13 @@ acceptance gate for this section.
     Updated `inventory.sh` INTERNAL_PATTERN to match.  Manifest
     totals: 947→959 tcl-feature, 225→213 tcl-internal, 17 tcl-perf.
 
-- [ ] **9.4.5** Linux-only nightly.  Wire into CI as a *nightly*
+- [~] **9.4.5** Linux-only nightly.  Wire into CI as a *nightly*
   job (not per-commit — the Tcl suite is ~hours).  PR gate stays
   on 9.1 / 9.2 / 9.3.1's seed-set sweep.
-  - [ ] **9.4.5.a** CI config — `.github/workflows/tcl-nightly.yml`
-    (or matching CI surface) that runs `bin/TclTestDriver` against
-    the full MANIFEST + diff against `STATUS.txt` (9.4.8.b).
+  - [X] **9.4.5.a** CI config — `.github/workflows/tcl-nightly.yml`
+    runs `bin/TclTestDriver --gate strict` against the full MANIFEST
+    nightly (cron `17 4 * * *`) + `workflow_dispatch`; 30-min budget
+    over reported ~5-6 min sweep; sharding/artefact deferred to .b/.c.
   - [ ] **9.4.5.b** Sharding — split the 946-test sweep across N
     parallel workers (each worker takes a slice of MANIFEST).
     Driver-side flag `--shard I/N`.  Reduces wall-time from ~hours

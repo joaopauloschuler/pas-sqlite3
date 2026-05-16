@@ -1,56 +1,45 @@
-# tcl-nightly.yml — task 9.4.5.a (CI nightly Tcl-suite).
+# tcl-nightly.yml — task 9.4.5.a (CI nightly Tcl-suite, bare wiring).
 #
-# Nightly run of bin/TclTestDriver against the full MANIFEST.txt,
-# sharded across N parallel workers (9.4.5.b).  After all shards
-# finish, an aggregate job compares the concatenated result log
-# against src/tests/tcl/STATUS.txt and fails the build on any
-# `pas-strict` regression.
+# Nightly run of bin/TclTestDriver against the full MANIFEST.txt.
+# The driver invoked with `--gate strict` (9.4.8.c) compares each
+# test's outcome against src/tests/tcl/STATUS.txt and exits non-zero
+# on any pas-strict regression — which fails this workflow.
 #
-# On failure, each shard uploads its per-test failure logs
-# (bin/tcl-failure-logs/*.out|.err) plus its raw result log and the
-# current src/tests/tcl/DIVERGENCES.md as a workflow artefact
-# (9.4.5.c).
+# Scope of *this* ticket (9.4.5.a) is the bare nightly wiring only.
+# Sharding (9.4.5.b) and failure-report artefact upload (9.4.5.c)
+# are deliberately out of scope and will land in follow-up tickets.
 #
-# The job invokes `bin/TclTestDriver --gate strict` per the 9.4.8.c
-# contract.  Until 9.4.8.c fully wires that flag, the driver accepts
-# `--gate strict` as a no-op (with an stderr note) so this workflow
-# can land first.
+# PR gate stays on the Phase 9.1 / 9.2 / 9.3.1 seed-set sweep; this
+# workflow runs nightly only (cron) and on manual dispatch.
 #
-# Manual invocation: trigger via the GitHub UI "Run workflow" button
-# on the Actions tab (workflow_dispatch is enabled below).  The job
-# can also be reproduced locally:
-#
+# Local reproduction:
 #   src/tests/build.sh
 #   src/tests/build_tcl_lib.sh
 #   src/tests/build_tcl_driver.sh
-#   bin/TclTestDriver --gate strict --shard 0/4 \
-#       --fail-log-dir bin/tcl-failure-logs > /tmp/shard0.log
-#   src/tests/tcl/check_status_regression.sh /tmp/shard0.log
+#   bin/TclTestDriver --gate strict
 #
 # Pre-req: upstream sqlite3 source tree at ../sqlite3 relative to the
-# checkout (see src/tests/build.sh).  The job clones the SQLite GitHub
-# mirror into that location.
+# checkout (see src/tests/build.sh).  The job clones the SQLite
+# GitHub mirror into that location.
+#
+# Threading audit (9.4.7.i) hasn't landed; single Linux profile only.
 
 name: tcl-nightly
 
 on:
   schedule:
-    # 04:00 UTC every day.
-    - cron: '0 4 * * *'
+    # 04:17 UTC daily — low-traffic window for GitHub Actions, off
+    # the top of the hour to avoid scheduler contention.
+    - cron: '17 4 * * *'
   workflow_dispatch:
 
 jobs:
-  shard:
-    name: tcl-shard ${{ matrix.shard }} of ${{ matrix.total }}
+  nightly:
+    name: tcl-nightly (full MANIFEST, --gate strict)
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        # 4-way shard.  Bump `total` here and add entries to `shard`
-        # to scale out.
-        total: [4]
-        shard: [0, 1, 2, 3]
+    # Reported full-sweep wall-time: ~5-6 min (334.8 s / 959 tests in
+    # 9.4.4.g).  30 min budget gives ~5x headroom for CI variance.
+    timeout-minutes: 30
     steps:
       - name: Checkout pas-sqlite3
         uses: actions/checkout@v4
@@ -81,73 +70,9 @@ jobs:
         working-directory: pas-sqlite3
         run: src/tests/build_tcl_driver.sh
 
-      - name: Run TclTestDriver (shard ${{ matrix.shard }}/${{ matrix.total }})
+      - name: Run TclTestDriver (full MANIFEST, --gate strict)
         working-directory: pas-sqlite3
-        run: |
-          mkdir -p bin/tcl-failure-logs
-          # `--gate strict` is the 9.4.8.c contract; presently a stub.
-          set +e
-          bin/TclTestDriver \
-              --gate strict \
-              --shard ${{ matrix.shard }}/${{ matrix.total }} \
-              --fail-log-dir bin/tcl-failure-logs \
-              > bin/shard-${{ matrix.shard }}.log 2> bin/shard-${{ matrix.shard }}.err
-          driver_rc=$?
-          set -e
-          echo "driver_rc=$driver_rc"
-          tail -3 bin/shard-${{ matrix.shard }}.err || true
-          # Do NOT fail the shard step on driver_rc — the aggregate
-          # job runs the pas-strict regression gate.  Surface the
-          # driver code so the artefact carries it.
-          echo "$driver_rc" > bin/shard-${{ matrix.shard }}.rc
-
-      - name: Upload shard result + failure logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tcl-shard-${{ matrix.shard }}
-          path: |
-            pas-sqlite3/bin/shard-${{ matrix.shard }}.log
-            pas-sqlite3/bin/shard-${{ matrix.shard }}.err
-            pas-sqlite3/bin/shard-${{ matrix.shard }}.rc
-            pas-sqlite3/bin/tcl-failure-logs/
-            pas-sqlite3/src/tests/tcl/DIVERGENCES.md
-          if-no-files-found: warn
-          retention-days: 14
-
-  aggregate:
-    name: aggregate + STATUS.txt regression gate
-    runs-on: ubuntu-latest
-    needs: shard
-    if: always()
-    steps:
-      - name: Checkout pas-sqlite3
-        uses: actions/checkout@v4
-
-      - name: Download all shard artefacts
-        uses: actions/download-artifact@v4
-        with:
-          path: shard-artifacts
-          pattern: tcl-shard-*
-
-      - name: Concatenate shard result logs
-        run: |
-          mkdir -p _agg
-          find shard-artifacts -name 'shard-*.log' -print0 \
-              | xargs -0 cat > _agg/all-results.log
-          echo "Aggregated $(wc -l < _agg/all-results.log) result lines."
-
-      - name: Compare against STATUS.txt (pas-strict gate)
-        run: |
-          src/tests/tcl/check_status_regression.sh _agg/all-results.log
-
-      - name: Upload aggregated result log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tcl-aggregate
-          path: |
-            _agg/all-results.log
-            src/tests/tcl/DIVERGENCES.md
-            src/tests/tcl/STATUS.txt
-          retention-days: 30
+        # `--gate strict` (9.4.8.c) makes the driver exit non-zero on
+        # any pas-strict regression vs STATUS.txt — which fails the
+        # job per the task contract.
+        run: bin/TclTestDriver --gate strict
