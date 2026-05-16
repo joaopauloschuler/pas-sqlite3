@@ -2919,6 +2919,13 @@ var
   pCell  : Pu8;
   nCellKey: i64;
   rawKey : u64;
+  { 12.2.candidate.4: cache hot pPage^ fields in locals so FPC does not
+    re-deref through pPage every loop iteration.  Refreshed each outer
+    iteration immediately after pPage := pCur^.pPage. }
+  aData   : Pu8;
+  aDataO  : Pu8;   { aDataOfst — used by findCellPastPtr inline }
+  aCellI  : Pu8;   { aCellIdx  — used by findCellPastPtr inline }
+  mskPage : u16;   { maskPage }
 label
   moveto_table_next_layer, moveto_table_finish;
 begin
@@ -2954,6 +2961,11 @@ begin
   c := 0;
   while True do begin
     pPage := pCur^.pPage;
+    { Refresh cached locals — pPage may have changed via moveToChild. }
+    aData   := pPage^.aData;
+    aDataO  := pPage^.aDataOfst;
+    aCellI  := pPage^.aCellIdx;
+    mskPage := pPage^.maskPage;
     lwr := 0;
     upr := pPage^.nCell - 1;
     if biasRight <> 0 then
@@ -2962,7 +2974,8 @@ begin
       idx := upr shr 1;
 
     while True do begin
-      pCell := findCellPastPtr(pPage, idx);
+      { Inlined findCellPastPtr(pPage, idx) using cached locals. }
+      pCell := aDataO + (mskPage and u16(get2byteAligned(aCellI + 2*idx)));
       if pPage^.intKeyLeaf <> 0 then begin
         { Skip the payload length varint }
         while (pCell[0] and $80 <> 0) do begin
@@ -3010,9 +3023,10 @@ begin
 
 moveto_table_next_layer:
     if lwr >= pPage^.nCell then
-      chldPg := get4byte(pPage^.aData + pPage^.hdrOffset + 8)
+      chldPg := get4byte(aData + pPage^.hdrOffset + 8)
     else
-      chldPg := get4byte(findCell(pPage, lwr));
+      { Inlined findCell(pPage, lwr) using cached locals. }
+      chldPg := get4byte(aData + (mskPage and u16(get2byteAligned(aCellI + 2*lwr))));
     pCur^.ix := u16(lwr);
     rc := moveToChild(pCur, chldPg);
     if rc <> SQLITE_OK then begin
