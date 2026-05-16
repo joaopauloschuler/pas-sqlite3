@@ -1683,6 +1683,180 @@ begin
 end;
 
 { ----------------------------------------------------------------------
+  9.4.divbug.62.b extension — statement-introspection commands missing
+  from the earlier .62.b cluster: sqlite3_sql / _expanded_sql /
+  _normalized_sql / _stmt_status / _stmt_busy / _stmt_readonly /
+  _stmt_isexplain / _column_bytes16.  All accept a single "0xABCD..."
+  STMT pointer (per sqlite3TestTextToPtr); _stmt_status additionally
+  takes a symbolic op + reset flag.
+  ---------------------------------------------------------------------- }
+
+{ test1.c:5602..5618 — sqlite3_sql STMT. }
+function tcl_test_sql(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStm: PVdbe;
+  z: PAnsiChar;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  z := sqlite3_sql(pStm);
+  if z = nil then z := PAnsiChar('');
+  Tcl_SetResult(interp, PChar(z), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ test1.c:5619..5638 — sqlite3_expanded_sql STMT (caller frees). }
+function tcl_test_ex_sql(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStm: PVdbe;
+  z: PAnsiChar;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  z := sqlite3_expanded_sql(pStm);
+  if z <> nil then begin
+    Tcl_SetResult(interp, PChar(z), TCL_VOLATILE);
+    sqlite3_free(z);
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:5640..5656 — sqlite3_normalized_sql STMT.  Engine returns NULL
+  when SQLITE_ENABLE_NORMALIZE is not active; we still register the cmd
+  so callers don't trip "invalid command name". }
+function tcl_test_norm_sql(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStm: PVdbe;
+  z: PAnsiChar;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  z := sqlite3_normalized_sql(pStm);
+  if z = nil then z := PAnsiChar('');
+  Tcl_SetResult(interp, PChar(z), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ test1.c:2288..2330 — sqlite3_stmt_status STMT PARAMETER RESETFLAG. }
+function tcl_test_stmt_status(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+type
+  TOpEntry = record zName: PAnsiChar; op: cint; end;
+const
+  aOp: array[0..6] of TOpEntry = (
+    (zName: 'SQLITE_STMTSTATUS_FULLSCAN_STEP'; op: SQLITE_STMTSTATUS_FULLSCAN_STEP),
+    (zName: 'SQLITE_STMTSTATUS_SORT';          op: SQLITE_STMTSTATUS_SORT),
+    (zName: 'SQLITE_STMTSTATUS_AUTOINDEX';     op: SQLITE_STMTSTATUS_AUTOINDEX),
+    (zName: 'SQLITE_STMTSTATUS_VM_STEP';       op: SQLITE_STMTSTATUS_VM_STEP),
+    (zName: 'SQLITE_STMTSTATUS_REPREPARE';     op: SQLITE_STMTSTATUS_REPREPARE),
+    (zName: 'SQLITE_STMTSTATUS_RUN';           op: SQLITE_STMTSTATUS_RUN),
+    (zName: 'SQLITE_STMTSTATUS_MEMUSED';       op: SQLITE_STMTSTATUS_MEMUSED));
+var
+  pStm: PVdbe;
+  i, op, resetFlag, iValue: cint;
+  zOpName: PAnsiChar;
+  matched: Boolean;
+begin
+  if objc <> 4 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT PARAMETER RESETFLAG'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  zOpName := Tcl_GetString(objv[2]);
+  op := 0; matched := False;
+  for i := 0 to High(aOp) do
+    if StrComp(aOp[i].zName, zOpName) = 0 then begin
+      op := aOp[i].op; matched := True; break;
+    end;
+  if not matched then
+    if Tcl_GetIntFromObj(interp, objv[2], @op) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  if Tcl_GetBooleanFromObj(interp, objv[3], @resetFlag) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  iValue := sqlite3_stmt_status(pStm, op, resetFlag);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(iValue));
+  Result := TCL_OK;
+end;
+
+{ test1.c:3034..3057 — sqlite3_stmt_busy STMT. }
+function tcl_test_stmt_busy(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStm: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(sqlite3_stmt_busy(pStm)));
+  Result := TCL_OK;
+end;
+
+{ test1.c:2952..2971 — sqlite3_stmt_readonly STMT. }
+function tcl_test_stmt_readonly(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStm: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(sqlite3_stmt_readonly(pStm)));
+  Result := TCL_OK;
+end;
+
+{ test1.c:2979..2998 — sqlite3_stmt_isexplain STMT (returns 0/1/2). }
+function tcl_test_stmt_isexplain(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStm: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_stmt_isexplain(pStm)));
+  Result := TCL_OK;
+end;
+
+{ test1.c:5853..5912 (test_stmt_utf16/_bytes16 cluster) — sqlite3_column_bytes16
+  STMT column.  Returns the UTF-16 byte length of the indicated column. }
+function tcl_column_bytes16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStm: PVdbe; col: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT column'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(sqlite3_column_bytes16(pStm, col)));
+  Result := TCL_OK;
+end;
+
+{ ----------------------------------------------------------------------
   9.4.divbug.62.b — sqlite3_bind_* family + hexio_* helpers.
 
   Ported handlers (verbatim from upstream test1.c / test_hexio.c):
@@ -3200,6 +3374,24 @@ begin
     @tcl_stmt_utf8, Pointer(@sqlite3_column_table_name), nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_column_origin_name'),
     @tcl_stmt_utf8, Pointer(@sqlite3_column_origin_name), nil);
+  { 9.4.divbug.62.b extension — stmt-introspection (test1.c:5602..5656,
+    2288..2330, 2952..2998, 3034..3057). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_sql'),
+    @tcl_test_sql, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_expanded_sql'),
+    @tcl_test_ex_sql, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_normalized_sql'),
+    @tcl_test_norm_sql, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_status'),
+    @tcl_test_stmt_status, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_busy'),
+    @tcl_test_stmt_busy, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_readonly'),
+    @tcl_test_stmt_readonly, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_isexplain'),
+    @tcl_test_stmt_isexplain, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_bytes16'),
+    @tcl_column_bytes16, nil, nil);
   { 9.4.divbug.62.b — sqlite3_bind_* family + hexio_* helpers
     (test1.c:9114..9132, test_hexio.c:461..465). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_int'),
