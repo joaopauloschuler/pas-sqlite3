@@ -1625,15 +1625,28 @@ functions with `asm` content cannot be inlined.
         note in `profile_perf.sh` is cleared, to confirm
         ranking holds on larger tables.
 
-- [ ] **12.2** Aggressive `inline` on VDBE opcode helpers, varint
-  codecs, and page cell accessors.
+- [~] **12.2** Aggressive `inline` on VDBE opcode helpers, varint
+  codecs, and page cell accessors.  Headline candidate.2 landed
+  (xRecordCompare fast-path dispatch); secondary inline candidates
+  (1, 3..11) still open.
   - [ ] **12.2.candidate.1** Inline `sqlite3VdbeSerialGet`
         (passqlite3vdbe.pas:2050) — 1.20 % self, called from
         every `OP_Column` step.
-  - [ ] **12.2.candidate.2** Specialise `sqlite3VdbeRecordCompare`
-        on int-key fast path (port C's `xRecordCompare` /
-        `vdbeRecordCompareInt`) — 8.70 % self,
-        passqlite3btree.pas:3188.
+  - [X] **12.2.candidate.2** Specialise `sqlite3VdbeRecordCompare`
+        on int-key + string-key fast paths — port of vdbeaux.c
+        `vdbeRecordCompareInt` / `vdbeRecordCompareString` /
+        `sqlite3VdbeFindCompare` (vdbeaux.c:4971..5181) landed at
+        passqlite3btree.pas:3396..3568.  Callgrind self-time on
+        the generic comparator dropped from 8.70 % (21.6 M Ir)
+        to 1.95 % (4.65 M Ir); two new specialised entries cost
+        2.22 % (Int) + 1.41 % (Str) for **combined 5.58 %** —
+        a net 3.12 % cut and ~9 M total program Ir saved on the
+        speedtest1 main testset (248.3 M → 239.3 M).  Bench
+        regression sweep shows ~22 BETTER vs baseline (several
+        sub-tests -50 % to -75 %).  Note: Pas merged
+        `RecordCompareWithSkip` into the generic comparator,
+        so the bSkip=1 trailing-field path falls back to the
+        generic (correct, ~1 % win left on the table vs C).
   - [ ] **12.2.candidate.3** Cache `pPage^.aData` / `aCellIdx` /
         `maskPage` in locals at the top of
         `sqlite3BtreeIndexMoveto` (passqlite3btree.pas:3452) —
