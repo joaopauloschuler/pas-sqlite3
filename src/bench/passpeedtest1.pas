@@ -752,7 +752,459 @@ begin
   Halt(2);
 end;
 
-procedure testset_main;        begin testset_not_yet('main',        'Phase 11.2'); end;
+{ ----------------------------- testset_main ----------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 781..1244. }
+
+procedure testset_main;
+var
+  i, n, sz, maxb: Integer;
+  x1, x2: LongWord;
+  len: Integer;
+  zNum: AnsiString;
+begin
+  len := 0;
+  x1 := 0; x2 := 0;
+
+  sz := g.szTest * 500;
+  n  := sz;
+  maxb := Integer(roundup_allones(LongWord(sz)));
+
+  { ---- 100 ---- }
+  speedtest1_begin_test(100, '%d INSERTs into table with no index', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_exec('CREATE%s TABLE z1(a INTEGER %s, b INTEGER %s, c TEXT %s);',
+                  [isTemp(9), PAnsiChar(g.zNN), PAnsiChar(g.zNN), PAnsiChar(g.zNN)]);
+  speedtest1_prepare('INSERT INTO z1 VALUES(?1,?2,?3); --  %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    zNum := speedtest1_numbername(x1);
+    sqlite3_bind_int64(g.pStmt, 1, i64(x1));
+    sqlite3_bind_int(g.pStmt, 2, i);
+    sqlite3_bind_text(g.pStmt, 3, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 110 ---- }
+  n := sz;
+  speedtest1_begin_test(110, '%d ordered INSERTS with one index/PK', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_exec(
+    'CREATE%s TABLE z2(a INTEGER %s %s, b INTEGER %s, c TEXT %s) %s',
+    [isTemp(5), PAnsiChar(g.zNN), PAnsiChar(g.zPK),
+     PAnsiChar(g.zNN), PAnsiChar(g.zNN), PAnsiChar(g.zWR)]);
+  speedtest1_prepare('INSERT INTO z2 VALUES(?1,?2,?3); -- %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    zNum := speedtest1_numbername(x1);
+    sqlite3_bind_int(g.pStmt, 1, i);
+    sqlite3_bind_int64(g.pStmt, 2, i64(x1));
+    sqlite3_bind_text(g.pStmt, 3, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 120 ---- }
+  n := sz;
+  speedtest1_begin_test(120, '%d unordered INSERTS with one index/PK', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_exec(
+    'CREATE%s TABLE t3(a INTEGER %s %s, b INTEGER %s, c TEXT %s) %s',
+    [isTemp(3), PAnsiChar(g.zNN), PAnsiChar(g.zPK),
+     PAnsiChar(g.zNN), PAnsiChar(g.zNN), PAnsiChar(g.zWR)]);
+  speedtest1_prepare('INSERT INTO t3 VALUES(?1,?2,?3); -- %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    zNum := speedtest1_numbername(x1);
+    sqlite3_bind_int(g.pStmt, 2, i);
+    sqlite3_bind_int64(g.pStmt, 1, i64(x1));
+    sqlite3_bind_text(g.pStmt, 3, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { Note: speedtest1.c:847..850 group_concat shim for SQLITE_VERSION_NUMBER<3005004
+    is omitted; modern engine has group_concat builtin. }
+
+  { ---- 130 ---- }
+  n := 25;
+  speedtest1_begin_test(130, '%d SELECTS, numeric BETWEEN, unindexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT count(*), avg(b), sum(length(c)), group_concat(c) FROM z1'#10 +
+    ' WHERE b BETWEEN ?1 AND ?2; -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := speedtest1_random mod LongWord(maxb);
+      x2 := (speedtest1_random mod 10) + LongWord(sz div 5000) + x1;
+    end;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_int(g.pStmt, 2, Integer(x2));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 140 ---- }
+  n := 10;
+  speedtest1_begin_test(140, '%d SELECTS, LIKE, unindexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT count(*), avg(b), sum(length(c)), group_concat(c) FROM z1'#10 +
+    ' WHERE c LIKE ?1; -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := speedtest1_random mod LongWord(maxb);
+      zNum := '%' + speedtest1_numbername(LongWord(i)) + '%';
+      len := Length(zNum);
+    end;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zNum), len, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 142 ---- }
+  n := 10;
+  speedtest1_begin_test(142, '%d SELECTS w/ORDER BY, unindexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT a, b, c FROM z1 WHERE c LIKE ?1'#10 +
+    ' ORDER BY a; -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := speedtest1_random mod LongWord(maxb);
+      zNum := '%' + speedtest1_numbername(LongWord(i)) + '%';
+      len := Length(zNum);
+    end;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zNum), len, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 145 ---- }
+  n := 10;
+  speedtest1_begin_test(145, '%d SELECTS w/ORDER BY and LIMIT, unindexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT a, b, c FROM z1 WHERE c LIKE ?1'#10 +
+    ' ORDER BY a LIMIT 10; -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := speedtest1_random mod LongWord(maxb);
+      zNum := '%' + speedtest1_numbername(LongWord(i)) + '%';
+      len := Length(zNum);
+    end;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zNum), len, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 150 ---- }
+  speedtest1_begin_test(150, 'CREATE INDEX five times');
+  speedtest1_exec('BEGIN;');
+  speedtest1_exec('CREATE UNIQUE INDEX t1b ON z1(b);');
+  speedtest1_exec('CREATE INDEX t1c ON z1(c);');
+  speedtest1_exec('CREATE UNIQUE INDEX t2b ON z2(b);');
+  speedtest1_exec('CREATE INDEX t2c ON z2(c DESC);');
+  speedtest1_exec('CREATE INDEX t3bc ON t3(b,c);');
+  speedtest1_exec('COMMIT;');
+  speedtest1_end_test;
+
+  { ---- 160 ---- }
+  n := sz div 5;
+  speedtest1_begin_test(160, '%d SELECTS, numeric BETWEEN, indexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT count(*), avg(b), sum(length(c)), group_concat(a) FROM z1'#10 +
+    ' WHERE b BETWEEN ?1 AND ?2; -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := speedtest1_random mod LongWord(maxb);
+      x2 := (speedtest1_random mod 10) + LongWord(sz div 5000) + x1;
+    end;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_int(g.pStmt, 2, Integer(x2));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 161 ---- }
+  n := sz div 5;
+  speedtest1_begin_test(161, '%d SELECTS, numeric BETWEEN, PK', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT count(*), avg(b), sum(length(c)), group_concat(a) FROM z2'#10 +
+    ' WHERE a BETWEEN ?1 AND ?2; -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := speedtest1_random mod LongWord(maxb);
+      x2 := (speedtest1_random mod 10) + LongWord(sz div 5000) + x1;
+    end;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_int(g.pStmt, 2, Integer(x2));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 170 ---- }
+  n := sz div 5;
+  speedtest1_begin_test(170, '%d SELECTS, text BETWEEN, indexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT count(*), avg(b), sum(length(c)), group_concat(a) FROM z1'#10 +
+    ' WHERE c BETWEEN ?1 AND (?1||''~''); -- %d times', [n]);
+  for i := 1 to n do begin
+    if ((i - 1) mod g.nRepeat) = 0 then begin
+      x1 := swizzle(LongWord(i), LongWord(maxb));
+      zNum := speedtest1_numbername(x1);
+      len := Length(zNum);
+    end;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zNum), len, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 180 ---- }
+  n := sz;
+  speedtest1_begin_test(180, '%d INSERTS with three indexes', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_exec(
+    'CREATE%s TABLE t4('#10 +
+    '  a INTEGER %s %s,'#10 +
+    '  b INTEGER %s,'#10 +
+    '  c TEXT %s'#10 +
+    ') %s',
+    [isTemp(1), PAnsiChar(g.zNN), PAnsiChar(g.zPK),
+     PAnsiChar(g.zNN), PAnsiChar(g.zNN), PAnsiChar(g.zWR)]);
+  speedtest1_exec('CREATE INDEX t4b ON t4(b)');
+  speedtest1_exec('CREATE INDEX t4c ON t4(c)');
+  speedtest1_exec('INSERT INTO t4 SELECT * FROM z1');
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 190 ---- }
+  n := sz;
+  speedtest1_begin_test(190, 'DELETE and REFILL one table', [n]);
+  speedtest1_exec('DELETE FROM z2;');
+  speedtest1_exec('INSERT INTO z2 SELECT * FROM z1;');
+  speedtest1_end_test;
+
+  { ---- 200 ---- }
+  speedtest1_begin_test(200, 'VACUUM');
+  speedtest1_exec('VACUUM');
+  speedtest1_end_test;
+
+  { ---- 210 ---- }
+  speedtest1_begin_test(210, 'ALTER TABLE ADD COLUMN, and query');
+  speedtest1_exec('ALTER TABLE z2 ADD COLUMN d INT DEFAULT 123');
+  speedtest1_exec('SELECT sum(d) FROM z2');
+  speedtest1_end_test;
+
+  { ---- 230 ---- }
+  n := sz div 5;
+  speedtest1_begin_test(230, '%d UPDATES, numeric BETWEEN, indexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'UPDATE z2 SET d=b*2 WHERE b BETWEEN ?1 AND ?2; -- %d times', [n]);
+  for i := 1 to n do begin
+    x1 := speedtest1_random mod LongWord(maxb);
+    x2 := (speedtest1_random mod 10) + LongWord(sz div 5000) + x1;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_int(g.pStmt, 2, Integer(x2));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 240 ---- }
+  n := sz;
+  speedtest1_begin_test(240, '%d UPDATES of individual rows', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare('UPDATE z2 SET d=b*3 WHERE a=?1; -- %d times', [n]);
+  for i := 1 to n do begin
+    x1 := (speedtest1_random mod LongWord(sz)) + 1;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 250 ---- }
+  speedtest1_begin_test(250, 'One big UPDATE of the whole %d-row table', [sz]);
+  speedtest1_exec('UPDATE z2 SET d=b*4');
+  speedtest1_end_test;
+
+  { ---- 260 ---- }
+  speedtest1_begin_test(260, 'Query added column after filling');
+  speedtest1_exec('SELECT sum(d) FROM z2');
+  speedtest1_end_test;
+
+  { ---- 270 ---- }
+  n := sz div 5;
+  speedtest1_begin_test(270, '%d DELETEs, numeric BETWEEN, indexed', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'DELETE FROM z2 WHERE b BETWEEN ?1 AND ?2; -- %d times', [n]);
+  for i := 1 to n do begin
+    x1 := (speedtest1_random mod LongWord(maxb)) + 1;
+    x2 := (speedtest1_random mod 10) + LongWord(sz div 5000) + x1;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_int(g.pStmt, 2, Integer(x2));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 280 ---- }
+  n := sz;
+  speedtest1_begin_test(280, '%d DELETEs of individual rows', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare('DELETE FROM t3 WHERE a=?1; -- %d times', [n]);
+  for i := 1 to n do begin
+    x1 := (speedtest1_random mod LongWord(sz)) + 1;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 290 ---- }
+  speedtest1_begin_test(290, 'Refill two %d-row tables using REPLACE', [sz]);
+  speedtest1_exec('REPLACE INTO z2(a,b,c) SELECT a,b,c FROM z1');
+  speedtest1_exec('REPLACE INTO t3(a,b,c) SELECT a,b,c FROM z1');
+  speedtest1_end_test;
+
+  { ---- 300 ---- }
+  speedtest1_begin_test(300, 'Refill a %d-row table using (b&1)==(a&1)', [sz]);
+  speedtest1_exec('DELETE FROM z2;');
+  speedtest1_exec('INSERT INTO z2(a,b,c)'#10 +
+                  ' SELECT a,b,c FROM z1  WHERE (b&1)==(a&1);');
+  speedtest1_exec('INSERT INTO z2(a,b,c)'#10 +
+                  ' SELECT a,b,c FROM z1  WHERE (b&1)<>(a&1);');
+  speedtest1_end_test;
+
+  { ---- 310 ---- }
+  n := sz div 5;
+  speedtest1_begin_test(310, '%d four-ways joins', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_prepare(
+    'SELECT z1.c FROM z1, z2, t3, t4'#10 +
+    ' WHERE t4.a BETWEEN ?1 AND ?2'#10 +
+    '   AND t3.a=t4.b'#10 +
+    '   AND z2.a=t3.b'#10 +
+    '   AND z1.c=z2.c;');
+  for i := 1 to n do begin
+    x1 := (speedtest1_random mod LongWord(sz)) + 1;
+    x2 := (speedtest1_random mod 10) + x1 + 4;
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_int(g.pStmt, 2, Integer(x2));
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 320 ---- }
+  speedtest1_begin_test(320, 'subquery in result set', [n]);
+  speedtest1_prepare(
+    'SELECT sum(a), max(c),'#10 +
+    '       avg((SELECT a FROM z2 WHERE 5+z2.b=z1.b) AND rowid<?1), max(c)'#10 +
+    ' FROM z1 WHERE rowid<?1;');
+  sqlite3_bind_int(g.pStmt, 1, est_square_root(g.szTest) * 50);
+  speedtest1_run;
+  speedtest1_end_test;
+
+  { ---- 400 ---- }
+  sz := g.szTest * 700;
+  n  := sz;
+  maxb := Integer(roundup_allones(LongWord(sz div 3)));
+  speedtest1_begin_test(400, '%d REPLACE ops on an IPK', [n]);
+  speedtest1_exec('BEGIN');
+  speedtest1_exec('CREATE%s TABLE t5(a INTEGER PRIMARY KEY, b %s);',
+                  [isTemp(9), PAnsiChar(g.zNN)]);
+  speedtest1_prepare('REPLACE INTO t5 VALUES(?1,?2); --  %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    zNum := speedtest1_numbername(LongWord(i));
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 410 ---- }
+  speedtest1_begin_test(410, '%d SELECTS on an IPK', [n]);
+  if g.doBigTransactions <> 0 then speedtest1_exec('BEGIN');
+  speedtest1_prepare('SELECT b FROM t5 WHERE a=?1; --  %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    sqlite3_bind_int(g.pStmt, 1, Integer(x1));
+    speedtest1_run;
+  end;
+  if g.doBigTransactions <> 0 then speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 500 ---- }
+  sz := g.szTest * 700;
+  n  := sz;
+  maxb := Integer(roundup_allones(LongWord(sz div 3)));
+  speedtest1_begin_test(500, '%d REPLACE on TEXT PK', [n]);
+  speedtest1_exec('BEGIN');
+  if sqlite3_libversion_number >= 3008002 then
+    speedtest1_exec('CREATE%s TABLE t6(a TEXT PRIMARY KEY, b %s)%s;',
+                    [isTemp(9), PAnsiChar(g.zNN), PAnsiChar('WITHOUT ROWID')])
+  else
+    speedtest1_exec('CREATE%s TABLE t6(a TEXT PRIMARY KEY, b %s)%s;',
+                    [isTemp(9), PAnsiChar(g.zNN), PAnsiChar('')]);
+  speedtest1_prepare('REPLACE INTO t6 VALUES(?1,?2); --  %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    zNum := speedtest1_numbername(x1);
+    sqlite3_bind_int(g.pStmt, 2, i);
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 510 ---- }
+  speedtest1_begin_test(510, '%d SELECTS on a TEXT PK', [n]);
+  if g.doBigTransactions <> 0 then speedtest1_exec('BEGIN');
+  speedtest1_prepare('SELECT b FROM t6 WHERE a=?1; --  %d times', [n]);
+  for i := 1 to n do begin
+    x1 := swizzle(LongWord(i), LongWord(maxb));
+    zNum := speedtest1_numbername(x1);
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zNum), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  if g.doBigTransactions <> 0 then speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  { ---- 520 ---- }
+  speedtest1_begin_test(520, '%d SELECT DISTINCT', [n]);
+  speedtest1_exec('SELECT DISTINCT b FROM t5;');
+  speedtest1_exec('SELECT DISTINCT b FROM t6;');
+  speedtest1_end_test;
+
+  { ---- 980 ---- }
+  speedtest1_begin_test(980, 'PRAGMA integrity_check');
+  speedtest1_exec('PRAGMA integrity_check');
+  speedtest1_end_test;
+
+  { ---- 990 ---- }
+  speedtest1_begin_test(990, 'ANALYZE');
+  speedtest1_exec('ANALYZE');
+  speedtest1_end_test;
+end;
 procedure testset_cte;         begin testset_not_yet('cte',         'Phase 11.3'); end;
 procedure testset_fp;          begin testset_not_yet('fp',          'Phase 11.3'); end;
 procedure testset_parsenumber; begin testset_not_yet('parsenumber', 'Phase 11.3'); end;
