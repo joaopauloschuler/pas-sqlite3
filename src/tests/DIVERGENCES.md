@@ -15,6 +15,5 @@ survive the mask are real port drift.
 
 | source | tier | tag | status | cite | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|--------|------|---------|---------|---------------|--------------------------|
-| src/tests/DiagBloom.pas | tier2 | dql | pas-strict | - | 9 | 2 | db-blob | `ANALYZE` |
 
 _End of file._

@@ -50111,16 +50111,27 @@ begin
     Exit;
   end;
 
-  { PragTyp_PAGE_SIZE read arm (pragma.c:598).  Page size is fixed at
-    open time so capture at codegen via sqlite3BtreeGetPageSize. }
-  if SameText(zName, 'page_size') and (pValue = nil) then begin
+  { PragTyp_PAGE_SIZE (pragma.c:598).  Read arm: page size is fixed at
+    open time so capture at codegen via sqlite3BtreeGetPageSize.  Write
+    arm: stash in db^.nextPagesize and call sqlite3BtreeSetPageSize —
+    the btree honours the new size only if BTS_PAGESIZE_FIXED is unset
+    (i.e. before the first write materialises the header). }
+  if SameText(zName, 'page_size') then begin
     pBtArg := PBtree(db^.aDb[iDb].pBt);
-    if pBtArg <> nil then
-      iVal := sqlite3BtreeGetPageSize(pBtArg)
-    else
-      iVal := 0;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Assert(pBtArg <> nil);
+    if pValue = nil then begin
+      if pBtArg <> nil then
+        iVal := sqlite3BtreeGetPageSize(pBtArg)
+      else
+        iVal := 0;
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    end else begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      db^.nextPagesize := sqlite3Atoi(PChar(zRight));
+      if SQLITE_NOMEM = sqlite3BtreeSetPageSize(pBtArg, db^.nextPagesize, 0, 0) then
+        sqlite3OomFault(db);
+    end;
     Exit;
   end;
 

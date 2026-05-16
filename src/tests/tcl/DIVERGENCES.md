@@ -527,17 +527,21 @@ NULL gate fires).  C reference: func.c `countStep` distinct path,
 select.c `updateAccumulator` DISTINCT loop.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.34 — `PRAGMA page_size` default mismatch
+## 9.4.divbug.34 — `PRAGMA page_size` default mismatch — RESOLVED
 
 Affects: 2 tests (`createtab.test` createtab-0.2 expects 4096, got 8192;
 `format4.test` format4-1.1 expects 2048, got 8192).
 Symptom: a fresh DB's `PRAGMA page_size` reports the build-time default
-(8192) regardless of the size the test set via `PRAGMA page_size=…` or
-the format-version-implied default.  Likely the
-`SQLITE_DEFAULT_PAGE_SIZE` build constant in Pascal does not honour
-the per-test `PRAGMA page_size=N` before the first write that
-materialises the header.  C reference: pragma.c PragTyp_PAGE_SIZE
-write arm, pager.c `sqlite3PagerSetPagesize`.
+(8192) regardless of the size the test set via `PRAGMA page_size=…`.
+Root cause: PragTyp_PAGE_SIZE write arm was not ported — codegen only
+emitted the read arm, so `PRAGMA page_size=N` was a parser-only no-op
+(the btree's `pageSize` stayed at SQLITE_DEFAULT_PAGE_SIZE and the
+file header was written with 8192).
+Fix: port pragma.c:604..611 — set `db^.nextPagesize := sqlite3Atoi(zRight)`
+and call `sqlite3BtreeSetPageSize(pBt, db^.nextPagesize, 0, 0)`;
+OOM-bubble on SQLITE_NOMEM.  Verified: pre-schema writes now
+materialise the requested size (file size matches C oracle); post-
+schema writes are silently rejected (BTS_PAGESIZE_FIXED) matching C.
 Surfaced by: 9.4.4.e sweep.
 
 ## 9.4.divbug.35 — Float-to-text precision artifacts (`-1.1099999999999999`)
