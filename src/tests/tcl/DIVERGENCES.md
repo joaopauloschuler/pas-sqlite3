@@ -648,3 +648,78 @@ and AS-affinity propagation when the DEFAULT carries an expression.
 C reference: build.c `sqlite3AddDefaultValue`, ` sqlite3AffinityType`.
 Surfaced by: 9.4.4.e sweep.
 
+## Run summary (9.4.4.f sweep)
+
+Broadened the sweep to the **first 500 tcl-feature tests** in MANIFEST.txt
+order, run under `bin/TclTestDriver --limit 500` (engine + tcl lib rebuilt
+fresh).
+
+PASS / FAIL / SKIP = **280 / 220 / 0** (500 total, 149.2 s).  One 30 s
+timeout (`changes.test`) counted as FAIL (the timeout cluster cited under
+9.4.divbug.36-residue — `PRAGMA journal_mode=off` flipped via divbug.36,
+but the changes-1.1.0 sub-body now hangs further downstream).
+
+Delta vs 9.4.4.e (1..250 slice):
+
+|                         | 9.4.4.e | 9.4.4.f | Δ   |
+|-------------------------|---------|---------|-----|
+| PASS                    | 147     | 151     | +4  |
+| FAIL                    | 103     | 99      | -4  |
+
+Per-row transitions in the 1..250 slice (vs HEAD STATUS.txt):
+
+- pas-strict → PASS (held green): 146
+- pas-strict → FAIL (regression): 1
+- pas-soft   → PASS (recovered):  5  (divbug.32/.33/.36/.37/.40 fixes)
+- pas-soft   → FAIL (still soft): 88
+- pas-skip   → FAIL (now run, still failing): 10
+
+The single pas-strict regression is a sweep-state cross-contamination
+artefact — the test PASSes in isolation under
+`bin/TclTestDriver --filter <name>` but FAILs when run after a
+predecessor leaks a connection / vfs handle / atexit hook into the same
+`tclsh` interpreter.  Tracked as 9.4.divbug.42.
+
+251..500 slice (all pas-skip-baseline; new ground truth):
+- PASS = **129**, FAIL = **121** (no prior tag to compare against).
+
+After STATUS.txt retag the totals across the 500 swept rows are
+**280 pas-strict / 220 pas-soft / 0 pas-skip-leftover**.
+
+Of the 220 FAILs, the dominant single bucket remains **harness gap**
+(no engine work needed) — `fts3_common.tcl` missing from the staged
+tcl shim directory accounts for ~15 fts3*/fts4* failures alone; a
+further ~40 failures cite missing `sqlite3_*` test-util commands
+(`sqlite3_bind_*`, `sqlite3_create_function`, `sqlite3_step`,
+`hexio_*`, `testvfs`, `sqlite3_normalize`, `sqlite3_mmap_warm`,
+`sqlite3_multiplex_initialize`, `sqlite3_soft_heap_limit`,
+`sqlite3_get_autocommit`, `sqlite3_reset_auto_extension`, …) all
+queued under 9.4.6.q.  Engine clusters surfaced are listed below as
+9.4.divbug.42..56.
+
+| Cluster (new)                                     | Approx tests |
+|---------------------------------------------------|--------------|
+| .42 sweep-state cross-test contamination          | 1            |
+| .43 ORDER BY NULLS FIRST/LAST ignored             | nulls1 family|
+| .44 indexed MIN/MAX + IN fast-path → 0/empty      | ~10          |
+| .45 HAVING with non-aggregate predicate           | having-3.x   |
+| .46 LIMIT + subquery / DESC mis-clamp             | limit*       |
+| .47 numeric `_` digit-separator parser gap        | literal,literal2|
+| .48 hex-literal overflow detection / error text   | hexlit       |
+| .49 generated-column codegen value/type loss      | gencol1      |
+| .50 JSON float formatting (`1` vs `1.0`, `1E99`)  | json101      |
+| .51 JSON error-message text / quoting             | json103/5/9  |
+| .52 JSON `subtype()` / sqlite_subtype unported    | json102      |
+| .53 parser emits `near "token"` placeholder       | fuzz2        |
+| .54 ORDER BY DESC compound mis-ordering           | orderby6/9/A |
+| .55 EQP detail-string divergences (DISTINCT btree/COVERING INDEX) | orderby5,indexedby,indexexpr1,index8 |
+| .56 LIKE default-collation case-folding           | like         |
+| .57 sqlite3_open_v2 readonly-mode not enforced    | openv2       |
+| .58 CREATE INDEX missing-column error gate        | index-2.1b   |
+| .59 JOIN USING/NATURAL alias column resolution    | joinC        |
+| .60 Tcl-bridge integer→REAL coercion              | keyword1     |
+| .61 fts3_common.tcl shim missing (harness)        | ~15 fts3/4   |
+
+(Buckets .42..61 listed in tasklist.md under Phase 9.4 divbug ledger; the
+top-frequency engine root is .44 — indexed MIN/MAX fast paths returning
+0/empty — which alone accounts for ~10 cross-test failures.)
