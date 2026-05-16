@@ -2264,8 +2264,18 @@ begin
   { Open the file (os_unix.c ~6678) }
   fd := FpOpen(zName, openFlags, SQLITE_DEFAULT_FILE_PERMISSIONS);
 
-  { Retry as read-only if read-write open failed (os_unix.c ~6693) }
+  { Retry as read-only if read-write open failed (os_unix.c ~6689..6696).
+    Faithful port: mutate the *caller-visible* `flags` to drop READWRITE|CREATE
+    and set READONLY, so that pOutFlags^ (line below) and the cached
+    pPreallocatedUnused^.flags reflect the actual open mode.  Without this,
+    pager.c's `readOnly := (fout and SQLITE_OPEN_READONLY) <> 0` reads 0 on a
+    chmod-444 file, BTS_READ_ONLY is never set in btreeOpen, and a later write
+    attempt trips SQLITE_IOERR_LOCK ($F0A=3850) at pagerLockDb instead of the
+    expected SQLITE_READONLY → "attempt to write a readonly database"
+    (9.4.divbug.32). }
   if (fd < 0) and isReadWrite and (fpgeterrno <> ESysEISDIR) then begin
+    flags     := (flags and not (SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE))
+                 or SQLITE_OPEN_READONLY;
     openFlags := (openFlags and not (O_RDWR or O_CREAT)) or O_RDONLY;
     fd := FpOpen(zName, openFlags, SQLITE_DEFAULT_FILE_PERMISSIONS);
     if fd >= 0 then
