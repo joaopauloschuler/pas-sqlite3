@@ -6905,8 +6905,19 @@ end;
 { --- stub helpers needed by OP_Halt and abort path --- }
 
 function sqlite3ErrStr(rc: i32): PAnsiChar;
+{ Port of main.c:1648.  Match the C two-phase lookup: handle the
+  extended ABORT_ROLLBACK / ROW / DONE codes first, otherwise mask
+  off the high bits before consulting the primary-code table.
+  9.4.divbug.71: previously this routine returned "unknown error" for
+  SQLITE_ABORT_ROLLBACK because the bare `case` matched neither the
+  extended value nor any of the primary codes. }
 begin
   case rc of
+    SQLITE_ABORT_ROLLBACK: begin Result := 'abort due to ROLLBACK'; Exit; end;
+    SQLITE_ROW:            begin Result := 'another row available'; Exit; end;
+    SQLITE_DONE:           begin Result := 'no more rows available'; Exit; end;
+  end;
+  case (rc and $FF) of
     SQLITE_OK:       Result := 'not an error';
     SQLITE_ERROR:    Result := 'SQL logic error';
     SQLITE_INTERNAL: Result := 'internal SQLite error';
@@ -6933,9 +6944,7 @@ begin
     SQLITE_NOTADB:   Result := 'file is not a database';
     SQLITE_NOTICE:   Result := 'notification message';
     SQLITE_WARNING:  Result := 'warning message';
-    SQLITE_ROW:      Result := 'another row available';
-    SQLITE_DONE:     Result := 'no more rows available';
-  else                Result := 'unknown error';
+  else               Result := 'unknown error';
   end;
 end;
 
@@ -7852,6 +7861,22 @@ var
   pCycleOp: PVdbeOp;
   t0Cycle:  u64;
   {$ENDIF}
+  { OP_TypeCheck locals (vdbe.c:3305) — 9.4.divbug.71.
+    PTable is an opaque Pointer in vdbe.pas; we reach into TTable/TColumn
+    via the byte-offset pattern used elsewhere in this file (sizeof TColumn
+    = 16, TTable fields zName@0, aCol@8, nCol@54). }
+  pTabBaseTC: Pu8;            { TTable base pointer }
+  aColBaseTC: Pu8;            { aCol base pointer (=pTabBaseTC + 8 deref) }
+  pColTC:     Pu8;            { current TColumn entry }
+  zTabNameTC: PAnsiChar;
+  zColNameTC: PAnsiChar;
+  iTC, nColTC, eCTypeTC: i32;
+  affTC:      u8;
+  colFlagsTC: u16;
+  typeFlagsTC: u8;
+  zMemTypeTC: PAnsiChar;
+  zStdTypeTC: PAnsiChar;
+  zErrMsgTC:  PAnsiChar;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -11353,9 +11378,112 @@ begin
       end;
     end;
 
-    { ────── OP_TypeCheck ────── (vdbe.c:3305) — deferred }
+    { ────── OP_TypeCheck ────── (vdbe.c:3305) — 9.4.divbug.71
+      Verify the values in registers P1..P1+P2-1 conform to the column
+      types of the STRICT table P4.  On mismatch emit
+      "cannot store <type> value in <COLTYPE> column <tbl>.<col>" and
+      return SQLITE_CONSTRAINT_DATATYPE.
+
+      Field offsets (verified against passqlite3codegen.TTable / TColumn):
+        TTable:   zName@0(ptr) aCol@8(ptr) nCol@54(i16)
+        TColumn:  zCnName@0(ptr) typeFlags@8(u8) affinity@9(u8)
+                  colFlags@14(u16);  sizeof TColumn = 16
+        eCType  = (typeFlags >> 4) & 0xF   (1=ANY 2=BLOB 3=INT 4=INTEGER
+                                            5=REAL 6=TEXT)
+        COLFLAG_GENERATED = $0060 (STORED|VIRTUAL); COLFLAG_VIRTUAL = $0020 }
     OP_TypeCheck: begin
-      { Type checking requires table schema (Phase 6) }
+      pTabBaseTC := Pu8(pOp^.p4.pTab);
+      aColBaseTC := Pu8(PPointer(pTabBaseTC + 8)^);
+      pIn1       := @aMem[pOp^.p1];
+      if pOp^.p3 < 2 then begin
+        iTC    := 0;
+        nColTC := PSmallInt(pTabBaseTC + 54)^;
+      end else begin
+        iTC    := pOp^.p3 - 2;
+        nColTC := iTC + 1;
+      end;
+      zErrMsgTC := nil;
+      eCTypeTC  := -1;
+      while iTC < nColTC do begin
+        pColTC      := aColBaseTC + (iTC * 16);
+        colFlagsTC  := Pu16(pColTC + 14)^;
+        if ((colFlagsTC and $0060) <> 0) and (pOp^.p3 < 2) then begin
+          if (colFlagsTC and $0020) <> 0 then begin
+            Inc(iTC);
+            Continue;
+          end;
+          if pOp^.p3 <> 0 then begin
+            Inc(pIn1);
+            Inc(iTC);
+            Continue;
+          end;
+        end;
+        affTC := Pu8(pColTC + 9)^;
+        applyAffinity(pIn1, AnsiChar(affTC), enc);
+        eCTypeTC := -1;
+        if (pIn1^.flags and MEM_Null) = 0 then begin
+          typeFlagsTC := Pu8(pColTC + 8)^;
+          eCTypeTC := (typeFlagsTC shr 4) and $0F;
+          case eCTypeTC of
+            2: { COLTYPE_BLOB }
+              if (pIn1^.flags and MEM_Blob) <> 0 then eCTypeTC := -1;
+            3, 4: { COLTYPE_INT / INTEGER }
+              if (pIn1^.flags and MEM_Int) <> 0 then eCTypeTC := -1;
+            6: { COLTYPE_TEXT }
+              if (pIn1^.flags and MEM_Str) <> 0 then eCTypeTC := -1;
+            5: begin { COLTYPE_REAL }
+              if (pIn1^.flags and MEM_Int) <> 0 then begin
+                if (pIn1^.u.i <= 140737488355327) and
+                   (pIn1^.u.i >= -140737488355328) then begin
+                  pIn1^.flags := pIn1^.flags or MEM_IntReal;
+                  pIn1^.flags := pIn1^.flags and not u16(MEM_Int);
+                end else begin
+                  pIn1^.u.r   := Double(pIn1^.u.i);
+                  pIn1^.flags := pIn1^.flags or MEM_Real;
+                  pIn1^.flags := pIn1^.flags and not u16(MEM_Int);
+                end;
+                eCTypeTC := -1;
+              end else if (pIn1^.flags and (MEM_Real or MEM_IntReal)) <> 0 then
+                eCTypeTC := -1;
+            end;
+          else
+            eCTypeTC := -1;  { COLTYPE_ANY and any other: accept anything }
+          end;
+        end;
+        if eCTypeTC >= 0 then Break;  { mismatch — pIn1, iTC pin error site }
+        Inc(pIn1);
+        Inc(iTC);
+      end;
+      if eCTypeTC >= 0 then begin
+        { vdbeMemTypeName: SQLITE_INTEGER=1..SQLITE_NULL=5 }
+        case sqlite3_value_type(pIn1) of
+          1: zMemTypeTC := 'INT';
+          2: zMemTypeTC := 'REAL';
+          3: zMemTypeTC := 'TEXT';
+          4: zMemTypeTC := 'BLOB';
+        else
+          zMemTypeTC := 'NULL';
+        end;
+        case eCTypeTC of
+          1: zStdTypeTC := 'ANY';
+          2: zStdTypeTC := 'BLOB';
+          3: zStdTypeTC := 'INT';
+          4: zStdTypeTC := 'INTEGER';
+          5: zStdTypeTC := 'REAL';
+          6: zStdTypeTC := 'TEXT';
+        else
+          zStdTypeTC := '';
+        end;
+        zTabNameTC := PPAnsiChar(pTabBaseTC + 0)^;
+        zColNameTC := PPAnsiChar(pColTC + 0)^;
+        zErrMsgTC := sqlite3MPrintf(Psqlite3db(db),
+          'cannot store %s value in %s column %s.%s',
+          [zMemTypeTC, zStdTypeTC, zTabNameTC, zColNameTC]);
+        sqlite3VdbeError(v, zErrMsgTC);
+        sqlite3DbFree(db, zErrMsgTC);
+        rc := SQLITE_CONSTRAINT_DATATYPE;
+        goto abort_due_to_error;
+      end;
     end;
 
     { ────── OP_PureFunc ────── — same as OP_Function (already handled) }

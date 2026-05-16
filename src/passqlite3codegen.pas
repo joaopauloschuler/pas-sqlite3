@@ -42179,6 +42179,10 @@ var
   pIdxRD: PIndex2;
   nPkRD, nNewRD, iRD, jRD, kRD: i32;
   isDupRD: Boolean;
+  { 9.4.divbug.71 STRICT arm }
+  pCol_eTC:    PColumn;
+  eCTypeStr:   i32;
+  zStrictErrTC: PAnsiChar;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -42256,6 +42260,42 @@ begin
       sqlite3ErrorMsg(pParse,
         PAnsiChar('must have at least one non-generated column'));
       Exit;
+    end;
+  end;
+
+  { STRICT-table arm — port of build.c:2686..2713 (9.4.divbug.71).
+    Without this, TF_Strict never reaches pTab^.tabFlags, so
+    sqlite3TableAffinity skips its OP_TypeCheck branch and INSERTs of
+    wrong-typed values into STRICT tables silently succeed. }
+  if (tabOpts and TF_Strict) <> 0 then begin
+    pTab^.tabFlags := pTab^.tabFlags or TF_Strict;
+    for ii := 0 to pTab^.nCol - 1 do begin
+      pCol_eTC := @pTab^.aCol[ii];
+      eCTypeStr := (pCol_eTC^.typeFlags shr 4) and $0F;
+      if eCTypeStr = COLTYPE_CUSTOM then begin
+        if (pCol_eTC^.colFlags and COLFLAG_HASTYPE) <> 0 then
+          zStrictErrTC := sqlite3MPrintf(db,
+            'unknown datatype for %s.%s: "%s"',
+            [pTab^.zName, pCol_eTC^.zCnName,
+             sqlite3ColumnType(pCol_eTC, PAnsiChar(''))])
+        else
+          zStrictErrTC := sqlite3MPrintf(db,
+            'missing datatype for %s.%s',
+            [pTab^.zName, pCol_eTC^.zCnName]);
+        sqlite3ErrorMsg(pParse, zStrictErrTC);
+        sqlite3DbFree(db, zStrictErrTC);
+        Exit;
+      end else if eCTypeStr = COLTYPE_ANY then begin
+        pCol_eTC^.affinity := AnsiChar(SQLITE_AFF_BLOB);
+      end;
+      if ((pCol_eTC^.colFlags and COLFLAG_PRIMKEY) <> 0)
+         and (pTab^.iPKey <> ii)
+         and ((pCol_eTC^.typeFlags and $0F) = OE_None) then
+      begin
+        pCol_eTC^.typeFlags :=
+          (pCol_eTC^.typeFlags and $F0) or u8(OE_Abort);
+        pTab^.tabFlags := pTab^.tabFlags or TF_HasNotNull;
+      end;
     end;
   end;
 

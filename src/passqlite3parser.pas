@@ -1221,8 +1221,17 @@ procedure runParser_free(p: Pointer); external 'c' name 'free';
   sqlite3ErrStr[] verbatim).  Local name avoids clashing with the
   vdbe-side symbol when both are in the same final binary. }
 function runParser_errStr(rc: i32): PAnsiChar;
+{ 9.4.divbug.71: handle extended SQLITE_ABORT_ROLLBACK before mask-and-lookup,
+  matching main.c:1648.  Previously the bare-value case statement neither
+  matched the extended code nor any primary code, so callers reported
+  "unknown error" for aborted-stmt rollbacks. }
 begin
   case rc of
+    SQLITE_ABORT_ROLLBACK: begin Result := 'abort due to ROLLBACK'; Exit; end;
+    SQLITE_ROW:            begin Result := 'another row available'; Exit; end;
+    SQLITE_DONE:           begin Result := 'no more rows available'; Exit; end;
+  end;
+  case (rc and $FF) of
     SQLITE_OK:        Result := 'not an error';
     SQLITE_ERROR:     Result := 'SQL logic error';
     SQLITE_INTERNAL:  Result := 'internal SQLite error';
@@ -1249,8 +1258,6 @@ begin
     SQLITE_NOTADB:    Result := 'file is not a database';
     SQLITE_NOTICE:    Result := 'notification message';
     SQLITE_WARNING:   Result := 'warning message';
-    SQLITE_ROW:       Result := 'another row available';
-    SQLITE_DONE:      Result := 'no more rows available';
   else                Result := 'unknown error';
   end;
 end;
