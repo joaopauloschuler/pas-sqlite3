@@ -24364,6 +24364,19 @@ begin
   begin
     Assert(pLimit^.op = TK_LIMIT);
     Assert(pLimit^.pLeft <> nil);
+    { 9.4.divbug.72 — reject row-value LIMIT / OFFSET vectors before
+      attempting to code them.  C raises this from inside sqlite3ExprCode's
+      TK_VECTOR arm (expr.c:5597..5600); in Pas the LIMIT path bypasses that
+      arm (the LIMIT expr is evaluated against an integer register without
+      first descending into TK_VECTOR), so without this explicit gate
+      `LIMIT (1,2)` is accepted silently — see expr.c:5597..5600 +
+      select.c:2538..2548. }
+    if (sqlite3ExprIsVector(pLimit^.pLeft) <> 0)
+       or ((pLimit^.pRight <> nil) and (sqlite3ExprIsVector(pLimit^.pRight) <> 0)) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Exit;
+    end;
     Inc(pParse^.nMem);
     iLimit    := pParse^.nMem;
     p^.iLimit := iLimit;
@@ -29937,6 +29950,22 @@ begin
     Falls back to the stub for non-constant LIMIT until that lands. }
   if (p^.pLimit <> nil) and (not isExists) then
   begin
+    { 9.4.divbug.72 — row-value LIMIT / OFFSET is illegal; C raises this
+      from sqlite3ExprCode TK_VECTOR arm (expr.c:5597..5600).  Emit the
+      diagnostic *before* the non-constant LIMIT bail so the error isn't
+      silently swallowed by the SQLITE_OK exit below. }
+    if (p^.pLimit^.pLeft <> nil)
+       and (sqlite3ExprIsVector(p^.pLimit^.pLeft) <> 0) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Result := SQLITE_ERROR; Exit;
+    end;
+    if (p^.pLimit^.pRight <> nil)
+       and (sqlite3ExprIsVector(p^.pLimit^.pRight) <> 0) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Result := SQLITE_ERROR; Exit;
+    end;
     if (p^.pLimit^.pLeft = nil)
        or (sqlite3ExprIsInteger(p^.pLimit^.pLeft, nil, pParse) = 0) then
     begin Result := SQLITE_OK; Exit; end;
@@ -31895,6 +31924,17 @@ begin
   end
   else if (not isExists) and (p^.pLimit <> nil) then
   begin
+    { 9.4.divbug.72 — reject row-value LIMIT / OFFSET vectors here too;
+      this inline pre-WHERE arm bypasses computeLimitRegisters' guard.
+      C raises this via expr.c:5597 (sqlite3ExprCode TK_VECTOR arm). }
+    if (sqlite3ExprIsVector(p^.pLimit^.pLeft) <> 0)
+       or ((p^.pLimit^.pRight <> nil)
+           and (sqlite3ExprIsVector(p^.pLimit^.pRight) <> 0)) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Result := 1;
+      Exit;
+    end;
     { Non-Exists constant-integer LIMIT — mirrors the
       sqlite3ExprIsInteger arm of computeLimitRegisters
       (select.c:2520..2530).  Emits OP_Integer N, iLimit before the
