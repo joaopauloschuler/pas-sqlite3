@@ -3035,6 +3035,42 @@ begin
   if clientData = nil then ;
 end;
 
+{ test1.c:7249..7276 — file_control_reservebytes DB N.  Thin Tcl wrapper
+  over sqlite3_file_control(db, "main", SQLITE_FCNTL_RESERVE_BYTES, &n).
+  Returns the symbolic rc name (e.g. "SQLITE_OK") via sqlite3ErrName.
+  9.4.divbug.63.b. }
+function file_control_reservebytes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  n:  cint;
+  rc: cint;
+begin
+  db := nil;
+  n  := 0;
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB N'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @n) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  rc := sqlite3_file_control(db, PAnsiChar('main'),
+    SQLITE_FCNTL_RESERVE_BYTES, @n);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(sqlite3ErrName(rc), -1));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -3211,6 +3247,9 @@ begin
     @database_may_be_corrupt, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('tcl_variable_type'),
     @tcl_variable_type, nil, nil);
+  { 9.4.divbug.63.b — file_control_reservebytes (test1.c:9258 / 7249..7276). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_reservebytes'),
+    @file_control_reservebytes, nil, nil);
   Result := TCL_OK;
 end;
 
