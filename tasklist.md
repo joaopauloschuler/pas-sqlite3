@@ -1727,12 +1727,28 @@ empty for the code under test.
 Persistent-mode `__AFL_LOOP` is orthogonal to the choice above
 and can be added later via a small C entry stub.
 
-- [ ] **13.1** AFL wiring.  `src/tests/fuzz/afl-driver.pas` wraps
+- [~] **13.1** AFL wiring.  `src/tests/fuzz/afl-driver.pas` wraps
   9.3.1 for `afl-fuzz` (read input from stdin, write to a tmp
   file, invoke the in-process harness, return AFL-compatible exit
   codes).  Stand up instrumentation route (1), (2), or (3) above;
   document the choice in `src/tests/fuzz/README.md`.  Skip
   gracefully if AFL isn't installed — script must self-report.
+  Landed: src/tests/fuzz/afl-driver.pas (slurps stdin, mkstemp-equiv
+  in /tmp, FpFork+FpExecv into bin/TestFuzzDiff, propagates rc /
+  re-raises signal-death as 128+N for AFL crash bucketing), build-afl.sh
+  (route-1 → route-2 → route-3 fallback chain, AFL-missing self-report
+  → exit 0), README.md (route table + install + run recipe + 9.3.2
+  smoke baseline citation).  Smoke verified on dev host (no AFL):
+  default run prints self-report and exits 0; FORCE_BUILD=1 picks
+  route (3) and compiles; driver returns rc=3 on empty stdin and
+  rc=0 (PASS) on 4 KiB of fuzzdata1.db.  Tmp files cleaned up
+  post-exec.  Cite: src/tests/fuzz/afl-driver.pas, build-afl.sh,
+  README.md.
+  - [ ] **13.1.unverified** Re-run build-afl.sh on a host with afl-fuzz
+    installed and confirm route (1) `afl-as` wedge actually completes
+    a smoke-fuzz iteration (`AFL_BENCH_JUST_ONE=1 afl-fuzz …`).  Today
+    untested — dev host lacks afl-fuzz; only the AFL-missing self-report
+    and the route-3 fallback compile path were exercised.
 
 - [ ] **13.2** Crash-vs-divergence classifier.  Triage helper
   that separates (a) Pascal crash, (b) C crash, (c) silent
