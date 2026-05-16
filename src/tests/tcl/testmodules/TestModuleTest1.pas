@@ -135,6 +135,129 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:6191..6325 — fpnum_compare STRING1 STRING2.
+  Fuzzy float-string equality used by tester.tcl do_test as a fallback
+  when [string compare] fails (tester.tcl:789..792).  Compares two
+  whitespace-separated token streams; for floating-point tokens the
+  match tolerates up to ~15 significant digits of drift (rounding-up
+  on either side, exponent zero-padding "e+9" vs "e+09").  This is the
+  mechanism by which fpconv1.test default-3.3 etc. accept either
+  17-digit (Grisu / FP_DIGITS=17) or 15-digit (FP_DIGITS=15) renderings
+  of the same underlying double — without it our exact-string compare
+  diverges from upstream even though the SQLite engine renders
+  byte-identically.  Surfaced 9.4.divbug.35. }
+function fpnum_compare(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zA, zB: PAnsiChar;
+  i, j:   cint;
+  nDigit: cint;
+  function IsSp(c: AnsiChar): Boolean; inline;
+  begin Result := (c = ' ') or (c = #9) or (c = #10) or (c = #11)
+                              or (c = #12) or (c = #13);
+  end;
+  function IsDig(c: AnsiChar): Boolean; inline;
+  begin Result := (c >= '0') and (c <= '9'); end;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STRING1 STRING2'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zA := Tcl_GetString(objv[1]);
+  zB := Tcl_GetString(objv[2]);
+  i := 0; j := 0;
+  while True do begin
+    while IsSp(zA[i]) do Inc(i);
+    while IsSp(zB[j]) do Inc(j);
+    if zA[i] <> zB[j] then Break;
+    if (zA[i] = '-') and IsDig(zA[i+1]) then begin Inc(i); Inc(j); end;
+    if not IsDig(zA[i]) then begin
+      while (not IsSp(zA[i])) and (zA[i] <> #0) and (zA[i] = zB[j]) do
+      begin Inc(i); Inc(j); end;
+      if zA[i] <> zB[j] then Break;
+      if IsSp(zA[i]) then Continue;
+      Break;
+    end;
+    nDigit := 0;
+    while (zA[i] = zB[j]) and IsDig(zA[i]) do
+    begin Inc(i); Inc(j); Inc(nDigit); end;
+    if zA[i] <> zB[j] then Break;
+    if zA[i] = #0 then Break;
+    if (zA[i] = '.') and (zB[j] = '.') then begin
+      Inc(i); Inc(j);
+      while (zA[i] = zB[j]) and IsDig(zA[i]) do
+      begin Inc(i); Inc(j); Inc(nDigit); end;
+      if zA[i] = #0 then begin
+        while (zB[j] = '0') or (IsDig(zB[j]) and (nDigit >= 15)) do
+        begin Inc(j); Inc(nDigit); end;
+        Break;
+      end;
+      if zB[j] = #0 then begin
+        while (zA[i] = '0') or (IsDig(zA[i]) and (nDigit >= 15)) do
+        begin Inc(i); Inc(nDigit); end;
+        Break;
+      end;
+      if IsSp(zA[i]) and IsSp(zB[j]) then Continue;
+      if IsDig(zA[i]) and IsDig(zB[j]) then begin
+        if (zA[i] = AnsiChar(Ord(zB[j])+1))
+           and (not IsDig(zA[i+1])) and IsDig(zB[j+1]) then begin
+          Inc(j);
+          while zB[j] = '9' do begin Inc(j); Inc(nDigit); end;
+          if (nDigit < 14) and ((not IsDig(zB[j])) or (zB[j] < '5'))
+            then Break;
+          while IsDig(zB[j]) do Inc(j);
+          Inc(i);
+        end else if (zB[j] = AnsiChar(Ord(zA[i])+1))
+                 and (not IsDig(zB[j+1])) and IsDig(zA[i+1]) then begin
+          Inc(i);
+          while zA[i] = '9' do begin Inc(i); Inc(nDigit); end;
+          if (nDigit < 14) and ((not IsDig(zA[i])) or (zA[i] < '5'))
+            then Break;
+          while IsDig(zA[i]) do Inc(i);
+          Inc(j);
+        end else
+          Break;
+      end else if (not IsDig(zA[i])) and IsDig(zB[j]) then begin
+        while zB[j] = '0' do begin Inc(j); Inc(nDigit); end;
+        if nDigit < 15 then Break;
+        while IsDig(zB[j]) do Inc(j);
+      end else if (not IsDig(zB[j])) and IsDig(zA[i]) then begin
+        while zA[i] = '0' do begin Inc(i); Inc(nDigit); end;
+        if nDigit < 15 then Break;
+        while IsDig(zA[i]) do Inc(i);
+      end else
+        Break;
+    end;
+    if (zA[i] = 'e') and (zB[j] = 'e') then begin
+      Inc(i); Inc(j);
+      if ((zA[i] = '+') or (zA[i] = '-')) and (zB[j] = zA[i]) then
+      begin Inc(i); Inc(j); end;
+      if zA[i] <> zB[j] then begin
+        if (zA[i] = '0') and (zA[i+1] = zB[j]) then Inc(i);
+        if (zB[j] = '0') and (zB[j+1] = zA[i]) then Inc(j);
+      end;
+      while (zA[i] = zB[j]) and IsDig(zA[i]) do
+      begin Inc(i); Inc(j); end;
+      if zA[i] <> zB[j] then Break;
+      if zA[i] = #0 then Break;
+      Continue;
+    end;
+    { Fall through: C loops back to the top of `while(1)` to handle the
+      next token (e.g. after a plain integer like "-21" the next char is
+      whitespace, which the loop head skips before matching the next
+      token).  Earlier draft `Break`d here which mishandled multi-token
+      inputs whose first token was a non-floating integer. }
+    Continue;
+  end;
+  while IsSp(zA[i]) do Inc(i);
+  while IsSp(zB[j]) do Inc(j);
+  if (zA[i] = #0) and (zB[j] = #0) then
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(1))
+  else
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(0));
+  Result := TCL_OK;
+end;
+
 { test1.c:8617..8680 — test_sqlite3_db_config.
   tclcmd:  sqlite3_db_config DB SETTING ?VALUE?
   Every setting in the table is a boolean/int config slot, so the port
@@ -972,6 +1095,10 @@ begin
     @get_sqlite_pointer, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
+  { 9.4.divbug.35 — fpnum_compare for fuzzy float-string equality
+    fallback used by tester.tcl do_test (tester.tcl:789..792). }
+  Tcl_CreateObjCommand(interp, PChar('fpnum_compare'),
+    @fpnum_compare, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('atomic_batch_write'),
     @test_atomic_batch_write, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('load_static_extension'),

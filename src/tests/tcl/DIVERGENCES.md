@@ -552,16 +552,33 @@ materialise the requested size (file size matches C oracle); post-
 schema writes are silently rejected (BTS_PAGESIZE_FIXED) matching C.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.35 — Float-to-text precision artifacts (`-1.1099999999999999`)
+## 9.4.divbug.35 — Float-to-text precision artifacts — FIXED
 
-Affects: 2 tests (`fpconv1.test` fpconv1-1.2/1.3; `default.test`
-default-3.3 — `9.22337203685478e+18` got `9.223372036854776e+18`).
-Symptom: float-to-string conversion of `-1.11` yields
-`-1.1099999999999999` instead of `-1.11`; large doubles get one extra
-digit of mantissa.  Likely the Pascal `printf` `%!.15g` / `%.17g`
-shortest-round-trip path uses `FloatToStrF(ffGeneral,15,…)` which
-doesn't implement Grisu/Dragon4.  C reference: util.c
-`sqlite3_str_appendf` `%g` arm, printf.c `etFLOAT`.
+Triage revealed this was NOT a printf-port bug.  `passqlite3printf`'s
+etFLOAT / `%!.*g` arm already honours `db->nFpDigit` and renders
+byte-identically to the C oracle:
+```
+$ LD_LIBRARY_PATH=src bin/passqlite3 :memory: \
+    ".dbconfig fp_digits 15
+     SELECT 1.23 - 2.34;"
+-1.11               # ← matches C oracle exactly
+```
+The real divergence lived in the Tcl harness.  `tester.tcl:789..792`
+falls back from exact string compare to a C-side fuzzy-equality
+helper `fpnum_compare` (test1.c:6191..6325) which tolerates ≤15-digit
+mantissa drift and "e+9" vs "e+09" exponent zero-padding.  Without it,
+fpconv1-1.2/1.3 (FP_DIGITS=15 → "-1.11") and default-3.3
+("9.22337203685478e+18" vs the 17-digit Grisu rendering
+"9.223372036854776e+18") failed exact-string compare even though the
+underlying SQLite double is bit-identical.
+
+Fix (TestModuleTest1.pas:138..254 + tester_min.tcl:144..162): port
+`fpnum_compare` verbatim from test1.c, register the Tcl command in
+`Sqlitetest1_Init`, and wire the fallback into our `do_test`'s
+post-string-compare arm.  Reproducer fpconv1.test now PASS 4/4;
+default-3.3 PASS (the other default.test failures are tracked as
+9.4.divbug.40 — DEFAULT error column-name drop / affinity ordering —
+and are unaffected by this fix).
 Surfaced by: 9.4.4.e sweep.
 
 ## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored — FIXED

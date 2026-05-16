@@ -144,8 +144,18 @@ proc do_test {name cmd expected} {
   } else {
     set ok [expr {[string compare $result $expected]==0}]
     # Upstream falls back to fpnum_compare when string compare fails
-    # (tester.tcl:789..792); we don't have that helper ported, so the
-    # exact-compare result stands.
+    # (tester.tcl:789..792).  fpnum_compare is the C Tcl command
+    # registered by Sqlitetest1_Init (test1.c:6191..6325, ported in
+    # TestModuleTest1.pas) that does fuzzy 15-digit float-string
+    # equality so e.g. -1.11 matches -1.1099999999999999 and
+    # 9.22337203685478e+18 matches 9.2233720368547758e+18.  Without
+    # this, exact-string compare on float-bearing results diverges
+    # from upstream even when SQLite renders byte-identically (9.4.divbug.35).
+    if {!$ok} {
+      if {[llength [info commands fpnum_compare]]} {
+        set ok [fpnum_compare $result $expected]
+      }
+    }
   }
   if {$ok} {
     puts " Ok"

@@ -318,7 +318,7 @@ pas-strict	../sqlite3/test/fkey8.test	-
 pas-skip	../sqlite3/test/fkey_malloc.test	unswept
 pas-soft	../sqlite3/test/fordelete.test	9.4.divbug.41-residual
 pas-soft	../sqlite3/test/format4.test	9.4.divbug.34
-pas-soft	../sqlite3/test/fpconv1.test	9.4.divbug.35
+pas-strict	../sqlite3/test/fpconv1.test	-
 pas-strict	../sqlite3/test/fts-9fd058691.test	-
 pas-strict	../sqlite3/test/fts3.test	-
 pas-strict	../sqlite3/test/fts3aa.test	-
