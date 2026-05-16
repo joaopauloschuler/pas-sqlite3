@@ -26,7 +26,12 @@ if [ "${SQLITE_DEBUG:-0}" = "1" ];                  then DEBUG_FLAGS="$DEBUG_FLA
 if [ "${SQLITE_ENABLE_STMT_SCANSTATUS:-0}" != "0" ]; then DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STMT_SCANSTATUS"; fi
 if [ "${STAT4:-0}" != "0" ];                         then DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STAT4"; fi
 
-FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
+# Phase 11.9: profiling hand-off. -gl adds line-info, -gw3 emits DWARF v3 so
+# perf / valgrind-callgrind can resolve mangled FPC symbols → src/*.pas:line.
+# The size hit is modest (~10-20%) and runtime cost is zero.
+PROFILE_FLAGS="-gl -gw3"
+
+FPC_FLAGS="-O3 $DEBUG_FLAGS $PROFILE_FLAGS -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 echo "Compiling passpeedtest1.pas ..."
 fpc $FPC_FLAGS "$SCRIPT_DIR/passpeedtest1.pas"
@@ -57,6 +62,13 @@ echo "Compiling PragmaMatrix.pas ..."
 # oracle per cell, parses TOTAL, emits bench/pragma_matrix.txt.
 fpc -O2 -FE$BIN_DIR "$SCRIPT_DIR/PragmaMatrix.pas"
 echo "PragmaMatrix compiled -> $BIN_DIR/PragmaMatrix"
+
+echo "Compiling AnnotateProfile.pas ..."
+# AnnotateProfile (Phase 11.9): post-processes bench/perf_report.txt or
+# bench/callgrind.out, locates the matching Pascal source line, emits
+# bench/profile_top.md. Plain console program — no engine units linked.
+fpc -O2 -FE$BIN_DIR "$SCRIPT_DIR/AnnotateProfile.pas"
+echo "AnnotateProfile compiled -> $BIN_DIR/AnnotateProfile"
 
 # Clean compiled artefacts
 find "$SCRIPT_DIR" -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete

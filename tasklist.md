@@ -1500,11 +1500,15 @@ existing `speedtest.tcl` diff workflow keeps working.  Lives in
   table; the interesting result is *which knobs move the pas/c
   ratio*.
 
-- [ ] **11.9** Profiling hand-off to Phase 9.  Wrapper scripts that
+- [x] **11.9** Profiling hand-off to Phase 9.  Wrapper scripts that
   run `passpeedtest1` under `perf record` and
   `valgrind --tool=callgrind`, plus a small Pascal helper that
   annotates the resulting reports against `passqlite3*.pas` source
   lines.  Output of this task is the input of 9.1.
+  Landed: bench/profile_perf.sh, bench/profile_callgrind.sh,
+  src/bench/AnnotateProfile.pas (built via src/bench/build.sh).
+  Harness now compiles with -gl -gw3 DWARF for symbol→line.
+  Overrides: PROFILE_SIZE / PROFILE_TESTSET env vars.
 
 ---
 
