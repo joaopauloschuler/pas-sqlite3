@@ -18567,10 +18567,18 @@ begin
         if (isMatch <> 0)
            and ((obItems[i].fg.sortFlags and KEYINFO_ORDER_BIGNULL) <> 0) then
         begin
-          if j = i32(pLoop^.u.btree.nEq) then
-            pLoop^.wsFlags := pLoop^.wsFlags or WHERE_BIGNULL_SORT
-          else
-            isMatch := 0;
+          { 9.4.divbug.43: the C planner accepts BIGNULL ordering and the
+            wherecode emitter (wherecode.c:1933..1953 + 2030..2086 +
+            2134..2164 + where.c:7616..7620) generates a two-pass
+            NULL-then-non-NULL (or vice-versa) scan around regBignull/
+            addrBignull/OP_DecrJumpZero.  That two-pass codegen is not yet
+            ported (the assertion at codegen.pas:22592 explicitly defers
+            it).  Until it lands, refuse the index-satisfies-ORDER-BY
+            match whenever NULL ordering would diverge from the index's
+            natural NULL placement so the planner falls back to the
+            external sorter, which already honours sortFlags via
+            VdbeRecordCompare (btree.pas:3361). }
+          isMatch := 0;
         end;
         if isMatch <> 0 then
         begin
