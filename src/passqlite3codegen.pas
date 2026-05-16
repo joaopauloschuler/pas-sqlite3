@@ -43486,13 +43486,16 @@ begin
     { build.c:4216..4219 — convert TK_STRING to TK_ID, then resolve
       column references.  Under IN_RENAME_OBJECT this rewrites simple
       column references from TK_ID to TK_COLUMN so renameColumnExprCb
-      (TK_COLUMN gate) can match the indexed-column span.  Restricted to
-      rename mode here because the legacy zToken-based aiColumn lookup
-      below still relies on the pre-resolve identifier text. }
-    if InRenameObject(pParse) then begin
+      (TK_COLUMN gate) can match the indexed-column span.  Outside
+      rename mode we also run the resolve so that a bogus column name
+      (e.g. CREATE INDEX i ON t(f4) where f4 is not in t) emits the
+      "no such column: f4" diagnostic up-front, matching C's
+      `if(pParse->nErr) goto exit_create_index;` (9.4.divbug.58).
+      Skip on init.busy — schema-reload reparse should not re-resolve. }
+    if db^.init.busy = 0 then begin
       sqlite3StringToId(pColExpr);
-      if sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil) <> 0 then
-        goto exit_create_index;
+      sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil);
+      if pParse^.nErr <> 0 then goto exit_create_index;
     end;
     { 10.1.bug.108: peel any TK_COLLATE wrapper to expose the underlying
       column expression, and capture the wrapper's zToken as the index
@@ -43514,7 +43517,9 @@ begin
       a non-identifier expression u.zToken is NOT a valid pointer (e.g. an
       integer literal carries u.iValue under EP_IntValue) — dereferencing
       it segfaults (9.4.divbug.12).  Route such slots to XN_EXPR like C. }
-    if (pColExpr <> nil)
+    if (pColExpr <> nil) and (pColExpr^.op = TK_COLUMN) then
+      n := pColExpr^.iColumn
+    else if (pColExpr <> nil)
        and ((pColExpr^.op = TK_ID) or (pColExpr^.op = TK_STRING))
        and ((pColExpr^.flags and EP_IntValue) = 0) then
       n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken)
