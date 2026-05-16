@@ -89,121 +89,8 @@ delete-ish remaining) remain on divbug.5 and missing `db one`.
 ## 9.4.divbug.16 — `affinity3.test` segfaults — FIXED
 ## 9.4.divbug.17 — nested aggregate produces row-wise instead of folded result, then segfaults — FIXED
 ## 9.4.divbug.18 — WITHOUT ROWID virtual-table xUpdate codegen mis-handles DELETE (no-op) and UPDATE (segfault) — FIXED
-## Run summary (9.4.4.b.2 sweep)
-
-First fixed a driver regression: the 9.4.7.f per-test tmpdir
-isolation cd's tclsh into a throwaway dir, but `ProcessEntry` still
-handed `BuildScript` the *relative* manifest path — so every test
-SOURCE-ERROR'd in ~11 ms (a spurious 0/10/0).  Fix: `ExpandFileName`
-the path to absolute before `BuildScript`.  After that the sweep
-runs for real and is reproducible under `bin/TclTestDriver`.
-
-| Test            | 9.4.4.b            | 9.4.4.b.2          | Δ / divbug                         |
-|-----------------|--------------------|--------------------|------------------------------------|
-| select1.test    | CRASH @ 4.4        | FAIL (assert @6.22)| divbug.1 FIXED; new divbug.11 + .14 |
-| insert.test     | TIMEOUT (hang)     | FAIL 3/36          | divbug.7 FIXED; divbug.14/.15 left  |
-| update.test     | FAIL 34/128        | CRASH @ 17.10      | helpers/divbug.2/4 OK; new divbug.12|
-| delete.test     | FAIL 1/23          | FAIL 2/49          | runs further; divbug.15 + CTAS gap  |
-| index.test      | CRASH @ 3.3        | FAIL 11/101        | divbug.3/.8 FIXED; divbug.14 left   |
-| boundary1.test  | FAIL 1481/1511     | FAIL 888/1511      | divbug.10 FIXED (empty); new .13    |
-| cast.test       | PASS (vacuous)     | **PASS** (vacuous) | unchanged                          |
-| lastinsert.test | CRASH @ 1.1w       | **PASS** 6/6       | divbug.9 FIXED                      |
-| numcast.test    | FAIL 50/51         | **PASS** 51/51     | divbug.5 FIXED                      |
-| reindex.test    | PASS (vacuous)     | **PASS** (vacuous) | unchanged                          |
-
-PASS / FAIL / CRASH under 9.4.4.b.2 = **4 / 5 / 1** (under
-`bin/TclTestDriver`; the driver reports `update.test` as FAIL since
-the segfault is a nonzero exit — counted as CRASH here).  cast +
-reindex remain vacuous PASSes.
-
-Buckets CLOSED by the landed harness+engine fixes: divbug.1, .3,
-.5, .7, .8, .9 (and .10's empty-result symptom).  Buckets still
-OPEN / newly opened: divbug.2 (sibling .14), .4 (no longer fatal
-but error-text still off), .11, .12, .13, .14, .15.
-
-
-## Run summary (9.4.4.c sweep)
-
-Broadened the sweep to the **first 50 tcl-feature tests** in
-MANIFEST.txt order, run under `bin/TclTestDriver` (the relative-path
-fix from 9.4.4.b.2 in place).
-
-PASS / FAIL / SKIP = **41 / 9 / 0** (50 total, 6.6 s).
-
-The 9 FAILs break down as:
-
-| Test            | Verdict           | Bucket / cause                          |
-|-----------------|-------------------|-----------------------------------------|
-| affinity3.test  | CRASH (SIGSEGV)   | new **9.4.divbug.16**                   |
-| aggerror.test   | FAIL 6/6          | `sqlite3_connection_pointer` unported + |
-|                 |                   | divbug.14 (error text)                  |
-| aggfault.test   | FAIL (SOURCE-ERR) | `faultsim_save_and_close` unported      |
-| aggnested.test  | CRASH + wrong res | new **9.4.divbug.17**                   |
-| aggorderby.test | FAIL 3/29         | divbug.14 + `ORDER BY may not be used   |
-|                 |                   | with non-aggregate` not raised (.15 fam)|
-| all.test        | FAIL (SOURCE-ERR) | sources `permutations.test` (absent)    |
-| atof1.test      | FAIL 39998/40005  | `real2hex`/`hex2real` test SQL funcs    |
-|                 |                   | unported                                |
-| atof2.test      | FAIL (SOURCE-ERR) | `load_static_extension` unported        |
-| atomic.test     | FAIL (SOURCE-ERR) | `atomic_batch_write` unported           |
-
-Only **two** are genuine new engine divergences (divbug.16, .17);
-the other seven are unported test-only Tcl commands / SQL functions
-or a missing harness file — port-side follow-ups, not engine bugs.
-See STATUS.txt for the per-test pas-strict/soft/skip tags seeded
-from this run under 9.4.8.b.
-
 ### 9.4.6.q follow-up — test1.c command subset ported
-
-Ported `sqlite3_connection_pointer`, `sqlite3_db_config`,
-`atomic_batch_write`, `load_static_extension` (test1.c) into
-`testmodules/TestModuleTest1.pas`, plus the `real2hex` SQL scalar
-(test_func.c) and `faultsim_save_and_close` / `faultsim_restore` /
-`faultsim_restore_and_reopen` aliases in `tester_min.tcl`.  Of the 7
-non-engine FAILs above:
-
-- **atof2.test** — now **PASS** (0/4 errors); `load_static_extension
-  ieee754` wires the already-ported `passqlite3ieee754` unit.
-- **atomic.test** — now **PASS** (0/0; skips gracefully — VFS reports
-  no batch-atomic support); `atomic_batch_write` ported.
-- **aggfault.test** — `faultsim_save_and_close` unblocked; now fails
-  only on `do_faultsim_test` (full malloc-fault machinery, 9.4.2.g.13).
-- **aggerror.test** — `sqlite3_connection_pointer` unblocked; still
-  blocked on unported `sqlite3_create_aggregate` (separate test1.c
-  command, out of 9.4.6.q scope) + divbug.14.
-- **atof1.test** — `real2hex` exists and is reachable via
-  `load_static_extension real2hex`, but atof1.test invokes it directly
-  expecting `autoinstall_test_functions` (task 9.4.6.l.4); still
-  blocked on that.
-
-`hex2real` does not exist in upstream C — only `real2hex` is real;
-the tasklist mention of `hex2real` was spurious.
-
 ### 9.4.6.l.5 follow-up — `register_async_vtab` investigated → drop the bullet
-
-Investigated whether `register_async_vtab` (from `test_async.c`) can be
-ported. Findings:
-
-- `test_async.c` / any `test_async*` file does **not** exist anywhere
-  under `../sqlite3/` — checked `src/`, `test/`, `ext/`. The only
-  `*async*` file is `ext/wasm/api/sqlite3-opfs-async-proxy.c-pp.js`
-  (unrelated OPFS WASM proxy).
-- Grepping the entire `../sqlite3/` tree for `register_async_vtab`,
-  `register_async`, `test_async`, `asyncvfs` → **zero hits**.
-- No `.test` file calls `register_async_vtab`. The three test files
-  containing the substring `async` (`lock2.test`, `trans.test`,
-  `walblock.test`) only use the Tcl-core `flush_async_queue` event-loop
-  command / a prose comment — nothing to do with the async VFS vtab.
-- `src/tests/tcl/MANIFEST.txt` has no `async` reference; no tcl-feature
-  test we run is gated on `register_async_vtab`.
-
-Conclusion: the upstream async VFS (`test_async.c`) was removed from
-SQLite long ago (asynchronous I/O was deprecated). There is no source
-to port and nothing references the symbol. **Recommendation: drop the
-9.4.6.l.5 bullet from tasklist.md** — it is dead weight, not a porting
-gap. If a future SQLite version ever reintroduces it, the bullet can be
-re-added once `test_async.c` is present in `../sqlite3/src/`.
-
 ## 9.4.divbug.19 — table-qualified `rowid` alias not resolved
 
 Affects: 2 tests (`../sqlite3/test/boundary3.test`,
@@ -285,27 +172,6 @@ the impact is limited to EQP-asserting tests.
 Surfaced by: 9.4.4.d sweep.
 
 ## 9.4.divbug.24 — AUTOINCREMENT / `sqlite_sequence` double-create — FIXED
-
-Affects: 1 test (`../sqlite3/test/aggnested.test`, `aggnested-3.x`).
-Symptom (original): `aggnested-3.0`/`3.1` error `table sqlite_sequence
-already exists`; `aggnested-3.2`/`3.3` return row-wise instead of
-folded results (`[0 1 0 1 0 1]` vs `[1 0]`); `aggnested-3.11` SIGSEGVs.
-Root cause of the double-CREATE: Pascal `sqlite3CreateTable` did NOT
-port the C `strcmp(p->zName,"sqlite_sequence")==0 → pSchema->pSeqTab=p`
-arm (build.c:2967..2972).  The init.busy reparse of `sqlite_sequence`
-itself never pinned `pSchema^.pSeqTab`, so when the user's NEXT
-AUTOINCREMENT CREATE TABLE checked the early guard
-`pSchema^.pSeqTab = nil` (build.c:2925 equivalent) it tried to
-re-CREATE the shadow.  Fix: port build.c:2968..2970 verbatim into
-codegen.pas:40916+ — pin pSeqTab whenever the table being added under
-init.busy IS named `sqlite_sequence`.
-Status after fix: aggnested-3.0 / 3.1 now return correct rows
-(`{2 1}` / `{1 1}`).  Residual aggregate-mis-fold + segfault tracked
-as **9.4.divbug.24.b** — independent of sqlite_sequence (3.2 has no
-AUTOINCREMENT at all; reproduces folded-row count = group count
-instead of folded result; 3.11 still SIGSEGVs).
-Surfaced by: 9.4.4.d sweep (deferred from divbug.17).
-
 ## 9.4.divbug.24.b — aggregate sub-query in correlated GROUP BY mis-folds + segfault
 
 Affects: `../sqlite3/test/aggnested.test` `aggnested-3.1` (after .24
@@ -430,75 +296,9 @@ unblock the whole `corrupt*` family for triage.
 Newly assigned engine divbug clusters:
 
 ## 9.4.divbug.28 — EXPLAIN QUERY PLAN multi-table segfault — FIXED
-
-Fixed by gating the NRE per-row continuation path in DbEvalNextCmd
-(PasTclSqlite.pas:1111..1120) — the Tcl_NRAddCallback +
-Tcl_NREvalObj loop was the root cause, not the engine.  Once the
-script body for the first row returned, Tcl's NRE trampoline
-jumped to a stale function-pointer (rip landed in the stack page
-0x7fffffffXXXX), crashing every multi-row `db eval $sql { ... }`
-that the upstream `query_plan_graph` helper depends on.  Per the
-follow-up note at PasTclSqlite.pas:4269..4274, the per-row body
-was always meant to evaluate on the !DbUseNre() recursive
-Tcl_EvalObjEx path until the NRE continuation machinery is fully
-audited; the broken NRE branch was hot only because 9.4.2.x.1.d
-also wrote the inline NRE arm.  Forcing the recursive arm restores
-upstream's pre-NRE behaviour (tclsqlite.c:1992).  Archive.
-Surviving divergence in the same 4 tests is the ORDER BY EQP
-detail text — Pas always emits "USE TEMP B-TREE FOR ORDER BY"
-where C emits "FOR LAST [N] TERMS OF ORDER BY" when nOBSat>0
-(select.c:1705..1709 vs codegen.pas:31665); tracked separately
-as 9.4.divbug.41 below.
-
 ## 9.4.divbug.41 — EQP "TEMP B-TREE FOR ORDER BY" omits LAST-N-TERMS — FIXED
-
-Affected: residual sub-tests of eqp2.test, cost.test, fordelete.test,
-delete2.test (post-9.4.divbug.28).
-Symptom: Pas emitted `USE TEMP B-TREE FOR ORDER BY` where C emits
-`USE TEMP B-TREE FOR LAST TERM OF ORDER BY` (or
-`FOR LAST <n> TERMS OF ORDER BY` when nOBSat>0).
-Fix: codegen.pas:31663 now branches on `pWInfo^.nOBSat` and
-`p^.pOrderBy^.nExpr - nOBSat` to pick the LAST-TERM / LAST-N-TERMS /
-plain-ORDER-BY string, matching select.c:1702..1711.
-
 ## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER — FIXED
-
-Affects: 1 test (`collate1.test`, all sub-tests of section 1).
-Symptom: `INSERT INTO t VALUES(45, hex(45))` (where `hex` is a Tcl-
-registered SQL function returning `format 0x%X`) stored the TEXT
-result as INTEGER 281 / 45 instead of TEXT `'0x119'` / `'0x2D'`.
-Root cause: not in `applyAffinity` (the original triage was a red
-herring — the C-shell reproducer never reproduced).  The bug was in
-the Pascal Tcl bridge's `DbSqlFunc` auto-detect arm
-(src/tests/tcl/PasTclSqlite.pas:1654..1668).  C's tclsqlite.c:1108
-keys off `pVar->typePtr->name` — a plain string Tcl_Obj has type
-`"string"` and goes to the TEXT branch.  Pascal instead *probed*
-with `Tcl_GetWideIntFromObj`, which side-effects the Tcl_Obj into an
-int representation for strings like `"0x119"` because Tcl parses
-`0x`-prefixed integer literals — so every `hex(...)` result was
-promoted to SQLITE_INTEGER.
-Fix: add a minimal `Tcl_Obj` peek struct (refCount/bytes/length/
-typePtr only) plus a Tcl_ObjType `name` accessor, and dispatch on
-the type name exactly like tclsqlite.c:1112..1127
-(bytearray/boolean/booleanString/wideInt/int/double/else).
-Cite: tclsqlite.c:1108..1127 DbSqlFunc auto-detect.
-
 ## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders — FIXED
-
-Root cause: `vdbeSorterCompareRec` (passqlite3vdbe.pas) left the unpacked
-record's `nField` at the allocator default of `nKeyField+1`, so
-`sqlite3VdbeRecordUnpack` + `sqlite3VdbeRecordCompare` walked into the
-data column after the key column tied under NOCASE.  The aColl[i] slot
-for the data column is `nil` → fell to BINARY `memcmp`, resorting
-NOCASE-equal rows by raw bytes (uppercase-first).  Upstream caps the
-unpacked record's `nField` to `pKeyInfo->nKeyField` in
-`vdbeSortAllocUnpacked` (vdbesort.c:1358), so its comparator stops at
-the key columns and the stable merge preserves insertion order.
-Fix: assign `pUR^.nField := pKeyInfo^.nKeyField` after
-sqlite3VdbeAllocUnpackedRecord, matching the C oracle.
-Cite: vdbesort.c:1358 vdbeSortAllocUnpacked.
-Surfaced by: 9.4.4.e sweep.
-
 ## 9.4.divbug.31 — Spurious `database disk image is malformed` for non-corrupt errors
 
 Affects: 2 tests (`collate3.test`, `count.test`).  Symptom:
@@ -536,72 +336,8 @@ select.c `updateAccumulator` DISTINCT loop.
 Surfaced by: 9.4.4.e sweep.
 
 ## 9.4.divbug.34 — `PRAGMA page_size` default mismatch — RESOLVED
-
-Affects: 2 tests (`createtab.test` createtab-0.2 expects 4096, got 8192;
-`format4.test` format4-1.1 expects 2048, got 8192).
-Symptom: a fresh DB's `PRAGMA page_size` reports the build-time default
-(8192) regardless of the size the test set via `PRAGMA page_size=…`.
-Root cause: PragTyp_PAGE_SIZE write arm was not ported — codegen only
-emitted the read arm, so `PRAGMA page_size=N` was a parser-only no-op
-(the btree's `pageSize` stayed at SQLITE_DEFAULT_PAGE_SIZE and the
-file header was written with 8192).
-Fix: port pragma.c:604..611 — set `db^.nextPagesize := sqlite3Atoi(zRight)`
-and call `sqlite3BtreeSetPageSize(pBt, db^.nextPagesize, 0, 0)`;
-OOM-bubble on SQLITE_NOMEM.  Verified: pre-schema writes now
-materialise the requested size (file size matches C oracle); post-
-schema writes are silently rejected (BTS_PAGESIZE_FIXED) matching C.
-Surfaced by: 9.4.4.e sweep.
-
 ## 9.4.divbug.35 — Float-to-text precision artifacts — FIXED
-
-Triage revealed this was NOT a printf-port bug.  `passqlite3printf`'s
-etFLOAT / `%!.*g` arm already honours `db->nFpDigit` and renders
-byte-identically to the C oracle:
-```
-$ LD_LIBRARY_PATH=src bin/passqlite3 :memory: \
-    ".dbconfig fp_digits 15
-     SELECT 1.23 - 2.34;"
--1.11               # ← matches C oracle exactly
-```
-The real divergence lived in the Tcl harness.  `tester.tcl:789..792`
-falls back from exact string compare to a C-side fuzzy-equality
-helper `fpnum_compare` (test1.c:6191..6325) which tolerates ≤15-digit
-mantissa drift and "e+9" vs "e+09" exponent zero-padding.  Without it,
-fpconv1-1.2/1.3 (FP_DIGITS=15 → "-1.11") and default-3.3
-("9.22337203685478e+18" vs the 17-digit Grisu rendering
-"9.223372036854776e+18") failed exact-string compare even though the
-underlying SQLite double is bit-identical.
-
-Fix (TestModuleTest1.pas:138..254 + tester_min.tcl:144..162): port
-`fpnum_compare` verbatim from test1.c, register the Tcl command in
-`Sqlitetest1_Init`, and wire the fallback into our `do_test`'s
-post-string-compare arm.  Reproducer fpconv1.test now PASS 4/4;
-default-3.3 PASS (the other default.test failures are tracked as
-9.4.divbug.40 — DEFAULT error column-name drop / affinity ordering —
-and are unaffected by this fix).
-Surfaced by: 9.4.4.e sweep.
-
 ## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored — FIXED
-
-Root cause: the Pascal port of `PragTyp_JOURNAL_MODE` only emitted the
-*read* arm — it printed the current journal-mode string and never
-emitted `OP_JournalMode` for the `=MODE` write form, so every
-`PRAGMA journal_mode=...` was a silent no-op (the parser accepted the
-value but the pager was never asked to switch).  The opcode itself
-(`OP_JournalMode`, vdbe.c:8054) is already ported and works.
-
-Fix (codegen.pas:50249..): faithful port of pragma.c:734..771.  When
-`pValue<>nil` walk `azJournalModeName[]` via `sqlite3_strnicmp` for a
-case-insensitive prefix match (matches C's `sqlite3StrNICmp(zRight,
-zMode, n)` semantics), apply the defensive-mode `OFF→QUERY` gate, then
-emit one `OP_JournalMode` per affected attached DB (reverse order so
-reg 1 ends up holding `main`'s mode) followed by the final
-`OP_ResultRow`.  Reproducer (file-backed DB, single connection):
-`PRAGMA journal_mode=off` now returns `off`, and a follow-up
-`PRAGMA journal_mode` query also returns `off`, matching the C oracle
-sqlite3_prepare_v2 path.
-Surfaced by: 9.4.4.e sweep.
-
 ## 9.4.divbug.37 — WAL `wal_hook` callback count = 0
 
 Affects: 1 test (`e_walhook.test`, e_walhook-1.3+).
@@ -625,15 +361,6 @@ C reference: parse.y refargs grammar; fkey.c
 Surfaced by: 9.4.4.e sweep.
 
 ## 9.4.divbug.39 — `CREATE TABLE AS SELECT` unsupported — FIXED
-
-Fixed by porting the `pSelect` arm of `sqlite3EndTable`
-(codegen.pas:41832..) faithful to build.c:2836..2884:
-OpenWrite(P5=P2ISREG) → InitCoroutine → ResultSetOfSelect (steals
-aCol into the new table) → sqlite3Select(SRT_Coroutine) →
-EndCoroutine → Yield/MakeRecord/TableAffinity/NewRowid/Insert loop
-→ Close.  Reproducer `CREATE TABLE t AS SELECT 1,2; SELECT * FROM t`
-now returns `1|2` matching the C oracle.
-
 ## 9.4.divbug.40 — `DEFAULT` literal type + error-msg column-name drop
 
 Affects: 1 test (`default.test`, default-1.3, default-3.1).
