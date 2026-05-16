@@ -9601,6 +9601,128 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                            pOuterSrc, pInnerSrc, bFound);
   end;
 
+  { Recursive helper for 9.4.divbug.59 — given a nested-from wrapper pWrap,
+    locate the pEList-index inside pWrap^.pSelect^.pEList that corresponds
+    to qualifier (zTab, zCol).  Each pEList entry is a TK_COLUMN whose
+    iTable refers to a SrcItem in the wrapper's own pSrc.  If that
+    referenced item is the leaf table named zTab, match by column index.
+    If it's itself a nested-from wrapper, recurse into it: that wrapper's
+    pSTab is built from its pEList so the inner index becomes the iColumn
+    referenced by the outer pEList entry. }
+  function FindWrapperEListIdx(pWrap: PSrcItem; zTab_, zCol_: PAnsiChar;
+    out idx_: i32): Boolean;
+  var
+    pSel:    PSelect;
+    pInnerS: PSrcList;
+    pInnerB: PSrcItem;
+    pE2:     PExpr;
+    pELst:   PExprList;
+    items_:  PExprListItem;
+    j, k:    i32;
+    pRef:    PSrcItem;
+    iInnerCol: i32;
+    subIdx:  i32;
+    iColL:   i32;
+  begin
+    Result := False;
+    if pWrap^.u4.pSubq = nil then Exit;
+    pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    pELst := pSel^.pEList;
+    pInnerS := pSel^.pSrc;
+    if (pELst = nil) or (pInnerS = nil) then Exit;
+    items_ := ExprListItems(pELst);
+    pInnerB := SrcListItems(pInnerS);
+    for j := 0 to pELst^.nExpr - 1 do
+    begin
+      pE2 := items_[j].pExpr;
+      if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Continue;
+      pRef := nil;
+      for k := 0 to pInnerS^.nSrc - 1 do
+      begin
+        pInnerB := SrcListItems(pInnerS);
+        Inc(pInnerB, k);
+        if pInnerB^.iCursor = pE2^.iTable then
+        begin pRef := pInnerB; Break; end;
+      end;
+      if pRef = nil then Continue;
+      iInnerCol := pE2^.iColumn;
+      { Leaf table reference? }
+      if ((pRef^.fg.fgBits2 and $40) = 0)
+         or ((pRef^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
+      begin
+        if pRef^.pSTab = nil then Continue;
+        { Match by alias-or-name on the leaf table. }
+        if pRef^.zAlias <> nil then
+        begin
+          if sqlite3StrICmp(pRef^.zAlias, zTab_) <> 0 then Continue;
+        end else if sqlite3StrICmp(pRef^.pSTab^.zName, zTab_) <> 0 then
+          Continue;
+        iColL := sqlite3ColumnIndex(pRef^.pSTab, zCol_);
+        if iColL <> iInnerCol then Continue;
+        idx_ := j;
+        Result := True;
+        Exit;
+      end
+      else
+      begin
+        { Inner item is itself a nested-from wrapper.  Its pSTab^.aCol[k]
+          is the k-th entry of its own pEList; recurse to find whether the
+          (zTab, zCol) maps to that k. }
+        if not FindWrapperEListIdx(pRef, zTab_, zCol_, subIdx) then Continue;
+        if subIdx <> iInnerCol then Continue;
+        idx_ := j;
+        Result := True;
+        Exit;
+      end;
+    end;
+  end;
+
+  { 9.4.divbug.59 — port of resolve.c:351..417 nested-from arm, adapted
+    to the Pas expandStar slice.  The C resolver matches zTab.zCol against
+    the wrapper's pEList via sqlite3MatchEName, then binds pE to
+    (pMatch->iCursor, j) — flattenSubquery later rewrites that to the inner
+    table cursor.  Pas expandStar produces TK_COLUMN entries (with inner
+    cursor / col already wired) but no zEName; so we locate the inner
+    (cursor, col, pTab) triple by walking the wrapper's pSrc, then find the
+    pEList entry whose TK_COLUMN refers to that triple and bind the outer
+    pE to (wrapper.iCursor, pEList-index, wrapper.pSTab).  After
+    flattenSubquery, the wrapper.iCursor binding is substituted to the inner
+    cursor; if flatten is skipped, the wrapper materialises and the read
+    from (wrapper.iCursor, j) yields the inner column value. }
+  function ResolveNestedFromDot(pItem: PSrcItem; pE: PExpr): Boolean;
+  var
+    pSel:     PSelect;
+    pEList_:  PExprList;
+    items:    PExprListItem;
+    j:        i32;
+    zCol_:    PAnsiChar;
+    zTab_:    PAnsiChar;
+  begin
+    Result := False;
+    pSel   := PSubquery(pItem^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    zCol_  := pE^.pRight^.u.zToken;
+    zTab_  := pE^.pLeft^.u.zToken;
+    j := -1;
+    if not FindWrapperEListIdx(pItem, zTab_, zCol_, j) then Exit;
+    pEList_ := pSel^.pEList;
+    if (pEList_ = nil) or (j < 0) or (j >= pEList_^.nExpr) then Exit;
+    items := ExprListItems(pEList_);
+    pE^.op      := TK_COLUMN;
+    pE^.iTable  := pItem^.iCursor;
+    pE^.iColumn := i16(j);
+    pE^.y.pTab  := pItem^.pSTab;
+    pE^.pLeft   := nil;
+    pE^.pRight  := nil;
+    items[j].fg.eBits := items[j].fg.eBits or $40;  { bUsed }
+    if j < BMS - 1 then
+      pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
+    else
+      pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+    Result := True;
+  end;
+
   procedure ResolveExpr(pE: PExpr);
   var
     pSrc:   PSrcList;
@@ -9658,6 +9780,22 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
+          { 9.4.divbug.59 — nested-from arm (resolve.c:351..417).
+            When a parenthesised FROM-clause subset becomes one SrcItem with
+            SF_NestedFrom (e.g. `t1 JOIN (t2 JOIN t3 USING(a)) USING(a)`),
+            the inner tables' qualified names (t2.a, t3.a) are not in
+            outer pSrc.  Each entry of the nested subquery's pEList carries
+            ENAME_TAB with zEName encoded as "[db.]tab.col" — sqlite3MatchEName
+            tests the triple.  Stop at first ENAME_TAB match with bUsingTerm
+            (USING-shared column, since both sides project the same span). }
+          if ((pItem^.fg.fgBits2 and $40) <> 0)  { isNestedFrom }
+             and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+             and (pItem^.u4.pSubq <> nil)
+             and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil)
+             and (PSubquery(pItem^.u4.pSubq)^.pSelect^.pEList <> nil) then
+          begin
+            if ResolveNestedFromDot(pItem, pE) then Exit;
+          end;
           if pItem^.zAlias <> nil then
           begin
             if sqlite3StrICmp(pItem^.zAlias, pE^.pLeft^.u.zToken) <> 0 then Continue;
@@ -25313,8 +25451,12 @@ begin
         { select.c:6251..6258 — for non-T.* expansion of a non-first FROM
           item that is part of a USING-style join, omit any column whose
           name appears in the USING IdList.  This is what NATURAL JOIN
-          and JOIN ... USING(col) need to coalesce duplicate columns. }
+          and JOIN ... USING(col) need to coalesce duplicate columns.
+          9.4.divbug.59: SF_NestedFrom wrappers must KEEP both sides'
+          USING columns so qualified refs (t3.a) resolve through the
+          wrapper. }
         if (i > 0) and (zTName = nil) and
+           ((p^.selFlags and SF_NestedFrom) = 0) and
            ((pItem^.fg.fgBits2 and $08) <> 0) and
            (pItem^.u3.pUsing <> nil) and
            (sqlite3IdListIndex(pItem^.u3.pUsing,
