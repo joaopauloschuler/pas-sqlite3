@@ -10668,6 +10668,103 @@ begin
   Result := rc;
 end;
 
+{ 10.1a.1.8  `.progress N` callback.  shell.c.in:2490..2510.  Returns
+  non-zero to interrupt the running statement when the configured
+  limit is reached.  Mirrors C `progress_handler`. }
+function shellProgressHandler(pClientData: Pointer): i32; cdecl;
+var
+  p: PShellState;
+  elapsed: Double;
+begin
+  p := PShellState(pClientData);
+  Inc(p^.nProgress);
+  if ((p^.flgProgress and SHELL_PROGRESS_TMOUT) <> 0)
+     and (shellTimerBeginNs <> 0) then begin
+    elapsed := (shellTimeOfDayUs - shellTimerBeginNs) * 0.000001;
+    if elapsed >= p^.tmProgress then begin
+      shellSPutZ(Format('Progress timeout after %.6f seconds'#10,
+        [elapsed]));
+      Result := 1; Exit;
+    end;
+  end;
+  if (p^.nProgress >= p^.mxProgress) and (p^.mxProgress > 0) then begin
+    shellSPutZ(Format('Progress limit reached (%u)'#10, [p^.nProgress]));
+    if (p^.flgProgress and SHELL_PROGRESS_RESET) <> 0 then p^.nProgress := 0;
+    if (p^.flgProgress and SHELL_PROGRESS_ONCE) <> 0 then p^.mxProgress := 0;
+    Result := 1; Exit;
+  end;
+  if (p^.flgProgress and SHELL_PROGRESS_QUIET) = 0 then
+    shellSPutZ(Format('Progress %u'#10, [p^.nProgress]));
+  Result := 0;
+end;
+
+{ 10.1a.1.8  `.progress N`               shell.c.in:10380..10435
+  Installs a sqlite3_progress_handler firing every N VDBE opcodes with
+  --quiet/--reset/--once/--limit/--timeout flag parsing. }
+function cmdProgress(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
+var
+  i: i32;
+  nn: i32;
+  z: AnsiString;
+begin
+  Result := 0;
+  nn := 0;
+  p^.flgProgress := 0;
+  p^.mxProgress := 0;
+  p^.nProgress := 0;
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 1) and (z[1] = '-') then begin
+      Delete(z, 1, 1);
+      if (Length(z) >= 1) and (z[1] = '-') then Delete(z, 1, 1);
+      if (z = 'quiet') or (z = 'q') then begin
+        p^.flgProgress := p^.flgProgress or SHELL_PROGRESS_QUIET;
+        Inc(i); Continue;
+      end;
+      if z = 'reset' then begin
+        p^.flgProgress := p^.flgProgress or SHELL_PROGRESS_RESET;
+        Inc(i); Continue;
+      end;
+      if z = 'once' then begin
+        p^.flgProgress := p^.flgProgress or SHELL_PROGRESS_ONCE;
+        Inc(i); Continue;
+      end;
+      if z = 'timeout' then begin
+        if i = nArg - 1 then begin
+          shellDotError(p, i + 1, 'missing argument', '');
+          Result := 1; Exit;
+        end;
+        Inc(i);
+        Val(args[i], p^.tmProgress);
+        if p^.tmProgress > 0.0 then begin
+          p^.flgProgress := SHELL_PROGRESS_QUIET or SHELL_PROGRESS_TMOUT;
+          if nn = 0 then nn := 100;
+        end;
+        Inc(i); Continue;
+      end;
+      if z = 'limit' then begin
+        if i + 1 >= nArg then begin
+          shellEPutZ('Error: missing argument on --limit'#10);
+          Result := 1; Exit;
+        end else begin
+          Inc(i);
+          p^.mxProgress := u32(shellIntegerValue(args[i]));
+        end;
+        Inc(i); Continue;
+      end;
+      shellEPutZ(Format('Error: unknown option: "%s"'#10, [args[i]]));
+      Result := 1; Exit;
+    end else begin
+      nn := i32(shellIntegerValue(z));
+    end;
+    Inc(i);
+  end;
+  openDb(p, 0);
+  sqlite3_progress_handler(p^.db, nn, @shellProgressHandler, p);
+end;
+
 { 10.1a.1.5  `.nonce STRING`            shell.c.in:10116..10128
   When ShellState.zNonce matches, clear bSafeMode for the *next*
   command and return 0 immediately (caller-side bSafeMode reset
@@ -10800,8 +10897,9 @@ begin
   end;
   if zCmd = 'intck'     then begin Result := cmdIntck(p, args, nArg); Exit; end;
   if zCmd = 'load'      then begin Result := cmdLoad(p, args, nArg); Exit; end;
-  { 10.1a.1.7  .imposter — wraps SQLITE_TESTCTRL_IMPOSTER. }
+  { 10.1a.1.7/.8  .imposter / .progress — TESTCTRL_IMPOSTER + progress_handler. }
   if zCmd = 'imposter'  then begin Result := cmdImposter(p, args, nArg); Exit; end;
+  if zCmd = 'progress'  then begin Result := cmdProgress(p, args, nArg); Exit; end;
 
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));
