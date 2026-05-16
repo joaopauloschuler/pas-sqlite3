@@ -54130,83 +54130,13 @@ const
     or SQLITE_CASE_SENSITIVE_LIKE build).  Bound by sqlite3RegisterLikeFunctions. }
   likeInfoAlt:  TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 0);
 
-{ Forward decl: patternCompare is defined far below near sqlite3_strlike,
-  but likeFunc (next) needs to call it directly with the per-connection
-  pInfo (9.4.divbug.56). }
-function patternCompare(
-  zPattern, zString: Pu8;
-  const pInfo: TCompareInfo;
-  matchOther: u32
-): i32; forward;
-
-procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
-var
-  zPat, zStr, zE: PAnsiChar;
-  zEU8: Pu8;
-  escape: u32;
-  nPat: i32;
-  db: PTsqlite3;
-  pInfo, pInfoOrig: PCompareInfo;
-  backupInfo: TCompareInfo;
-begin
-  { Port of func.c:907..971 likeFunc.  Reads its compareInfo from
-    sqlite3_user_data(pCtx) — which sqlite3RegisterLikeFunctions flips
-    between likeInfoNorm (noCase=1) and likeInfoAlt (noCase=0) when
-    PRAGMA case_sensitive_like fires.  Calls patternCompare directly:
-    sqlite3_strlike hardcodes likeInfoNorm so the per-connection
-    case-sensitivity would never reach the engine.  9.4.divbug.56. }
-  db := sqlite3_context_db_handle(pCtx);
-  pInfo := PCompareInfo(sqlite3_user_data(pCtx));
-  if pInfo = nil then pInfo := @likeInfoNorm;
-  pInfoOrig := pInfo;
-
-  { Pattern-length limit (func.c:931..940). }
-  nPat := sqlite3_value_bytes(Psqlite3_value(argv^));
-  if (db <> nil) and (nPat > db^.aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]) then
-  begin
-    sqlite3_result_error(pCtx, 'LIKE or GLOB pattern too complex', -1);
-    Exit;
-  end;
-
-  if argc = 3 then begin
-    zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
-    if zE = nil then Exit;
-    if sqlite3Utf8CharLen(zE, -1) <> 1 then begin
-      sqlite3_result_error(pCtx,
-        'ESCAPE expression must be a single character', -1);
-      Exit;
-    end;
-    zEU8 := Pu8(zE);
-    escape := sqlite3Utf8Read(PPChar(@zEU8));
-    if (escape = pInfo^.matchAll) or (escape = pInfo^.matchOne) then begin
-      backupInfo := pInfoOrig^;
-      pInfo := @backupInfo;
-      if escape = pInfo^.matchAll then pInfo^.matchAll := 0;
-      if escape = pInfo^.matchOne then pInfo^.matchOne := 0;
-    end;
-  end else
-    escape := pInfo^.matchSet;
-
-  zPat := sqlite3_value_text(Psqlite3_value(argv^));
-  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if (zPat <> nil) and (zStr <> nil) then
-    sqlite3_result_int(pCtx,
-      i32(patternCompare(Pu8(zPat), Pu8(zStr), pInfo^, escape) = 0));
-end;
-
-procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
-var
-  zPat, zStr: PAnsiChar;
-begin
-  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
-     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
-  zPat := sqlite3_value_text(Psqlite3_value(argv^));
-  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if (zPat = nil) or (zStr = nil) then begin sqlite3_result_null(pCtx); Exit; end;
-  sqlite3_result_int(pCtx, i32(sqlite3_strglob(zPat, zStr) = 0));
-end;
+{ likeFunc + globFunc bodies were relocated by 12.2.candidate.5.a so they
+  sit *after* patternCompare's definition (eliminating the hand-written
+  pseudo-duplicate forward decl of patternCompare that used to live here).
+  aBuiltinFuncs (further down) still references them by address, so we
+  carry forward declarations only. }
+procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl; forward;
+procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl; forward;
 
 procedure coalesceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
@@ -58605,6 +58535,78 @@ begin
   if zPattern = nil then begin Result := 1; Exit; end;
   Result := patternCompare(Pu8(zPattern), Pu8(zStr), likeInfoNorm, esc);
   if Result = SQLITE_NOWILDCARDMATCH then Result := SQLITE_NOMATCH;
+end;
+
+{ likeFunc + globFunc — moved here by 12.2.candidate.5.a so they sit after
+  patternCompare's body and no longer need a hand-written forward
+  declaration further up. }
+procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zPat, zStr, zE: PAnsiChar;
+  zEU8: Pu8;
+  escape: u32;
+  nPat: i32;
+  db: PTsqlite3;
+  pInfo, pInfoOrig: PCompareInfo;
+  backupInfo: TCompareInfo;
+begin
+  { Port of func.c:907..971 likeFunc.  Reads its compareInfo from
+    sqlite3_user_data(pCtx) — which sqlite3RegisterLikeFunctions flips
+    between likeInfoNorm (noCase=1) and likeInfoAlt (noCase=0) when
+    PRAGMA case_sensitive_like fires.  Calls patternCompare directly:
+    sqlite3_strlike hardcodes likeInfoNorm so the per-connection
+    case-sensitivity would never reach the engine.  9.4.divbug.56. }
+  db := sqlite3_context_db_handle(pCtx);
+  pInfo := PCompareInfo(sqlite3_user_data(pCtx));
+  if pInfo = nil then pInfo := @likeInfoNorm;
+  pInfoOrig := pInfo;
+
+  { Pattern-length limit (func.c:931..940). }
+  nPat := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if (db <> nil) and (nPat > db^.aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]) then
+  begin
+    sqlite3_result_error(pCtx, 'LIKE or GLOB pattern too complex', -1);
+    Exit;
+  end;
+
+  if argc = 3 then begin
+    zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
+    if zE = nil then Exit;
+    if sqlite3Utf8CharLen(zE, -1) <> 1 then begin
+      sqlite3_result_error(pCtx,
+        'ESCAPE expression must be a single character', -1);
+      Exit;
+    end;
+    zEU8 := Pu8(zE);
+    escape := sqlite3Utf8Read(PPChar(@zEU8));
+    if (escape = pInfo^.matchAll) or (escape = pInfo^.matchOne) then begin
+      backupInfo := pInfoOrig^;
+      pInfo := @backupInfo;
+      if escape = pInfo^.matchAll then pInfo^.matchAll := 0;
+      if escape = pInfo^.matchOne then pInfo^.matchOne := 0;
+    end;
+  end else
+    escape := pInfo^.matchSet;
+
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat <> nil) and (zStr <> nil) then
+    sqlite3_result_int(pCtx,
+      i32(patternCompare(Pu8(zPat), Pu8(zStr), pInfo^, escape) = 0));
+end;
+
+procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zPat, zStr: PAnsiChar;
+begin
+  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
+     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat = nil) or (zStr = nil) then begin sqlite3_result_null(pCtx); Exit; end;
+  sqlite3_result_int(pCtx, i32(sqlite3_strglob(zPat, zStr) = 0));
 end;
 
 
