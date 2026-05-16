@@ -10765,6 +10765,103 @@ begin
   sqlite3_progress_handler(p^.db, nn, @shellProgressHandler, p);
 end;
 
+{ 10.1a.1.10  safeModeAuth — shell.c.in:2209..2256
+  Restrictive authorizer used when `.auth ON` runs and the shell is
+  in safe-mode-persist, or when --safe is in effect.  Denies ATTACH
+  and a fixed allow-list of dangerous SQL functions via failIfSafeMode
+  (which terminates the process when bSafeMode is set). }
+function safeModeAuth(pClientData: Pointer; op: i32;
+                      zA1, zA2, zA3, zA4: PAnsiChar): i32; cdecl;
+const
+  azProhibited: array[0..7] of PAnsiChar = (
+    'edit', 'fts3_tokenizer', 'load_extension', 'readfile',
+    'realpath', 'writefile', 'zipfile', 'zipfile_cds');
+var
+  ps: PShellState;
+  i: i32;
+begin
+  ps := PShellState(pClientData);
+  case op of
+    SQLITE_ATTACH_AUTH:
+      failIfSafeMode(ps, 'cannot run ATTACH in safe mode');
+    SQLITE_FUNCTION_AUTH:
+      for i := 0 to High(azProhibited) do
+        if sqlite3_stricmp(zA2, azProhibited[i]) = 0 then
+          failIfSafeMode(ps,
+            'cannot use the ' + AnsiString(azProhibited[i]) +
+            '() function in safe mode');
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ 10.1a.1.10  shellAuth — shell.c.in:2258..2302
+  Audit authorizer: prints "authorizer: <ACTION> <z1> <z2> <z3> <z4>"
+  for every authorizable action.  Strings are emitted via the C-string
+  escape vocabulary (see cEscapeStr above) or "NULL" when nil.  When
+  bSafeMode is also set, defers the safe-mode filter to safeModeAuth. }
+function shellAuth(pClientData: Pointer; op: i32;
+                   zA1, zA2, zA3, zA4: PAnsiChar): i32; cdecl;
+const
+  azAction: array[0..33] of PAnsiChar = (
+    nil,
+    'CREATE_INDEX',         'CREATE_TABLE',         'CREATE_TEMP_INDEX',
+    'CREATE_TEMP_TABLE',    'CREATE_TEMP_TRIGGER',  'CREATE_TEMP_VIEW',
+    'CREATE_TRIGGER',       'CREATE_VIEW',          'DELETE',
+    'DROP_INDEX',           'DROP_TABLE',           'DROP_TEMP_INDEX',
+    'DROP_TEMP_TABLE',      'DROP_TEMP_TRIGGER',    'DROP_TEMP_VIEW',
+    'DROP_TRIGGER',         'DROP_VIEW',            'INSERT',
+    'PRAGMA',               'READ',                 'SELECT',
+    'TRANSACTION',          'UPDATE',               'ATTACH',
+    'DETACH',               'ALTER_TABLE',          'REINDEX',
+    'ANALYZE',              'CREATE_VTABLE',        'DROP_VTABLE',
+    'FUNCTION',             'SAVEPOINT',            'RECURSIVE');
+var
+  ps: PShellState;
+  az: array[0..3] of PAnsiChar;
+  i: i32;
+  zName: PAnsiChar;
+begin
+  ps := PShellState(pClientData);
+  az[0] := zA1; az[1] := zA2; az[2] := zA3; az[3] := zA4;
+  if (op >= 0) and (op <= High(azAction)) and (azAction[op] <> nil) then
+    zName := azAction[op]
+  else
+    zName := PAnsiChar('???');
+  Write('authorizer: ', AnsiString(zName));
+  for i := 0 to 3 do begin
+    Write(' ');
+    if az[i] <> nil then
+      outputCString(AnsiString(az[i]))
+    else
+      Write('NULL');
+  end;
+  WriteLn;
+  if ps^.bSafeMode <> 0 then
+    safeModeAuth(pClientData, op, zA1, zA2, zA3, zA4);
+  Result := SQLITE_OK;
+end;
+
+{ 10.1a.1.10  `.auth ON|OFF`             shell.c.in:9006..9022
+  Installs shellAuth for ON, safeModeAuth for OFF when bSafeModePersist
+  is set, or clears the authorizer entirely otherwise. }
+function cmdAuth(p: PShellState; const args: array of AnsiString;
+                 nArg: SizeInt): i32;
+begin
+  Result := 0;
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .auth ON|OFF'#10);
+    Result := 1;
+    Exit;
+  end;
+  openDb(p, 0);
+  if parseOnOff(args[0], 0) <> 0 then
+    sqlite3_set_authorizer(p^.db, @shellAuth, p)
+  else if p^.bSafeModePersist <> 0 then
+    sqlite3_set_authorizer(p^.db, @safeModeAuth, p)
+  else
+    sqlite3_set_authorizer(p^.db, nil, nil);
+end;
+
 { 10.1a.1.5  `.nonce STRING`            shell.c.in:10116..10128
   When ShellState.zNonce matches, clear bSafeMode for the *next*
   command and return 0 immediately (caller-side bSafeMode reset
@@ -10891,6 +10988,7 @@ begin
   if zCmd = 'version'   then begin Result := cmdVersion(p); Exit; end;
   if zCmd = 'prompt'    then begin Result := cmdPrompt(args, nArg); Exit; end;
   if zCmd = 'nonce'     then begin Result := cmdNonce(p, args, nArg); Exit; end;
+  if zCmd = 'auth'      then begin Result := cmdAuth(p, args, nArg); Exit; end;
   { 10.1a.1.6/.9/.10  .limit / .load / .intck — dot-command wrappers. }
   if (zCmd = 'limit') or (zCmd = 'limits') then begin
     Result := cmdLimit(p, args, nArg); Exit;
