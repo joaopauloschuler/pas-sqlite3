@@ -1435,7 +1435,18 @@ ports: bare table-valued or MATCH-style invocations are blocked by bug 6.13
 - [X] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`. Productive recommendations confirmed once 6.13.B.11 was closed.
 - [X] **10.1.102** `.open --zip` / `--deserialize` / `--hexdb` shell glue + faithful `sqlite3_deserialize` port.
 
-- [ ] **10.1a.1** fill the next porting chunk here.
+- [~] **10.1a.1** Residual dot-command coverage gap surfaced by 2026-05-16 audit (Outcome B).  C `shell.c.in` help table (lines 3711..3962) lists 67 dot-commands; `doMetaCommand` in `src/passqlite3shell.pas:10342` routed 56 of them.  The 11 missing handlers all have working backing APIs in the engine and live entries in the Pas `azHelp[]` table (3704..3958).  Decomposed into bite-sized sub-arms 10.1a.1.1..10.1a.1.11; the 5 trivially-small ones (≤25 LOC each) landed inline 2026-05-16; the 6 medium ones are queued.  Gates: `bin/TestShellRepl` 8/8, `bin/TestShellModes` 2/2, `bin/TestShellSchema` 10/10, `bin/TestShellIO` 11/11, `bin/TestShellMeta` 60/60, `bin/TestCliParity` 20/1S/0 (== baseline).
+  - [X] **10.1a.1.1** `.bail on|off` — bail_on_error toggle.  Cite: shell.c.in:9104..9110 (~7 lines).  Pas: `cmdBail` at `passqlite3shell.pas` + dispatcher route.
+  - [X] **10.1a.1.2** `.timeout MS` — `sqlite3_busy_timeout` wrapper.  Cite: shell.c.in:11881..11884 (~4 lines).  Pas: `cmdTimeout`.
+  - [X] **10.1a.1.3** `.version` — libversion + sourceid + compiler tag (fpc-X.Y.Z subbed for the C build's clang/gcc/msvc arm).  Cite: shell.c.in:11978..11996 (~18 lines).  Pas: `cmdVersion`.
+  - [X] **10.1a.1.4** `.prompt MAIN ?CONTINUE?` — replace `mainPromptStr` / `continuePromptStr`.  Cite: shell.c.in:10438..10445 (~8 lines).  Pas: `cmdPrompt`.
+  - [X] **10.1a.1.5** `.nonce STRING` — match-or-halt; clears bSafeMode on hit.  Cite: shell.c.in:10116..10128 (~13 lines).  Pas: `cmdNonce` (uses `Halt(1)` for the cli_exit(1) arm).
+  - [ ] **10.1a.1.6** `.limit ?NAME? ?VAL?` — list / set `sqlite3_limit` with the 13-entry `aLimit[]` table + prefix-match.  Cite: shell.c.in:10002..10061 (~60 lines).  Engine `sqlite3_limit` already wired (passqlite3main.pas:470 / 4889).  Bite-size; queued.
+  - [ ] **10.1a.1.7** `.imposter INDEX IMPOSTER` / `.imposter off` — emits `CREATE TABLE` from `PRAGMA index_xinfo` + `SQLITE_TESTCTRL_IMPOSTER` wrap.  Cite: shell.c.in:9781..9962 (~180 lines).  Depends on `sqlite3_test_control(IMPOSTER, …)` arm being live; verify before porting.
+  - [ ] **10.1a.1.8** `.progress N` — `sqlite3_progress_handler` plus `--quiet/--reset/--once/--timeout/--limit` flag parser.  Cite: shell.c.in:10380..10435 (~56 lines).  Needs `flgProgress` / `mxProgress` / `tmProgress` / `nProgress` ShellState fields (check whether already present) and a `progress_handler` callback trampoline.
+  - [ ] **10.1a.1.9** `.load FILE ?ENTRY?` — `sqlite3_load_extension`.  Cite: shell.c.in:10069..10100 (~32 lines).  Engine entry exists (passqlite3main.pas:350 / 2840) but is a `SQLITE_OMIT_LOAD_EXTENSION` stub returning "extension loading is disabled"; the Pas handler must still parse args + surface the engine's error text faithfully.
+  - [ ] **10.1a.1.10** `.auth ON|OFF` — `sqlite3_set_authorizer(shellAuth | safeModeAuth | nil)`.  Cite: shell.c.in:9007..9022 (~16 lines).  Needs `shellAuth` callback + `safeModeAuth` callback ported from shell.c.in:8901..8973 (~80 lines additional).  Total ~100 LOC.
+  - [ ] **10.1a.1.11** `.intck ?STEPS_PER_UNLOCK?` — `intckDatabaseCmd` driver.  Cite: shell.c.in:9964..9977 (~14 lines for the dispatch arm) but `intckDatabaseCmd` itself is the wrapper around `sqlite3_intck_*` API in `src/passqlite3intck.pas` (already ported at 10.1.96).  Verify intck driver entry-point shape; if present, this is a ~15-LOC wrap.
 
 ### 10.1.bug.* — fixed bug ledger (kept as ticked stubs only)
 

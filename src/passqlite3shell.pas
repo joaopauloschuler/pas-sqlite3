@@ -10339,6 +10339,87 @@ begin
   arDotCommand(p, 0, args, nArg);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1a.1.1  `.bail on|off`            shell.c.in:9104..9110
+  Sets bail_on_error.  Mirrors C's booleanValue() recogniser. }
+function cmdBail(const args: array of AnsiString; nArg: SizeInt): i32;
+begin
+  Result := 0;
+  if nArg = 1 then
+    bail_on_error := parseOnOff(args[0], bail_on_error)
+  else begin
+    shellEPutZ('Usage: .bail on|off'#10);
+    Result := 1;
+  end;
+end;
+
+{ 10.1a.1.2  `.timeout MS`              shell.c.in:11881..11884
+  Wraps sqlite3_busy_timeout. }
+function cmdTimeout(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt): i32;
+var
+  ms: i32;
+begin
+  openDb(p, 0);
+  if nArg >= 1 then ms := StrToIntDef(args[0], 0) else ms := 0;
+  sqlite3_busy_timeout(p^.db, ms);
+  Result := 0;
+end;
+
+{ 10.1a.1.3  `.version`                 shell.c.in:11978..11996
+  Print library version + sourceid + (when available) compiler tag.
+  Pas port is FPC-only — emit a single fpc-<version> tag mirroring
+  the gcc-<__VERSION__> arm at shell.c.in:11993..11995. }
+function cmdVersion(p: PShellState): i32;
+var
+  zPtrSz: AnsiString;
+begin
+  if SizeOf(Pointer) = 8 then zPtrSz := '64-bit' else zPtrSz := '32-bit';
+  shellSPutZ(Format('SQLite %s %s'#10,
+    [AnsiString(sqlite3_libversion), AnsiString(sqlite3_sourceid)]));
+  shellSPutZ(Format('fpc-%d.%d.%d (%s)'#10,
+    [FPC_VERSION, FPC_RELEASE, FPC_PATCH, zPtrSz]));
+  Result := 0;
+end;
+
+{ 10.1a.1.4  `.prompt MAIN ?CONTINUE?`  shell.c.in:10438..10445
+  Update the two REPL prompt strings.  Upstream uses a fixed-size
+  buffer + shell_strncpy; the Pas backing storage is AnsiString so we
+  just assign. }
+function cmdPrompt(const args: array of AnsiString; nArg: SizeInt): i32;
+begin
+  if nArg >= 1 then mainPromptStr := args[0];
+  if nArg >= 2 then continuePromptStr := args[1];
+  Result := 0;
+end;
+
+{ 10.1a.1.5  `.nonce STRING`            shell.c.in:10116..10128
+  When ShellState.zNonce matches, clear bSafeMode for the *next*
+  command and return 0 immediately (caller-side bSafeMode reset
+  bypassed).  Mismatch is a hard exit — matches upstream cli_exit(1). }
+function cmdNonce(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
+var
+  zArg, zNonceS: AnsiString;
+begin
+  Result := 0;
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .nonce NONCE'#10);
+    Result := 1;
+    Exit;
+  end;
+  zArg := args[0];
+  if p^.zNonce = nil then zNonceS := '' else zNonceS := AnsiString(p^.zNonce);
+  if (zNonceS = '') or (zArg <> zNonceS) then begin
+    shellEPutZ(Format('line %d: incorrect nonce: "%s"'#10,
+      [p^.lineno, zArg]));
+    Halt(1);
+  end;
+  p^.bSafeMode := 0;
+  { Return 0; the do-not-reset signalling is implicit — bSafeMode is
+    already 0 and the C trailing reset is harmless in the Pas build. }
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
@@ -10432,6 +10513,12 @@ begin
     WriteLn;
     Exit;
   end;
+  { 10.1a.1.1..5  bite-sized handlers (.bail/.timeout/.version/.prompt/.nonce). }
+  if zCmd = 'bail'      then begin Result := cmdBail(args, nArg); Exit; end;
+  if zCmd = 'timeout'   then begin Result := cmdTimeout(p, args, nArg); Exit; end;
+  if zCmd = 'version'   then begin Result := cmdVersion(p); Exit; end;
+  if zCmd = 'prompt'    then begin Result := cmdPrompt(args, nArg); Exit; end;
+  if zCmd = 'nonce'     then begin Result := cmdNonce(p, args, nArg); Exit; end;
 
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));
