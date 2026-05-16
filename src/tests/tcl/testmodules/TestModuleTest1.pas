@@ -2941,6 +2941,100 @@ begin
   if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
 end;
 
+{ 9.4.divbug.63.a — test1.c:3707..3714 test_breakpoint.
+  Usage:  breakpoint
+  A pure no-op TCL command that exists solely as a GDB breakpoint
+  anchor.  Tests sprinkle `breakpoint` calls inside their bodies so a
+  developer running testfixture under gdb can `b test_breakpoint` to
+  catch a specific iteration. }
+function test_breakpoint(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+begin
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (argc < 0) or (argv = nil) then ;
+end;
+
+{ 9.4.divbug.63.a — test1.c:7544..7552 database_may_be_corrupt.
+  tclcmd:  database_may_be_corrupt
+  Indicate that database files might be corrupt (normal state). }
+function database_may_be_corrupt(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_NEVER_CORRUPT_OP, 0);
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ 9.4.divbug.63.a — test1.c:7560..7568 database_never_corrupt.
+  tclcmd:  database_never_corrupt
+  Indicate that database files are always well-formed; enables extra
+  asserts that test invariants of well-formed databases. }
+function database_never_corrupt(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_NEVER_CORRUPT_OP, 1);
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ 9.4.divbug.63.a — test1.c:6169..6186 tcl_variable_type.
+  Usage:  tcl_variable_type VARIABLENAME
+  Return the name of the internal Tcl_Obj type of the named variable's
+  current value (e.g. "int", "double", "list", "bytearray").  Tests
+  use this to probe whether a recent shimmer made the interp produce a
+  particular internalRep.  When the value has no typePtr (pure-string),
+  return the empty result.
+
+  Tcl_Obj layout (tcl.h):
+    int            refCount;
+    char          *bytes;
+    int            length;
+    const Tcl_ObjType *typePtr;
+    union { ... }  internalRep;
+  Tcl_ObjType layout:
+    const char *name;
+    ... }
+type
+  PTclObjTypeName = ^PAnsiChar;
+  TTclObjLayout = record
+    refCount:  cint;
+    bytes:     PAnsiChar;
+    length:    cint;
+    typePtr:   PTclObjTypeName;
+    { internalRep omitted — we never read it }
+  end;
+  PTclObjLayout = ^TTclObjLayout;
+
+function tcl_variable_type(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pVar:   PTclObj;
+  pLay:   PTclObjLayout;
+  zName:  PAnsiChar;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('VARIABLE'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  { TCL_LEAVE_ERR_MSG = $200 from tcl.h:885 }
+  pVar := Tcl_GetVar2Ex(interp, Tcl_GetString(objv[1]), nil, $200);
+  if pVar = nil then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  pLay := PTclObjLayout(pVar);
+  if pLay^.typePtr <> nil then
+  begin
+    zName := pLay^.typePtr^;
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(zName, -1));
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -3107,6 +3201,16 @@ begin
     @tcl_test_config_pmasz, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_reset_auto_extension'),
     @tcl_reset_auto_extension, nil, nil);
+  { 9.4.divbug.63.a — breakpoint / database_*_corrupt / tcl_variable_type
+    (test1.c:9087 old-style, 9194..9195 / 9272 objCommand). }
+  Tcl_CreateCommand(interp, PChar('breakpoint'),
+    @test_breakpoint, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('database_never_corrupt'),
+    @database_never_corrupt, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('database_may_be_corrupt'),
+    @database_may_be_corrupt, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('tcl_variable_type'),
+    @tcl_variable_type, nil, nil);
   Result := TCL_OK;
 end;
 

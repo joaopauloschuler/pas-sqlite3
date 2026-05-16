@@ -1155,6 +1155,37 @@ proc do_faultsim_test {name args} {
   }
 }
 
+# 9.4.divbug.63.a — explain_no_trace (tester.tcl:1620..1623).  Show the
+# VDBE program for an SQL statement but skip the leading Trace opcode
+# block; used by callers that want to compare opcode sequences of two
+# statements without the trace-row prefix differing.
+proc explain_no_trace {sql} {
+  set tr [db eval "EXPLAIN $sql"]
+  return [lrange $tr 7 end]
+}
+
+# 9.4.divbug.63.a — faultsim_test_result (malloc_common.tcl:291..298,
+# 348..350).  In upstream this command is dynamically (re)defined by
+# do_one_faultsim_test with the per-test -injecterrlist baked in;
+# baseline pas-sqlite3 collapses the fault matrix down to a single
+# no-fault pass (see do_faultsim_test above), so the dynamic redefine
+# never runs.  Provide a fallback definition that mirrors
+# faultsim_test_result_int verbatim, with an empty injectErrList — under
+# the baseline pass testrc/testresult always come from the body itself
+# (testnfail=0), so the first equality clause (testnfail==0 && t!=r[0])
+# governs and lets the body's own success/error decide.
+proc faultsim_test_result_int {args} {
+  upvar testrc testrc testresult testresult testnfail testnfail
+  set t [list $testrc $testresult]
+  set r $args
+  if { ($testnfail==0 && $t != [lindex $r 0]) || [lsearch -exact $r $t]<0 } {
+    error "nfail=$testnfail rc=$testrc result=$testresult list=$r"
+  }
+}
+proc faultsim_test_result {args} {
+  uplevel faultsim_test_result_int $args [list {0 {}}]
+}
+
 # Install the test scalar UDFs (randstr, test_*, real2hex, ...) as an
 # auto-extension so every freshly-opened connection picks them up.
 # Mirrors upstream tester.tcl:512 (one-shot at shim load).  Without this,
