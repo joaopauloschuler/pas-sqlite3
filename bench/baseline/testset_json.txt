@@ -1,0 +1,10 @@
+       Begin testset "json"
+ 100 - table J1 is 5 rows of JSONB.................................  TIME
+ 110 - table J2 is 1 rows from J1 converted to text................  TIME
+ 120 - create indexes on JSON expressions on J1....................  TIME
+ 130 - create indexes on JSON expressions on J2....................  TIME
+ 140 - queries against J1..........................................  TIME
+ 141 - queries involving json_type()...............................  TIME
+ 150 - json_insert()/set()/remove() on every row of J1.............  TIME
+ 160 - json_insert()/set()/remove() on every row of J2.............  TIME
+       TOTAL.......................................................  TIME

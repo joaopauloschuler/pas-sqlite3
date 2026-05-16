@@ -1,0 +1,3 @@
+       Begin testset "rtree"
+speedtest1: R-tree extension not available in this build
+       TOTAL.......................................................  TIME

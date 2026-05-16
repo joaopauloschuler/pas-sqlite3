@@ -43,6 +43,14 @@ program passpeedtest1;
     est_square_root         speedtest1.c:704..714
     main()                  speedtest1.c:2964..3477
 
+  Phase 11.5 additions:
+    testset_debug1          speedtest1.c:2741..2753
+    testset_json            speedtest1.c:2758..2867
+    testset_rtree (stub)    speedtest1.c:2088..2270 — deferred until R-tree
+                            extension port lands (mirrors SQLITE_OMIT_* in
+                            shell.c: prints one-line "not available" and
+                            returns rc=0).
+
   Skipped (gated):
     groupConcat shim        speedtest1.c:717..776   (SQLITE_VERSION_NUMBER<3005004 — modern engine has it)
     WASM helpers            speedtest1.c:3479..end
@@ -2043,10 +2051,157 @@ begin
   speedtest1_end_test;
   speedtest1_exec('COMMIT');
 end;
-procedure testset_debug1;      begin testset_not_yet('debug1',      'Phase 11.5'); end;
-procedure testset_json;        begin testset_not_yet('json',        'Phase 11.5'); end;
+{ ----------------------------- testset_debug1 --------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 2741..2753. }
+
+procedure testset_debug1;
+var
+  i, n: LongWord;
+  x1, x2: LongWord;
+  zNum: AnsiString;
+begin
+  n := LongWord(g.szTest);
+  i := 1;
+  while i <= n do begin
+    x1 := swizzle(i, n);
+    x2 := swizzle(x1, n);
+    zNum := speedtest1_numbername(x1);
+    WriteLn(Format('%5d %5d %5d %s', [i, x1, x2, zNum]));
+    Inc(i);
+  end;
+end;
+
+{ ----------------------------- testset_json ----------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 2758..2867.
+  Performance tests for JSON1 / JSONB (pas-sqlite3 has JSON via Phase 6.8). }
+
+procedure testset_json;
+var
+  r: u32;
+begin
+  r := $12345678;
+  { SQLITE_TESTCTRL_PRNG_SEED = 28 (passqlite3main.pas:5021) }
+  sqlite3_test_control(28, g.db, Integer(r));
+
+  speedtest1_begin_test(100, 'table J1 is %d rows of JSONB', [g.szTest*5]);
+  speedtest1_exec(
+     'CREATE TABLE j1(x JSONB);'#10 +
+     'WITH RECURSIVE'#10 +
+     '  jval(n,j) AS ('#10 +
+     '    VALUES(0,''{}''),(1,''[]''),(2,''true''),(3,''false''),(4,''null''),'#10 +
+     '          (5,''{x:1,y:2}''),(6,''0.0''),(7,''3.14159''),(8,''-99.9''),'#10 +
+     '          (9,''[1,2,"\n\u2192\"\u2190",4]'')'#10 +
+     '  ),'#10 +
+     '  c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<26*26-1),'#10 +
+     '  array1(y) AS MATERIALIZED ('#10 +
+     '    SELECT jsonb_group_array('#10 +
+     '      jsonb_object(''x'',x,'#10 +
+     '                  ''y'',jsonb(coalesce(j,random()%%10000)),'#10 +
+     '                  ''z'',hex(randomblob(50)))'#10 +
+     '    )'#10 +
+     '    FROM c LEFT JOIN jval ON (x%%20)=n'#10 +
+     '  ),'#10 +
+     '  object1(z) AS MATERIALIZED ('#10 +
+     '    SELECT jsonb_group_object(char(0x61+x%%26,0x61+(x/26)%%26),'#10 +
+     '                      jsonb( coalesce(j,random()%%10000)))'#10 +
+     '      FROM c LEFT JOIN jval ON (x%%20)=n'#10 +
+     '  ),'#10 +
+     '  c2(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM c2 WHERE n<%d)'#10 +
+     'INSERT INTO j1(x)'#10 +
+     '  SELECT jsonb_object(''a'',n,''b'',n+10000,''c'',jsonb(y),''d'',jsonb(z),'#10 +
+     '                     ''e'',n+20000,''f'',n+30000)'#10 +
+     '    FROM array1, object1, c2;',
+     [g.szTest*5]
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(110, 'table J2 is %d rows from J1 converted to text', [g.szTest]);
+  speedtest1_exec(
+     'CREATE TABLE j2(x JSON TEXT);'#10 +
+     'INSERT INTO j2(x) SELECT json(x) FROM j1 LIMIT %d', [g.szTest]
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(120, 'create indexes on JSON expressions on J1');
+  speedtest1_exec(
+    'BEGIN;'#10 +
+    'CREATE INDEX j1x1 ON j1(x->>''a'');'#10 +
+    'CREATE INDEX j1x2 ON j1(x->>''b'');'#10 +
+    'CREATE INDEX j1x3 ON j1(x->>''f'');'#10 +
+    'COMMIT;'#10
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(130, 'create indexes on JSON expressions on J2');
+  speedtest1_exec(
+    'BEGIN;'#10 +
+    'CREATE INDEX j2x1 ON j2(x->>''a'');'#10 +
+    'CREATE INDEX j2x2 ON j2(x->>''b'');'#10 +
+    'CREATE INDEX j2x3 ON j2(x->>''f'');'#10 +
+    'COMMIT;'#10
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(140, 'queries against J1');
+  speedtest1_exec(
+    'WITH c(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM c WHERE n<7)'#10 +
+    '  SELECT sum(x->>format(''$.c[%%d].x'',n)) FROM c, j1;'#10 +
+
+    'WITH c(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM c WHERE n<5)'#10 +
+    '  SELECT sum(x->>format(''$."c"[#-%%d].y'',n)) FROM c, j1;'#10 +
+
+    'SELECT sum(x->>''$.d.ez'' + x->>''$.d."xz"'' + x->>''a'' + x->>''$.c[10].y'') FROM j1;'#10 +
+
+    'SELECT x->>''$.d.tz[2]'', x->''$.d.tz'' FROM j1;'#10
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(141, 'queries involving json_type()');
+  speedtest1_exec(
+    'WITH c(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM c WHERE n<20)'#10 +
+    '  SELECT json_type(x,format(''$.c[#-%%d].y'',n)), count(*)'#10 +
+    '    FROM c, j1'#10 +
+    '   WHERE j1.rowid=1'#10 +
+    '   GROUP BY 1 ORDER BY 2;'
+  );
+  speedtest1_end_test;
+
+
+  speedtest1_begin_test(150, 'json_insert()/set()/remove() on every row of J1');
+  speedtest1_exec(
+    'BEGIN;'#10 +
+    'UPDATE j1 SET x=jsonb_insert(x,''$.g'',(x->>''f'')+1,''$.h'',3.14159,''$.i'',''hello'','#10 +
+    '                               ''$.j'',json(''{x:99}''),''$.k'',''{y:98}'');'#10 +
+    'UPDATE j1 SET x=jsonb_set(x,''$.e'',(x->>''f'')-1);'#10 +
+    'UPDATE j1 SET x=jsonb_remove(x,''$.d'');'#10 +
+    'COMMIT;'#10
+  );
+  speedtest1_end_test;
+
+  speedtest1_begin_test(160, 'json_insert()/set()/remove() on every row of J2');
+  speedtest1_exec(
+    'BEGIN;'#10 +
+    'UPDATE j2 SET x=json_insert(x,''$.g'',(x->>''f'')+1);'#10 +
+    'UPDATE j2 SET x=json_set(x,''$.e'',(x->>''f'')-1);'#10 +
+    'UPDATE j2 SET x=json_remove(x,''$.d'');'#10 +
+    'COMMIT;'#10
+  );
+  speedtest1_end_test;
+end;
+
 procedure testset_app;         begin testset_not_yet('app',         'Phase 11.5'); end;
-procedure testset_rtree(a, b: Integer); begin testset_not_yet('rtree', 'Phase 11.5'); end;
+
+{ ----------------------------- testset_rtree ---------------------------- }
+{ Stub.  See ../sqlite3/test/speedtest1.c:2088..2270 — deferred until the
+  R-tree extension port lands in pas-sqlite3.  Mirrors the SQLITE_OMIT_*
+  pattern in shell.c: prints a one-line "not available" message and
+  exits cleanly so dispatch from main() does not crash. }
+
+procedure testset_rtree(a, b: Integer);
+begin
+  WriteLn('speedtest1: R-tree extension not available in this build');
+  Flush(Output);
+end;
 
 { =========================== main() ===================================== }
 

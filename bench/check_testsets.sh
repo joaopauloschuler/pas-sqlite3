@@ -79,5 +79,10 @@ run_one star        --testset star        --size 1 --sqlonly
 run_one orm         --testset orm         --size 1
 # trigger: upstream C bug — t1/t2 missing (header).
 run_one trigger     --testset trigger     --size 1 --sqlonly
+# Phase 11.5: debug1 is pure stdout (no SQL); json runs end-to-end since
+# Phase 6.8 JSON1 lands in the Pas engine; rtree is the omit-stub.
+run_one debug1      --testset debug1
+run_one json        --testset json        --size 1
+run_one rtree       --testset rtree
 
 exit $fail
