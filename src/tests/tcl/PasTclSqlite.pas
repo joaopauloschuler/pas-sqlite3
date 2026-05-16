@@ -32,6 +32,7 @@ implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
+     passqlite3percentile, passqlite3regexp,
      TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr;
 
@@ -4648,6 +4649,20 @@ begin
   rc := sqlite3_open_v2(zFile, @pHandle, flags, zVfs);
   if bTranslateFileName <> 0 then
     Tcl_DStringFree(@ds);
+  { 9.4.divbug.66 — wire optional ext/misc extensions that the upstream
+    test suite assumes are statically linked.  Mirrors the way the .so
+    flavour calls each *_init in sqlite3_extension_init / shell.c:
+      * percentile / median / percentile_cont / percentile_disc
+        (ext/misc/percentile.c — required by percentile.test)
+      * regexp / regexpi
+        (ext/misc/regexp.c — required by regexp1/regexp2.test)
+    Both Init functions are idempotent and tolerate being called even
+    when sqlite3_open_v2 reported a non-OK rc (no-op on nil handle). }
+  if pHandle <> nil then
+  begin
+    sqlite3PercentileInit(pHandle);
+    sqlite3RegexpInit(pHandle);
+  end;
   if (rc <> SQLITE_OK) or (pHandle = nil) or
      (sqlite3_errcode(pHandle) <> SQLITE_OK) then
   begin
