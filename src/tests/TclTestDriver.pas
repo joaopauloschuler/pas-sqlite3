@@ -27,10 +27,20 @@
       --fail-log-dir DIR  (9.4.5.c) on FAIL, write per-test
                           <basename>.out / .err under DIR.  Default is
                           <bin>/tcl-failure-logs/ when unset.
-      --gate strict       (9.4.5.a placeholder; full implementation
-                          tracked under 9.4.8.c) currently a no-op —
-                          accepted so CI invocation contract is stable
-                          before 9.4.8.c lands.
+      --gate strict       (9.4.8.c) after the run, diff the result
+                          classifications against the pas-strict tags
+                          in src/tests/tcl/STATUS.txt; exit non-zero
+                          if any pas-strict row regressed to FAIL.
+                          Mirrors check_status_regression.sh inline.
+      --coverage          (9.4.8.d) opt-in opcode-coverage mode.
+                          Injects pas_opcode_coverage_enable into the
+                          child tclsh script, dumps per-test hit
+                          tables to a tmpdir, aggregates them on exit,
+                          and writes src/tests/tcl/COVERAGE_DELTA.md
+                          listing opcodes hit ONLY by the tcl corpus
+                          (i.e. cold in 9.1 / 9.2 per the corpus
+                          COVERAGE_GAPS.md snapshot).  Defaults off so
+                          the standard sweep pays zero extra cost.
 
   No top-level gate yet — wiring deferred to 9.4.4.a.  Skip-list hook
   is in place but empty.
@@ -115,8 +125,14 @@ var
   gShardI     : Integer = -1;       { 9.4.5.b — -1 = no sharding }
   gShardN     : Integer = -1;
   gFailLogDir : string  = '';       { 9.4.5.c — empty = default <bin>/tcl-failure-logs }
-  gGateStrict : Boolean = False;    { 9.4.5.a placeholder; full impl = 9.4.8.c }
+  gGateStrict : Boolean = False;    { 9.4.8.c — strict gate on STATUS.txt pas-strict rows }
+  gCoverage   : Boolean = False;    { 9.4.8.d — opcode coverage harvest }
+  gCovTmpDir  : string  = '';       { 9.4.8.d — per-test dump landing zone }
+  gCovUnion   : array of Int64;     { 9.4.8.d — aggregated across all tests }
+  gCovNames   : array of string;    { opcode -> name from first dump }
+  gCovInited  : Boolean = False;
   gSkipList   : TStringList;
+  gResults    : TStringList;        { 9.4.8.c — captures one PASS|FAIL|SKIP line per test for the strict gate }
 
   nPass, nFail, nSkip, nTotal : Integer;
 
@@ -199,6 +215,8 @@ begin
         Writeln(StdErr, 'TclTestDriver: unknown --gate value: ', g);
         Halt(2);
       end;
+    end else if a = '--coverage' then begin
+      gCoverage := True;
     end else begin
       Writeln(StdErr, 'TclTestDriver: unknown arg: ', a);
       Halt(2);
@@ -213,7 +231,8 @@ end;
   tmpDir, when non-empty, is the isolated per-test working directory the
   interpreter cd's into before sourcing the .test file (9.4.7.f).
 ----------------------------------------------------------------------------}
-function BuildScript(const testAbsPath: string; const tmpDir: string): string;
+function BuildScript(const testAbsPath: string; const tmpDir: string;
+                     const covDumpPath: string): string;
 var sb: TStringList;
 begin
   sb := TStringList.Create;
@@ -248,7 +267,12 @@ begin
     sb.Add('proc source {path args} {');
     sb.Add('  set tail [file tail $path]');
     sb.Add('  if {$tail eq "tester.tcl"} {');
-    sb.Add('    return [uplevel 1 [list __orig_source $::pas_shim_dir/tester_min.tcl]]');
+    sb.Add('    set __r [uplevel 1 [list __orig_source $::pas_shim_dir/tester_min.tcl]]');
+    { 9.4.8.d: re-apply the cov wrap after tester_min re-installs
+      finalize_testing; harmless no-op when --coverage is off (the
+      proc is undefined in that case). }
+    sb.Add('    catch { __pas_install_cov_wrap }');
+    sb.Add('    return $__r');
     sb.Add('  }');
     { 9.4.6.q.2: route `source $testdir/permutations.test` to our baseline-only
       stub.  Upstream all.test does `source $testdir/permutations.test`, but
@@ -264,10 +288,42 @@ begin
       ./test.db via reset_db (mirroring upstream tester.tcl), so the
       driver no longer issues its own `sqlite3 db :memory:` — that
       broke sub-tests that re-open test.db to re-read the schema. }
+    { 9.4.8.d: flip the opcode-coverage counter before sourcing the test
+      so every VDBE step the test fires lands in gVdbeOpCoverage[].
+      Wrap finalize_testing so the dump fires inside the same exit path
+      finish_test takes (finish_test → finalize_testing → exit), and
+      install a Tcl trace on `proc` so any re-source of tester.tcl (most
+      .test files do `source $testdir/tester.tcl` which our shim redirects
+      to tester_min — and that re-defines finalize_testing, blowing away
+      a one-shot rename) re-applies the wrap on top of the fresh copy. }
+    if covDumpPath <> '' then begin
+      sb.Add('catch { pas_opcode_coverage_enable }');
+      sb.Add('set ::__pas_cov_dump_path {' + covDumpPath + '}');
+      sb.Add('proc __pas_install_cov_wrap {} {');
+      sb.Add('  if {![llength [info commands finalize_testing]]} { return }');
+      sb.Add('  if {[llength [info commands __orig_finalize_testing]] &&');
+      sb.Add('      [info body finalize_testing] eq {');
+      sb.Add('    catch { pas_opcode_coverage_dump $::__pas_cov_dump_path }');
+      sb.Add('    uplevel 1 __orig_finalize_testing');
+      sb.Add('  }} { return }');
+      sb.Add('  catch { rename __orig_finalize_testing {} }');
+      sb.Add('  rename finalize_testing __orig_finalize_testing');
+      sb.Add('  proc finalize_testing {} {');
+      sb.Add('    catch { pas_opcode_coverage_dump $::__pas_cov_dump_path }');
+      sb.Add('    uplevel 1 __orig_finalize_testing');
+      sb.Add('  }');
+      sb.Add('}');
+      sb.Add('__pas_install_cov_wrap');
+    end;
     sb.Add('if {[catch {source ' + testAbsPath + '} __err __opts]} {');
     sb.Add('  puts stderr "SOURCE-ERROR: $__err"');
     sb.Add('}');
     sb.Add('catch { db close }');
+    { 9.4.8.d post-source fallback dump for tests that never call
+      finish_test (some only call do_test in a loop and end without
+      finalize).  No-op when the wrapped finalize_testing already ran. }
+    if covDumpPath <> '' then
+      sb.Add('catch { pas_opcode_coverage_dump {' + covDumpPath + '} }');
     sb.Add('finalize_testing');
     Result := sb.Text;
   finally
@@ -346,6 +402,55 @@ end;
   RunOne — spawn tclsh, feed script via stdin, capture stdout/stderr,
   enforce timeout.  Returns exit code (or -1 on spawn fail, -2 on timeout).
 ----------------------------------------------------------------------------}
+{ MergeCoverageDump — read a per-test dump (one `idx<TAB>name<TAB>hits` per
+  line) and OR it into the union-of-hits accumulator.  Allocates gCovUnion
+  / gCovNames lazily on first call so we don't hard-code the opcode count.
+}
+procedure MergeCoverageDump(const dumpPath: string);
+var
+  sl: TStringList;
+  i, idx, tab1, tab2: Integer;
+  ln, sIdx, sName, sHits: string;
+  hits: Int64;
+begin
+  if not FileExists(dumpPath) then Exit;
+  sl := TStringList.Create;
+  try
+    try
+      sl.LoadFromFile(dumpPath);
+    except
+      Exit;
+    end;
+    if not gCovInited then begin
+      SetLength(gCovUnion, sl.Count);
+      SetLength(gCovNames, sl.Count);
+      gCovInited := True;
+    end;
+    if sl.Count > Length(gCovUnion) then begin
+      SetLength(gCovUnion, sl.Count);
+      SetLength(gCovNames, sl.Count);
+    end;
+    for i := 0 to sl.Count - 1 do begin
+      ln := sl[i];
+      if ln = '' then Continue;
+      tab1 := Pos(#9, ln);
+      if tab1 = 0 then Continue;
+      tab2 := Pos(#9, ln, tab1 + 1);
+      if tab2 = 0 then Continue;
+      sIdx  := Copy(ln, 1, tab1 - 1);
+      sName := Copy(ln, tab1 + 1, tab2 - tab1 - 1);
+      sHits := Copy(ln, tab2 + 1, MaxInt);
+      idx := StrToIntDef(sIdx, -1);
+      if (idx < 0) or (idx >= Length(gCovUnion)) then Continue;
+      hits := StrToInt64Def(sHits, 0);
+      gCovUnion[idx] := gCovUnion[idx] + hits;
+      if gCovNames[idx] = '' then gCovNames[idx] := sName;
+    end;
+  finally
+    sl.Free;
+  end;
+end;
+
 function RunOne(const testAbsPath: string;
                 out sOut, sErr: AnsiString;
                 out durationMs: Int64): Integer;
@@ -357,6 +462,7 @@ var
   endTick    : QWord;
   cwd        : string;
   tmpDir     : string;
+  covDump    : string;
 begin
   sOut := '';
   sErr := '';
@@ -364,7 +470,16 @@ begin
 
   { 9.4.7.f: spin up an isolated working directory for this test. }
   tmpDir := MakeTestTmpDir(testAbsPath);
-  script := BuildScript(testAbsPath, tmpDir);
+  { 9.4.8.d: per-test coverage dump path lives under the global cov
+    tmpdir, NOT the per-test tmpdir (which is wiped before we can read
+    it back).  Empty when --coverage not set: BuildScript skips the
+    pas_opcode_coverage_* injections in that case. }
+  covDump := '';
+  if gCoverage and (gCovTmpDir <> '') then
+    covDump := IncludeTrailingPathDelimiter(gCovTmpDir)
+               + 'cov_' + IntToStr(nTotal) + '_'
+               + ChangeFileExt(ExtractFileName(testAbsPath), '') + '.txt';
+  script := BuildScript(testAbsPath, tmpDir, covDump);
 
   p := TProcess.Create(nil);
   try
@@ -434,6 +549,13 @@ begin
     Result := p.ExitStatus;
   finally
     p.Free;
+    { 9.4.8.d: harvest the per-test opcode-coverage dump (if any) BEFORE
+      we tear down anything else.  Dump lives under gCovTmpDir, not the
+      per-test tmpdir, so it survives the recursive remove below. }
+    if covDump <> '' then begin
+      MergeCoverageDump(covDump);
+      DeleteFile(covDump);
+    end;
     { 9.4.7.f: tear down the per-test tmpdir (and any test.db / journals
       / WAL files the test left behind).  Done in finally so it also
       runs on the timeout and spawn-fail early-exit paths. }
@@ -567,6 +689,10 @@ begin
   cls := Classify(rc, sOut, sErr);
 
   Writeln(cls, ' ', relPath, ' ', nT, ' ', durMs);
+  { 9.4.8.c: capture <classification><TAB><path> so the strict gate
+    can re-classify against STATUS.txt without re-parsing stdout. }
+  if gResults <> nil then
+    gResults.Add(cls + #9 + relPath);
   if cls = 'PASS' then Inc(nPass)
   else if cls = 'SKIP' then Inc(nSkip)
   else begin
@@ -575,6 +701,208 @@ begin
   end;
 
   Flush(Output);
+end;
+
+{----------------------------------------------------------------------------
+  9.4.8.c — strict gate.  After the run, diff result classifications
+  against the canonical pas-strict / pas-soft / pas-skip tags in
+  src/tests/tcl/STATUS.txt.  Returns the count of pas-strict tests
+  that diverged to FAIL; 0 means the gate passes.
+
+  Inline port of check_status_regression.sh so the driver stays
+  self-contained — no shell-out, no PATH dependence, deterministic
+  exit code for CI.
+----------------------------------------------------------------------------}
+function RunStrictGate: Integer;
+var
+  statusPath : string;
+  statusLines: TStringList;
+  statusMap  : TStringList;   { name=path, value=tag }
+  i, tab1, tab2, j: Integer;
+  ln, tag, path, cls, expect, observed: string;
+  regressions, unknowns: Integer;
+begin
+  Result := 0;
+  statusPath := IncludeTrailingPathDelimiter(gTclDir) + 'STATUS.txt';
+  if not FileExists(statusPath) then begin
+    Writeln(StdErr, 'TclTestDriver --gate strict: missing ', statusPath);
+    Result := -1;
+    Exit;
+  end;
+
+  statusLines := TStringList.Create;
+  statusMap   := TStringList.Create;
+  try
+    statusMap.CaseSensitive := True;
+    statusLines.LoadFromFile(statusPath);
+    for i := 0 to statusLines.Count - 1 do begin
+      ln := statusLines[i];
+      if (ln = '') or (ln[1] = '#') then Continue;
+      tab1 := Pos(#9, ln);
+      if tab1 = 0 then Continue;
+      tab2 := Pos(#9, ln, tab1 + 1);
+      tag  := Copy(ln, 1, tab1 - 1);
+      if tab2 = 0 then
+        path := Copy(ln, tab1 + 1, MaxInt)
+      else
+        path := Copy(ln, tab1 + 1, tab2 - tab1 - 1);
+      if (tag <> 'pas-strict') and (tag <> 'pas-soft') and (tag <> 'pas-skip') then
+        Continue;
+      statusMap.Values[path] := tag;
+    end;
+
+    regressions := 0;
+    unknowns    := 0;
+    Writeln(StdErr, '--- 9.4.8.c strict gate ---');
+    if gResults <> nil then begin
+      for i := 0 to gResults.Count - 1 do begin
+        ln := gResults[i];
+        tab1 := Pos(#9, ln);
+        if tab1 = 0 then Continue;
+        cls  := Copy(ln, 1, tab1 - 1);
+        path := Copy(ln, tab1 + 1, MaxInt);
+        expect := statusMap.Values[path];
+        if expect = '' then begin
+          Inc(unknowns);
+          Writeln(StdErr, '  WARN unknown (not in STATUS.txt): ', path, ' [', cls, ']');
+          Continue;
+        end;
+        if (expect = 'pas-strict') and (cls = 'FAIL') then begin
+          Inc(regressions);
+          Writeln(StdErr, '  REGRESSION (pas-strict FAIL): ', path);
+        end;
+      end;
+    end;
+
+    { Also surface pas-strict entries that were *expected* to run but
+      that this sweep never touched — useful when a shard config
+      silently drops a test. }
+    if gResults <> nil then begin
+      for j := 0 to statusMap.Count - 1 do begin
+        path := statusMap.Names[j];
+        tag  := statusMap.ValueFromIndex[j];
+        if tag <> 'pas-strict' then Continue;
+        observed := '';
+        for i := 0 to gResults.Count - 1 do begin
+          ln := gResults[i];
+          tab1 := Pos(#9, ln);
+          if tab1 = 0 then Continue;
+          if Copy(ln, tab1 + 1, MaxInt) = path then begin
+            observed := Copy(ln, 1, tab1 - 1);
+            Break;
+          end;
+        end;
+        { absence from result log is silently OK — shard/filter/limit. }
+        if (observed <> '') and (observed <> 'PASS') and (observed <> 'FAIL') and (observed <> 'SKIP') then
+          Writeln(StdErr, '  WARN unclassified result for pas-strict: ', path, ' [', observed, ']');
+      end;
+    end;
+
+    if regressions > 0 then
+      Writeln(StdErr, 'FAIL: ', regressions, ' pas-strict regression(s).')
+    else
+      Writeln(StdErr, 'OK: no pas-strict regressions (', unknowns, ' unknown paths).');
+    Result := regressions;
+  finally
+    statusMap.Free;
+    statusLines.Free;
+  end;
+end;
+
+{----------------------------------------------------------------------------
+  9.4.8.d — write src/tests/tcl/COVERAGE_DELTA.md.
+
+  Lists opcodes hit by the tcl-feature corpus that are catalogued cold
+  in src/tests/corpus/COVERAGE_GAPS.md (i.e. hot HERE, cold THERE).
+  Those are the opcodes the corpus oracle never reaches but that the
+  upstream .test files do — driving the categorization step Phase
+  9.4.8.d calls for ("opcodes / codegen arms that only the Tcl corpus
+  hits").
+----------------------------------------------------------------------------}
+procedure LoadCorpusCold(out cold: TStringList);
+var
+  gapsPath: string;
+  raw: TStringList;
+  i, pipe1, pipe2: Integer;
+  ln, sIdx: string;
+  idx: Integer;
+begin
+  cold := TStringList.Create;
+  cold.Sorted := True;
+  cold.Duplicates := dupIgnore;
+  gapsPath := IncludeTrailingPathDelimiter(gRoot)
+              + 'src' + DirectorySeparator + 'tests'
+              + DirectorySeparator + 'corpus'
+              + DirectorySeparator + 'COVERAGE_GAPS.md';
+  if not FileExists(gapsPath) then Exit;
+  raw := TStringList.Create;
+  try
+    raw.LoadFromFile(gapsPath);
+    for i := 0 to raw.Count - 1 do begin
+      ln := Trim(raw[i]);
+      if (ln = '') or (Pos('|', ln) <> 1) then Continue;
+      { row form: "| <idx> | <name> | <reason> |" }
+      pipe1 := Pos('|', ln);
+      pipe2 := Pos('|', ln, pipe1 + 1);
+      if pipe2 = 0 then Continue;
+      sIdx := Trim(Copy(ln, pipe1 + 1, pipe2 - pipe1 - 1));
+      idx := StrToIntDef(sIdx, -1);
+      if idx >= 0 then cold.Add(IntToStr(idx));
+    end;
+  finally
+    raw.Free;
+  end;
+end;
+
+procedure WriteCoverageDelta;
+var
+  outPath: string;
+  cold: TStringList;
+  md: TStringList;
+  i, nHotHere, nDeltaOnly: Integer;
+  isCold: Boolean;
+begin
+  outPath := IncludeTrailingPathDelimiter(gTclDir) + 'COVERAGE_DELTA.md';
+  LoadCorpusCold(cold);
+  md := TStringList.Create;
+  try
+    md.Add('# COVERAGE_DELTA.md');
+    md.Add('');
+    md.Add('Generated by `bin/TclTestDriver --coverage` (Phase 9.4.8.d).');
+    md.Add('');
+    md.Add('Opcodes hit by the tcl-feature corpus that are catalogued cold');
+    md.Add('in `src/tests/corpus/COVERAGE_GAPS.md` (i.e. unreached by the');
+    md.Add('9.1 / 9.2 .pas spine corpus).  These are the opcodes only the');
+    md.Add('Tcl driver exercises today.  When the 9.1 corpus closes one of');
+    md.Add('these gaps it should be dropped from `IsCoverageGap` upstream.');
+    md.Add('');
+    md.Add('| opcode | name | tcl-hits |');
+    md.Add('|-------:|------|---------:|');
+    nHotHere    := 0;
+    nDeltaOnly  := 0;
+    for i := 0 to Length(gCovUnion) - 1 do begin
+      if gCovUnion[i] <= 0 then Continue;
+      Inc(nHotHere);
+      isCold := cold.IndexOf(IntToStr(i)) >= 0;
+      if not isCold then Continue;
+      Inc(nDeltaOnly);
+      md.Add('| ' + IntToStr(i) + ' | ' + gCovNames[i] + ' | ' + IntToStr(gCovUnion[i]) + ' |');
+    end;
+    md.Add('');
+    md.Add('_Summary: ' + IntToStr(nHotHere) + ' opcodes hit by the tcl corpus; '
+           + IntToStr(nDeltaOnly) + ' of them are catalogued cold in the .pas corpus._');
+  finally
+    cold.Free;
+  end;
+  try
+    md.SaveToFile(outPath);
+    Writeln(StdErr, '9.4.8.d coverage delta: ', nDeltaOnly,
+            ' tcl-only opcode(s) written to ', outPath);
+  except
+    on E: Exception do
+      Writeln(StdErr, 'TclTestDriver --coverage: write failed: ', E.Message);
+  end;
+  md.Free;
 end;
 
 {----------------------------------------------------------------------------
@@ -588,6 +916,7 @@ var
   tabIdx   : Integer;
   startTotal: QWord;
   shardLo, shardHi: Integer;
+  strictRegressions: Integer;
 begin
   gRoot := ResolveRoot;
   gBinDir := IncludeTrailingPathDelimiter(gRoot) + 'bin';
@@ -601,7 +930,20 @@ begin
     gFailLogDir := IncludeTrailingPathDelimiter(gBinDir) + 'tcl-failure-logs';
 
   if gGateStrict then
-    Writeln(StdErr, 'TclTestDriver: --gate strict accepted (stub; full enforcement = 9.4.8.c)');
+    Writeln(StdErr, 'TclTestDriver: --gate strict enabled (9.4.8.c)');
+  if gCoverage then begin
+    { 9.4.8.d: stage a persistent tmpdir for per-test dumps that
+      survives the per-test tmpdir wipe in RunOne's finally. }
+    gCovTmpDir := GetTempDir(False);
+    if gCovTmpDir = '' then gCovTmpDir := '/tmp/';
+    gCovTmpDir := IncludeTrailingPathDelimiter(gCovTmpDir)
+                  + 'pastcl_cov_' + IntToStr(GetProcessID);
+    if not ForceDirectories(gCovTmpDir) then begin
+      Writeln(StdErr, 'TclTestDriver --coverage: cannot create ', gCovTmpDir);
+      Halt(2);
+    end;
+    Writeln(StdErr, 'TclTestDriver: --coverage enabled (9.4.8.d) tmp=', gCovTmpDir);
+  end;
 
   if not FileExists(gSoPath) then begin
     Writeln(StdErr, 'TclTestDriver: missing ', gSoPath);
@@ -618,6 +960,7 @@ begin
 
   gSkipList := TStringList.Create;
   { 9.4.3.a: skip list intentionally empty; populated in 9.4.4.a }
+  gResults := TStringList.Create;
 
   manifest := TStringList.Create;
   try
@@ -672,6 +1015,28 @@ begin
     manifest.Free;
     gSkipList.Free;
   end;
+
+  { 9.4.8.d: emit COVERAGE_DELTA.md before exit so the report lands even
+    if the strict gate trips below.  Then tear down the cov tmpdir. }
+  if gCoverage then begin
+    WriteCoverageDelta;
+    if gCovTmpDir <> '' then RemoveDirRecursive(gCovTmpDir);
+  end;
+
+  { 9.4.8.c: strict gate runs AFTER per-test reporting + Total: line so
+    a CI log always shows the per-test counts even when the gate trips.
+    When set, the strict gate is the SOLE exit-code decider — a pas-soft
+    FAIL that's catalogued in STATUS.txt must not fail CI.  Without
+    --gate strict the legacy "any FAIL → exit 1" rule still applies. }
+  if gGateStrict then begin
+    strictRegressions := RunStrictGate;
+    gResults.Free;
+    if strictRegressions < 0 then Halt(2);     { missing STATUS.txt }
+    if strictRegressions > 0 then Halt(1);
+    Halt(0);
+  end;
+
+  gResults.Free;
 
   if nFail > 0 then Halt(1) else Halt(0);
 end.

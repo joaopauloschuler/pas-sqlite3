@@ -4762,6 +4762,70 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.8.d — opcode coverage Tcl hooks.
+
+  `pas_opcode_coverage_enable` flips gVdbeOpCoverageEnabled to 1 and
+  zeroes the counter array, so the child tclsh records VDBE opcode
+  hits for the rest of the test.  Costs one predictable branch per
+  opcode step when active and is a no-op otherwise (default 0).
+
+  `pas_opcode_coverage_dump <path>` walks gVdbeOpCoverage[] and writes
+  one `<opcode>\t<name>\t<hits>` line per index to <path>.  TclTestDriver
+  aggregates the per-test dump files in --coverage mode to compute the
+  union-of-hits set across the corpus, then diffs against the 9.1.6 /
+  9.2 snapshot to produce src/tests/tcl/COVERAGE_DELTA.md. }
+function PasOpcodeCoverageEnable(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: i32;
+begin
+  if objc <> 1 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  gVdbeOpCoverageEnabled := 1;
+  for i := 0 to SQLITE_NUM_OPCODES - 1 do gVdbeOpCoverage[i] := 0;
+  Result := TCL_OK;
+end;
+
+function PasOpcodeCoverageDump(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zPath: PAnsiChar;
+  f: TextFile;
+  i: i32;
+  name: PAnsiChar;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('PATH'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zPath := Tcl_GetString(ObjvAt(objv, 1));
+  try
+    AssignFile(f, AnsiString(zPath));
+    Rewrite(f);
+    try
+      for i := 0 to SQLITE_NUM_OPCODES - 1 do begin
+        name := sqlite3OpcodeName(i);
+        if name = nil then name := PAnsiChar('?');
+        WriteLn(f, i, #9, AnsiString(name), #9, gVdbeOpCoverage[i]);
+      end;
+    finally
+      CloseFile(f);
+    end;
+  except
+    on E: Exception do begin
+      Tcl_SetObjResult(interp, Tcl_NewStringObj(
+        PChar('pas_opcode_coverage_dump: ' + E.Message), -1));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+  end;
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -4772,6 +4836,11 @@ begin
     @DbMain, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('register_dbstat_vtab'),
     @TestRegisterDbstatVtab, nil, nil);
+  { 9.4.8.d — opcode coverage probes (see PasOpcodeCoverage{Enable,Dump}). }
+  Tcl_CreateObjCommand(interp, PChar('pas_opcode_coverage_enable'),
+    @PasOpcodeCoverageEnable, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('pas_opcode_coverage_dump'),
+    @PasOpcodeCoverageDump, nil, nil);
   { 9.4.6.l.3 — test_md5.c: register md5 / md5-10x8 / md5file commands. }
   Md5_Init(interp);
   { 9.4.6.l.2 — test_tclvar.c: register the `register_tclvar_module` cmd. }

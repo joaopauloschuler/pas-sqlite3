@@ -800,16 +800,26 @@ acceptance gate for this section.
     populate after 9.4.4.g lands.  Default: every test that
     PASSes is pas-strict; FAIL with citation is pas-soft;
     SKIP is pas-skip with mandatory cite.
-  - [ ] **9.4.8.c** Strict gate — `bin/TclTestDriver --gate strict`
-    exits non-zero if any pas-strict test diverges.  Mirrors
-    9.1.5's strict gate.  This is the long-term PR gate.
-  - [ ] **9.4.8.d** Coverage check — analogous to 9.1.6:
-    track which VDBE opcodes / codegen arms are exercised by
-    the tcl-feature corpus that aren't already covered by 9.1/9.2.
-    Identify "cold" opcodes that *only* tcl-feature catches.
-  - [ ] **9.4.8.e** Regression archive — once full-corpus green,
-    every divergence reopening counts as a regression; auto-bisect
-    via `git bisect` driver.  Long-term.
+  - [X] **9.4.8.c** Strict gate — `bin/TclTestDriver --gate strict`
+    is now the sole exit-code decider when set: it diffs results
+    against STATUS.txt inline (mirroring check_status_regression.sh)
+    and exits non-zero iff any pas-strict row regressed to FAIL.
+    Verified locally: `--gate strict --limit 50` exits 0 today;
+    flipping one pas-soft row to pas-strict flips exit to 1.
+  - [X] **9.4.8.d** Coverage check — `bin/TclTestDriver --coverage`
+    injects `pas_opcode_coverage_{enable,dump}` Tcl cmds (registered
+    by PasTclSqlite.Sqlite3_Init) into each per-test script, dumps
+    per-test gVdbeOpCoverage[] snapshots to a tmpdir, aggregates,
+    and writes `src/tests/tcl/COVERAGE_DELTA.md` listing opcodes
+    hit ONLY by the tcl corpus (cold per `src/tests/corpus/
+    COVERAGE_GAPS.md`).  Wrap is finalize_testing-aware and re-
+    applies after every tester.tcl re-source.  Default-off so the
+    normal sweep pays zero extra cost.
+  - [X] **9.4.8.e** Regression archive — `src/tests/tcl/
+    regression_bisect.sh` walks `git bisect` between a known-good
+    baseline and a known-broken commit, using TclTestDriver as the
+    test predicate (PASS=good, anything else=bad, build-fail=125).
+    Ready for use once the corpus gate flips green.
 
 #### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
 
