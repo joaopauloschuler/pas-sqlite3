@@ -384,3 +384,220 @@ group would unblock bind/bind2/bindxfer/capi2/badutf/badutf2/backup5
 `wal_set/check_journal_mode`, `randstr` SQL func, `eval` SQL
 extension, `test_set_config_pagecache`, `sqlite3_create_aggregate`,
 `autoinstall_test_functions`, `do_faultsim_test`.
+
+## Run summary (9.4.4.e sweep)
+
+Broadened the sweep to the **first 250 tcl-feature tests** in MANIFEST.txt
+order, run under `bin/TclTestDriver --limit 250` (engine + tcl lib rebuilt
+fresh).
+
+PASS / FAIL / SKIP = **147 / 103 / 0** (250 total, 137.9 s).  Two of the
+103 FAILs are 30s-timeouts (`btree01.test`, `changes.test`) — driver
+counts them as FAIL.
+
+Delta vs 9.4.4.d (first-100 subset): 72→75 PASS — a 3-test improvement
+on tests previously in the window, attributable to the divbug.19/20/21/22/23/24/24.b/25/26/27 fix landings between 9.4.4.d and 9.4.4.e.
+The 28 FAILs from the first-100 slice have **all** moved to a status of
+either FIXED (improved PASS count) or unchanged divbug pas-soft.
+
+Of the **79 new FAILs in the [101..250] slice** (= 103 minus the 25
+first-100 FAILs that still fail minus 1 already-tracked timeout), the
+breakdown by root cause is:
+
+| Cluster                                          | Count |
+|--------------------------------------------------|-------|
+| **Harness gap — test1.c C-API command unported** | ~28   |
+|  (sqlite3_step, sqlite3_prepare16, sqlite3_open, |       |
+|   sqlite3_finalize, sqlite3_next_stmt,           |       |
+|   sqlite3_data_count, sqlite3_column_*, …)       |       |
+| **Harness gap — test-util / test_func / testvfs**| ~22   |
+|  (database_may_be_corrupt, do_select_tests,      |       |
+|   execsql2, hexio_read/write, file_control_*,    |       |
+|   testvfs, sqlite3_register_cksumvfs, randstr,   |       |
+|   do_adp_test, drop_all_tables, sqlite_pending_  |       |
+|   byte, sqlite3_table_column_metadata,           |       |
+|   sqlite3_soft_heap_limit, faultsim_test_result, |       |
+|   load_static_extension fileio/decimal, …)       |       |
+| **9.4.divbug.28..40** (new engine clusters)      | ~13   |
+| **Already-tracked .19..27 residue**              | ~6    |
+| **CTAS unsupported (engine, divbug.39)**         | ~3    |
+
+The 16 `corrupt*.test` files all bounce off a single harness gap
+(`database_may_be_corrupt` — a setter that toggles
+`SQLITE_TESTCTRL_NEVER_CORRUPT`).  Porting that one shim would
+unblock the whole `corrupt*` family for triage.
+
+Newly assigned engine divbug clusters:
+
+## 9.4.divbug.28 — EXPLAIN QUERY PLAN multi-table segfault
+
+Affects: 4 tests (`eqp2.test`, `cost.test`, `fordelete.test`,
+`delete2.test`).
+Symptom: `EXPLAIN QUERY PLAN` on a query that touches two or more
+tables / indexes returns the first row correctly, then SIGSEGVs when
+the EQP cursor advances to subsequent rows.  Reproducer:
+```
+CREATE TABLE t3(id INTEGER PRIMARY KEY, b NOT NULL);
+CREATE TABLE t4(c, d, e);
+CREATE UNIQUE INDEX i3 ON t3(b);
+CREATE UNIQUE INDEX i4 ON t4(c, d);
+EXPLAIN QUERY PLAN SELECT e FROM t3, t4 WHERE b=c ORDER BY b, d;
+```
+First row (`SCAN t3 USING COVERING INDEX i3`) is emitted, then segfault.
+Likely cause: `sqlite3VdbeExplain` / `OP_Explain` formatter walks a
+parent/child id chain whose Pascal port doesn't terminate the
+`pParse->aExplain` array tail (or doesn't track `parent==0` sentinel
+correctly).  Probably a single missing termination in `addExplainTrace`
+or a stale `pNext` pointer after the first emit.  C reference:
+vdbe.c `OP_Explain` ~7100, vdbeaux.c `sqlite3VdbeExplain`.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER
+
+Affects: 1 test (`collate1.test`, all sub-tests of section 1).
+Symptom: `INSERT INTO t(c TEXT) VALUES('0x119')` is stored as INTEGER
+281 instead of TEXT `'0x119'`.  SELECT then returns `45 281` (decimal
+ints) where upstream returns the TEXT strings `0x2D 0x119`.
+Likely cause: Pascal `applyAffinity` / `sqlite3VdbeMemNumerify` invokes
+the hex-string parser on a TEXT-affinity column where C's
+`applyAffinity` for `SQLITE_AFF_TEXT` should never numerify.  Check
+`applyAffinity` text arm — it may be falling through to the BLOB->TEXT
+case instead of returning.  C reference: vdbeaux.c `applyAffinity`
+~vdbe.c:209.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders
+
+Affects: 3 tests (`collate2.test`, `collate9.test`, `collate8.test`).
+Symptom: `SELECT … ORDER BY x COLLATE NOCASE` returns rows in a
+case-segregated order (`AB Ab aB ab BA …`) instead of upstream's
+case-folded order (`ab aB Ab AB ba …`).  collate9-1.6/4.5 also report
+`sort` where EQP should say `nosort` (index-uses-collation gate fails),
+and collate8-1.15 fails resolution of an alias column under a custom
+collation.  Probably the `xCmp` callback registered for NOCASE in the
+TCL bridge differs from upstream's, OR sqlite3 picks the wrong index
+when an ORDER BY collation is different from the index's intrinsic.
+Likely cause: `sqlite3FindCollSeq` / collating-sequence pinning at
+ORDER-BY-resolve.  C reference: callback.c `sqlite3FindCollSeq`,
+where.c `wherePathSatisfiesOrderBy`.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.31 — Spurious `database disk image is malformed` for non-corrupt errors
+
+Affects: 2 tests (`collate3.test`, `count.test`).  Symptom:
+`SELECT … COLLATE caseless` where `caseless` is not registered should
+raise `no such collation sequence: caseless`; our build raises
+`database disk image is malformed` instead.  Similarly `count-1.2.4/5`
+hit the same generic message where upstream raises a specific schema
+error.
+Likely cause: when the prepare-time error path raises a missing-
+collation diagnostic, our `sqlite3ErrorWithMsg` arm maps SQLITE_ERROR
+through `SQLITE_CORRUPT` somewhere upstream of `setErrorMsg`.  Check
+`sqlite3LocateCollSeq` / `sqlite3CheckCollSeq` return-path.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.32 — readonly DB write returns `unknown error`
+
+Affects: 1 test (`delete.test`, delete-8.x; same shape may show in
+backup/io tests once their harness lands).
+Symptom: a `DELETE` against an attached read-only DB returns
+`unknown error` instead of `attempt to write a readonly database`.
+Likely cause: a SQLITE_READONLY result code reaches the Tcl bridge
+without the corresponding error-message lookup table being primed
+(or a missing `sqlite3ErrStr` entry / extended-rc demotion).
+C reference: main.c `sqlite3ErrStr`, btreeBeginTrans RO arm.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.33 — `count(DISTINCT …)` wrong result
+
+Affects: 1 test (`distinctagg.test`, distinctagg-3.x).
+Symptom: `SELECT count(DISTINCT …)` returns 1 where upstream returns 0
+(empty set should yield 0).  Likely an init-vs-update ordering bug in
+the DISTINCT-aggregate accumulator (the seed row is counted before the
+NULL gate fires).  C reference: func.c `countStep` distinct path,
+select.c `updateAccumulator` DISTINCT loop.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.34 — `PRAGMA page_size` default mismatch
+
+Affects: 2 tests (`createtab.test` createtab-0.2 expects 4096, got 8192;
+`format4.test` format4-1.1 expects 2048, got 8192).
+Symptom: a fresh DB's `PRAGMA page_size` reports the build-time default
+(8192) regardless of the size the test set via `PRAGMA page_size=…` or
+the format-version-implied default.  Likely the
+`SQLITE_DEFAULT_PAGE_SIZE` build constant in Pascal does not honour
+the per-test `PRAGMA page_size=N` before the first write that
+materialises the header.  C reference: pragma.c PragTyp_PAGE_SIZE
+write arm, pager.c `sqlite3PagerSetPagesize`.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.35 — Float-to-text precision artifacts (`-1.1099999999999999`)
+
+Affects: 2 tests (`fpconv1.test` fpconv1-1.2/1.3; `default.test`
+default-3.3 — `9.22337203685478e+18` got `9.223372036854776e+18`).
+Symptom: float-to-string conversion of `-1.11` yields
+`-1.1099999999999999` instead of `-1.11`; large doubles get one extra
+digit of mantissa.  Likely the Pascal `printf` `%!.15g` / `%.17g`
+shortest-round-trip path uses `FloatToStrF(ffGeneral,15,…)` which
+doesn't implement Grisu/Dragon4.  C reference: util.c
+`sqlite3_str_appendf` `%g` arm, printf.c `etFLOAT`.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored
+
+Affects: 1 test (`changes.test`, changes-1.1.0).
+Symptom: `PRAGMA journal_mode=off` returns `delete` (the prior mode)
+instead of `off`; subsequent ops still use the rollback journal.
+Likely a missing arm in `pragma.c PragTyp_JOURNAL_MODE` write path —
+the parser accepts `off` but Pascal's mode-string table doesn't
+include it, so the assignment no-ops.  C reference: pragma.c
+azModeName[] (~PAGER_JOURNALMODE_OFF).
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.37 — WAL `wal_hook` callback count = 0
+
+Affects: 1 test (`e_walhook.test`, e_walhook-1.3+).
+Symptom: after `db wal_hook { … }` is set and the connection commits a
+WAL transaction, the hook fires but the test-counted invocation count
+stays at 0.  Possibly the hook is invoked from a non-WAL path, or the
+WAL frame-count argument arrives 0 (the test checks
+`expr {$nFrame > 0}`).  C reference: wal.c
+`sqlite3WalCallback` / pager.c walCommit invocation point.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.38 — FK ON-clause syntax error not raised + row mis-pick
+
+Affects: 1 test (`e_fkey.test`, e_fkey-2.1 / 3.1).
+Symptom: e_fkey-3.1 expects `near "ON": syntax error` for malformed
+`REFERENCES` but our parser accepts it; e_fkey-2.1 returns `world`
+where upstream returns `hello` (FK-cascade target row picked wrong).
+Two related symptoms under one FK-codegen root cluster.
+C reference: parse.y refargs grammar; fkey.c
+`sqlite3FkActionTrigger`.
+Surfaced by: 9.4.4.e sweep.
+
+## 9.4.divbug.39 — `CREATE TABLE AS SELECT` unsupported
+
+Affects: 3 tests (`errofst1.test` errofst1-1.1; `delete.test`
+delete-7.6; `distinct2.test` distinct2-100; plus older affinity3
+residue).
+Symptom: parser/codegen returns `CREATE TABLE AS SELECT not yet
+supported in this build`.  Engine has the AST shape but the SRT_*
+sink + table-creation post-step never wired.  C reference: build.c
+`sqlite3EndTable` `pSelect` arm + select.c `SRT_Table`.
+Surfaced by: 9.4.4.e sweep (already known but had no dedicated bucket).
+
+## 9.4.divbug.40 — `DEFAULT` literal type + error-msg column-name drop
+
+Affects: 1 test (`default.test`, default-1.3, default-3.1).
+Symptom: default-1.3 expected
+`default value of column [y] is not constant` but our build prints
+`default value of column is not constant` (the `%s` column name is
+dropped — sibling of divbug.14 but in DEFAULT clause).  default-3.1
+returns column-affinity types in a different order (`xyz text 321
+integer 432 text` vs upstream's `xyz text 321 text 432 integer`).
+Likely cause: two related codegen issues in DEFAULT-clause checker
+and AS-affinity propagation when the DEFAULT carries an expression.
+C reference: build.c `sqlite3AddDefaultValue`, ` sqlite3AffinityType`.
+Surfaced by: 9.4.4.e sweep.
+
