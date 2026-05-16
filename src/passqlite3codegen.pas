@@ -49527,6 +49527,12 @@ var
   bShowInternal: i32;
   pPragmaId: PToken;
   newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
+  { 9.4.divbug.36 — PragTyp_JOURNAL_MODE write arm locals
+    (pragma.c:734..771).  eModeJm = resolved PAGER_JOURNALMODE_*,
+    iJm = loop var, zModeJm = candidate name from azJournalModeName[]. }
+  eModeJm:   i32;
+  iJm:       i32;
+  zModeJm:   PAnsiChar;
   { 6.28.6.a — locals for PRAGMA integrity_check / quick_check.  Match
     C var names from pragma.c:1696 (i, j, addr, mxErr, x, pTbls, aRoot,
     cnt, pTab, pIdx, nIdx, isQuick).  Renamed to *Ic suffix where the
@@ -50247,20 +50253,50 @@ begin
     always end with `OP_ResultRow` carrying the (possibly updated) current
     mode (pragma.c:770 / pragma.c:725). }
   if SameText(zName, 'journal_mode') then begin
-    { pragma.c:734..771 — emit the *current* journal mode name from the
-      attached pager.  On an in-memory DB this is "memory"; on an on-disk
-      DB the default is "delete".  Previously the Pas port hard-coded
-      "memory" which diverged from the C oracle on file-backed corpora
-      (Phase 9.1.divbug.2).  We do not yet port the OP_JournalMode opcode
-      so the mode-switch arm of zRight is still a silent no-op; reads now
-      reflect reality, which is what TestSQLCorpus exercises. }
-    pBtArg := PBtree(db^.aDb[iDb].pBt);
-    if pBtArg <> nil then
-      sqlite3VdbeLoadString(v, 1,
-        PChar(AnsiString(sqlite3JournalModename(
-          sqlite3PagerGetJournalMode(sqlite3BtreePager(pBtArg))))))
-    else
-      sqlite3VdbeLoadString(v, 1, 'memory');
+    { pragma.c:734..771 PragTyp_JOURNAL_MODE — faithful port.  Resolves
+      the requested mode (or PAGER_JOURNALMODE_QUERY for read form), then
+      emits one OP_JournalMode per affected attached DB and a final
+      ResultRow carrying the resulting mode (reg 1).  9.4.divbug.36:
+      previously the write arm was a silent no-op so
+      `PRAGMA journal_mode=off` was ignored. }
+    if (pValue <> nil) and (Length(zRight) > 0) then begin
+      { Walk azJournalModeName[] looking for a case-insensitive prefix
+        match — pragma.c:744..747. }
+      eModeJm := PAGER_JOURNALMODE_QUERY;
+      iJm := 0;
+      while True do begin
+        zModeJm := sqlite3JournalModename(iJm);
+        if zModeJm = nil then Break;
+        if sqlite3_strnicmp(PChar(zRight), PChar(zModeJm),
+                            Length(zRight)) = 0 then begin
+          eModeJm := iJm;
+          Break;
+        end;
+        Inc(iJm);
+      end;
+      { pragma.c:753..757 — defensive mode rejects "off". }
+      if (eModeJm = PAGER_JOURNALMODE_OFF)
+         and ((db^.flags and u64($10000000)) <> 0) then { SQLITE_Defensive }
+        eModeJm := PAGER_JOURNALMODE_QUERY;
+    end else
+      eModeJm := PAGER_JOURNALMODE_QUERY;
+
+    { pragma.c:759..763 — bare "PRAGMA journal_mode" without schema
+      qualifier maps to main.journal_mode. }
+    if (eModeJm = PAGER_JOURNALMODE_QUERY)
+       and ((pId2 = nil) or (pId2^.n = 0)) then
+      iDb := 0;
+
+    { pragma.c:764..769 — emit OP_JournalMode for the selected DB(s).
+      When pId2 is empty, all attached DBs get touched (reverse order
+      so reg 1 ends up holding main's mode for the ResultRow). }
+    for iJm := db^.nDb - 1 downto 0 do begin
+      if (db^.aDb[iJm].pBt <> nil)
+         and ((iJm = iDb) or (pId2 = nil) or (pId2^.n = 0)) then begin
+        sqlite3VdbeUsesBtree(v, iJm);
+        sqlite3VdbeAddOp3(v, OP_JournalMode, iJm, 1, eModeJm);
+      end;
+    end;
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;

@@ -556,15 +556,25 @@ doesn't implement Grisu/Dragon4.  C reference: util.c
 `sqlite3_str_appendf` `%g` arm, printf.c `etFLOAT`.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored
+## 9.4.divbug.36 — `PRAGMA journal_mode=off` silently ignored — FIXED
 
-Affects: 1 test (`changes.test`, changes-1.1.0).
-Symptom: `PRAGMA journal_mode=off` returns `delete` (the prior mode)
-instead of `off`; subsequent ops still use the rollback journal.
-Likely a missing arm in `pragma.c PragTyp_JOURNAL_MODE` write path —
-the parser accepts `off` but Pascal's mode-string table doesn't
-include it, so the assignment no-ops.  C reference: pragma.c
-azModeName[] (~PAGER_JOURNALMODE_OFF).
+Root cause: the Pascal port of `PragTyp_JOURNAL_MODE` only emitted the
+*read* arm — it printed the current journal-mode string and never
+emitted `OP_JournalMode` for the `=MODE` write form, so every
+`PRAGMA journal_mode=...` was a silent no-op (the parser accepted the
+value but the pager was never asked to switch).  The opcode itself
+(`OP_JournalMode`, vdbe.c:8054) is already ported and works.
+
+Fix (codegen.pas:50249..): faithful port of pragma.c:734..771.  When
+`pValue<>nil` walk `azJournalModeName[]` via `sqlite3_strnicmp` for a
+case-insensitive prefix match (matches C's `sqlite3StrNICmp(zRight,
+zMode, n)` semantics), apply the defensive-mode `OFF→QUERY` gate, then
+emit one `OP_JournalMode` per affected attached DB (reverse order so
+reg 1 ends up holding `main`'s mode) followed by the final
+`OP_ResultRow`.  Reproducer (file-backed DB, single connection):
+`PRAGMA journal_mode=off` now returns `off`, and a follow-up
+`PRAGMA journal_mode` query also returns `off`, matching the C oracle
+sqlite3_prepare_v2 path.
 Surfaced by: 9.4.4.e sweep.
 
 ## 9.4.divbug.37 — WAL `wal_hook` callback count = 0
