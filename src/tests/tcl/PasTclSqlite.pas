@@ -704,6 +704,106 @@ begin
   Dispose(pDb);
 end;
 
+{ DbBindOneParam — 9.4.divbug.60.  Resolves a single `$NAME` / `:NAME` /
+  `@NAME` bind parameter against the calling Tcl scope and dispatches on
+  the resolved Tcl_Obj's typePtr->name to pick the matching
+  sqlite3_bind_xxx flavour.  Mirrors tclsqlite.c:1491..1556 (the typed-
+  bind ladder added for divbug.60).  When pPS is non-nil the BLOB/text
+  branches stash an incref'd reference in apParm[iParm^] so the bytes
+  survive until DbReleaseStmt drops them; when pPS is nil (objc==3 flat
+  list path which finalises immediately) we hand SQLite SQLITE_TRANSIENT
+  copies instead.  Returns True if the parameter was bound, False if the
+  name didn't match the supported prefixes.  Sibling of divbug.29's
+  DbSqlFunc auto-detect peek. }
+function DbBindOneParam(pDb: PSqliteDb; pStmt: Pointer; i: cint;
+                        zParamName: PAnsiChar;
+                        pPS: PSqlPreparedStmt; iParm: pcint): Boolean;
+var
+  pVarObj: PTclObj;
+  zType:   PAnsiChar;
+  tc:      AnsiChar;
+  nBytes:  cint;
+  nBool:   cint;
+  wVal:    Int64;
+  rVal:    Double;
+  pBlob:   PChar;
+  pVarStr: PChar;
+  xDel:    TxDelProc;
+begin
+  Result := False;
+  if (zParamName = nil) or
+     ((zParamName[0] <> '$') and (zParamName[0] <> ':')
+      and (zParamName[0] <> '@')) then Exit;
+  Result := True;
+  pVarObj := Tcl_GetVar2Ex(pDb^.interp, zParamName + 1, nil, 0);
+  if pVarObj = nil then
+  begin
+    sqlite3_bind_null(pStmt, i);
+    Exit;
+  end;
+  zType := TclObjTypeName(pVarObj);
+  if zType = nil then tc := #0 else tc := zType[0];
+
+  { Choose SQLITE_STATIC + apParm[]-incref when we have a stmt cache
+    node to anchor the lifetime; otherwise SQLITE_TRANSIENT so SQLite
+    copies the bytes itself before the row loop. }
+  if (pPS <> nil) and (iParm <> nil) then
+    xDel := SQLITE_STATIC
+  else
+    xDel := SQLITE_TRANSIENT;
+
+  { tclsqlite.c:1519..1527 — '@' always BLOB; bytearray w/o string rep
+    also goes BLOB. }
+  if (zParamName[0] = '@') or
+     ((tc = 'b') and TclObjHasNoStringRep(pVarObj)
+        and (StrComp(zType, 'bytearray') = 0)) then
+  begin
+    pBlob := Tcl_GetByteArrayFromObj(pVarObj, @nBytes);
+    sqlite3_bind_blob(pStmt, i, pBlob, nBytes, xDel);
+    if pPS <> nil then
+    begin
+      Tcl_IncrRefCount(pVarObj);
+      (PPTclObj(PtrUInt(pPS^.apParm) + PtrUInt(iParm^)*SizeOf(Pointer)))^
+        := pVarObj;
+      Inc(iParm^);
+    end;
+  end
+  else if (tc = 'b') and TclObjHasNoStringRep(pVarObj)
+       and ((StrComp(zType, 'booleanString') = 0)
+            or (StrComp(zType, 'boolean') = 0)) then
+  begin
+    { tclsqlite.c:1528..1534. }
+    Tcl_GetBooleanFromObj(pDb^.interp, pVarObj, @nBool);
+    sqlite3_bind_int(pStmt, i, nBool);
+  end
+  else if (tc = 'd') and (StrComp(zType, 'double') = 0) then
+  begin
+    { tclsqlite.c:1535..1538. }
+    Tcl_GetDoubleFromObj(pDb^.interp, pVarObj, @rVal);
+    sqlite3_bind_double(pStmt, i, rVal);
+  end
+  else if ((tc = 'w') and (StrComp(zType, 'wideInt') = 0))
+       or ((tc = 'i') and (StrComp(zType, 'int') = 0)) then
+  begin
+    { tclsqlite.c:1539..1543. }
+    Tcl_GetWideIntFromObj(pDb^.interp, pVarObj, @wVal);
+    sqlite3_bind_int64(pStmt, i, wVal);
+  end
+  else
+  begin
+    { tclsqlite.c:1544..1549 — UTF-8 text fallback. }
+    pVarStr := Tcl_GetStringFromObj(pVarObj, @nBytes);
+    sqlite3_bind_text64(pStmt, i, pVarStr, u64(nBytes), xDel, SQLITE_UTF8);
+    if pPS <> nil then
+    begin
+      Tcl_IncrRefCount(pVarObj);
+      (PPTclObj(PtrUInt(pPS^.apParm) + PtrUInt(iParm^)*SizeOf(Pointer)))^
+        := pVarObj;
+      Inc(iParm^);
+    end;
+  end;
+end;
+
 { DbPrepareAndBind — minimal port of dbPrepareAndBind
   (tclsqlite.c:1392..1562).  Looks up the first SQL statement in `zIn`
   against the LRU cache; if not found, prepares it (with
@@ -733,7 +833,6 @@ var
   prepFlags:  u32;
   nByte:      PtrUInt;
   zParamName: PAnsiChar;
-  pVarStr:    PChar;
   rc:         cint;
 begin
   ppPS^ := nil;
@@ -810,20 +909,14 @@ begin
   Assert(pPS <> nil);
   nVar := sqlite3_bind_parameter_count(pStmt);
   iParm := 0;
-  { Walk bind parameters — tclsqlite.c:1491..1556 (text-only subset). }
+  { Walk bind parameters — tclsqlite.c:1491..1556 via DbBindOneParam
+    helper (9.4.divbug.60).  apParm[] anchors incref'd Tcl_Obj refs for
+    the BLOB / text branches so SQLITE_STATIC bytes stay live until
+    DbReleaseStmt drops them. }
   for i := 1 to nVar do
   begin
     zParamName := sqlite3_bind_parameter_name(pStmt, i);
-    if (zParamName <> nil) and
-       ((zParamName[0] = '$') or (zParamName[0] = ':') or
-        (zParamName[0] = '@')) then
-    begin
-      pVarStr := Tcl_GetVar(pDb^.interp, zParamName + 1, 0);
-      if pVarStr <> nil then
-        sqlite3_bind_text(pStmt, i, pVarStr, -1, SQLITE_TRANSIENT)
-      else
-        sqlite3_bind_null(pStmt, i);
-    end;
+    DbBindOneParam(pDb, pStmt, i, zParamName, pPS, @iParm);
   end;
   pPS^.nParm := iParm;
   ppPS^ := pPS;
@@ -1275,7 +1368,6 @@ var
   nVar:       i32;
   iParam:     i32;
   zParamName: PAnsiChar;
-  pVarStr:    PChar;
   pVarName:   PTclObj;       { array name obj, or nil for the scalar form }
   pScript:    PTclObj;       { per-row script body, or nil for objc==3   }
   pColName:   PTclObj;
@@ -1368,18 +1460,15 @@ begin
     { 9.4.divbug.5 — minimal port of tclsqlite.c:dbPrepareAndBind
       (tclsqlite.c:1490..1556).  Walk the prepared statement's parameter
       list and substitute `$NAME` / `:NAME` / `@NAME` from the calling
-      Tcl scope. }
+      Tcl scope.  9.4.divbug.60: route through DbBindOneParam so each
+      bind picks the right sqlite3_bind_xxx based on the Tcl_Obj's
+      typePtr->name (int/wideInt/double/bytearray/boolean) instead of
+      uniformly binding TEXT — without this every `SELECT typeof($x)`
+      answers "text" regardless of $x's internal rep. }
     nVar := sqlite3_bind_parameter_count(pStmt);
     for iParam := 1 to nVar do begin
       zParamName := sqlite3_bind_parameter_name(pStmt, iParam);
-      if (zParamName <> nil) and
-         ((zParamName[0] = '$') or (zParamName[0] = ':') or (zParamName[0] = '@')) then begin
-        pVarStr := Tcl_GetVar(interp, zParamName + 1, 0);
-        if pVarStr <> nil then
-          sqlite3_bind_text(pStmt, iParam, pVarStr, -1, SQLITE_TRANSIENT)
-        else
-          sqlite3_bind_null(pStmt, iParam);
-      end;
+      DbBindOneParam(pDb, pStmt, iParam, zParamName, nil, nil);
     end;
 
     nCol := sqlite3_column_count(pStmt);
