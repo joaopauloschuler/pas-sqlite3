@@ -6529,6 +6529,14 @@ begin
           done := True;
         end;
       end;
+    TK_VECTOR:
+      begin
+        { Port of expr.c:5597..5600.  A bare row-value vector reached
+          codegen in scalar context — `SELECT (1,2)`, `(a,b)+1`, etc.
+          C raises "row value misused" and falls through (no OP). }
+        sqlite3ErrorMsg(pParse, 'row value misused');
+        done := True;
+      end;
     else
       { C default arm semantics: assert (op==TK_NULL || op==TK_ERROR ||
         mallocFailed) then emit OP_Null.  TK_NULL is its own arm above;
