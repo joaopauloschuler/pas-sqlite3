@@ -51579,6 +51579,11 @@ begin
   if p = nil then begin
     zErr := 'no such collation sequence: ' + AnsiString(zName);
     sqlite3ErrorMsg(pParse, PAnsiChar(zErr));
+    { callback.c:231 — distinguish missing-collation errors from generic
+      SQLITE_ERROR so build.c:5674's KeyInfoOfIndex assertion holds and
+      so the extended-rc surfaces as SQLITE_ERROR_MISSING_COLLSEQ (257)
+      at the API boundary. }
+    pParse^.rc := SQLITE_ERROR_MISSING_COLLSEQ;
   end;
   Result := p;
 end;
@@ -51608,14 +51613,24 @@ end;
 
 function sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
 var
-  db:  PTsqlite3;
-  enc: u8;
-  p:   PTCollSeq;
+  db:       PTsqlite3;
+  enc:      u8;
+  initbusy: u8;
+  p:        PTCollSeq;
 begin
-  db  := pParse^.db;
-  enc := db^.enc;
-  p   := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 1));
-  if (p <> nil) and (p^.xCmp = nil) then
+  { Faithful port of callback.c:256..268.  During schema load (init.busy=1)
+    we MUST NOT report a missing collation as an error — the inner CREATE
+    TABLE re-parse would otherwise fail, sqlite3InitCallback routes the
+    failure through corruptSchema → SQLITE_CORRUPT → "database disk image
+    is malformed".  Instead, allocate a placeholder CollSeq via
+    sqlite3FindCollSeq(create=initbusy) and let the runtime path
+    (init.busy=0) report "no such collation sequence: …" via
+    sqlite3GetCollSeq when the table is actually used (9.4.divbug.31). }
+  db       := pParse^.db;
+  enc      := db^.enc;
+  initbusy := db^.init.busy;
+  p        := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, initbusy));
+  if (initbusy = 0) and ((p = nil) or (p^.xCmp = nil)) then
     p := PTCollSeq(sqlite3GetCollSeq(pParse, enc, p, zName));
   Result := p;
 end;
