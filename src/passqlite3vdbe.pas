@@ -1441,7 +1441,7 @@ function  sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
 function  sqlite3VdbeSerialPut(buf: Pu8; pMem: PMem; serial_type: u32): u32;
 procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem); inline;
 function  sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
-                                  p: Pointer): Pointer; { returns UnpackedRecord* }
+                                  p: Pointer): Pointer; inline; { returns UnpackedRecord* }
 function  sqlite3VdbeAllocUnpackedRecord(pKeyInfo: PKeyInfo): Pointer;
 function  sqlite3VdbeRecordCompareWithSkip(nKey1: i32; pKey1: Pointer;
                                            pPKey2: Pointer; bSkip: i32): i32;
@@ -2261,7 +2261,7 @@ end;
   using sqlite3VdbeSerialGet / sqlite3VdbeSerialTypeLen.  Returns p (the
   C reference is void; the Pascal signature returns Pointer historically). }
 function sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
-                                 p: Pointer): Pointer;
+                                 p: Pointer): Pointer; inline;
 var
   pUR:        PUnpackedRecord;
   aKey:       Pu8;
@@ -2273,12 +2273,18 @@ var
   pMm:        PMem;
   enc:        u8;
   pDb:        Psqlite3;
+  nAllField:  i32;  { hoisted from pUR^.nField to avoid repeated deref in loop;
+                      task 12.2.candidate.7 (nAllField is the C-side KeyInfo
+                      header field; in this routine the loop bound is the
+                      unpacked-record's own nField, which mirrors the same
+                      caller-supplied count). }
 begin
   pUR  := PUnpackedRecord(p);
   aKey := Pu8(pKey);
   pMm  := PMem(pUR^.aMem);
   enc  := Pu8(pKeyInfo)[4];
   pDb  := PPointer(Pu8(pKeyInfo) + 16)^;
+  nAllField := pUR^.nField;
   pUR^.default_rc := 0;
   { getVarint32 macro fast path: high-bit clear means single-byte varint. }
   if (aKey[0] and $80) = 0 then begin
@@ -2303,11 +2309,11 @@ begin
     sqlite3VdbeSerialGet(@aKey[d], serialType, pMm);
     Inc(d, sqlite3VdbeSerialTypeLen(serialType));
     Inc(u);
-    if u >= u16(pUR^.nField) then break;
+    if u >= u16(nAllField) then break;
     Inc(pMm);
   end;
   if (d > u32(nKey)) and (u <> 0) then begin
-    if u < u16(pUR^.nField) then
+    if u < u16(nAllField) then
       sqlite3VdbeMemSetNull(pMm);
   end;
   pUR^.nField := i32(u);
