@@ -690,7 +690,7 @@ procedure sqlite3Put4byte(p: Pu8; v: u32);
 { Varint codec (util.c) }
 function sqlite3PutVarint(p: Pu8; v: u64): i32;
 function sqlite3GetVarint(p: Pu8; out v: u64): u8;
-function sqlite3GetVarint32(p: Pu8; out v: u32): u8;
+function sqlite3GetVarint32(p: Pu8; out v: u32): u8; inline;
 function sqlite3VarintLen(v: u64): i32;
 
 { Hash table (hash.c) }
@@ -1712,16 +1712,14 @@ begin
   Result := 9;
 end;
 
-function sqlite3GetVarint32(p: Pu8; out v: u32): u8;
+function sqlite3GetVarint32Slow(p: Pu8; out v: u32): u8;
 var
   v64: u64;
   n:   u8;
 begin
-  { Caller guarantees (p[0] and $80) <> 0 }
-  if (p[1] and $80) = 0 then begin
-    v := (u32(p[0] and $7f) shl 7) or u32(p[1]);
-    Exit(2);
-  end;
+  { Slow path for 3+ byte varints, also used by getVarint32 inline shim
+    when p[1] has its high bit set.  Caller guarantees
+    (p[0] and $80) <> 0 AND (p[1] and $80) <> 0. }
   if (p[2] and $80) = 0 then begin
     v := (u32(p[0] and $7f) shl 14) or (u32(p[1] and $7f) shl 7) or u32(p[2]);
     Exit(3);
@@ -1732,6 +1730,19 @@ begin
   else
     v := u32(v64);
   Result := n;
+end;
+
+function sqlite3GetVarint32(p: Pu8; out v: u32): u8;
+var
+  b1: u8;
+begin
+  { Caller guarantees (p[0] and $80) <> 0.  Inline 2-byte fast path. }
+  b1 := p[1];
+  if (b1 and $80) = 0 then begin
+    v := (u32(p[0] and $7f) shl 7) or u32(b1);
+    Exit(2);
+  end;
+  Result := sqlite3GetVarint32Slow(p, v);
 end;
 
 function sqlite3VarintLen(v: u64): i32;
