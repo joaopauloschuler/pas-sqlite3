@@ -663,7 +663,7 @@ pas-strict	../sqlite3/test/pragma.test	-
 pas-strict	../sqlite3/test/pragma2.test	-
 pas-soft	../sqlite3/test/pragma3.test	9.4.divbug.69
 pas-soft	../sqlite3/test/pragma4.test	9.4.divbug.62
-pas-soft	../sqlite3/test/pragma5.test	9.4.divbug.68
+pas-skip	../sqlite3/test/pragma5.test	9.4.divbug.68 fts5-unported
 pas-soft	../sqlite3/test/pragma6.test	9.4.divbug.63
 pas-skip	../sqlite3/test/pragmafault.test	unswept
 pas-strict	../sqlite3/test/prefixes.test	-
@@ -813,13 +813,13 @@ pas-strict	../sqlite3/test/spellfix2.test	-
 pas-strict	../sqlite3/test/spellfix3.test	-
 pas-strict	../sqlite3/test/spellfix4.test	-
 pas-soft	../sqlite3/test/sqldiff1.test	9.4.divbug.63
-pas-soft	../sqlite3/test/sqllimits1.test	9.4.divbug.67
+pas-soft	../sqlite3/test/sqllimits1.test	9.4.divbug.84 SQLITE_MAX_LENGTH-tclvar-unported
 pas-strict	../sqlite3/test/sqllog.test	-
-pas-soft	../sqlite3/test/starschema1.test	9.4.divbug.67
+pas-soft	../sqlite3/test/starschema1.test	9.4.divbug.83 heap-corruption-mid-test
 pas-strict	../sqlite3/test/stat.test	-
 pas-skip	../sqlite3/test/statfault.test	unswept
-pas-soft	../sqlite3/test/stmt.test	9.4.divbug.67
-pas-soft	../sqlite3/test/stmtrand.test	9.4.divbug.67
+pas-soft	../sqlite3/test/stmt.test	9.4.divbug.62 sqlite_open_file_count-tclvar-unported
+pas-strict	../sqlite3/test/stmtrand.test	-
 pas-skip	../sqlite3/test/stmtvtab1.test	unswept
 pas-soft	../sqlite3/test/strict1.test	9.4.divbug.71
 pas-soft	../sqlite3/test/strict2.test	9.4.divbug.71

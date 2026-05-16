@@ -42,6 +42,7 @@ uses
   passqlite3codegen,
   passqlite3ieee754,
   passqlite3regexp,
+  passqlite3stmtrand,
   passqlite3main;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -470,12 +471,24 @@ begin
   Result := sqlite3RegexpInit(db);
 end;
 
+{ stmtrand — already-ported passqlite3stmtrand unit (ext/misc/stmtrand.c).
+  Wrapped to the C extension-init ABI for load_static_extension.
+  Needed by stmtrand.test, stmt.test, sqllimits1.test, starschema1.test
+  which load it via `load_static_extension db stmtrand` (test_stmt.c:82..97
+  registers sqlite3_stmtrand_init the same way for the C build).
+  9.4.divbug.67. }
+function stmtrand_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3StmtrandInit(db);
+end;
+
 function tclLoadStaticExtensionCmd(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
 const
   SQLITE_OK_LOAD_PERMANENTLY = 256;  { sqlite3.h — SQLITE_OK | (8<<8) }
 var
-  aExtension: array[0..2] of TStaticExt;
+  aExtension: array[0..3] of TStaticExt;
   db:         PTsqlite3;
   zName:      PAnsiChar;
   i, j, rc:   cint;
@@ -484,6 +497,7 @@ begin
   aExtension[0].zExtName := 'ieee754';  aExtension[0].pInit := @ieee754_ext_init;
   aExtension[1].zExtName := 'real2hex'; aExtension[1].pInit := @realhex_ext_init;
   aExtension[2].zExtName := 'regexp';   aExtension[2].pInit := @regexp_ext_init;
+  aExtension[3].zExtName := 'stmtrand'; aExtension[3].pInit := @stmtrand_ext_init;
   zErrMsg := nil;
   if objc < 3 then
   begin
