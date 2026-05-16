@@ -382,16 +382,27 @@ end;
 { ----------------------------- speedtest1_numbername -------------------- }
 { speedtest1.c:359..410.  Output buffer is a Pascal AnsiString. }
 
+{ 12.3.candidate.1: declare the lookup tables as RawByteString so that
+  concat with the function's RawByteString Result stays byte-level (CP_NONE).
+  Previously these were AnsiString — typed-const AnsiStrings inherit the
+  unit's {$codepage utf8} (CP=65001), while a function's local AnsiString
+  Result is allocated with DefaultSystemCodePage (CP=0 = CP_ACP).  FPC's
+  concat of two AnsiStrings with different code pages promotes via
+  UnicodeString (fpc_ansistr_to_unicodestr -> DefaultAnsi2UnicodeMove ->
+  fpc_unicodestr_concat -> DefaultUnicode2AnsiMove), which callgrind
+  showed as ~3-6% of the bench runtime — pure HARNESS overhead skewing
+  pas/c ratios.  Switching to RawByteString (CP_NONE) makes both operands
+  bytes-only and bypasses the encoding-conversion path entirely. }
 const
-  ones: array[0..19] of AnsiString = (
+  ones: array[0..19] of RawByteString = (
     'zero','one','two','three','four','five','six','seven','eight','nine',
     'ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen',
     'seventeen','eighteen','nineteen');
-  tens: array[0..9] of AnsiString = (
+  tens: array[0..9] of RawByteString = (
     '','ten','twenty','thirty','forty','fifty','sixty','seventy','eighty',
     'ninety');
 
-function speedtest1_numbername(n: LongWord): AnsiString;
+function speedtest1_numbername(n: LongWord): RawByteString;
 begin
   Result := '';
   if n >= 1000000000 then begin
@@ -768,7 +779,7 @@ var
   i, n, sz, maxb: Integer;
   x1, x2: LongWord;
   len: Integer;
-  zNum: AnsiString;
+  zNum: RawByteString;
 begin
   len := 0;
   x1 := 0; x2 := 0;
@@ -1217,7 +1228,7 @@ end;
 { 1:1 port of ../sqlite3/test/speedtest1.c lines 1250..1398. }
 
 const
-  azPuzzle: array[0..2] of AnsiString = (
+  azPuzzle: array[0..2] of RawByteString = (
     { Easy }
     '534...9..' + '67.195...' + '.98....6.' +
     '8...6...3' + '4..8.3..1' + '....2...6' +
@@ -1233,7 +1244,7 @@ const
 
 procedure testset_cte;
 var
-  zPuz: AnsiString;
+  zPuz: RawByteString;
   rSpacing: Double;
   nElem: Integer;
 begin
@@ -1347,7 +1358,7 @@ end;
 { -------------------- speedtest1_random_ascii_fp ------------------------ }
 { 1:1 port of ../sqlite3/test/speedtest1.c lines 1403..1411. }
 
-function speedtest1_random_ascii_fp: AnsiString;
+function speedtest1_random_ascii_fp: RawByteString;
 var
   x, y, z: Integer;
 begin
@@ -1365,7 +1376,7 @@ end;
 procedure testset_fp;
 var
   n, i: Integer;
-  zFP1, zFP2: AnsiString;
+  zFP1, zFP2: RawByteString;
 begin
   n := g.szTest * 5000;
   speedtest1_begin_test(100, 'Fill a table with %d FP values', [n * 2]);
@@ -1587,7 +1598,7 @@ var
   i, j, n: LongWord;
   nRow: LongWord;
   x1, len: LongWord;
-  zNum: AnsiString;
+  zNum: RawByteString;
   c: AnsiChar;
 begin
   n := LongWord(g.szTest) * 250;
@@ -1851,7 +1862,7 @@ end;
 procedure testset_trigger;
 var
   jj, ii: Integer;
-  zNum: AnsiString;
+  zNum: RawByteString;
   x1: Integer;
   NROW, NROW2: Integer;
 begin
@@ -2058,7 +2069,7 @@ procedure testset_debug1;
 var
   i, n: LongWord;
   x1, x2: LongWord;
-  zNum: AnsiString;
+  zNum: RawByteString;
 begin
   n := LongWord(g.szTest);
   i := 1;
