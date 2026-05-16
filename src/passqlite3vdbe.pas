@@ -5852,6 +5852,36 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ vdbeapi.c:739 — doWalCallbacks.  Invoked from sqlite3Step after a
+  statement commits (rc=DONE && db->autoCommit).  Walks every attached
+  Btree, drains its pager's pending wal-frame count via
+  sqlite3PagerWalCallback, and fires the registered xWalCallback for
+  any database that wrote frames.  Without this, db.wal_hook never
+  observes the frames a COMMIT just flushed (9.4.divbug.37). }
+function doWalCallbacks(db: PTsqlite3): i32;
+type
+  TWalCb = function(p: Pointer; db: PTsqlite3; zDb: PAnsiChar;
+                    nFrame: i32): i32; cdecl;
+var
+  i      : i32;
+  pBt    : PBtree;
+  nEntry : i32;
+begin
+  Result := SQLITE_OK;
+  if db = nil then Exit;
+  for i := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt <> nil then begin
+      sqlite3BtreeEnter(pBt);
+      nEntry := sqlite3PagerWalCallback(sqlite3BtreePager(pBt));
+      sqlite3BtreeLeave(pBt);
+      if (nEntry > 0) and (db^.xWalCallback <> nil) and (Result = SQLITE_OK) then
+        Result := TWalCb(db^.xWalCallback)(db^.pWalArg, db,
+                    db^.aDb[i].zDbSName, nEntry);
+    end;
+  end;
+end;
+
 { --- sqlite3_step / sqlite3_reset / sqlite3_finalize (vdbeapi.c:771) --- }
 
 function sqlite3_step(pStmt: PVdbe): i32;
@@ -5917,6 +5947,13 @@ begin
   end;
 
   pStmt^.pResultRow := nil;
+  { vdbeapi.c:878..883 — on clean commit, invoke wal_hook callbacks
+    (9.4.divbug.37).  Must precede the error-transfer arm so a hook
+    failure can override rc. }
+  if (rc = SQLITE_DONE) and (db <> nil) and (db^.autoCommit <> 0) then begin
+    pStmt^.rc := doWalCallbacks(db);
+    if pStmt^.rc <> SQLITE_OK then rc := SQLITE_ERROR;
+  end;
   if db <> nil then begin
     { vdbeapi.c:884 — transfer p^.zErrMsg into db^.pErr so sqlite3_errmsg
       returns the real cause.  C gates on SQLITE_PREPARE_SAVESQL to also
