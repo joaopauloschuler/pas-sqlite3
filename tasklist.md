@@ -1612,15 +1612,74 @@ Changes here must preserve byte-for-byte on-disk parity.  Compile
 flags: `-dAVX2 -CfAVX2 -CpCOREAVX -OpCOREAVX`.  Note: in FPC,
 functions with `asm` content cannot be inlined.
 
-- [ ] **12.1** `perf record` on benchmark workloads; identify the
+- [X] **12.1** `perf record` on benchmark workloads; identify the
   top 10 hot functions.
+  - Profiler used: callgrind (perf unavailable —
+    `perf_event_paranoid=4`, no CAP_PERFMON / sudo).
+  - Workload: `passpeedtest1 --testset main --size 1`, 248 M Ir.
+  - Report: `bench/HOT10.md`.
+  - Top 3: `sqlite3VdbeExec` 17.94 %,
+    `sqlite3VdbeRecordCompare` 8.70 %, `System.Move` 5.05 %.
+  - [ ] **12.1.followup.bigger-sample** Re-run callgrind at
+        `--size 5` once `--testset main --size 5` SQLITE_CORRUPT
+        note in `profile_perf.sh` is cleared, to confirm
+        ranking holds on larger tables.
 
 - [ ] **12.2** Aggressive `inline` on VDBE opcode helpers, varint
   codecs, and page cell accessors.
+  - [ ] **12.2.candidate.1** Inline `sqlite3VdbeSerialGet`
+        (passqlite3vdbe.pas:2050) — 1.20 % self, called from
+        every `OP_Column` step.
+  - [ ] **12.2.candidate.2** Specialise `sqlite3VdbeRecordCompare`
+        on int-key fast path (port C's `xRecordCompare` /
+        `vdbeRecordCompareInt`) — 8.70 % self,
+        passqlite3btree.pas:3188.
+  - [ ] **12.2.candidate.3** Cache `pPage^.aData` / `aCellIdx` /
+        `maskPage` in locals at the top of
+        `sqlite3BtreeIndexMoveto` (passqlite3btree.pas:3452) —
+        4.95 % self.
+  - [ ] **12.2.candidate.4** Same field-cache trick on
+        `sqlite3BtreeTableMoveto` (passqlite3btree.pas:2909) —
+        1.95 % self.
+  - [ ] **12.2.candidate.5** Investigate the **two** definitions
+        of `patternCompare` at passqlite3codegen.pas:54136 and
+        :58452; dead-code-drop the duplicate, then evaluate
+        AVX2 byte-search for the `noCase=0, esc=0` arm —
+        combined 2.29 %.
+  - [ ] **12.2.candidate.6** Reduce zero-fill churn: audit
+        `sqlite3DbMallocZero` / `VdbeMakeReady` /
+        `pcache1FetchNoMutex` for FillChar calls that could be
+        replaced by reuse (low priority, ~1.5 %).
+  - [ ] **12.2.candidate.7** Inline `sqlite3VdbeRecordUnpack`
+        (passqlite3vdbe.pas:2263) and hoist `pKeyInfo^.nAllField`
+        — 1.10 % self.
+  - [ ] **12.2.candidate.8** Inline `btreeParseCellPtr`
+        (passqlite3btree.pas:918) — 0.80 % self, called from
+        every cell access.
+  - [ ] **12.2.candidate.9** Audit `fillInCell` / `insertCellFast`
+        for redundant payload Move calls (low priority).
+  - [ ] **12.2.candidate.10** Inline `freeSpace`
+        (passqlite3btree.pas:1284) — 0.98 % self.
+  - [ ] **12.2.candidate.11** Hand-tune `sqlite3GetVarint`
+        (passqlite3util.pas) — varint decode is in many hot
+        paths, ~0.46 % self plus inclusive presence in #2/#10.
 
 - [ ] **12.3** Consider replacing the VDBE big `case` with threaded
   dispatch (computed-goto-style) using `{$GOTO ON}`.  Land only if
   profiling shows the switch is a real bottleneck.
+  - [ ] **12.3.candidate.1** Strip UnicodeString round-tripping
+        in `passpeedtest1.pas` glue (DefaultUnicode2AnsiMove +
+        DefaultAnsi2UnicodeMove + fpc_unicodestr_* together
+        ~6 %).  Likely a *harness* fix, not engine — but it
+        skews benchmarks vs C and should land before
+        threaded-dispatch comparison.
+  - [ ] **12.3.candidate.2** `{$GOTO ON}` jump-table dispatch
+        for the top-10 hottest VDBE opcodes (`OP_Column`,
+        `OP_Next`, `OP_Goto`, `OP_Integer`, `OP_AggStep`,
+        `OP_ResultRow`, `OP_IdxGT`, `OP_SeekGE`, `OP_IfNot`,
+        `OP_MakeRecord`) — sqlite3VdbeExec is 17.94 % self;
+        even a 20 % cut here is ~3.5 % total.  Gate landing on
+        measured cycle-level improvement, not Ir.
 
 ---
 
