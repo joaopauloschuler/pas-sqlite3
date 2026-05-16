@@ -214,3 +214,41 @@ nearest Pascal caller in the *opportunity* column.
   `PATTERNCOMPARE...$$LONGINT'2`) is FPC's clone suffix —
   inlined / specialised variants emitted alongside the
   original.  Both copies attributed to the same source line.
+
+## 12.2.candidate.5.b evaluation
+
+Considered: hand-rolled AVX2 PCMPEQB byte-search for the
+`noCase=0 AND esc=0` arm of patternCompare (the wildcard
+post-`%` scan at codegen.pas where the C reference uses
+`zString += strcspn(zString, zStop)`).  Decision: **defer
+(evaluation only, no asm added).**
+
+Rationale.  (i) In the `noCase=0 esc=0` arm `zStop0==zStop1`,
+so the inner scan looks for *one* byte (or NUL).  FPC's RTL
+`IndexByte` is already a 16-byte-stride SSE2 PCMPEQB primitive
+implemented in `rtl/x86_64/x86_64.inc` (verified: a 16-byte
+buffer probe returns the correct index from a single call).
+(ii) However `IndexByte` needs an explicit length; the input
+is NUL-terminated and unknown-length, so a naive port would
+need an `strlen` precursor (doubling the byte traffic) or a
+sentinel-aware variant that does not exist in stock FPC.
+(iii) The callgrind 2.29 % patternCompare share is split
+across wildcard handling, recursive descent, UTF-8 decode, and
+the inner scan; the scan itself is well under 1 % of total Ir.
+Hand-written AVX2 with proper alignment + tail handling +
+NUL-stop OR `zStop0` OR `zStop1` triple-compare would add
+~60 lines of `{$ASMMODE INTEL}` asm plus a Pascal fallback for
+sub-1 % gain, and the `noCase=0` case is *not* the LIKE
+default (LIKE default is case-insensitive ⇒ noCase=1, which
+goes through the two-byte stop path and would need a separate
+asm kernel).  (iv) The simpler win — replacing the manual
+scalar loop with `IndexByte` for the noCase=0 arm — also helps
+the C-vs-Pas asymmetry but is gated on knowing the string
+length; deferred together with (v) below.
+
+Re-evaluate when: a profiling run shows LIKE/GLOB on long
+TEXT columns (>=512 bytes) appearing in HOT10, OR when
+12.3.candidate.2 lands a string-length cache on Mem* that
+would make `IndexByte` cheap to wire in.
+
+Closed as: evaluated, no implementation.
