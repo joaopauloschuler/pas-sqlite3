@@ -381,3 +381,99 @@ The 0.x % self-time of these helpers comes from the legitimate
 payload-copy work, not from spurious zero-fills.
 
 Closed as: **audited, no implementation.**
+
+---
+
+## 12.3.candidate.2 evaluation — `{$GOTO ON}` threaded dispatch
+
+Target: hottest function `sqlite3VdbeExec` (17.94 % self at size=1,
+18.90 % at size=5).  C uses GCC's computed-goto extension
+(`goto *jump_table[op]`) under `SQLITE_USE_COMPUTED_GOTO` to thread
+dispatch — each opcode body ends with its own indirect jump so the
+CPU branch-predictor (BHT) gets a distinct slot per dispatch site.
+Reported C-side win on dispatch-heavy code: 2–5 %.
+
+### FPC capability check
+- `{$GOTO ON}` is **already enabled globally** via `passqlite3.inc`
+  (line 5).  All existing `goto jump_to_p2_*` / `goto abort_due_to_*`
+  arms in `sqlite3VdbeExec` compile under it.
+- FPC has labelled `goto Label` but **no address-of-label and no
+  computed-goto**.  There is no portable Pascal equivalent to
+  `&&label` / `goto *p`.
+- FPC's `case` on a dense contiguous integer compiles to a true jump
+  table.  Verified with a 16-arm probe (`/tmp/pas_asm_probe/probe.s`)
+  built with `fpc -al -O3` + the same directives used by
+  passqlite3vdbe.pas:
+  ```
+  cmpl   $15,%eax
+  ja     .Lj7
+  movq   $.Ld1,%rcx
+  movslq (%rcx,%rax,4),%rax
+  addq   %rcx,%rax
+  jmp    *%rax
+  ```
+  i.e. `jmp *%rax` indirect through a `.Ld1` base + signed 32-bit
+  offset table.  This is byte-identical in shape to the GCC `switch`
+  fallback when `SQLITE_USE_COMPUTED_GOTO` is **off**.
+
+### Current dispatch shape (passqlite3vdbe.pas:7611..11904)
+- One `repeat ... case pOp^.opcode of ... end; Inc(pOp); continue;
+  until False` outer loop.
+- `case` has ~192 arms (one per OP_*); dense and contiguous → FPC
+  emits a jump table at the case head (one `jmp *%rax`).
+- Most opcode bodies fall through to the shared `Inc(pOp); continue;`
+  at the bottom of `repeat`.  Jumping opcodes (OP_Goto, OP_Gosub,
+  OP_Yield, comparisons) already `goto jump_to_p2` /
+  `goto jump_to_p2_and_check_for_interrupt`.
+
+### Why threading does not pay on FPC
+The win from C's computed-goto is **not** "skip the dispatch loop's
+back-edge" (that's a perfectly-predicted unconditional jump).  The
+win is that **each opcode body emits its own `jmp *jump_table[op]`**
+so the BHT/BTB can learn per-opcode successor frequencies
+(OP_Column → OP_AggStep, OP_Next → OP_IfPos, etc.).  With one shared
+dispatch point all 192 arms collide on a single BHT slot.
+
+To get this benefit in FPC we would need to duplicate the indirect
+jump at each opcode-body tail.  But:
+1. No address-of-label means we cannot synthesise the per-site indirect.
+2. `goto Dispatch:` (labelling the case head) compiles to a single
+   direct `jmp .Ldispatch` — i.e. it routes back to the **same**
+   `jmp *%rax` instruction, sharing one BHT slot — identical to the
+   `Inc(pOp); continue;` we already emit.  Zero BHT benefit.
+3. Inlining the `case` jump-table arithmetic per-opcode-body via raw
+   `{$ASMMODE INTEL}` `jmp *jt(,%rax,8)` is possible in principle but
+   would (a) require a hand-maintained `jt` table indexed by all 192
+   opcodes outside the case, (b) duplicate ~30 bytes of dispatch
+   prologue × 10 hot bodies = ~300 bytes I-cache pressure for an
+   unmeasurable hit-rate delta, and (c) trip FPC's "asm block forbids
+   inlining" restriction on the enclosing function, which would
+   undo the inlining of `sqlite3VdbeSerialGet` won in 12.2.candidate.1
+   — a net loss.
+
+### Estimate
+- Hypothetical win from per-site indirect (if FPC supported it):
+  tasklist line 1701 estimates "20 % cut of dispatch = ~3.5 % total".
+  At measured 17.94 % self that's a 3.6 % total-time delta.
+- Realistic win available from any pure-Pascal `{$GOTO ON}`
+  refactor: **0 %**, because the dispatch indirect-jump is shared
+  regardless of how many `goto` arms we add.
+
+### Decision
+**Deferred — no implementation.**  The `{$GOTO ON}` directive is
+already enabled.  The dispatch is already a jump table.  FPC's
+language surface gives no mechanism to extract C's per-site
+branch-prediction win.  Implementing `goto Dispatch:` patterns
+would add boilerplate for zero measured gain.
+
+### Re-evaluate when
+- FPC adds address-of-label syntax (no RFC at time of writing); OR
+- A `-Cf` / `-O4` switch lands that auto-threads case statements
+  (none today); OR
+- The dispatch cost dominates **after** sqlite3VdbeSerialGet,
+  sqlite3VdbeRecordCompare specialisation, and OP_Column fast-path
+  inlining land — at that point a hand-written `{$ASMMODE INTEL}`
+  threaded core may become worth the maintenance cost.
+
+Closed as: **evaluated, no implementation.  FPC case already
+jump-tables; computed-goto win is unreachable in Pascal.**
