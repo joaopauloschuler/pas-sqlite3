@@ -1726,15 +1726,36 @@ begin
     Result := nil;
 end;
 
-{ ---- parserSyntaxError (parse.y:85) ------------------------------------- }
-{ Tiny helper used by rule 186 when a "#N" register reference appears        }
-{ outside a nested parse.  C body: sqlite3ErrorMsg(pParse,                   }
-{ "near \"%T\": syntax error", p);  Our sqlite3ErrorMsg currently lacks the  }
-{ printf-style %T specifier (see chunk 7.2e.1 notes), so we emit a static    }
-{ message and accept reduced fidelity until Phase 8 wires up varargs.        }
+{ ---- parserSyntaxError (parse.y:122..126) ------------------------------- }
+{ C body: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", p);          }
+{ sqlite3ErrorMsg() in this codebase lacks a varargs overload, so we route  }
+{ through sqlite3MPrintf (which honours the %T token specifier) and stamp   }
+{ nErr/rc/zErrMsg by hand — same pattern as yy_syntax_error above.  Bug     }
+{ 9.4.divbug.53 (fuzz2-6.1 expects `near "#0": syntax error`).              }
 procedure parserSyntaxError(pPse: PParse; const p: PToken);
+var
+  db:   PTsqlite3;
+  zMsg: PAnsiChar;
 begin
-  sqlite3ErrorMsg(pPse, 'near token: syntax error');
+  if pPse = nil then Exit;
+  db := pPse^.db;
+  if (db <> nil) and (db^.suppressErr <> 0) then begin
+    Inc(pPse^.nErr);
+    pPse^.rc := SQLITE_ERROR;
+    Exit;
+  end;
+  zMsg := sqlite3MPrintf(db, 'near "%T": syntax error', [p]);
+  Inc(pPse^.nErr);
+  pPse^.rc := SQLITE_ERROR;
+  if zMsg <> nil then begin
+    if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+    pPse^.zErrMsg := zMsg;
+  end;
+  { Mirror %T's sqlite3RecordErrorByteOffset side-effect so the CLI caret   }
+  { marker (10.1.bug.80) anchors under the offending token.                 }
+  if (db <> nil) and (p <> nil) and (p^.z <> nil) and (pPse^.zTail <> nil)
+     and (PtrUInt(p^.z) >= PtrUInt(pPse^.zTail)) then
+    db^.errByteOffset := i32(PtrUInt(p^.z) - PtrUInt(pPse^.zTail));
 end;
 
 { ---- sqlite3ExprFunction (expr.c:1169) ----------------------------------- }
