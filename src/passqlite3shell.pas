@@ -10552,6 +10552,122 @@ begin
   end;
 end;
 
+{ 10.1a.1.7  `.imposter INDEX IMPOSTER` shell.c.in:9781..9876
+  Installs a fake table that reads an index (or WITHOUT ROWID table)
+  root-page in raw storage order.  Depends on the typed
+  sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER,...) overload added in
+  passqlite3main.pas.  `.imposter off` resets all schemas. }
+function cmdImposter(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
+var
+  zSql, zCollist, zNewCol: PAnsiChar;
+  pStmt: PVdbe;
+  tnum, isWO, lenPK, i: i32;
+  rc: i32;
+  zCol: PAnsiChar;
+  zLabel: AnsiString;
+  zSqlTab: PAnsiChar;
+  szCollist: i32;
+begin
+  Result := 0;
+  zCollist := nil;
+  tnum := 0;
+  isWO := 0;
+  lenPK := 0;
+  { nArg here is the count of POST-azArg[0] arguments (the dot-cmd
+    name was already consumed by the dispatcher).  C requires
+    nArg==3 (.imposter X Y) or nArg==2 with azArg[1]="off"; in our
+    indexing that maps to nArg=2 or (nArg=1 and args[0]="off"). }
+  if not ((nArg = 2) or ((nArg = 1) and (SameText(args[0], 'off')))) then
+  begin
+    shellEPutZ('Usage: .imposter INDEX IMPOSTER'#10 +
+               '       .imposter off'#10);
+    Result := 1;
+    Exit;
+  end;
+  openDb(p, 0);
+  if nArg = 1 then begin
+    sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, p^.db,
+                         PAnsiChar('main'), 0, 1);
+    Exit;
+  end;
+  zSql := sqlite3MPrintf(nil,
+    'SELECT rootpage, 0 FROM sqlite_schema'
+    + ' WHERE type=''index'' AND lower(name)=lower(''%q'')'
+    + 'UNION ALL '
+    + 'SELECT rootpage, 1 FROM sqlite_schema'
+    + ' WHERE type=''table'' AND lower(name)=lower(''%q'')'
+    + '   AND sql LIKE ''%%without%%rowid%%''',
+    [PAnsiChar(args[0]), PAnsiChar(args[0])]);
+  pStmt := nil;
+  sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, nil);
+  sqlite3_free(zSql);
+  if sqlite3_step(pStmt) = SQLITE_ROW then begin
+    tnum := sqlite3_column_int(pStmt, 0);
+    isWO := sqlite3_column_int(pStmt, 1);
+  end;
+  sqlite3_finalize(pStmt);
+  zSql := sqlite3MPrintf(nil, 'PRAGMA index_xinfo=''%q''',
+    [PAnsiChar(args[0])]);
+  rc := sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, nil);
+  sqlite3_free(zSql);
+  i := 0;
+  while (rc = SQLITE_OK) and (sqlite3_step(pStmt) = SQLITE_ROW) do begin
+    zCol := PAnsiChar(sqlite3_column_text(pStmt, 2));
+    Inc(i);
+    if zCol = nil then begin
+      if sqlite3_column_int(pStmt, 1) = -1 then
+        zCol := PAnsiChar('_ROWID_')
+      else begin
+        zLabel := Format('expr%d', [i]);
+        zCol := PAnsiChar(zLabel);
+      end;
+    end;
+    if (isWO <> 0) and (lenPK = 0)
+       and (sqlite3_column_int(pStmt, 5) = 0)
+       and (zCollist <> nil) then
+      lenPK := i32(StrLen(zCollist));
+    if zCollist = nil then
+      zCollist := sqlite3MPrintf(nil, '"%w"', [zCol])
+    else begin
+      zNewCol := sqlite3MPrintf(nil, '%s,"%w"', [zCollist, zCol]);
+      sqlite3_free(zCollist);
+      zCollist := zNewCol;
+    end;
+  end;
+  sqlite3_finalize(pStmt);
+  if (i = 0) or (tnum = 0) then begin
+    shellEPutZ(Format('no such index: "%s"'#10, [args[0]]));
+    Result := 1;
+    sqlite3_free(zCollist);
+    Exit;
+  end;
+  if lenPK = 0 then lenPK := 100000;
+  szCollist := i32(StrLen(zCollist));
+  if lenPK > szCollist then lenPK := szCollist;
+  zSqlTab := sqlite3MPrintf(nil,
+    'CREATE TABLE "%w"(%s,PRIMARY KEY(%.*s))WITHOUT ROWID',
+    [PAnsiChar(args[1]), zCollist, lenPK, zCollist]);
+  sqlite3_free(zCollist);
+  rc := sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, p^.db,
+                             PAnsiChar('main'), 2, tnum);
+  if rc = SQLITE_OK then begin
+    rc := sqlite3_exec(p^.db, zSqlTab, nil, nil, nil);
+    sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, p^.db,
+                         PAnsiChar('main'), 0, 0);
+    if rc <> 0 then
+      shellEPutZ(Format('Error in [%s]: %s'#10,
+        [AnsiString(zSqlTab), AnsiString(sqlite3_errmsg(p^.db))]))
+    else
+      shellSPutZ(Format('%s;'#10, [AnsiString(zSqlTab)]));
+  end else begin
+    shellEPutZ(Format('SQLITE_TESTCTRL_IMPOSTER returns %d'#10, [rc]));
+    rc := 1;
+  end;
+  sqlite3_free(zSqlTab);
+  Result := rc;
+end;
+
 { 10.1a.1.5  `.nonce STRING`            shell.c.in:10116..10128
   When ShellState.zNonce matches, clear bSafeMode for the *next*
   command and return 0 immediately (caller-side bSafeMode reset
@@ -10684,6 +10800,8 @@ begin
   end;
   if zCmd = 'intck'     then begin Result := cmdIntck(p, args, nArg); Exit; end;
   if zCmd = 'load'      then begin Result := cmdLoad(p, args, nArg); Exit; end;
+  { 10.1a.1.7  .imposter — wraps SQLITE_TESTCTRL_IMPOSTER. }
+  if zCmd = 'imposter'  then begin Result := cmdImposter(p, args, nArg); Exit; end;
 
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));

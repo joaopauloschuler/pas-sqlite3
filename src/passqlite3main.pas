@@ -530,6 +530,8 @@ function sqlite3_test_control(op: i32; db: PTsqlite3; a: i32): i32; cdecl; overl
 function sqlite3_test_control(op: i32; db: PTsqlite3; pN: Pi32): i32; cdecl; overload;
 function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl; overload;
 function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3; zDbName: PAnsiChar;
+                              mode: i32; tnum: i32): i32; cdecl; overload;
 
 { Phase 8.4.1 — TRACEFLAGS storage.  Mirrors sqliteInt.h:1119/1163.
   10.1.42 update: the consumer-side TREETRACE / WHERETRACE arms now
@@ -5018,6 +5020,7 @@ const
   SQLITE_TESTCTRL_BYTEORDER_OP            = 22;
   SQLITE_TESTCTRL_ISINIT_OP               = 23;
   SQLITE_TESTCTRL_SORTER_MMAP_OP          = 24;
+  SQLITE_TESTCTRL_IMPOSTER_OP             = 25;
   SQLITE_TESTCTRL_PRNG_SEED_OP            = 28;
   SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP  = 29;
   SQLITE_TESTCTRL_TRACEFLAGS_OP           = 31;
@@ -5180,6 +5183,38 @@ end;
 function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl;
 begin
   Result := testCtrlImpl(op, 0, Pointer(pVal), nil, nil);
+end;
+
+{ main.c:4593..4625 — SQLITE_TESTCTRL_IMPOSTER(db, zDbName, mode, tnum).
+  Enables imposter mode on iDb so a single CREATE TABLE installs a fake
+  table reading an existing b-tree root.  mode=0 disables; with tnum>0
+  also reset all schemas so prior imposters disappear. }
+function sqlite3_test_control(op: i32; db: PTsqlite3; zDbName: PAnsiChar;
+                              mode: i32; tnum: i32): i32; cdecl;
+var
+  iDb: i32;
+begin
+  Result := 0;
+  if op <> SQLITE_TESTCTRL_IMPOSTER_OP then Exit;
+  if db = nil then Exit;
+  sqlite3_mutex_enter(db^.mutex);
+  iDb := sqlite3FindDbName(db, zDbName);
+  if iDb >= 0 then begin
+    db^.init.iDb     := u8(iDb);
+    db^.init.busy    := u8(mode);
+    { Pas Tsqlite3InitInfo.flags layout (passqlite3util.pas:422):
+      bit 1 ($02) = imposterTable "on" (corresponds to any non-zero
+      C `init.imposterTable` value); bit 2 ($04) = readonly arm
+      (corresponds to C `init.imposterTable>=2`).  C mode==1 sets
+      $02 alone, mode==2 sets $02|$04, mode==0 clears both. }
+    db^.init.flags := db^.init.flags and not u8($06);
+    if mode >= 1 then db^.init.flags := db^.init.flags or $02;
+    if mode >= 2 then db^.init.flags := db^.init.flags or $04;
+    db^.init.newTnum := u32(tnum);
+    if (db^.init.busy = 0) and (tnum > 0) then
+      sqlite3ResetAllSchemasOfConnection(db);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
 end;
 
 { ----------------------------------------------------------------------
