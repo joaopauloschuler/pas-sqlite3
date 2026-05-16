@@ -31696,10 +31696,23 @@ begin
             sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
                               sqlite3VdbeCurrentAddr(v) + 4);
             sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+            { 9.4.divbug.54 — C pushOntoSorter (select.c:852..853) uses
+              `regBase+nOBSat, nExpr-nOBSat` because the nOBSat>0 arm at
+              select.c:789..831 has already flushed the sorter at every
+              block boundary, leaving only entries that share the first
+              nOBSat key columns.  The Pas port of that block-flush arm
+              is deferred — so feeding `nOBSat>0, nExpr-nOBSat` here lets
+              the Top-N cap compare only the trailing (non-satisfied)
+              keys across block boundaries, which is wrong:  after the
+              first block exhausts the LIMIT+OFFSET budget the second
+              block's trailing-key comparison drops valid rows of the
+              new block (orderby6-1.12..1.14 with `b DESC,a`).  Until
+              the block-flush lands, compare the FULL sort key (which is
+              correct in all cases, only slightly less efficient). }
             iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
                               iSorterCsr, 0,
-                              regSortBase + pWInfo^.nOBSat,
-                              sortNKey - pWInfo^.nOBSat);
+                              regSortBase,
+                              sortNKey);
             sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
           end;
           Inc(pParse^.nMem);
