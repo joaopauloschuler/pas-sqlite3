@@ -158,9 +158,81 @@ heuristic misclassified a finding.
 **Smoke baseline.**  Running the classifier across the 8 upstream
 seeds yields 8/8 PASS, 0 bucketed — matching the Phase 9.3.2 sweep.
 
+## Soak workflow (Phase 13.3)
+
+`fuzz-soak.sh` is the long-running manual gate.  Default is a 24-hour
+run that bails on first divergence so the operator (or a cron job)
+can hand findings straight to `classify-crash.sh`.
+
+```sh
+# Default: 24h, stop on first crash/hang.
+bash src/tests/fuzz/fuzz-soak.sh
+
+# Shorter run, don't bail (stress soak):
+bash src/tests/fuzz/fuzz-soak.sh --duration 2h --no-stop
+
+# Anything timeout(1) accepts works: 30s, 30m, 2h, 24h, 7d.
+```
+
+Flow:
+
+1. Pre-flight: reruns `build-afl.sh` to make sure `bin/afl-driver`
+   matches the current tree, picks the route from `.afl-route`.
+2. Launches `afl-fuzz` (with `-Q`/`-n` per route) under GNU
+   `timeout(1)` so the wall-clock budget is hard.
+3. Polls `findings/default/{crashes,hangs}/` every 5 min.  On first
+   finding (with the default `--stop-on-first-divergence`): SIGTERMs
+   `afl-fuzz`, runs `classify-crash.sh` on the new findings, prints
+   the bucket summary.
+4. Appends one row to `SOAK_LOG.md`: date, target, actual duration,
+   seed count, route, `CLEAN` / `FOUND-N-BUGS`, git SHA.
+
+Exit codes: `0` clean (timeout reached without findings), `2`
+stopped on first finding, `1` setup failure.  If `afl-fuzz` is
+missing the script self-reports and exits `0` — same convention as
+`build-afl.sh`.
+
+`SOAK_LOG.md` is the cumulative ledger.  We want N CLEAN 24h rows
+visible before declaring Phase 13 finished; the ledger is evidence
+for the manual gate, not a CI gate.
+
+## Seed minimisation (Phase 13.4)
+
+`minimize-corpus.sh` runs the standard AFL two-step:
+
+1. `afl-cmin` — drop seeds whose AFL bitmap is a strict subset of
+   another seed (no unique edges).
+2. `afl-tmin` — shrink each surviving seed to the smallest byte
+   sequence that still hits its bitmap.
+
+```sh
+# Dry-run: produces seeds.cmin/ next to seeds/ for inspection.
+bash src/tests/fuzz/minimize-corpus.sh
+
+# After eyeballing seeds.cmin/, swap it in + stage the change.
+# (The script never auto-commits; it prints the suggested invocation.)
+bash src/tests/fuzz/minimize-corpus.sh --commit
+```
+
+If `afl-cmin` / `afl-tmin` are missing the script self-reports and
+exits `0` — same convention as `build-afl.sh`.
+
+The minimised corpus is meaningful only when the driver was built
+with real instrumentation (route 1 or 2).  Route 3 (black-box) has
+no bitmap to minimise against; the script will run but warns and
+the reduction will be trivial.
+
 ## Status
 
 Phase 13.1: AFL driver wiring landed.  The build script self-reports
 "AFL missing" on machines without `afl-fuzz` and exits cleanly; the
 13.1.unverified follow-up tracks running the end-to-end build on a
 host that has AFL installed.
+
+Phase 13.2: `classify-crash.sh` triage helper landed (8/8 PASS on
+the seed corpus, four-bucket synthetic smoke).
+
+Phase 13.3 + 13.4: `fuzz-soak.sh` + `minimize-corpus.sh` landed.
+Both self-report on AFL-missing hosts.  No real soak has run yet
+(`SOAK_LOG.md` empty); the 13.3.unverified / 13.4.unverified
+followups track running them on an AFL-equipped host.

@@ -1796,16 +1796,40 @@ and can be added later via a small C entry stub.
     Runtime-error preamble is present on every Pascal SIGSEGV
     AFL surfaces).
 
-- [ ] **13.3** ≥24 h soak target.  Wrapper script `fuzz-soak.sh`
+- [~] **13.3** ≥24 h soak target.  Wrapper script `fuzz-soak.sh`
   with `--duration` (default 24h) and stop-on-first-divergence.
   Not a CI gate — a manual gate documented in README.  Each
   clean soak bumps a counter in `src/tests/fuzz/SOAK_LOG.md` so
   we can prove the wallclock budget over time.
+  Landed: src/tests/fuzz/fuzz-soak.sh (--duration / --no-stop /
+  --quiet), src/tests/fuzz/SOAK_LOG.md (header + empty ledger).
+  Pre-flights via build-afl.sh, picks route from .afl-route, polls
+  findings/default/{crashes,hangs}/ every 5 min, hands findings to
+  classify-crash.sh on first detection.  Self-reports + exits 0
+  when afl-fuzz is missing.  README "Soak workflow" section added.
+  - [ ] **13.3.unverified** This host has no AFL install; the
+    real-soak path (afl-fuzz launch, bitmap-driven mutation, ledger
+    row from a non-trivial run) wasn't exercised — only the AFL-
+    missing self-report path was smoke-verified locally.  Re-run
+    on an AFL-equipped host with `--duration 30m` once to confirm
+    the polling loop, classify-crash hand-off, and SOAK_LOG.md
+    row format all behave as advertised.
 
-- [ ] **13.4** Coverage-guided seed minimisation.  `afl-cmin` +
+- [~] **13.4** Coverage-guided seed minimisation.  `afl-cmin` +
   `afl-tmin` pipeline pruning the seed set to the smallest input
   set that still hits every covered branch.  Re-commit the
   minimised seeds when they shrink.
+  Landed: src/tests/fuzz/minimize-corpus.sh (--commit / --quiet).
+  Runs afl-cmin → seeds.cmin/, then afl-tmin per survivor; prints
+  before/after counts + bytes; --commit swaps seeds.cmin/ over
+  seeds/, stages, and emits the suggested `git commit` line (never
+  auto-commits).  Self-reports + exits 0 when afl-cmin/afl-tmin
+  are missing.  README "Seed minimisation" section added.
+  - [ ] **13.4.unverified** AFL not installed on this host; only
+    the missing-tools self-report path was smoke-verified.  On an
+    AFL-equipped host (route 1 or 2 — route 3's empty bitmap makes
+    the pipeline a no-op), run the pipeline against the current
+    8-seed corpus and re-commit the minimised set when it shrinks.
 
 ---
 
