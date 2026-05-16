@@ -450,16 +450,16 @@ where C emits "FOR LAST [N] TERMS OF ORDER BY" when nOBSat>0
 (select.c:1705..1709 vs codegen.pas:31665); tracked separately
 as 9.4.divbug.41 below.
 
-## 9.4.divbug.41 — EQP "TEMP B-TREE FOR ORDER BY" omits LAST-N-TERMS
+## 9.4.divbug.41 — EQP "TEMP B-TREE FOR ORDER BY" omits LAST-N-TERMS — FIXED
 
-Affects: residual sub-tests of eqp2.test, cost.test, fordelete.test,
+Affected: residual sub-tests of eqp2.test, cost.test, fordelete.test,
 delete2.test (post-9.4.divbug.28).
-Symptom: Pas emits `USE TEMP B-TREE FOR ORDER BY` where C emits
+Symptom: Pas emitted `USE TEMP B-TREE FOR ORDER BY` where C emits
 `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` (or
 `FOR LAST <n> TERMS OF ORDER BY` when nOBSat>0).
-Cause: codegen.pas:31663..31667 hard-codes the literal `'ORDER BY'`
-without consulting pSort->nOBSat / nKey.  Port the C arm from
-select.c:1704..1710.  Surfaced 9.4.divbug.28 archive.
+Fix: codegen.pas:31663 now branches on `pWInfo^.nOBSat` and
+`p^.pOrderBy^.nExpr - nOBSat` to pick the LAST-TERM / LAST-N-TERMS /
+plain-ORDER-BY string, matching select.c:1702..1711.
 
 ## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER
 
