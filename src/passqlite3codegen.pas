@@ -41814,6 +41814,9 @@ var
   regRowidAS: i32;
   addrTopAS:  i32;
   addrInsLoopAS: i32;
+  pIdxRD: PIndex2;
+  nPkRD, nNewRD, iRD, jRD, kRD: i32;
+  isDupRD: Boolean;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -41974,6 +41977,74 @@ begin
     if pPk2 <> nil then begin
       pPk2^.idxFlags := pPk2^.idxFlags or u32($28); { isCovering=bit5, uniqNotNull=bit3 }
       pPk2^.nColumn := pPk2^.nKeyCol;
+    end;
+
+    { Update the in-memory representation of every UNIQUE / non-PK index
+      so the synthesised "rowid tail" column emitted by sqlite3CreateIndex
+      (the pPk=nil arm at codegen.pas:43307..43313) is replaced with the
+      WITHOUT-ROWID PK key columns (dedup-aware).  Port of
+      build.c:2451..2483.  Without this the secondary index's aiColumn
+      tail still contains XN_ROWID, and any planner path that opens that
+      index dereferences past the column array → segfault on tables like
+      `CREATE TABLE t0(c0 COLLATE RTRIM, c1 BLOB UNIQUE, PRIMARY KEY(c0,c1))
+      WITHOUT ROWID` (9.4.divbug.42). }
+    if pPk2 <> nil then begin
+      pIdxRD := pTab^.pIndex;
+      nPkRD := i32(pPk2^.nKeyCol);
+      while pIdxRD <> nil do begin
+        if (pIdxRD^.idxFlags and 3) <> SQLITE_IDXTYPE_PRIMARYKEY then begin
+          { Count non-duplicate PK columns. }
+          nNewRD := 0;
+          for iRD := 0 to nPkRD - 1 do begin
+            isDupRD := False;
+            jRD := i32(pIdxRD^.nKeyCol);
+            for kRD := 0 to jRD - 1 do begin
+              if ((pIdxRD^.aiColumn + kRD)^ = (pPk2^.aiColumn + iRD)^)
+                 and ((PPAnsiChar(pIdxRD^.azColl) + kRD)^ <> nil)
+                 and ((PPAnsiChar(pPk2^.azColl) + iRD)^ <> nil)
+                 and (sqlite3StrICmp((PPAnsiChar(pIdxRD^.azColl) + kRD)^,
+                                     (PPAnsiChar(pPk2^.azColl)  + iRD)^) = 0) then
+              begin
+                isDupRD := True; Break;
+              end;
+            end;
+            if not isDupRD then Inc(nNewRD);
+          end;
+          if nNewRD = 0 then begin
+            { Index is a superset of the PK — drop the rowid tail. }
+            pIdxRD^.nColumn := pIdxRD^.nKeyCol;
+          end else begin
+            if resizeIndexObject(pParse, pIdxRD,
+                                 i32(pIdxRD^.nKeyCol) + nNewRD) <> SQLITE_OK then
+              Exit;
+            jRD := i32(pIdxRD^.nKeyCol);
+            for iRD := 0 to nPkRD - 1 do begin
+              isDupRD := False;
+              for kRD := 0 to i32(pIdxRD^.nKeyCol) - 1 do begin
+                if ((pIdxRD^.aiColumn + kRD)^ = (pPk2^.aiColumn + iRD)^)
+                   and ((PPAnsiChar(pIdxRD^.azColl) + kRD)^ <> nil)
+                   and ((PPAnsiChar(pPk2^.azColl) + iRD)^ <> nil)
+                   and (sqlite3StrICmp((PPAnsiChar(pIdxRD^.azColl) + kRD)^,
+                                       (PPAnsiChar(pPk2^.azColl)  + iRD)^) = 0) then
+                begin
+                  isDupRD := True; Break;
+                end;
+              end;
+              if not isDupRD then begin
+                (pIdxRD^.aiColumn + jRD)^ := (pPk2^.aiColumn + iRD)^;
+                (PPAnsiChar(pIdxRD^.azColl) + jRD)^ :=
+                  (PPAnsiChar(pPk2^.azColl) + iRD)^;
+                if (pPk2^.aSortOrder + iRD)^ <> 0 then
+                  { Per build.c:2476 ticket bba7b69f9849b5bf — set
+                    bAscKeyBug (bit 9 of idxFlags). }
+                  pIdxRD^.idxFlags := pIdxRD^.idxFlags or u32(1 shl 9);
+                Inc(jRD);
+              end;
+            end;
+          end;
+        end;
+        pIdxRD := pIdxRD^.pNext;
+      end;
     end;
 
     { Append all non-PK, non-VIRTUAL table columns to the PK index so the
