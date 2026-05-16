@@ -1439,7 +1439,7 @@ function  sqlite3VdbeSerialType(pMem: PMem; file_format: i32; pLen: Pu32): u32;
 function  sqlite3VdbeSerialTypeLen(serialType: u32): u32;
 function  sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
 function  sqlite3VdbeSerialPut(buf: Pu8; pMem: PMem; serial_type: u32): u32;
-procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem); inline;
 function  sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
                                   p: Pointer): Pointer; { returns UnpackedRecord* }
 function  sqlite3VdbeAllocUnpackedRecord(pKeyInfo: PKeyInfo): Pointer;
@@ -2047,7 +2047,7 @@ end;
   Source: vdbeaux.c sqlite3VdbeSerialGet().
   ============================================================================ }
 
-procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem); inline;
 var
   x: u64;
   y: u32;
