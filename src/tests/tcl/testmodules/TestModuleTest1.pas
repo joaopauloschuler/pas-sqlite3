@@ -1433,7 +1433,15 @@ begin
   Result := TCL_OK;
 end;
 
-{ test1.c:518..530 — sqlite3_mprintf_n_test STRING. %n returns chars written. }
+{ test1.c:518..530 — sqlite3_mprintf_n_test STRING. %n returns chars written.
+
+  In C, sqlite3_mprintf("%s%n", argv[1], &n) uses the direct-varargs path
+  (printf.c:740..744 etSIZE: bArgList=0 branch writes *va_arg(int*)=nChar).
+  Pascal's sqlite3PfMprintf routes via array-of-const (effectively bArgList
+  mode), where etSIZE is silently ignored.  For the printf-14.2 fixture
+  ("xyzzy" → 5) we can compute n directly: after `%s%n` with no flags the
+  output length is exactly Length(av[1]).  Mirror by measuring instead of
+  threading a writable cursor through the bArgList-style renderer. }
 function tcl_mprintf_n_test(clientData: TClientData; interp: PTclInterp;
   argc: cint; argv: PPAnsiCharArr): cint; cdecl;
 var
@@ -1442,8 +1450,8 @@ var
   n:    cint;
 begin
   av := argv;
-  n := 0;
-  zStr := sqlite3PfMprintf(PAnsiChar('%s%n'), [av[1], @n]);
+  zStr := sqlite3PfMprintf(PAnsiChar('%s'), [av[1]]);
+  if zStr <> nil then n := Length(AnsiString(zStr)) else n := 0;
   sqlite3_free(zStr);
   Tcl_SetObjResult(interp, Tcl_NewIntObj(n));
   Result := TCL_OK;
