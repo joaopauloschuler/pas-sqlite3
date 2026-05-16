@@ -5354,6 +5354,7 @@ var
   c:     i32;
   value: i64;
   z:     PAnsiChar;
+  zMsg:  PAnsiChar;
 begin
   v := pParse^.pVdbe;
   if (pExpr^.flags and EP_IntValue) <> 0 then
@@ -5371,7 +5372,20 @@ begin
        or ((negFlag <> 0) and (value = i64($8000000000000000))) then
     begin
       if sqlite3_strnicmp(z, '0x', 2) = 0 then
-        sqlite3ErrorMsg(pParse, 'hex literal too big')
+      begin
+        { expr.c:4340..4341 — "hex literal too big: %s%#T".  %s is the
+          negFlag prefix ("-" or ""), %#T renders pExpr^.u.zToken
+          (printf.c:957..962).  Build via sqlite3MPrintf with a %s
+          surrogate for the zToken — we don't have a %#T Expr*
+          dispatch in the Pascal printf, and zToken is already in
+          hand so the substitution is byte-identical. }
+        if negFlag <> 0 then
+          zMsg := sqlite3MPrintf(pParse^.db, 'hex literal too big: -%s', [z])
+        else
+          zMsg := sqlite3MPrintf(pParse^.db, 'hex literal too big: %s', [z]);
+        sqlite3ErrorMsg(pParse, zMsg);
+        if zMsg <> nil then sqlite3DbFree(pParse^.db, zMsg);
+      end
       else
         codeReal(v, z, negFlag, iMem);
     end
