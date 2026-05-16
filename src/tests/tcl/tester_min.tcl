@@ -546,6 +546,10 @@ proc omit_test {name reason {append 1}} {
 # does `db close; sqlite3 db test.db` to re-read the schema from disk
 # (e.g. index-1.1c/1.1d): the reopened handle saw an empty database
 # because the in-memory schema was never persisted (9.4.divbug.3).
+# Also exports `::DB` as the raw sqlite3* connection pointer (upstream
+# tester.tcl:557) so .test files (schema.test, malloc*.test, ioerr*.test)
+# that pass `$::DB` to sqlite3_prepare / sqlite3_extended_result_codes /
+# etc. don't trip "can't read \"::DB\": no such variable" (9.4.divbug.65).
 # C ref: tester.tcl:548..558.
 proc reset_db {} {
   catch {db close}
@@ -554,6 +558,7 @@ proc reset_db {} {
   forcedelete test.db-wal
   forcedelete test.db-shm
   sqlite3 db ./test.db
+  set ::DB [sqlite3_connection_pointer db]
 }
 
 # query_plan_graph — upstream tester.tcl:990..1001.  Renders the
