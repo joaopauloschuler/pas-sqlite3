@@ -1074,7 +1074,7 @@ partial landings cannot silently no-op.
       to `whereRangeScanEst` crash under STAT4 (C would too — the input
       isn't a valid planner call); those tests now run only meaningfully
       on the default build.  Closed in c.9.
-    - [ ] **10.1.42.b.7.prereq** Port `sqlite3Stat4ProbeSetValue` and
+    - [X] **10.1.42.b.7.prereq** Port `sqlite3Stat4ProbeSetValue` and
       `sqlite3Stat4ValueFromExpr` (consumers of `IndexSample` /
       `sqlite3VdbeRecordCompare`) plus any sample-vector machinery they
       depend on (`sqlite3Stat4Init`, `analyzeOneTable` STAT4 arm, etc.).
@@ -1086,6 +1086,20 @@ partial landings cannot silently no-op.
       Complexity: L.  **Decomposed 2026-05-15** into three sub-arms
       (a/b/c) — survey commit none, ~2000-2500 LOC total; default-build
       byte-identical parity preserved at every sub-arm boundary.
+      **Closed 2026-05-16**: all three sub-arms a/b/c landed in prior
+      passes (prereq.a record-shape, prereq.b writer-side, prereq.c
+      reader-side decomposed across c.1..c.9).  Reader-side bodies
+      verified present: `sqlite3Stat4ProbeSetValue` /
+      `sqlite3Stat4ValueFromExpr` interface forwards at
+      `src/passqlite3codegen.pas:1957..1961`, `whereKeyStats` body at
+      `:15687`, `whereRangeSkipScanEst` at `:15827`, `whereEqualScanEst`
+      at `:15936`, `whereInScanEst` at `:15992`, `loadStat4` at `:41167`
+      (wired into `analysisLoadTrampoline` at `:41270`).  All 4
+      WHERETRACE 0x20 host arms re-enabled in `whereLoopAddBtreeIndex`
+      (codegen.pas:16873..16875) + `whereRangeScanEst`
+      (codegen.pas:16411..16495).  Default-build smoke confirmed:
+      TestExplainParity 1026/1026, TestWherePlanner 679/679,
+      regression 99/100 (sole TestFuzzDiff failure pre-existing).
     - [X] **10.1.42.b.7.prereq.a** Record-shape + scaffolding.  Added
       `SQLITE_ENABLE_STAT4` gate doc to `src/passqlite3.inc:75..96` +
       `STAT4=1` arm to `src/tests/build.sh:109..123` mirroring the
