@@ -8744,22 +8744,60 @@ end;
 
 { resolveUpsertExcludedRefs — walk pE rewriting any excluded.<col> qualified
   references against pUpsert->pUpsertSrc->a[0].pSTab.  Mirrors resolve.c
-  lookupName's NC_UUpsert arm (resolve.c:547..588). }
-procedure resolveUpsertExcludedRefs(pUpsert: PUpsert; pE: PExpr);
+  lookupName's NC_UUpsert arm (resolve.c:547..588).
+
+  C resolve.c:522 only enters this arm when the qualified name failed to
+  match any table in pSrcList (`cnt==0`).  Hence if the *outer* SrcList
+  contains a real table aliased/named "excluded" (the very case
+  upsert3-200 exercises — `CREATE TABLE excluded(...)`), the standard
+  resolver wins and `excluded.c` reads the existing row's c rather than
+  the proposed-insert register.  Bug 9.4.divbug.74 was an unconditional
+  rewrite that bypassed that precedence. }
+procedure resolveUpsertExcludedRefs(pNC: PNameContext; pE: PExpr); forward;
+
+function upsertExcludedShadowed(pSrc: PSrcList): Boolean;
 var
-  pItem:  PSrcItem;
-  iCol:   i32;
-  pList:  PExprList;
   i:      i32;
-  items:  PExprListItem;
+  sItems: PSrcItem;
+  zNm:    PAnsiChar;
 begin
-  if (pE = nil) or (pUpsert = nil) or (pUpsert^.pUpsertSrc = nil) then Exit;
+  Result := False;
+  if (pSrc = nil) or (pSrc^.nSrc <= 0) then Exit;
+  sItems := SrcListItems(pSrc);
+  if sItems = nil then Exit;
+  for i := 0 to pSrc^.nSrc - 1 do
+  begin
+    if sItems[i].zAlias <> nil then
+      zNm := sItems[i].zAlias
+    else
+      zNm := sItems[i].zName;
+    if (zNm <> nil) and (sqlite3StrICmp(zNm, 'excluded') = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure resolveUpsertExcludedRefs(pNC: PNameContext; pE: PExpr);
+var
+  pUps:  PUpsert;
+  pItem: PSrcItem;
+  iCol:  i32;
+  pList: PExprList;
+  i:     i32;
+  items: PExprListItem;
+begin
+  if (pE = nil) or (pNC = nil) then Exit;
+  pUps := pNC^.uNC.pUpsert;
+  if (pUps = nil) or (pUps^.pUpsertSrc = nil) then Exit;
   if (pE^.op = TK_DOT)
      and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
      and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
-     and (sqlite3StrICmp(pE^.pLeft^.u.zToken, 'excluded') = 0) then
+     and (sqlite3StrICmp(pE^.pLeft^.u.zToken, 'excluded') = 0)
+     and (not upsertExcludedShadowed(pNC^.pSrcList)) then
   begin
-    pItem := SrcListItems(pUpsert^.pUpsertSrc);
+    pItem := SrcListItems(pUps^.pUpsertSrc);
     if (pItem <> nil) and (pItem^.pSTab <> nil) then
     begin
       iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.u.zToken);
@@ -8771,28 +8809,28 @@ begin
       if (iCol >= -1) and (iCol < pItem^.pSTab^.nCol) then
       begin
         { Mirror resolve.c:574..587 — collapse excluded.<col> directly to
-          TK_REGISTER pointing at pUpsert->regData + iCol (storage order). }
+          TK_REGISTER pointing at pUps->regData + iCol (storage order). }
         pE^.op      := TK_REGISTER;
         pE^.op2     := TK_COLUMN;
         pE^.iColumn := i16(iCol);
         pE^.y.pTab  := pItem^.pSTab;
         { sqlite3TableColumnToStorage simplified — iCol<0 returns iCol;
           TF_HasVirtual not exercised in the upsert path. }
-        pE^.iTable  := pUpsert^.regData + iCol;
+        pE^.iTable  := pUps^.regData + iCol;
         pE^.pLeft   := nil;
         pE^.pRight  := nil;
         Exit;
       end;
     end;
   end;
-  if pE^.pLeft  <> nil then resolveUpsertExcludedRefs(pUpsert, pE^.pLeft);
-  if pE^.pRight <> nil then resolveUpsertExcludedRefs(pUpsert, pE^.pRight);
+  if pE^.pLeft  <> nil then resolveUpsertExcludedRefs(pNC, pE^.pLeft);
+  if pE^.pRight <> nil then resolveUpsertExcludedRefs(pNC, pE^.pRight);
   if not ExprUseXSelect(pE) and (pE^.x.pList <> nil) then
   begin
     pList := pE^.x.pList;
     items := ExprListItems(pList);
     for i := 0 to pList^.nExpr - 1 do
-      resolveUpsertExcludedRefs(pUpsert, items[i].pExpr);
+      resolveUpsertExcludedRefs(pNC, items[i].pExpr);
   end;
 end;
 
@@ -9046,7 +9084,7 @@ begin
     if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
       resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
     if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
-      resolveUpsertExcludedRefs(pNC^.uNC.pUpsert, pExpr);
+      resolveUpsertExcludedRefs(pNC, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
       resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr);
