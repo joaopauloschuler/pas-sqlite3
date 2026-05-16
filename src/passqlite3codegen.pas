@@ -9795,6 +9795,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pMatch: PSrcItem;
     matchCol: i32;
     cnt:    i32;
+    pCompArm: PSelect;   { 9.4.divbug.75 — walks pInner^.pPrior chain }
   begin
     if pE = nil then Exit;
     { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
@@ -10090,50 +10091,73 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pWhere) — correlation can live in pEList, pHaving, pGroupBy,
           pOrderBy.  Without this, an inner subquery whose ONLY outer
           reference is in (e.g.) the projection list would lose the
-          SF_Correlated marker. }
+          SF_Correlated marker.
+
+          9.4.divbug.75 — walk the entire compound pPrior chain so each
+          arm of a UNION/INTERSECT/EXCEPT subquery has its own outer-ref
+          scan against its own pSrc.  Without this, refs like `P.pk`
+          living in the LEFT arm of an EXCEPT subquery (select7-4.1) are
+          never tagged as correlated and the inner resolver later raises
+          "no such column: P.pk".  Mirrors resolve.c's per-Select walker
+          dispatch (resolve.c:1382..1388 lookups run per compound arm via
+          sqlite3WalkSelect descending pPrior). }
         if p^.pSrc <> nil then
         begin
-          if ExprListRefsOuterTable(pInner^.pEList,
-                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprRefsOuterTable(pInner^.pWhere,
-                                p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprRefsOuterTable(pInner^.pHaving,
-                                p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprListRefsOuterTable(pInner^.pGroupBy,
-                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprListRefsOuterTable(pInner^.pOrderBy,
-                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
-          { 10.1.bug.131 — also detect unqualified TK_ID outer refs. }
-          if ExprListRefsOuterID(pInner^.pEList,
-                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprRefsOuterID(pInner^.pWhere,
-                             p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprRefsOuterID(pInner^.pHaving,
-                             p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprListRefsOuterID(pInner^.pGroupBy,
-                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprListRefsOuterID(pInner^.pOrderBy,
-                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            if ExprListRefsOuterTable(pCompArm^.pEList,
+                                      p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprRefsOuterTable(pCompArm^.pWhere,
+                                  p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprRefsOuterTable(pCompArm^.pHaving,
+                                  p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprListRefsOuterTable(pCompArm^.pGroupBy,
+                                      p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprListRefsOuterTable(pCompArm^.pOrderBy,
+                                      p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            { 10.1.bug.131 — also detect unqualified TK_ID outer refs. }
+            if ExprListRefsOuterID(pCompArm^.pEList,
+                                   p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprRefsOuterID(pCompArm^.pWhere,
+                               p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprRefsOuterID(pCompArm^.pHaving,
+                               p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprListRefsOuterID(pCompArm^.pGroupBy,
+                                   p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprListRefsOuterID(pCompArm^.pOrderBy,
+                                   p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            pCompArm := pCompArm^.pPrior;
+          end;
         end;
         { Step 3: resolve outer-ref TK_DOT nodes against the outer pSrc
           BEFORE the inner resolver runs.  Matching nodes become TK_COLUMN
           bound to the outer cursor; non-matching TK_DOTs stay in place
           and the inner resolver below will emit the proper "no such
           column" error if they don't match the inner FROM either.
-          Walks every clause that can contain expressions. }
+          Walks every clause that can contain expressions.
+
+          9.4.divbug.75 — also walks pPrior chain so each compound arm's
+          outer refs are rewritten against its own pSrc before inner
+          resolution. }
         if (p^.pSrc <> nil) and bCorr then
         begin
-          ResolveOuterRefsInList(pInner^.pEList,   p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefs(pInner^.pWhere,         p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
-          { 10.1.bug.131 — bare-TK_ID outer refs alongside TK_DOT. }
-          ResolveOuterIDsInList(pInner^.pEList,   p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDs(pInner^.pWhere,         p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            ResolveOuterRefsInList(pCompArm^.pEList,   p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefs(pCompArm^.pWhere,         p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            { 10.1.bug.131 — bare-TK_ID outer refs alongside TK_DOT. }
+            ResolveOuterIDsInList(pCompArm^.pEList,   p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDs(pCompArm^.pWhere,         p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
         end;
         { Step 4: resolve inner clauses against inner pSrc. }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
