@@ -1633,6 +1633,7 @@ const
   WHERE_GROUPBY          = u16($0040);
   WHERE_DISTINCTBY       = u16($0080);
   WHERE_WANT_DISTINCT    = u16($0100);
+  WHERE_AGG_DISTINCT     = u16($0400);
   WHERE_SORTBYGROUP      = u16($0200);
   WHERE_ORDERBY_LIMIT    = u16($0800);
   WHERE_RIGHT_JOIN       = u16($1000);
@@ -27099,6 +27100,39 @@ begin
   end;
 end;
 
+{ fixDistinctOpenEph — select.c:1017..1042.  Runs after updateAccumulator
+  to retro-edit the OP_OpenEphemeral that resetAccumulatorSimple laid
+  down at pF^.iDistAddr based on eTnctType from sqlite3WhereIsDistinct:
+    NOOP / UNORDERED — keep the ephemeral (default-path dedup needs it).
+    UNIQUE           — noop the OpenEphemeral (WHERE loop already unique).
+    ORDERED          — rewrite into OP_Null over regPrev (iVal) so the
+                       first iteration's OP_Eq fails on Cleared-NULL. }
+procedure fixDistinctOpenEph(pParse: PParse; eTnctType: i32;
+  iVal: i32; iOpenEphAddr: i32);
+var
+  v:   PVdbe;
+  pOp: PVdbeOp;
+begin
+  if pParse^.nErr <> 0 then Exit;
+  if (eTnctType <> WHERE_DISTINCT_UNIQUE)
+     and (eTnctType <> WHERE_DISTINCT_ORDERED) then Exit;
+  v := pParse^.pVdbe;
+  sqlite3VdbeChangeToNoop(v, iOpenEphAddr);
+  pOp := sqlite3VdbeGetOp(v, iOpenEphAddr + 1);
+  if (pOp <> nil) and (pOp^.opcode = OP_Explain) then
+    sqlite3VdbeChangeToNoop(v, iOpenEphAddr + 1);
+  if eTnctType = WHERE_DISTINCT_ORDERED then
+  begin
+    pOp := sqlite3VdbeGetOp(v, iOpenEphAddr);
+    if pOp <> nil then
+    begin
+      pOp^.opcode := OP_Null;
+      pOp^.p1     := 1;
+      pOp^.p2     := iVal;
+    end;
+  end;
+end;
+
 { updateAccumulatorSimple — select.c:6799 (slim).  For each aggregate
   function, code its argument list into a contiguous temp range and emit
   OP_AggStep with the FuncDef attached as P4.  After the per-Func loop,
@@ -27107,7 +27141,7 @@ end;
   populated.  Slim variant: no FILTER / DISTINCT / ORDER BY / NEEDCOLL
   arms (rejected by gate). }
 procedure updateAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo;
-  regAcc: i32 = 0);
+  regAcc: i32 = 0; eDistinctType: i32 = WHERE_DISTINCT_UNORDERED);
 var
   v:       PVdbe;
   i, j, nArg, r1: i32;
@@ -27215,21 +27249,74 @@ begin
       regAgg := 0;
       regDistinct := 0;
     end;
-    { DISTINCT dedup — select.c:6902..6908 default WHERE_DISTINCT_UNORDERED
-      arm.  Skip the AggStep when the arg-record is already present in the
-      ephemeral table opened by resetAccumulatorSimple. }
+    { DISTINCT dedup — select.c:6902..6908 + codeDistinct (select.c:933).
+      Three-way dispatch on eDistinctType from sqlite3WhereIsDistinct:
+        UNIQUE   — WHERE loop already yields unique rows; nothing to do
+                   (fixDistinctOpenEph will noop the OpenEphemeral too).
+        ORDERED  — rows arrive sorted; compare against previous-row reg
+                   via OP_Ne/OP_Eq instead of an ephemeral b-tree.
+                   pF^.iDistinct is rewritten to the regPrev base.
+        UNORDERED/NOOP — default path: OP_Found / OP_MakeRecord /
+                   OP_IdxInsert into the per-Func ephemeral.
+      Bug 9.4.divbug.33: without this dispatch the port always emitted
+      the UNORDERED ephemeral even when an index on the DISTINCT column
+      made the rows arrive sorted/unique, causing distinctagg-3.x EXPLAIN
+      to find an extra OpenEphemeral the upstream test forbids. }
     if (pF^.iDistinct >= 0) and (pList <> nil) then
     begin
       if addrNext = 0 then
         addrNext := sqlite3VdbeMakeLabel(pParse);
-      r1 := sqlite3GetTempReg(pParse);
-      sqlite3VdbeAddOp4Int(v, OP_Found, pF^.iDistinct, addrNext,
-                           regDistinct, nArg);
-      sqlite3VdbeAddOp3(v, OP_MakeRecord, regDistinct, nArg, r1);
-      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iDistinct, r1,
-                           regDistinct, nArg);
-      sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
-      sqlite3ReleaseTempReg(pParse, r1);
+      case eDistinctType of
+        WHERE_DISTINCT_ORDERED:
+          begin
+            { codeDistinct WHERE_DISTINCT_ORDERED arm — select.c:946..970.
+              Allocate regPrev[0..nArg-1] to hold the previous row's
+              distinct key; for each column emit OP_Ne (skip if differs
+              partway through a multi-col key) and a terminal OP_Eq that
+              jumps to addrNext when the *full* key equals the previous
+              row.  fixDistinctOpenEph then rewrites the OpenEphemeral
+              into an OP_Null over regPrev so the first iteration's Eq
+              fails on the NULL-Cleared sentinel. }
+            r1 := pParse^.nMem + 1;     { regPrev base }
+            pParse^.nMem := pParse^.nMem + nArg;
+            pF^.iDistinct := r1;        { used by fixDistinctOpenEph }
+            { iJump destination: address right after the final OP_Eq. }
+            for j := 0 to nArg - 1 do
+            begin
+              if j < nArg - 1 then
+                sqlite3VdbeAddOp3(v, OP_Ne,
+                  regDistinct + j,
+                  sqlite3VdbeCurrentAddr(v) + (nArg - 1 - j) + 1,
+                  r1 + j)
+              else
+                sqlite3VdbeAddOp3(v, OP_Eq,
+                  regDistinct + j, addrNext, r1 + j);
+              sqlite3VdbeChangeP4(v, -1,
+                PAnsiChar(sqlite3ExprCollSeq(pParse,
+                  ExprListItems(pList)[j].pExpr)),
+                P4_COLLSEQ);
+              sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+            end;
+            sqlite3VdbeAddOp3(v, OP_Copy, regDistinct, r1, nArg - 1);
+          end;
+        WHERE_DISTINCT_UNIQUE:
+          begin
+            { Nothing to emit — WHERE loop already filters duplicates.
+              fixDistinctOpenEph will noop the OpenEphemeral. }
+          end;
+        else
+          begin
+            { Default — WHERE_DISTINCT_UNORDERED / NOOP. }
+            r1 := sqlite3GetTempReg(pParse);
+            sqlite3VdbeAddOp4Int(v, OP_Found, pF^.iDistinct, addrNext,
+                                 regDistinct, nArg);
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, regDistinct, nArg, r1);
+            sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iDistinct, r1,
+                                 regDistinct, nArg);
+            sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+            sqlite3ReleaseTempReg(pParse, r1);
+          end;
+      end;
     end;
     if pF^.iOBTab >= 0 then
     begin
@@ -27600,6 +27687,9 @@ var
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
   minMaxFlag:  u8;
+  pAggDistinct: PExprList;       { 9.4.divbug.33 }
+  distFlag:    u16;              { 9.4.divbug.33 }
+  eDistResult: i32;              { 9.4.divbug.33 }
   { DISTINCT codegen locals (select.c:8253..8260) — only the
     WHERE_DISTINCT_UNORDERED ephemeral-table path is implemented;
     UNIQUE/ORDERED optimisations stay deferred (matches a build that
@@ -30103,16 +30193,43 @@ begin
             minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
                                       @pMinMaxOrderBy);
 
+          { 9.4.divbug.33 — DISTINCT-aggregate index ride.  Mirrors
+            select.c:8849..8853: when there are no bare accumulator
+            columns and exactly one aggregate with iDistinct>=0, pass
+            its argument list to sqlite3WhereBegin as pDistinct +
+            WHERE_WANT_DISTINCT|WHERE_AGG_DISTINCT.  The WHERE engine
+            then probes whether an existing index already yields rows
+            unique on that column (sets pWInfo^.eDistinct), and
+            fixDistinctOpenEph below noops the ephemeral b-tree. }
+          pAggDistinct := nil;
+          distFlag     := 0;
+          if (pAggI2^.nAccumulator = 0)
+             and (pAggI2^.nFunc = 1)
+             and (pAggI2^.aFunc[0].iDistinct >= 0)
+             and ExprUseXList(pAggI2^.aFunc[0].pFExpr) then
+          begin
+            pAggDistinct := pAggI2^.aFunc[0].pFExpr^.x.pList;
+            if pAggDistinct <> nil then
+              distFlag := WHERE_WANT_DISTINCT or WHERE_AGG_DISTINCT;
+          end;
+
           {$IFDEF SQLITE_DEBUG}
           TreeTraceLine($2, 'WhereBegin');  { select.c:8871 }
           {$ENDIF}
           pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
-                                      pMinMaxOrderBy, nil, p, minMaxFlag, 0);
+                                      pMinMaxOrderBy, pAggDistinct, p,
+                                      u16(minMaxFlag) or distFlag, 0);
           if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
           {$IFDEF SQLITE_DEBUG}
           TreeTraceLine($2, 'WhereBegin returns');  { select.c:8877 }
           {$ENDIF}
-          updateAccumulatorSimple(pParse, pAggI2, regAcc);
+          eDistResult := sqlite3WhereIsDistinct(pWInfo);
+          updateAccumulatorSimple(pParse, pAggI2, regAcc, eDistResult);
+          if (eDistResult <> WHERE_DISTINCT_NOOP)
+             and (pAggI2^.nFunc > 0) then
+            fixDistinctOpenEph(pParse, eDistResult,
+              pAggI2^.aFunc[0].iDistinct,
+              pAggI2^.aFunc[0].iDistAddr);
           if regAcc <> 0 then
             sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
           if minMaxFlag <> WHERE_ORDERBY_NORMAL then
