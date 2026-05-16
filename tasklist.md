@@ -1750,10 +1750,51 @@ and can be added later via a small C entry stub.
     untested — dev host lacks afl-fuzz; only the AFL-missing self-report
     and the route-3 fallback compile path were exercised.
 
-- [ ] **13.2** Crash-vs-divergence classifier.  Triage helper
+- [X] **13.2** Crash-vs-divergence classifier.  Triage helper
   that separates (a) Pascal crash, (b) C crash, (c) silent
   divergence, (d) timeout.  Each gets its own bucket under
   `src/tests/fuzz/crashes/`.
+  Landed: src/tests/fuzz/classify-crash.sh (pure-bash, no AFL
+  dependency).  Runs each input through bin/TestFuzzDiff under
+  `timeout -k 2 ${TIMEOUT_S:-30}` and dispatches on rc:
+    * rc=0       → PASS, skipped (no bucket).
+    * rc=2       → `crashes/divergence/` + meta sidecar with the
+                   diverged-channel list (parsed from "DIVERGE
+                   channel=" stderr lines) + hex-prefix first-diff
+                   hints.
+    * rc=124     → `crashes/timeout/` (plain `timeout(1)` returns
+                   124 on SIGTERM kill — NO `--preserve-status`
+                   because that maps to 128+15 indistinguishably
+                   from a child SIGTERM crash).
+    * rc>=128    → crash bucket; pas-vs-c side picked by stderr
+                   heuristic (FPC RTL emits "Runtime error <n>"
+                   on Pascal-side death; libsqlite3.so SIGSEGV
+                   is silent).  Heuristic documented in README +
+                   the script header so operators can override.
+    * rc=1/3     → I/O error / malformed dbsqlfuzz frame, skipped.
+  Sidecar `<input>.meta.txt` captures: classification, original
+  path, harness rc + signal, wall-clock, last stderr line, full
+  stderr head (4 KiB).  Default input list = AFL's
+  `findings/default/crashes/`; `--copy` preserves originals;
+  `--quiet` suppresses per-input lines.  Script exits 2 if anything
+  bucketed (CI-gateable), 0 if not.  Per-bucket `.gitkeep` plus
+  `crashes/.gitkeep` so directories survive empty in git.
+  Smoke-verified all four buckets via synthetic harness stubs
+  (/tmp/cc-smoke/fake-*.sh): divergence (rc=2), pas-crash (sig=11
+  with FPC stderr), c-crash (sig=11 silent stderr), timeout
+  (TIMEOUT_S=2).  Real-corpus run on `src/tests/fuzz/seeds/`
+  reports 8/8 PASS, 0 bucketed — matches the 9.3.2 baseline, no
+  false positives.  README "Triage workflow" section added.
+  Cite: src/tests/fuzz/classify-crash.sh,
+  src/tests/fuzz/README.md "Triage workflow",
+  src/tests/fuzz/crashes/{pas-crash,c-crash,divergence,timeout}/.gitkeep.
+  - [ ] **13.2.unverified** No real-world AFL crash corpus has hit
+    the classifier yet — the four-bucket smoke used synthetic
+    bash stubs.  Once 13.3's 24h soak surfaces an actual finding,
+    re-run `classify-crash.sh` on the AFL crashes/ dir and
+    confirm the side-disambiguation heuristic holds (FPC RTL
+    Runtime-error preamble is present on every Pascal SIGSEGV
+    AFL surfaces).
 
 - [ ] **13.3** ≥24 h soak target.  Wrapper script `fuzz-soak.sh`
   with `--duration` (default 24h) and stop-on-first-divergence.

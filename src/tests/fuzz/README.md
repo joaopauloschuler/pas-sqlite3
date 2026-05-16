@@ -12,10 +12,12 @@ codes so the fuzzer can bucket findings.
 
 | File              | Purpose                                                  |
 |-------------------|----------------------------------------------------------|
-| `afl-driver.pas`  | Stdin→tmpfile shim that execs `bin/TestFuzzDiff`.        |
-| `build-afl.sh`    | Detects AFL, picks instrumentation route, compiles.       |
-| `seeds/`          | 8 `fuzzdataN.db` files from upstream (~62 MiB total).    |
-| `.afl-route`      | One-line note recording which route the last build used. |
+| `afl-driver.pas`     | Stdin→tmpfile shim that execs `bin/TestFuzzDiff`.        |
+| `build-afl.sh`       | Detects AFL, picks instrumentation route, compiles.       |
+| `classify-crash.sh`  | Phase 13.2 triage helper — sorts AFL findings into 4 buckets. |
+| `seeds/`             | 8 `fuzzdataN.db` files from upstream (~62 MiB total).    |
+| `crashes/`           | Triaged AFL findings, bucketed by classifier (4 subdirs). |
+| `.afl-route`         | One-line note recording which route the last build used. |
 
 ## Instrumentation routes
 
@@ -105,6 +107,56 @@ construction, an input the seed sweep didn't already cover.
 
 `afl-fuzz` treats signal-death as a crash; codes 2/3 surface through
 the bitmap as new edges and are queued for later triage by Phase 13.2.
+
+## Triage workflow (Phase 13.2)
+
+`classify-crash.sh` is a pure-bash triage helper: feed it an AFL
+`findings/default/crashes/` directory (or any list of suspect inputs)
+and it sorts each input into one of four buckets under `crashes/`:
+
+| Bucket          | Trigger condition                                              |
+|-----------------|----------------------------------------------------------------|
+| `pas-crash/`    | Harness died on signal AND stderr contains an FPC `Runtime error` / `EAccessViolation` / `External: SIG` marker. |
+| `c-crash/`      | Harness died on signal AND stderr is silent (no FPC backtrace — only the preamble line printed before death). |
+| `divergence/`   | Harness exited rc=2 — both backends ran to completion but at least one channel (stdout / stderr / rc / db-blob) differs. |
+| `timeout/`      | Harness exceeded `TIMEOUT_S` wall-clock (default 30s) and was SIGTERM'd by `timeout(1)` — surfaces as rc=124. |
+
+`PASS` inputs (rc=0) and `rc∈{1,3}` (I/O error / malformed dbsqlfuzz
+frame) are silently skipped — they don't represent a defect.
+
+Each placed input gets a `<input>.meta.txt` sidecar containing:
+classification, original path, harness path + rc + signal, wall-clock,
+diverged-channel list (for divergence), hex-prefix first-diff hints
+(for divergence), and the first 4 KiB of the captured stderr.
+
+```sh
+# Default — point at AFL's per-session crash bucket
+bash src/tests/fuzz/classify-crash.sh
+
+# Or any directory / explicit file list, with --copy to preserve
+# originals instead of moving:
+bash src/tests/fuzz/classify-crash.sh --copy /path/to/inputs/
+
+# Knobs:
+TIMEOUT_S=60                         bash src/tests/fuzz/classify-crash.sh ...
+PAS_FUZZDIFF_BIN=/alt/TestFuzzDiff   bash src/tests/fuzz/classify-crash.sh ...
+```
+
+Exit code: `0` if nothing bucketed (all PASS / skipped); `2` if at
+least one input landed in a bucket — useful for CI gating.
+
+**Crash-side disambiguation caveat.**  TestFuzzDiff runs both oracles
+in a single process (C first, then Pas — `TestFuzzDiff.pas:RunBoth`).
+On signal-death we can't tell from rc alone which oracle was active,
+so we use the stderr heuristic above.  FPC's RTL reliably prints a
+`Runtime error <n> at <addr>` preamble + backtrace on any uncaught
+Pascal exception or SIGSEGV inside Pascal code (SysUtils installs
+the SIGSEGV → RunError 216 hook); `libsqlite3.so` SIGSEGV emits
+nothing.  Override in `<input>.meta.txt` if you have evidence the
+heuristic misclassified a finding.
+
+**Smoke baseline.**  Running the classifier across the 8 upstream
+seeds yields 8/8 PASS, 0 bucketed — matching the Phase 9.3.2 sweep.
 
 ## Status
 
