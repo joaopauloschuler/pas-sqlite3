@@ -27994,6 +27994,25 @@ begin
     end;
     p^.selFlags := p^.selFlags and (not u32(SF_Distinct));
   end;
+  { 9.4.divbug.44 — Pas-only workaround for the missing SRT_Set sort path.
+    C's selectInnerLoop/generateSortTail both implement an SRT_Set arm
+    (select.c:1384..1407 and 1837..1843) so an `IN (SELECT ... ORDER BY x)`
+    subquery sorts into the eph table and the set is populated correctly.
+    Our 31351..31354 sort gate only accepts SRT_Output / SRT_EphemTab /
+    SRT_Coroutine, and 31465..31470 bails on any other destination with a
+    leftover ORDER BY — so SRT_Set + ORDER BY produced an empty eph cursor
+    and the parent `b IN (…)` test always failed (misc3-4.3 returned 0).
+    Until the full SRT_Set sort path lands, drop the superfluous ORDER BY
+    for SRT_Set with no LIMIT (the set contents are order-independent —
+    see C's own comment at select.c:1386..1389).  With LIMIT the order
+    matters; leave that case alone so the existing bail still fires. }
+  if (pDest <> nil) and (pDest^.eDest = SRT_Set)
+     and (p^.pOrderBy <> nil) and (p^.pLimit = nil) then
+  begin
+    sqlite3ParserAddCleanup(pParse,
+      @sqlite3ExprListDeleteGeneric, p^.pOrderBy);
+    p^.pOrderBy := nil;
+  end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
   {$IFDEF SQLITE_DEBUG}
