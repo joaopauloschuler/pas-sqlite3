@@ -21,6 +21,16 @@
       --limit N           cap number of tcl-feature entries processed
       --filter SUBSTR     only paths whose name contains SUBSTR
       --manifest PATH     override manifest location
+      --shard I/N         (9.4.5.b) run only entries in slice I of N
+                          where entries are sliced AFTER --filter but
+                          BEFORE --limit.  I is 0-based, 0<=I<N.
+      --fail-log-dir DIR  (9.4.5.c) on FAIL, write per-test
+                          <basename>.out / .err under DIR.  Default is
+                          <bin>/tcl-failure-logs/ when unset.
+      --gate strict       (9.4.5.a placeholder; full implementation
+                          tracked under 9.4.8.c) currently a no-op —
+                          accepted so CI invocation contract is stable
+                          before 9.4.8.c lands.
 
   No top-level gate yet — wiring deferred to 9.4.4.a.  Skip-list hook
   is in place but empty.
@@ -102,6 +112,10 @@ var
   gManifest   : string;        { absolute manifest path }
   gLimit      : Integer = -1;
   gFilter     : string  = '';
+  gShardI     : Integer = -1;       { 9.4.5.b — -1 = no sharding }
+  gShardN     : Integer = -1;
+  gFailLogDir : string  = '';       { 9.4.5.c — empty = default <bin>/tcl-failure-logs }
+  gGateStrict : Boolean = False;    { 9.4.5.a placeholder; full impl = 9.4.8.c }
   gSkipList   : TStringList;
 
   nPass, nFail, nSkip, nTotal : Integer;
@@ -140,8 +154,29 @@ begin
   end;
 end;
 
+procedure ParseShardSpec(const spec: string);
+var
+  slash: Integer;
+  sI, sN: string;
+begin
+  slash := Pos('/', spec);
+  if slash = 0 then begin
+    Writeln(StdErr, 'TclTestDriver: --shard expects I/N, got: ', spec);
+    Halt(2);
+  end;
+  sI := Copy(spec, 1, slash - 1);
+  sN := Copy(spec, slash + 1, MaxInt);
+  gShardI := StrToIntDef(sI, -1);
+  gShardN := StrToIntDef(sN, -1);
+  if (gShardN <= 0) or (gShardI < 0) or (gShardI >= gShardN) then begin
+    Writeln(StdErr, 'TclTestDriver: invalid --shard ', spec,
+            ' (need 0<=I<N, N>=1)');
+    Halt(2);
+  end;
+end;
+
 procedure ParseArgs;
-var i: Integer; a: string;
+var i: Integer; a, g: string;
 begin
   i := 1;
   while i <= ParamCount do begin
@@ -152,6 +187,18 @@ begin
       Inc(i); gFilter := ParamStr(i);
     end else if a = '--manifest' then begin
       Inc(i); gManifest := ExpandFileName(ParamStr(i));
+    end else if a = '--shard' then begin
+      Inc(i); ParseShardSpec(ParamStr(i));
+    end else if a = '--fail-log-dir' then begin
+      Inc(i); gFailLogDir := ExpandFileName(ParamStr(i));
+    end else if a = '--gate' then begin
+      Inc(i); g := LowerCase(ParamStr(i));
+      if g = 'strict' then
+        gGateStrict := True
+      else if g <> 'none' then begin
+        Writeln(StdErr, 'TclTestDriver: unknown --gate value: ', g);
+        Halt(2);
+      end;
     end else begin
       Writeln(StdErr, 'TclTestDriver: unknown arg: ', a);
       Halt(2);
@@ -456,6 +503,34 @@ begin
 end;
 
 {----------------------------------------------------------------------------
+  9.4.5.c: persist per-test stdout/stderr capture to disk on FAIL so the
+  CI upload-artifact step can grab them for triage.
+----------------------------------------------------------------------------}
+procedure WriteFailLogs(const relPath: string; const sOut, sErr: AnsiString);
+var
+  bn, base, outP, errP: string;
+  f: TextFile;
+  i: Integer;
+begin
+  if gFailLogDir = '' then Exit;
+  if not ForceDirectories(gFailLogDir) then Exit;
+  bn := ExtractFileName(relPath);
+  if bn = '' then bn := 'unknown';
+  { sanitise: replace any path separators left in basename }
+  for i := 1 to Length(bn) do
+    if bn[i] in ['/', '\', ':'] then bn[i] := '_';
+  base := IncludeTrailingPathDelimiter(gFailLogDir) + bn;
+  outP := base + '.out';
+  errP := base + '.err';
+  try
+    AssignFile(f, outP); Rewrite(f); Write(f, sOut); CloseFile(f);
+  except end;
+  try
+    AssignFile(f, errP); Rewrite(f); Write(f, sErr); CloseFile(f);
+  except end;
+end;
+
+{----------------------------------------------------------------------------
   ProcessEntry — handle one manifest line that has tag 'tcl-feature'.
 ----------------------------------------------------------------------------}
 procedure ProcessEntry(const relPath: string);
@@ -494,7 +569,10 @@ begin
   Writeln(cls, ' ', relPath, ' ', nT, ' ', durMs);
   if cls = 'PASS' then Inc(nPass)
   else if cls = 'SKIP' then Inc(nSkip)
-  else Inc(nFail);
+  else begin
+    Inc(nFail);
+    WriteFailLogs(relPath, sOut, sErr);
+  end;
 
   Flush(Output);
 end;
@@ -504,10 +582,12 @@ end;
 ----------------------------------------------------------------------------}
 var
   manifest : TStringList;
+  filtered : TStringList;        { 9.4.5.b — tcl-feature paths post-filter }
   i, nDone : Integer;
   line, tag, p: string;
   tabIdx   : Integer;
   startTotal: QWord;
+  shardLo, shardHi: Integer;
 begin
   gRoot := ResolveRoot;
   gBinDir := IncludeTrailingPathDelimiter(gRoot) + 'bin';
@@ -516,6 +596,12 @@ begin
   gManifest := IncludeTrailingPathDelimiter(gTclDir) + 'MANIFEST.txt';
 
   ParseArgs;
+
+  if gFailLogDir = '' then
+    gFailLogDir := IncludeTrailingPathDelimiter(gBinDir) + 'tcl-failure-logs';
+
+  if gGateStrict then
+    Writeln(StdErr, 'TclTestDriver: --gate strict accepted (stub; full enforcement = 9.4.8.c)');
 
   if not FileExists(gSoPath) then begin
     Writeln(StdErr, 'TclTestDriver: missing ', gSoPath);
@@ -539,18 +625,45 @@ begin
     nPass := 0; nFail := 0; nSkip := 0; nTotal := 0; nDone := 0;
     startTotal := GetTickCount64;
 
-    for i := 0 to manifest.Count - 1 do begin
-      line := manifest[i];
-      if line = '' then Continue;
-      tabIdx := Pos(#9, line);
-      if tabIdx = 0 then Continue;
-      tag := Copy(line, 1, tabIdx - 1);
-      p   := Copy(line, tabIdx + 1, MaxInt);
-      if tag <> 'tcl-feature' then Continue;
-      if (gFilter <> '') and (Pos(gFilter, ExtractFileName(p)) = 0) then Continue;
-      if (gLimit > 0) and (nDone >= gLimit) then Break;
-      Inc(nDone);
-      ProcessEntry(p);
+    { 9.4.5.b: build the filtered tcl-feature list first.  Then --limit
+      truncates the list, and --shard slices the *truncated* list — so
+      `--shard I/N --limit M` partitions the first M entries into N
+      contiguous, non-overlapping chunks (CI workers each get their own
+      slice of the same M-prefix). }
+    filtered := TStringList.Create;
+    try
+      for i := 0 to manifest.Count - 1 do begin
+        line := manifest[i];
+        if line = '' then Continue;
+        tabIdx := Pos(#9, line);
+        if tabIdx = 0 then Continue;
+        tag := Copy(line, 1, tabIdx - 1);
+        p   := Copy(line, tabIdx + 1, MaxInt);
+        if tag <> 'tcl-feature' then Continue;
+        if (gFilter <> '') and (Pos(gFilter, ExtractFileName(p)) = 0) then Continue;
+        filtered.Add(p);
+      end;
+
+      if (gLimit > 0) and (gLimit < filtered.Count) then
+        while filtered.Count > gLimit do filtered.Delete(filtered.Count - 1);
+
+      if gShardN > 0 then begin
+        shardLo := (filtered.Count * gShardI) div gShardN;
+        shardHi := (filtered.Count * (gShardI + 1)) div gShardN;
+      end else begin
+        shardLo := 0;
+        shardHi := filtered.Count;
+      end;
+
+      Writeln(StdErr, Format('Shard slice: [%d, %d) of %d (post-filter, post-limit) entries',
+        [shardLo, shardHi, filtered.Count]));
+
+      for i := shardLo to shardHi - 1 do begin
+        Inc(nDone);
+        ProcessEntry(filtered[i]);
+      end;
+    finally
+      filtered.Free;
     end;
 
     Writeln(StdErr, Format('Total: %d pass / %d fail / %d skip / %d total in %d ms',
