@@ -585,16 +585,15 @@ C reference: parse.y refargs grammar; fkey.c
 `sqlite3FkActionTrigger`.
 Surfaced by: 9.4.4.e sweep.
 
-## 9.4.divbug.39 — `CREATE TABLE AS SELECT` unsupported
+## 9.4.divbug.39 — `CREATE TABLE AS SELECT` unsupported — FIXED
 
-Affects: 3 tests (`errofst1.test` errofst1-1.1; `delete.test`
-delete-7.6; `distinct2.test` distinct2-100; plus older affinity3
-residue).
-Symptom: parser/codegen returns `CREATE TABLE AS SELECT not yet
-supported in this build`.  Engine has the AST shape but the SRT_*
-sink + table-creation post-step never wired.  C reference: build.c
-`sqlite3EndTable` `pSelect` arm + select.c `SRT_Table`.
-Surfaced by: 9.4.4.e sweep (already known but had no dedicated bucket).
+Fixed by porting the `pSelect` arm of `sqlite3EndTable`
+(codegen.pas:41832..) faithful to build.c:2836..2884:
+OpenWrite(P5=P2ISREG) → InitCoroutine → ResultSetOfSelect (steals
+aCol into the new table) → sqlite3Select(SRT_Coroutine) →
+EndCoroutine → Yield/MakeRecord/TableAffinity/NewRowid/Insert loop
+→ Close.  Reproducer `CREATE TABLE t AS SELECT 1,2; SELECT * FROM t`
+now returns `1|2` matching the C oracle.
 
 ## 9.4.divbug.40 — `DEFAULT` literal type + error-msg column-name drop
 

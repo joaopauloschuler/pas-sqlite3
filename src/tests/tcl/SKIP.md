@@ -148,8 +148,8 @@ runs to completion or further:
   `sqlite3_db_config` SOURCE-ERROR (unported test command).
 - **delete.test** — now **runs** 49 sub-tests, 2 errors; the old
   `db one` blocker is gone; remaining are divbug.15 + a
-  `sqlite3_connection_pointer` SOURCE-ERROR (unported test command)
-  + `CREATE TABLE AS SELECT not yet supported in this build`.
+  `sqlite3_connection_pointer` SOURCE-ERROR (unported test command).
+  (CTAS-blocker fixed by 9.4.divbug.39.)
 - **update.test** — now SIGSEGVs at `update-17.10` — new
   **9.4.divbug.12**.
 - **boundary1.test** — empty-result (divbug.10) fixed; now fails on
@@ -157,7 +157,7 @@ runs to completion or further:
 
 Remaining shim/test-command gaps surfaced (port-side follow-ups,
 not divergences): `sqlite3_db_config`, `sqlite3_connection_pointer`,
-`CREATE TABLE AS SELECT`, and `set ::AUTOVACUUM` in `tester_min.tcl`.
+and `set ::AUTOVACUUM` in `tester_min.tcl`.
 
 ## Notes for future shim growth
 

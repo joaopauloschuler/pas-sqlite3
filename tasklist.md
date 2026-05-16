@@ -922,7 +922,7 @@ acceptance gate for this section.
 - [ ] **9.4.divbug.36** `PRAGMA journal_mode=off` silently ignored — keeps prior mode `delete` (changes-1.1.0).  Cite: pragma.c azModeName[] PAGER_JOURNALMODE_OFF.  Surfaced 9.4.4.e.
 - [ ] **9.4.divbug.37** WAL `wal_hook` callback reports 0 frames where upstream reports >0 (e_walhook-1.3+).  Cite: wal.c `sqlite3WalCallback`, pager.c walCommit hook invocation.  Surfaced 9.4.4.e.
 - [ ] **9.4.divbug.38** FK ON-clause: malformed `REFERENCES … ON` not raised as `near "ON": syntax error`; FK-cascade picks wrong target row (e_fkey-2.1/3.1).  Cite: parse.y refargs grammar, fkey.c `sqlite3FkActionTrigger`.  Surfaced 9.4.4.e.
-- [ ] **9.4.divbug.39** `CREATE TABLE AS SELECT` (CTAS) unsupported in this build (errofst1, distinct2-100, delete-7.6).  Cite: build.c `sqlite3EndTable` pSelect arm, select.c `SRT_Table`.  Surfaced 9.4.4.e (existed in 9.4.4.d as residue with no dedicated bucket).
+- [X] **9.4.divbug.39** `CREATE TABLE AS SELECT` (CTAS) unsupported in this build (errofst1, distinct2-100, delete-7.6).  Cite: build.c `sqlite3EndTable` pSelect arm, select.c `SRT_Table`.  Surfaced 9.4.4.e (existed in 9.4.4.d as residue with no dedicated bucket).  Fixed by porting the pSelect coroutine arm of `sqlite3EndTable` faithful to build.c:2836..2884 (codegen.pas:41832..).  Reproducer `CREATE TABLE t AS SELECT 1,2; SELECT * FROM t` now returns `1|2`.
 - [ ] **9.4.divbug.40** `DEFAULT` clause: error text drops column-name (default-1.3 `default value of column is not constant` missing `[y]`); DEFAULT-derived affinity reported in wrong order (default-3.1).  Sibling-of divbug.14 but in DEFAULT path.  Cite: build.c `sqlite3AddDefaultValue`, `sqlite3AffinityType`.  Surfaced 9.4.4.e.
 
 ---

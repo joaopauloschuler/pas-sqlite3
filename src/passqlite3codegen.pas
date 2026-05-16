@@ -41590,6 +41590,14 @@ var
   zCollPk: PAnsiChar;
   pListPk: PExprList;
   ipkTokenPk: TToken;
+  pSelTab:    PTable2;
+  destAS:     TSelectDest;
+  iCsrAS:     i32;
+  regYieldAS: i32;
+  regRecAS:   i32;
+  regRowidAS: i32;
+  addrTopAS:  i32;
+  addrInsLoopAS: i32;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -41604,16 +41612,6 @@ begin
   end;
 
   db := pParse^.db;
-
-  { CREATE TABLE ... AS SELECT body codegen is deferred to Phase 7.x.
-    Without it we would write a CREATE-table schema row with no column
-    list, leaving sqlite_schema malformed.  Surface a clean parse error
-    instead and skip the entire emit path. }
-  if pSelect <> nil then begin
-    sqlite3ErrorMsg(pParse,
-      PAnsiChar('CREATE TABLE AS SELECT not yet supported in this build'));
-    Exit;
-  end;
 
   { Test-scaffold gate: the synthetic dbs used by TestParserSmoke /
     TestVtab leave eOpenState=1 and have no working aDb[].pSchema /
@@ -41835,13 +41833,8 @@ begin
       Exit;
     end;
 
-    { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Parser owns
-      pSelect and frees it after EndTable returns; we only note whether
-      a SELECT was present so the createTableStmt branch below can fire. }
     bAsSelect := 0;
-    if pSelect <> nil then begin
-      bAsSelect := 1;
-    end;
+    if pSelect <> nil then bAsSelect := 1;
 
     { Determine zType / zType2 (build.c:2811..2820): regular table vs view. }
     if pTab^.eTabType = TABTYP_NORM then begin
@@ -41852,12 +41845,59 @@ begin
       zType2 := PAnsiChar('VIEW');
     end;
 
+    { Phase 6.10 step 2: emit OP_Close 0 (build.c:2806). }
+    sqlite3VdbeAddOp1(v, OP_Close, 0);
+
+    { CREATE TABLE ... AS SELECT body — port of build.c:2836..2884.
+      Open a write cursor on the new btree (root in regRoot, P5=P2ISREG),
+      run the SELECT into a coroutine, then loop OP_Yield → MakeRecord →
+      NewRowid → Insert until the coroutine signals EOF. }
+    if bAsSelect <> 0 then begin
+      { build.c:2846..2850 — refuse during DECLARE_VTAB / RENAME passes. }
+      if pParse^.eParseMode <> PARSE_MODE_NORMAL then begin
+        pParse^.rc := SQLITE_ERROR;
+        Inc(pParse^.nErr);
+        Exit;
+      end;
+      iCsrAS := pParse^.nTab; Inc(pParse^.nTab);
+      Inc(pParse^.nMem); regYieldAS := pParse^.nMem;
+      Inc(pParse^.nMem); regRecAS   := pParse^.nMem;
+      Inc(pParse^.nMem); regRowidAS := pParse^.nMem;
+      sqlite3MayAbort(pParse);
+      sqlite3VdbeAddOp3(v, OP_OpenWrite, iCsrAS, pParse^.u1.cr.regRoot, iDb);
+      sqlite3VdbeChangeP5(v, OPFLAG_P2ISREG);
+      addrTopAS := sqlite3VdbeCurrentAddr(v) + 1;
+      sqlite3VdbeAddOp3(v, OP_InitCoroutine, regYieldAS, 0, addrTopAS);
+      if pParse^.nErr <> 0 then Exit;
+      pSelTab := sqlite3ResultSetOfSelect(pParse, pSelect,
+                   AnsiChar(SQLITE_AFF_BLOB));
+      if pSelTab = nil then Exit;
+      AssertH(pTab^.aCol = nil, 'EndTable AS SELECT: aCol must be empty');
+      pTab^.nCol   := pSelTab^.nCol;
+      pTab^.nNVCol := pSelTab^.nCol;
+      pTab^.aCol   := pSelTab^.aCol;
+      pSelTab^.nCol := 0;
+      pSelTab^.aCol := nil;
+      sqlite3DeleteTable(db, pSelTab);
+      sqlite3SelectDestInit(@destAS, SRT_Coroutine, regYieldAS);
+      sqlite3Select(pParse, pSelect, @destAS);
+      if pParse^.nErr <> 0 then Exit;
+      sqlite3VdbeEndCoroutine(v, regYieldAS);
+      sqlite3VdbeJumpHere(v, addrTopAS - 1);
+      addrInsLoopAS := sqlite3VdbeAddOp1(v, OP_Yield, destAS.iSDParm);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, destAS.iSdst, destAS.nSdst, regRecAS);
+      sqlite3TableAffinity(v, pTab, 0);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iCsrAS, regRowidAS);
+      sqlite3VdbeAddOp3(v, OP_Insert, iCsrAS, regRecAS, regRowidAS);
+      sqlite3VdbeGoto(v, addrInsLoopAS);
+      sqlite3VdbeJumpHere(v, addrInsLoopAS);
+      sqlite3VdbeAddOp1(v, OP_Close, iCsrAS);
+    end;
+
     { Compute the complete text of the CREATE statement (build.c:2886..2896). }
     if (bAsSelect <> 0) and (gCreateTableStmt <> nil) then begin
       zStmt := gCreateTableStmt(db, pTab);
     end else if bAsSelect <> 0 then begin
-      { Hook not registered (codegen-only test programs).  Leave nil; the
-        schema-row sql column will be empty for the AS SELECT arm. }
       zStmt := nil;
     end else begin
       pEnd2 := pEnd;
@@ -41868,10 +41908,6 @@ begin
                               [zType2, n, pParse^.sNameToken.z]);
     end;
 
-    { Phase 6.10 step 2: emit OP_Close 0 (build.c:2806), then the
-      UPDATE-equivalent bytecode that overwrites the placeholder row
-      sqlite3StartTable inserted into sqlite_schema. }
-    sqlite3VdbeAddOp1(v, OP_Close, 0);
     emitSchemaRowUpdate(pParse, v, iDb, zType, pTab^.zName,
                         pTab^.zName, pParse^.u1.cr.regRoot, zStmt,
                         pParse^.u1.cr.regRowid);
