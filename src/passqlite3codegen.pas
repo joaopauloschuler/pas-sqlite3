@@ -10610,7 +10610,34 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
-  procedure ResolveAliasInHavingList(pList: PExprList);
+  { 9.4.divbug.70.c — forward decl so that the alias arm below can
+    consult ExprIsOrContainsAggregate when descending into the args of
+    an aggregate function call inside HAVING.  Mirrors resolve.c:670..683
+    aliased-aggregate misuse detection (NC_AllowAgg=0 context applies
+    inside another aggregate's argument list). }
+  function ExprIsOrContainsAggregate(pX: PExpr): i32; forward;
+
+  function IsAggregateFunctionCall(pX: PExpr): Boolean;
+  var
+    pDef: PTFuncDef;
+    n:    i32;
+  begin
+    Result := False;
+    if pX = nil then Exit;
+    if (pX^.op <> TK_FUNCTION) or (pX^.u.zToken = nil) then Exit;
+    if not ExprUseXList(pX) then Exit;
+    if pX^.x.pList <> nil then n := pX^.x.pList^.nExpr else n := 0;
+    pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, n,
+                                pParse^.db^.enc, 0);
+    if (pDef = nil) and (n <> 0) then
+      pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
+                                  pParse^.db^.enc, 0);
+    Result := (pDef <> nil) and Assigned(pDef^.xFinalize);
+  end;
+
+  procedure ResolveAliasInHavingEx(pE: PExpr; inAgg: Boolean); forward;
+
+  procedure ResolveAliasInHavingList(pList: PExprList; inAgg: Boolean);
   var
     i:     i32;
     items: PExprListItem;
@@ -10618,12 +10645,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if pList = nil then Exit;
     items := ExprListItems(pList);
     for i := 0 to pList^.nExpr - 1 do
-      ResolveAliasInHaving(items[i].pExpr);
+      ResolveAliasInHavingEx(items[i].pExpr, inAgg);
   end;
 
-  procedure ResolveAliasInHaving(pE: PExpr);
+  procedure ResolveAliasInHavingEx(pE: PExpr; inAgg: Boolean);
   var
-    iCol: i32;
+    iCol:    i32;
+    items:   PExprListItem;
+    pOrig:   PExpr;
+    zAs:     PAnsiChar;
+    aggKind: i32;
+    childAgg: Boolean;
   begin
     if pE = nil then Exit;
     if pE^.op = TK_DOT then Exit;
@@ -10635,21 +10667,53 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if sqlite3IsRowid(pE^.u.zToken) <> 0 then Exit;
       iCol := ResolveAsName(p^.pEList, pE);
       if iCol > 0 then
+      begin
+        if inAgg then
+        begin
+          items := ExprListItems(p^.pEList);
+          pOrig := items[iCol - 1].pExpr;
+          zAs := items[iCol - 1].zEName;
+          aggKind := ExprIsOrContainsAggregate(pOrig);
+          if aggKind = 1 then
+          begin
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('misuse of aliased aggregate ' + AnsiString(zAs)));
+            Exit;
+          end;
+          if aggKind = 2 then
+          begin
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('misuse of aliased window function ' + AnsiString(zAs)));
+            Exit;
+          end;
+        end;
         resolveAlias(pParse, p^.pEList, iCol - 1, pE, 0);
+      end;
       Exit;
     end;
-    ResolveAliasInHaving(pE^.pLeft);
-    ResolveAliasInHaving(pE^.pRight);
+    ResolveAliasInHavingEx(pE^.pLeft, inAgg);
+    ResolveAliasInHavingEx(pE^.pRight, inAgg);
     if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
     begin
       if not ExprHasProperty(pE, EP_xIsSelect) then
-        ResolveAliasInHavingList(pE^.x.pList);
+      begin
+        { 9.4.divbug.70.c — set inAgg when descending into the args of an
+          aggregate function call (resolve.c clears NC_AllowAgg in that
+          context, so aliased aggregates trip the misuse arm). }
+        childAgg := inAgg or IsAggregateFunctionCall(pE);
+        ResolveAliasInHavingList(pE^.x.pList, childAgg);
+      end;
       { Subselects: skip — they have their own pEList scope; avoid
         accidentally rebinding a correlated alias reference. }
       if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
          and (pE^.y.pWin^.pFilter <> nil) then
-        ResolveAliasInHaving(pE^.y.pWin^.pFilter);
+        ResolveAliasInHavingEx(pE^.y.pWin^.pFilter, inAgg);
     end;
+  end;
+
+  procedure ResolveAliasInHaving(pE: PExpr);
+  begin
+    ResolveAliasInHavingEx(pE, False);
   end;
 
   { ResolveAliasInWhere — mirrors ResolveAliasInHaving but enforces
@@ -10854,6 +10918,63 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     RewriteAggToAggFuncList(pList);
   end;
 
+  { 9.4.divbug.70.c — port of resolve.c:1245..1265 misuse detection for
+    aggregates nested inside aggregate-function argument lists.  C clears
+    NC_AllowAgg before resolving an aggregate's args; the pas resolver
+    skips that, so we re-walk the resolved tree and complain if any
+    aggregate function call has another aggregate (or window) call inside
+    its argument list.  Mirrors the "misuse of aggregate function NAME()"
+    text emitted at resolve.c:1262. }
+  procedure CheckNestedAggInList(pList: PExprList); forward;
+
+  procedure CheckNestedAggInExpr(pX: PExpr; inAgg: Boolean);
+  var
+    childAgg: Boolean;
+    j:        i32;
+    items:    PExprListItem;
+  begin
+    if pX = nil then Exit;
+    if pParse^.nErr > 0 then Exit;
+    if (pX^.op = TK_AGG_FUNCTION) or IsAggregateFunctionCall(pX) then
+    begin
+      if inAgg and (pX^.u.zToken <> nil)
+         and ((pX^.flags and EP_IntValue) = 0) then
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+          'misuse of aggregate function %s()', [pX^.u.zToken]));
+        Exit;
+      end;
+      childAgg := True;
+    end
+    else
+      childAgg := inAgg;
+    if not ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then
+    begin
+      CheckNestedAggInExpr(pX^.pLeft,  childAgg);
+      CheckNestedAggInExpr(pX^.pRight, childAgg);
+      if not ExprHasProperty(pX, EP_xIsSelect) and (pX^.x.pList <> nil) then
+      begin
+        items := ExprListItems(pX^.x.pList);
+        for j := 0 to pX^.x.pList^.nExpr - 1 do
+          CheckNestedAggInExpr(items[j].pExpr, childAgg);
+      end;
+    end;
+  end;
+
+  procedure CheckNestedAggInList(pList: PExprList);
+  var
+    i:     i32;
+    items: PExprListItem;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      if pParse^.nErr > 0 then Exit;
+      CheckNestedAggInExpr(items[i].pExpr, False);
+    end;
+  end;
+
 var
   pTopSel:    PSelect;
   isCompound: Boolean;
@@ -10875,6 +10996,14 @@ begin
     handling it per-select here. }
   deferOB := isCompound and (p = pTopSel);
   ResolveExprList(p^.pEList);
+  { 9.4.divbug.70.c — port of resolve.c:1261..1265 nested-aggregate detection.
+    `SELECT SUM(min(f1))…` clears NC_AllowAgg when descending into SUM's args;
+    if min is then detected as aggregate, resolve.c emits
+    "misuse of aggregate function NAME()".  The pas resolver does not track
+    NC_AllowAgg, so re-scan pEList / pHaving / pOrderBy here for any aggregate
+    function call that contains a nested aggregate in its argument list. }
+  if pParse^.nErr = 0 then
+    CheckNestedAggInList(p^.pEList);
   { Phase 6.13.B.8 — resolve TABFUNC argument lists in pSrc so
     fitTabFuncArgs (called later inside sqlite3WhereBegin) sees fully
     bound TK_COLUMN references rather than raw TK_DOT/TK_ID.  C does
@@ -10904,7 +11033,11 @@ begin
   ResolveExprList(p^.pGroupBy);
   if p^.pHaving <> nil then
     ResolveAliasInHaving(p^.pHaving);
-  ResolveExpr    (p^.pHaving);
+  { 9.4.divbug.70.c — skip ResolveExpr when ResolveAliasInHaving already
+    raised "misuse of aliased aggregate <m>", otherwise a stale TK_ID
+    left in place would trigger "no such column: m" and overwrite it. }
+  if pParse^.nErr = 0 then
+    ResolveExpr    (p^.pHaving);
 
   { resolve.c:1797..1806 — alias-arm runs BEFORE ResolveExprList on
     pOrderBy so a bare alias TK_ID gets tagged via iOrderByCol and is
