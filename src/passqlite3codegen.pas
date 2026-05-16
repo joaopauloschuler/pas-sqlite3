@@ -29114,9 +29114,18 @@ begin
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine)
-          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table))
+          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
+          or (pDest^.eDest = SRT_Set))
   then
   begin
+    { 9.4.divbug.82 — SRT_Set admitted so IN-RHS subselect (sqlite3CodeRhsOfIN
+      Case-1) with an outer GROUP BY actually emits the inner Where-scan +
+      sorter + group-output subroutine.  Without it, GROUP BY + SRT_Set fell
+      through to the non-aggregate gate and the subroutine body collapsed
+      to OpenEphemeral + NullRow + Return — the IN-RHS eph was never
+      populated.  Disposal arm at the post-finalize result-render below
+      handles SRT_Set (MakeRecord with zAffSdst + IdxInsert).  Mirrors C
+      select.c:8456 (no eDest gate). }
     pItem := SrcListItems(p^.pSrc);
     pTab  := pItem^.pSTab;
     if p^.pSrc^.nSrc = 1 then
@@ -29609,6 +29618,26 @@ begin
         sqlite3VdbeAddOp3(v, OP_Insert,     pDest^.iSDParm, r1, r2);
         sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
         sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else if pDest^.eDest = SRT_Set then
+      begin
+        { 9.4.divbug.82 — IN-RHS subselect (sqlite3CodeRhsOfIN Case-1) with
+          an outer GROUP BY hands an SRT_Set destination down here.  Without
+          this arm the grouped row is computed but never hashed into the
+          eph cursor at iSDParm, so the parent `x IN (SELECT … GROUP BY …)`
+          test always returns 0 (tkt-31338dca7e-3.1 cascade).  Mirrors the
+          C selectInnerLoop SRT_Set arm (select.c:1384..1407) — MakeRecord
+          with per-row affinity zAffSdst, then OP_IdxInsert into iSDParm.
+          Bloom-filter side-channel at iSDParm2 deferred. }
+        r1 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                          r1, pDest^.zAffSdst, nResultCol);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                             pDest^.iSdst, nResultCol);
+        if pDest^.iSDParm2 > 0 then
+          sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+                               pDest^.iSdst, nResultCol);
         sqlite3ReleaseTempReg(pParse, r1);
       end;
       sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
@@ -31963,12 +31992,19 @@ begin
       affinity string in P4. }
     if (bSort <> 0) and (pDest^.eDest = SRT_EphemTab) then
     begin
-      { pushOntoSorter for SRT_EphemTab — non-OMITREF, non-Top-N slice.
-        Mirrors the SRT_Output non-OMITREF arm below.  Sort tail drains
-        the sorter and re-emits MakeRecord+NewRowid+Insert into iSDParm
-        instead of OP_ResultRow. }
+      { pushOntoSorter for SRT_EphemTab — mirrors the SRT_Output non-OMITREF
+        arm below, including the bUseSorter=0 Top-N B-tree gate
+        (Sequence/Last/IdxLE/Delete + IdxInsert).  Sort tail (32316..) drains
+        the sorted store via OP_SorterSort/OP_Sort and re-emits
+        MakeRecord+NewRowid+Insert into iSDParm instead of OP_ResultRow.
+        9.4.divbug.82 — without the bUseSorter switch, SorterInsert into a
+        B-tree cursor opened with OpenEphemeral silently no-ops; the sort
+        tail then drains an empty store, so an outer GROUP BY over a
+        FROM-subquery with ORDER BY + LIMIT yields zero rows
+        (tkt-31338dca7e-3.1).  Port of select.c:1341..1352 routed through
+        pushOntoSorter (select.c:860..866). }
       regSortBase := pParse^.nMem + 1;
-      Inc(pParse^.nMem, sortNKey + nResultCol);
+      Inc(pParse^.nMem, sortNKey + bSeqExtra + nResultCol);
       for jj := 0 to sortNKey - 1 do
       begin
         r1 := sqlite3ExprCodeTarget(pParse,
@@ -31977,15 +32013,46 @@ begin
         if r1 <> regSortBase + jj then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
       end;
+      { bSeq=1 path (Top-N): emit OP_Sequence between keys and data so
+        duplicate sort-keys remain insertable into the B-tree. }
+      if bSeqExtra <> 0 then
+      begin
+        regSeq := regSortBase + sortNKey;
+        sqlite3VdbeAddOp2(v, OP_Sequence, iSorterCsr, regSeq);
+      end;
       for jj := 0 to nResultCol - 1 do
         sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
-                          regSortBase + sortNKey + jj);
+                          regSortBase + sortNKey + bSeqExtra + jj);
+      { Top-N gate (select.c pushOntoSorter:832..856).  When LIMIT is set
+        and we are in B-tree mode (bUseSorter=0), cap the B-tree at
+        LIMIT+OFFSET entries via the Last+IdxLE+Delete sequence. }
+      iSkipTopN := 0;
+      if (bUseSorter = 0) and (p^.iLimit <> 0) then
+      begin
+        if p^.iOffset <> 0 then iLimitTopN := p^.iOffset + 1
+                            else iLimitTopN := p^.iLimit;
+        sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
+                          sqlite3VdbeCurrentAddr(v) + 4);
+        sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+        iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
+                          iSorterCsr, 0,
+                          regSortBase,
+                          sortNKey);
+        sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
+      end;
       Inc(pParse^.nMem);
       regSortRec := pParse^.nMem;
       sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
-                        sortNKey + nResultCol, regSortRec);
-      sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
-                           regSortBase, nResultCol);
+                        sortNKey + bSeqExtra + nResultCol, regSortRec);
+      if bUseSorter <> 0 then
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol)
+      else
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iSorterCsr, regSortRec,
+                             regSortBase,
+                             sortNKey + bSeqExtra + nResultCol);
+      if iSkipTopN > 0 then
+        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
     end
     else if (pDest^.eDest = SRT_Output)
          or ((pDest^.eDest = SRT_Coroutine) and (bSort <> 0)) then
