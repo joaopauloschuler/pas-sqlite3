@@ -36,6 +36,46 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr;
 
 type
+  { Minimal Tcl_Obj / Tcl_ObjType peek layout — first fields only.
+    tcl.h (Tcl 8.6):
+      typedef struct Tcl_Obj { int refCount; char *bytes; int length;
+                               const Tcl_ObjType *typePtr; ... } Tcl_Obj;
+      typedef struct Tcl_ObjType { const char *name; ... } Tcl_ObjType;
+    Used solely by DbSqlFunc auto-detect to mirror tclsqlite.c:1108..1127
+    which inspects pVar->typePtr->name and pVar->bytes.  Anything past
+    typePtr is left untouched, so the union internalRep size mismatch
+    between Tcl 8.6 / 9.x is irrelevant for this read-only peek. }
+  PTclObjPeek = ^TTclObjPeek;
+  TTclObjPeek = record
+    refCount: cint;
+    bytes:    PAnsiChar;
+    length:   cint;
+    typePtr:  Pointer;
+  end;
+  PTclObjTypePeek = ^TTclObjTypePeek;
+  TTclObjTypePeek = record
+    name: PAnsiChar;
+  end;
+
+function TclObjTypeName(p: PTclObj): PAnsiChar;
+var
+  pk: PTclObjPeek;
+  tp: PTclObjTypePeek;
+begin
+  Result := nil;
+  if p = nil then Exit;
+  pk := PTclObjPeek(p);
+  tp := PTclObjTypePeek(pk^.typePtr);
+  if tp = nil then Exit;
+  Result := tp^.name;
+end;
+
+function TclObjHasNoStringRep(p: PTclObj): Boolean;
+begin
+  Result := (p <> nil) and (PTclObjPeek(p)^.bytes = nil);
+end;
+
+type
   PSqlFunc = ^TSqlFunc;
   PSqliteDb = ^TSqliteDb;
 
@@ -1541,6 +1581,7 @@ var
   rv:     Double;
   data:   PAnsiChar;
   n:      cint;
+  zType:  PAnsiChar;
 begin
   pFn := PSqlFunc(sqlite3_user_data(pCtx));
   if pFn = nil then
@@ -1653,15 +1694,25 @@ begin
 
     if eType = SQLITE_NULL then
     begin
-      { Probe-based auto-detection.  A bytearray with no string rep is
-        a blob; otherwise prefer wideInt, then double, else text. }
-      n := 0;
-      data := Tcl_GetByteArrayFromObj(pRes, @n);
-      if (data <> nil) and (n = 0) then
+      { Type-name auto-detection — mirrors tclsqlite.c:1108..1127.
+        Probing with Tcl_Get*FromObj instead would mis-classify strings
+        like '0x119' (returned by `format 0x%X`) as INTEGER because Tcl
+        parses 0x-prefixed numeric literals; the C oracle keys off the
+        *current* internalRep type name so a plain string stays TEXT.
+        Bug 9.4.divbug.29 / collate1-1.x. }
+      zType := TclObjTypeName(pRes);
+      if zType = nil then zType := PAnsiChar('');
+      if (zType[0] = 'b') and (StrComp(zType, 'bytearray') = 0)
+           and TclObjHasNoStringRep(pRes) then
         eType := SQLITE_BLOB
-      else if Tcl_GetWideIntFromObj(nil, pRes, @wv) = TCL_OK then
+      else if ((zType[0] = 'b') and TclObjHasNoStringRep(pRes)
+                and (StrComp(zType, 'boolean') = 0))
+           or ((zType[0] = 'b') and TclObjHasNoStringRep(pRes)
+                and (StrComp(zType, 'booleanString') = 0))
+           or ((zType[0] = 'w') and (StrComp(zType, 'wideInt') = 0))
+           or ((zType[0] = 'i') and (StrComp(zType, 'int') = 0)) then
         eType := SQLITE_INTEGER
-      else if Tcl_GetDoubleFromObj(nil, pRes, @rv) = TCL_OK then
+      else if (zType[0] = 'd') and (StrComp(zType, 'double') = 0) then
         eType := SQLITE_FLOAT
       else
         eType := SQLITE_TEXT;

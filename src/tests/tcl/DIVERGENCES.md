@@ -461,19 +461,27 @@ Fix: codegen.pas:31663 now branches on `pWInfo^.nOBSat` and
 `p^.pOrderBy^.nExpr - nOBSat` to pick the LAST-TERM / LAST-N-TERMS /
 plain-ORDER-BY string, matching select.c:1702..1711.
 
-## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER
+## 9.4.divbug.29 — TEXT-affinity column stores hex literal `0x...` as INTEGER — FIXED
 
 Affects: 1 test (`collate1.test`, all sub-tests of section 1).
-Symptom: `INSERT INTO t(c TEXT) VALUES('0x119')` is stored as INTEGER
-281 instead of TEXT `'0x119'`.  SELECT then returns `45 281` (decimal
-ints) where upstream returns the TEXT strings `0x2D 0x119`.
-Likely cause: Pascal `applyAffinity` / `sqlite3VdbeMemNumerify` invokes
-the hex-string parser on a TEXT-affinity column where C's
-`applyAffinity` for `SQLITE_AFF_TEXT` should never numerify.  Check
-`applyAffinity` text arm — it may be falling through to the BLOB->TEXT
-case instead of returning.  C reference: vdbeaux.c `applyAffinity`
-~vdbe.c:209.
-Surfaced by: 9.4.4.e sweep.
+Symptom: `INSERT INTO t VALUES(45, hex(45))` (where `hex` is a Tcl-
+registered SQL function returning `format 0x%X`) stored the TEXT
+result as INTEGER 281 / 45 instead of TEXT `'0x119'` / `'0x2D'`.
+Root cause: not in `applyAffinity` (the original triage was a red
+herring — the C-shell reproducer never reproduced).  The bug was in
+the Pascal Tcl bridge's `DbSqlFunc` auto-detect arm
+(src/tests/tcl/PasTclSqlite.pas:1654..1668).  C's tclsqlite.c:1108
+keys off `pVar->typePtr->name` — a plain string Tcl_Obj has type
+`"string"` and goes to the TEXT branch.  Pascal instead *probed*
+with `Tcl_GetWideIntFromObj`, which side-effects the Tcl_Obj into an
+int representation for strings like `"0x119"` because Tcl parses
+`0x`-prefixed integer literals — so every `hex(...)` result was
+promoted to SQLITE_INTEGER.
+Fix: add a minimal `Tcl_Obj` peek struct (refCount/bytes/length/
+typePtr only) plus a Tcl_ObjType `name` accessor, and dispatch on
+the type name exactly like tclsqlite.c:1112..1127
+(bytearray/boolean/booleanString/wideInt/int/double/else).
+Cite: tclsqlite.c:1108..1127 DbSqlFunc auto-detect.
 
 ## 9.4.divbug.30 — ORDER BY with non-default collation mis-orders — FIXED
 
