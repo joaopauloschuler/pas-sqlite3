@@ -43835,6 +43835,14 @@ begin
     if (n >= 0) and ((PColumn(pTab^.aCol)[n].typeFlags and $0F) = OE_None) then
       pIndex^.idxFlags := pIndex^.idxFlags and not u32($08);
     (pIndex^.aiColumn + i)^ := i16(n);
+    { build.c:4251..4269 — when no explicit COLLATE wrapper is present and
+      the indexed term resolves to a real table column (n>=0), the index
+      column inherits the table column's declared collation; otherwise
+      fall back to BINARY.  Without the inheritance arm any index built
+      over a column declared "x TEXT COLLATE custom" carries BINARY in
+      azColl[], so wherePathSatisfiesOrderBy's azColl-vs-ExprNNCollSeq
+      compare rejects the index for ORDER BY x — planner falls back to a
+      TEMP B-TREE sorter, scrambling row order vs C (9.4.divbug.79). }
     if zCollName <> nil then
     begin
       pCollSeq := PTCollSeq(sqlite3LocateCollSeq(pParse, zCollName));
@@ -43842,6 +43850,13 @@ begin
         (PPAnsiChar(pIndex^.azColl) + i)^ := pCollSeq^.zName
       else
         (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
+    end else if n >= 0 then
+    begin
+      zCollName := sqlite3ColumnColl(@PColumn(pTab^.aCol)[n]);
+      if zCollName = nil then
+        (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY
+      else
+        (PPAnsiChar(pIndex^.azColl) + i)^ := zCollName;
     end else
       (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + i)^ := 0;
