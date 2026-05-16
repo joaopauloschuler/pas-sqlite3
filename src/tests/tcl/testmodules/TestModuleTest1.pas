@@ -2876,6 +2876,75 @@ begin
      or (argv = nil) then ;
 end;
 
+{ test1.c:651..663 — sqlite3_key DB KEY.  SEE-only; without the
+  codec extension upstream simply returns TCL_OK. }
+function tcl_test_key(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+begin
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (argc < 0)
+     or (argv = nil) then ;
+end;
+
+{ 9.4.divbug.62.f — sqlite3_key_v2 / sqlite3_rekey_v2 are the
+  SEE-only multi-database variants (engine API at passqlite3main.pas
+  returns SQLITE_OK without SEE).  No upstream test1.c counterpart;
+  registered here purely so tests that invoke them do not abort with
+  `invalid command name`.  Same TCL_OK semantics as tcl_test_key. }
+function tcl_test_key_v2(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+begin
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (argc < 0)
+     or (argv = nil) then ;
+end;
+
+{ 9.4.divbug.62.f — test_malloc.c:927..966 sqlite3_config_alt_pcache.
+  Upstream installs an instrumented test page cache via
+  installTestPCache (test_pcache.c).  test_pcache.c is not ported;
+  this handler validates the argument shape exactly like upstream
+  (objc 2..5, optional discardChance in [0,100], prngSeed, highStress)
+  and returns TCL_OK without installing anything.  Tests that merely
+  toggle the alt-pcache on/off (and don't depend on the fault
+  injection behaviour) therefore no longer abort. }
+function tcl_test_config_alt_pcache(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  installFlag, discardChance, prngSeed, highStress: cint;
+begin
+  installFlag := 0;
+  discardChance := 0;
+  prngSeed := 0;
+  highStress := 0;
+  if (objc < 2) or (objc > 5) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('INSTALLFLAG DISCARDCHANCE PRNGSEEED HIGHSTRESS'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @installFlag) <> 0 then
+  begin Result := TCL_ERROR; Exit; end;
+  if (objc >= 3)
+     and (Tcl_GetIntFromObj(interp, objv[2], @discardChance) <> 0) then
+  begin Result := TCL_ERROR; Exit; end;
+  if (objc >= 4)
+     and (Tcl_GetIntFromObj(interp, objv[3], @prngSeed) <> 0) then
+  begin Result := TCL_ERROR; Exit; end;
+  if (objc >= 5)
+     and (Tcl_GetIntFromObj(interp, objv[4], @highStress) <> 0) then
+  begin Result := TCL_ERROR; Exit; end;
+  if (discardChance < 0) or (discardChance > 100) then
+  begin
+    Tcl_AppendResult(interp,
+      PChar('discard-chance should be between 0 and 100'), nil);
+    Result := TCL_ERROR; Exit;
+  end;
+  { test_pcache.c installTestPCache not ported — stub, no-op. }
+  Result := TCL_OK;
+  if (clientData = nil) or (installFlag = 0) or (prngSeed = 0)
+     or (highStress = 0) then ;
+end;
+
 { ----------------------------------------------------------------------
   test1.c:727..1226 — the UDF helpers that test_create_function registers
   on DB.  Each is a 1:1 port of the matching C body.
@@ -3998,6 +4067,14 @@ begin
     @tcl_test_hard_heap_limit, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_rekey'),
     @tcl_test_rekey, nil, nil);
+  { 9.4.divbug.62.f — sqlite3_key + SEE-only _v2 variants
+    (test1.c:9088 + engine APIs).  All TCL_OK stubs without SEE. }
+  Tcl_CreateCommand(interp, PChar('sqlite3_key'),
+    @tcl_test_key, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_key_v2'),
+    @tcl_test_key_v2, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_rekey_v2'),
+    @tcl_test_key_v2, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_create_function'),
     @test_create_function, nil, nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
@@ -4007,14 +4084,17 @@ begin
     @sqlite3_sort_count, TCL_LINK_INT);
   { 9.4.divbug.62.d — sqlite3_config_uri / _config_pmasz
     (test_malloc.c:1163..1241, registered at test_malloc.c:1497, 1499)
-    and sqlite3_reset_auto_extension (test_autoext.c:189..219).
-    sqlite3_config_alt_pcache and sqlite3_simulate_device skipped:
-    installTestPCache (test_pcache.c) and devsym_register
-    (test_devsym.c) are not ported. }
+    and sqlite3_reset_auto_extension (test_autoext.c:189..219). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_uri'),
     @tcl_test_config_uri, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pmasz'),
     @tcl_test_config_pmasz, nil, nil);
+  { 9.4.divbug.62.f — sqlite3_config_alt_pcache stub
+    (test_malloc.c:927..966, registered at test_malloc.c:1488).
+    Validates args; install is a no-op since test_pcache.c is not
+    ported. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_alt_pcache'),
+    @tcl_test_config_alt_pcache, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_reset_auto_extension'),
     @tcl_reset_auto_extension, nil, nil);
   { 9.4.divbug.63.a — breakpoint / database_*_corrupt / tcl_variable_type
