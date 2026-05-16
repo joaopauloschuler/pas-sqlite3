@@ -1205,9 +1205,258 @@ begin
   speedtest1_exec('ANALYZE');
   speedtest1_end_test;
 end;
-procedure testset_cte;         begin testset_not_yet('cte',         'Phase 11.3'); end;
-procedure testset_fp;          begin testset_not_yet('fp',          'Phase 11.3'); end;
-procedure testset_parsenumber; begin testset_not_yet('parsenumber', 'Phase 11.3'); end;
+{ ----------------------------- testset_cte ------------------------------ }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 1250..1398. }
+
+const
+  azPuzzle: array[0..2] of AnsiString = (
+    { Easy }
+    '534...9..' + '67.195...' + '.98....6.' +
+    '8...6...3' + '4..8.3..1' + '....2...6' +
+    '.6....28.' + '...419..5' + '...28..79',
+    { Medium }
+    '53....9..' + '6..195...' + '.98....6.' +
+    '8...6...3' + '4..8.3..1' + '....2...6' +
+    '.6....28.' + '...419..5' + '....8..79',
+    { Hard }
+    '53.......' + '6..195...' + '.98....6.' +
+    '8...6...3' + '4..8.3..1' + '....2...6' +
+    '.6....28.' + '...419..5' + '....8..79');
+
+procedure testset_cte;
+var
+  zPuz: AnsiString;
+  rSpacing: Double;
+  nElem: Integer;
+begin
+  if g.szTest < 25 then
+    zPuz := azPuzzle[0]
+  else if g.szTest < 70 then
+    zPuz := azPuzzle[1]
+  else
+    zPuz := azPuzzle[2];
+
+  speedtest1_begin_test(100, 'Sudoku with recursive ''digits''');
+  speedtest1_prepare(
+    'WITH RECURSIVE'#10 +
+    '  input(sud) AS (VALUES(?1)),'#10 +
+    '  digits(z,lp) AS ('#10 +
+    '    VALUES(''1'', 1)'#10 +
+    '    UNION ALL'#10 +
+    '    SELECT CAST(lp+1 AS TEXT), lp+1 FROM digits WHERE lp<9'#10 +
+    '  ),'#10 +
+    '  x(s, ind) AS ('#10 +
+    '    SELECT sud, instr(sud, ''.'') FROM input'#10 +
+    '    UNION ALL'#10 +
+    '    SELECT'#10 +
+    '      substr(s, 1, ind-1) || z || substr(s, ind+1),'#10 +
+    '      instr( substr(s, 1, ind-1) || z || substr(s, ind+1), ''.'' )'#10 +
+    '     FROM x, digits AS z'#10 +
+    '    WHERE ind>0'#10 +
+    '      AND NOT EXISTS ('#10 +
+    '            SELECT 1'#10 +
+    '              FROM digits AS lp'#10 +
+    '             WHERE z.z = substr(s, ((ind-1)/9)*9 + lp, 1)'#10 +
+    '                OR z.z = substr(s, ((ind-1)%9) + (lp-1)*9 + 1, 1)'#10 +
+    '                OR z.z = substr(s, (((ind-1)/3) % 3) * 3'#10 +
+    '                        + ((ind-1)/27) * 27 + lp'#10 +
+    '                        + ((lp-1) / 3) * 6, 1)'#10 +
+    '         )'#10 +
+    '  )'#10 +
+    'SELECT s FROM x WHERE ind=0;');
+  sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zPuz), -1, SQLITE_STATIC);
+  speedtest1_run;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(200, 'Sudoku with VALUES ''digits''');
+  speedtest1_prepare(
+    'WITH RECURSIVE'#10 +
+    '  input(sud) AS (VALUES(?1)),'#10 +
+    '  digits(z,lp) AS (VALUES(''1'',1),(''2'',2),(''3'',3),(''4'',4),(''5'',5),'#10 +
+    '                         (''6'',6),(''7'',7),(''8'',8),(''9'',9)),'#10 +
+    '  x(s, ind) AS ('#10 +
+    '    SELECT sud, instr(sud, ''.'') FROM input'#10 +
+    '    UNION ALL'#10 +
+    '    SELECT'#10 +
+    '      substr(s, 1, ind-1) || z || substr(s, ind+1),'#10 +
+    '      instr( substr(s, 1, ind-1) || z || substr(s, ind+1), ''.'' )'#10 +
+    '     FROM x, digits AS z'#10 +
+    '    WHERE ind>0'#10 +
+    '      AND NOT EXISTS ('#10 +
+    '            SELECT 1'#10 +
+    '              FROM digits AS lp'#10 +
+    '             WHERE z.z = substr(s, ((ind-1)/9)*9 + lp, 1)'#10 +
+    '                OR z.z = substr(s, ((ind-1)%9) + (lp-1)*9 + 1, 1)'#10 +
+    '                OR z.z = substr(s, (((ind-1)/3) % 3) * 3'#10 +
+    '                        + ((ind-1)/27) * 27 + lp'#10 +
+    '                        + ((lp-1) / 3) * 6, 1)'#10 +
+    '         )'#10 +
+    '  )'#10 +
+    'SELECT s FROM x WHERE ind=0;');
+  sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zPuz), -1, SQLITE_STATIC);
+  speedtest1_run;
+  speedtest1_end_test;
+
+  rSpacing := 5.0 / g.szTest;
+  speedtest1_begin_test(300, 'Mandelbrot Set with spacing=%f', [rSpacing]);
+  speedtest1_prepare(
+    'WITH RECURSIVE '#10 +
+    '  xaxis(x) AS (VALUES(-2.0) UNION ALL SELECT x+?1 FROM xaxis WHERE x<1.2),'#10 +
+    '  yaxis(y) AS (VALUES(-1.0) UNION ALL SELECT y+?2 FROM yaxis WHERE y<1.0),'#10 +
+    '  m(iter, cx, cy, x, y) AS ('#10 +
+    '    SELECT 0, x, y, 0.0, 0.0 FROM xaxis, yaxis'#10 +
+    '    UNION ALL'#10 +
+    '    SELECT iter+1, cx, cy, x*x-y*y + cx, 2.0*x*y + cy FROM m '#10 +
+    '     WHERE (x*x + y*y) < 4.0 AND iter<28'#10 +
+    '  ),'#10 +
+    '  m2(iter, cx, cy) AS ('#10 +
+    '    SELECT max(iter), cx, cy FROM m GROUP BY cx, cy'#10 +
+    '  ),'#10 +
+    '  a(t) AS ('#10 +
+    '    SELECT group_concat( substr('' .+*#'', 1+min(iter/7,4), 1), '''') '#10 +
+    '    FROM m2 GROUP BY cy'#10 +
+    '  )'#10 +
+    'SELECT group_concat(rtrim(t),x''0a'') FROM a;');
+  sqlite3_bind_double(g.pStmt, 1, rSpacing * 0.05);
+  sqlite3_bind_double(g.pStmt, 2, rSpacing);
+  speedtest1_run;
+  speedtest1_end_test;
+
+  nElem := 10000 * g.szTest;
+  speedtest1_begin_test(400, 'EXCEPT operator on %d-element tables', [nElem]);
+  speedtest1_prepare(
+    'WITH RECURSIVE '#10 +
+    '  z1(x) AS (VALUES(2) UNION ALL SELECT x+2 FROM z1 WHERE x<%d),'#10 +
+    '  z2(y) AS (VALUES(3) UNION ALL SELECT y+3 FROM z2 WHERE y<%d)'#10 +
+    'SELECT count(x), avg(x) FROM ('#10 +
+    '  SELECT x FROM z1 EXCEPT SELECT y FROM z2 ORDER BY 1'#10 +
+    ');',
+    [nElem, nElem]);
+  speedtest1_run;
+  speedtest1_end_test;
+end;
+
+{ -------------------- speedtest1_random_ascii_fp ------------------------ }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 1403..1411. }
+
+function speedtest1_random_ascii_fp: AnsiString;
+var
+  x, y, z: Integer;
+begin
+  x := Integer(speedtest1_random);
+  y := Integer(speedtest1_random);
+  z := y mod 10;
+  if z < 0 then z := -z;
+  y := y div 10;
+  Result := Format('%d.%de%d', [y, z, x mod 200]);
+end;
+
+{ ----------------------------- testset_fp ------------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 1416..1482. }
+
+procedure testset_fp;
+var
+  n, i: Integer;
+  zFP1, zFP2: AnsiString;
+begin
+  n := g.szTest * 5000;
+  speedtest1_begin_test(100, 'Fill a table with %d FP values', [n * 2]);
+  speedtest1_exec('BEGIN');
+  speedtest1_exec('CREATE%s TABLE z1(a REAL %s, b REAL %s);',
+                  [isTemp(1), PAnsiChar(g.zNN), PAnsiChar(g.zNN)]);
+  speedtest1_prepare('INSERT INTO z1 VALUES(?1,?2); -- %d times', [n]);
+  for i := 1 to n do begin
+    zFP1 := speedtest1_random_ascii_fp;
+    zFP2 := speedtest1_random_ascii_fp;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zFP1), -1, SQLITE_STATIC);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zFP2), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_exec('COMMIT');
+  speedtest1_end_test;
+
+  n := g.szTest div 25 + 2;
+  speedtest1_begin_test(110, '%d range queries', [n]);
+  speedtest1_prepare('SELECT sum(b) FROM z1 WHERE a BETWEEN ?1 AND ?2');
+  for i := 1 to n do begin
+    zFP1 := speedtest1_random_ascii_fp;
+    zFP2 := speedtest1_random_ascii_fp;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zFP1), -1, SQLITE_STATIC);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zFP2), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_end_test;
+
+  speedtest1_begin_test(120, 'CREATE INDEX three times');
+  speedtest1_exec('BEGIN;');
+  speedtest1_exec('CREATE INDEX t1a ON z1(a);');
+  speedtest1_exec('CREATE INDEX t1b ON z1(b);');
+  speedtest1_exec('CREATE INDEX t1ab ON z1(a,b);');
+  speedtest1_exec('COMMIT;');
+  speedtest1_end_test;
+
+  n := g.szTest div 3 + 2;
+  speedtest1_begin_test(130, '%d indexed range queries', [n]);
+  speedtest1_prepare('SELECT sum(b) FROM z1 WHERE a BETWEEN ?1 AND ?2');
+  for i := 1 to n do begin
+    zFP1 := speedtest1_random_ascii_fp;
+    zFP2 := speedtest1_random_ascii_fp;
+    sqlite3_bind_text(g.pStmt, 1, PAnsiChar(zFP1), -1, SQLITE_STATIC);
+    sqlite3_bind_text(g.pStmt, 2, PAnsiChar(zFP2), -1, SQLITE_STATIC);
+    speedtest1_run;
+  end;
+  speedtest1_end_test;
+
+  n := g.szTest * 5000;
+  speedtest1_begin_test(140, '%d calls to round()', [n]);
+  speedtest1_exec('SELECT sum(round(a,2)+round(b,4)) FROM z1;');
+  speedtest1_end_test;
+
+  speedtest1_begin_test(150, '%d printf() calls', [n * 4]);
+  speedtest1_exec(
+    'WITH c(fmt) AS (VALUES(''%g''),(''%e''),(''%!g''),(''%.20f''))' +
+    'SELECT sum(printf(fmt,a)) FROM z1, c');
+  speedtest1_end_test;
+end;
+
+{ -------------------------- testset_parsenumber ------------------------- }
+{ 1:1 port of ../sqlite3/test/speedtest1.c lines 2875..2911. }
+
+procedure testset_parsenumber;
+const
+  zSql1: PAnsiChar = 'SELECT 1, 12, 123, 1234, 12345, 123456';
+  zSql2: PAnsiChar = 'SELECT 8227256643844975616, 7932208612563860480, ' +
+                     '2010730661871032832, 9138463067404021760, ' +
+                     '2557616153664746496, 2557616153664746496';
+  zSql3: PAnsiChar = 'SELECT 1.0, 1.2, 1.23, 123.4, 1.2345, 1.23456';
+  zSql4: PAnsiChar = 'SELECT 8.227256643844975616, 7.932208612563860480, ' +
+                     '2.010730661871032832, 9.138463067404021760, ' +
+                     '2.557616153664746496, 2.557616153664746496';
+var
+  NROW, ii: Integer;
+begin
+  NROW := 100 * g.szTest;
+
+  speedtest1_begin_test(100, 'parsing %d small integers', [NROW]);
+  for ii := 0 to NROW - 1 do
+    sqlite3_exec(g.db, zSql1, nil, nil, nil);
+  speedtest1_end_test;
+
+  speedtest1_begin_test(110, 'parsing %d large integers', [NROW]);
+  for ii := 0 to NROW - 1 do
+    sqlite3_exec(g.db, zSql2, nil, nil, nil);
+  speedtest1_end_test;
+
+  speedtest1_begin_test(200, 'parsing %d small reals', [NROW]);
+  for ii := 0 to NROW - 1 do
+    sqlite3_exec(g.db, zSql3, nil, nil, nil);
+  speedtest1_end_test;
+
+  speedtest1_begin_test(210, 'parsing %d large reals', [NROW]);
+  for ii := 0 to NROW - 1 do
+    sqlite3_exec(g.db, zSql4, nil, nil, nil);
+  speedtest1_end_test;
+end;
 procedure testset_star;        begin testset_not_yet('star',        'Phase 11.4'); end;
 procedure testset_orm;         begin testset_not_yet('orm',         'Phase 11.4'); end;
 procedure testset_trigger;     begin testset_not_yet('trigger',     'Phase 11.4'); end;
