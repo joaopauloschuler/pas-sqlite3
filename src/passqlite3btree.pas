@@ -338,7 +338,7 @@ function  findCellPastPtr(pPage: PMemPage; i: i32): Pu8; inline;
 { Free-space and page management }
 function  pageFindSlot(pPg: PMemPage; nByte: i32; out pRc: i32): Pu8;
 function  allocateSpace(pPage: PMemPage; nByte: i32; out pIdx: i32): i32;
-function  freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32;
+function  freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32; inline;
 function  defragmentPage(pPage: PMemPage; nMaxFrag: i32): i32;
 function  decodeFlags(pPage: PMemPage; flagByte: i32): i32;
 function  btreeComputeFreeSpace(pPage: PMemPage): i32;
@@ -1285,7 +1285,7 @@ end;
   freeSpace
   btree.c lines 1918-2013
   =========================================================================== }
-function freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32;
+function freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32; inline;
 var
   iPtr    : i32;
   iFreeBlk: i32;
