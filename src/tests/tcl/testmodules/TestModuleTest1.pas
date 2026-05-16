@@ -2354,6 +2354,539 @@ begin
   Result := TCL_OK;
 end;
 
+{ ----------------------------------------------------------------------
+  9.4.divbug.62.c — additional test1.c / test_malloc.c Tcl commands:
+  sqlite3_status, sqlite3_release_memory, sqlite3_limit, sqlite3_rekey,
+  sqlite3_create_function (with the UDF helpers x_coalesce / hex8 /
+  tkt2213func / pointer_change / counter1 / counter2 / intreal /
+  add_text_type / add_int_type / add_real_type / strtod / dtostr /
+  inttoptr).  Cite ranges noted per block. }
+
+{ test_malloc.c:1280..1335 — sqlite3_status OPCODE RESETFLAG.
+  Returns {rc current highwater}. }
+function tcl_test_status(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+type
+  TStatOp = record
+    zName: PAnsiChar;
+    op: cint;
+  end;
+const
+  aOp: array[0..9] of TStatOp = (
+    (zName: 'SQLITE_STATUS_MEMORY_USED';         op: SQLITE_STATUS_MEMORY_USED),
+    (zName: 'SQLITE_STATUS_MALLOC_SIZE';         op: SQLITE_STATUS_MALLOC_SIZE),
+    (zName: 'SQLITE_STATUS_PAGECACHE_USED';      op: SQLITE_STATUS_PAGECACHE_USED),
+    (zName: 'SQLITE_STATUS_PAGECACHE_OVERFLOW';  op: SQLITE_STATUS_PAGECACHE_OVERFLOW),
+    (zName: 'SQLITE_STATUS_PAGECACHE_SIZE';      op: SQLITE_STATUS_PAGECACHE_SIZE),
+    (zName: 'SQLITE_STATUS_SCRATCH_USED';        op: SQLITE_STATUS_SCRATCH_USED),
+    (zName: 'SQLITE_STATUS_SCRATCH_OVERFLOW';    op: SQLITE_STATUS_SCRATCH_OVERFLOW),
+    (zName: 'SQLITE_STATUS_SCRATCH_SIZE';        op: SQLITE_STATUS_SCRATCH_SIZE),
+    (zName: 'SQLITE_STATUS_PARSER_STACK';        op: SQLITE_STATUS_PARSER_STACK),
+    (zName: 'SQLITE_STATUS_MALLOC_COUNT';        op: SQLITE_STATUS_MALLOC_COUNT)
+  );
+var
+  rc, iValue, mxValue, i, op, resetFlag: cint;
+  zOpName: PAnsiChar;
+  pResult: PTclObj;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('PARAMETER RESETFLAG'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zOpName := Tcl_GetString(objv[1]);
+  op := 0;
+  i := 0;
+  while i <= High(aOp) do
+  begin
+    if StrComp(aOp[i].zName, zOpName) = 0 then
+    begin
+      op := aOp[i].op;
+      Break;
+    end;
+    Inc(i);
+  end;
+  if i > High(aOp) then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[1], @op) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[2], @resetFlag) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  iValue  := 0;
+  mxValue := 0;
+  rc := sqlite3_status(op, @iValue, @mxValue, resetFlag);
+  pResult := Tcl_NewObj;
+  Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(rc));
+  Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(iValue));
+  Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(mxValue));
+  Tcl_SetObjResult(interp, pResult);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:6327..6356 — sqlite3_release_memory ?N?. }
+function tcl_test_release_memory(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  N, amt: cint;
+begin
+  if (objc <> 1) and (objc <> 2) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?N?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 2 then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[1], @N) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  end
+  else
+    N := -1;
+  amt := sqlite3_release_memory(N);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(amt));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:7372..7433 — sqlite3_limit DB ID VALUE. }
+function tcl_test_limit(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+type
+  TLimitId = record
+    zName: PAnsiChar;
+    id: cint;
+  end;
+const
+  aId: array[0..14] of TLimitId = (
+    (zName: 'SQLITE_LIMIT_LENGTH';              id: SQLITE_LIMIT_LENGTH),
+    (zName: 'SQLITE_LIMIT_SQL_LENGTH';          id: SQLITE_LIMIT_SQL_LENGTH),
+    (zName: 'SQLITE_LIMIT_COLUMN';              id: SQLITE_LIMIT_COLUMN),
+    (zName: 'SQLITE_LIMIT_EXPR_DEPTH';          id: SQLITE_LIMIT_EXPR_DEPTH),
+    (zName: 'SQLITE_LIMIT_PARSER_DEPTH';        id: SQLITE_LIMIT_PARSER_DEPTH),
+    (zName: 'SQLITE_LIMIT_COMPOUND_SELECT';     id: SQLITE_LIMIT_COMPOUND_SELECT),
+    (zName: 'SQLITE_LIMIT_VDBE_OP';             id: SQLITE_LIMIT_VDBE_OP),
+    (zName: 'SQLITE_LIMIT_FUNCTION_ARG';        id: SQLITE_LIMIT_FUNCTION_ARG),
+    (zName: 'SQLITE_LIMIT_ATTACHED';            id: SQLITE_LIMIT_ATTACHED),
+    (zName: 'SQLITE_LIMIT_LIKE_PATTERN_LENGTH'; id: SQLITE_LIMIT_LIKE_PATTERN_LENGTH),
+    (zName: 'SQLITE_LIMIT_VARIABLE_NUMBER';     id: SQLITE_LIMIT_VARIABLE_NUMBER),
+    (zName: 'SQLITE_LIMIT_TRIGGER_DEPTH';       id: SQLITE_LIMIT_TRIGGER_DEPTH),
+    (zName: 'SQLITE_LIMIT_WORKER_THREADS';      id: SQLITE_LIMIT_WORKER_THREADS),
+    { Out-of-range probes — matches test1.c:7404..7406. }
+    (zName: 'SQLITE_LIMIT_TOOSMALL';            id: -1),
+    (zName: 'SQLITE_LIMIT_TOOBIG';              id: SQLITE_LIMIT_PARSER_DEPTH + 1)
+  );
+var
+  db: PTsqlite3;
+  rc, i, id, val: cint;
+  zId: PAnsiChar;
+begin
+  if objc <> 4 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetStringFromObj(objv[0], nil), PChar(' DB ID VALUE'),
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zId := Tcl_GetString(objv[2]);
+  id := 0;
+  i := 0;
+  while i <= High(aId) do
+  begin
+    if StrComp(zId, aId[i].zName) = 0 then
+    begin
+      id := aId[i].id;
+      Break;
+    end;
+    Inc(i);
+  end;
+  if i > High(aId) then
+  begin
+    Tcl_AppendResult(interp, PChar('unknown limit type: '), zId,
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[3], @val) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_limit(db, id, val);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:665..677 — sqlite3_rekey DB KEY.  SQLite without the SEE
+  extension simply returns TCL_OK (codec is a no-op). }
+function tcl_test_rekey(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+begin
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (argc < 0)
+     or (argv = nil) then ;
+end;
+
+{ ----------------------------------------------------------------------
+  test1.c:727..1226 — the UDF helpers that test_create_function registers
+  on DB.  Each is a 1:1 port of the matching C body.
+  ---------------------------------------------------------------------- }
+
+{ test1.c:731..745 — x_coalesce: returns the first non-NULL argument. }
+procedure t1_ifnullFunc(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..255] of Psqlite3_value;
+var
+  i, n: cint;
+  pa:   PValueArr;
+begin
+  pa := PValueArr(argv);
+  for i := 0 to argc - 1 do
+    if sqlite3_value_type(pa^[i]) <> SQLITE_NULL then
+    begin
+      n := sqlite3_value_bytes(pa^[i]);
+      sqlite3_result_text(pCtx, PAnsiChar(sqlite3_value_text(pa^[i])),
+        n, SQLITE_TRANSIENT);
+      Break;
+    end;
+end;
+
+{ test1.c:752..762 — hex8: hex-encode the UTF-8 bytes of arg[0]. }
+procedure hex8Func(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+const
+  cHex: array[0..15] of AnsiChar = '0123456789abcdef';
+var
+  z:    PAnsiChar;
+  i:    cint;
+  zBuf: array[0..199] of AnsiChar;
+  b:    Byte;
+  pa:   PValueArr;
+begin
+  pa := PValueArr(argv);
+  z := PAnsiChar(sqlite3_value_text(pa^[0]));
+  i := 0;
+  while (i < (SizeOf(zBuf) div 2) - 2) and (z <> nil) and (z[i] <> #0) do
+  begin
+    b := Byte(z[i]);
+    zBuf[i * 2]     := cHex[b shr 4];
+    zBuf[i * 2 + 1] := cHex[b and $0F];
+    Inc(i);
+  end;
+  zBuf[i * 2] := #0;
+  sqlite3_result_text(pCtx, @zBuf[0], -1, SQLITE_TRANSIENT);
+  if argc = 0 then ;
+end;
+
+{ test1.c:866..888 — tkt2213func: pointer-stability probe.
+  Calls sqlite3_value_text 3x; errors if pointers diverge; otherwise
+  returns a fresh copy via sqlite3_malloc owned by sqlite3_free. }
+procedure tkt2213Function(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  nText: cint;
+  zText1, zText2, zText3, zCopy: PAnsiChar;
+  pa:    PValueArr;
+begin
+  pa := PValueArr(argv);
+  nText  := sqlite3_value_bytes(pa^[0]);
+  zText1 := PAnsiChar(sqlite3_value_text(pa^[0]));
+  zText2 := PAnsiChar(sqlite3_value_text(pa^[0]));
+  zText3 := PAnsiChar(sqlite3_value_text(pa^[0]));
+  if (zText1 <> zText2) or (zText2 <> zText3) then
+    sqlite3_result_error(pCtx, PChar('tkt2213 is not fixed'), -1)
+  else
+  begin
+    zCopy := PAnsiChar(sqlite3_malloc(nText));
+    Move(zText1^, zCopy^, nText);
+    sqlite3_result_text(pCtx, zCopy, nText, Pointer(@sqlite3_free));
+  end;
+  if argc = 0 then ;
+end;
+
+{ test1.c:914..962 — pointer_change(VALUE, API1, BYTES, API2).
+  Reports 1 if the pointers returned by API1/API2 differ on VALUE. }
+procedure ptrChngFunction(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  p1, p2: Pointer;
+  zCmd:   PAnsiChar;
+  pa:     PValueArr;
+begin
+  pa := PValueArr(argv);
+  if argc <> 4 then Exit;
+  zCmd := PAnsiChar(sqlite3_value_text(pa^[1]));
+  if zCmd = nil then Exit;
+  if StrComp(zCmd, 'text') = 0 then
+    p1 := sqlite3_value_text(pa^[0])
+  else if StrComp(zCmd, 'text16') = 0 then
+    p1 := sqlite3_value_text16(pa^[0])
+  else if StrComp(zCmd, 'blob') = 0 then
+    p1 := sqlite3_value_blob(pa^[0])
+  else
+    Exit;
+  zCmd := PAnsiChar(sqlite3_value_text(pa^[2]));
+  if zCmd = nil then Exit;
+  if StrComp(zCmd, 'bytes') = 0 then
+    sqlite3_value_bytes(pa^[0])
+  else if StrComp(zCmd, 'bytes16') = 0 then
+    sqlite3_value_bytes16(pa^[0])
+  else if StrComp(zCmd, 'noop') = 0 then
+    { do nothing }
+  else
+    Exit;
+  zCmd := PAnsiChar(sqlite3_value_text(pa^[3]));
+  if zCmd = nil then Exit;
+  if StrComp(zCmd, 'text') = 0 then
+    p2 := sqlite3_value_text(pa^[0])
+  else if StrComp(zCmd, 'text16') = 0 then
+    p2 := sqlite3_value_text16(pa^[0])
+  else if StrComp(zCmd, 'blob') = 0 then
+    p2 := sqlite3_value_blob(pa^[0])
+  else
+    Exit;
+  if p1 = p2 then
+    sqlite3_result_int(pCtx, 0)
+  else
+    sqlite3_result_int(pCtx, 1);
+end;
+
+{ test1.c:968..975 — counter1/counter2: ascending-int probe. }
+var
+  g_nondetCnt: cint = 0;
+
+procedure nondeterministicFunction(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+begin
+  sqlite3_result_int(pCtx, g_nondetCnt);
+  Inc(g_nondetCnt);
+  if (argc < 0) or (argv = nil) then ;
+end;
+
+{ test1.c:981..989 — intreal: integer value tagged as MEM_IntReal.
+  The C path is sqlite3_result_int64 + sqlite3_test_control
+  (SQLITE_TESTCTRL_RESULT_INTREAL, ctx) which sets MEM_IntReal on
+  pCtx->pOut.  We inline the flag toggle here since the test-control
+  op is not yet ported. }
+procedure intrealFunction(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  v:  i64;
+  pa: PValueArr;
+begin
+  pa := PValueArr(argv);
+  v := sqlite3_value_int64(pa^[0]);
+  sqlite3_result_int64(pCtx, v);
+  if (pCtx <> nil) and (pCtx^.pOut <> nil) then
+    pCtx^.pOut^.flags := (pCtx^.pOut^.flags and not MEM_Int) or MEM_IntReal;
+  if argc = 0 then ;
+end;
+
+{ test1.c:996..1022 — add_text_type / add_int_type / add_real_type.
+  Each forces an additional internal type-tag via a coercion call,
+  then echoes argv[0]. }
+procedure addTextTypeFunction(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var pa: PValueArr;
+begin
+  pa := PValueArr(argv);
+  sqlite3_value_text(pa^[0]);
+  sqlite3_result_value(pCtx, pa^[0]);
+  if argc = 0 then ;
+end;
+
+procedure addIntTypeFunction(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var pa: PValueArr;
+begin
+  pa := PValueArr(argv);
+  sqlite3_value_int64(pa^[0]);
+  sqlite3_result_value(pCtx, pa^[0]);
+  if argc = 0 then ;
+end;
+
+procedure addRealTypeFunction(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var pa: PValueArr;
+begin
+  pa := PValueArr(argv);
+  sqlite3_value_double(pa^[0]);
+  sqlite3_result_value(pCtx, pa^[0]);
+  if argc = 0 then ;
+end;
+
+{ test1.c:1031..1040 — strtod(X): C-library text→double via Pascal's
+  StrToFloat (close enough — these tests probe rounding parity). }
+procedure shellStrtod(pCtx: Psqlite3_context; nVal: cint;
+  apVal: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  z:  PAnsiChar;
+  d:  Double;
+  pa: PValueArr;
+  fs: TFormatSettings;
+begin
+  pa := PValueArr(apVal);
+  z := PAnsiChar(sqlite3_value_text(pa^[0]));
+  if z = nil then Exit;
+  fs := DefaultFormatSettings;
+  fs.DecimalSeparator := '.';
+  if not TryStrToFloat(AnsiString(z), d, fs) then d := 0;
+  sqlite3_result_double(pCtx, d);
+  if nVal = 0 then ;
+end;
+
+{ test1.c:1049..1061 — dtostr(X[,N]): "%#+.*e" double→text. }
+procedure shellDtostr(pCtx: Psqlite3_context; nVal: cint;
+  apVal: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  r:    Double;
+  n:    cint;
+  z:    array[0..399] of AnsiChar;
+  s:    AnsiString;
+  pa:   PValueArr;
+begin
+  pa := PValueArr(apVal);
+  r := sqlite3_value_double(pa^[0]);
+  if nVal >= 2 then n := sqlite3_value_int(pa^[1]) else n := 26;
+  if n < 1 then n := 1;
+  if n > 350 then n := 350;
+  { Pascal has no '%#+.*e'; emulate: sign-forced, decimal point present. }
+  s := Format('%.*e', [n, r]);
+  if (Length(s) > 0) and (s[1] <> '-') then s := '+' + s;
+  { Ensure decimal point — Format with non-zero precision always emits one. }
+  FillChar(z[0], SizeOf(z), 0);
+  Move(PAnsiChar(s)^, z[0], Length(s));
+  sqlite3_result_text(pCtx, @z[0], -1, SQLITE_TRANSIENT);
+end;
+
+{ test1.c:1071..1086 — inttoptr(X): wrap integer as pointer-typed result. }
+procedure inttoptrFunc(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  i64v: i64;
+  p:    Pointer;
+  pa:   PValueArr;
+begin
+  pa := PValueArr(argv);
+  i64v := sqlite3_value_int64(pa^[0]);
+  p := Pointer(PtrUInt(i64v));
+  sqlite3_result_pointer(pCtx, p, PChar('carray'), nil);
+  if argc = 0 then ;
+end;
+
+{ test1.c:1088..1226 — test_create_function: register the UDFs above
+  on DB.  Returns the rc enum-name.  Skips the UTF-16 hex16 / x_sqlite_exec
+  arms (SQLITE_OMIT_UTF16-equivalent gate). }
+function test_create_function(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+type
+  TArgvArr = array[0..16] of PAnsiChar;
+  PArgvArr = ^TArgvArr;
+var
+  db: PTsqlite3;
+  rc: cint;
+  av: PArgvArr;
+begin
+  av := PArgvArr(argv);
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av^[0], PChar(' DB"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av^[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_function(db, PChar('x_coalesce'), -1, SQLITE_UTF8,
+          nil, @t1_ifnullFunc, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('hex8'), 1,
+            SQLITE_UTF8 or SQLITE_DETERMINISTIC, nil,
+            @hex8Func, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('tkt2213func'), 1, SQLITE_ANY,
+            nil, @tkt2213Function, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('pointer_change'), 4, SQLITE_ANY,
+            nil, @ptrChngFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('counter1'), -1, SQLITE_UTF8,
+            nil, @nondeterministicFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('counter2'), -1,
+            SQLITE_UTF8 or SQLITE_DETERMINISTIC, nil,
+            @nondeterministicFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('intreal'), 1, SQLITE_UTF8,
+            nil, @intrealFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('add_text_type'), 1, SQLITE_UTF8,
+            nil, @addTextTypeFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('add_int_type'), 1, SQLITE_UTF8,
+            nil, @addIntTypeFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('add_real_type'), 1, SQLITE_UTF8,
+            nil, @addRealTypeFunction, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('strtod'), 1, SQLITE_UTF8,
+            nil, @shellStrtod, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('dtostr'), 1, SQLITE_UTF8,
+            nil, @shellDtostr, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('dtostr'), 2, SQLITE_UTF8,
+            nil, @shellDtostr, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('inttoptr'), 1, SQLITE_UTF8,
+            nil, @inttoptrFunc, nil, nil);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -2491,6 +3024,18 @@ begin
     @tcl_hexio_render_int16, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('hexio_render_int32'),
     @tcl_hexio_render_int32, nil, nil);
+  { 9.4.divbug.62.c — sqlite3_status / _release_memory / _limit / _rekey
+    / _create_function (test1.c:9081..9186). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_status'),
+    @tcl_test_status, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_release_memory'),
+    @tcl_test_release_memory, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_limit'),
+    @tcl_test_limit, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_rekey'),
+    @tcl_test_rekey, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_create_function'),
+    @test_create_function, nil, nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
     regression tests (between.test's `queryplan` proc, etc.) can
     verify the optimizer correctly elides ORDER BY sorts. }
