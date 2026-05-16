@@ -4081,10 +4081,33 @@ begin
   end;
 
   { function — tclsqlite.c:3386 (DB_FUNCTION).  Scalar UDF registration
-    via sqlite3_create_function_v2; Tcl trampoline is DbSqlFunc. }
-  if (zSub <> nil) and (StrComp(zSub, 'function') = 0) then
+    via sqlite3_create_function_v2; Tcl trampoline is DbSqlFunc.
+
+    9.4.divbug.64: accept the `func` prefix as well.  Upstream's
+    DbObjCmd dispatch goes through Tcl_GetIndexFromObj which does
+    unambiguous prefix matching; `func` is unique to `function` in the
+    subcommand table (tclsqlite.c:2446..2466) so `db func ...` lands
+    here too.  Several tests (tkt-d11f09d36e, update2, tkt1514, ...)
+    rely on this abbreviation. }
+  if (zSub <> nil) and
+     ((StrComp(zSub, 'function') = 0) or (StrComp(zSub, 'func') = 0)) then
   begin
     Result := DbFunctionArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { format — tclsqlite.c:3368 (DB_FORMAT).  Dispatches to dbQrf
+    (tclsqlite.c:2111..), which itself is gated on SQLITE_QRF_H:
+    when the QRF extension is not compiled in, upstream returns
+    "QRF not available in this build" with TCL_ERROR.  This Pas port
+    does not include QRF, so we mirror that error verbatim — qrf03..06
+    suites then skip gracefully instead of hitting "unknown subcommand".
+    9.4.divbug.64. }
+  if (zSub <> nil) and (StrComp(zSub, 'format') = 0) then
+  begin
+    Tcl_SetResult(interp, PChar('QRF not available in this build'),
+                  TCL_VOLATILE);
+    Result := TCL_ERROR;
     Exit;
   end;
 
@@ -4443,16 +4466,58 @@ var
   flags:    cint;
   i:        cint;
   b:        cint;
+  bTranslateFileName: cint;
+  ds:       TTclDString;
+  zTrans:   PAnsiChar;
+
+  function Usage: cint;
+  begin
+    { Port of sqliteCmdUsage (tclsqlite.c:4225..4235). }
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(
+      'HANDLE ?FILENAME? ?-vfs VFSNAME? ?-readonly BOOLEAN? ?-create BOOLEAN?' +
+      ' ?-nofollow BOOLEAN?' +
+      ' ?-nomutex BOOLEAN? ?-fullmutex BOOLEAN? ?-uri BOOLEAN?'));
+    Usage := TCL_ERROR;
+  end;
+
 begin
   flags   := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or SQLITE_OPEN_NOMUTEX;
   zFile   := nil;
   zVfs    := nil;
+  bTranslateFileName := 1;
 
-  if objc < 3 then
+  { Port of tclsqlite.c:4282..4297 — bare `sqlite3` plus the three
+    `sqlite3 -flag` introspection forms (-version / -sourceid / -has-codec)
+    used by pragma3.test:19 and similar.  Without these arms divbug.57
+    rejected objc<3 outright with `wrong # args`. }
+  if objc = 1 then
   begin
-    Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE FILENAME ?OPTIONS?'));
-    Result := TCL_ERROR;
+    Result := Usage;
     Exit;
+  end;
+  if objc = 2 then
+  begin
+    zArg := Tcl_GetStringFromObj(ObjvAt(objv, 1), nil);
+    if StrComp(zArg, '-version') = 0 then
+    begin
+      Tcl_AppendResult(interp, sqlite3_libversion(), Pointer(nil));
+      Result := TCL_OK; Exit;
+    end;
+    if StrComp(zArg, '-sourceid') = 0 then
+    begin
+      Tcl_AppendResult(interp, sqlite3_sourceid(), Pointer(nil));
+      Result := TCL_OK; Exit;
+    end;
+    if StrComp(zArg, '-has-codec') = 0 then
+    begin
+      Tcl_AppendResult(interp, PChar('0'), Pointer(nil));
+      Result := TCL_OK; Exit;
+    end;
+    if (zArg <> nil) and (zArg[0] = '-') then
+    begin
+      Result := Usage;
+      Exit;
+    end;
   end;
 
   zDbName := Tcl_GetStringFromObj(ObjvAt(objv, 1), nil);
@@ -4467,8 +4532,7 @@ begin
     begin
       if zFile <> nil then
       begin
-        Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE FILENAME ?OPTIONS?'));
-        Result := TCL_ERROR;
+        Result := Usage;
         Exit;
       end;
       zFile := zArg;
@@ -4477,8 +4541,7 @@ begin
     end;
     if i = objc - 1 then
     begin
-      Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE FILENAME ?OPTIONS?'));
-      Result := TCL_ERROR;
+      Result := Usage;
       Exit;
     end;
     Inc(i);
@@ -4554,6 +4617,13 @@ begin
       else
         flags := flags and not SQLITE_OPEN_URI;
     end
+    else if StrComp(zArg, '-translatefilename') = 0 then
+    begin
+      { Port of tclsqlite.c:4364..4367 — toggles Tcl_TranslateFileName below. }
+      if Tcl_GetBooleanFromObj(interp, ObjvAt(objv, i), @bTranslateFileName)
+         <> TCL_OK then
+      begin Result := TCL_ERROR; Exit; end;
+    end
     else
     begin
       Tcl_AppendResult(interp, PChar('unknown option: '), zArg, Pointer(nil));
@@ -4565,8 +4635,19 @@ begin
 
   if zFile = nil then zFile := '';
 
+  { Port of tclsqlite.c:4377..4383 — apply ~user / env-var expansion when
+    -translatefilename is not explicitly disabled. }
+  if bTranslateFileName <> 0 then
+  begin
+    Tcl_DStringInit(@ds);
+    zTrans := Tcl_TranslateFileName(interp, zFile, @ds);
+    if zTrans <> nil then zFile := zTrans;
+  end;
+
   pHandle := nil;
   rc := sqlite3_open_v2(zFile, @pHandle, flags, zVfs);
+  if bTranslateFileName <> 0 then
+    Tcl_DStringFree(@ds);
   if (rc <> SQLITE_OK) or (pHandle = nil) or
      (sqlite3_errcode(pHandle) <> SQLITE_OK) then
   begin
