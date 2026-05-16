@@ -32,6 +32,12 @@ echo "Compiling passpeedtest1.pas ..."
 fpc $FPC_FLAGS "$SCRIPT_DIR/passpeedtest1.pas"
 echo "passpeedtest1 compiled -> $BIN_DIR/passpeedtest1"
 
+echo "Compiling SpeedtestDiff.pas ..."
+# SpeedtestDiff is a plain TProcess driver — does not link the pas engine
+# units, only spawns bin/passpeedtest1 and the C oracle. No -k-l* needed.
+fpc -O2 -FE$BIN_DIR "$SCRIPT_DIR/SpeedtestDiff.pas"
+echo "SpeedtestDiff compiled -> $BIN_DIR/SpeedtestDiff"
+
 # Clean compiled artefacts
 find "$SCRIPT_DIR" -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
 find "$BIN_DIR"    -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
