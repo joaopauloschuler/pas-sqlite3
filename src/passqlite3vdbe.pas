@@ -9639,10 +9639,18 @@ begin
             PPMem(PByte(pCtxAgg) + ((SizeOf(Tsqlite3_context)+7) and not 7)));
       end;
       if pCtxAgg^.isError <> 0 then begin
+        { Mirror vdbe.c:7928..7942 — when xSFunc reported an error via
+          sqlite3_result_error, the message sits as TEXT in pCtx^.pOut.
+          Lift it into the vdbe's zErrMsg BEFORE we release pOut, else
+          OP_AggFinal / sqlite3_step report a generic "SQL logic error".
+          Ported for 9.4.divbug.51 (json_group_array(BLOB) sub-case). }
         rc := pCtxAgg^.isError;
-        pCtxAgg^.isError := 0;
+        if rc > 0 then
+          sqlite3VdbeError(v, PAnsiChar(sqlite3_value_text(
+            Psqlite3_value(pCtxAgg^.pOut))));
         sqlite3VdbeMemRelease(pCtxAgg^.pOut);
         pCtxAgg^.pOut^.flags := MEM_Null;
+        pCtxAgg^.isError := 0;
         if rc <> 0 then goto abort_due_to_error;
       end;
     end;

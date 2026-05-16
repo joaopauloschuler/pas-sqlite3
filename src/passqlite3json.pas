@@ -3998,14 +3998,17 @@ var
   ctx: Psqlite3_context;
 begin
   ctx := Psqlite3_context(pCtx);
+  { json.c:3506..3513 — paths are wrapped via %Q (SQL-quoted: single quotes
+    around the text, internal "'" doubled, NULL → bare NULL).  Use
+    sqlite3FormatStr so we get byte-identical quoting vs C oracle. }
   if u32(rc) = JSON_LOOKUP_NOTARRAY then
-    msg := 'not an array element: ' + AnsiString(zPath)
+    msg := sqlite3FormatStr(PAnsiChar('not an array element: %Q'), [zPath])
   else if u32(rc) = JSON_LOOKUP_ERROR then
     msg := 'malformed JSON'
   else if u32(rc) = JSON_LOOKUP_TOODEEP then
     msg := 'JSON path too deep'
   else
-    msg := 'bad JSON path: ' + AnsiString(zPath);
+    msg := sqlite3FormatStr(PAnsiChar('bad JSON path: %Q'), [zPath]);
   if ctx = nil then
   begin
     Result := PAnsiChar(StrAlloc(Length(msg) + 1));
