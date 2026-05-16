@@ -52654,6 +52654,17 @@ begin
   end;
 end;
 
+{ subtype(X) — func.c:100..111.  Returns the subtype byte of the argument
+  (0 if no subtype set).  Registered with SQLITE_FUNC_TYPEOF|SQLITE_SUBTYPE
+  so the planner does not optimise it out (FUNC_TYPEOF) and the resolver
+  propagates the source value's subtype across the call (SUBTYPE).
+  9.4.divbug.52. }
+procedure subtypeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  sqlite3_result_int(pCtx,
+    i32(sqlite3_value_subtype(Psqlite3_value(argv^))));
+end;
+
 procedure octetLengthFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pVal: PMem;
@@ -54448,7 +54459,7 @@ const
   FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
-  aBuiltinFuncs: array[0..81] of TFuncDef;
+  aBuiltinFuncs: array[0..82] of TFuncDef;
 
 { TCompareInfo / globInfo / likeInfoNorm — hoisted from the patternCompare
   block further down so aBuiltinFuncs[].pUserData (set in InitBuiltinFuncs)
@@ -54666,6 +54677,13 @@ begin
     @compileoptionusedFunc, nil, 'sqlite_compileoption_used');
   MakeFD(aBuiltinFuncs[81], 1, FUNC_ENC or SQLITE_FUNC_SLOCHNG,
     @compileoptiongetFunc, nil, 'sqlite_compileoption_get');
+  { subtype(X) — func.c:3306: FUNCTION2(subtype, 1, 0, 0, subtypeFunc,
+    SQLITE_FUNC_TYPEOF|SQLITE_SUBTYPE).  Returns the subtype byte stored
+    on the argument's Mem (e.g. JSON_SUBTYPE = 74 for json()/json_extract
+    results).  9.4.divbug.52. }
+  MakeFD(aBuiltinFuncs[82], 1,
+    FUNC_ENC or SQLITE_FUNC_TYPEOF or SQLITE_SUBTYPE,
+    @subtypeFunc, nil, 'subtype');
 end;
 
 var
