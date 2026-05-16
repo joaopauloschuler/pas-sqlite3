@@ -55303,7 +55303,7 @@ const
   FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
-  aBuiltinFuncs: array[0..82] of TFuncDef;
+  aBuiltinFuncs: array[0..83] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -55515,6 +55515,12 @@ begin
   MakeFD(aBuiltinFuncs[82], 1,
     FUNC_ENC or SQLITE_FUNC_TYPEOF or SQLITE_SUBTYPE,
     @subtypeFunc, nil, 'subtype');
+  { 9.4.divbug.66.a — `if(c,a,b)` is registered upstream as an alias for
+    `iif(c,a,b)` via INLINE_FUNC (func.c:3430).  Same inlined codegen
+    branch (INLINEFUNC_iif); only the name differs.  Resolves
+    "no such function: if" (qrf01-13.x). }
+  MakeFD(aBuiltinFuncs[83], 3, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'if');
+  aBuiltinFuncs[83].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
 end;
 
 var

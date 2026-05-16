@@ -511,13 +511,20 @@ end;
 
 { test_func.c:780 Sqlitetest_func_Init — register the Tcl commands.  This
   port surfaces only autoinstall_test_functions (abuse_create_function /
-  install_fts3_rank_function are not ported).  Unlike C, we do NOT also
-  pre-register registerTestFunctions as an auto-extension at init time —
-  tests opt in explicitly via the Tcl command. }
+  install_fts3_rank_function are not ported).
+  9.4.divbug.66.a — also pre-register registerTestFunctions as an
+  auto-extension (mirrors test_func.c:949 — Sqlitetest_func_Init calls
+  sqlite3_auto_extension((void(*)(void))registerTestFunctions) at init
+  time so randstr / test_destructor / test_auxdata / etc. are surfaced
+  on every new connection without each .test file having to invoke
+  `autoinstall_test_functions` explicitly).  Resolves
+  "no such function: randstr" (tkt3918). }
 function Sqlitetestfunc_Init(interp: PTclInterp): cint; cdecl;
 begin
   Tcl_CreateObjCommand(interp, PChar('autoinstall_test_functions'),
     @autoinstall_test_funcs, nil, nil);
+  sqlite3_initialize;
+  sqlite3_auto_extension(Tsqlite3_loadext_fn(@registerTestFunctions));
   Result := TCL_OK;
 end;
 
