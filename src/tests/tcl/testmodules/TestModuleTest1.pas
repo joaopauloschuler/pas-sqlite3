@@ -2887,6 +2887,60 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.62.d — test_malloc.c:1163..1184 test_config_uri.
+  Set SQLITE_CONFIG_URI; return sqlite3ErrName(rc). }
+function tcl_test_config_uri(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc, bOpenUri: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOL'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @bOpenUri) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_config(SQLITE_CONFIG_URI, bOpenUri);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.d — test_malloc.c:1220..1241 test_config_pmasz.
+  Set the minimum PMA size via SQLITE_CONFIG_PMASZ. }
+function tcl_test_config_pmasz(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc, iPmaSz: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOL'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @iPmaSz) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_config(SQLITE_CONFIG_PMASZ, iPmaSz);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.62.d — test_autoext.c:189..197 resetAutoExtObjCmd.
+  Reset all auto-extensions. }
+function tcl_reset_auto_extension(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_reset_auto_extension;
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -3041,6 +3095,18 @@ begin
     verify the optimizer correctly elides ORDER BY sorts. }
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
     @sqlite3_sort_count, TCL_LINK_INT);
+  { 9.4.divbug.62.d — sqlite3_config_uri / _config_pmasz
+    (test_malloc.c:1163..1241, registered at test_malloc.c:1497, 1499)
+    and sqlite3_reset_auto_extension (test_autoext.c:189..219).
+    sqlite3_config_alt_pcache and sqlite3_simulate_device skipped:
+    installTestPCache (test_pcache.c) and devsym_register
+    (test_devsym.c) are not ported. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_uri'),
+    @tcl_test_config_uri, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pmasz'),
+    @tcl_test_config_pmasz, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_reset_auto_extension'),
+    @tcl_reset_auto_extension, nil, nil);
   Result := TCL_OK;
 end;
 
