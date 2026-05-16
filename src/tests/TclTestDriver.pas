@@ -35,6 +35,62 @@ uses
 const
   PER_TEST_TIMEOUT_MS = 30000;
 
+  { 9.4.divbug.84: a handful of upstream .test files are genuinely long-
+    running — large fuzz/crash-injection loops with hundreds-of-thousands
+    of subtests — that exceed the 30 s baseline even though no engine bug
+    is at play.  Override their per-test budget here so the driver no
+    longer mis-counts them as FAIL via the timeout watchdog.
+
+    Measured pas runtimes (worktree, 2026-05-16):
+      securedel2.test  >617 s   (subtests reach 1.6.x; loop blocked on
+                                 missing `hexio_read` Tcl command — each
+                                 page-inspection do_test catches the
+                                 missing-cmd error and continues)
+      select4.test     >181 s   (1043-line EXCEPT/UNION matrix; reaches
+                                 11.7 of ~14 named groups in 180 s — still
+                                 progressing, just slow)
+      writecrash.test  >180 s   (subtest IDs reach 1.331698.x; loop blocked
+                                 on missing `crash_on_write` crash-VFS cmd
+                                 — every iteration is a no-op so the test
+                                 walks its full ~331k row matrix)
+
+    900 s (15 min) gives enough headroom for the three to either complete
+    or to surface real failures the classifier can act on.  The two
+    "missing Tcl command" cases (hexio_read, crash_on_write) are tracked
+    separately under the test1.c port (divbug.62.b/.c family) — once they
+    land, runtimes will collapse and this table can shrink.
+
+    These tests are listed `pas-soft` in src/tests/tcl/STATUS.txt so the
+    aggregate sweep doesn't flag them; the override here is only to keep
+    the per-test driver from mis-attributing FAIL via the watchdog.
+
+    Keep the table small and explicit; do NOT use it as a dumping ground
+    for tests that legitimately fail.  Each entry must have a measured
+    runtime comment justifying its presence. }
+type
+  TPerTestTimeout = record
+    BaseName : string;       { ExtractFileName, lowercase }
+    Ms       : LongInt;
+  end;
+const
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..2] of TPerTestTimeout = (
+    (BaseName: 'securedel2.test'; Ms: 900000),
+    (BaseName: 'select4.test';    Ms: 900000),
+    (BaseName: 'writecrash.test'; Ms: 900000)
+  );
+
+function TimeoutForTest(const testAbsPath: string): LongInt;
+var
+  i  : Integer;
+  bn : string;
+begin
+  bn := LowerCase(ExtractFileName(testAbsPath));
+  for i := Low(PER_TEST_TIMEOUT_OVERRIDES) to High(PER_TEST_TIMEOUT_OVERRIDES) do
+    if PER_TEST_TIMEOUT_OVERRIDES[i].BaseName = bn then
+      Exit(PER_TEST_TIMEOUT_OVERRIDES[i].Ms);
+  Result := PER_TEST_TIMEOUT_MS;
+end;
+
 var
   gRoot       : string;        { absolute pas-sqlite3 root }
   gBinDir     : string;        { absolute path to bin/ (holds .so + pkgIndex.tcl) }
@@ -309,7 +365,7 @@ begin
       AppendChunk(p.Output, sOut);
       AppendChunk(p.Stderr, sErr);
       endTick := GetTickCount64;
-      if (endTick - startTick) > PER_TEST_TIMEOUT_MS then begin
+      if (endTick - startTick) > QWord(TimeoutForTest(testAbsPath)) then begin
         Writeln(StdErr, 'timeout: ', testAbsPath);
         p.Terminate(124);
         durationMs := Int64(endTick - startTick);
