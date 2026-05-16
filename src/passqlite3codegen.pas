@@ -37119,6 +37119,10 @@ var
   regRec:         i32;
   regTempRowid:   i32;
   addrL:          i32;
+  iRegStore:      i32;
+  nHidden:        i32;
+  colFlg:         u32;
+  tmaskBefore:    Boolean;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -37681,73 +37685,94 @@ generic_coro_done:
     else
       pListItems := nil;
 
+    { Port of insert.c:1361..1437.  Walk pTab columns in storage order.
+      iRegStore tracks the destination register; VIRTUAL generated columns
+      do not participate in OP_MakeRecord, so iRegStore is held back when
+      one is skipped.  STORED generated columns get a SoftNull placeholder
+      iff BEFORE triggers fire (so the OP_Copy at insert.c:1471 reads
+      something defined); their final value is filled in later by
+      sqlite3ComputeGeneratedColumns.  Hidden columns not named in the
+      IDLIST take their default. }
+    nHidden   := 0;
+    iRegStore := regData;
+    tmaskBefore := (tmask and TRIGGER_BEFORE) <> 0;
     for i := 0 to i32(pTab^.nCol) - 1 do
     begin
+      colFlg := pTab^.aCol[i].colFlags;
+      if (colFlg and COLFLAG_NOINSERT) <> 0 then
+      begin
+        Inc(nHidden);
+        if (colFlg and COLFLAG_VIRTUAL) <> 0 then
+        begin
+          { Virtual generated columns do not occupy a record slot — do
+            not advance iRegStore.  insert.c:1377..1382. }
+          Continue;
+        end
+        else if (colFlg and COLFLAG_STORED) <> 0 then
+        begin
+          { Stored generated columns computed later; SoftNull only if
+            BEFORE triggers will copy the slot. }
+          if tmaskBefore then
+            sqlite3VdbeAddOp1(v, OP_SoftNull, iRegStore);
+          Inc(iRegStore);
+          Continue;
+        end
+        else if pColumn = nil then
+        begin
+          { Hidden col with no IDLIST → default value. }
+          sqlite3ExprCodeFactorable(pParse,
+            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore);
+          Inc(iRegStore);
+          Continue;
+        end;
+      end;
+
       if useTempTable then
       begin
-        { Template-4 column extraction — port of insert.c:1363..1424.
-          IPK column gets a SoftNull placeholder (real value already
-          loaded into regRowid at loop top); every other column is
-          read from the srcTab cursor.  A column not named in the
-          IDLIST falls back to its default value. }
-        if i = i32(pTab^.iPKey) then
-        begin
-          sqlite3VdbeAddOp1(v, OP_SoftNull, regData + i);
-          Continue;
-        end;
+        { Template-4 column extraction — port of insert.c:1363..1424. }
         if pColumn <> nil then
         begin
           k := (aTabColMap + i)^;
           if k = 0 then
             sqlite3ExprCodeFactorable(pParse,
-              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
           else
-            sqlite3VdbeAddOp3(v, OP_Column, srcTab, k - 1, regData + i);
+            sqlite3VdbeAddOp3(v, OP_Column, srcTab, k - 1, iRegStore);
         end
         else
-          sqlite3VdbeAddOp3(v, OP_Column, srcTab, i, regData + i);
-        Continue;
-      end;
-      if useCoroutine then
+          sqlite3VdbeAddOp3(v, OP_Column, srcTab, i - nHidden, iRegStore);
+      end
+      else if useCoroutine then
       begin
-        { Coroutine streams values into regFromSelect..; copy into regData+i
-          only when the layouts diverge (IDLIST out-of-order or partial).
-          IPK slot stays NULL (will be re-loaded into regRowid in rowid arm). }
-        if i = i32(pTab^.iPKey) then
-        begin
-          if regData <> regFromSelect then
-            sqlite3VdbeAddOp1(v, OP_SoftNull, regData + i);
-          Continue;
-        end;
-        if regData = regFromSelect then Continue;
         if pColumn <> nil then
         begin
           k := (aTabColMap + i)^;
           if k = 0 then
             sqlite3ExprCodeFactorable(pParse,
-              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
-          else
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
+          else if regData <> regFromSelect then
             sqlite3VdbeAddOp2(v, OP_SCopy,
-              regFromSelect + (k - 1), regData + i);
+              regFromSelect + (k - 1), iRegStore);
         end
-        else
-          sqlite3VdbeAddOp2(v, OP_SCopy, regFromSelect + i, regData + i);
-        Continue;
-      end;
-      if pColumn <> nil then
+        else if regData <> regFromSelect then
+          sqlite3VdbeAddOp2(v, OP_SCopy,
+            regFromSelect + (i - nHidden), iRegStore);
+      end
+      else if pColumn <> nil then
       begin
         j := (aTabColMap + i)^;
         if j = 0 then
           sqlite3ExprCodeFactorable(pParse,
-            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
         else
-          sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
+          sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, iRegStore);
       end
       else if pCurRow = nil then
         sqlite3ExprCodeFactorable(pParse,
-          sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+          sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
       else
-        sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
+        sqlite3ExprCode(pParse, pListItems[i - nHidden].pExpr, iRegStore);
+      Inc(iRegStore);
     end;
 
     { Determine whether the user supplied a value for the IPK alias column
