@@ -1650,6 +1650,710 @@ begin
   Result := TCL_OK;
 end;
 
+{ ----------------------------------------------------------------------
+  9.4.divbug.62.b — sqlite3_bind_* family + hexio_* helpers.
+
+  Ported handlers (verbatim from upstream test1.c / test_hexio.c):
+    * sqlite3_bind_int             test1.c:3796..3824 (test_bind_int)
+    * sqlite3_bind_int64           test1.c:3972..4000 (test_bind_int64)
+    * sqlite3_bind_double          test1.c:4010..4077 (test_bind_double)
+    * sqlite3_bind_null            test1.c:4086..4112 (test_bind_null)
+    * sqlite3_bind_text            test1.c:4122..4165 (test_bind_text)
+    * sqlite3_bind_text16          test1.c:4175..4226 (test_bind_text16)
+    * sqlite3_bind_blob            test1.c:4235..4281 (test_bind_blob)
+    * sqlite3_bind_zeroblob        test1.c:3723..3750 (test_bind_zeroblob)
+    * sqlite3_bind_zeroblob64      test1.c:3759..3787 (test_bind_zeroblob64)
+    * sqlite3_bind_value_from_select
+                                   test1.c:4338..4379
+    * sqlite3_bind_parameter_count test1.c:4736..4751
+    * sqlite3_bind_parameter_name  test1.c:4760..4779
+    * sqlite3_bind_parameter_index test1.c:4787..4806
+    * sqlite3_clear_bindings       test1.c:4812..4827
+    * hexio_read                   test_hexio.c:97..138
+    * hexio_write                  test_hexio.c:147..187
+    * hexio_get_int                test_hexio.c:196..241
+    * hexio_render_int16           test_hexio.c:249..268
+    * hexio_render_int32           test_hexio.c:276..297
+
+  Stmt pointers arrive as "0xABCD..." strings (sqlite3TestTextToPtr)
+  matching the convention already used by the column_* / step / finalize
+  cluster. test1.c's getStmtPointer additionally accepts a Tcl-command
+  name, but no affected test (tkt2213, vacuum*, upsert5, values,
+  rowvalue7) relies on that path.
+  ---------------------------------------------------------------------- }
+
+{ test_hexio.c:32..44 — sqlite3TestBinToHex. }
+procedure t1BinToHex(zBuf: PByte; N: cint);
+const
+  zHex: array[0..15] of AnsiChar = '0123456789ABCDEF';
+var
+  i, j: cint;
+  c: Byte;
+begin
+  i := N * 2;
+  (zBuf + i)^ := 0;
+  Dec(i);
+  for j := N - 1 downto 0 do
+  begin
+    c := (zBuf + j)^;
+    (zBuf + i)^ := Byte(zHex[c and $f]); Dec(i);
+    (zBuf + i)^ := Byte(zHex[c shr 4]);  Dec(i);
+  end;
+end;
+
+{ test_hexio.c:52..87 — sqlite3TestHexToBin. }
+function t1HexToBin(zIn: PByte; N: cint; aOut: PByte): cint;
+const
+  aMap: array[0..255] of Byte = (
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     1, 2, 3, 4, 5, 6, 7, 8,  9,10, 0, 0, 0, 0, 0, 0,
+     0,11,12,13,14,15,16, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0,11,12,13,14,15,16, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+     0, 0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0);
+var
+  i, j: cint;
+  hi: cint;
+  c: Byte;
+begin
+  hi := 1; j := 0;
+  for i := 0 to N - 1 do
+  begin
+    c := aMap[(zIn + i)^];
+    if c = 0 then continue;
+    if hi <> 0 then
+    begin
+      (aOut + j)^ := (c - 1) shl 4;
+      hi := 0;
+    end else begin
+      (aOut + j)^ := (aOut + j)^ or (c - 1);
+      Inc(j);
+      hi := 1;
+    end;
+  end;
+  Result := j;
+end;
+
+{ test1.c:3796..3824 — sqlite3_bind_int. }
+function tcl_bind_int(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, value, rc: cint;
+begin
+  if objc <> 4 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N VALUE'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[3], @value) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_int(pStmt, idx, value);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:3972..4000 — sqlite3_bind_int64. }
+function tcl_bind_int64(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, rc: cint;
+  value: Int64;
+begin
+  if objc <> 4 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N VALUE'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, objv[3], @value) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_int64(pStmt, idx, value);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4010..4077 — sqlite3_bind_double, with "NaN"/"+Inf" sentinels. }
+function tcl_bind_double(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+type
+  TSpecialFp = record
+    zName: PAnsiChar;
+    iUpper, iLower: cuint;
+  end;
+const
+  aSpecialFp: array[0..9] of TSpecialFp = (
+    (zName: 'NaN';      iUpper: $7fffffff; iLower: $ffffffff),
+    (zName: 'SNaN';     iUpper: $7ff7ffff; iLower: $ffffffff),
+    (zName: '-NaN';     iUpper: $ffffffff; iLower: $ffffffff),
+    (zName: '-SNaN';    iUpper: $fff7ffff; iLower: $ffffffff),
+    (zName: '+Inf';     iUpper: $7ff00000; iLower: $00000000),
+    (zName: '-Inf';     iUpper: $fff00000; iLower: $00000000),
+    (zName: 'Epsilon';  iUpper: $00000000; iLower: $00000001),
+    (zName: '-Epsilon'; iUpper: $80000000; iLower: $00000001),
+    (zName: 'NaN0';     iUpper: $7ff80000; iLower: $00000000),
+    (zName: '-NaN0';    iUpper: $fff80000; iLower: $00000000));
+var
+  pStmt: PVdbe;
+  idx, rc, i: cint;
+  value: Double;
+  zVal: PAnsiChar;
+  x: QWord;
+  matched: Boolean;
+begin
+  if objc <> 4 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N VALUE'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zVal := Tcl_GetString(objv[3]);
+  value := 0; matched := False;
+  for i := 0 to High(aSpecialFp) do
+  begin
+    if StrComp(aSpecialFp[i].zName, zVal) = 0 then
+    begin
+      x := QWord(aSpecialFp[i].iUpper);
+      x := x shl 32;
+      x := x or QWord(aSpecialFp[i].iLower);
+      Move(x, value, 8);
+      matched := True;
+      break;
+    end;
+  end;
+  if (not matched) and (Tcl_GetDoubleFromObj(interp, objv[3], @value) <> 0) then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_double(pStmt, idx, value);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4086..4112 — sqlite3_bind_null. }
+function tcl_bind_null(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, rc: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_null(pStmt, idx);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4122..4165 — sqlite3_bind_text. }
+function tcl_bind_text(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, bytes, rc: cint;
+  trueLength: cint;
+  value, toFree: PAnsiChar;
+begin
+  if objc <> 5 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N VALUE BYTES'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  trueLength := 0;
+  value := Tcl_GetByteArrayFromObj(objv[3], @trueLength);
+  if Tcl_GetIntFromObj(interp, objv[4], @bytes) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  toFree := nil;
+  if bytes < 0 then
+  begin
+    GetMem(toFree, trueLength + 1);
+    if toFree = nil then begin
+      Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    Move(value^, toFree^, trueLength);
+    (toFree + trueLength)^ := #0;
+    value := toFree;
+  end;
+  rc := sqlite3_bind_text(pStmt, idx, value, bytes, SQLITE_TRANSIENT);
+  if toFree <> nil then FreeMem(toFree);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4175..4226 — sqlite3_bind_text16 ?-static? STMT N STRING BYTES. }
+function tcl_bind_text16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, bytes, rc: cint;
+  trueLength: cint;
+  value, toFree: PAnsiChar;
+  xDel: TxDelProc;
+  oStmt, oN, oString, oBytes: PTclObj;
+begin
+  if (objc <> 5) and (objc <> 6) then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N VALUE BYTES'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 6 then xDel := SQLITE_STATIC else xDel := SQLITE_TRANSIENT;
+  oStmt   := objv[objc - 4];
+  oN      := objv[objc - 3];
+  oString := objv[objc - 2];
+  oBytes  := objv[objc - 1];
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(oStmt)));
+  if Tcl_GetIntFromObj(interp, oN, @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  trueLength := 0;
+  value := Tcl_GetByteArrayFromObj(oString, @trueLength);
+  if Tcl_GetIntFromObj(interp, oBytes, @bytes) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  toFree := nil;
+  if (bytes < 0) and (xDel = SQLITE_TRANSIENT) then
+  begin
+    GetMem(toFree, trueLength + 3);
+    if toFree = nil then begin
+      Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    Move(value^, toFree^, trueLength);
+    FillChar((toFree + trueLength)^, 3, 0);
+    value := toFree;
+  end;
+  rc := sqlite3_bind_text16(pStmt, idx, Pointer(value), bytes, xDel);
+  if toFree <> nil then FreeMem(toFree);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4235..4281 — sqlite3_bind_blob ?-static? STMT N DATA BYTES. }
+function tcl_bind_blob(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, bytes, rc: cint;
+  len: cint;
+  value: PAnsiChar;
+  xDel: TxDelProc;
+  ofs: cint;
+  zBuf: array[0..199] of AnsiChar;
+begin
+  if (objc <> 5) and (objc <> 6) then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT N DATA BYTES'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  xDel := SQLITE_TRANSIENT; ofs := 0;
+  if objc = 6 then begin
+    xDel := SQLITE_STATIC;
+    ofs := 1;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1 + ofs])));
+  if Tcl_GetIntFromObj(interp, objv[2 + ofs], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  len := 0;
+  value := Tcl_GetByteArrayFromObj(objv[3 + ofs], @len);
+  if Tcl_GetIntFromObj(interp, objv[4 + ofs], @bytes) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if bytes > len then begin
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    StrPCopy(zBuf, 'cannot use ' + IntToStr(bytes) + ' blob bytes, have '
+             + IntToStr(len));
+    Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_blob(pStmt, idx, value, bytes, xDel);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:3723..3750 — sqlite3_bind_zeroblob STMT IDX N. }
+function tcl_bind_zeroblob(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, n, rc: cint;
+begin
+  if objc <> 4 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT IDX N'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[3], @n) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_zeroblob(pStmt, idx, n);
+  if rc <> SQLITE_OK then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:3759..3787 — sqlite3_bind_zeroblob64 STMT IDX N. }
+function tcl_bind_zeroblob64(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  idx, rc: cint;
+  n: Int64;
+begin
+  if objc <> 4 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT IDX N'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, objv[3], @n) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_bind_zeroblob64(pStmt, idx, u64(n));
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4338..4379 — sqlite3_bind_value_from_select STMT N SELECT. }
+function tcl_bind_value_from_select(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt, pStmt2: PVdbe;
+  idx, rc: cint;
+  zSql: PAnsiChar;
+  db: PTsqlite3;
+  pVal: Psqlite3_value;
+begin
+  if objc <> 4 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT N SELECT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zSql := Tcl_GetString(objv[3]);
+  db := sqlite3_db_handle(pStmt);
+  rc := sqlite3_prepare_v2(db, zSql, -1, @pStmt2, nil);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, PChar('error in SQL: '),
+      sqlite3_errmsg(db), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if sqlite3_step(pStmt2) = SQLITE_ROW then
+  begin
+    pVal := sqlite3_column_value(pStmt2, 0);
+    sqlite3_bind_value(pStmt, idx, pVal);
+  end;
+  rc := sqlite3_finalize(pStmt2);
+  if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, PChar('error runnning SQL: '),
+      sqlite3_errmsg(db), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4736..4751 — sqlite3_bind_parameter_count STMT. }
+function tcl_bind_parameter_count(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(sqlite3_bind_parameter_count(pStmt)));
+  Result := TCL_OK;
+end;
+
+{ test1.c:4760..4779 — sqlite3_bind_parameter_name STMT N. }
+function tcl_bind_parameter_name(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  i: cint;
+  z: PAnsiChar;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT N'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @i) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  z := sqlite3_bind_parameter_name(pStmt, i);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(z, -1));
+  Result := TCL_OK;
+end;
+
+{ test1.c:4787..4806 — sqlite3_bind_parameter_index STMT NAME. }
+function tcl_bind_parameter_index(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT NAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(sqlite3_bind_parameter_index(pStmt,
+      Tcl_GetString(objv[2]))));
+  Result := TCL_OK;
+end;
+
+{ test1.c:4812..4827 — sqlite3_clear_bindings STMT. }
+function tcl_clear_bindings(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStmt: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(sqlite3_clear_bindings(pStmt)));
+  Result := TCL_OK;
+end;
+
+{ test_hexio.c:97..138 — hexio_read FILENAME OFFSET AMT. }
+function tcl_hexio_read(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  offset, amt, got: cint;
+  zFile: PAnsiChar;
+  zBuf: PByte;
+  inF: PFile;
+begin
+  if objc <> 4 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FILENAME OFFSET AMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @offset) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[3], @amt) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zFile := Tcl_GetString(objv[1]);
+  zBuf := PByte(sqlite3_malloc(amt * 2 + 1));
+  if zBuf = nil then begin Result := TCL_ERROR; Exit; end;
+  inF := fopen(zFile, PChar('rb'));
+  if inF = nil then inF := fopen(zFile, PChar('r'));
+  if inF = nil then begin
+    Tcl_AppendResult(interp, PChar('cannot open input file '),
+      zFile, Pointer(nil));
+    sqlite3_free(zBuf);
+    Result := TCL_ERROR; Exit;
+  end;
+  fseek(inF, offset, SEEK_SET);
+  got := fread(zBuf, 1, amt, inF);
+  fclose(inF);
+  if got < 0 then got := 0;
+  t1BinToHex(zBuf, got);
+  Tcl_AppendResult(interp, PAnsiChar(zBuf), Pointer(nil));
+  sqlite3_free(zBuf);
+  Result := TCL_OK;
+end;
+
+{ test_hexio.c:147..187 — hexio_write FILENAME OFFSET HEXDATA. }
+function tcl_hexio_write(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  offset, nIn, nOut, written: cint;
+  zFile: PAnsiChar;
+  zIn: PAnsiChar;
+  aOut: PByte;
+  outF: PFile;
+begin
+  if objc <> 4 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FILENAME OFFSET HEXDATA'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @offset) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zFile := Tcl_GetString(objv[1]);
+  nIn := 0;
+  zIn := Tcl_GetStringFromObj(objv[3], @nIn);
+  aOut := PByte(sqlite3_malloc(1 + nIn div 2));
+  if aOut = nil then begin Result := TCL_ERROR; Exit; end;
+  nOut := t1HexToBin(PByte(zIn), nIn, aOut);
+  outF := fopen(zFile, PChar('r+b'));
+  if outF = nil then outF := fopen(zFile, PChar('r+'));
+  if outF = nil then begin
+    Tcl_AppendResult(interp, PChar('cannot open output file '),
+      zFile, Pointer(nil));
+    sqlite3_free(aOut);
+    Result := TCL_ERROR; Exit;
+  end;
+  fseek(outF, offset, SEEK_SET);
+  written := fwrite(aOut, 1, nOut, outF);
+  sqlite3_free(aOut);
+  fclose(outF);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(written));
+  Result := TCL_OK;
+end;
+
+{ test_hexio.c:196..241 — hexio_get_int [-littleendian] HEXDATA. }
+function tcl_hexio_get_int(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  val, nIn, nOut: cint;
+  zIn, z: PAnsiChar;
+  aOut: PByte;
+  aNum: array[0..3] of Byte;
+  bLittle: cint;
+  n: cint;
+begin
+  bLittle := 0;
+  if objc = 3 then
+  begin
+    n := 0;
+    z := Tcl_GetStringFromObj(objv[1], @n);
+    if (n >= 2) and (n <= 13) and (CompareByte(z^, PAnsiChar('-littleendian')^, n) = 0) then
+      bLittle := 1;
+  end;
+  if (objc - bLittle) <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('[-littleendian] HEXDATA'));
+    Result := TCL_ERROR; Exit;
+  end;
+  nIn := 0;
+  zIn := Tcl_GetStringFromObj(objv[1 + bLittle], @nIn);
+  aOut := PByte(sqlite3_malloc(1 + nIn div 2));
+  if aOut = nil then begin Result := TCL_ERROR; Exit; end;
+  nOut := t1HexToBin(PByte(zIn), nIn, aOut);
+  if nOut >= 4 then
+    Move(aOut^, aNum[0], 4)
+  else begin
+    FillChar(aNum, SizeOf(aNum), 0);
+    Move(aOut^, aNum[4 - nOut], nOut);
+  end;
+  sqlite3_free(aOut);
+  if bLittle <> 0 then
+    val := cint((cuint(aNum[3]) shl 24) or (cuint(aNum[2]) shl 16)
+                or (cuint(aNum[1]) shl 8) or cuint(aNum[0]))
+  else
+    val := cint((cuint(aNum[0]) shl 24) or (cuint(aNum[1]) shl 16)
+                or (cuint(aNum[2]) shl 8) or cuint(aNum[3]));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(val));
+  Result := TCL_OK;
+end;
+
+{ test_hexio.c:249..268 — hexio_render_int16 INTEGER. }
+function tcl_hexio_render_int16(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  val: cint;
+  aNum: array[0..9] of Byte;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('INTEGER'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @val) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  aNum[0] := Byte(val shr 8);
+  aNum[1] := Byte(val);
+  t1BinToHex(@aNum[0], 2);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(PAnsiChar(@aNum[0]), 4));
+  Result := TCL_OK;
+end;
+
+{ test_hexio.c:276..297 — hexio_render_int32 INTEGER. }
+function tcl_hexio_render_int32(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  val: cint;
+  aNum: array[0..9] of Byte;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('INTEGER'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @val) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  aNum[0] := Byte(val shr 24);
+  aNum[1] := Byte(val shr 16);
+  aNum[2] := Byte(val shr 8);
+  aNum[3] := Byte(val);
+  t1BinToHex(@aNum[0], 4);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(PAnsiChar(@aNum[0]), 8));
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -1747,6 +2451,46 @@ begin
     @tcl_stmt_utf8, Pointer(@sqlite3_column_table_name), nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_column_origin_name'),
     @tcl_stmt_utf8, Pointer(@sqlite3_column_origin_name), nil);
+  { 9.4.divbug.62.b — sqlite3_bind_* family + hexio_* helpers
+    (test1.c:9114..9132, test_hexio.c:461..465). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_int'),
+    @tcl_bind_int, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_int64'),
+    @tcl_bind_int64, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_double'),
+    @tcl_bind_double, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_null'),
+    @tcl_bind_null, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_text'),
+    @tcl_bind_text, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_text16'),
+    @tcl_bind_text16, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_blob'),
+    @tcl_bind_blob, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_zeroblob'),
+    @tcl_bind_zeroblob, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_zeroblob64'),
+    @tcl_bind_zeroblob64, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_value_from_select'),
+    @tcl_bind_value_from_select, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_parameter_count'),
+    @tcl_bind_parameter_count, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_parameter_name'),
+    @tcl_bind_parameter_name, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_parameter_index'),
+    @tcl_bind_parameter_index, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_clear_bindings'),
+    @tcl_clear_bindings, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('hexio_read'),
+    @tcl_hexio_read, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('hexio_write'),
+    @tcl_hexio_write, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('hexio_get_int'),
+    @tcl_hexio_get_int, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('hexio_render_int16'),
+    @tcl_hexio_render_int16, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('hexio_render_int32'),
+    @tcl_hexio_render_int32, nil, nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
     regression tests (between.test's `queryplan` proc, etc.) can
     verify the optimizer correctly elides ORDER BY sorts. }
