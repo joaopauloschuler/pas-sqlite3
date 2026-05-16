@@ -31660,11 +31660,35 @@ begin
       annotation that distinguishes a sorter-driven ORDER BY from one
       satisfied by an index. }
     i := sqlite3VdbeCurrentAddr(v);
-    sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
-                      sqlite3MPrintf(pParse^.db,
-                                     'USE TEMP B-TREE FOR %s',
-                                     ['ORDER BY']),
-                      P4_DYNAMIC);
+    { select.c:1702..1711 — when the planner already satisfies a leading
+      prefix of ORDER BY (pWInfo^.nOBSat>0), distinguish single-trailing-key
+      "LAST TERM OF ORDER BY" from multi-trailing-key "LAST N TERMS OF
+      ORDER BY".  Otherwise plain "ORDER BY". }
+    if (pWInfo^.nOBSat = 0)
+       or ((p^.pOrderBy <> nil)
+           and ((p^.pOrderBy^.nExpr - pWInfo^.nOBSat) = 1)) then
+    begin
+      if pWInfo^.nOBSat <> 0 then
+        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                          sqlite3MPrintf(pParse^.db,
+                                         'USE TEMP B-TREE FOR %s',
+                                         ['LAST TERM OF ORDER BY']),
+                          P4_DYNAMIC)
+      else
+        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                          sqlite3MPrintf(pParse^.db,
+                                         'USE TEMP B-TREE FOR %s',
+                                         ['ORDER BY']),
+                          P4_DYNAMIC);
+    end
+    else
+    begin
+      sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                        sqlite3MPrintf(pParse^.db,
+                                       'USE TEMP B-TREE FOR LAST %d TERMS OF ORDER BY',
+                                       [p^.pOrderBy^.nExpr - pWInfo^.nOBSat]),
+                        P4_DYNAMIC);
+    end;
     if addrSortBrk = 0 then
       addrSortBrk := sqlite3VdbeMakeLabel(pParse);
     if bUseSorter <> 0 then
