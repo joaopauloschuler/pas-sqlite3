@@ -21094,6 +21094,29 @@ begin
       Exit(nil);
     end;
 
+    { where.c:7218..7237 — for DELETE/UPDATE plans (WHERE_ONEPASS_DESIRED)
+      that target a rowid table, clear WHERE_IDX_ONLY on the driving
+      WhereLoop: the caller will need the table cursor live for the
+      delete/update proper, so the loop must scan the table-cursor side
+      too.  This also suppresses the EQP "USING COVERING INDEX" tag in
+      favour of plain "USING INDEX" for these plans (divbug.55).
+
+      NB: we apply the wsFlags clear unconditionally on ONEPASS_DESIRED
+      (without writing pWInfo^.eOnePass) — the pas-side ONEPASS execution
+      path is rowid-EQ only today; broader ONEPASS adoption stays
+      deferred, but the EQP shape must match C either way. }
+    if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
+    begin
+      pLoop := whereInfoLevels(pWInfo)[0].pWLoop;
+      pTab  := SrcListItems(pTabList)[0].pSTab;
+      if HasRowid(pTab)
+         and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0)
+         and (pTab^.eTabType <> TABTYP_VTAB) then
+      begin
+        pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
+      end;
+    end;
+
     { where.c:7242..7423 — open a cursor for every level.
       Simplified: skip virtual-table, WHERE_INDEXED, RIGHT JOIN, and ONEPASS
       branches.  Only plain OP_OpenRead fires for the shapes exercised by
@@ -21361,9 +21384,11 @@ begin
     the scan is not a MULTI-OR (or the caller granted DUPLICATES_OK),
     and the OnePass optimisation is enabled.
 
-    bFordelete / WHERE_IDX_ONLY clearing is deferred — Pas planner does
-    not currently emit covering-index DELETE plans, so the gate has no
-    work to do on those bits. }
+    For ONEPASS DELETE/UPDATE, also clear WHERE_IDX_ONLY when the table
+    has a rowid: the caller needs the table cursor open for the delete
+    proper, so the loop must scan the table-cursor side too.  This also
+    suppresses the "USING COVERING INDEX" tag in EQP output for
+    DELETE/UPDATE plans (where.c:7230..7234). }
   if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
   begin
     if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
@@ -21379,6 +21404,16 @@ begin
     begin
       pWInfo^.eOnePass := ONEPASS_MULTI;
       pWInfo^.aiCurOnePass[0] := pLevel^.iTabCur;
+    end;
+    { where.c:7230..7234 — for ONEPASS rowid tables, clear WHERE_IDX_ONLY
+      since the table cursor must be live for the delete itself.  This
+      also makes EQP report plain "USING INDEX" (not "USING COVERING
+      INDEX") for these DELETE/UPDATE plans (divbug.55). }
+    if (pWInfo^.eOnePass <> ONEPASS_OFF)
+       and HasRowid(pTab)
+       and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0) then
+    begin
+      pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
     end;
   end;
 
@@ -27798,6 +27833,18 @@ var
   iTabTnct:    i32;
   pDistKey:    PKeyInfo2;
   rDistTmp:    i32;
+  addrDistinctEph: i32;            { addr of OP_OpenEphemeral for DISTINCT
+                                     dedup; -1 when not opened.  Used to
+                                     noop the eph when WHERE layer satisfies
+                                     DISTINCT (select.c:8292..8294 +
+                                     8905..8907 — divbug.55). }
+  eTnctTypeSel: i32;               { WHERE_DISTINCT_* result from
+                                     sqlite3WhereIsDistinct (NOOP, UNORDERED,
+                                     UNIQUE, ORDERED). }
+  wctrlFlagsSel: u16;
+  regPrevTnct: i32;                { regPrev for ORDERED dedup arm. }
+  iJumpTnct:   i32;
+  pCollTnct:   PCollSeq;
   { GROUP BY aggregate locals — select.c:8454..8669 (groupBySort=1 only). }
   pGroupByLoc: PExprList;
   pHavingLoc:  PExpr;
@@ -31320,12 +31367,13 @@ begin
     optimisations require passing WHERE_WANT_DISTINCT into
     sqlite3WhereBegin and are deferred. }
   iTabTnct := -1;
+  addrDistinctEph := -1;
   if (p^.selFlags and SF_Distinct) <> 0 then
   begin
     iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
     pDistKey := sqlite3KeyInfoFromExprList(pParse, pEList, 0, 0);
-    sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
-                      PAnsiChar(pDistKey), P4_KEYINFO);
+    addrDistinctEph := sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
+                                         PAnsiChar(pDistKey), P4_KEYINFO);
     sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
   end;
 
@@ -31472,11 +31520,43 @@ begin
   {$IFDEF SQLITE_DEBUG}
   TreeTraceLine($2, 'WhereBegin');  { select.c:8279 }
   {$ENDIF}
+  { Pass WHERE_WANT_DISTINCT when DISTINCT was requested so the WHERE
+    layer can elect a covering / ordered scan that obviates the dedup
+    ephemeral (select.c:8267).  Also forward SF_FixedLimit (== WHERE_USE_LIMIT)
+    so the planner can stop early on LIMIT plans. }
+  wctrlFlagsSel := 0;
+  if (p^.selFlags and SF_Distinct) <> 0 then
+    wctrlFlagsSel := wctrlFlagsSel or WHERE_WANT_DISTINCT;
+  if (p^.selFlags and SF_FixedLimit) <> 0 then
+    wctrlFlagsSel := wctrlFlagsSel or u16(SF_FixedLimit);
   pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
-                              pEList, p, 0, 0);
+                              pEList, p, wctrlFlagsSel, 0);
   if pWInfo = nil then
   begin
     Result := SQLITE_ERROR; Exit;
+  end;
+  { select.c:8292..8294 — if the WHERE layer can satisfy DISTINCT, capture
+    its mode.  WHERE_DISTINCT_UNIQUE means the scan emits each row once;
+    WHERE_DISTINCT_ORDERED means consecutive duplicates can be detected
+    with a single OP_Eq.  Either way we noop the dedup ephemeral and
+    suppress the "USE TEMP B-TREE FOR DISTINCT" EQP detail. }
+  eTnctTypeSel := WHERE_DISTINCT_NOOP;
+  if ((p^.selFlags and SF_Distinct) <> 0) and (iTabTnct >= 0) then
+  begin
+    eTnctTypeSel := sqlite3WhereIsDistinct(pWInfo);
+    if (eTnctTypeSel = WHERE_DISTINCT_UNIQUE)
+       or (eTnctTypeSel = WHERE_DISTINCT_ORDERED) then
+    begin
+      if addrDistinctEph >= 0 then
+        sqlite3VdbeChangeToNoop(v, addrDistinctEph);
+      { For UNIQUE the WHERE layer guarantees per-row uniqueness — drop
+        the dedup ephemeral entirely.  For ORDERED, the dedup site below
+        falls back to a regPrev / OP_Ne|OP_Eq compare (select.c
+        codeDistinct lines 946..970).  Clearing iTabTnct suppresses the
+        EQP "USE TEMP B-TREE FOR DISTINCT" detail in both cases
+        (divbug.55). }
+      iTabTnct := -1;
+    end;
   end;
   {$IFDEF SQLITE_DEBUG}
   TreeTraceLine($2, 'WhereBegin returns');  { select.c:8302 }
@@ -31585,9 +31665,13 @@ begin
           sqlite3ExprCode(pParse, pE, pDest^.iSdst + i);
       end;
 
-    { DISTINCT dedup — codeDistinct WHERE_DISTINCT_UNORDERED
-      (select.c:978..988).  Inserted before any disposal so the per-row
-      arms below see only first-occurrence rows. }
+    { DISTINCT dedup — codeDistinct (select.c:933..985).
+      Dispatch on eTnctTypeSel determined after sqlite3WhereBegin:
+        UNORDERED — full OP_Found / OP_IdxInsert against the ephemeral.
+        ORDERED   — OP_Ne/OP_Eq chain against a regPrev row, then OP_Copy
+                    over the previous-row buffer.  Ephemeral was noop'd
+                    above (divbug.55).
+        UNIQUE    — nothing to do; WHERE layer guarantees uniqueness. }
     if iTabTnct >= 0 then
     begin
       rDistTmp := sqlite3GetTempReg(pParse);
@@ -31599,6 +31683,31 @@ begin
                            pDest^.iSdst, nResultCol);
       sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
       sqlite3ReleaseTempReg(pParse, rDistTmp);
+    end
+    else if eTnctTypeSel = WHERE_DISTINCT_ORDERED then
+    begin
+      { Port of codeDistinct ORDERED arm (select.c:946..970).  Allocate
+        nResultCol regs starting at regPrev to hold the previous row;
+        for each column emit OP_Ne (jumps past the Copy when different)
+        or OP_Eq on last (jumps to iContinue when fully equal). }
+      regPrevTnct := pParse^.nMem + 1;
+      Inc(pParse^.nMem, nResultCol);
+      { Initialize regPrev[0] = NULL so first iteration's OP_Eq fails. }
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regPrevTnct);
+      iJumpTnct := sqlite3VdbeCurrentAddr(v) + nResultCol;
+      for jj := 0 to nResultCol - 1 do
+      begin
+        pCollTnct := sqlite3ExprCollSeq(pParse, ExprListItems(pEList)[jj].pExpr);
+        if jj < nResultCol - 1 then
+          sqlite3VdbeAddOp3(v, OP_Ne, pDest^.iSdst + jj, iJumpTnct,
+                            regPrevTnct + jj)
+        else
+          sqlite3VdbeAddOp3(v, OP_Eq, pDest^.iSdst + jj, pWInfo^.iContinue,
+                            regPrevTnct + jj);
+        sqlite3VdbeChangeP4(v, -1, PAnsiChar(pCollTnct), P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+      end;
+      sqlite3VdbeAddOp3(v, OP_Copy, pDest^.iSdst, regPrevTnct, nResultCol - 1);
     end;
 
     { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits
