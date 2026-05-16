@@ -3907,18 +3907,97 @@ end;
 { Phase 6.7 window stubs — real implementations follow at end of file }
 
 { Stubs for rename/auth/cleanup (Phase 6.5/6.6) }
+{ sqlite3AffinityType — port of build.c:1651..1717.  Scan zIn for the
+  substrings CHAR/CLOB/TEXT/BLOB/REAL/FLOA/DOUB/INT using a rolling 4-byte
+  lowercase hash; precedence is INT > TEXT-family > BLOB(only if still
+  NUMERIC/REAL) > REAL-family(only if NUMERIC).  Default NUMERIC.
+  The first-character switch was a stub that mis-ranked compound type
+  names like 'NATIONAL CHARACTER(15)' (→ NUMERIC) and 'LONG INTEGER'
+  (→ BLOB).  See 9.4.divbug.40.b. }
 function sqlite3AffinityType(zIn: PAnsiChar; pColl: Pointer): AnsiChar;
+var
+  h:     u32;
+  aff:   AnsiChar;
+  zChar: PAnsiChar;
+  pCol:  PColumn;
+  v:     i32;
+  x:     u8;
+  p:     PAnsiChar;
 begin
-  { Minimal implementation: recognise type names }
   if zIn = nil then begin Result := AnsiChar(SQLITE_AFF_BLOB); Exit; end;
-  case UpCase(Char(zIn[0])) of
-    'I': Result := AnsiChar(SQLITE_AFF_INTEGER);
-    'R', 'F', 'D': Result := AnsiChar(SQLITE_AFF_REAL);
-    'T', 'C', 'V': Result := AnsiChar(SQLITE_AFF_TEXT);
-    'N': Result := AnsiChar(SQLITE_AFF_NUMERIC);
-  else
-    Result := AnsiChar(SQLITE_AFF_BLOB);
+  h     := 0;
+  aff   := AnsiChar(SQLITE_AFF_NUMERIC);
+  zChar := nil;
+  p     := zIn;
+  while p^ <> #0 do
+  begin
+    x := u8(Byte(p^));
+    h := (h shl 8) + u32(u8(sqlite3UpperToLower[x]));
+    Inc(p);
+    if h = (u32(Ord('c')) shl 24) + (u32(Ord('h')) shl 16) + (u32(Ord('a')) shl 8) + u32(Ord('r')) then
+    begin
+      aff := AnsiChar(SQLITE_AFF_TEXT);
+      zChar := p;
+    end
+    else if h = (u32(Ord('c')) shl 24) + (u32(Ord('l')) shl 16) + (u32(Ord('o')) shl 8) + u32(Ord('b')) then
+      aff := AnsiChar(SQLITE_AFF_TEXT)
+    else if h = (u32(Ord('t')) shl 24) + (u32(Ord('e')) shl 16) + (u32(Ord('x')) shl 8) + u32(Ord('t')) then
+      aff := AnsiChar(SQLITE_AFF_TEXT)
+    else if (h = (u32(Ord('b')) shl 24) + (u32(Ord('l')) shl 16) + (u32(Ord('o')) shl 8) + u32(Ord('b')))
+        and ((aff = AnsiChar(SQLITE_AFF_NUMERIC)) or (aff = AnsiChar(SQLITE_AFF_REAL))) then
+    begin
+      aff := AnsiChar(SQLITE_AFF_BLOB);
+      if p^ = '(' then zChar := p;
+    end
+    else if (h = (u32(Ord('r')) shl 24) + (u32(Ord('e')) shl 16) + (u32(Ord('a')) shl 8) + u32(Ord('l')))
+        and (aff = AnsiChar(SQLITE_AFF_NUMERIC)) then
+      aff := AnsiChar(SQLITE_AFF_REAL)
+    else if (h = (u32(Ord('f')) shl 24) + (u32(Ord('l')) shl 16) + (u32(Ord('o')) shl 8) + u32(Ord('a')))
+        and (aff = AnsiChar(SQLITE_AFF_NUMERIC)) then
+      aff := AnsiChar(SQLITE_AFF_REAL)
+    else if (h = (u32(Ord('d')) shl 24) + (u32(Ord('o')) shl 16) + (u32(Ord('u')) shl 8) + u32(Ord('b')))
+        and (aff = AnsiChar(SQLITE_AFF_NUMERIC)) then
+      aff := AnsiChar(SQLITE_AFF_REAL)
+    else if (h and $00FFFFFF) = (u32(Ord('i')) shl 16) + (u32(Ord('n')) shl 8) + u32(Ord('t')) then
+    begin
+      aff := AnsiChar(SQLITE_AFF_INTEGER);
+      Break;
+    end;
   end;
+
+  pCol := PColumn(pColl);
+  if pCol <> nil then
+  begin
+    v := 0;
+    if u8(aff) < SQLITE_AFF_NUMERIC then
+    begin
+      if zChar <> nil then
+      begin
+        while zChar^ <> #0 do
+        begin
+          if sqlite3Isdigit(u8(Byte(zChar^))) <> 0 then
+          begin
+            { Inline minimal positive decimal parse for BLOB(k)/VARCHAR(k)/CHAR(k). }
+            v := 0;
+            while (zChar^ <> #0) and (sqlite3Isdigit(u8(Byte(zChar^))) <> 0) do
+            begin
+              v := v * 10 + (Ord(zChar^) - Ord('0'));
+              Inc(zChar);
+              if v > 1000000 then begin v := 1000000; Break; end;
+            end;
+            Break;
+          end;
+          Inc(zChar);
+        end;
+      end
+      else
+        v := 16;
+    end;
+    v := v div 4 + 1;
+    if v > 255 then v := 255;
+    pCol^.szEst := u8(v);
+  end;
+  Result := aff;
 end;
 
 { sqlite3ParserAddCleanup implemented in Phase 6.5 section below }
@@ -41176,8 +41255,9 @@ begin
     pCol := @p^.aCol[p^.nCol - 1];
     if sqlite3ExprIsConstantOrFunction(pExpr, isInit) = 0 then
     begin
-      sqlite3ErrorMsg(pParse,
-        PAnsiChar('default value of column is not constant'));
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'default value of column [%s] is not constant',
+        [pCol^.zCnName]));
     end
     else if (pCol^.colFlags and COLFLAG_GENERATED) <> 0 then
     begin
