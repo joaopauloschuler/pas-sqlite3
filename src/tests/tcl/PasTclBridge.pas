@@ -293,6 +293,13 @@ function  Tcl_DStringAppend(dsPtr: PTclDString; bytes: PChar; length: cint): PCh
 function  Tcl_DStringAppendElement(dsPtr: PTclDString; element: PChar): PChar; cdecl; external 'tcl8.6';
 procedure Tcl_DStringFree(dsPtr: PTclDString); cdecl; external 'tcl8.6';
 function  Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+{ Tcl_TranslateFileName — Tcl 8.6.  Expands ~user/ etc.; on success returns
+  a pointer into bufferPtr (which the caller must Tcl_DStringFree).  On
+  error returns nil and leaves a message in interp.  Mirrors C usage at
+  tclsqlite.c:4378. }
+function  Tcl_TranslateFileName(interp: PTclInterp; name: PChar;
+                                bufferPtr: PTclDString): PChar;
+                                cdecl; external 'tcl8.6';
 
 { ----------------------------------------------------------------------
   Tcl I/O channels — used by the DB_COPY arm of DbObjCmd
