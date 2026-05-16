@@ -20858,6 +20858,39 @@ begin
   pPrs^.pIdxPartExpr := saved_pIdxPartExpr;
 end;
 
+{ 9.4.divbug.83 — port where.c:6726..6738 whereReverseScanOrder.  Set
+  revMask bit for every FROM-list scan that should run in reverse order;
+  the only exception is a MATERIALIZED CTE whose body has its own ORDER
+  BY (its declared order is preserved).  Mirrors the C field accesses:
+  pItem->fg.isCte, pItem->u2.pCteUse->eM10d, pItem->fg.isSubquery,
+  pItem->u4.pSubq->pSelect->pOrderBy. }
+procedure whereReverseScanOrder(pWInfo: PWhereInfo);
+var
+  ii: Integer;
+  pItem: PSrcItem;
+  pSubq: PSubquery;
+  isCte_, hasOwnOB: Boolean;
+begin
+  pItem := SrcListItems(pWInfo^.pTabList);
+  for ii := 0 to pWInfo^.pTabList^.nSrc - 1 do
+  begin
+    isCte_   := (pItem[ii].fg.fgBits2 and u8($02)) <> 0;
+    hasOwnOB := False;
+    if isCte_
+       and (pItem[ii].u2.pCteUse <> nil)
+       and (pItem[ii].u2.pCteUse^.eM10d = u8(0))   { M10d_Yes }
+       and SrcItemIsSubquery(pItem[ii].fg)
+       and (pItem[ii].u4.pSubq <> nil) then
+    begin
+      pSubq := PSubquery(pItem[ii].u4.pSubq);
+      if (pSubq^.pSelect <> nil) and (pSubq^.pSelect^.pOrderBy <> nil) then
+        hasOwnOB := True;
+    end;
+    if not hasOwnOB then
+      pWInfo^.revMask := pWInfo^.revMask or (Bitmask(1) shl ii);
+  end;
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
@@ -21208,6 +21241,15 @@ begin
     sqlite3WhereCodeOneLoopStart Case 4.  Without this gate,
     `SELECT b FROM t WHERE a=N` silently returns 0 rows when N does
     not happen to coincide with an existing rowid. }
+  { 9.4.divbug.83 — apply whereReverseScanOrder up-front so both the
+    full-planner block (which Exits before reaching the second hook below)
+    and the inline single-table fast path see the same revMask.  C calls
+    whereReverseScanOrder once at where.c:7125; we mirror that here to
+    cover the fast path's plan-selected level-0 loop.  Idempotent: the
+    in-block call later will only re-OR the same bits. }
+  if (pWInfo^.pOrderBy = nil) and ((db^.flags and SQLITE_ReverseOrder) <> 0) then
+    whereReverseScanOrder(pWInfo);
+
   if fSingleTabCoroutine
      or (nTabList <> 1)
      or (whereShortCut(@sWLB) = 0)
@@ -21272,6 +21314,16 @@ begin
       {$ENDIF}
       pWInfo^.nRowOut := i16(pWInfo^.nRowOut - 30);
     end;
+
+    { 9.4.divbug.83 — port where.c:7124..7127 whereReverseScanOrder hook.
+      When PRAGMA reverse_unordered_selects=ON and the query has no ORDER
+      BY, flip every FROM-list scan into reverse order via revMask.  Skip
+      MATERIALIZED CTEs whose body has its own ORDER BY (they preserve
+      their declared order).  Without this the SQLITE_ReverseOrder flag is
+      latched but never consulted, so whereA-1.2 returns rows in insertion
+      order. }
+    if (pWInfo^.pOrderBy = nil) and ((db^.flags and SQLITE_ReverseOrder) <> 0) then
+      whereReverseScanOrder(pWInfo);
 
     if pParse^.nErr <> 0 then
     begin
@@ -21899,6 +21951,19 @@ begin
     end;
     Assert((pStart <> nil) or (pEnd <> nil));
 
+    { 9.4.divbug.83 — port wherecode.c:1727..1731 bRev swap.  This inline
+      single-level fast path runs at level 0, so bRev = revMask bit 0.
+      When PRAGMA reverse_unordered_selects=ON (or the planner picked
+      this loop in reverse), the start/end bounds and the Rewind/Last
+      direction must flip together so the IPK-range scan walks rows in
+      descending rowid order. }
+    if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+    begin
+      pTerm  := pStart;
+      pStart := pEnd;
+      pEnd   := pTerm;
+    end;
+
     if pStart <> nil then
     begin
       Assert((pStart^.wtFlags and TERM_VNULL) = 0);
@@ -21918,6 +21983,8 @@ begin
       sqlite3VdbeAddOp3(v, op3, pLevel^.iTabCur, pLevel^.addrBrk, r1);
       sqlite3ReleaseTempReg(pParse, rTemp);
     end
+    else if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+      sqlite3VdbeAddOp2(v, OP_Last,   pLevel^.iTabCur, pLevel^.addrHalt)
     else
       sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrHalt);
 
@@ -21929,15 +21996,30 @@ begin
       Inc(pParse^.nMem);
       memEndValue := pParse^.nMem;
       sqlite3ExprCode(pParse, pX^.pRight, memEndValue);
+      { 9.4.divbug.83 — port wherecode.c:1794..1800 bRev branch of testOp.
+        Strict bounds (TK_LT / TK_GT) use Ge/Le; non-strict use Gt/Lt. }
       if (pX^.op = TK_LT) or (pX^.op = TK_GT_TK) then
-        testOp := OP_Ge
+      begin
+        if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+          testOp := OP_Le
+        else
+          testOp := OP_Ge;
+      end
       else
-        testOp := OP_Gt;
+      begin
+        if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+          testOp := OP_Lt
+        else
+          testOp := OP_Gt;
+      end;
       disableTerm(pLevel, pEnd);
     end;
 
     startAddr := sqlite3VdbeCurrentAddr(v);
-    pLevel^.op := OP_Next;
+    if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+      pLevel^.op := OP_Prev
+    else
+      pLevel^.op := OP_Next;
     pLevel^.p1 := pLevel^.iTabCur;
     pLevel^.p2 := startAddr;
     { 10.1.39.b — do NOT overwrite pLevel^.addrBody here.  In C
@@ -21991,7 +22073,13 @@ begin
     end
     else
     begin
-      sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
+      { 9.4.divbug.83 — port wherecode.c:2574..2576 aStart/aStep[bRev].
+        Reverse-order plain scan at level 0: Last+Prev instead of
+        Rewind+Next when revMask bit 0 is set. }
+      if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+        sqlite3VdbeAddOp2(v, OP_Last,   pLevel^.iTabCur, pLevel^.addrBrk)
+      else
+        sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
       { 10.1.39.b — keep addrBody = Rewind addr (from where.c:7467 mirror);
         track the post-Rewind landing site locally for OP_Next.p2. }
       startAddr := sqlite3VdbeCurrentAddr(v);
@@ -22000,7 +22088,10 @@ begin
         sqlite3VdbeAddOp0(v, OP_Noop);
         DoInRhsHoist;
       end;
-      pLevel^.op := OP_Next;
+      if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+        pLevel^.op := OP_Prev
+      else
+        pLevel^.op := OP_Next;
       pLevel^.p1 := pLevel^.iTabCur;
       pLevel^.p2 := startAddr;
       { pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP — stmt-status counter
