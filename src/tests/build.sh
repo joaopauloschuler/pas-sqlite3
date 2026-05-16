@@ -218,6 +218,7 @@ compile_test TestShellArchive
 compile_test TestShellDbinfo
 compile_test TestShellFilectrl
 compile_test TestShellMisc
+compile_test TestCliParity
 compile_test TestVtabLateral
 compile_test TestExplainParity
 compile_test TestBytecodeParity
