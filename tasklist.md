@@ -1181,7 +1181,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.046** `json502` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [x] **9.4.divbug.88.047** `laststmtchanges` — ported `sqlite3_exec_printf` Tcl trampoline (test1.c:299..328; reuses execPrintfCb at TestModuleTest1.pas:641, sqlite3PfMprintf wrapper). Registered TestModuleTest1.pas via Tcl_CreateCommand (C ref test1.c:9072). laststmtchanges → PASS 6/205.
   - [ ] **9.4.divbug.88.048** `lock5` — SOURCE-ERROR: invalid command name "db2"
-  - [ ] **9.4.divbug.88.049** `main` — ! main-1.1 error: unknown subcommand "complete" - implemented in 9.4.2.d..o
+  - [X] **9.4.divbug.88.049** `main` — ported `db complete SQL` arm (tclsqlite.c:2844 → PasTclSqlite.pas:4183); main.test now PASS 218/218.
   - [x] **9.4.divbug.88.050** `memsubsys1` — SOURCE-ERROR: invalid command name "sqlite3_config_lookaside"
   - [x] **9.4.divbug.88.051** `memsubsys2` — SOURCE-ERROR: invalid command name "sqlite3_config_memstatus"
   - [ ] **9.4.divbug.88.052** `misc6` — ! misc6-1.1 error: invalid command name "sqlite_bind"

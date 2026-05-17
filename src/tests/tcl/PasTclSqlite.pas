@@ -31,6 +31,7 @@ function Sqlite3_SafeInit(interp: PTclInterp): cint; cdecl;
 implementation
 
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
+     passqlite3parser,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
      passqlite3percentile, passqlite3regexp,
      TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
@@ -4177,6 +4178,24 @@ begin
   if (zSub <> nil) and (StrComp(zSub, 'commit_hook') = 0) then
   begin
     Result := DbCommitHookArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { complete — tclsqlite.c:2844 (DB_COMPLETE).  `db complete SQL` returns
+    1 iff SQL parses as a complete statement (trailing `;`), 0 otherwise.
+    Faithful 1:1 port of the C arm. }
+  if (zSub <> nil) and (StrComp(zSub, 'complete') = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('SQL'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Tcl_SetObjResult(interp,
+      Tcl_NewBooleanObj(sqlite3_complete(
+        Tcl_GetStringFromObj(ObjvAt(objv, 2), nil))));
+    Result := TCL_OK;
     Exit;
   end;
 
