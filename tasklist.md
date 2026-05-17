@@ -1158,11 +1158,11 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.023** `corruptN` — ported decode_hexdb Tcl cmd (test1.c:8837..8910) into TestModuleTest1.pas:2290..2452; prologue cleared, driver now executes 17/256 corruptN-1.* subtests instead of SOURCE-ERROR'ing at line 1.
   - [X] **9.4.divbug.88.024** `dataversion1` — ported file_control_data_version Tcl trampoline (TestModuleTest1.pas; C ref test1.c:6873..6903, registered :9249).  Wraps sqlite3_file_control(db, zDb, SQLITE_FCNTL_DATA_VERSION, &iVers); objc==2→zDb=NULL; rc<>0→sqlite3ErrName + TCL_ERROR; success returns decimal of unsigned int.  dataversion1 now PASS (8/78).
   - [ ] **9.4.divbug.88.025** `delete_db` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"
-  - [ ] **9.4.divbug.88.026** `e_createtable` — SOURCE-ERROR: invalid command name "do_select_tests"
-  - [ ] **9.4.divbug.88.027** `e_dropview` — SOURCE-ERROR: invalid command name "do_select_tests"
-  - [ ] **9.4.divbug.88.028** `e_reindex` — SOURCE-ERROR: invalid command name "do_select_tests"
-  - [ ] **9.4.divbug.88.029** `e_select2` — SOURCE-ERROR: invalid command name "drop_all_tables"
-  - [ ] **9.4.divbug.88.030** `e_update` — SOURCE-ERROR: invalid command name "do_select_tests"
+  - [X] **9.4.divbug.88.026** `e_createtable` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (145 PASS / 4 FAIL of 149).
+  - [X] **9.4.divbug.88.027** `e_dropview` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (48 PASS / 0 FAIL).
+  - [X] **9.4.divbug.88.028** `e_reindex` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (100 PASS / 15 FAIL of 115).
+  - [X] **9.4.divbug.88.029** `e_select2` — SOURCE-ERROR cleared via drop_all_tables port at tester.tcl:2253..2275 (do_select_tests also added); downstream subtests now run (199 PASS / 6 FAIL of 205).
+  - [X] **9.4.divbug.88.030** `e_update` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (136 PASS / 12 FAIL of 148).
   - [X] **9.4.divbug.88.031** `e_uri` — sqlite3_close / sqlite3_close_v2 Tcl trampolines ported (TestModuleTest1.pas test_close + test_close_v2; C ref test1.c:684..725, registered :9079..9080). Engine entries already exported (passqlite3main.pas:1015,1020). SOURCE-ERROR: invalid command name "sqlite3_close" cleared in e_uri.test; now runs 21 cases (13 PASS / 8 FAIL) — remaining failures are deeper assertions. close.test also advances (39 PASS / 12 FAIL).
   - [ ] **9.4.divbug.88.032** `e_wal` — SOURCE-ERROR: invalid command name "testvfs"
   - [ ] **9.4.divbug.88.033** `e_walauto` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
