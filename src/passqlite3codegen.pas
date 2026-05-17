@@ -44304,6 +44304,8 @@ var
   zCollName:   PAnsiChar;
   jj:          i32;
   isDup:       Boolean;
+  sortOrderMask: i32;
+  requestedSortOrder: i32;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -44474,6 +44476,14 @@ begin
   if InRenameObject(pParse) then begin
     pIndex^.aColExpr := pList;
   end;
+  { build.c:4190..4196 — honour DESC sort order on indexed columns only
+    when the schema file_format is >= 4.  Older databases must ignore the
+    DESC qualifier (sortOrderMask=0) so the on-disk b-tree direction stays
+    backwards-compatible. }
+  if pDb^.pSchema^.file_format >= 4 then
+    sortOrderMask := -1
+  else
+    sortOrderMask := 0;
   for i := 0 to i32(pList^.nExpr) - 1 do
   begin
     n := -1;
@@ -44568,7 +44578,13 @@ begin
         (PPAnsiChar(pIndex^.azColl) + i)^ := zCollName;
     end else
       (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
-    (pIndex^.aSortOrder + i)^ := 0;
+    { build.c:4270..4271 — store the per-column ASC/DESC bit (masked by
+      sortOrderMask so legacy file_format<4 schemas ignore DESC). }
+    requestedSortOrder :=
+      i32(PExprListItem(PByte(ExprListItems(pList))
+                        + i * SizeOf(TExprListItem))^.fg.sortFlags)
+      and sortOrderMask;
+    (pIndex^.aSortOrder + i)^ := u8(requestedSortOrder);
   end;
   { Append rowid (or pPk key cols) as the implicit tail.  WITHOUT ROWID
     tables: copy each pPk key column (skipping duplicates already in
