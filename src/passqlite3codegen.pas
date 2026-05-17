@@ -51378,7 +51378,7 @@ const
     activate_extensions (CEROD), data_store_directory (Win32),
     lock_proxy_file (LOCKING_STYLE), lock_status / parser_trace / sql_trace
     / stats / vdbe_* (DEBUG/TEST only). }
-  aPragmaName: array[0..65] of TPragmaName = (
+  aPragmaName: array[0..66] of TPragmaName = (
     (zName: 'analysis_limit';            ePragTyp: PragTyp_ANALYSIS_LIMIT;
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'application_id';            ePragTyp: PragTyp_HEADER_VALUE;
@@ -51456,6 +51456,10 @@ const
      mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq;                                  iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'legacy_alter_table';        ePragTyp: PragTyp_FLAG;
      mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_LegacyAlter),
+    { 9.4.divbug.87.048 — pragma.h:411..415 (gated SQLITE_DEBUG||SQLITE_TEST,
+      always-on in this port).  ColNames slot 53 = "database" (mirrors pragCName). }
+    (zName: 'lock_status';               ePragTyp: PragTyp_LOCK_STATUS;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName: 53; nPragCName: 2; iArg: 0),
     (zName: 'locking_mode';              ePragTyp: PragTyp_LOCKING_MODE;
      mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq;                                  iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'max_page_count';            ePragTyp: PragTyp_PAGE_COUNT;
@@ -51690,6 +51694,11 @@ var
   zModVIc:    PAnsiChar;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
+  { pragma.c:2744..2745 — LOCK_STATUS names (slots 0..4) plus
+    'unknown' (5) and 'closed' (6) for the Pas LOCK_STATUS arm. }
+  azLockName: array[0..6] of PAnsiChar = (
+    'unlocked', 'shared', 'reserved', 'pending', 'exclusive',
+    'unknown',  'closed');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
   { pragma.c:269 — actionName(): map ON DELETE/UPDATE action codes to text.
     Indexed by the FK action byte directly (OE_None=0, OE_Restrict=7,
@@ -51987,6 +51996,36 @@ begin
         sqlite3VdbeMultiLoad(v, 1, 'is', [i, Pointer(pCollA^.zName)]);
         Inc(i);
         pElemA := passqlite3util.PHashElem(pElemA^.next);
+      end;
+      Exit;
+    end;
+
+    { pragma.c:2743..2764 — PRAGMA lock_status.  Report each attached db's
+      lock state via sqlite3_file_control(SQLITE_FCNTL_LOCKSTATE).
+      9.4.divbug.87.048 — lock7-1.2 expected "main unlocked temp closed"
+      but got [] because this case arm was missing. }
+    PragTyp_LOCK_STATUS: begin
+      pParse^.nMem := 2;
+      i := 0;
+      while i < db^.nDb do begin
+        if db^.aDb[i].zDbSName = nil then begin
+          Inc(i); continue;
+        end;
+        pBtArg := PBtree(db^.aDb[i].pBt);
+        zType := azLockName[5]; { 'unknown' }
+        if (pBtArg = nil) or (sqlite3BtreePager(pBtArg) = nil) then
+          zType := azLockName[6] { 'closed' }
+        else begin
+          j := 0;
+          sqlite3BtreeEnter(pBtArg);
+          if sqlite3OsFileControl(sqlite3PagerFile(sqlite3BtreePager(pBtArg)),
+              SQLITE_FCNTL_LOCKSTATE, @j) = SQLITE_OK then
+            if (j >= 0) and (j <= 4) then zType := azLockName[j];
+          sqlite3BtreeLeave(pBtArg);
+        end;
+        sqlite3VdbeMultiLoad(v, 1, 'ss',
+          [Pointer(db^.aDb[i].zDbSName), Pointer(zType)]);
+        Inc(i);
       end;
       Exit;
     end;
