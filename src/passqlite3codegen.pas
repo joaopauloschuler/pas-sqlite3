@@ -51174,6 +51174,18 @@ begin
     Closing the remaining DiagPragma divergences. }
   pName := pragmaLocate(PAnsiChar(zName));
 
+  { pragma.c:521..524 — make sure the database schema is loaded if the
+    pragma requires it (PragFlg_NeedSchema).  Without this gate the
+    first PRAGMA integrity_check (and any other NeedSchema pragma)
+    issued on a fresh connection runs against an empty pSchema → only
+    the freelist root is walked; subsequent prepares then fail
+    "database schema has changed" because the cookie mismatch is only
+    detected mid-step (corruptC-2.x, divbug.87.006). }
+  if (pName <> nil) and ((pName^.mPragFlg and PragFlg_NeedSchema) <> 0) then
+  begin
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
+  end;
+
   { Register the result column names for pragmas that return results
     (pragma.c:526..531 setPragmaResultColumnNames).  Without this every
     PRAGMA's OP_ResultRow yields a 0-column row that the shell renders
