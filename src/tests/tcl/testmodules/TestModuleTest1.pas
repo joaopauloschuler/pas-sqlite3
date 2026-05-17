@@ -4593,6 +4593,56 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.031 — test1.c:684..701 sqlite_test_close.
+  Usage: sqlite3_close DB.  Engine: passqlite3main.pas:1015. }
+function test_close(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' FILENAME"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_close(db);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.88.031 — test1.c:708..725 sqlite_test_close_v2.
+  Usage: sqlite3_close_v2 DB.  Engine: passqlite3main.pas:1020. }
+function test_close_v2(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' FILENAME"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_close_v2(db);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.003 — test1.c:6383..6411 test_db_cacheflush.
   Usage: sqlite3_db_cacheflush DB.  Attempt to flush any dirty pages to
   disk.  Engine entry: passqlite3main.pas:4391 (main.c:921). }
@@ -4651,6 +4701,11 @@ begin
     @test_open_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_open16'),
     @test_open16, nil, nil);
+  { 9.4.divbug.88.031 — test1.c:9079..9080 sqlite3_close / _v2. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_close'),
+    @test_close, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_close_v2'),
+    @test_close_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg'),

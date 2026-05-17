@@ -1163,7 +1163,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.028** `e_reindex` — SOURCE-ERROR: invalid command name "do_select_tests"
   - [ ] **9.4.divbug.88.029** `e_select2` — SOURCE-ERROR: invalid command name "drop_all_tables"
   - [ ] **9.4.divbug.88.030** `e_update` — SOURCE-ERROR: invalid command name "do_select_tests"
-  - [ ] **9.4.divbug.88.031** `e_uri` — SOURCE-ERROR: invalid command name "sqlite3_close"
+  - [X] **9.4.divbug.88.031** `e_uri` — sqlite3_close / sqlite3_close_v2 Tcl trampolines ported (TestModuleTest1.pas test_close + test_close_v2; C ref test1.c:684..725, registered :9079..9080). Engine entries already exported (passqlite3main.pas:1015,1020). SOURCE-ERROR: invalid command name "sqlite3_close" cleared in e_uri.test; now runs 21 cases (13 PASS / 8 FAIL) — remaining failures are deeper assertions. close.test also advances (39 PASS / 12 FAIL).
   - [ ] **9.4.divbug.88.032** `e_wal` — SOURCE-ERROR: invalid command name "testvfs"
   - [ ] **9.4.divbug.88.033** `e_walauto` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [ ] **9.4.divbug.88.034** `enc3` — SOURCE-ERROR: invalid command name "sqlite3_enable_shared_cache"
