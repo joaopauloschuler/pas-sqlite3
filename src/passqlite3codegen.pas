@@ -22652,18 +22652,21 @@ begin
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 20 — IN-loop tail.
 
-        Trimmed port of where.c:7628..7673.  For loops with WHERE_IN_ABLE
-        and a populated u.in.aInLoop[] (today set up by Case 2 IPK-IN in
-        sqlite3WhereBegin), resolve addrNxt at the OP_Next emission point,
-        walk aInLoop in reverse, patch the OP_IsNull jump to addrNxt
-        (addrInTop+1), emit OP_Next iCur, addrInTop, then patch the
-        OP_Rewind jump-on-empty (addrInTop-1) to land just past OP_Next so
-        the post-loop addrBrk resolution exits cleanly.
+        Port of where.c:7628..7673.  For loops with WHERE_IN_ABLE and a
+        populated u.in.aInLoop[]: resolve addrNxt at the OP_Next emission
+        point, walk aInLoop in reverse, patch the OP_IsNull jump to
+        addrNxt (addrInTop+1), optionally emit the LEFT-JOIN IfNotOpen
+        bypass and the WHERE_IN_EARLYOUT OP_IfNoHope skip, then emit
+        OP_Next iCur, addrInTop, and patch the OP_Rewind jump-on-empty
+        (addrInTop-1) to land just past OP_Next so the post-loop addrBrk
+        resolution exits cleanly.
 
-        The full C tail also handles WHERE_IN_EARLYOUT / iLeftJoin /
-        WHERE_IN_SEEKSCAN — none exercised by the IPK-IN single-level slice
-        today, so they stay deferred (will land alongside the composite
-        index-IN scan plan in a later sub-progress). }
+        9.4.divbug.87.023 — port the WHERE_IN_EARLYOUT / iLeftJoin
+        sub-arm (where.c:7637..7664).  Without OP_IfNoHope, the
+        multikey-IN-operator early-out optimisation never fires:
+        in6-1.5 expects sqlite_search_count=39 but got 104 because every
+        IN value did a full index lookup instead of bailing once the
+        prefix went past the matching range. }
       pLoop := pLevel^.pWLoop;
       if ((pLoop^.wsFlags and WHERE_IN_ABLE) <> 0)
          and (pLevel^.u.in_nIn > 0)
@@ -22676,7 +22679,40 @@ begin
           Inc(pIn, j - 1);
           sqlite3VdbeJumpHere(v, pIn^.addrInTop + 1);
           if pIn^.eEndLoopOp <> OP_Noop then
+          begin
+            if pIn^.nPrefix <> 0 then
+            begin
+              { bEarlyOut: emit OP_IfNoHope to abandon the IN loop when
+                no row in the index can match the current prefix. }
+              if ((pLoop^.wsFlags and WHERE_VIRTUALTABLE) = 0)
+                 and ((pLoop^.wsFlags and WHERE_IN_EARLYOUT) <> 0) then
+              begin
+                if pLevel^.iLeftJoin <> 0 then
+                begin
+                  { LEFT JOIN: cursor pIn^.iCur may not have been opened
+                    yet (e.g. `a=? AND b IN(...)` with NULL a).  Skip
+                    over the OP_IfNoHope + OP_Next (2 ops) when not open. }
+                  sqlite3VdbeAddOp2(v, OP_IfNotOpen, pIn^.iCur,
+                    sqlite3VdbeCurrentAddr(v) + 3);
+                end;
+                sqlite3VdbeAddOp4Int(v, OP_IfNoHope, pLevel^.iIdxCur,
+                  sqlite3VdbeCurrentAddr(v) + 2,
+                  pIn^.iBase, pIn^.nPrefix);
+                { Retarget the OP_IsNull against the left operand of IN
+                  so it jumps past the OP_IfNoHope.  Without this the
+                  OP_IsNull would also bypass the OP_Affinity opcode
+                  that OP_IfNoHope requires. }
+                sqlite3VdbeJumpHere(v, pIn^.addrInTop + 1);
+              end
+              else if pLevel^.iLeftJoin <> 0 then
+              begin
+                { LEFT JOIN with no early-out: skip just the OP_Next. }
+                sqlite3VdbeAddOp2(v, OP_IfNotOpen, pIn^.iCur,
+                  sqlite3VdbeCurrentAddr(v) + 2);
+              end;
+            end;
             sqlite3VdbeAddOp2(v, pIn^.eEndLoopOp, pIn^.iCur, pIn^.addrInTop);
+          end;
           sqlite3VdbeJumpHere(v, pIn^.addrInTop - 1);
         end;
       end;
