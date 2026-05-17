@@ -4712,8 +4712,19 @@ begin
 
   { New() is safe here because TSqliteDb has no managed-type fields
     (zNull is a raw PAnsiChar, not an AnsiString).  See memory
-    feedback_new_record_ansistring for the trap to avoid. }
+    feedback_new_record_ansistring for the trap to avoid.
+
+    9.4.divbug.21 (residual, 2026-05-17): FPC `New()` does NOT zero the
+    record, and the individual field assignments below miss several
+    pointer / counter fields (pIncrblob, nStep/nSort/nIndex/nVMStep).
+    On a fresh heap those happen to be zero, but after busy.test's many
+    `sqlite3 db2 test.db` cycles the heap recycles dirty bytes and the
+    DbDeleteCmd → CloseIncrblobChannels walker dereferences garbage —
+    SIGSEGV at finish_test inside the tcl shutdown.  Stock C tclsqlite.c
+    uses `Tcl_Alloc` + explicit zeroing (`memset(p,0,sizeof(*p))` at
+    tclsqlite.c:4396).  Mirror that here. }
   New(pDb);
+  FillChar(pDb^, SizeOf(TSqliteDb), 0);
   pDb^.db       := pHandle;
   pDb^.interp   := interp;
   { tclsqlite.c:4400 — preserve the URI bit for backup/restore arms. }
