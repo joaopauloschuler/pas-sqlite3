@@ -55218,54 +55218,111 @@ begin
 end;
 
 procedure trimFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+{ 1:1 port of func.c:1569..1648 (trimFunc).  Splits zCharSet into UTF-8
+  characters via SQLITE_SKIP_UTF8 (lead byte >= 0xc0 → skip continuation
+  bytes 0x80..0xBF) and then trims by multi-byte character match, not by
+  individual bytes.  Function side (left/right/both) is selected from the
+  registered pUserData (1=ltrim, 2=rtrim, 3=trim). }
 var
-  z, zChars: PAnsiChar;
-  n, nChars, i, j, start, stop: i32;
-  doLeft, doRight: Boolean;
-  matched: Boolean;
-  pFd: PTFuncDef;
+  zIn:      PAnsiChar;            { input string }
+  zCharSet: PAnsiChar;            { set of characters to trim }
+  nIn:      u32;
+  flags:    i32;
+  i:        i32;
+  aLen:     PUInt32;              { length of each char in zCharSet }
+  azChar:   PPAnsiChar;           { individual chars in zCharSet }
+  nChar:    i32;
+  z, zSav:  PAnsiChar;
+  len:      u32;
+  blockSz:  PtrInt;
+  pFd:      PTFuncDef;
+  staticLenOne: u32;
+  staticAzOne:  PAnsiChar;
 begin
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
-  z := sqlite3_value_text(Psqlite3_value(argv^));
-  n := sqlite3_value_bytes(Psqlite3_value(argv^));
-  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
-  if argc >= 2 then begin
-    zChars := sqlite3_value_text(Psqlite3_value((argv+1)^));
-    nChars := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
-    if zChars = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  aLen := nil;
+  azChar := nil;
+  zCharSet := nil;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  zIn := sqlite3_value_text(Psqlite3_value(argv^));
+  if zIn = nil then Exit;
+  nIn := u32(sqlite3_value_bytes(Psqlite3_value(argv^)));
+  if argc = 1 then begin
+    staticLenOne := 1;
+    staticAzOne  := PAnsiChar(' ');
+    nChar  := 1;
+    aLen   := @staticLenOne;
+    azChar := @staticAzOne;
+    zCharSet := nil;
   end else begin
-    zChars := ' ';
-    nChars := 1;
-  end;
-  { Determine which sides to trim based on function name }
-  pFd := PTFuncDef(Psqlite3_context(pCtx)^.pFunc);
-  doLeft  := True;
-  doRight := True;
-  if pFd <> nil then begin
-    if sqlite3StrICmp(pFd^.zName, 'ltrim') = 0 then doRight := False;
-    if sqlite3StrICmp(pFd^.zName, 'rtrim') = 0 then doLeft  := False;
-  end;
-  start := 0;
-  stop  := n;
-  if doLeft then begin
-    while start < stop do begin
-      matched := False;
-      for j := 0 to nChars - 1 do
-        if (z + start)^ = (zChars + j)^ then begin matched := True; Break; end;
-      if matched then Inc(start) else Break;
+    zCharSet := sqlite3_value_text(Psqlite3_value((argv+1)^));
+    if zCharSet = nil then Exit;
+    z := zCharSet; nChar := 0;
+    while z^ <> #0 do begin
+      if u8(z^) >= $C0 then begin
+        Inc(z);
+        while (u8(z^) and $C0) = $80 do Inc(z);
+      end else
+        Inc(z);
+      Inc(nChar);
+    end;
+    if nChar > 0 then begin
+      blockSz := PtrInt(nChar) * (SizeOf(Pointer) + SizeOf(u32));
+      azChar := sqlite3_malloc(blockSz);
+      if azChar = nil then begin
+        sqlite3_result_error_nomem(pCtx); Exit;
+      end;
+      aLen := PUInt32(PAnsiChar(azChar) + PtrInt(nChar) * SizeOf(Pointer));
+      z := zCharSet; nChar := 0;
+      while z^ <> #0 do begin
+        (azChar + nChar)^ := z;
+        zSav := z;
+        if u8(z^) >= $C0 then begin
+          Inc(z);
+          while (u8(z^) and $C0) = $80 do Inc(z);
+        end else
+          Inc(z);
+        (aLen + nChar)^ := u32(z - zSav);
+        Inc(nChar);
+      end;
     end;
   end;
-  if doRight then begin
-    while stop > start do begin
-      matched := False;
-      for j := 0 to nChars - 1 do
-        if (z + stop - 1)^ = (zChars + j)^ then begin matched := True; Break; end;
-      if matched then Dec(stop) else Break;
+  if nChar > 0 then begin
+    pFd := PTFuncDef(Psqlite3_context(pCtx)^.pFunc);
+    flags := 3;
+    if pFd <> nil then begin
+      if sqlite3StrICmp(pFd^.zName, 'ltrim') = 0 then flags := 1
+      else if sqlite3StrICmp(pFd^.zName, 'rtrim') = 0 then flags := 2;
     end;
+    if (flags and 1) <> 0 then begin
+      while nIn > 0 do begin
+        len := 0;
+        i := 0;
+        while i < nChar do begin
+          len := (aLen + i)^;
+          if (len <= nIn) and CompareMem(zIn, (azChar + i)^, len) then Break;
+          Inc(i);
+        end;
+        if i >= nChar then Break;
+        Inc(zIn, len);
+        Dec(nIn, len);
+      end;
+    end;
+    if (flags and 2) <> 0 then begin
+      while nIn > 0 do begin
+        len := 0;
+        i := 0;
+        while i < nChar do begin
+          len := (aLen + i)^;
+          if (len <= nIn) and CompareMem(zIn + (nIn - len), (azChar + i)^, len) then Break;
+          Inc(i);
+        end;
+        if i >= nChar then Break;
+        Dec(nIn, len);
+      end;
+    end;
+    if zCharSet <> nil then sqlite3_free(azChar);
   end;
-  sqlite3_result_text(pCtx, z + start, stop - start, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, zIn, i32(nIn), SQLITE_TRANSIENT);
 end;
 
 procedure replaceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
