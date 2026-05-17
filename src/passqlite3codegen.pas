@@ -10332,6 +10332,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end
         else if (pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0 then
           ExprSetProperty(pE, EP_Unlikely);
+        { divbug.14 (residual aggorderby-1.3) — resolve.c:1288..1290.  If
+          the resolved FuncDef is NOT an aggregate (xFinalize nil) and the
+          TK_FUNCTION node carries an attached ORDER BY (parser put it in
+          pLeft as a TK_ORDER node), raise
+            "ORDER BY may not be used with non-aggregate <name>()". }
+        if (pDef_ <> nil) and (not Assigned(pDef_^.xFinalize))
+           and (pE^.pLeft <> nil) then
+        begin
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+            'ORDER BY may not be used with non-aggregate %s()',
+            [pE^.u.zToken]));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        end;
       end;
     end;
   end;
@@ -54698,18 +54711,36 @@ end;
   `flags & MEM_Null` which never triggers (init leaves all bits 0): min
   worked only by accident (number<string fallback returned -1 so the <0
   branch happened to copy); max always missed because >0 was never true. }
+{ minmaxStep magnet — when the incoming arg does NOT supersede the
+  running best, raise the skip-accumulator-load flag so OP_AggStep1
+  signals the magnet register and the outer codegen's OP_If gate
+  bypasses bare-column reloads on this iteration.  Without this the
+  sticky-row property of `SELECT c, max(a) FROM t1` is lost and
+  bare columns hold the LAST scanned row, not the row that won
+  min/max (divbug.14 residual aggorderby-4.1). func.c:2103 / 2121. }
+procedure minmaxSkipLoad(pCtx: Psqlite3_context); inline;
+begin
+  pCtx^.isError  := -1;
+  pCtx^.skipFlag := 1;
+end;
+
 procedure minStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pAgg: PMem;
 begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
   if pAgg = nil then Exit;
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    if pAgg^.flags <> 0 then minmaxSkipLoad(pCtx);
+    Exit;
+  end;
   if pAgg^.flags = 0 then begin
     pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
   end else if sqlite3MemCompare(argv^, pAgg, nil) < 0 then
-    sqlite3VdbeMemCopy(pAgg, argv^);
+    sqlite3VdbeMemCopy(pAgg, argv^)
+  else
+    minmaxSkipLoad(pCtx);
 end;
 
 procedure maxStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -54718,12 +54749,17 @@ var
 begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
   if pAgg = nil then Exit;
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    if pAgg^.flags <> 0 then minmaxSkipLoad(pCtx);
+    Exit;
+  end;
   if pAgg^.flags = 0 then begin
     pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
   end else if sqlite3MemCompare(argv^, pAgg, nil) > 0 then
-    sqlite3VdbeMemCopy(pAgg, argv^);
+    sqlite3VdbeMemCopy(pAgg, argv^)
+  else
+    minmaxSkipLoad(pCtx);
 end;
 
 procedure minMaxFinal(pCtx: Psqlite3_context); cdecl;

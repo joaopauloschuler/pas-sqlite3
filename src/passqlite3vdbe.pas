@@ -9692,10 +9692,25 @@ begin
         if rc > 0 then
           sqlite3VdbeError(v, PAnsiChar(sqlite3_value_text(
             Psqlite3_value(pCtxAgg^.pOut))));
+        { Magnet wiring (vdbe.c:7933..7938).  min/max's skipFlag uses
+          isError=-1 as a non-rc carrier — set the magnet register so
+          updateAccumulator's OP_If gate skips bare-column reload on
+          this non-bumping row.  Required for `SELECT bare, max(x)`
+          sticky-row semantics (divbug.14 residual aggorderby-4.1). }
+        if pCtxAgg^.skipFlag <> 0 then begin
+          { Preceding op must be OP_CollSeq; its p1 is the magnet reg. }
+          if (PtrUInt(pOp) >= PtrUInt(aOp) + SizeOf(TVdbeOp))
+             and ((pOp - 1)^.opcode = OP_CollSeq) then
+          begin
+            ii := (pOp - 1)^.p1;
+            if ii > 0 then sqlite3VdbeMemSetInt64(@aMem[ii], 1);
+          end;
+          pCtxAgg^.skipFlag := 0;
+        end;
         sqlite3VdbeMemRelease(pCtxAgg^.pOut);
         pCtxAgg^.pOut^.flags := MEM_Null;
         pCtxAgg^.isError := 0;
-        if rc <> 0 then goto abort_due_to_error;
+        if rc > 0 then goto abort_due_to_error;
       end;
     end;
 

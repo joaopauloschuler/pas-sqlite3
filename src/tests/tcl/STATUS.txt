@@ -29,10 +29,10 @@
 pas-strict	../sqlite3/test/8_3_names.test	-
 pas-strict	../sqlite3/test/affinity2.test	-
 pas-strict	../sqlite3/test/affinity3.test	-
-pas-soft	../sqlite3/test/aggerror.test	9.4.divbug.14
+pas-strict	../sqlite3/test/aggerror.test	-
 pas-soft	../sqlite3/test/aggfault.test	9.4.2.g.13-malloc-faultsim-deferred
 pas-soft	../sqlite3/test/aggnested.test	9.4.divbug.24
-pas-soft	../sqlite3/test/aggorderby.test	9.4.divbug.14
+pas-strict	../sqlite3/test/aggorderby.test	-
 pas-strict	../sqlite3/test/alias.test	-
 pas-strict	../sqlite3/test/all.test	-
 pas-skip	../sqlite3/test/alter.test	unswept

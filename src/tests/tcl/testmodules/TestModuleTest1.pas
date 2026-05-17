@@ -981,9 +981,17 @@ type
   end;
 
 { test1.c:1270..1291 — t1CountStep.  Argless: bump n.  1-arg: bump n
-  unless arg is NULL; emit SQLITE_ERROR if v=40 (UTF-8). }
+  unless arg is NULL; emit SQLITE_ERROR if v=40 (UTF-8), or
+  SQLITE_ERROR with UTF-16 "abc" if v=41 (aggerror-1.4, divbug.14
+  residual).  zUtf16ErrMsg layout mirrors test1.c:1286 — 8 bytes
+  storing 0|'a'|0|'b'|0|'c'|0|0 so &z[1-SQLITE_BIGENDIAN] addresses
+  the LE byte stream on a little-endian host. }
 procedure t1CountStep(pCtx: Psqlite3_context; argc: cint;
   argv: PPsqlite3_value); cdecl;
+const
+  { test1.c:1286 — { 0, 0x61, 0, 0x62, 0, 0x63, 0, 0, 0 }. }
+  zUtf16ErrMsg: array[0..8] of Byte =
+    ($00, $61, $00, $62, $00, $63, $00, $00, $00);
 var
   p: Pt1CountCtx;
   v: cint;
@@ -997,8 +1005,10 @@ begin
     v := sqlite3_value_int(argv^);
     if v = 40 then
       sqlite3_result_error(pCtx,
-        PChar('value of 40 handed to x_count'), -1);
-    { v=41 UTF-16 arm omitted — SQLITE_OMIT_UTF16 not exercised here. }
+        PChar('value of 40 handed to x_count'), -1)
+    else if v = 41 then
+      { LE-host shift = 1 (1-SQLITE_BIGENDIAN, BIGENDIAN=0). }
+      sqlite3_result_error16(pCtx, @zUtf16ErrMsg[1], -1);
   end;
 end;
 
