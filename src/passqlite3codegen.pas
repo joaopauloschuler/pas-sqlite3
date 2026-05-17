@@ -51255,6 +51255,43 @@ begin
       sqlite3VdbeReusable(v);
       Exit;
     end;
+
+    { pragma.c:2517..2640 — PRAGMA optimize / PRAGMA optimize=MASK.  Minimal
+      port: the full version walks every schema table, consults sqlite_stat1
+      thresholds, and re-runs ANALYZE on tables that drifted by 10x.  This
+      reduced port only emits the read-lock attempt (OP_Transaction on every
+      non-temp attached DB) plus OP_Expire — enough to engage the busy
+      handler when another connection holds an EXCLUSIVE lock, which is the
+      behaviour exercised by busy.test 3.2/3.5/3.7 and the reason the
+      previous silent no-op was a soft divergence (9.4.divbug.21 residual).
+      The 0x02 mask bit in the C body is "perform analysis"; without zRight
+      we default to opMask=0xfffe matching pragma.c:2536. }
+    PragTyp_OPTIMIZE: begin
+      if zRight <> '' then begin
+        iVal := sqlite3Atoi(PChar(zRight));
+        if (iVal and $02) = 0 then begin
+          Exit;
+        end;
+      end;
+      { Schema verification on every non-temp attached database forces a
+        shared read lock on each pBt (sqlite3CodeVerifySchema → OP_Transaction
+        P2=0).  We then upgrade with sqlite3BeginWriteOperation so that the
+        eventual ANALYZE re-run would have its write lock — engaging the
+        busy handler when another connection holds either an EXCLUSIVE lock
+        (busy-3.2) or merely a SHARED read lock that blocks the write
+        upgrade (busy-3.5/3.7).  The full C body (pragma.c:2549..2622) walks
+        sqlite_stat1 thresholds per table and emits OP_SqlExec("ANALYZE …")
+        — not yet ported; this reduced arm covers the busy-handler
+        engagement that the original silent no-op was missing
+        (9.4.divbug.21 residual). }
+      for i := 0 to db^.nDb - 1 do begin
+        if i = 1 then Continue;  { skip TEMP (no on-disk lock) }
+        sqlite3CodeVerifySchema(pParse, i);
+        sqlite3BeginWriteOperation(pParse, 0, i);
+      end;
+      sqlite3VdbeAddOp0(v, OP_Expire);
+      Exit;
+    end;
   end;
 
   { PragTyp_FLAG — pragma.c (generic boolean-flag arm).  Read emits
