@@ -5087,6 +5087,44 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.063 — test1.c:2920..2944 test_next_stmt.
+  Usage: sqlite3_next_stmt DB STMT.  Returns the next prepared statement
+  in sequence after STMT as a "0x%p" hex pointer, or empty string when
+  the chain is exhausted.  Engine entry: passqlite3main.pas:4120.
+  Required by capi3d.test (capi3d-1.1, capi3d-2.*). }
+function tcl_test_next_stmt(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  pStmt: Pointer;
+  s:     AnsiString;
+  zBuf:  array[0..49] of AnsiChar;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB STMT"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := sqlite3TestTextToPtr(Tcl_GetString(objv[2]));
+  pStmt := sqlite3_next_stmt(db, pStmt);
+  if pStmt <> nil then
+  begin
+    { C: sqlite3TestMakePointerStr → "0x%p". }
+    s := '0x' + LowerCase(IntToHex(PtrUInt(pStmt), 1));
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    Move(s[1], zBuf[0], Length(s));
+    Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.031 — test1.c:684..701 sqlite_test_close.
   Usage: sqlite3_close DB.  Engine: passqlite3main.pas:1015. }
 function test_close(clientData: TClientData; interp: PTclInterp;
@@ -5277,6 +5315,9 @@ begin
     @test_close, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_close_v2'),
     @test_close_v2, nil, nil);
+  { 9.4.divbug.88.063 — test1.c:9164 sqlite3_next_stmt. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_next_stmt'),
+    @tcl_test_next_stmt, nil, nil);
   { 9.4.divbug.88.035 — sqlite3_extended_errcode Tcl trampoline used by
     tester.tcl:1682 verify_ex_errcode (errmsg.test, fkey2.test,
     notnull.test).  C ref test1.c registered at 9133. }
