@@ -1464,6 +1464,62 @@ begin
   Result := TCL_OK;
 end;
 
+{ test_malloc.c:968..983 — sqlite3_config_memstatus BOOLEAN.
+  Enable/disable memory status reporting via SQLITE_CONFIG_MEMSTATUS.
+  Returns the rc from sqlite3_config. }
+function test_config_memstatus(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  enable, rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @enable) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_config(SQLITE_CONFIG_MEMSTATUS, enable);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_malloc.c:986..1013 — sqlite3_config_lookaside SIZE COUNT.
+  Returns prior {szLookaside nLookaside} list, then applies new values
+  via SQLITE_CONFIG_LOOKASIDE. }
+function test_config_lookaside(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  sz, cnt: cint;
+  pRet:    PTclObj;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('SIZE COUNT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @sz) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @cnt) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  pRet := Tcl_NewObj;
+  Tcl_ListObjAppendElement(interp, pRet,
+    Tcl_NewIntObj(sqlite3GlobalConfig.szLookaside));
+  Tcl_ListObjAppendElement(interp, pRet,
+    Tcl_NewIntObj(sqlite3GlobalConfig.nLookaside));
+  sqlite3_config(SQLITE_CONFIG_LOOKASIDE, sz, cnt);
+  Tcl_SetObjResult(interp, pRet);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test_config.c / tclsqlite.c — thin wrappers around the engine
   lifecycle entry points; used by test_set_config_pagecache. }
 function test_initialize(clientData: TClientData; interp: PTclInterp;
@@ -4919,6 +4975,12 @@ begin
     @test_create_aggregate, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pagecache'),
     @test_config_pagecache, nil, nil);
+  { 9.4.divbug.88.050/051 — test_malloc.c:1494..1495 sqlite3_config_memstatus
+    and sqlite3_config_lookaside. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_memstatus'),
+    @test_config_memstatus, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_lookaside'),
+    @test_config_lookaside, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_initialize'),
     @test_initialize, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_shutdown'),
