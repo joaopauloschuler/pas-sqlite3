@@ -29,6 +29,7 @@ uses
   TestModuleMalloc,
   TestModuleIoerr,
   TestModuleCrash,
+  TestModuleVfs,
   PasTclSqlite;
 
 exports

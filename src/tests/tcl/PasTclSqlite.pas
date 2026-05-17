@@ -35,7 +35,8 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
      passqlite3percentile, passqlite3regexp,
      TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
-     TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash;
+     TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
+     TestModuleVfs;
 
 type
   { Minimal Tcl_Obj / Tcl_ObjType peek layout — first fields only.
@@ -4930,6 +4931,10 @@ begin
     (sqlite3_crash_enable, sqlite3_crash_now, sqlite3_crashparams)
     used by the upstream `crashsql` Tcl proc. }
   Sqlitetest6_Init(interp);
+  { 9.4.divbug.88.041 + 88.054 — test_vfs.c: register the `testvfs`
+    Tcl command (wrapper VFS with filter/script callbacks) used by
+    interrupt2.test, mjournal.test, e_wal.test, nolock.test, etc. }
+  Sqlitetestvfs_Init(interp);
   { 9.4.divbug.73 — test1.c:9366..9371 Tcl_LinkVar the optimiser/B-tree
     visit counters so regression tests (rowid-4.5/.5.1, where*/in*/minmax,
     between's `queryplan`) can read them.  Without this, $sqlite_search_count
