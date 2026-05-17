@@ -1199,18 +1199,20 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.064** `capi3d` engine bug — `sqlite3_prepare16*` on UTF-16 SQL produces `near "S E L E C T ": syntax error`; engine-side encoding plumbing in `sqlite3Prepare16` misroutes the UTF-16 buffer (separate from the trampoline; needs engine port audit at `passqlite3main.pas:3884..3895` vs `prepare.c` UTF-16 entry).
   - [X] **9.4.divbug.88.065** `filectrl` follow-ups — ported `file_control_lasterrno_test` (test1.c:6830..6865, registered test1.c:9245) and `file_control_tempfilename` (test1.c:7279..7309, registered test1.c:9259) Tcl trampolines in `src/tests/tcl/testmodules/TestModuleTest1.pas`, plus `get_pwd` Tcl helper (tester.tcl:169..191) in `src/tests/tcl/tester_min.tcl`. filectrl-1.4 and filectrl-1.6 now PASS; filectrl-1.5 advances past `get_pwd` to the next missing trampoline `file_control_lockproxy_test` (separate follow-up).
   - [ ] **9.4.divbug.88.066** `varint` engine bug — `sqlite3GetVarint32` returns one byte too many on certain small values (88 varint.test subtests fail with `putVarint returned 1 and GetVarint32 returned 2`). Audit `passqlite3util.pas` GetVarint32 fast-path vs `util.c` `sqlite3GetVarint32`. Surfaced by 88.062.
+  - [ ] **9.4.divbug.88.067** `filectrl` follow-up — port `file_control_lockproxy_test` Tcl trampoline (test1.c). Surfaced by 88.065 once `get_pwd` cleared filectrl-1.5.
+  - [ ] **9.4.divbug.88.068** `cksumvfs` full port — 88.007 landed STUB trampolines; sub-tests beyond cksumvfs-1.3 need a real port of `../sqlite3/ext/misc/cksumvfs.c` (~820 line page-checksum shim VFS).
 - [~] **9.4.divbug.89** Empty driver diagnostic (carved from `9.4.4.g-unbucketed` 2026-05-16) — **12 pas-soft tests** (`corruptB`, `e_changes`, `e_totalchanges`, `fuzz`, `index4`, `index5`, `join6`, `joinA`, `joinB`, `joinD`, `manydb`, `tkt3080`) FAIL but `bin/tcl-failure-logs/<base>.{err,out}` capture no diagnostic — driver swallows the message or the tests abort outside `tcltest`.  Action: instrument `TclTestDriver` to dump the last N lines of stdout/stderr on any non-PASS exit so these become triageable.  Instrumentation landed (TclTestDriver.pas: `WriteFailLogs` now emits a header — test path, spawn cmd, exit-code, byte counts — and appends a 50-line tail block; empty streams write `(empty)`).  Smoke: join6 now reveals `exit-code: 134` + `double free or corruption (!prev)`; e_changes/manydb reveal `exit-code: 139` (SIGSEGV) past the last `Ok` line.  Per-test root-causing of .001..012 remains TODO.
   - [ ] **9.4.divbug.89.001** `corruptB` — malformed}]
-  - [ ] **9.4.divbug.89.002** `e_changes` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.002** `e_changes` — SIGSEGV (exit-code 139) past `e_changes-4.3.2`; investigate engine fault triggered by next subtest.
   - [ ] **9.4.divbug.89.003** `e_totalchanges` — (UNKNOWN-empty-log, no log captured)
   - [ ] **9.4.divbug.89.004** `fuzz` — (UNKNOWN-empty-log, no log captured)
   - [ ] **9.4.divbug.89.005** `index4` — (UNKNOWN-empty-log, no log captured)
   - [ ] **9.4.divbug.89.006** `index5` — (UNKNOWN-empty-log, no log captured)
-  - [ ] **9.4.divbug.89.007** `join6` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.007** `join6` — SIGABRT (exit-code 134): `double free or corruption (!prev)` surfaced after 89-instrumentation; investigate child-process heap corruption during join.
   - [ ] **9.4.divbug.89.008** `joinA` — (UNKNOWN-empty-log, no log captured)
   - [ ] **9.4.divbug.89.009** `joinB` — (UNKNOWN-empty-log, no log captured)
   - [ ] **9.4.divbug.89.010** `joinD` — (UNKNOWN-empty-log, no log captured)
-  - [ ] **9.4.divbug.89.011** `manydb` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.011** `manydb` — SIGSEGV (exit-code 139) past `manydb-1.42`; investigate engine fault.
   - [ ] **9.4.divbug.89.012** `tkt3080` — SOURCE-ERROR:
 - [ ] **9.4.divbug.90** Extension / SQL function / VFS registration residue (sibling of `9.4.divbug.66`, carved from `9.4.4.g-unbucketed` 2026-05-16) — **8 pas-soft tests**: 6 `no such extension` (`btree02`, `extension01`, `func4`, `indexexpr2`, …), 1 `no such function` (`func9`), 1 `no such vfs: devsym` (`io`).  Each pin in the C build is a known extension/function/VFS shim; port or auto-register at db-open following the `.66` template.
   - [ ] **9.4.divbug.90.001** `btree02` — SOURCE-ERROR: no such extension: eval
