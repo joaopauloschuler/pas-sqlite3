@@ -1174,7 +1174,7 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.039** `hook` — verify_ex_errcode SOURCE-ERROR cleared by 88.035 (shared trampoline + tester_min.tcl proc). hook.test now 33 PASS / 417 FAIL; e_walhook.test 18/79 FAIL; hook2.test 17/0 PASS; walhook.test 19/0 PASS — residual failures are deeper assertions.
   - [ ] **9.4.divbug.88.040** `indexexpr1` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.041** `interrupt2` — SOURCE-ERROR: invalid command name "testvfs"
-  - [ ] **9.4.divbug.88.042** `ioerr` — SOURCE-ERROR: invalid command name "sqlite3_get_autocommit"
+  - [x] **9.4.divbug.88.042** `ioerr` — SOURCE-ERROR: invalid command name "sqlite3_get_autocommit" → ported trampoline (test1.c:6075..6098, registered test1.c:9094) in TestModuleTest1.pas; SOURCE-ERROR cleared.  Residual: ioerr.test still FAIL (1967/12915 — distinct injected-IO regressions, separate from trampoline).
   - [ ] **9.4.divbug.88.043** `join` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.044** `joinH` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.045** `json102` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
@@ -1192,7 +1192,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.057** `nolock` — SOURCE-ERROR: invalid command name "testvfs"
   - [ ] **9.4.divbug.88.058** `normalize` — ! normalize-100 error: invalid command name "sqlite3_normalize"
   - [ ] **9.4.divbug.88.059** `notnull2` — SOURCE-ERROR: invalid command name "do_vmstep_test"
-  - [ ] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit"
+  - [x] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit" → same trampoline as 88.042 (test1.c:6075..6098); trans3.test now PASS 8/70.
   - [ ] **9.4.divbug.88.061** `upfrom4` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.062** `varint` — ! varint-1.1 error: invalid command name "btree_varint_test"
 - [ ] **9.4.divbug.89** Empty driver diagnostic (carved from `9.4.4.g-unbucketed` 2026-05-16) — **12 pas-soft tests** (`corruptB`, `e_changes`, `e_totalchanges`, `fuzz`, `index4`, `index5`, `join6`, `joinA`, `joinB`, `joinD`, `manydb`, `tkt3080`) FAIL but `bin/tcl-failure-logs/<base>.{err,out}` capture no diagnostic — driver swallows the message or the tests abort outside `tcltest`.  Action: instrument `TclTestDriver` to dump the last N lines of stdout/stderr on any non-PASS exit so these become triageable.

@@ -4757,6 +4757,38 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.042 + 9.4.divbug.88.060 — test1.c:6075..6098 get_autocommit.
+  Usage: sqlite3_get_autocommit DB.  Returns 1 if DB is in auto-commit mode,
+  0 otherwise.  Required by ioerr.test and trans3.test (trans3-1.3.1). }
+function get_autocommit(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+type
+  TArgvArr = array[0..16] of PAnsiChar;
+  PArgvArr = ^TArgvArr;
+var
+  db:   PTsqlite3;
+  av:   PArgvArr;
+  sBuf: ShortString;
+begin
+  av := PArgvArr(argv);
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av^[0], PChar(' DB"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av^[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  { C: sqlite3_snprintf(sizeof zBuf,"%d", sqlite3_get_autocommit(db)). }
+  Str(sqlite3_get_autocommit(db), sBuf);
+  sBuf[Length(sBuf)+1] := #0;
+  Tcl_AppendResult(interp, PChar(@sBuf[1]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -4984,6 +5016,9 @@ begin
     @tcl_test_key_v2, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_create_function'),
     @test_create_function, nil, nil);
+  { 9.4.divbug.88.042 + 9.4.divbug.88.060 — test1.c:9094 sqlite3_get_autocommit. }
+  Tcl_CreateCommand(interp, PChar('sqlite3_get_autocommit'),
+    @get_autocommit, nil, nil);
   { test1.c:9370..9371 — expose the undocumented sort counter so
     regression tests (between.test's `queryplan` proc, etc.) can
     verify the optimizer correctly elides ORDER BY sorts. }
