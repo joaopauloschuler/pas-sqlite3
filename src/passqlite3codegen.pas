@@ -51769,6 +51769,7 @@ var
   bShowInternal: i32;
   pPragmaId: PToken;
   newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
+  iValPragma: i64; { 9.4.divbug.87.067 — PRAGMA max_page_count=N parse }
   { 9.4.divbug.36 — PragTyp_JOURNAL_MODE write arm locals
     (pragma.c:734..771).  eModeJm = resolved PAGER_JOURNALMODE_*,
     iJm = loop var, zModeJm = candidate name from azJournalModeName[]. }
@@ -52607,13 +52608,27 @@ begin
     end;
   end;
 
-  { max_page_count default — pragma.c:1042.  OP_MaxPgcnt with P3=0 reads
-    the current limit (default 4294967294 = 0xFFFFFFFE on a fresh memory
-    db).  Yields i64 in result Mem so column_int truncates to -2 and
-    column_text renders "4294967294" via %lld — matching the C oracle. }
-  if SameText(zName, 'max_page_count') and (pValue = nil) then begin
+  { max_page_count — pragma.c:663..681 (PragTyp_PAGE_COUNT, 'm' branch).
+    Read form (pValue=nil): OP_MaxPgcnt with P3=0 reads the current limit
+    (default 4294967294 = 0xFFFFFFFE on a fresh memory db); yields i64 in
+    result Mem so column_int truncates to -2 and column_text renders
+    "4294967294" via %lld — matching the C oracle.
+    Write form (9.4.divbug.87.067): clamp the requested N to [0..0xFFFFFFFE]
+    via sqlite3DecOrHexToI64 and pass as P3 to OP_MaxPgcnt — without this the
+    write was a silent no-op so `PRAGMA max_page_count=40` never installed the
+    pager mxPgno cap and disk-full enforcement (tkt2920) was disabled. }
+  if SameText(zName, 'max_page_count') then begin
     sqlite3CodeVerifySchema(pParse, iDb);
-    sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma) = 0 then begin
+        if iValPragma < 0 then iValPragma := 0
+        else if iValPragma > i64($FFFFFFFE) then iValPragma := i64($FFFFFFFE);
+      end else
+        iValPragma := 0;
+      sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, i32(iValPragma));
+    end else
+      sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
