@@ -4480,6 +4480,36 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.067 — test1.c:6981..7048 file_control_lockproxy_test.
+  Usage: file_control_lockproxy_test DB PWD.  On Apple targets exercises
+  SQLITE_{GET,SET}_LOCKPROXYFILE; on non-Apple platforms the C body is
+  compiled out, so this is a validate-args-and-return-OK stub matching
+  the upstream Linux behaviour. }
+function file_control_lockproxy_test_tcl(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  db := nil;
+  if objc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetStringFromObj(objv[0], nil), PChar(' DB PWD'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  { Non-Apple builds: SQLITE_ENABLE_LOCKING_STYLE block elided; mirror
+    the C function's fall-through to TCL_OK. }
+  Result := TCL_OK;
+  if clientData = nil then ;
+  if db = nil then ;
+end;
+
 { 9.4.divbug.87.005 — test1.c:1740..1791 test_table_column_metadata.
   Usage: sqlite3_table_column_metadata DB dbname tblname ?colname?
   Returns a 5-element list: datatype collseq notnull primarykey autoinc.
@@ -5724,6 +5754,10 @@ begin
   { 9.4.divbug.88.065 — file_control_tempfilename (test1.c:9259 / 7279..7309). }
   Tcl_CreateObjCommand(interp, PChar('file_control_tempfilename'),
     @file_control_tempfilename_tcl, nil, nil);
+  { 9.4.divbug.88.067 — file_control_lockproxy_test (test1.c:9246 / 6987..7048).
+    Linux: no-op stub (Apple-only body compiled out). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_lockproxy_test'),
+    @file_control_lockproxy_test_tcl, nil, nil);
   { 9.4.divbug.62.e — sqlite3_create_function_v2 / _create_window_function /
     _load_extension / _simulate_device / _user_version
     (test1.c:9262 + 9183 + test_window.c:337). }
