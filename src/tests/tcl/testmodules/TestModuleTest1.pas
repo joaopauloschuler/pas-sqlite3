@@ -872,6 +872,138 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.004 — test1.c:5280..5330 — test_prepare16.
+  Usage: sqlite3_prepare16 DB sql bytes ?tailvar?
+  Mirrors the UTF-8 sibling but routes through sqlite3_prepare16 and
+  echoes the unused tail back as a byte-array Tcl_Obj (matching
+  Tcl_NewByteArrayObj in the C reference). }
+function test_prepare16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:     PTsqlite3;
+  zSql:   Pointer;
+  zTail:  Pointer;
+  pStmt:  Pointer;
+  pTail:  PTclObj;
+  bytes:  cint;
+  objlen: cint;
+  rc:     i32;
+  hex:    AnsiString;
+  zBuf:   array[0..63] of AnsiChar;
+begin
+  if (objc <> 5) and (objc <> 4) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB sql bytes ?tailvar?'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  objlen := 0;
+  zSql := Tcl_GetByteArrayFromObj(objv[2], @objlen);
+  if Tcl_GetIntFromObj(interp, objv[3], @bytes) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zTail := nil;
+  pStmt := nil;
+  if objc >= 5 then
+    rc := sqlite3_prepare16(db, zSql, bytes, @pStmt, @zTail)
+  else
+    rc := sqlite3_prepare16(db, zSql, bytes, @pStmt, nil);
+  if rc <> SQLITE_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc >= 5 then
+  begin
+    if zTail <> nil then
+      objlen := objlen - cint(PtrUInt(zTail) - PtrUInt(zSql))
+    else
+      objlen := 0;
+    pTail := Tcl_NewByteArrayObj(zTail, objlen);
+    Tcl_DbIncrRefCount(pTail, PChar('test_prepare16'), 0);
+    Tcl_ObjSetVar2(interp, objv[4], nil, pTail, 0);
+    Tcl_DbDecrRefCount(pTail, PChar('test_prepare16'), 0);
+  end;
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  if pStmt <> nil then
+  begin
+    ptrToHex(pStmt, hex);
+    Move(hex[1], zBuf[0], Length(hex));
+  end;
+  Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.88.004 — test1.c:5340..5390 — test_prepare16_v2.
+  Identical surface to test_prepare16 but routes through the _v2 engine
+  entry (sets SQLITE_PREPARE_SAVESQL). }
+function test_prepare16_v2(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:     PTsqlite3;
+  zSql:   Pointer;
+  zTail:  Pointer;
+  pStmt:  Pointer;
+  pTail:  PTclObj;
+  bytes:  cint;
+  objlen: cint;
+  rc:     i32;
+  hex:    AnsiString;
+  zBuf:   array[0..63] of AnsiChar;
+begin
+  if (objc <> 5) and (objc <> 4) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB sql bytes ?tailvar?'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  objlen := 0;
+  zSql := Tcl_GetByteArrayFromObj(objv[2], @objlen);
+  if Tcl_GetIntFromObj(interp, objv[3], @bytes) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zTail := nil;
+  pStmt := nil;
+  if objc >= 5 then
+    rc := sqlite3_prepare16_v2(db, zSql, bytes, @pStmt, @zTail)
+  else
+    rc := sqlite3_prepare16_v2(db, zSql, bytes, @pStmt, nil);
+  if rc <> SQLITE_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc >= 5 then
+  begin
+    if zTail <> nil then
+      objlen := objlen - cint(PtrUInt(zTail) - PtrUInt(zSql))
+    else
+      objlen := 0;
+    pTail := Tcl_NewByteArrayObj(zTail, objlen);
+    Tcl_DbIncrRefCount(pTail, PChar('test_prepare16_v2'), 0);
+    Tcl_ObjSetVar2(interp, objv[4], nil, pTail, 0);
+    Tcl_DbDecrRefCount(pTail, PChar('test_prepare16_v2'), 0);
+  end;
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  if pStmt <> nil then
+  begin
+    ptrToHex(pStmt, hex);
+    Move(hex[1], zBuf[0], Length(hex));
+  end;
+  Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:3145..3164 — test_transfer_bind.
   Usage: sqlite3_transfer_bindings FROM-STMT TO-STMT }
 function test_transfer_bind(clientData: TClientData; interp: PTclInterp;
@@ -4482,6 +4614,12 @@ begin
     @test_prepare, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare_v2'),
     @test_prepare_v2, nil, nil);
+  { 9.4.divbug.88.004 — sqlite3_prepare16 / sqlite3_prepare16_v2.
+    test1.c:5280..5330, 5340..5390; registered at test1.c:9147 and 9151. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare16'),
+    @test_prepare16, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare16_v2'),
+    @test_prepare16_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_transfer_bindings'),
     @test_transfer_bind, nil, nil);
   { 9.4.divbug.88.001 — sqlite3_expired STMT.  test1.c:3121..3138, 9155. }
