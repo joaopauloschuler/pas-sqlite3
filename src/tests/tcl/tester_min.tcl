@@ -275,6 +275,13 @@ set ::sqlite_options(allow_rowid_in_view) 0
 # SQLITE_OMIT_FTS3 / SQLITE_OMIT_FTS5 are defined.
 set ::sqlite_options(fts3) 0
 set ::sqlite_options(fts5) 0
+# 9.4.divbug.87.066 — this build defines neither SQLITE_SECURE_DELETE nor
+# SQLITE_FAST_SECURE_DELETE (btree.c:2695..2699 / test_config.c:751..759),
+# so both caps must read 0.  Without these, `ifcapable fast_secure_delete`
+# defaults to 1 below and securedel.test computes DEFAULT_SECDEL=2 while
+# the engine honestly returns 0 → 1.0/1.1/1.2 fail.
+set ::sqlite_options(fast_secure_delete) 0
+set ::sqlite_options(secure_delete) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
