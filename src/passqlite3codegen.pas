@@ -9987,6 +9987,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     cnt:    i32;
     pCompArm: PSelect;   { 9.4.divbug.75 — walks pInner^.pPrior chain }
     pDeep: PSelect;      { 9.4.divbug.76 — walks FROM-subquery interior selects }
+    zDb: PAnsiChar;        { 9.4.divbug.87.058 — 3-part qualifier `db.tab.col` }
+    pDbSchema: Pointer;
   begin
     if pE = nil then Exit;
     { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
@@ -10021,6 +10023,43 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       Mirrors resolve.c:lookupName qualified-ref handling. }
     if pE^.op = TK_DOT then
     begin
+      { 9.4.divbug.87.058 — three-part qualifier `db.tab.col`
+        (resolve.c:1083..1098 sqlite3ResolveExprNames TK_DOT arm).  Parser
+        builds TK_DOT(TK_ID(db), TK_DOT(TK_ID(tab), TK_ID(col))).  Validate
+        the schema name; if known, rewrite pE in place to the 2-part shape
+        and remember the schema so the per-SrcItem loop can require it. }
+      pDbSchema := nil;
+      if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+         and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_DOT)
+         and (pE^.pRight^.pLeft <> nil) and (pE^.pRight^.pLeft^.op = TK_ID)
+         and (pE^.pRight^.pRight <> nil) and (pE^.pRight^.pRight^.op = TK_ID)
+         and (pParse^.db <> nil) then
+      begin
+        zDb := pE^.pLeft^.u.zToken;
+        if zDb <> nil then
+        begin
+          for i := 0 to pParse^.db^.nDb - 1 do
+          begin
+            if (pParse^.db^.aDb[i].zDbSName <> nil)
+               and (sqlite3StrICmp(pParse^.db^.aDb[i].zDbSName, zDb) = 0) then
+            begin
+              pDbSchema := pParse^.db^.aDb[i].pSchema;
+              Break;
+            end;
+          end;
+          if (pDbSchema = nil) and (sqlite3StrICmp(zDb, 'main') = 0)
+             and (pParse^.db^.nDb > 0) then
+            pDbSchema := pParse^.db^.aDb[0].pSchema;
+        end;
+        if pDbSchema <> nil then
+        begin
+          { Collapse to 2-part: discard the db node, hoist the inner TK_DOT
+            arms.  The inner TK_DOT node itself is leaked into the parse
+            arena (freed at parse end); pLeft/pRight TK_IDs reattach. }
+          pE^.pLeft  := pE^.pRight^.pLeft;
+          pE^.pRight := pE^.pRight^.pRight;
+        end;
+      end;
       if (p^.pSrc <> nil)
          and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
@@ -10031,6 +10070,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
+          { 9.4.divbug.87.058 — when zDb was supplied, skip sources whose
+            table belongs to a different schema (resolve.c:420..425). }
+          if (pDbSchema <> nil) and (pItem^.pSTab^.pSchema <> pDbSchema) then
+            Continue;
           { 9.4.divbug.59 — nested-from arm (resolve.c:351..417).
             When a parenthesised FROM-clause subset becomes one SrcItem with
             SF_NestedFrom (e.g. `t1 JOIN (t2 JOIN t3 USING(a)) USING(a)`),
