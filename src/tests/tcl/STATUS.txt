@@ -169,7 +169,7 @@ pas-soft	../sqlite3/test/collate1.test	9.4.4.f
 pas-strict	../sqlite3/test/collate2.test	-
 pas-soft	../sqlite3/test/collate3.test	9.4.divbug.31
 pas-soft	../sqlite3/test/collate4.test	9.4.divbug.30
-pas-strict	../sqlite3/test/collate5.test	-
+pas-soft	../sqlite3/test/collate5.test	9.4.divbug.85
 pas-strict	../sqlite3/test/collate6.test	-
 pas-soft	../sqlite3/test/collate7.test	9.4.4.g-unbucketed
 pas-soft	../sqlite3/test/collate8.test	9.4.divbug.30
