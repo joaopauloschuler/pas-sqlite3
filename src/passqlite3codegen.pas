@@ -29658,6 +29658,33 @@ begin
       pWInfo      := nil;
       addrGBBodyStart := 0;
       addrGBLoopDone  := 0;
+
+      { 9.4.divbug.33 — DISTINCT-aggregate index ride (GROUP BY arm).
+        Mirrors select.c:8466..8481.  When there is exactly one aggregate
+        with iDistinct>=0, build pDistinct = pGroupBy ++ argExpr and pass
+        WHERE_WANT_DISTINCT|WHERE_AGG_DISTINCT to sqlite3WhereBegin so
+        the planner can probe whether an existing index already yields
+        rows unique on the (group, distinct-arg) tuple.  The matching
+        fixDistinctOpenEph call after the addrReset subroutine then
+        noops the per-group dedup ephemeral when eDist != NOOP. }
+      pAggDistinct := nil;
+      distFlag     := 0;
+      eDistResult  := WHERE_DISTINCT_NOOP;
+      if (not isGBSubquery)
+         and (pAggI2^.nFunc = 1)
+         and (pAggI2^.aFunc[0].iDistinct >= 0)
+         and (pAggI2^.aFunc[0].pFExpr <> nil)
+         and ExprUseXList(pAggI2^.aFunc[0].pFExpr)
+         and (pAggI2^.aFunc[0].pFExpr^.x.pList <> nil) then
+      begin
+        pE := sqlite3ExprDup(pParse^.db,
+                ExprListItems(pAggI2^.aFunc[0].pFExpr^.x.pList)[0].pExpr, 0);
+        pAggDistinct := sqlite3ExprListDup(pParse^.db, pGroupByLoc, 0);
+        pAggDistinct := sqlite3ExprListAppend(pParse, pAggDistinct, pE);
+        if pAggDistinct <> nil then
+          distFlag := WHERE_WANT_DISTINCT or WHERE_AGG_DISTINCT;
+      end;
+
       if isGBSubquery then
       begin
         addrGBLoopDone := sqlite3VdbeMakeLabel(pParse);
@@ -29711,12 +29738,21 @@ begin
         TreeTraceLine($2, 'WhereBegin');  { select.c:8518 }
         {$ENDIF}
         pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
-                                    nil, p, WHERE_GROUPBY, 0);
-        if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+                                    pAggDistinct, p,
+                                    WHERE_GROUPBY or distFlag, 0);
+        if pWInfo = nil then
+        begin
+          sqlite3ExprListDelete(pParse^.db, pAggDistinct);
+          Result := SQLITE_ERROR; Exit;
+        end;
         { 10.1.42.a.6.3 — adjust AggInfo for any indexed expressions that
           the planner wired up.  Mirrors select.c:8527..8529. }
         if pParse^.pIdxEpr <> nil then
           optimizeAggregateUseOfIndexedExpr(pParse, p, pAggI2, @sNCAgg);
+        { 9.4.divbug.33 — read back the planner's DISTINCT verdict so we
+          can (a) skip per-row dedup work in updateAccumulatorSimple and
+          (b) noop the OP_OpenEphemeral.  Mirrors select.c:8531. }
+        eDistResult := sqlite3WhereIsDistinct(pWInfo);
         {$IFDEF SQLITE_DEBUG}
         TreeTraceLine($2, 'WhereBegin returns');  { select.c:8532 }
         {$ENDIF}
@@ -29833,7 +29869,11 @@ begin
       sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
 
       sqlite3VdbeJumpHere(v, addr1);
-      updateAccumulatorSimple(pParse, pAggI2, iUseFlag);
+      { 9.4.divbug.33 — pass the planner's DISTINCT verdict so updateAcc
+        emits the matching dedup shape (NOOP/UNORDERED → ephemeral
+        Found/IdxInsert; UNIQUE → no dedup at all; ORDERED → register
+        compare).  Mirrors select.c:8692. }
+      updateAccumulatorSimple(pParse, pAggI2, iUseFlag, eDistResult);
       sqlite3VdbeAddOp2(v, OP_Integer, 1, iUseFlag);
 
       sqlite3VdbeAddOp2(v, OP_SorterNext, pAggI2^.sortingIdx, addrTopOfLoop);
@@ -29952,6 +29992,16 @@ begin
       resetAccumulatorSimple(pParse, pAggI2);
       sqlite3VdbeAddOp2(v, OP_Integer, 0, iUseFlag);
       sqlite3VdbeAddOp1(v, OP_Return, regReset);
+
+      { 9.4.divbug.33 — noop the per-Func iDistinct OpenEphemeral when
+        the WHERE engine already delivers rows unique on the distinct-arg
+        column.  Mirrors select.c:8750..8753. }
+      if (distFlag <> 0) and (eDistResult <> WHERE_DISTINCT_NOOP)
+         and (pAggI2^.nFunc > 0) then
+        fixDistinctOpenEph(pParse, eDistResult,
+                           pAggI2^.aFunc[0].iDistinct,
+                           pAggI2^.aFunc[0].iDistAddr);
+      sqlite3ExprListDelete(pParse^.db, pAggDistinct);
 
       sqlite3VdbeResolveLabel(v, addrEnd);
 

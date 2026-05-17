@@ -250,7 +250,7 @@ pas-strict	../sqlite3/test/descidx3.test	-
 pas-soft	../sqlite3/test/diskfull.test	9.4.4.g-unbucketed
 pas-strict	../sqlite3/test/distinct.test	-
 pas-soft	../sqlite3/test/distinct2.test	9.4.divbug.39-residual
-pas-soft	../sqlite3/test/distinctagg.test	9.4.divbug.33
+pas-strict	../sqlite3/test/distinctagg.test	-
 pas-strict	../sqlite3/test/e_blobbytes.test	-
 pas-strict	../sqlite3/test/e_blobclose.test	-
 pas-strict	../sqlite3/test/e_blobopen.test	-
