@@ -1172,13 +1172,13 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.037** `filectrl` — ported `file_control_test` Tcl cmd (test1.c:6795..6827). 4-call FCNTL plumbing probe (opcode 0, bad schema name + SQLITE_FCNTL_LOCKSTATE, "main"/"temp" + opcode -1); release-build assert() drops match Pas no-op. SOURCE-ERROR cleared: filectrl-1.1/1.2/1.3 PASS; remaining 1.4/1.5/1.6 are separate unported cmds (file_control_lasterrno_test, get_pwd, file_control_tempfilename).
   - [ ] **9.4.divbug.88.038** `filefmt` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [X] **9.4.divbug.88.039** `hook` — verify_ex_errcode SOURCE-ERROR cleared by 88.035 (shared trampoline + tester_min.tcl proc). hook.test now 33 PASS / 417 FAIL; e_walhook.test 18/79 FAIL; hook2.test 17/0 PASS; walhook.test 19/0 PASS — residual failures are deeper assertions.
-  - [ ] **9.4.divbug.88.040** `indexexpr1` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [X] **9.4.divbug.88.040** `indexexpr1` — shared port: accept `null` as unique prefix of `nullvalue` (Tcl prefix-match, tclsqlite.c:2448,2479) at PasTclSqlite.pas:4080; SOURCE-ERROR cleared, indexexpr1.test now runs (106 fails on downstream assertions, not the trampoline).
   - [ ] **9.4.divbug.88.041** `interrupt2` — SOURCE-ERROR: invalid command name "testvfs"
   - [x] **9.4.divbug.88.042** `ioerr` — SOURCE-ERROR: invalid command name "sqlite3_get_autocommit" → ported trampoline (test1.c:6075..6098, registered test1.c:9094) in TestModuleTest1.pas; SOURCE-ERROR cleared.  Residual: ioerr.test still FAIL (1967/12915 — distinct injected-IO regressions, separate from trampoline).
-  - [ ] **9.4.divbug.88.043** `join` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
-  - [ ] **9.4.divbug.88.044** `joinH` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
-  - [ ] **9.4.divbug.88.045** `json102` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
-  - [ ] **9.4.divbug.88.046** `json502` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [X] **9.4.divbug.88.043** `join` — shared port with 88.040: `db null` = prefix of `nullvalue` at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared.
+  - [X] **9.4.divbug.88.044** `joinH` — shared port with 88.040 at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared, joinH.test now runs (78 fail on downstream).
+  - [X] **9.4.divbug.88.045** `json102` — shared port with 88.040 at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared, json102.test now runs (316 fail on downstream).
+  - [X] **9.4.divbug.88.046** `json502` — shared port with 88.040 at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared.
   - [x] **9.4.divbug.88.047** `laststmtchanges` — ported `sqlite3_exec_printf` Tcl trampoline (test1.c:299..328; reuses execPrintfCb at TestModuleTest1.pas:641, sqlite3PfMprintf wrapper). Registered TestModuleTest1.pas via Tcl_CreateCommand (C ref test1.c:9072). laststmtchanges → PASS 6/205.
   - [ ] **9.4.divbug.88.048** `lock5` — SOURCE-ERROR: invalid command name "db2"
   - [X] **9.4.divbug.88.049** `main` — ported `db complete SQL` arm (tclsqlite.c:2844 → PasTclSqlite.pas:4183); main.test now PASS 218/218.
@@ -1193,7 +1193,7 @@ acceptance gate for this section.
   - [x] **9.4.divbug.88.058** `normalize` — ported sqlite3_normalize Tcl cmd (test1.c:5550..5572) wrapping passqlite3normalize.sqlite3_normalize; SOURCE-ERROR cleared, test now runs (69/114 pass on real assertions).
   - [X] **9.4.divbug.88.059** `notnull2` — ported `do_vmstep_test` 1:1 from tester.tcl:913..933 into tester_min.tcl; SOURCE-ERROR cleared; notnull2.test FAIL-line 1→28 (downstream).
   - [x] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit" → same trampoline as 88.042 (test1.c:6075..6098); trans3.test now PASS 8/70.
-  - [ ] **9.4.divbug.88.061** `upfrom4` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [X] **9.4.divbug.88.061** `upfrom4` — shared port with 88.040 at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared, upfrom4.test now runs (11 fail on downstream).
   - [x] **9.4.divbug.88.062** `varint` — ported btree_varint_test Tcl cmd (test3.c:429..502, registered test3.c:675) using sqlite3PutVarint/sqlite3GetVarint/sqlite3GetVarint32; SOURCE-ERROR cleared, varint-1.1 PASSES (160 pass / 88 fail; remaining failures are a separate GetVarint32 codec divergence, not the trampoline).
   - [X] **9.4.divbug.88.063** `capi3d` follow-up — ported `sqlite3_next_stmt` Tcl trampoline (test1.c:2920..2944, registered test1.c:9164) wrapping engine `sqlite3_next_stmt` (passqlite3main.pas:4120); renders next-stmt pointer as `0x%p` hex via existing helpers. `invalid command name "sqlite3_next_stmt"` cleared, capi3d-1.1 PASSES; remaining capi3d divergence is the separate UTF-16 prepare16 issue tracked at 88.064.
   - [ ] **9.4.divbug.88.064** `capi3d` engine bug — `sqlite3_prepare16*` on UTF-16 SQL produces `near "S E L E C T ": syntax error`; engine-side encoding plumbing in `sqlite3Prepare16` misroutes the UTF-16 buffer (separate from the trampoline; needs engine port audit at `passqlite3main.pas:3884..3895` vs `prepare.c` UTF-16 entry).

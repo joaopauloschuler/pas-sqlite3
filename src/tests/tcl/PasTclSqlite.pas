@@ -4075,8 +4075,16 @@ begin
     Exit;
   end;
 
-  { nullvalue — tclsqlite.c:3524.  Mutates pDb^.zNull. }
-  if (zSub <> nil) and (StrComp(zSub, 'nullvalue') = 0) then
+  { nullvalue — tclsqlite.c:3524.  Mutates pDb^.zNull.
+
+    9.4.divbug.88.040+: also accept `null` as a unique prefix.  Upstream
+    DbObjCmd dispatch uses Tcl_GetIndexFromObj with flags=0
+    (tclsqlite.c:2479), which does unambiguous-prefix matching; `null`
+    uniquely prefixes `nullvalue` in the subcommand table
+    (tclsqlite.c:2448).  Tests json102/json502/upfrom4/indexexpr1/join/
+    joinH all rely on `db null ?value?`. }
+  if (zSub <> nil) and
+     ((StrComp(zSub, 'nullvalue') = 0) or (StrComp(zSub, 'null') = 0)) then
   begin
     Result := DbNullValueArm(clientData, interp, objc, objv);
     Exit;
