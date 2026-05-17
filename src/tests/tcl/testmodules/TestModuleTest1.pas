@@ -3796,6 +3796,104 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.009 — test1.c:1858..1935 testCreateCollation* +
+  test_create_collation_v2.
+  Usage: sqlite3_create_collation_v2 DB-HANDLE NAME CMP-PROC DEL-PROC
+  The C handler first attempts registration with an invalid encoding (16)
+  and expects SQLITE_MISUSE, then registers with SQLITE_UTF8.  The
+  destructor fires the DEL-PROC Tcl script.  collate7-1.x checks both. }
+type
+  PTestCollationX = ^TTestCollationX;
+  TTestCollationX = record
+    interp: PTclInterp;
+    pCmp:   PTclObj;
+    pDel:   PTclObj;
+  end;
+
+procedure testCreateCollationDel(pCtx: Pointer); cdecl;
+var
+  p: PTestCollationX;
+  rc: cint;
+begin
+  p := PTestCollationX(pCtx);
+  if p = nil then Exit;
+  if (p^.interp <> nil) and (p^.pDel <> nil) then
+  begin
+    rc := Tcl_EvalObjEx(p^.interp, p^.pDel,
+            TCL_EVAL_DIRECT or TCL_EVAL_GLOBAL);
+    if rc <> TCL_OK then Tcl_BackgroundError(p^.interp);
+  end;
+  if p^.pCmp <> nil then Tcl_DecrRefCount(p^.pCmp);
+  if p^.pDel <> nil then Tcl_DecrRefCount(p^.pDel);
+  sqlite3_free(p);
+end;
+
+function testCreateCollationCmp(pCtx: Pointer; nLeft: cint; zLeft: Pointer;
+  nRight: cint; zRight: Pointer): cint; cdecl;
+var
+  p: PTestCollationX;
+  pScript: PTclObj;
+  iRes: cint;
+begin
+  p := PTestCollationX(pCtx);
+  iRes := 0;
+  pScript := Tcl_DuplicateObj(p^.pCmp);
+  Tcl_IncrRefCount(pScript);
+  Tcl_ListObjAppendElement(nil, pScript,
+    Tcl_NewStringObj(PChar(zLeft), nLeft));
+  Tcl_ListObjAppendElement(nil, pScript,
+    Tcl_NewStringObj(PChar(zRight), nRight));
+  if (Tcl_EvalObjEx(p^.interp, pScript,
+        TCL_EVAL_DIRECT or TCL_EVAL_GLOBAL) <> TCL_OK)
+     or (Tcl_GetIntFromObj(p^.interp,
+           Tcl_GetObjResult(p^.interp), @iRes) <> TCL_OK) then
+    Tcl_BackgroundError(p^.interp);
+  Tcl_DecrRefCount(pScript);
+  Result := iRes;
+end;
+
+function tcl_test_create_collation_v2(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  p: PTestCollationX;
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 5 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('DB-HANDLE NAME CMP-PROC DEL-PROC'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  p := PTestCollationX(sqlite3_malloc(SizeOf(TTestCollationX)));
+  if p = nil then begin Result := TCL_ERROR; Exit; end;
+  FillChar(p^, SizeOf(p^), 0);
+  p^.pCmp := objv[3];
+  p^.pDel := objv[4];
+  p^.interp := interp;
+  Tcl_IncrRefCount(p^.pCmp);
+  Tcl_IncrRefCount(p^.pDel);
+
+  rc := sqlite3_create_collation_v2(db, Tcl_GetString(objv[2]), 16,
+          p, @testCreateCollationCmp, @testCreateCollationDel);
+  if rc <> SQLITE_MISUSE then
+  begin
+    Tcl_AppendResult(interp,
+      PChar('sqlite3_create_collate_v2() failed to detect '
+            + 'an invalid encoding'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_collation_v2(db, Tcl_GetString(objv[2]), SQLITE_UTF8,
+          p, @testCreateCollationCmp, @testCreateCollationDel);
+  if rc = 0 then ;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.62.e — test_window.c:24..177 TestWindow trampoline +
   test_create_window.  Usage:
     sqlite3_create_window_function DB NAME XSTEP XFINAL XVALUE XINVERSE
@@ -4504,6 +4602,9 @@ begin
     (test1.c:9262 + 9183 + test_window.c:337). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_create_function_v2'),
     @tcl_test_create_function_v2, nil, nil);
+  { 9.4.divbug.88.009 — sqlite3_create_collation_v2 (test1.c:9237). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_create_collation_v2'),
+    @tcl_test_create_collation_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_create_window_function'),
     @tcl_test_create_window, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_load_extension'),

@@ -1141,7 +1141,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.006** `chunksize` — SOURCE-ERROR: invalid command name "file_control_chunksize_test"
   - [ ] **9.4.divbug.88.007** `cksumvfs` — SOURCE-ERROR: invalid command name "sqlite3_register_cksumvfs"
   - [X] **9.4.divbug.88.008** `close` — cured by .005's sqlite3_open trampoline port (TestModuleTest1.pas test_open; C ref test1.c:5395..5417, registered :9140). Cited "invalid command name sqlite3_open" cleared; close-1.0 PASS, close-1.1+ now block on sqlite3_close_v2 / sqlite3_blob_open trampolines — tracked separately.
-  - [ ] **9.4.divbug.88.009** `collate7` — ! collate7-1.1 error: invalid command name "sqlite3_create_collation_v2"
+  - [X] **9.4.divbug.88.009** `collate7` — sqlite3_create_collation_v2 Tcl trampoline ported (TestModuleTest1.pas tcl_test_create_collation_v2 + testCreateCollation{Cmp,Del}; C ref test1.c:1858..1935, registered :9237). collate7-1.1 now PASS; 1.2+ block on separate `sqlite_delete_collation` cmd (test1.c:6056) — tracked separately.
   - [ ] **9.4.divbug.88.010** `colname` — ! colname-2.1 error: invalid command name "execsql2"
   - [ ] **9.4.divbug.88.011** `corrupt` — ! corrupt-2.1.8 error: invalid command name "btree_from_db"
   - [ ] **9.4.divbug.88.012** `corrupt2` — nonzero_reserved_bytes Tcl cmd ported (PasTclSqlite.pas:NonzeroReservedBytes; mirrors tester.tcl:331 `return [sqlite3 -has-codec]`=0 for no-codec build). Port advanced past prologue; corrupt2 now exercises 393 subtests (12 PASS / 381 FAIL — deeper port bugs around corrupt-DB handling). Verified via `LD_LIBRARY_PATH=src/ bin/TclTestDriver --filter corrupt2`.
