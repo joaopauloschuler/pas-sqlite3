@@ -355,8 +355,8 @@ pas-sqlite3/
 | 8 | Public API | 🧪 Ported — in testing |
 | 9 | Acceptance: differential + fuzz testing | 🚧 In progress |
 | 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🚧 In progress |
-| 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
-| 12 | Performance optimisation | 🔲 Pending |
+| 11 | Benchmarks (Pascal `speedtest1` port) | 🧪 Coded — in testing |
+| 12 | Performance optimisation | 🚧 In progress |
 
 See `tasklist.md` for the full per-task breakdown.
 
