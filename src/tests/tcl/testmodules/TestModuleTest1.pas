@@ -891,6 +891,26 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.001 — test1.c:3121..3138.  Usage: sqlite3_expired STMT.
+  sqlite3_expired() itself is deprecated and always returns 0 in the
+  modern engine; we still wire the Tcl command 1:1 so badutf2.test can
+  load. }
+function test_expired(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' <STMT>'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(sqlite3_expired(pStmt)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { ----------------------------------------------------------------------
   test_backup.c — backupTestInit + backupTestCmd.
   Usage: sqlite3_backup CMDNAME DESTHANDLE DESTNAME SRCHANDLE SRCNAME
@@ -4028,6 +4048,9 @@ begin
     @test_prepare_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_transfer_bindings'),
     @test_transfer_bind, nil, nil);
+  { 9.4.divbug.88.001 — sqlite3_expired STMT.  test1.c:3121..3138, 9155. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_expired'),
+    @test_expired, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_backup'),
     @backupTestInit, nil, nil);
   { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
