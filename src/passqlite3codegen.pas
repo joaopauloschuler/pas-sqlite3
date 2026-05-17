@@ -9098,6 +9098,48 @@ begin
   resolveSubqueryOuterRefs(pParse, pOuterSrc, pE^.pRight);
 end;
 
+{ 9.4.divbug.87.039 — rewriteTrueFalseAndTruth: always-on companion to
+  flagUnresolvedTKID that *only* performs the TK_ID→TK_TRUEFALSE and
+  TK_IS/TK_ISNOT+TK_TRUEFALSE→TK_TRUTH rewrites C does in resolveExprStep
+  (resolve.c:1402..1415 + resolve.c lookupName tail).  Unlike
+  flagUnresolvedTKID it never emits "no such column" errors, so it is safe
+  to invoke for contexts with no pSrcList (e.g. INSERT VALUES, where the
+  bare TK_ID 'true' otherwise stays as TK_ID and sqlite3ExprCode silently
+  emits OP_Null into the destination register).  Without this walk, single-
+  row `INSERT INTO t(c) VALUES(true)` stored NULL instead of 1, and any
+  `CHECK(c IS TRUE)` constraint then fired even on legitimate inserts. }
+procedure rewriteTrueFalseAndTruth(pE: PExpr);
+var
+  i: i32;
+  pList_: PExprList;
+begin
+  if pE = nil then Exit;
+  if pE^.op = TK_ID then
+  begin
+    sqlite3ExprIdToTrueFalse(pE);
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  rewriteTrueFalseAndTruth(pE^.pLeft);
+  rewriteTrueFalseAndTruth(pE^.pRight);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+        rewriteTrueFalseAndTruth(ExprListItems(pList_)[i].pExpr);
+  end;
+  if (pE^.op = TK_IS) or (pE^.op = TK_ISNOT) then
+  begin
+    if (pE^.pRight <> nil)
+       and (sqlite3ExprSkipCollateAndLikely(pE^.pRight)^.op = TK_TRUEFALSE) then
+    begin
+      pE^.op2 := pE^.op;
+      pE^.op  := TK_TRUTH;
+    end;
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -9111,6 +9153,12 @@ begin
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
       resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr);
+    { Unconditional TK_ID→TK_TRUEFALSE and TK_IS+TK_TRUEFALSE→TK_TRUTH
+      rewrite — port of resolve.c:1402..1415 and resolve.c lookupName tail.
+      Runs regardless of pSrcList so INSERT VALUES, CHECK, DEFAULT and any
+      other no-SrcList context still get TRUE/FALSE folded properly.  The
+      err-emitting leftover-sweep below remains pSrcList-gated. }
+    rewriteTrueFalseAndTruth(pExpr);
     { 9.4.divbug.76 — when the current NameContext has no pSrcList (i.e. the
       enclosing SELECT has no FROM clause, e.g. tkt3346-1.1's inner
       `(SELECT x.b='alice' AS y)`), any leftover TK_DOT / bare TK_ID does
