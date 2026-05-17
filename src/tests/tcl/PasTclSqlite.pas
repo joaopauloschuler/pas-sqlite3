@@ -4689,6 +4689,12 @@ begin
   begin
     sqlite3PercentileInit(pHandle);
     sqlite3RegexpInit(pHandle);
+    { 9.4.divbug.91 — register the md5sum() SQL aggregate on every new
+      connection.  Upstream wires this via sqlite3_auto_extension() in
+      autoinstall_test_functions (test_func.c:723..726); pas-sqlite3 has
+      no auto-extension table, so we call Md5_Register directly here.
+      Required by backup, backup_ioerr, fuzz3, interrupt, trans2 tests. }
+    Md5_Register(pHandle, nil, nil);
   end;
   if (rc <> SQLITE_OK) or (pHandle = nil) or
      (sqlite3_errcode(pHandle) <> SQLITE_OK) then

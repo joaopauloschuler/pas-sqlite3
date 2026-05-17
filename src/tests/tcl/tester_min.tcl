@@ -1367,6 +1367,31 @@ set ::MEMORY_MANAGEMENT 0
 # expressions are handled by the always-true `ifcapable` stub above.
 # C ref: src/test_config.c:309..313.
 array set ::sqlite_options {default_autovacuum 0}
+# 9.4.divbug.91.016 — types.test reads $sqlite_options(utf16) directly
+# (not through ifcapable).  pas-sqlite3 has UTF-16 enabled in its build,
+# matching the upstream default; mirror test_config.c:705 in that arm.
+set ::sqlite_options(utf16) 1
+
+# 9.4.divbug.91 — assorted globals that upstream test_config.c /
+# test1.c plumb but pas-sqlite3 does not.  Each test that names one
+# below errors with "no such variable" before reaching its first
+# assertion, so the engine never runs.  Seeding the value here lets
+# those tests load.  C refs noted per-line.
+#   bitmask_size: test1.c:9335..9438 LinkVar of sizeof(Bitmask)*8 = 64
+#     (Bitmask is u64 in this port — see passqlite3codegen.pas:53).
+#     Used by join3.test as the join-table-count limit.
+set ::bitmask_size 64
+#   SQLITE_MAX_VARIABLE_NUMBER: test_config.c:817 LinkVar of the
+#     SQLITE_MAX_VARIABLE_NUMBER macro (= 32766; matches
+#     passqlite3main.pas:653 / passqlite3types.pas:282).  Used by
+#     bind.test:422.
+set ::SQLITE_MAX_VARIABLE_NUMBER 32766
+#   cmdlinearg(soft-heap-limit): tester.tcl:378 / :404 default + CLI
+#     override; tester.tcl:546 feeds it to sqlite3_soft_heap_limit64.
+#     0 means "no limit".  Used by avtrans.test:169 and capi3b.test:144.
+if {![info exists ::cmdlinearg(soft-heap-limit)]} {
+  set ::cmdlinearg(soft-heap-limit) 0
+}
 
 # --------------------------------------------------------------------------
 # 9.4.6.q.2 — remaining tester.tcl / malloc_common.tcl procs surfaced by

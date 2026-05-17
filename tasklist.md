@@ -1221,23 +1221,23 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.90.006** `io` — SOURCE-ERROR: no such vfs: devsym
   - [ ] **9.4.divbug.90.007** `memdb` — ! memdb-7.1 error: no such extension: wholenumber (co-victim 2026-05-17: percentile-2.0 in `percentile.test` also hits `no such extension: wholenumber`; fix once at the registration shim).
   - [ ] **9.4.divbug.90.008** `misc8` — SOURCE-ERROR: no such extension: eval
-- [ ] **9.4.divbug.91** Tcl harness helper gaps (carved from `9.4.4.g-unbucketed` 2026-05-16) — **16 pas-soft tests** on missing test-harness plumbing (engine behaviour not exercised): `md5sum` Tcl command (5: `backup_ioerr`, `backup`, `fuzz3`, `interrupt`, …); arbitrary missing tclvars (4: `join3`, `savepoint2`, `tkt3992`, `types`); `cmdlinearg(soft-heap-limit)` array (2: `avtrans`, `capi3b`); `SQLITE_MAX_VARIABLE_NUMBER` tcl-const (1: `bind`); `QRF not available in this build` build-flag gap (2: `qrf01`, `qrf02`); `no files matched glob "*malloc*.test"` (1: `mallocAll`); `couldn't read file "-"` stdin input (1: `memleak`).  Wire each helper in `tester_min.tcl` (or upstream the missing testfixture commands) to drain the cluster.
-  - [ ] **9.4.divbug.91.001** `avtrans` — SOURCE-ERROR: can't read "cmdlinearg(soft-heap-limit)": no such variable
-  - [ ] **9.4.divbug.91.002** `backup` — SOURCE-ERROR: no such function: md5sum
-  - [ ] **9.4.divbug.91.003** `backup_ioerr` — SOURCE-ERROR: no such function: md5sum
-  - [ ] **9.4.divbug.91.004** `bind` — SOURCE-ERROR: can't read "SQLITE_MAX_VARIABLE_NUMBER": no such variable
-  - [ ] **9.4.divbug.91.005** `capi3b` — SOURCE-ERROR: can't read "cmdlinearg(soft-heap-limit)": no such variable
-  - [ ] **9.4.divbug.91.006** `fuzz3` — SOURCE-ERROR: no such function: md5sum
-  - [ ] **9.4.divbug.91.007** `interrupt` — SOURCE-ERROR: no such function: md5sum
-  - [ ] **9.4.divbug.91.008** `join3` — SOURCE-ERROR: can't read "bitmask_size": no such variable
-  - [ ] **9.4.divbug.91.009** `mallocAll` — SOURCE-ERROR: no files matched glob pattern "/home/bpsa/app/pas-sqlite3/src/tests/tcl/*malloc*.test"
-  - [ ] **9.4.divbug.91.010** `memleak` — SOURCE-ERROR: couldn't read file "-": no such file or directory
-  - [ ] **9.4.divbug.91.011** `qrf01` — ! qrf01-1.10 error: QRF not available in this build
-  - [ ] **9.4.divbug.91.012** `qrf02` — SOURCE-ERROR: QRF not available in this build
-  - [ ] **9.4.divbug.91.013** `savepoint2` — SOURCE-ERROR: can't read "::sig(one)": no such variable
-  - [ ] **9.4.divbug.91.014** `tkt3992` — ! tkt3992-2.3 error: can't read "res": no such variable
-  - [ ] **9.4.divbug.91.015** `trans2` — ! trans2-1.1 error: no such function: md5sum
-  - [ ] **9.4.divbug.91.016** `types` — SOURCE-ERROR: can't read "sqlite_options(utf16)": no such element in array
+- [ ] **9.4.divbug.91** Tcl harness helper gaps (carved from `9.4.4.g-unbucketed` 2026-05-16) — **16 pas-soft tests** on missing test-harness plumbing (engine behaviour not exercised): `md5sum` Tcl command (5: `backup_ioerr`, `backup`, `fuzz3`, `interrupt`, `trans2`); arbitrary missing tclvars (4: `join3`, `savepoint2`, `tkt3992`, `types`); `cmdlinearg(soft-heap-limit)` array (2: `avtrans`, `capi3b`); `SQLITE_MAX_VARIABLE_NUMBER` tcl-const (1: `bind`); `QRF not available in this build` build-flag gap (2: `qrf01`, `qrf02`); `no files matched glob "*malloc*.test"` (1: `mallocAll`); `couldn't read file "-"` stdin input (1: `memleak`).  Progress 2026-05-17: md5sum SQL aggregate now auto-registered on every connection (PasTclSqlite.pas DbMain — calls Md5_Register after sqlite3_open_v2, mirrors test_func.c:723..726 autoinstall_test_functions / auto_extension), and tester_min.tcl seeds `bitmask_size=64` (test1.c:9335..9438), `SQLITE_MAX_VARIABLE_NUMBER=32766` (test_config.c:817), `cmdlinearg(soft-heap-limit)=0` (tester.tcl:378), `sqlite_options(utf16)=1` (test_config.c:705).  3/16 closed; 10/16 now reach the engine (residuals are not harness gaps and re-bucket below); 3/16 remain genuine harness gaps (backup family, qrf, mallocAll/memleak).
+  - [X] **9.4.divbug.91.001** `avtrans` — cmdlinearg(soft-heap-limit) seeded; now reaches engine.  Residual: avtrans-7.1 "database disk image is malformed" + SOURCE-ERROR `checksum` — engine VFS / checksum-test plumbing, not divbug.91.
+  - [ ] **9.4.divbug.91.002** `backup` — md5sum landed, but the test still times out at 30s with no output (engine-level deadlock during backup loop, NOT a harness gap).  Re-bucket: backup-API hang.
+  - [ ] **9.4.divbug.91.003** `backup_ioerr` — same 30s timeout post-md5sum; re-bucket with .91.002.
+  - [X] **9.4.divbug.91.004** `bind` — SQLITE_MAX_VARIABLE_NUMBER seeded; test now reaches engine.  Residual: 8 engine-level errors (separate bucket — sqlite3_bind_* edge cases).
+  - [X] **9.4.divbug.91.005** `capi3b` — cmdlinearg(soft-heap-limit) seeded; **PASS** 22/22 via driver.
+  - [X] **9.4.divbug.91.006** `fuzz3` — md5sum landed; test now reaches engine.  Residual: SOURCE-ERROR `pcache_stats` — separate harness gap (test_pcache.c).
+  - [X] **9.4.divbug.91.007** `interrupt` — md5sum landed; test now reaches engine (65 cases run).  Residual: 34 engine-level errors (sqlite3_interrupt timing — separate bucket).
+  - [X] **9.4.divbug.91.008** `join3` — bitmask_size=64 seeded; test now reaches engine.  Residual: SIGSEGV / "corrupted size vs. prev_size" at join3-2.16 (16-table join) — genuine Pas codegen bug, NOT a harness gap.  Re-bucket: many-way-join crash.
+  - [ ] **9.4.divbug.91.009** `mallocAll` — driver glob `*malloc*.test` finds nothing under per-test tmpdir; needs `$testdir` to point at upstream test/ directory or a malloc-test inventory shim.  Still open.
+  - [ ] **9.4.divbug.91.010** `memleak` — driver redirects `source` but the test re-invokes itself via stdin (`source -`); needs harness arm to feed scripts via stdin or seed the file-list.  Still open.
+  - [ ] **9.4.divbug.91.011** `qrf01` — QRF (Query Result Formatter) is a tclsqlite.c-internal feature not ported.  Genuine build-flag gap; deferred (port out of scope for harness drain).
+  - [ ] **9.4.divbug.91.012** `qrf02` — same as .011.
+  - [X] **9.4.divbug.91.013** `savepoint2` — md5sum landed (the `signature` proc that sets `::sig(one)` uses md5sum on the db); **PASS** 181/181 via driver.
+  - [X] **9.4.divbug.91.014** `tkt3992` — **PASS** 6/6 via driver (was a stale flake — already passing on entry).
+  - [X] **9.4.divbug.91.015** `trans2` — md5sum landed; test now reaches engine (407 cases run).  Residual: md5 digests diverge from upstream — separate bucket (transaction/rollback engine semantics).
+  - [X] **9.4.divbug.91.016** `types` — sqlite_options(utf16)=1 seeded; test now reaches engine.  Residual: 4 errors `invalid command name "btree_open"` — separate harness gap (test_btree.c Tcl commands).
 
 ---
 
