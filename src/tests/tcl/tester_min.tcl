@@ -1284,7 +1284,17 @@ proc do_faultsim_test {name args} {
   set ::testrc [catch [list uplevel #0 $O(-body)] ::testresult]
   set ::testnfail 0
   if {$O(-test) ne ""} {
-    do_test $name.baseline [list uplevel #0 $O(-test) \; set {}] {}
+    # Mirror upstream do_one_faultsim_test (malloc_common.tcl:347,378..380):
+    # wrap -test as a proc receiving (testrc,testresult,testnfail), then
+    # `do_test` succeeds iff the proc runs without throwing.  Using a proc
+    # avoids `uplevel #0 <body> \; set {}` which (after `[list ...]` quotes
+    # the `;`) collapses to a single uplevel arg list where the trailing
+    # `{}` is dropped during arg concat, leaving `set` with zero args →
+    # "wrong # args: should be \"set varName ?newValue?\"".
+    proc faultsim_test_proc {testrc testresult testnfail} $O(-test)
+    set rc [catch [list faultsim_test_proc $::testrc $::testresult $::testnfail] res]
+    if {$rc == 0} {set res ok}
+    do_test $name.baseline [list list $rc $res] {0 ok}
   } else {
     do_test $name.baseline [list set ::testrc] 0
   }

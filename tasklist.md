@@ -1071,11 +1071,11 @@ acceptance gate for this section.
   - [X] **9.4.divbug.87.010** `diskfull` — ! diskfull-2.2.2 got: [{*** in database main ***  Already fixed by 2944378 (divbug.87.006/.007 — PragFlg_NeedSchema upfront `sqlite3ReadSchema` gate at pragma.c:521..524 → passqlite3codegen.pas:51175..51187).  After VACUUM aborts under simulated SQLITE_FULL (os_unix.c:3707..3708 SimulateDiskfullError → passqlite3os.pas:1710..1714), the test does `db close; sqlite3 db test.db; integrity_check`; without the upfront ReadSchema the first `PRAGMA integrity_check` on the fresh handle codegen'd against an empty pSchema and integrity_check synthesised "*** in database main *** Page N: never used" lines.  Re-run post-build: diskfull.test PASS 744 sub-tests in ~2.4 s; stale failure-log timestamped 2026-05-16 21:54 (pre-2944378).
   - [ ] **9.4.divbug.87.011** `eval` — ! eval-2.3 got: [1 {} {} 2 {} {} 3 {} {} 4 {} {}]
   - [ ] **9.4.divbug.87.012** `exec` — ! exec-1.2 got: [0 {{1} {2}}]
-  - [ ] **9.4.divbug.87.013** `exprfault` — ! exprfault-1.1.baseline error: wrong # args: should be "set varName ?newValue?"
-  - [ ] **9.4.divbug.87.014** `exprfault2` — ! exprfault2-1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [X] **9.4.divbug.87.013** `exprfault` — FIXED: tester_min.tcl do_faultsim_test mis-quoted `\;` separator collapsed `set {}` into zero-arg `set`. Port verbatim from malloc_common.tcl:347,378..380 (proc faultsim_test_proc wrap).
+  - [X] **9.4.divbug.87.014** `exprfault2` — FIXED with .013 (same root cause; malloc_common.tcl:347,378..380).
   - [ ] **9.4.divbug.87.015** `func3` — ! func3-1.2 got: [1]
   - [ ] **9.4.divbug.87.016** `fuzz-oss1` — ! fuzz-oss1-skrooge error: no such column: v_operation_tmp1.id
-  - [ ] **9.4.divbug.87.017** `gcfault` — ! gcfault-1.utf16.3.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [X] **9.4.divbug.87.017** `gcfault` — FIXED with .013 (same root cause; malloc_common.tcl:347,378..380).
   - [ ] **9.4.divbug.87.018** `gencol1` — ! gencol1-2.1.150 error: table t1 has 6 columns but 3 values were supplied
   - [ ] **9.4.divbug.87.019** `having` — ! having-5.2 error: no such column: Col0
   - [ ] **9.4.divbug.87.020** `hexlit` — ! hexlist-401 got: [0 {}]
@@ -1093,8 +1093,8 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.87.032** `insert` — no such column: t3.a}]
   - [ ] **9.4.divbug.87.033** `insert2` — ! insert2-1.2.1 got: [0]
   - [ ] **9.4.divbug.87.034** `insert3` — ! insert3-2.2 error: UNIQUE constraint failed: t2.a
-  - [ ] **9.4.divbug.87.035** `insertfault` — ! insertfault-1.baseline error: wrong # args: should be "set varName ?newValue?"
-  - [ ] **9.4.divbug.87.036** `instrfault` — ! instrfault-1.utf8.1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [X] **9.4.divbug.87.035** `insertfault` — FIXED with .013 (same root cause; malloc_common.tcl:347,378..380).
+  - [X] **9.4.divbug.87.036** `instrfault` — FIXED with .013 (same root cause; malloc_common.tcl:347,378..380).
   - [ ] **9.4.divbug.87.037** `intpkey` — ! intpkey-3.8 got: [11 hello world 1]
   - [ ] **9.4.divbug.87.038** `intreal` — ! intreal-3.0 error: string or blob too big
   - [ ] **9.4.divbug.87.039** `istrue` — ! istrue-520 error: CHECK constraint failed: b IS TRUE
@@ -1115,7 +1115,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.87.054** `misc4` — ! misc4-1.2.1 got: [SQLITE_ERROR SQLITE_ERROR]
   - [ ] **9.4.divbug.87.055** `misc5` — ! misc5-3.1 got: []
   - [ ] **9.4.divbug.87.056** `mmapwarm` — ! mmapwarm-1.0 got: [127]
-  - [ ] **9.4.divbug.87.057** `notnullfault` — ! notnullfault-1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [X] **9.4.divbug.87.057** `notnullfault` — FIXED with .013 (same root cause; malloc_common.tcl:347,378..380).
   - [ ] **9.4.divbug.87.058** `null` — ! null-6.4 error: 1st ORDER BY term does not match any column in the result set
   - [ ] **9.4.divbug.87.059** `nulls1` — ! nulls1-5.3 got: [
   - [ ] **9.4.divbug.87.060** `orderby5` — ! orderby5-3.0 got: [4 0 59 {SEARCH t3 USING INDEX t3bcde (b=? AND c=?)} 18 0 0 {USE TEMP B-TREE FOR LAST TERM OF ORDER BY}]
