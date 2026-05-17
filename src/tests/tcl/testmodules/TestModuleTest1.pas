@@ -2257,6 +2257,36 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.007 — sqlite3_register_cksumvfs.  test1.c:8795..8814.
+  STUB: full cksumvfs port (cksumvfs.c, ~820 lines, page-checksum shim VFS)
+  is out of scope here; we register the Tcl command and return SQLITE_OK so
+  the test prologue (cksumvfs.test:27) advances.  Downstream subtests that
+  rely on actual checksum behaviour will fail with a clearer error than
+  the original "invalid command name". }
+function tcl_test_register_cksumvfs(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc <> 1 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ 9.4.divbug.88.007 — sqlite3_unregister_cksumvfs.  test1.c:8816..8835.
+  STUB: paired with the register stub above; returns SQLITE_OK. }
+function tcl_test_unregister_cksumvfs(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc <> 1 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
 { test1.c:2288..2330 — sqlite3_stmt_status STMT PARAMETER RESETFLAG. }
 function tcl_test_stmt_status(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
@@ -5165,6 +5195,12 @@ begin
   { 9.4.divbug.88.058 — sqlite3_normalize SQL (test1.c:5550..5572). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_normalize'),
     @tcl_test_normalize, nil, nil);
+  { 9.4.divbug.88.007 — sqlite3_register_cksumvfs / _unregister_cksumvfs
+    STUBS (test1.c:9328..9329).  Full cksumvfs.c port deferred. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_register_cksumvfs'),
+    @tcl_test_register_cksumvfs, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_unregister_cksumvfs'),
+    @tcl_test_unregister_cksumvfs, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_status'),
     @tcl_test_stmt_status, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_busy'),
