@@ -1592,6 +1592,7 @@ type
   TPrepareV2Fn       = function(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                                 ppStmt: PPointer;
                                 pzTail: PPointer): i32; cdecl;
+  TRepreparFn        = function(p: PVdbe): i32;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1623,6 +1624,11 @@ var
                                                 the synthesised "PRAGMA name(arg)"
                                                 statement.  Codegen cannot import
                                                 main directly (circular). }
+  gReprepare:              TRepreparFn;      { wired by passqlite3main — invoked
+                                                by sqlite3_step on SQLITE_SCHEMA
+                                                to recompile the statement
+                                                against the new schema.  See
+                                                vdbeapi.c:911 wrapper. }
 {$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
 type
   TVdbePreUpdateHookFn = procedure(v: Pointer; pCsr: PVdbeCursor; op: i32;
@@ -5901,7 +5907,9 @@ end;
 
 { --- sqlite3_step / sqlite3_reset / sqlite3_finalize (vdbeapi.c:771) --- }
 
-function sqlite3_step(pStmt: PVdbe): i32;
+{ Inner step (vdbeapi.c:771 sqlite3Step) — public sqlite3_step (vdbeapi.c:911)
+  is the wrapper below that catches SQLITE_SCHEMA and reprepares. }
+function sqlite3StepInternal(pStmt: PVdbe): i32;
 type
   { vdbeapi.c:72 — legacy sqlite3_profile callback shape. }
   TVdbeLegacyProfileFn = procedure(p: Pointer; zSql: PAnsiChar; tm: u64); cdecl;
@@ -5983,6 +5991,61 @@ begin
     { vdbeapi.c sqlite3Step tail — fold extended → primary unless the
       app opted in via sqlite3_extended_result_codes(...,1). }
     rc := rc and db^.errMask;
+  end;
+  Result := rc;
+end;
+
+{ vdbeapi.c:911 — public sqlite3_step wrapper.  Catches SQLITE_SCHEMA from
+  the inner step, invokes sqlite3Reprepare (via gReprepare trampoline; main
+  owns the body) and retries up to SQLITE_MAX_SCHEMA_RETRY times.  Without
+  this loop a prepared statement that survives a concurrent schema change
+  (e.g. backup overwrite — backup5-1.6) keeps returning SQLITE_SCHEMA or,
+  worse, decodes stale b-tree pages and surfaces bogus SQLITE_CORRUPT. }
+function sqlite3_step(pStmt: PVdbe): i32;
+var
+  rc:      i32;
+  cnt:     i32;
+  savedPc: i32;
+  db:      PTsqlite3;
+  zErr:    PAnsiChar;
+begin
+  if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  db  := pStmt^.db;
+  cnt := 0;
+  rc  := sqlite3StepInternal(pStmt);
+  while (rc = SQLITE_SCHEMA) and (cnt < SQLITE_MAX_SCHEMA_RETRY)
+        and Assigned(gReprepare) do begin
+    Inc(cnt);
+    savedPc := pStmt^.pc;
+    rc := gReprepare(pStmt);
+    if rc <> SQLITE_OK then begin
+      { Reprepare failed — copy the parser error from db^.pErr into the
+        stmt so sqlite3_errmsg() returns it after sqlite3_finalize.
+        Matches vdbeapi.c:929..945. }
+      if (db <> nil) and (db^.pErr <> nil) then
+        zErr := PAnsiChar(sqlite3_value_text(db^.pErr))
+      else
+        zErr := nil;
+      sqlite3DbFree(db, pStmt^.zErrMsg);
+      if (db = nil) or (db^.mallocFailed = 0) then begin
+        if zErr <> nil then
+          pStmt^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db, zErr))
+        else
+          pStmt^.zErrMsg := nil;
+        pStmt^.rc := rc;
+        if db <> nil then db^.errCode := rc;
+      end else begin
+        pStmt^.zErrMsg := nil;
+        pStmt^.rc      := SQLITE_NOMEM;
+        rc             := SQLITE_NOMEM;
+        if db <> nil then db^.errCode := SQLITE_NOMEM;
+      end;
+      Break;
+    end;
+    sqlite3_reset(pStmt);
+    if savedPc >= 0 then
+      pStmt^.minWriteFileFormat := 254;
+    rc := sqlite3StepInternal(pStmt);
   end;
   Result := rc;
 end;
@@ -10087,10 +10150,40 @@ begin
             end;
             goto abort_due_to_error;
           end;
-          { Schema cookie check — only when p5≠0 and schema is fully ported }
-          { Skipped for now: pDb->pSchema->iGeneration not yet accessible }
+          { Schema cookie check — vdbe.c:4163..4198.
+            When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
+            P3 (cookie at prepare time) and pSchema->iGeneration against P4.i
+            (generation at prepare time).  Mismatch → SQLITE_SCHEMA so the
+            sqlite3_step() wrapper can reprepare via sqlite3Reprepare().
+            Without this gate, statements like SELECT against a table dropped
+            by a concurrent backup keep using stale schema and the cursor
+            decodes raw pages as the gone table — surfaces as bogus
+            SQLITE_CORRUPT (backup5-1.6).  C cite: vdbe.c:4163..4197. }
+          if (rc = SQLITE_OK) and (pOp^.p5 <> 0) then begin
+            if pDbb^.pSchema <> nil then begin
+              if (iMeta5g <> pOp^.p3) or
+                 (PSchema(pDbb^.pSchema)^.iGeneration <> pOp^.p4.i) then
+              begin
+                sqlite3DbFree(db, v^.zErrMsg);
+                v^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db,
+                  'database schema has changed'));
+                { Only reset the schema if the on-disk cookie has changed; a
+                  pure iGeneration mismatch (e.g. v-table reload) keeps the
+                  cached schema alive — vdbe.c:4187..4190. }
+                if PSchema(pDbb^.pSchema)^.schema_cookie <> iMeta5g then begin
+                  if Assigned(gResetOneSchema) then
+                    gResetOneSchema(db, pOp^.p1);
+                end;
+                v^.vdbeFlags :=
+                  (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+                rc := SQLITE_SCHEMA;
+                v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_ChangeCntOn);
+              end;
+            end;
+          end;
         end;
       end;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_Savepoint ────── (vdbe.c:3823)

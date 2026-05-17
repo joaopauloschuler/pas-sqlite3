@@ -6239,6 +6239,12 @@ initialization
     xFilter (codegen.pas) can prepare its synthesised PRAGMA statement. }
   passqlite3vdbe.gPrepareV2 := passqlite3vdbe.TPrepareV2Fn(@sqlite3_prepare_v2);
 
+  { Wire sqlite3Reprepare so passqlite3vdbe.sqlite3_step (vdbeapi.c:911
+    wrapper) can recompile the statement against a new schema on
+    SQLITE_SCHEMA — required for backup-induced schema changes to surface
+    as SQLITE_ERROR ("no such table") rather than CORRUPT (backup5-1.6). }
+  passqlite3vdbe.gReprepare := @sqlite3Reprepare;
+
   { Phase 6.27 — wire sqlite3_exec into codegen's analysisLoadTrampoline so
     the sqlite_stat1 SELECT (analyze.c:1974) lands real rows into the
     schema. }
