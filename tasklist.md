@@ -1179,7 +1179,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.044** `joinH` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.045** `json102` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.046** `json502` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
-  - [ ] **9.4.divbug.88.047** `laststmtchanges` — ! laststmtchanges-1.2.1 error: invalid command name "sqlite3_exec_printf"
+  - [x] **9.4.divbug.88.047** `laststmtchanges` — ported `sqlite3_exec_printf` Tcl trampoline (test1.c:299..328; reuses execPrintfCb at TestModuleTest1.pas:641, sqlite3PfMprintf wrapper). Registered TestModuleTest1.pas via Tcl_CreateCommand (C ref test1.c:9072). laststmtchanges → PASS 6/205.
   - [ ] **9.4.divbug.88.048** `lock5` — SOURCE-ERROR: invalid command name "db2"
   - [ ] **9.4.divbug.88.049** `main` — ! main-1.1 error: unknown subcommand "complete" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.050** `memsubsys1` — SOURCE-ERROR: invalid command name "sqlite3_config_lookaside"

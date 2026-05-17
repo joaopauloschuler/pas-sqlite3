@@ -728,6 +728,53 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:299..328 — test_exec_printf.
+  Usage: sqlite3_exec_printf DB FORMAT STRING.
+  Builds SQL via sqlite3_mprintf(FORMAT, STRING), runs sqlite3_exec with
+  execPrintfCb accumulating into a Tcl_DString, then appends
+  "{rc} {result-or-err}".  Trampoline takes the legacy argc/argv form
+  (Tcl_CreateCommand), matching the C registration at test1.c:9072. }
+function test_exec_printf(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db:    PTsqlite3;
+  rc:    i32;
+  zErr:  PAnsiChar;
+  zSql:  PAnsiChar;
+  str:   TTclDString;
+  zBuf:  array[0..31] of AnsiChar;
+  av:    PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 4 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB FORMAT STRING'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_DStringInit(@str);
+  zErr := nil;
+  zSql := sqlite3PfMprintf(av[2], [av[3]]);
+  rc := sqlite3_exec(db, zSql, @execPrintfCb, @str, @zErr);
+  sqlite3_free(zSql);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  StrPCopy(zBuf, IntToStr(rc));
+  Tcl_AppendElement(interp, @zBuf[0]);
+  if rc = SQLITE_OK then
+    Tcl_AppendElement(interp, Tcl_DStringValue(@str))
+  else if zErr <> nil then
+    Tcl_AppendElement(interp, zErr)
+  else
+    Tcl_AppendElement(interp, PChar(''));
+  Tcl_DStringFree(@str);
+  if zErr <> nil then sqlite3_free(zErr);
+  Result := TCL_OK;
+end;
+
 { test1.c:4910..4929 — test_errmsg.
   Usage: sqlite3_errmsg DB. }
 function test_errmsg(clientData: TClientData; interp: PTclInterp;
@@ -4829,6 +4876,12 @@ begin
     @test_extended_errcode, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
+  { 9.4.divbug.88.047 — sqlite3_exec_printf DB FORMAT STRING.
+    test1.c:299..328, registered at test1.c:9072.  Used by
+    laststmtchanges-1.2.1 to inject a value into a CREATE TABLE statement
+    via %q. }
+  Tcl_CreateCommand(interp, PChar('sqlite3_exec_printf'),
+    @test_exec_printf, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg'),
     @test_errmsg, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare'),
