@@ -9239,6 +9239,71 @@ begin
   end;
 end;
 
+{ 9.4.divbug.72 — checkRowValueMisuse: port of the comparison-operator
+  arm at resolve.c:1420..1453 (TK_EQ/TK_NE/TK_LT/TK_LE/TK_GT/TK_GE/TK_IS
+  /TK_ISNOT/TK_BETWEEN).  C's resolveExprStep recurses into every node
+  and, after the LHS/RHS have been resolved, validates that
+  sqlite3ExprVectorSize(pLeft)==sqlite3ExprVectorSize(pRight) — emitting
+  "row value misused" when they diverge.  The Pas resolver does a
+  structurally lighter walk via resolveExprAgainstSrcList and never runs
+  the per-node size check, so e.g. `(b,b) <= 1` slips through resolution
+  and SIGSEGVs deep inside the planner (whereRangeVectorLen dereferences
+  the scalar RHS's x.pList as if it were a vector list).  Walking the
+  fully-resolved tree once here matches the C contract and short-circuits
+  the bad term before the planner sees it. }
+procedure checkRowValueMisuse(pParse: PParse; pE: PExpr);
+var
+  i:      i32;
+  nLeft:  i32;
+  nRight: i32;
+  pList_: PExprList;
+begin
+  if pE = nil then Exit;
+  if pParse = nil then Exit;
+  if pParse^.nErr <> 0 then Exit;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  { Recurse first so we don't double-report on outer ops whose children
+    are themselves vector-mismatched. }
+  checkRowValueMisuse(pParse, pE^.pLeft);
+  if pParse^.nErr <> 0 then Exit;
+  checkRowValueMisuse(pParse, pE^.pRight);
+  if pParse^.nErr <> 0 then Exit;
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+      begin
+        checkRowValueMisuse(pParse, ExprListItems(pList_)[i].pExpr);
+        if pParse^.nErr <> 0 then Exit;
+      end;
+  end;
+  case pE^.op of
+    TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT_TK, TK_GE, TK_IS, TK_ISNOT:
+      begin
+        if pE^.pLeft = nil then Exit;
+        if pE^.pRight = nil then Exit;
+        nLeft  := sqlite3ExprVectorSize(pE^.pLeft);
+        nRight := sqlite3ExprVectorSize(pE^.pRight);
+        if nLeft <> nRight then
+          sqlite3ErrorMsg(pParse, 'row value misused');
+      end;
+    TK_BETWEEN:
+      begin
+        if pE^.pLeft = nil then Exit;
+        if (pE^.flags and EP_xIsSelect) <> 0 then Exit;
+        pList_ := pE^.x.pList;
+        if (pList_ = nil) or (pList_^.nExpr < 2) then Exit;
+        nLeft  := sqlite3ExprVectorSize(pE^.pLeft);
+        nRight := sqlite3ExprVectorSize(ExprListItems(pList_)[0].pExpr);
+        if nLeft = nRight then
+          nRight := sqlite3ExprVectorSize(ExprListItems(pList_)[1].pExpr);
+        if nLeft <> nRight then
+          sqlite3ErrorMsg(pParse, 'row value misused');
+      end;
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -9272,6 +9337,18 @@ begin
     begin
       flagUnresolvedTKID(pNC^.pParse, pExpr,
         (pNC^.ncFlags and NC_IsDDL) <> 0);
+      if pNC^.pParse^.nErr > 0 then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+    end;
+    { 9.4.divbug.72 — after resolution, check vector-size consistency on
+      every comparison / BETWEEN node.  Mirrors resolve.c:1420..1453's
+      per-step check; the Pas resolver does not recurse so this is the
+      single entry-point that gets the equivalent coverage. }
+    if pNC^.pParse <> nil then
+    begin
+      checkRowValueMisuse(pNC^.pParse, pExpr);
       if pNC^.pParse^.nErr > 0 then
       begin
         Result := SQLITE_ERROR; Exit;
@@ -11564,6 +11641,12 @@ begin
     ResolveAliasInWhere(p^.pWhere);
   if pParse^.nErr = 0 then
     ResolveExpr    (p^.pWhere);
+  { 9.4.divbug.72 — vector-size consistency check on the WHERE clause.
+    Mirrors resolve.c:1420..1453's per-step comparison/BETWEEN check that
+    Pas's lean ResolveExpr lacks; without it `WHERE (b,b) <= 1` slips
+    through resolution and SIGSEGVs in whereRangeVectorLen. }
+  if (pParse^.nErr = 0) and (p^.pWhere <> nil) then
+    checkRowValueMisuse(pParse, p^.pWhere);
   { Pas-port deviation from resolve.c:1797 (which skips alias-tagging for
     GROUP BY because lookupName's NC_UEList fallback handles it during
     sqlite3ResolveExprNames).  This port lacks the NC_UEList fallback in
@@ -11658,6 +11741,39 @@ begin
     standard recursion. }
   if (pParse^.nErr = 0) and (p^.pLimit <> nil) then
     ResolveExpr(p^.pLimit);
+  { 9.4.divbug.72 — vector-size sweep across result-list / HAVING /
+    ORDER BY / LIMIT post-resolution.  See WHERE comment above. }
+  if (pParse^.nErr = 0) and (p^.pHaving <> nil) then
+    checkRowValueMisuse(pParse, p^.pHaving);
+  if (pParse^.nErr = 0) and (p^.pLimit <> nil) then
+    checkRowValueMisuse(pParse, p^.pLimit);
+  if (pParse^.nErr = 0) and (p^.pEList <> nil) then
+  begin
+    items_ := ExprListItems(p^.pEList);
+    for i_ := 0 to p^.pEList^.nExpr - 1 do
+    begin
+      checkRowValueMisuse(pParse, items_[i_].pExpr);
+      if pParse^.nErr <> 0 then Break;
+    end;
+  end;
+  if (pParse^.nErr = 0) and (p^.pOrderBy <> nil) then
+  begin
+    items_ := ExprListItems(p^.pOrderBy);
+    for i_ := 0 to p^.pOrderBy^.nExpr - 1 do
+    begin
+      checkRowValueMisuse(pParse, items_[i_].pExpr);
+      if pParse^.nErr <> 0 then Break;
+    end;
+  end;
+  if (pParse^.nErr = 0) and (p^.pGroupBy <> nil) then
+  begin
+    items_ := ExprListItems(p^.pGroupBy);
+    for i_ := 0 to p^.pGroupBy^.nExpr - 1 do
+    begin
+      checkRowValueMisuse(pParse, items_[i_].pExpr);
+      if pParse^.nErr <> 0 then Break;
+    end;
+  end;
 
   { resolve.c:2079 — once ON clauses have been spliced into pWhere
     (selectExpander tags Select with SF_OnToWhere when it does this),
