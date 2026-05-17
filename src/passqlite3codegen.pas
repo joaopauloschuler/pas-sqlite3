@@ -3027,11 +3027,17 @@ type
   { 9.4.divbug.87.047 — wire sqlite3_busy_timeout (passqlite3main) into
     PragTyp_BUSY_TIMEOUT write arm without circular uses. }
   TBusyTimeoutFn = function(db: PTsqlite3; ms: i32): i32;
+  { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint (passqlite3main) and
+    sqlite3WalDefaultHook pointer into PragTyp_WAL_AUTOCHECKPOINT without
+    circular uses.  Both must be installed by passqlite3main at unit init. }
+  TWalAutoCheckpointFn = function(db: PTsqlite3; nFrame: i32): i32;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
   gSqlite3Init:      TSqlite3InitFn;
   gBusyTimeout:      TBusyTimeoutFn;
+  gWalAutoCheckpoint: TWalAutoCheckpointFn;
+  gWalDefaultHook:   Pointer;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -52635,6 +52641,28 @@ begin
     Exit;
   end;
 
+  { PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429).  Write arm calls
+    sqlite3_wal_autocheckpoint(db, atoi(zRight)) at compile time, which
+    installs sqlite3WalDefaultHook (positive N) or clears the hook (N<=0).
+    Both arms emit returnSingleInt(v, db->xWalCallback==sqlite3WalDefaultHook
+    ? PTR_TO_INT(db->pWalArg) : 0).  9.4.divbug.37: prior fall-through into
+    the constant-default block ignored writes, so `PRAGMA wal_autocheckpoint
+    = N` failed to overwrite a user-installed wal_hook (e_walhook-6.1.2). }
+  if SameText(zName, 'wal_autocheckpoint') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if Assigned(gWalAutoCheckpoint) then
+        gWalAutoCheckpoint(db, sqlite3Atoi(PChar(zRight)));
+    end;
+    if (gWalDefaultHook <> nil) and (db^.xWalCallback = gWalDefaultHook) then
+      iVal := i32(PtrUInt(db^.pWalArg))
+    else
+      iVal := 0;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -52647,7 +52675,6 @@ begin
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0
-    else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
     else if SameText(zName, 'journal_size_limit') then iVal := -1
     else if SameText(zName, 'freelist_count')     then iVal := 0
     else if SameText(zName, 'schema_version')     then iVal := 0

@@ -6266,6 +6266,11 @@ initialization
     write arm (codegen.pas can't `uses passqlite3main`). }
   passqlite3codegen.gBusyTimeout :=
     passqlite3codegen.TBusyTimeoutFn(@sqlite3_busy_timeout);
+  { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint + sqlite3WalDefaultHook
+    pointer for PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429). }
+  passqlite3codegen.gWalAutoCheckpoint :=
+    passqlite3codegen.TWalAutoCheckpointFn(@sqlite3_wal_autocheckpoint);
+  passqlite3codegen.gWalDefaultHook := @sqlite3WalDefaultHook;
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)
