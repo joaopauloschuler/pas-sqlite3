@@ -25557,16 +25557,25 @@ begin
   Result := SQLITE_OK;
 end;
 
-{ sqlite3SubqueryColumnTypes — fill Column type/affinity from SELECT exprs }
+{ sqlite3SubqueryColumnTypes — fill Column type/affinity from SELECT exprs.
+  Port of select.c:2346..2433.  Walks compound arms (pNext) to choose the
+  first non-NONE affinity, then downgrades to BLOB when later arms expose
+  a mixed-type clash (TEXT vs numeric or NUMERIC vs textual data) so a
+  UNION column with mixed-type members compares as BLOB — required to
+  give `data JOIN idmap USING(id)` the right P5 affinity in affinity3.
+  (divbug.16 residual). }
 procedure sqlite3SubqueryColumnTypes(pParse: PParse; pTab: PTable2;
   pSelect: PSelect; aff: AnsiChar);
 var
-  db:   PTsqlite3;
-  pSel: PSelect;
-  pCol: PColumn;
-  i:    i32;
-  pE:   PExpr;
+  db:    PTsqlite3;
+  pSel:  PSelect;
+  pS2:   PSelect;
+  pCol:  PColumn;
+  i:     i32;
+  m:     i32;
+  pE:    PExpr;
   items: PExprListItem;
+  s2items: PExprListItem;
   affC:  AnsiChar;
 begin
   db := pParse^.db;
@@ -25580,8 +25589,36 @@ begin
   begin
     pE := items[i].pExpr;
     if pE = nil then begin Inc(pCol); continue; end;
+    m := 0;
+    pS2 := pSel;
     affC := sqlite3ExprAffinity(pE);
+    { Walk forward through pNext while the affinity is still NONE — first
+      non-NONE arm wins (select.c:2378..2382). }
+    while (affC <= AnsiChar(SQLITE_AFF_NONE)) and (pS2^.pNext <> nil) do
+    begin
+      s2items := PExprListItem(PByte(pS2^.pEList) + SizeOf(TExprList));
+      m := m or sqlite3ExprDataType(s2items[i].pExpr);
+      pS2 := pS2^.pNext;
+      s2items := PExprListItem(PByte(pS2^.pEList) + SizeOf(TExprList));
+      affC := sqlite3ExprAffinity(s2items[i].pExpr);
+    end;
     if affC <= AnsiChar(SQLITE_AFF_NONE) then affC := aff;
+    { BLOB downgrade for compound mixed types (select.c:2386..2398). }
+    if (affC >= AnsiChar(SQLITE_AFF_TEXT))
+       and ((pS2^.pNext <> nil) or (pS2 <> pSel)) then
+    begin
+      pS2 := pS2^.pNext;
+      while pS2 <> nil do
+      begin
+        s2items := PExprListItem(PByte(pS2^.pEList) + SizeOf(TExprList));
+        m := m or sqlite3ExprDataType(s2items[i].pExpr);
+        pS2 := pS2^.pNext;
+      end;
+      if (affC = AnsiChar(SQLITE_AFF_TEXT)) and ((m and $01) <> 0) then
+        affC := AnsiChar(SQLITE_AFF_BLOB)
+      else if (affC >= AnsiChar(SQLITE_AFF_NUMERIC)) and ((m and $02) <> 0) then
+        affC := AnsiChar(SQLITE_AFF_BLOB);
+    end;
     pCol^.affinity := affC;
     Inc(pCol);
   end;

@@ -28,7 +28,7 @@
 # tests from the 9.4.4.c sweep.  Subsequent sweeps flip more rows.
 pas-strict	../sqlite3/test/8_3_names.test	-
 pas-strict	../sqlite3/test/affinity2.test	-
-pas-soft	../sqlite3/test/affinity3.test	9.4.divbug.16-residual
+pas-strict	../sqlite3/test/affinity3.test	-
 pas-soft	../sqlite3/test/aggerror.test	9.4.divbug.14
 pas-soft	../sqlite3/test/aggfault.test	9.4.2.g.13-malloc-faultsim-deferred
 pas-soft	../sqlite3/test/aggnested.test	9.4.divbug.24
