@@ -20709,9 +20709,24 @@ begin
     WHERE_TOP_LIMIT set; the existing Case-3 codegen at sqlite3WhereCodeOneLoopStart
     emits the OP_SeekGE / OP_SeekLE prologue and the per-row OP_Rowid /
     OP_Gt / OP_Lt loop-exit test, exactly mirroring the C reference for
-    `WHERE rowid BETWEEN x AND y`. }
+    `WHERE rowid BETWEEN x AND y`.
+
+    9.4.divbug.87.037 (intpkey-3.8): C's whereShortCut (where.c:6350..6440)
+    only short-circuits the cost-based planner on WHERE_ONEROW plans.  An
+    IPK-range plan must compete against any other index whose equality term
+    might be far more selective (e.g. `WHERE c='world' AND a>7` on a table
+    with INDEX i3(c,a) is hugely better served by i3).  When pTab has any
+    non-partial index, defer to whereLoopAddBtree / wherePathSolver instead
+    of taking this Pas-only shortcut.  Tables with no usable index keep the
+    shortcut so simple `WHERE rowid>?` cases don't pay the planner cost. }
   if pLoop^.wsFlags = 0 then
   begin
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      if pIdx^.pPartIdxWhere = nil then Exit(0);
+      pIdx := pIdx^.pNext;
+    end;
     pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_GT_WO or WO_GE, nil);
     while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
       pTerm := whereScanNext(@scan);
