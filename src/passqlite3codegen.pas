@@ -9927,6 +9927,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
     else
       pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+    if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+      ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
     Result := True;
   end;
 
@@ -9960,6 +9962,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       pE^.iTable  := pItem^.iCursor;
       pE^.iColumn := pE^.iColumn - 1;
       pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+      if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+        ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
       Exit;
     end;
     { NEW.x / OLD.x trigger pseudo-table refs — bind against
@@ -10031,6 +10035,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
             else
               pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+            { 9.4.divbug.87.040 — port resolve.c:509..511.  Columns from a
+              JT_LEFT/JT_LTORJ source can become NULL on outer-join misses;
+              flag so sqlite3ExprCanBeNull (expr.c:2982) returns true and
+              codeAllEqualityTerms emits the OP_IsNull skip-search guard. }
+            if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+              ExprSetProperty(pE, EP_CanBeNull);
             Exit;
           end;
           { 9.4.divbug.19 — qualified rowid alias (Tab.rowid / sp.oid).
@@ -10049,6 +10059,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             pE^.pLeft   := nil;
             pE^.pRight  := nil;
             pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+              ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
             Exit;
           end;
         end;
@@ -10140,6 +10152,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                              (Bitmask(1) shl (BMS - 1));
         if pE^.iColumn = -1 then
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        if (pMatch^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+          ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
         Exit;
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 10 — rowid pseudo-column.
@@ -10162,6 +10176,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pE^.iColumn := i16(-1);
           pE^.y.pTab  := pItem^.pSTab;
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+          if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+            ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
           Exit;
         end;
       end;
