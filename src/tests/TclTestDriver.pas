@@ -769,12 +769,67 @@ end;
 {----------------------------------------------------------------------------
   9.4.5.c: persist per-test stdout/stderr capture to disk on FAIL so the
   CI upload-artifact step can grab them for triage.
+
+  9.4.divbug.89: prepend a header (spawn command + exit code + byte
+  counts) and, when a stream is empty/trivial, emit an explicit
+  `(empty)` marker so empty-log FAILs are at least triageable to
+  "child produced no output" rather than being mistaken for a missing
+  file.  Also tee the last ~50 lines so very chatty tests can be
+  scanned quickly without losing tail context (full streams still
+  written verbatim above the tail block).
 ----------------------------------------------------------------------------}
-procedure WriteFailLogs(const relPath: string; const sOut, sErr: AnsiString);
+function TailLines(const s: AnsiString; n: Integer): AnsiString;
+var
+  sl: TStringList;
+  i, first: Integer;
+begin
+  Result := '';
+  if Length(s) = 0 then Exit;
+  sl := TStringList.Create;
+  try
+    sl.Text := s;
+    if sl.Count <= n then begin
+      Result := s;
+      Exit;
+    end;
+    first := sl.Count - n;
+    for i := first to sl.Count - 1 do
+      Result := Result + sl[i] + LineEnding;
+  finally
+    sl.Free;
+  end;
+end;
+
+procedure WriteFailLogStream(const path, header, stream: AnsiString);
+var
+  f: TextFile;
+  body: AnsiString;
+begin
+  try
+    AssignFile(f, path); Rewrite(f);
+    Write(f, header);
+    if Length(stream) = 0 then begin
+      Writeln(f, '(empty)');
+    end else begin
+      Write(f, stream);
+      { Always end with a tail block so a >50-line stream stays scannable. }
+      body := TailLines(stream, 50);
+      if body <> stream then begin
+        Writeln(f);
+        Writeln(f, '----- tail (last 50 lines) -----');
+        Write(f, body);
+      end;
+    end;
+    CloseFile(f);
+  except end;
+end;
+
+procedure WriteFailLogs(const relPath: string; rc: Integer;
+                        const sOut, sErr: AnsiString);
 var
   bn, base, outP, errP: string;
-  f: TextFile;
   i: Integer;
+  hdrCommon, hdrOut, hdrErr: AnsiString;
 begin
   if gFailLogDir = '' then Exit;
   if not ForceDirectories(gFailLogDir) then Exit;
@@ -786,12 +841,19 @@ begin
   base := IncludeTrailingPathDelimiter(gFailLogDir) + bn;
   outP := base + '.out';
   errP := base + '.err';
-  try
-    AssignFile(f, outP); Rewrite(f); Write(f, sOut); CloseFile(f);
-  except end;
-  try
-    AssignFile(f, errP); Rewrite(f); Write(f, sErr); CloseFile(f);
-  except end;
+  { 9.4.divbug.89: header attributes the FAIL even when both streams
+    are empty (the original 12 empty-log tests). }
+  hdrCommon := '# test: ' + relPath + LineEnding
+             + '# spawn: /usr/bin/tclsh - (script on stdin)' + LineEnding
+             + '# exit-code: ' + IntToStr(rc) + LineEnding
+             + '# stdout-bytes: ' + IntToStr(Length(sOut)) + LineEnding
+             + '# stderr-bytes: ' + IntToStr(Length(sErr)) + LineEnding;
+  hdrOut := hdrCommon + '# stream: stdout' + LineEnding
+          + '--------------------------------' + LineEnding;
+  hdrErr := hdrCommon + '# stream: stderr' + LineEnding
+          + '--------------------------------' + LineEnding;
+  WriteFailLogStream(outP, hdrOut, sOut);
+  WriteFailLogStream(errP, hdrErr, sErr);
 end;
 
 {----------------------------------------------------------------------------
@@ -839,7 +901,7 @@ begin
   else if cls = 'SKIP' then Inc(nSkip)
   else begin
     Inc(nFail);
-    WriteFailLogs(relPath, sOut, sErr);
+    WriteFailLogs(relPath, rc, sOut, sErr);
   end;
 
   Flush(Output);
@@ -1238,7 +1300,7 @@ begin
     else if s^.Classified = 'SKIP' then Inc(nSkip)
     else begin
       Inc(nFail);
-      WriteFailLogs(s^.Path, s^.StdOut, s^.StdErr);
+      WriteFailLogs(s^.Path, s^.Rc, s^.StdOut, s^.StdErr);
     end;
     if s^.CovDumpPath <> '' then begin
       MergeCoverageDump(s^.CovDumpPath);
