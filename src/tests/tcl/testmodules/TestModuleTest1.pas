@@ -4228,6 +4228,36 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.003 — test1.c:6383..6411 test_db_cacheflush.
+  Usage: sqlite3_db_cacheflush DB.  Attempt to flush any dirty pages to
+  disk.  Engine entry: passqlite3main.pas:4391 (main.c:921). }
+function test_db_cacheflush(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  db := nil;
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_db_cacheflush(db);
+  if rc <> 0 then
+  begin
+    Tcl_SetResult(interp, PChar(sqlite3ErrStr(rc)), TCL_STATIC);
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_ResetResult(interp);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -4236,6 +4266,9 @@ begin
     @get_sqlite_pointer, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
+  { 9.4.divbug.88.003 — test1.c:9173 sqlite3_db_cacheflush. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_db_cacheflush'),
+    @test_db_cacheflush, nil, nil);
   { 9.4.divbug.35 — fpnum_compare for fuzzy float-string equality
     fallback used by tester.tcl do_test (tester.tcl:789..792). }
   Tcl_CreateObjCommand(interp, PChar('fpnum_compare'),
