@@ -10704,8 +10704,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     AS-name match is found in p^.pEList.  In C, GROUP BY skips this step
     because lookupName's NC_UEList fallback handles it; the Pas port
     invokes this for GROUP BY too because its simplified ResolveExpr
-    lacks the NC_UEList fallback. }
-  procedure ResolveAliasOrderByCol(pList: PExprList);
+    lacks the NC_UEList fallback.
+
+    9.4.divbug.87.063 — for GROUP BY (forGroupBy=True) we must still
+    honour C's resolve.c:1797 "skip alias arm" by NOT pre-tagging when
+    the bare TK_ID also matches a column in the FROM clause.  Ticket
+    [1c69be2dafc28] (resolver01-5.1): `SELECT count(*), substr(m,2,1)
+    AS m FROM t5 GROUP BY m` must group by input t5.m (3 distinct
+    values) rather than the alias substr(m,2,1) (2 distinct).  The
+    alias-tag path is kept as a fallback for the case where no input
+    column matches (resolver01-5.3 `GROUP BY mx`). }
+  function ColumnInFromClause(zName: PAnsiChar): Boolean; forward;
+
+  procedure ResolveAliasOrderByCol(pList: PExprList; forGroupBy: Boolean);
   var
     i, iCol: i32;
     items: PExprListItem;
@@ -10718,6 +10729,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if items[i].u.x.iOrderByCol <> 0 then Continue;
       pE2 := sqlite3ExprSkipCollateAndLikely(items[i].pExpr);
       if pE2 = nil then Continue;
+      if forGroupBy and (pE2^.op = TK_ID) and (pE2^.u.zToken <> nil)
+         and ColumnInFromClause(pE2^.u.zToken) then
+        Continue;
       iCol := ResolveAsName(p^.pEList, pE2);
       if iCol > 0 then
         items[i].u.x.iOrderByCol := u16(iCol);
@@ -11390,7 +11404,7 @@ begin
     same iOrderByCol mechanism used for ORDER BY; sqlite3ResolveOrderGroupBy
     below rewrites the term into a copy of the matching result-set expr. }
   if p^.pGroupBy <> nil then
-    ResolveAliasOrderByCol(p^.pGroupBy);
+    ResolveAliasOrderByCol(p^.pGroupBy, True);
   ResolveExprList(p^.pGroupBy);
   if p^.pHaving <> nil then
     ResolveAliasInHaving(p^.pHaving);
@@ -11405,7 +11419,7 @@ begin
     skipped by name resolution (which would otherwise fail with
     "no such column: rn"). }
   if (p^.pOrderBy <> nil) and (not deferOB) then
-    ResolveAliasOrderByCol(p^.pOrderBy);
+    ResolveAliasOrderByCol(p^.pOrderBy, False);
 
   { 9.4.divbug.30 — port resolve.c:658..698 NC_UEList fallback for ORDER BY.
     When an ORDER BY term is an expression *containing* a bare TK_ID alias
