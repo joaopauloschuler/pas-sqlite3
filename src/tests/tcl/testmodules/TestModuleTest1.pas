@@ -1411,6 +1411,93 @@ begin
   if clientData = nil then ;
 end;
 
+{ test3.c:429..502 — btree_varint_test START MULTIPLIER COUNT INCREMENT.
+  Round-trips integers through sqlite3PutVarint / sqlite3GetVarint to
+  validate the codec.  Mirrors C 1:1 including the inner 19x getVarint
+  timing loop and the 32-bit fast-path cross-check.
+  9.4.divbug.88.062. }
+function btree_varint_test(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  start, mult, count, incr: u32;
+  inVal, outVal: u64;
+  out32:        u32;
+  n1, n2, i, j: cint;
+  zBuf:         array[0..99] of byte;
+  zErr:         array[0..199] of AnsiChar;
+  s:            AnsiString;
+begin
+  if argc <> 5 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'), argv[0],
+      PChar(' START MULTIPLIER COUNT INCREMENT"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetInt(interp, argv[1], @start) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if Tcl_GetInt(interp, argv[2], @mult)  <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if Tcl_GetInt(interp, argv[3], @count) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if Tcl_GetInt(interp, argv[4], @incr)  <> 0 then begin Result := TCL_ERROR; Exit; end;
+  inVal := start;
+  inVal := inVal * mult;
+  for i := 0 to cint(count) - 1 do
+  begin
+    n1 := sqlite3PutVarint(@zBuf[0], inVal);
+    if (n1 > 9) or (n1 < 1) then
+    begin
+      s := Format('putVarint returned %d - should be between 1 and 9', [n1]);
+      FillChar(zErr, SizeOf(zErr), 0);
+      Move(s[1], zErr[0], Length(s));
+      Tcl_AppendResult(interp, PChar(@zErr[0]), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    n2 := sqlite3GetVarint(@zBuf[0], outVal);
+    if n1 <> n2 then
+    begin
+      s := Format('putVarint returned %d and getVarint returned %d', [n1, n2]);
+      FillChar(zErr, SizeOf(zErr), 0);
+      Move(s[1], zErr[0], Length(s));
+      Tcl_AppendResult(interp, PChar(@zErr[0]), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    if inVal <> outVal then
+    begin
+      s := Format('Wrote 0x%.16x and got back 0x%.16x', [inVal, outVal]);
+      FillChar(zErr, SizeOf(zErr), 0);
+      Move(s[1], zErr[0], Length(s));
+      Tcl_AppendResult(interp, PChar(@zErr[0]), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    if (inVal and $ffffffff) = inVal then
+    begin
+      n2 := sqlite3GetVarint32(@zBuf[0], out32);
+      outVal := out32;
+      if n1 <> n2 then
+      begin
+        s := Format('putVarint returned %d and GetVarint32 returned %d', [n1, n2]);
+        FillChar(zErr, SizeOf(zErr), 0);
+        Move(s[1], zErr[0], Length(s));
+        Tcl_AppendResult(interp, PChar(@zErr[0]), Pointer(nil));
+        Result := TCL_ERROR; Exit;
+      end;
+      if inVal <> outVal then
+      begin
+        s := Format('Wrote 0x%.16x and got back 0x%.16x from GetVarint32',
+                    [inVal, outVal]);
+        FillChar(zErr, SizeOf(zErr), 0);
+        Move(s[1], zErr[0], Length(s));
+        Tcl_AppendResult(interp, PChar(@zErr[0]), Pointer(nil));
+        Result := TCL_ERROR; Exit;
+      end;
+    end;
+    { Realistic-timing loop: getVarint called 19 more times. }
+    for j := 0 to 18 do
+      sqlite3GetVarint(@zBuf[0], outVal);
+    inVal := inVal + incr;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test_malloc.c:884..915 — sqlite3_config_pagecache SIZE N.
   Sets the page-cache memory buffer.  The "static buf" trick from C is
   preserved via a unit-level var so successive calls do not leak.
@@ -4990,6 +5077,9 @@ begin
   { 9.4.divbug.88.011 — btree_from_db.  test3.c:676. }
   Tcl_CreateCommand(interp, PChar('btree_from_db'),
     @btree_from_db, nil, nil);
+  { 9.4.divbug.88.062 — btree_varint_test.  test3.c:675. }
+  Tcl_CreateCommand(interp, PChar('btree_varint_test'),
+    @btree_varint_test, nil, nil);
   { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
     test1.c:9082 / test_malloc.c:1487. }
   Tcl_CreateCommand(interp, PChar('sqlite3_create_aggregate'),

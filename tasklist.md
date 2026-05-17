@@ -1194,7 +1194,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.059** `notnull2` — SOURCE-ERROR: invalid command name "do_vmstep_test"
   - [x] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit" → same trampoline as 88.042 (test1.c:6075..6098); trans3.test now PASS 8/70.
   - [ ] **9.4.divbug.88.061** `upfrom4` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
-  - [ ] **9.4.divbug.88.062** `varint` — ! varint-1.1 error: invalid command name "btree_varint_test"
+  - [x] **9.4.divbug.88.062** `varint` — ported btree_varint_test Tcl cmd (test3.c:429..502, registered test3.c:675) using sqlite3PutVarint/sqlite3GetVarint/sqlite3GetVarint32; SOURCE-ERROR cleared, varint-1.1 PASSES (160 pass / 88 fail; remaining failures are a separate GetVarint32 codec divergence, not the trampoline).
 - [ ] **9.4.divbug.89** Empty driver diagnostic (carved from `9.4.4.g-unbucketed` 2026-05-16) — **12 pas-soft tests** (`corruptB`, `e_changes`, `e_totalchanges`, `fuzz`, `index4`, `index5`, `join6`, `joinA`, `joinB`, `joinD`, `manydb`, `tkt3080`) FAIL but `bin/tcl-failure-logs/<base>.{err,out}` capture no diagnostic — driver swallows the message or the tests abort outside `tcltest`.  Action: instrument `TclTestDriver` to dump the last N lines of stdout/stderr on any non-PASS exit so these become triageable.
   - [ ] **9.4.divbug.89.001** `corruptB` — malformed}]
   - [ ] **9.4.divbug.89.002** `e_changes` — (UNKNOWN-empty-log, no log captured)
