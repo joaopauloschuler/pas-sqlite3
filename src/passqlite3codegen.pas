@@ -32267,7 +32267,8 @@ begin
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
-          or (pDest^.eDest = SRT_Coroutine))
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_Exists))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -32286,8 +32287,14 @@ begin
          10.1.bug.113 — SRT_Coroutine (outer being coded as a coroutine
          producer, e.g. LEFT/RIGHT MERGE arm) admits FROM-subquery
          coroutine emission unconditionally, matching C select.c:8043
-         which has no eDest gate. }
+         which has no eDest gate.
+         divbug.89.004 — SRT_Mem (scalar subquery) and SRT_Exists
+         (EXISTS subquery from sqlite3CodeSubselect) also admit
+         FROM-subquery coroutine emission; without this the outer
+         scalar/EXISTS body emits OP_Rewind on a cursor that was never
+         opened (fuzz-1.5 / fuzz-1.11 AV at vdbe.c OP_Rewind). }
        and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
+            or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Exists)
             or ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0))
     then
     begin
@@ -32486,6 +32493,25 @@ begin
         if (bSort = 0) and (p^.iLimit <> 0) then
           sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
       end
+      else if pDest^.eDest = SRT_Mem then
+      begin
+        { divbug.89.004 — SRT_Mem (scalar subquery): the expression
+          loop above coded the result expressions directly into
+          pDest^.iSdst (== iSDParm from sqlite3CodeSubselect), so no
+          OP_Move/OP_ResultRow needed.  Apply LIMIT (sqlite3CodeSubselect
+          forces LIMIT 1 so we stop after the first qualifying row). }
+        if (bSort = 0) and (p^.iLimit <> 0) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
+      end
+      else if pDest^.eDest = SRT_Exists then
+      begin
+        { divbug.89.004 — SRT_Exists (EXISTS subquery): each qualifying
+          row sets iSDParm = 1; mirrors selectInnerLoop SRT_Exists arm
+          (codegen.pas:25254 / select.c:1287..1290). }
+        sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+        if (bSort = 0) and (p^.iLimit <> 0) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
+      end
       else
       begin
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
@@ -32528,6 +32554,16 @@ begin
           { 10.1.bug.113 — sort tail under SRT_Coroutine outer must
             yield each row to the consumer, not OP_ResultRow. }
           sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else if pDest^.eDest = SRT_Mem then
+        begin
+          { divbug.89.004 — sort tail under SRT_Mem outer: values are
+            already copied to pDest^.iSdst (==iSDParm) by the OP_Column
+            block above; no OP_ResultRow. }
+        end
+        else if pDest^.eDest = SRT_Exists then
+          { divbug.89.004 — sort tail under SRT_Exists outer: each row
+            sets iSDParm = 1. }
+          sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm)
         else
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
         if p^.iLimit <> 0 then
