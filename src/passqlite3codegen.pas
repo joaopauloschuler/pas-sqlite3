@@ -52246,6 +52246,31 @@ begin
       previous silent no-op was a soft divergence (9.4.divbug.21 residual).
       The 0x02 mask bit in the C body is "perform analysis"; without zRight
       we default to opMask=0xfffe matching pragma.c:2536. }
+    { pragma.c:624..643 — PRAGMA [schema.]secure_delete[=BOOL|FAST].
+      Read returns current BTS_FAST_SECURE >> BTS_SECURE_DELETE bit pair
+      (0=off, 1=on, 2=fast); write toggles BTS_SECURE_DELETE/BTS_OVERWRITE
+      via sqlite3BtreeSecureDelete.  When no schema prefix is given the
+      write propagates to every attached pBt (so PRAGMA secure_delete=ON
+      affects db2 too — securedel-1.3..1.6).  9.4.divbug.87.066. }
+    PragTyp_SECURE_DELETE: begin
+      iVal := -1;  { b in C oracle — sentinel "read only" }
+      if zRight <> '' then begin
+        if sqlite3_stricmp(PChar(zRight), 'fast') = 0 then
+          iVal := 2
+        else
+          iVal := sqlite3GetBoolean(PChar(zRight), 0);
+      end;
+      if ((pId2 = nil) or (pId2^.n = 0)) and (iVal >= 0) then begin
+        for i := 0 to db^.nDb - 1 do
+          sqlite3BtreeSecureDelete(PBtree(db^.aDb[i].pBt), iVal);
+      end;
+      iVal := sqlite3BtreeSecureDelete(PBtree(db^.aDb[iDb].pBt), iVal);
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+      sqlite3VdbeReusable(v);
+      Exit;
+    end;
+
     PragTyp_OPTIMIZE: begin
       if zRight <> '' then begin
         iVal := sqlite3Atoi(PChar(zRight));
@@ -52533,8 +52558,7 @@ begin
     not preserved), matching the pre-port behaviour. }
   if pValue = nil then begin
     iVal := MaxInt; { sentinel "not handled" }
-    if      SameText(zName, 'secure_delete')      then iVal := 0
-    else if SameText(zName, 'temp_store')         then iVal := 0
+    if      SameText(zName, 'temp_store')         then iVal := 0
     else if SameText(zName, 'threads')            then iVal := 0
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
