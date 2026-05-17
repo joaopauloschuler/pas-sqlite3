@@ -2178,10 +2178,26 @@ begin
   Result := 4096;
 end;
 
-{ os_unix.c ~4470: unixDeviceCharacteristics_impl }
+{ os_unix.c ~4470: unixDeviceCharacteristics_impl.
+
+  9.4.divbug.34 — was returning 0 unconditionally, so the pager always
+  saw a non-POWERSAFE_OVERWRITE device and clamped szPageDflt up to the
+  filesystem sectorSize (4096+ on Linux ext4 / 8192 on some kernels).
+  That made `SQLITE_DEFAULT_PAGE_SIZE` (and hence stock-test expectations
+  like format4-1.1 / pagesize-*) effectively unreachable.
+
+  Stock C (os_unix.c:4368) ORs SQLITE_IOCAP_POWERSAFE_OVERWRITE into the
+  returned bits whenever UNIXFILE_PSOW is set in ctrlFlags — and that bit
+  is on by default (os_unix.c:6105 `pNew->ctrlFlags |= UNIXFILE_PSOW`)
+  unless overridden by the `psow=0` URI parameter. }
 function unixDeviceCharacteristics_impl(pFile: Psqlite3_file): cint; cdecl;
+var
+  pFd: PunixFile;
 begin
+  pFd := PunixFile(pFile);
   Result := 0;
+  if (pFd^.ctrlFlags and UNIXFILE_PSOW) <> 0 then
+    Result := Result or SQLITE_IOCAP_POWERSAFE_OVERWRITE;
 end;
 
 { ============================================================
@@ -2306,6 +2322,12 @@ begin
     ctrlFlags := ctrlFlags or UNIXFILE_NOLOCK;
   if (flags and SQLITE_OPEN_URI) <> 0 then
     ctrlFlags := ctrlFlags or UNIXFILE_URI;
+  { 9.4.divbug.34 — POWERSAFE_OVERWRITE on by default (os_unix.c:6098..6106).
+    Honoured by setSectorSize → sectorSize=512, so szPageDflt stays at
+    SQLITE_DEFAULT_PAGE_SIZE rather than being clamped up to the FS
+    sector size.  Disabled via the `psow=0` URI param. }
+  if sqlite3_uri_boolean(zName, 'psow', 1) <> 0 then
+    ctrlFlags := ctrlFlags or UNIXFILE_PSOW;
 
   { Locate (or create) the process-wide shared inodeInfo keyed by
     (device, inode) so that multiple sqlite3* handles on the same file
