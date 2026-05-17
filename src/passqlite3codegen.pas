@@ -1666,6 +1666,7 @@ const
   SQLITE_SkipScan       = u32($00004000);
   SQLITE_SeekScan       = u32($00020000);
   SQLITE_BloomFilter    = u32($00080000);
+  SQLITE_IndexedExpr    = u32($01000000);  { Pull exprs from index (sqliteInt.h:1926) }
   SQLITE_BloomPulldown  = u32($00100000);  { Run Bloom filters early (sqliteInt.h:1921) }
   SQLITE_OnePass        = u32($08000000);
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
@@ -1907,6 +1908,11 @@ function  whereIsCoveringIndex(pWInfo: PWhereInfo; pIdx: PIndex2;
 procedure whereIndexedExprCleanup(db: PTsqlite3; pObject: Pointer); cdecl;
 procedure wherePartIdxExpr(pParse: PParse; pIdx: PIndex2; pPart: PExpr;
   pMask: PBitmask; iIdxCur: i32; pItem: PSrcItem);
+procedure whereAddIndexedExpr(pParse: PParse; pIdx: PIndex2; iIdxCur: i32;
+  pTabItem: PSrcItem);
+function sqlite3IndexedExprLookup(pParse: PParse; pExpr: PExpr;
+  target: i32): i32;
+function sqlite3ExprCanReturnSubtype(pParse: PParse; pExpr: PExpr): i32;
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — auto-index pre-flight cluster
   (where.c:832..925).  Pure analysis helpers fed to whereLoopAddBtree's
@@ -5841,7 +5847,24 @@ begin
   done := False;
   repeat
     if pExpr = nil then op := TK_NULL
+    else if (pParse^.pIdxEpr <> nil)
+            and (not ExprHasProperty(pExpr, EP_Leaf)) then
+    begin
+      { expr.c:4946..4951 — try the indexed-expression lookup before
+        falling through to the per-op dispatch. }
+      r1 := sqlite3IndexedExprLookup(pParse, pExpr, target);
+      if r1 >= 0 then
+      begin
+        Result := r1;
+        done := True;
+        op := TK_NULL;  { unused — done short-circuits the loop }
+      end
+      else
+        op := pExpr^.op;
+    end
     else op := pExpr^.op;
+
+    if done then break;
 
     case op of
       TK_INTEGER:
@@ -15694,6 +15717,158 @@ begin
   end;
 end;
 
+{ exprNodeCanReturnSubtype — expr.c:4704..4720.  Walker callback used by
+  sqlite3ExprCanReturnSubtype: only a TK_FUNCTION may return a subtype.
+  If the function carries SQLITE_RESULT_SUBTYPE, set walker eCode=1 and
+  prune; otherwise descend (assume pass-through). }
+function exprNodeCanReturnSubtype(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  n: i32;
+  pDef: PTFuncDef;
+  db: PTsqlite3;
+begin
+  if pExpr^.op <> TK_FUNCTION then begin Result := WRC_Prune; Exit; end;
+  db := pWalker^.pParse^.db;
+  if pExpr^.x.pList <> nil then n := pExpr^.x.pList^.nExpr else n := 0;
+  pDef := PTFuncDef(sqlite3FindFunction(db, pExpr^.u.zToken, n, db^.enc, 0));
+  if (pDef = nil) or ((pDef^.funcFlags and SQLITE_RESULT_SUBTYPE) <> 0) then
+  begin
+    pWalker^.eCode := 1;
+    Result := WRC_Prune;
+    Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3ExprCanReturnSubtype — expr.c:4730..4737.  Returns 1 if pExpr
+  might return a subtype-carrying value. }
+function sqlite3ExprCanReturnSubtype(pParse: PParse; pExpr: PExpr): i32;
+var w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.pParse := pParse;
+  w.xExprCallback := @exprNodeCanReturnSubtype;
+  sqlite3WalkExpr(@w, pExpr);
+  Result := i32(w.eCode);
+end;
+
+{ sqlite3IndexedExprLookup — expr.c:4746..4807.  Scan pParse^.pIdxEpr;
+  if pExpr matches an indexed-expression entry, emit OP_Column to read
+  the value from the index cursor and return target.  Return -1 if no
+  match. }
+function sqlite3IndexedExprLookup(pParse: PParse; pExpr: PExpr;
+  target: i32): i32;
+var
+  p:        PIndexedExpr;
+  v:        PVdbe;
+  exprAff:  u8;
+  iDataCur: i32;
+  addr:     i32;
+  pSave:    PIndexedExpr;
+begin
+  p := PIndexedExpr(pParse^.pIdxEpr);
+  while p <> nil do
+  begin
+    iDataCur := p^.iDataCur;
+    if iDataCur < 0 then begin p := p^.pIENext; Continue; end;
+    if pParse^.iSelfTab <> 0 then
+    begin
+      if p^.iDataCur <> pParse^.iSelfTab - 1 then
+        begin p := p^.pIENext; Continue; end;
+      iDataCur := -1;
+    end;
+    if sqlite3ExprCompare(nil, pExpr, p^.pExpr, iDataCur) <> 0 then
+      begin p := p^.pIENext; Continue; end;
+    Assert((p^.aff >= SQLITE_AFF_BLOB) and (p^.aff <= SQLITE_AFF_NUMERIC));
+    exprAff := u8(sqlite3ExprAffinity(pExpr));
+    if ((exprAff <= SQLITE_AFF_BLOB) and (p^.aff <> SQLITE_AFF_BLOB))
+       or ((exprAff = SQLITE_AFF_TEXT) and (p^.aff <> SQLITE_AFF_TEXT))
+       or ((exprAff >= SQLITE_AFF_NUMERIC) and (p^.aff <> SQLITE_AFF_NUMERIC)) then
+    begin
+      p := p^.pIENext; Continue;
+    end;
+    if ExprHasProperty(pExpr, EP_SubtArg)
+       and (sqlite3ExprCanReturnSubtype(pParse, pExpr) <> 0) then
+    begin
+      p := p^.pIENext; Continue;
+    end;
+    v := pParse^.pVdbe;
+    Assert(v <> nil);
+    if p^.bMaybeNullRow <> 0 then
+    begin
+      addr := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_IfNullRow, p^.iIdxCur, addr + 3, target);
+      sqlite3VdbeAddOp3(v, OP_Column, p^.iIdxCur, p^.iIdxCol, target);
+      sqlite3VdbeGoto(v, 0);
+      pSave := PIndexedExpr(pParse^.pIdxEpr);
+      pParse^.pIdxEpr := nil;
+      sqlite3ExprCode(pParse, pExpr, target);
+      pParse^.pIdxEpr := pSave;
+      sqlite3VdbeJumpHere(v, addr + 2);
+    end
+    else
+    begin
+      sqlite3VdbeAddOp3(v, OP_Column, p^.iIdxCur, p^.iIdxCol, target);
+    end;
+    Result := target;
+    Exit;
+  end;
+  Result := -1;
+end;
+
+{ whereAddIndexedExpr — where.c:6668..6716.  Walk all expression
+  columns of pIdx (XN_EXPR slots, plus VIRTUAL generated columns)
+  and add IndexedExpr entries to pParse^.pIdxEpr so subsequent
+  expression code-gen can substitute index reads. }
+procedure whereAddIndexedExpr(pParse: PParse; pIdx: PIndex2; iIdxCur: i32;
+  pTabItem: PSrcItem);
+var
+  i, j:   i32;
+  pE:     PExpr;
+  pTab:   PTable2;
+  p:      PIndexedExpr;
+  db:     PTsqlite3;
+  jt:     u8;
+  pZAff:  PAnsiChar;
+begin
+  Assert(((pIdx^.idxFlags shr 11) and 1) <> 0);  { bHasExpr }
+  pTab := pIdx^.pTable;
+  db := pParse^.db;
+  for i := 0 to i32(pIdx^.nColumn) - 1 do
+  begin
+    j := pIdx^.aiColumn[i];
+    if j = XN_EXPR then
+      pE := ExprListItems(pIdx^.aColExpr)[i].pExpr
+    else if (j >= 0)
+            and ((pTab^.aCol[j].colFlags and COLFLAG_VIRTUAL) <> 0) then
+      pE := sqlite3ColumnExpr(pTab, @pTab^.aCol[j])
+    else
+      Continue;
+    if sqlite3ExprIsConstant(nil, pE) <> 0 then Continue;
+    p := PIndexedExpr(sqlite3DbMallocRaw(db, u64(SizeOf(TIndexedExpr))));
+    if p = nil then break;
+    p^.pIENext := PIndexedExpr(pParse^.pIdxEpr);
+    p^.pExpr := sqlite3ExprDup(db, pE, 0);
+    p^.iDataCur := pTabItem^.iCursor;
+    p^.iIdxCur := iIdxCur;
+    p^.iIdxCol := i;
+    jt := pTabItem^.fg.jointype;
+    if (jt and (JT_LEFT or JT_LTORJ or JT_RIGHT)) <> 0 then
+      p^.bMaybeNullRow := 1
+    else
+      p^.bMaybeNullRow := 0;
+    pZAff := sqlite3IndexAffinityStr(db, pIdx);
+    if pZAff <> nil then
+      p^.aff := u8(pIdx^.zColAff[i])
+    else
+      p^.aff := SQLITE_AFF_BLOB;
+    pParse^.pIdxEpr := p;
+    if p^.pIENext = nil then
+      sqlite3ParserAddCleanup(pParse, @whereIndexedExprCleanup,
+                              @pParse^.pIdxEpr);
+  end;
+end;
+
 { Process the WHERE clause of a partial index, looking for `col = constant`
   arms whose collation is BINARY and whose column has a TEXT/NUMERIC/INTEGER/
   REAL affinity (>= SQLITE_AFF_TEXT).  where.c:3914..3964.
@@ -21883,6 +22058,14 @@ begin
           begin
             pLevel^.iIdxCur := pParse^.nTab;
             Inc(pParse^.nTab);
+            { where.c:7348..7350 — register IndexedExpr entries so the
+              expression code generator can substitute index reads for
+              CREATE INDEX ... ON <expr>() match-sites (9.4.divbug.87.031). }
+            if (pLoop^.u.btree.pIndex <> nil)
+               and (((pLoop^.u.btree.pIndex^.idxFlags shr 11) and 1) <> 0)
+               and OptimizationEnabled(db, SQLITE_IndexedExpr) then
+              whereAddIndexedExpr(pParse, pLoop^.u.btree.pIndex,
+                                  pLevel^.iIdxCur, pTabItem);
             if pLoop^.u.btree.pIndex <> nil then
             begin
               sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
@@ -36162,7 +36345,14 @@ begin
   iTabCol := pIdx^.aiColumn[iIdxCol];
   if iTabCol = XN_EXPR then
   begin
-    Assert(False, 'sqlite3ExprCodeLoadIndexColumn: XN_EXPR not yet supported');
+    { expr.c:4367..4372 — code the indexed expression with iSelfTab set
+      so column refs route through iTabCur (9.4.divbug.87.031). }
+    Assert(pIdx^.aColExpr <> nil);
+    Assert(pIdx^.aColExpr^.nExpr > iIdxCol);
+    pParse^.iSelfTab := iTabCur + 1;
+    sqlite3ExprCodeCopy(pParse,
+      ExprListItems(pIdx^.aColExpr)[iIdxCol].pExpr, regOut);
+    pParse^.iSelfTab := 0;
     Exit;
   end;
   sqlite3ExprCodeGetColumnOfTable(pParse^.pVdbe, pIdx^.pTable, iTabCur,
