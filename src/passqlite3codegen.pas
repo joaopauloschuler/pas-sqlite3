@@ -10112,14 +10112,32 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           { 10.1.bug.97 — count matches across sources to detect ambiguous
             column refs (resolve.c lookupName:438..462).  USING-masked
             duplicates of the column on a non-RIGHT JOIN keep the
-            left-most match; otherwise cnt rises and we error below. }
+            left-most match; otherwise cnt rises and we error below.
+            9.4.divbug.87.042 — port the RIGHT/FULL arms of
+            resolve.c:449..461.  For a RIGHT JOIN (JT_RIGHT, no JT_LEFT)
+            on a USING-coalesced column, discard the left match and use
+            the right-most one (cnt=0 then Inc).  FULL JOIN (both
+            JT_LEFT and JT_RIGHT) would build a coalesce() via
+            extendFJMatch — not yet ported; for now, keep the left-most
+            match (matches at least the bare-column visibility, but the
+            result columns will be wrong for unmatched right-side rows
+            on FULL JOIN — tracked separately). }
           if cnt > 0 then
           begin
             if ((pItem^.fg.fgBits2 and $08) <> 0)  { isUsing }
                and (sqlite3IdListIndex(pItem^.u3.pUsing,
-                      PAnsiChar(pE^.u.zToken)) >= 0)
-               and ((pItem^.fg.jointype and JT_RIGHT) = 0) then
-              Continue;
+                      PAnsiChar(pE^.u.zToken)) >= 0) then
+            begin
+              if (pItem^.fg.jointype and JT_RIGHT) = 0 then
+                Continue                                  { LEFT/INNER: keep left }
+              else if (pItem^.fg.jointype and JT_LEFT) = 0 then
+              begin
+                { Pure RIGHT JOIN: use the right-most table. }
+                cnt := 0;
+              end;
+              { else FULL JOIN: extendFJMatch path not yet ported;
+                fall through and Inc(cnt) so duplicates remain detectable. }
+            end;
           end;
           Inc(cnt);
           pMatch := pItem;
