@@ -63907,6 +63907,13 @@ begin
   if v = nil then Exit;
   pLeft   := pExpr^.pLeft;
 
+  { Port of expr.c:4055 — validate LHS vector size against the
+    RHS sub-select column count (or scalar LHS for value-list RHS)
+    before any further codegen.  Emits "sub-select returns N columns
+    - expected M" / "row value misused" via sqlite3SubselectError /
+    sqlite3VectorErrorMsg.  Fixes select7-5.1..5.4 (9.4.divbug.75). }
+  if sqlite3ExprCheckIN(pParse, pExpr) <> 0 then Exit;
+
   { Phase 6.9-bis 11g.2.f sub-progress 23 — subselect IN-RHS now
     routes through `sqlite3CodeRhsOfIN`'s Case-1 materialisation via
     `sqlite3FindInIndex` below.  The prior pessimistic
