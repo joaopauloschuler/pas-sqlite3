@@ -9876,7 +9876,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           begin
             pE^.op      := TK_COLUMN;
             pE^.iTable  := pItem^.iCursor;
-            pE^.iColumn := i16(iCol);
+            { 9.4.divbug.30 — IPK alias to iColumn=-1 (resolve.c:871). }
+            if pItem^.pSTab^.iPKey = iCol then
+            begin
+              pE^.iColumn := i16(-1);
+              pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            end
+            else
+              pE^.iColumn := i16(iCol);
             pE^.y.pTab  := pItem^.pSTab;
             pE^.pLeft   := nil;
             pE^.pRight  := nil;
@@ -9978,13 +9985,21 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         pE^.op      := TK_COLUMN;
         pE^.iTable  := pMatch^.iCursor;
-        pE^.iColumn := i16(matchCol);
+        { 9.4.divbug.30 — port resolve.c:863..887 (sqlite3CreateColumnExpr):
+          alias INTEGER PRIMARY KEY column to iColumn=-1.  Without this,
+          ORDER BY <ipk-name> diverges from C in wherePathSatisfiesOrderBy. }
+        if pMatch^.pSTab^.iPKey = matchCol then
+          pE^.iColumn := i16(-1)
+        else
+          pE^.iColumn := i16(matchCol);
         pE^.y.pTab  := pMatch^.pSTab;
         if matchCol < BMS - 1 then
           pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
         else
           pMatch^.colUsed := pMatch^.colUsed or
                              (Bitmask(1) shl (BMS - 1));
+        if pE^.iColumn = -1 then
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
         Exit;
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 10 — rowid pseudo-column.
@@ -11060,6 +11075,8 @@ var
   pTopSel:    PSelect;
   isCompound: Boolean;
   deferOB:    Boolean;
+  i_:         i32;          { 9.4.divbug.30 — ORDER BY alias walk index }
+  items_:     PExprListItem; { 9.4.divbug.30 — ORDER BY alias walk items }
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
@@ -11126,6 +11143,22 @@ begin
     "no such column: rn"). }
   if (p^.pOrderBy <> nil) and (not deferOB) then
     ResolveAliasOrderByCol(p^.pOrderBy);
+
+  { 9.4.divbug.30 — port resolve.c:658..698 NC_UEList fallback for ORDER BY.
+    When an ORDER BY term is an expression *containing* a bare TK_ID alias
+    (e.g. `ORDER BY +x` where x is an AS-alias on a result column), the
+    integer/structural arms below don't catch it and ResolveExprList raises
+    "no such column: x".  The HAVING alias-rewriter already walks the tree
+    swapping alias TK_IDs for the underlying result-set expression; reuse
+    it here so bare aliases inside any ORDER BY sub-expression bind to the
+    alias target before name resolution (collate8-1.15). }
+  if (p^.pOrderBy <> nil) and (not deferOB) and (p^.pEList <> nil) then
+  begin
+    items_ := ExprListItems(p^.pOrderBy);
+    for i_ := 0 to p^.pOrderBy^.nExpr - 1 do
+      if items_[i_].u.x.iOrderByCol = 0 then
+        ResolveAliasInHaving(items_[i_].pExpr);
+  end;
 
   if not deferOB then
     ResolveExprList(p^.pOrderBy);
@@ -20562,6 +20595,20 @@ begin
         Exit(0);
       pIdx := pIdx^.pNext;
     end;
+    { 9.4.divbug.30 — when caller passed an ORDER BY / GROUP BY / DISTINCT,
+      the fallback SCAN below bypasses wherePathSolver and therefore the
+      wherePathSatisfiesOrderBy gate.  That means a plain `SELECT * FROM t
+      ORDER BY rowid` on a table with no usable index is forced through an
+      unnecessary external sorter (collate4-6.1/6.2 regression).  Defer to
+      the planner so the WHERE_IPK + rowid-order analysis can short-circuit
+      the sorter.  The C reference's whereShortCut never returns success on
+      a plain heap walk (where.c:6350..6417 only succeeds on WHERE_ONEROW),
+      so this matches upstream behaviour for the ORDER BY case. }
+    if (pWInfo^.pOrderBy <> nil)
+       or ((pWInfo^.wctrlFlags
+            and (WHERE_GROUPBY or WHERE_DISTINCTBY or WHERE_WANT_DISTINCT)) <> 0)
+    then
+      Exit(0);
     { Mirror where.c:4150 — a full rowid heap walk is WHERE_IPK (the IPK
       pseudo-index branch).  wsFlags=0 was Pas-only and left
       sqlite3WhereAddExplainText looking for a non-existent btree.pIndex on
@@ -25925,7 +25972,15 @@ begin
         pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
         if pColExpr = nil then Continue;
         pColExpr^.iTable  := pItem^.iCursor;
-        pColExpr^.iColumn := i16(j);
+        { 9.4.divbug.30 — port resolve.c:863..887 (sqlite3CreateColumnExpr):
+          alias the INTEGER PRIMARY KEY column to iColumn=-1 so downstream
+          planner code (wherePathSatisfiesOrderBy at codegen.pas:18996) can
+          recognise the rowid match.  Without this, `SELECT * FROM t ORDER
+          BY a` on an IPK table forces a temp-btree sort (collate4-6.x). }
+        if pTab^.iPKey = j then
+          pColExpr^.iColumn := i16(-1)
+        else
+          pColExpr^.iColumn := i16(j);
         pColExpr^.y.pTab  := pTab;
         if j < BMS - 1 then
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
