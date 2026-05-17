@@ -3891,6 +3891,16 @@ begin
   resolveP2Values(p, @nArg);
 
   p^.vdbeFlags := p^.vdbeFlags and not (VDBF_UsesStmtJournal or VDBF_EXPIRED_MASK);
+  { vdbeaux.c:2694 — p->usesStmtJournal = pParse->isMultiWrite && pParse->mayAbort.
+    Without this assignment the statement-journal arm in OP_Transaction is never
+    taken, so a constraint-aborted CREATE INDEX (or any failing multi-write DDL)
+    leaves the sqlite_master insert + freshly allocated btree root page
+    committed when the enclosing transaction commits — yielding integrity_check
+    "Page N: never used" (9.4.divbug.87.026, index3-1.4). }
+  { Parse offsets: isMultiWrite is u8 @32; parseFlags is u32 @40, mayAbort=bit 1. }
+  if (PByte(PByte(pParse) + 32)^ <> 0) and
+     ((PUInt32(PByte(pParse) + 40)^ and u32(1 shl 1)) <> 0) then
+    p^.vdbeFlags := p^.vdbeFlags or VDBF_UsesStmtJournal;
 
   { Port of vdbeaux.c:2695..2699 — propagate Parse.explain into the Vdbe and
     set the EXPLAIN result-column count.  EXPLAIN emits 8 columns
@@ -10149,6 +10159,29 @@ begin
               goto vdbe_return;
             end;
             goto abort_due_to_error;
+          end;
+
+          { vdbe.c:4140..4161 — open a statement-journal savepoint if this VM
+            uses one (usesStmtJournal = isMultiWrite && mayAbort) and we are
+            opening a write transaction nested inside an outer BEGIN…COMMIT
+            (autoCommit=0) or with concurrent readers (nVdbeRead>1).  Without
+            this arm an aborted CREATE INDEX inside a user transaction cannot
+            be rolled back at the btree level — the sqlite_master row + freshly
+            allocated root page survive the COMMIT and integrity_check reports
+            "Page N: never used" (9.4.divbug.87.026, index3-1.4). }
+          if ((v^.vdbeFlags and VDBF_UsesStmtJournal) <> 0)
+             and (pOp^.p2 <> 0)
+             and ((db^.autoCommit = 0) or (db^.nVdbeRead > 1)) then begin
+            if v^.iStatement = 0 then begin
+              Inc(db^.nStatement);
+              v^.iStatement := db^.nSavepoint + db^.nStatement;
+            end;
+            rc := sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, v^.iStatement - 1);
+            if rc = SQLITE_OK then
+              rc := sqlite3BtreeBeginStmt(pX, v^.iStatement);
+            { Snapshot deferred-FK counters for matching statement-rollback. }
+            v^.nStmtDefCons    := db^.nDeferredCons;
+            v^.nStmtDefImmCons := db^.nDeferredImmCons;
           end;
           { Schema cookie check — vdbe.c:4163..4198.
             When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
