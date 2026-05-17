@@ -13030,8 +13030,14 @@ begin
       Inc(a);
     end;
   end;
-  if pWC^.a <> @pWC^.aStatic[0] then
-    sqlite3DbFree(db, pWC^.a);
+  { Do NOT free pWC^.a here.  Faithful to whereexpr.c:1759..1790 — when the
+    static slot pool overflows in whereClauseInsert the growth allocation
+    comes from sqlite3WhereMalloc (the WhereInfo arena), not from the heap.
+    Arena blocks are released wholesale by whereInfoFree via the pMemToFree
+    chain.  A direct sqlite3DbFree(pWC^.a) here would corrupt the heap by
+    freeing an arena interior pointer.  9.4.divbug.89.007..010. }
+  { db reference retained for parity with the C declaration. }
+  if db = nil then ;
 end;
 
 procedure whereOrInfoDelete(db: PTsqlite3; pOrInfo: PWhereOrInfo);
