@@ -4643,6 +4643,51 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.035 — extended-rc name helper for sqlite3_extended_errcode
+  trampoline.  Subset of main.c:1533..1641 sqlite3ErrName covering the
+  extended codes verify_ex_errcode call-sites actually compare against
+  (test/errmsg.test, test/fkey2.test, test/notnull.test).  Falls back to
+  the primary t1ErrName for non-extended rc. }
+function extErrName(rc: cint): PAnsiChar;
+begin
+  case rc of
+    SQLITE_CONSTRAINT_CHECK:      Result := PChar('SQLITE_CONSTRAINT_CHECK');
+    SQLITE_CONSTRAINT_FOREIGNKEY: Result := PChar('SQLITE_CONSTRAINT_FOREIGNKEY');
+    SQLITE_CONSTRAINT_NOTNULL:    Result := PChar('SQLITE_CONSTRAINT_NOTNULL');
+    SQLITE_CONSTRAINT_PRIMARYKEY: Result := PChar('SQLITE_CONSTRAINT_PRIMARYKEY');
+    SQLITE_CONSTRAINT_UNIQUE:     Result := PChar('SQLITE_CONSTRAINT_UNIQUE');
+  else
+    Result := t1ErrName(rc);
+  end;
+end;
+
+{ 9.4.divbug.88.035 — test1.c:test_ex_errcode analogue.
+  Usage: sqlite3_extended_errcode DB.  Returns symbolic extended-rc name
+  (e.g. "SQLITE_CONSTRAINT_UNIQUE").  Required by tester.tcl:1682
+  verify_ex_errcode (errmsg.test, fkey2.test, notnull.test).
+  Engine entry: passqlite3main.pas:3703. }
+function test_extended_errcode(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_extended_errcode(db);
+  Tcl_AppendResult(interp, extErrName(rc), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.003 — test1.c:6383..6411 test_db_cacheflush.
   Usage: sqlite3_db_cacheflush DB.  Attempt to flush any dirty pages to
   disk.  Engine entry: passqlite3main.pas:4391 (main.c:921). }
@@ -4706,6 +4751,11 @@ begin
     @test_close, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_close_v2'),
     @test_close_v2, nil, nil);
+  { 9.4.divbug.88.035 — sqlite3_extended_errcode Tcl trampoline used by
+    tester.tcl:1682 verify_ex_errcode (errmsg.test, fkey2.test,
+    notnull.test).  C ref test1.c registered at 9133. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_extended_errcode'),
+    @test_extended_errcode, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg'),

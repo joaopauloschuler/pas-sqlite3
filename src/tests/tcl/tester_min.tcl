@@ -185,6 +185,15 @@ proc do_realnum_test {name cmd expected} {
   ] [realnum_normalize $expected]]
 }
 
+# verify_ex_errcode — upstream tester.tcl:1682..1684.  Verbatim.
+# Asserts that the most recent error's extended rc symbolic name on $db
+# matches $expected.  Forwards to do_test for PASS/FAIL accounting.
+# Requires the sqlite3_extended_errcode Tcl trampoline (TestModuleTest1
+# 9.4.divbug.88.035).
+proc verify_ex_errcode {name expected {db db}} {
+  do_test $name [list sqlite3_extended_errcode $db] $expected
+}
+
 # execsql — upstream tester.tcl:1445..1448.  Verbatim.
 proc execsql {sql {db db}} {
   uplevel [list $db eval $sql]

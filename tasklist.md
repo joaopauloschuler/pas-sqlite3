@@ -1167,11 +1167,11 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.032** `e_wal` — SOURCE-ERROR: invalid command name "testvfs"
   - [ ] **9.4.divbug.88.033** `e_walauto` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [ ] **9.4.divbug.88.034** `enc3` — SOURCE-ERROR: invalid command name "sqlite3_enable_shared_cache"
-  - [ ] **9.4.divbug.88.035** `errmsg` — SOURCE-ERROR: invalid command name "verify_ex_errcode"
+  - [X] **9.4.divbug.88.035** `errmsg` — verify_ex_errcode Tcl proc + sqlite3_extended_errcode trampoline ported (tester_min.tcl:188 verbatim from tester.tcl:1682..1684; TestModuleTest1.pas test_extended_errcode + extErrName helper covering SQLITE_CONSTRAINT_{CHECK,FOREIGNKEY,NOTNULL,PRIMARYKEY,UNIQUE}; engine entry passqlite3main.pas:3703). SOURCE-ERROR cleared in errmsg.test: now 11 PASS / 131 FAIL (deeper assertions).
   - [ ] **9.4.divbug.88.036** `fallocate` — chunksize_test cmd now resolves (.006); fallocate.test still FAIL on deeper assertions — needs re-triage.
   - [ ] **9.4.divbug.88.037** `filectrl` — ! filectrl-1.1 error: invalid command name "file_control_test"
   - [ ] **9.4.divbug.88.038** `filefmt` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.039** `hook` — SOURCE-ERROR: invalid command name "verify_ex_errcode"
+  - [X] **9.4.divbug.88.039** `hook` — verify_ex_errcode SOURCE-ERROR cleared by 88.035 (shared trampoline + tester_min.tcl proc). hook.test now 33 PASS / 417 FAIL; e_walhook.test 18/79 FAIL; hook2.test 17/0 PASS; walhook.test 19/0 PASS — residual failures are deeper assertions.
   - [ ] **9.4.divbug.88.040** `indexexpr1` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [ ] **9.4.divbug.88.041** `interrupt2` — SOURCE-ERROR: invalid command name "testvfs"
   - [ ] **9.4.divbug.88.042** `ioerr` — SOURCE-ERROR: invalid command name "sqlite3_get_autocommit"
