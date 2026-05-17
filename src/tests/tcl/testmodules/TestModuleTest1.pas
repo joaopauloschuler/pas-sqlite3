@@ -891,6 +891,13 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.002 — test1.c:3193..3194 module statics backing the
+  `static` flag of sqlite_bind (test_bind) and exposed via Tcl_LinkVar
+  at test1.c:9429..9432.  Init left at nil / 0 to mirror C `= 0`. }
+var
+  sqlite_static_bind_value: PAnsiChar = nil;
+  sqlite_static_bind_nbyte: cint = 0;
+
 { 9.4.divbug.88.001 — test1.c:3121..3138.  Usage: sqlite3_expired STMT.
   sqlite3_expired() itself is deprecated and always returns 0 in the
   modern engine; we still wire the Tcl command 1:1 so badutf2.test can
@@ -907,6 +914,53 @@ begin
   end;
   pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
   Tcl_SetObjResult(interp, Tcl_NewBooleanObj(sqlite3_expired(pStmt)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.88.002 — test1.c:3207..3247 (old-style argc/argv handler).
+  Usage: sqlite_bind VM IDX VALUE (null|static|static-nbytes|normal|blob10) }
+function test_bind(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pStmt: PVdbe;
+  rc, idx: cint;
+  sBuf: ShortString;
+begin
+  if argc <> 5 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'), argv[0],
+      PChar(' VM IDX VALUE (null|static|normal)"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(argv[1]));
+  if Tcl_GetInt(interp, argv[2], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if StrComp(argv[4], 'null') = 0 then
+    rc := sqlite3_bind_null(pStmt, idx)
+  else if StrComp(argv[4], 'static') = 0 then
+    rc := sqlite3_bind_text(pStmt, idx, sqlite_static_bind_value, -1, nil)
+  else if StrComp(argv[4], 'static-nbytes') = 0 then
+    rc := sqlite3_bind_text(pStmt, idx, sqlite_static_bind_value,
+                            sqlite_static_bind_nbyte, nil)
+  else if StrComp(argv[4], 'normal') = 0 then
+    rc := sqlite3_bind_text(pStmt, idx, argv[3], -1, SQLITE_TRANSIENT)
+  else if StrComp(argv[4], 'blob10') = 0 then
+    rc := sqlite3_bind_text(pStmt, idx, PAnsiChar(#$61#$62#$63#$00#$78#$79#$7a#$00#$70#$71),
+                            10, SQLITE_STATIC)
+  else begin
+    Tcl_AppendResult(interp,
+      PChar('4th argument should be "null" or "static" or "normal"'),
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if rc <> 0 then begin
+    Str(rc, sBuf);
+    sBuf := '(' + sBuf + ') ' + #0;
+    Tcl_AppendResult(interp, PChar(@sBuf[1]),
+      sqlite3ErrStr(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
   Result := TCL_OK;
   if clientData = nil then ;
 end;
@@ -4051,6 +4105,15 @@ begin
   { 9.4.divbug.88.001 — sqlite3_expired STMT.  test1.c:3121..3138, 9155. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_expired'),
     @test_expired, nil, nil);
+  { 9.4.divbug.88.002 — sqlite_bind VM IDX VALUE FLAGS (old-style argc/argv).
+    test1.c:3207..3247, registered at test1.c:9086.
+    Paired Tcl_LinkVars at test1.c:9429..9432. }
+  Tcl_CreateCommand(interp, PChar('sqlite_bind'),
+    @test_bind, nil, nil);
+  Tcl_LinkVar(interp, PChar('sqlite_static_bind_value'),
+    @sqlite_static_bind_value, TCL_LINK_STRING);
+  Tcl_LinkVar(interp, PChar('sqlite_static_bind_nbyte'),
+    @sqlite_static_bind_nbyte, TCL_LINK_INT);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_backup'),
     @backupTestInit, nil, nil);
   { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
