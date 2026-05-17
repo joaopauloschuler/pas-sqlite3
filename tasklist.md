@@ -1190,7 +1190,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.055** `multiplex4` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"
   - [ ] **9.4.divbug.88.056** `nan` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [ ] **9.4.divbug.88.057** `nolock` — SOURCE-ERROR: invalid command name "testvfs"
-  - [ ] **9.4.divbug.88.058** `normalize` — ! normalize-100 error: invalid command name "sqlite3_normalize"
+  - [x] **9.4.divbug.88.058** `normalize` — ported sqlite3_normalize Tcl cmd (test1.c:5550..5572) wrapping passqlite3normalize.sqlite3_normalize; SOURCE-ERROR cleared, test now runs (69/114 pass on real assertions).
   - [ ] **9.4.divbug.88.059** `notnull2` — SOURCE-ERROR: invalid command name "do_vmstep_test"
   - [x] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit" → same trampoline as 88.042 (test1.c:6075..6098); trans3.test now PASS 8/70.
   - [ ] **9.4.divbug.88.061** `upfrom4` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o

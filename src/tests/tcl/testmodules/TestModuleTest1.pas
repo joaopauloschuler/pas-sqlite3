@@ -44,6 +44,7 @@ uses
   passqlite3regexp,
   passqlite3stmtrand,
   passqlite3printf,
+  passqlite3normalize,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -2146,6 +2147,26 @@ begin
   z := sqlite3_normalized_sql(pStm);
   if z = nil then z := PAnsiChar('');
   Tcl_SetResult(interp, PChar(z), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ test1.c:5550..5572 — sqlite3_normalize SQL.  Normalises an SQL string
+  via the ext/misc/normalize.c helper (string-in / string-out). }
+function tcl_test_normalize(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zSql, zNorm: PAnsiChar;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('SQL'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zSql := Tcl_GetString(objv[1]);
+  zNorm := sqlite3_normalize(zSql);
+  if zNorm <> nil then begin
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(zNorm, -1));
+    sqlite3_free(zNorm);
+  end;
   Result := TCL_OK;
 end;
 
@@ -5051,6 +5072,9 @@ begin
     @tcl_test_ex_sql, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_normalized_sql'),
     @tcl_test_norm_sql, nil, nil);
+  { 9.4.divbug.88.058 — sqlite3_normalize SQL (test1.c:5550..5572). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_normalize'),
+    @tcl_test_normalize, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_status'),
     @tcl_test_stmt_status, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_busy'),
