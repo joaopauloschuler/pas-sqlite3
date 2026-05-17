@@ -33132,6 +33132,12 @@ begin
         treats SRT_Coroutine as a sibling of SRT_Output — same upstream
         register block, different downstream sink. }
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+      { divbug.87.033 — LIMIT decrement for SRT_Coroutine (select.c:1522..1524).
+        C emits DecrJumpZero p->iLimit, iBreak after the eDest dispatch when
+        no sorter is in play; without this, `INSERT INTO t(col) SELECT … FROM
+        src LIMIT N` yields every row of src instead of N. }
+      if (p^.iLimit <> 0) and (not isExists) then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
     end
     else if (pDest^.eDest = SRT_EphemTab)
          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo) then
@@ -38725,6 +38731,49 @@ begin
   bIdListInOrder := u8(ord(
     (pTab^.tabFlags and (TF_OOOHidden or TF_HasStored)) = 0));
 
+  { IDLIST per-column resolution pre-pass — port of insert.c:1077..1108.
+    Must run BEFORE the SELECT coroutine is emitted so destCoro.iSdst is
+    initialised from the IDLIST-resolved bIdListInOrder (a column-reorder
+    IDLIST forces dest.iSdst=0 and we then SCopy into table-storage order).
+    The count-mismatch check (insert.c:1256..1259) still runs later once
+    nColumn is known.  divbug.87.033: without this, INSERT INTO t(a,c)
+    SELECT * FROM t routed the SELECT directly into regData in IDLIST order
+    and skipped the SCopy shuffle, swapping b<->c in storage. }
+  if pColumn <> nil then
+  begin
+    aTabColMap := Pi32(sqlite3DbMallocZero(db,
+      SizeOf(i32) * SizeInt(pTab^.nCol)));
+    if aTabColMap = nil then goto insert_cleanup;
+    pIdItems := IdListItems(pColumn);
+    for i := 0 to pColumn^.nId - 1 do
+    begin
+      j := sqlite3ColumnIndex(pTab, pIdItems[i].zName);
+      if j >= 0 then
+      begin
+        if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
+        if i <> j then bIdListInOrder := 0;
+        if j = i32(pTab^.iPKey) then
+        begin
+          ipkColumn := i;
+          { assert( withoutRowid = 0 ) }
+        end;
+      end
+      else if (sqlite3IsRowid(pIdItems[i].zName) <> 0) and (withoutRowid = 0) then
+      begin
+        ipkColumn := i;
+        bIdListInOrder := 0;
+      end
+      else
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+          'table %S has no column named %s',
+          [@SrcListItems(pTabList)[0], pIdItems[i].zName]));
+        pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
+        goto insert_cleanup;
+      end;
+    end;
+  end;
+
   { Compound-SELECT-of-constants chain detection (Phase 6.8.6 narrowed scope).
     Multi-row VALUES is now produced via sqlite3MultiValues' viaCoroutine
     arm (caught above by useCoroutine), so the SF_Values fallback chain
@@ -38927,40 +38976,8 @@ generic_coro_done:
         '%d values for %d columns', [nColumn, pColumn^.nId]));
       goto insert_cleanup;
     end;
-    aTabColMap := Pi32(sqlite3DbMallocZero(db,
-      SizeOf(i32) * SizeInt(pTab^.nCol)));
-    if aTabColMap = nil then goto insert_cleanup;
-    pIdItems := IdListItems(pColumn);
-    for i := 0 to pColumn^.nId - 1 do
-    begin
-      j := sqlite3ColumnIndex(pTab, pIdItems[i].zName);
-      if j >= 0 then
-      begin
-        if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
-        if i <> j then bIdListInOrder := 0;
-        if j = i32(pTab^.iPKey) then
-        begin
-          ipkColumn := i;
-          { assert( withoutRowid = 0 ) }
-        end;
-      end
-      else if (sqlite3IsRowid(pIdItems[i].zName) <> 0) and (withoutRowid = 0) then
-      begin
-        { Rowid alias named in IDLIST for a table with no declared
-          INTEGER PRIMARY KEY — C insert.c:1097..1099.  The IDLIST index
-          becomes ipkColumn; the term carries the user-supplied rowid. }
-        ipkColumn := i;
-        bIdListInOrder := 0;
-      end
-      else
-      begin
-        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
-          'table %S has no column named %s',
-          [@SrcListItems(pTabList)[0], pIdItems[i].zName]));
-        pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
-        goto insert_cleanup;
-      end;
-    end;
+    { aTabColMap + bIdListInOrder + ipkColumn already computed by the
+      pre-coroutine IDLIST resolution pass above (insert.c:1077..1108). }
   end;
 
   { viaCoroutine register-reuse override (insert.c:1134..1138).  When the
@@ -39070,18 +39087,29 @@ generic_coro_done:
   if useTempTable then
   begin
     { Template-4 main loop top — port of insert.c:1322..1333.
-      Rewind srcTab; loop body reads each row via OP_Column srcTab. }
+      Rewind srcTab; loop body reads each row via OP_Column srcTab.
+      Per C insert.c:1505..1509, the IPK pre-load only fires when
+      ipkColumn >= 0 (i.e. the IPK is positionally present in the
+      coroutine output / IDLIST), and it reads srcTab column ipkColumn
+      (the IDLIST index of the IPK term), NOT pTab^.iPKey.  divbug.87.034:
+      reading column iPKey unconditionally treated the IDLIST's first
+      value (e.g. b=987) as the rowid when IDLIST didn't name the IPK,
+      surfacing as "UNIQUE constraint failed". }
     nRows := 1;
     addrInsTop := sqlite3VdbeAddOp1(v, OP_Rewind, srcTab);
     addrCont   := sqlite3VdbeCurrentAddr(v);
     ipkInSelect := False;
-    if pTab^.iPKey >= 0 then
+    if (pColumn = nil) and (pTab^.iPKey >= 0) then
     begin
-      { insert.c:1508..1509 — IPK value comes from the srcTab column.
-        Pre-load regRowid here (equivalent to C's read in the rowid
-        section: regRowid is not clobbered by the column loop, which
-        only SoftNulls regData+iPKey). }
+      { No-IDLIST positional path — IPK appears at storage position iPKey
+        in srcTab.  C insert.c:1505..1509 reads it via the same OP_Column. }
       sqlite3VdbeAddOp3(v, OP_Column, srcTab, i32(pTab^.iPKey), regRowid);
+      ipkInSelect := True;
+    end
+    else if ipkColumn >= 0 then
+    begin
+      { IDLIST names the IPK (or rowid alias) at index ipkColumn. }
+      sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid);
       ipkInSelect := True;
     end;
   end
