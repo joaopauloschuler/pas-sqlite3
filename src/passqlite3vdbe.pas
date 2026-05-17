@@ -5936,6 +5936,25 @@ begin
     sqlite3VdbeReset(pStmt);
   end;
 
+  { vdbeapi.c:779..792 — expired-stmt short-circuit.  Must precede the
+    READY→RUN transition so we don't bump counters or run any opcodes.
+    Sets p^.rc=SCHEMA so sqlite3_finalize returns SCHEMA, while step
+    itself returns SQLITE_ERROR (folded to 0xff later).  When prepared
+    with SAVESQL the real db error is surfaced via TransferError. }
+  if (pStmt^.eVdbeState = VDBE_READY_STATE)
+     and ((pStmt^.vdbeFlags and VDBF_EXPIRED_MASK) <> 0) then begin
+    pStmt^.rc := SQLITE_SCHEMA;
+    rc := SQLITE_ERROR;
+    if (pStmt^.prepFlags and SQLITE_PREPARE_SAVESQL) <> 0 then
+      rc := sqlite3VdbeTransferError(pStmt);
+    if db <> nil then begin
+      db^.errCode := rc;
+      Result := rc and db^.errMask;
+    end else
+      Result := rc;
+    Exit;
+  end;
+
   { Transition READY → RUN — vdbeapi.c:815..819 }
   if pStmt^.eVdbeState = VDBE_READY_STATE then begin
     if db <> nil then begin
