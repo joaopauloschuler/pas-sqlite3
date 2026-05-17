@@ -4360,6 +4360,86 @@ begin
   if rc = 0 then ;
 end;
 
+{ 9.4.divbug.88.065 — test1.c:6830..6865 file_control_lasterrno_test.
+  Usage: file_control_lasterrno_test DB.  Calls
+  sqlite3_file_control(db, NULL, SQLITE_LAST_ERRNO, &iArg); errors if rc
+  is non-zero or if the returned errno is non-zero. }
+function file_control_lasterrno_test_tcl(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:   PTsqlite3;
+  iArg: cint;
+  rc:   cint;
+  zBuf: array[0..63] of AnsiChar;
+begin
+  db := nil;
+  iArg := 0;
+  if objc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetStringFromObj(objv[0], nil), PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  rc := sqlite3_file_control(db, nil, SQLITE_FCNTL_LAST_ERRNO, @iArg);
+  if rc <> 0 then
+  begin
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if iArg <> 0 then
+  begin
+    StrPCopy(zBuf, IntToStr(iArg));
+    Tcl_AppendResult(interp, PChar('Unexpected non-zero errno: '),
+      PChar(@zBuf[0]), PChar(' '), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.88.065 — test1.c:7279..7309 file_control_tempfilename.
+  Usage: file_control_tempfilename DB ?AUXDB?.  Asks the VFS for a
+  temporary filename via SQLITE_FCNTL_TEMPFILENAME and appends it to
+  the interp result, then frees the allocation. }
+function file_control_tempfilename_tcl(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:      PTsqlite3;
+  zDbName: PAnsiChar;
+  zTName:  PAnsiChar;
+begin
+  db := nil;
+  zDbName := PAnsiChar('main');
+  zTName := nil;
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetStringFromObj(objv[0], nil), PChar(' DB ?AUXDB?'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if objc = 3 then
+    zDbName := Tcl_GetString(objv[2]);
+  sqlite3_file_control(db, zDbName, SQLITE_FCNTL_TEMPFILENAME, @zTName);
+  Tcl_AppendResult(interp, zTName, Pointer(nil));
+  if zTName <> nil then sqlite3_free(zTName);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.87.005 — test1.c:1740..1791 test_table_column_metadata.
   Usage: sqlite3_table_column_metadata DB dbname tblname ?colname?
   Returns a 5-element list: datatype collseq notnull primarykey autoinc.
@@ -5590,6 +5670,12 @@ begin
   { 9.4.divbug.88.037 — file_control_test (test1.c:9244 / 6795..6827). }
   Tcl_CreateObjCommand(interp, PChar('file_control_test'),
     @file_control_test_tcl, nil, nil);
+  { 9.4.divbug.88.065 — file_control_lasterrno_test (test1.c:9245 / 6830..6865). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_lasterrno_test'),
+    @file_control_lasterrno_test_tcl, nil, nil);
+  { 9.4.divbug.88.065 — file_control_tempfilename (test1.c:9259 / 7279..7309). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_tempfilename'),
+    @file_control_tempfilename_tcl, nil, nil);
   { 9.4.divbug.62.e — sqlite3_create_function_v2 / _create_window_function /
     _load_extension / _simulate_device / _user_version
     (test1.c:9262 + 9183 + test_window.c:337). }

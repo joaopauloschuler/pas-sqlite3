@@ -354,6 +354,23 @@ proc do_delete_file {force args} {
   }
 }
 
+# get_pwd — upstream tester.tcl:169..191.  Returns the current working
+# directory.  On Windows the upstream proc shells out to cmd /c CD to
+# preserve case; on POSIX (the only target here) it is just [pwd].
+proc get_pwd {} {
+  if {$::tcl_platform(platform) eq "windows"} {
+    if {[info exists ::env(ComSpec)]} {
+      set comSpec $::env(ComSpec)
+    } else {
+      set comSpec {C:\Windows\system32\cmd.exe}
+    }
+    return [string map [list \\ /] \
+        [string trim [exec -- $comSpec /c CD]]]
+  } else {
+    return [pwd]
+  }
+}
+
 # copy_file / forcecopy / do_copy_file — upstream tester.tcl:197..235.
 # Mirror of delete_file/forcedelete/do_delete_file above: `copy_file`
 # errors on a copy failure, `forcecopy` uses `file copy -force`.  Both
