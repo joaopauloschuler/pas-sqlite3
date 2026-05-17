@@ -1137,10 +1137,10 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.002** `bindxfer` — port `sqlite_bind` Tcl cmd (test1.c:3207..3247, registered :9086, old-style argc/argv) + Tcl_LinkVar `sqlite_static_bind_value`/`_nbyte` (test1.c:9429..9432).  bindxfer fully PASS (8/8).
   - [ ] **9.4.divbug.88.003** `cacheflush` — ! cacheflush-1.1.2 error: invalid command name "sqlite3_db_cacheflush"
   - [ ] **9.4.divbug.88.004** `capi3d` — SOURCE-ERROR: invalid command name "sqlite3_prepare16"
-  - [ ] **9.4.divbug.88.005** `capi3e` — ! capi3e-1.1.1 error: invalid command name "sqlite3_open"
+  - [X] **9.4.divbug.88.005** `capi3e` — ported sqlite3_open / _v2 / _16 Tcl trampolines (TestModuleTest1.pas test_open / test_open_v2 / test_open16; C ref test1.c:5395..5517, registered :9140..9142). Cited "invalid command name sqlite3_open" cleared; capi3e advances past prologue and surfaces deeper missing trampolines (sqlite3_close, etc.) — tracked separately.
   - [ ] **9.4.divbug.88.006** `chunksize` — SOURCE-ERROR: invalid command name "file_control_chunksize_test"
   - [ ] **9.4.divbug.88.007** `cksumvfs` — SOURCE-ERROR: invalid command name "sqlite3_register_cksumvfs"
-  - [ ] **9.4.divbug.88.008** `close` — ! close-1.1 error: invalid command name "sqlite3_open"
+  - [X] **9.4.divbug.88.008** `close` — cured by .005's sqlite3_open trampoline port (TestModuleTest1.pas test_open; C ref test1.c:5395..5417, registered :9140). Cited "invalid command name sqlite3_open" cleared; close-1.0 PASS, close-1.1+ now block on sqlite3_close_v2 / sqlite3_blob_open trampolines — tracked separately.
   - [ ] **9.4.divbug.88.009** `collate7` — ! collate7-1.1 error: invalid command name "sqlite3_create_collation_v2"
   - [ ] **9.4.divbug.88.010** `colname` — ! colname-2.1 error: invalid command name "execsql2"
   - [ ] **9.4.divbug.88.011** `corrupt` — ! corrupt-2.1.8 error: invalid command name "btree_from_db"

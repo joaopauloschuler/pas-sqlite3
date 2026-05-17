@@ -4075,6 +4075,159 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.005 / 88.008 — sqlite3_open / _v2 / _16 trampolines used by
+  capi3e.test (sqlite3_open / sqlite3_open16) and close.test (sqlite3_open).
+  C ref: test1.c:5395..5517 (test_open / test_open_v2 / test_open16),
+  registered at test1.c:9140..9142. }
+
+{ test1.c:5395..5417 — Usage: sqlite3_open ?filename? ?options-list? }
+function test_open(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zFilename: PAnsiChar;
+  db:        PTsqlite3;
+  hex:       AnsiString;
+  zBuf:      array[0..63] of AnsiChar;
+begin
+  if (objc <> 3) and (objc <> 2) and (objc <> 1) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' filename options-list"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc > 1 then
+    zFilename := Tcl_GetString(objv[1])
+  else
+    zFilename := nil;
+  db := nil;
+  sqlite3_open(zFilename, @db);
+  ptrToHex(db, hex);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(hex[1], zBuf[0], Length(hex));
+  Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:5419..5488 — Usage: sqlite3_open_v2 FILENAME FLAGS VFS }
+function test_open_v2(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  { Mirror of test1.c:5454..5475 OpenFlag table. }
+  aFlagName: array[0..19] of PAnsiChar = (
+    'SQLITE_OPEN_READONLY',     'SQLITE_OPEN_READWRITE',
+    'SQLITE_OPEN_CREATE',       'SQLITE_OPEN_DELETEONCLOSE',
+    'SQLITE_OPEN_EXCLUSIVE',    'SQLITE_OPEN_AUTOPROXY',
+    'SQLITE_OPEN_MAIN_DB',      'SQLITE_OPEN_TEMP_DB',
+    'SQLITE_OPEN_TRANSIENT_DB', 'SQLITE_OPEN_MAIN_JOURNAL',
+    'SQLITE_OPEN_TEMP_JOURNAL', 'SQLITE_OPEN_SUBJOURNAL',
+    'SQLITE_OPEN_SUPER_JOURNAL','SQLITE_OPEN_NOMUTEX',
+    'SQLITE_OPEN_FULLMUTEX',    'SQLITE_OPEN_SHAREDCACHE',
+    'SQLITE_OPEN_PRIVATECACHE', 'SQLITE_OPEN_WAL',
+    'SQLITE_OPEN_URI',          'SQLITE_OPEN_EXRESCODE'
+  );
+  aFlagVal:  array[0..19] of cint = (
+    SQLITE_OPEN_READONLY,       SQLITE_OPEN_READWRITE,
+    SQLITE_OPEN_CREATE,         SQLITE_OPEN_DELETEONCLOSE,
+    SQLITE_OPEN_EXCLUSIVE,      SQLITE_OPEN_AUTOPROXY,
+    SQLITE_OPEN_MAIN_DB,        SQLITE_OPEN_TEMP_DB,
+    SQLITE_OPEN_TRANSIENT_DB,   SQLITE_OPEN_MAIN_JOURNAL,
+    SQLITE_OPEN_TEMP_JOURNAL,   SQLITE_OPEN_SUBJOURNAL,
+    SQLITE_OPEN_SUPER_JOURNAL,  SQLITE_OPEN_NOMUTEX,
+    SQLITE_OPEN_FULLMUTEX,      SQLITE_OPEN_SHAREDCACHE,
+    SQLITE_OPEN_PRIVATECACHE,   SQLITE_OPEN_WAL,
+    SQLITE_OPEN_URI,            SQLITE_OPEN_EXRESCODE
+  );
+var
+  zFilename: PAnsiChar;
+  zVfs:      PAnsiChar;
+  flags:     cint;
+  db:        PTsqlite3;
+  rc:        cint;
+  hex:       AnsiString;
+  zBuf:      array[0..63] of AnsiChar;
+  nFlag:     cint;
+  apFlagRaw: Pointer;
+  apFlag:    PPTclObj;
+  i, j:      cint;
+  zFlag:     PAnsiChar;
+  found:     Boolean;
+begin
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FILENAME FLAGS VFS'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zFilename := Tcl_GetString(objv[1]);
+  zVfs := Tcl_GetString(objv[3]);
+  if (zVfs <> nil) and (zVfs[0] = #0) then zVfs := nil;
+
+  apFlagRaw := nil;
+  nFlag := 0;
+  rc := Tcl_ListObjGetElements(interp, objv[2], @nFlag, @apFlagRaw);
+  if rc <> TCL_OK then
+  begin
+    Result := rc; Exit;
+  end;
+  apFlag := PPTclObj(apFlagRaw);
+
+  flags := 0;
+  for i := 0 to nFlag - 1 do
+  begin
+    zFlag := Tcl_GetString(apFlag[i]);
+    found := False;
+    for j := 0 to High(aFlagName) do
+    begin
+      if StrComp(zFlag, aFlagName[j]) = 0 then
+      begin
+        flags := flags or aFlagVal[j];
+        found := True;
+        Break;
+      end;
+    end;
+    if not found then
+    begin
+      Tcl_AppendResult(interp, PChar('unknown flag: '), zFlag, Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+
+  db := nil;
+  rc := sqlite3_open_v2(zFilename, @db, flags, zVfs);
+  ptrToHex(db, hex);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(hex[1], zBuf[0], Length(hex));
+  Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  Result := TCL_OK;
+  if (clientData = nil) and (rc = rc) then ;
+end;
+
+{ test1.c:5490..5517 — Usage: sqlite3_open16 filename options }
+function test_open16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zFilename: Pointer;
+  db:        PTsqlite3;
+  hex:       AnsiString;
+  zBuf:      array[0..63] of AnsiChar;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' filename options-list"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  zFilename := Tcl_GetByteArrayFromObj(objv[1], nil);
+  db := nil;
+  sqlite3_open16(zFilename, @db);
+  ptrToHex(db, hex);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(hex[1], zBuf[0], Length(hex));
+  Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -4092,6 +4245,14 @@ begin
   Tcl_CreateObjCommand(interp, PChar('load_static_extension'),
     @tclLoadStaticExtensionCmd, nil, nil);
   { 9.4.6.q.1 — prepared-statement / errmsg / exec / transfer / backup. }
+  { 9.4.divbug.88.005 / 88.008 — sqlite3_open / _v2 / _16 Tcl trampolines.
+    test1.c:9140..9142. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_open'),
+    @test_open, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_open_v2'),
+    @test_open_v2, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_open16'),
+    @test_open16, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg'),
