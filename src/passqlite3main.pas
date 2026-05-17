@@ -3020,9 +3020,12 @@ end;
 procedure initCorruptSchema(pData: PInitData; argv: PPAnsiChar;
                             zExtra: PAnsiChar);
 var
-  db    : PTsqlite3;
-  zObj  : PAnsiChar;
-  z, z2 : PAnsiChar;
+  db        : PTsqlite3;
+  zObj      : PAnsiChar;
+  z, z2     : PAnsiChar;
+  zAlterTyp : PAnsiChar;
+  zArg0     : PAnsiChar;
+  zArg1     : PAnsiChar;
 begin
   db := pData^.db;
   if db^.mallocFailed <> 0 then begin
@@ -3031,6 +3034,8 @@ begin
   end;
   { Faithful port of prepare.c:22 corruptSchema.
     - keep any pre-existing message (prepare.c:30..31);
+    - ALTER reparse paths wrap the failure as
+      "error in <type> <name> after <kind>: <extra>" (prepare.c:32..44);
     - SQLITE_WriteSchema swallows the message and forces CORRUPT
       (prepare.c:45..46);
     - otherwise format "malformed database schema (<NAME>) [- <extra>]"
@@ -3038,6 +3043,35 @@ begin
   if (pData^.pzErrMsg <> nil) and (pData^.pzErrMsg^ <> nil)
      and (pData^.pzErrMsg^[0] <> #0) then begin
     { prior message wins }
+  end else if (pData^.mInitFlags and INITFLAG_AlterMask) <> 0 then begin
+    { ALTER-reparse arm — prepare.c:32..44.
+      argv[0] = type, argv[1] = name. }
+    case (pData^.mInitFlags and INITFLAG_AlterMask) of
+      INITFLAG_AlterRename:   zAlterTyp := 'rename';
+      INITFLAG_AlterDrop:     zAlterTyp := 'drop column';
+      INITFLAG_AlterAdd:      zAlterTyp := 'add column';
+      INITFLAG_AlterDropCons: zAlterTyp := 'drop constraint';
+    else
+      zAlterTyp := '?';
+    end;
+    if argv <> nil then begin
+      zArg0 := argv^;
+      zArg1 := (argv + 1)^;
+    end else begin
+      zArg0 := nil;
+      zArg1 := nil;
+    end;
+    if zArg0 = nil then zArg0 := '?';
+    if zArg1 = nil then zArg1 := '?';
+    if zExtra = nil then zExtra := '';
+    if pData^.pzErrMsg <> nil then begin
+      sqlite3DbFree(db, pData^.pzErrMsg^);
+      pData^.pzErrMsg^ := sqlite3MPrintf(db,
+        'error in %s %s after %s: %s',
+        [zArg0, zArg1, zAlterTyp, zExtra]);
+    end;
+    pData^.rc := SQLITE_ERROR;
+    Exit;
   end else if (db^.flags and SQLITE_WriteSchema) <> 0 then begin
     { writable_schema → no formatted message }
   end else if pData^.pzErrMsg <> nil then begin
