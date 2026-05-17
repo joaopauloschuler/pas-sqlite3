@@ -15,5 +15,19 @@ survive the mask are real port drift.
 
 | source | tier | tag | status | cite | scripts | diverge | first channel | first script (truncated) |
 |--------|------|-----|--------|------|---------|---------|---------------|--------------------------|
+| src/tests/TestExplainParity.pas | tier1 | mixed | pas-strict | - | 1024 | 43 | db-blob | `CREATE TABLE z1(a,b)` |
+| src/tests/TestBytecodeParity.pas | tier1 | mixed | pas-strict | - | 32 | 4 | db-blob | `CREATE TABLE z1(a,b)` |
+| src/tests/TestParser.pas | tier1 | mixed | pas-strict | - | 40 | 8 | db-blob | `CREATE TABLE z1(a,b)` |
+| src/tests/DiagFeatureProbe.pas | tier2 | mixed | pas-strict | - | 34 | 23 | db-blob | `CREATE TABLE t(a); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2); CREATE VIEW...` |
+| src/tests/DiagMisc.pas | tier2 | mixed | pas-strict | - | 18 | 13 | db-blob | `CREATE TABLE t(a, b DEFAULT 7); INSERT INTO t(a) VALUES(1); SELECT b FROM t` |
+| src/tests/DiagTxn.pas | tier2 | txn | pas-strict | - | 40 | 15 | db-blob | `CREATE TABLE t(a); BEGIN; INSERT INTO t VALUES(1); INSERT INTO t VALUES(2); COMM...` |
+| src/tests/DiagDml.pas | tier2 | dml | pas-strict | - | 14 | 2 | db-blob | `CREATE TABLE s(x,y); CREATE TABLE d(x,y); INSERT INTO s VALUES(1,10),(2,20),(3,3...` |
+| src/tests/DiagDropTable.pas | tier2 | ddl | pas-strict | - | 6 | 6 | db-blob | `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2); ; DROP TABLE t; SELECT * FROM t` |
+| src/tests/DiagSumOverflow.pas | tier2 | dql | pas-strict | - | 12 | 4 | db-blob | `CREATE TABLE t(x INTEGER); SELECT sum(x) FROM t` |
+| src/tests/DiagAnalyze.pas | tier2 | pragma | pas-strict | - | 3 | 3 | db-blob | `CREATE TABLE t(a,b); CREATE INDEX i1 ON t(a); INSERT INTO t VALUES(1,1),(2,2),(3...` |
+| src/tests/DiagBloom.pas | tier2 | dql | pas-strict | - | 9 | 5 | db-blob | `CREATE TABLE dim(k INTEGER PRIMARY KEY, v)` |
+| src/tests/DiagCovering.pas | tier2 | dql | pas-strict | - | 4 | 2 | db-blob | `CREATE TABLE t(a, b, c)` |
+| src/tests/DiagMultiValues.pas | tier2 | dml | pas-strict | - | 1 | 1 | db-blob | `CREATE TABLE t(a,b)` |
+| src/tests/DiagAutoIdx.pas | tier2 | dql | pas-strict | - | 3 | 3 | db-blob | `CREATE TABLE t(a,b,c)` |
 
 _End of file._
