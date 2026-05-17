@@ -1180,7 +1180,7 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.045** `json102` — shared port with 88.040 at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared, json102.test now runs (316 fail on downstream).
   - [X] **9.4.divbug.88.046** `json502` — shared port with 88.040 at PasTclSqlite.pas:4080 (tclsqlite.c:2448,2479); SOURCE-ERROR cleared.
   - [x] **9.4.divbug.88.047** `laststmtchanges` — ported `sqlite3_exec_printf` Tcl trampoline (test1.c:299..328; reuses execPrintfCb at TestModuleTest1.pas:641, sqlite3PfMprintf wrapper). Registered TestModuleTest1.pas via Tcl_CreateCommand (C ref test1.c:9072). laststmtchanges → PASS 6/205.
-  - [ ] **9.4.divbug.88.048** `lock5` — SOURCE-ERROR: invalid command name "db2"
+  - [~] **9.4.divbug.88.048** `lock5` — `db2` Tcl-object symptom cleared by prior tester_min/PasTclSqlite work (multi-instance `sqlite3 dbN file` already supported); rerun reveals real divergences in `unix-dotfile` / `unix-none` VFS lock semantics plus a SIGSEGV (exit 139) deep in lock5-2.dotfile/lock5-2.none arms.  Deferred: needs a unix-dotfile/unix-none pager-lock audit (>1h), not a Tcl trampoline gap.
   - [X] **9.4.divbug.88.049** `main` — ported `db complete SQL` arm (tclsqlite.c:2844 → PasTclSqlite.pas:4183); main.test now PASS 218/218.
   - [x] **9.4.divbug.88.050** `memsubsys1` — SOURCE-ERROR: invalid command name "sqlite3_config_lookaside"
   - [x] **9.4.divbug.88.051** `memsubsys2` — SOURCE-ERROR: invalid command name "sqlite3_config_memstatus"
