@@ -1185,6 +1185,52 @@ begin
   Result := TCL_OK;
 end;
 
+{ test3.c:504..546 — btree_from_db DB-HANDLE ?N?.
+  Returns the Btree* pointer for database iDb (default 0) of the SQLite
+  connection bound to the Tcl `db` command.  Rendered as "%p" hex.
+  9.4.divbug.88.011. }
+function btree_from_db(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+type
+  TArgvArr = array[0..16] of PAnsiChar;
+  PArgvArr = ^TArgvArr;
+var
+  cmdInfo: TTclCmdInfo;
+  p:       PTestSqliteDb;
+  db:      PTsqlite3;
+  pBt:     Pointer;
+  iDb:     cint;
+  av:      PArgvArr;
+  zBuf:    array[0..99] of AnsiChar;
+  s:       AnsiString;
+begin
+  av := PArgvArr(argv);
+  if (argc <> 2) and (argc <> 3) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av^[0], PChar(' DB-HANDLE ?N?"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetCommandInfo(interp, av^[1], @cmdInfo) = 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('No such db-handle: "'),
+      av^[1], PChar('"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  iDb := 0;
+  if argc = 3 then
+    iDb := StrToIntDef(StrPas(av^[2]), 0);
+  p := PTestSqliteDb(cmdInfo.objClientData);
+  db := p^.db;
+  pBt := db^.aDb[iDb].pBt;
+  s := '0x' + LowerCase(IntToHex(PtrUInt(pBt), 1));
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_SetResult(interp, PChar(@zBuf[0]), TCL_VOLATILE);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test_malloc.c:884..915 — sqlite3_config_pagecache SIZE N.
   Sets the page-cache memory buffer.  The "static buf" trick from C is
   preserved via a unit-level var so successive calls do not leak.
@@ -4408,6 +4454,9 @@ begin
     @sqlite_static_bind_nbyte, TCL_LINK_INT);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_backup'),
     @backupTestInit, nil, nil);
+  { 9.4.divbug.88.011 — btree_from_db.  test3.c:676. }
+  Tcl_CreateCommand(interp, PChar('btree_from_db'),
+    @btree_from_db, nil, nil);
   { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
     test1.c:9082 / test_malloc.c:1487. }
   Tcl_CreateCommand(interp, PChar('sqlite3_create_aggregate'),
