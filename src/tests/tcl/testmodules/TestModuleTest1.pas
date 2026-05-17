@@ -43,6 +43,11 @@ uses
   passqlite3ieee754,
   passqlite3regexp,
   passqlite3stmtrand,
+  passqlite3eval,
+  passqlite3fileio,
+  passqlite3totype,
+  passqlite3explain,
+  passqlite3wholenumber,
   passqlite3printf,
   passqlite3normalize,
   passqlite3main;
@@ -509,12 +514,49 @@ begin
   Result := sqlite3StmtrandInit(db);
 end;
 
+{ 9.4.divbug.90 — five more aExtension[] slots mirroring test1.c:8406..8435.
+  Each Pas port already exists; only the C-ABI shim + table row were missing.
+    * eval         — ext/misc/eval.c (btree02.test, misc8.test)
+    * fileio       — ext/misc/fileio.c (extension01.test)
+    * totype       — ext/misc/totype.c (func4.test)
+    * explain      — ext/misc/explain.c — vtab (indexexpr2.test)
+    * wholenumber  — ext/misc/wholenumber.c — vtab (memdb.test, percentile.test) }
+function eval_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3EvalInit(db);
+end;
+
+function fileio_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3FileioInit(db);
+end;
+
+function totype_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3TotypeInit(db);
+end;
+
+function explain_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3ExplainVtabInit(db);
+end;
+
+function wholenumber_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3WholenumberInit(db);
+end;
+
 function tclLoadStaticExtensionCmd(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
 const
   SQLITE_OK_LOAD_PERMANENTLY = 256;  { sqlite3.h — SQLITE_OK | (8<<8) }
 var
-  aExtension: array[0..3] of TStaticExt;
+  aExtension: array[0..8] of TStaticExt;
   db:         PTsqlite3;
   zName:      PAnsiChar;
   i, j, rc:   cint;
@@ -524,6 +566,11 @@ begin
   aExtension[1].zExtName := 'real2hex'; aExtension[1].pInit := @realhex_ext_init;
   aExtension[2].zExtName := 'regexp';   aExtension[2].pInit := @regexp_ext_init;
   aExtension[3].zExtName := 'stmtrand'; aExtension[3].pInit := @stmtrand_ext_init;
+  aExtension[4].zExtName := 'eval';        aExtension[4].pInit := @eval_ext_init;
+  aExtension[5].zExtName := 'fileio';      aExtension[5].pInit := @fileio_ext_init;
+  aExtension[6].zExtName := 'totype';      aExtension[6].pInit := @totype_ext_init;
+  aExtension[7].zExtName := 'explain';     aExtension[7].pInit := @explain_ext_init;
+  aExtension[8].zExtName := 'wholenumber'; aExtension[8].pInit := @wholenumber_ext_init;
   zErrMsg := nil;
   if objc < 3 then
   begin

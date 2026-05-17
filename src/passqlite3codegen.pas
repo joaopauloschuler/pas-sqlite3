@@ -56703,7 +56703,7 @@ const
   FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
-  aBuiltinFuncs: array[0..83] of TFuncDef;
+  aBuiltinFuncs: array[0..84] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -56921,6 +56921,13 @@ begin
     "no such function: if" (qrf01-13.x). }
   MakeFD(aBuiltinFuncs[83],-4, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'if');
   aBuiltinFuncs[83].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
+  { 9.4.divbug.90 — unistr_quote(X): same impl as quote(X) but with
+    pUserData=1 so quoteFunc emits the unistr() escape variant for
+    non-ASCII bytes (func.c:3340 FUNCTION(unistr_quote,1,1,0,quoteFunc),
+    consumed by quoteFunc at func.c:1264 via SQLITE_PTR_TO_INT(user_data)).
+    Closes func9-210 "no such function: unistr_quote". }
+  MakeFD(aBuiltinFuncs[84], 1, FUNC_ENC, @quoteFunc, nil, 'unistr_quote');
+  aBuiltinFuncs[84].pUserData := Pointer(PtrInt(1));
 end;
 
 var
