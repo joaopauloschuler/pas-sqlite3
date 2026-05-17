@@ -11643,6 +11643,22 @@ begin
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pGroupBy, 'GROUP');
   end;
 
+  { 9.4.divbug.89.016 — port resolve.c:1888 LIMIT/OFFSET resolution.
+    C runs `sqlite3ResolveExprNames(&sNC, p->pLimit)` with an empty
+    NameContext: LIMIT may not reference any names, but its subexpressions
+    (in particular, embedded TK_SELECT scalar subqueries like
+    `LIMIT (SELECT ...)`) must be Prep'd here so the inner select gains
+    SF_Resolved BEFORE sqlite3SelectAddTypeInfo blanket-sets SF_HasTypeInfo
+    on the whole tree.  Without this, the inner LIMIT subquery's
+    SelectPrep call at codeSubselect time early-returns on SF_HasTypeInfo
+    and ResolveCompoundOrderBy never runs — an `ORDER BY 1` term then
+    reaches multiSelectByMerge with iOrderByCol=0 and trips the
+    AssertH (`multiSelectByMerge: iOrderByCol<=0`).  Reusing ResolveExpr
+    here also handles the OFFSET expression via pLimit^.pRight via the
+    standard recursion. }
+  if (pParse^.nErr = 0) and (p^.pLimit <> nil) then
+    ResolveExpr(p^.pLimit);
+
   { resolve.c:2079 — once ON clauses have been spliced into pWhere
     (selectExpander tags Select with SF_OnToWhere when it does this),
     walk pWhere to confirm no ON term references a table to its right.
