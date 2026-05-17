@@ -19446,7 +19446,26 @@ begin
             if (pOBExpr^.op <> TK_COLUMN) and (pOBExpr^.op <> TK_AGG_COLUMN) then
               begin Inc(i); Continue; end;
             if pOBExpr^.iTable <> iCur then begin Inc(i); Continue; end;
-            if pOBExpr^.iColumn <> i16(iColumn) then begin Inc(i); Continue; end;
+            if pOBExpr^.iColumn <> i16(iColumn) then
+            begin
+              { 9.4.divbug.87.060 — Pas resolver leaves ORDER BY `a` as
+                iColumn=iPKey for an INTEGER PRIMARY KEY alias instead of
+                rewriting to XN_ROWID(-1) the way resolve.c:466/:562 do
+                (see MEMORY: generated_column_ipk_alias).  C's
+                where.c:5358 remaps the *index* slot iColumn==iPKey to
+                XN_ROWID, then the match at where.c:5393 compares
+                XN_ROWID==XN_ROWID.  Here pOBExpr^.iColumn still carries
+                the iPKey ordinal, so accept either form: if the index
+                slot is XN_ROWID and the table has an IPK, also match
+                pOBExpr^.iColumn = pTable^.iPKey. }
+              if (iColumn = XN_ROWID) and (pIndex <> nil)
+                 and (pIndex^.pTable <> nil)
+                 and (pIndex^.pTable^.iPKey >= 0)
+                 and (pOBExpr^.iColumn = pIndex^.pTable^.iPKey) then
+                { fall-through — treat as match }
+              else
+                begin Inc(i); Continue; end;
+            end;
           end
           else
           begin
