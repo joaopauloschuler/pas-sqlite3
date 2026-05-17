@@ -630,30 +630,36 @@ end;
 { test1.c:419..460 — test_exec.
   Usage: sqlite3_exec DB SQL  (string-arg form).
   The Pascal port collapses the result to a single-list: "{rc} {result-or-err}",
-  matching what Tcl_AppendElement produces.  We skip the % hex-decode pass
-  (it's only used by a handful of obscure tests) — straight passthrough. }
-type
-  TExecCtx = record
-    rows: AnsiString;
-  end;
-  PExecCtx = ^TExecCtx;
-
+  matching what Tcl_AppendElement produces.  Performs the in-place %HH hex
+  decode pass (test1.c:442..449) before invoking sqlite3_exec — badutf.test
+  and friends rely on it to inject raw bytes into the SQL string. }
+{ test1.c:195..208 — exec_printf_cb.
+  pArg is a Tcl_DString*.  On the first row, append the column names;
+  then for every row append each value as a Tcl list element.  Using
+  Tcl_DStringAppendElement gets the brace-escaping right (e.g.
+  "x 80" → "{x 80}", plain "80" → "80"). }
 function execPrintfCb(pArg: Pointer; nCol: i32;
   argv: PPAnsiChar; colv: PPAnsiChar): i32; cdecl;
 var
-  ctx: PExecCtx;
+  str: PTclDString;
   i:   i32;
   z:   PAnsiChar;
 begin
-  ctx := PExecCtx(pArg);
+  str := PTclDString(pArg);
+  if str^.length = 0 then
+  begin
+    for i := 0 to nCol - 1 do
+    begin
+      z := PPAnsiChar(PtrUInt(colv) + PtrUInt(i) * SizeOf(Pointer))^;
+      if z = nil then z := PAnsiChar('NULL');
+      Tcl_DStringAppendElement(str, z);
+    end;
+  end;
   for i := 0 to nCol - 1 do
   begin
-    if Length(ctx^.rows) > 0 then ctx^.rows := ctx^.rows + ' ';
     z := PPAnsiChar(PtrUInt(argv) + PtrUInt(i) * SizeOf(Pointer))^;
-    if z = nil then
-      ctx^.rows := ctx^.rows + '{}'
-    else
-      ctx^.rows := ctx^.rows + '{' + AnsiString(z) + '}';
+    if z = nil then z := PAnsiChar('NULL');
+    Tcl_DStringAppendElement(str, z);
   end;
   Result := 0;
 end;
@@ -664,8 +670,11 @@ var
   db:    PTsqlite3;
   rc:    i32;
   zErr:  PAnsiChar;
-  ctx:   TExecCtx;
+  str:   TTclDString;
   zBuf:  array[0..31] of AnsiChar;
+  zSql:  PAnsiChar;
+  zIn:   PAnsiChar;
+  i, j:  cint;
 begin
   if objc <> 3 then
   begin
@@ -677,18 +686,44 @@ begin
   begin
     Result := TCL_ERROR; Exit;
   end;
-  ctx.rows := '';
+  Tcl_DStringInit(@str);
   zErr := nil;
-  rc := sqlite3_exec(db, Tcl_GetString(objv[2]), @execPrintfCb, @ctx, @zErr);
+  { test1.c:441..449 — copy SQL into a mutable buffer and apply the
+    in-place %HH → raw-byte decode pass.  Pas sqlite3_mprintf has no
+    varargs entry, so allocate via GetMem and copy by hand. }
+  zIn := Tcl_GetString(objv[2]);
+  i := 0;
+  while zIn[i] <> #0 do Inc(i);
+  GetMem(zSql, i + 1);
+  Move(zIn^, zSql^, i + 1);
+  i := 0; j := 0;
+  while zSql[i] <> #0 do
+  begin
+    if (zSql[i] = '%') and (zSql[i+1] <> #0) and (zSql[i+2] <> #0) then
+    begin
+      zSql[j] := AnsiChar((testHexToInt(Ord(zSql[i+1])) shl 4)
+                        + testHexToInt(Ord(zSql[i+2])));
+      Inc(j); Inc(i, 3);
+    end
+    else
+    begin
+      zSql[j] := zSql[i];
+      Inc(j); Inc(i);
+    end;
+  end;
+  zSql[j] := #0;
+  rc := sqlite3_exec(db, zSql, @execPrintfCb, @str, @zErr);
+  FreeMem(zSql);
   FillChar(zBuf, SizeOf(zBuf), 0);
   StrPCopy(zBuf, IntToStr(rc));
   Tcl_AppendElement(interp, @zBuf[0]);
   if rc = SQLITE_OK then
-    Tcl_AppendElement(interp, PChar(ctx.rows))
+    Tcl_AppendElement(interp, Tcl_DStringValue(@str))
   else if zErr <> nil then
     Tcl_AppendElement(interp, zErr)
   else
     Tcl_AppendElement(interp, PChar(''));
+  Tcl_DStringFree(@str);
   if zErr <> nil then sqlite3_free(zErr);
   Result := TCL_OK;
 end;
