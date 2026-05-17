@@ -1734,12 +1734,18 @@ end;
 
 function sqlite3GetVarint32(p: Pu8; out v: u32): u8;
 var
-  b1: u8;
+  b0, b1: u8;
 begin
-  { Caller guarantees (p[0] and $80) <> 0.  Inline 2-byte fast path. }
+  { Mirrors C getVarint32 macro (sqliteInt.h:5344): inline single-byte
+    fast path before falling into the multi-byte function. }
+  b0 := p[0];
+  if (b0 and $80) = 0 then begin
+    v := u32(b0);
+    Exit(1);
+  end;
   b1 := p[1];
   if (b1 and $80) = 0 then begin
-    v := (u32(p[0] and $7f) shl 7) or u32(b1);
+    v := (u32(b0 and $7f) shl 7) or u32(b1);
     Exit(2);
   end;
   Result := sqlite3GetVarint32Slow(p, v);
