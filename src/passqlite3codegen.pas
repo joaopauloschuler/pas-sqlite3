@@ -20672,6 +20672,16 @@ begin
         Exit(0);
       pIdx := pIdx^.pNext;
     end;
+    { TRIAGE (divbug.87.027..029): a partial-index that matches the query's
+      WHERE-clause is NOT considered here.  Deferring to the full planner
+      would correctly enter whereLoopAddBtree → whereUsablePartialIndex,
+      but the WhereEnd Index→table column rewrite arm (where.c:7732..7886)
+      is still deferred in this port (codegen.pas:22584).  Without it any
+      WHERE_IDX_ONLY plan that pas chooses would crash at runtime because
+      OP_Column refs against an unopened table cursor still reach the VDBE.
+      Left as a deeper deferred — fixing it requires porting that rewrite
+      in tandem.  index8-1.1eqp / index9-1.1..4.4 / indexA-1.2 remain
+      diverging. }
     { 9.4.divbug.30 — when caller passed an ORDER BY / GROUP BY / DISTINCT,
       the fallback SCAN below bypasses wherePathSolver and therefore the
       wherePathSatisfiesOrderBy gate.  That means a plain `SELECT * FROM t
@@ -21729,22 +21739,26 @@ begin
 
     { where.c:7218..7237 — for DELETE/UPDATE plans (WHERE_ONEPASS_DESIRED)
       that target a rowid table, clear WHERE_IDX_ONLY on the driving
-      WhereLoop: the caller will need the table cursor live for the
-      delete/update proper, so the loop must scan the table-cursor side
-      too.  This also suppresses the EQP "USING COVERING INDEX" tag in
-      favour of plain "USING INDEX" for these plans (divbug.55).
-
-      NB: we apply the wsFlags clear unconditionally on ONEPASS_DESIRED
-      (without writing pWInfo^.eOnePass) — the pas-side ONEPASS execution
-      path is rowid-EQ only today; broader ONEPASS adoption stays
-      deferred, but the EQP shape must match C either way. }
+      WhereLoop so the per-level cursor-open arm below opens the table
+      cursor (the delete/update proper needs it live).  Gated 1:1 with
+      C: only fires when bOnerow OR (WHERE_ONEPASS_MULTIROW && !vtab &&
+      !MULTI_OR && SQLITE_OnePass enabled).  Earlier divbug.55 omitted
+      the gate, which mislabelled UPDATE/DELETE EQP for COVERING-INDEX
+      plans where chngKey suppresses MULTIROW (indexedby-8.1/8.3/11.10).
+      divbug.87.027..030 restores the gate. }
     if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
     begin
       pLoop := whereInfoLevels(pWInfo)[0].pWLoop;
       pTab  := SrcListItems(pTabList)[0].pSTab;
       if HasRowid(pTab)
          and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0)
-         and (pTab^.eTabType <> TABTYP_VTAB) then
+         and (pTab^.eTabType <> TABTYP_VTAB)
+         and (   ((pLoop^.wsFlags and WHERE_ONEROW) <> 0)
+              or (    ((wctrlFlags and WHERE_ONEPASS_MULTIROW) <> 0)
+                  and (((pLoop^.wsFlags and WHERE_MULTI_OR) = 0)
+                       or ((wctrlFlags and WHERE_DUPLICATES_OK) <> 0))
+                  and OptimizationEnabled(db, SQLITE_OnePass)) )
+      then
       begin
         pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
       end;
@@ -59748,6 +59762,46 @@ end;
 // sqlite3ExprCompare — compare two expressions (expr.c:6544)
 // Returns 0 if identical, 1 if certainly different, 2 if indeterminate.
 // ---------------------------------------------------------------------------
+{ exprCompareVariable — port of expr.c:6487..6516.
+  Returns 0 if pVar (a TK_VARIABLE) is currently bound to the same value
+  as the simple SQL literal pExpr; returns 2 otherwise (or when QPSG
+  disables this trick).  Two TK_VARIABLE nodes with identical iColumn
+  compare equal trivially (same bound slot).  divbug.87.027..030. }
+function exprCompareVariable(pParse: PParse; pVar: PExpr; pExpr: PExpr): i32;
+var
+  iVar: i32;
+  pL, pR: Psqlite3_value;
+begin
+  Result := 2;
+  pR := nil;
+  if (pExpr^.op = TK_VARIABLE) and (pVar^.iColumn = pExpr^.iColumn) then
+  begin
+    Result := 0; Exit;
+  end;
+  if (pParse^.db^.flags and u64($00800000)) <> 0 then  { SQLITE_EnableQPSG }
+  begin
+    Result := 2; Exit;
+  end;
+  sqlite3ValueFromExpr(pParse^.db, pExpr, SQLITE_UTF8, SQLITE_AFF_BLOB, pR);
+  if pR <> nil then
+  begin
+    iVar := pVar^.iColumn;
+    sqlite3VdbeSetVarmask(pParse^.pVdbe, iVar);
+    pL := sqlite3VdbeGetBoundValue(pParse^.pReprepare, iVar, SQLITE_AFF_BLOB);
+    if pL <> nil then
+    begin
+      if sqlite3_value_type(pL) = SQLITE_TEXT then
+        sqlite3_value_text(pL);  { force UTF-8 encoding }
+      if sqlite3MemCompare(pL, pR, nil) <> 0 then
+        Result := 2
+      else
+        Result := 0;
+    end;
+    sqlite3ValueFree(pR);
+    sqlite3ValueFree(pL);
+  end;
+end;
+
 function sqlite3ExprCompare(pParse: PParse; pA: PExpr; pB: PExpr;
   iTab: i32): i32;
 var
@@ -59755,6 +59809,10 @@ var
 begin
   if (pA = nil) or (pB = nil) then begin
     if pA = pB then Result := 0 else Result := 2;
+    Exit;
+  end;
+  if (pParse <> nil) and (pA^.op = TK_VARIABLE) then begin
+    Result := exprCompareVariable(pParse, pA, pB);
     Exit;
   end;
   combinedFlags := pA^.flags or pB^.flags;
