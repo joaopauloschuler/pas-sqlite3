@@ -38571,15 +38571,43 @@ generic_coro_done:
     aTabColMap[i] = (1-based) index into pColumn for table column i, or 0
     if column i is not named in the IDLIST (default value path).  IPK alias
     and generated-column arms are deferred until the IPK INSERT path lands. }
-  { No-IDLIST count mismatch — port of insert.c:1244..1254.  Skip the
-    NOINSERT-flag tally (no TF_HasGenerated / TF_HasHidden support yet);
-    nHidden is therefore 0 and the check reduces to nColumn vs nCol. }
-  if (pColumn = nil) and (nColumn > 0) and (nColumn <> i32(pTab^.nCol)) then
+  { No-IDLIST count mismatch — port of insert.c:1222..1254.
+
+    Two arms run before the count check:
+      (a) insert.c:1224..1235 — if the table has an INTEGER PRIMARY KEY *and*
+          generated columns precede it, ipkColumn drops one slot for each so
+          that the positional VALUES list (which skips generated cols) still
+          aligns the rowid term to the right index.
+      (b) insert.c:1241..1248 — tally NOINSERT (= GENERATED | HIDDEN) columns
+          into nHidden so the expected count nCol-nHidden ignores cols the
+          user can't supply.  Without this gencol1-2.1.150
+          (INSERT INTO t1 VALUES(a,b,c) on a 3-real + 3-generated table)
+          spuriously errored "table t1 has 6 columns but 3 values were
+          supplied". }
+  if (pColumn = nil) and (nColumn > 0) then
   begin
-    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
-      'table %S has %d columns but %d values were supplied',
-      [@SrcListItems(pTabList)[0], i32(pTab^.nCol), nColumn]));
-    goto insert_cleanup;
+    { Port of insert.c:1241..1254 — tally NOINSERT (= GENERATED | HIDDEN)
+      columns into nHidden so the expected count nCol-nHidden ignores cols
+      the user cannot supply.  Without this, gencol1-2.1.150 (3-real +
+      3-generated table) spuriously errored "table t1 has 6 columns but
+      3 values were supplied".  ipkColumn is left untouched; the row-
+      emission loop below recomputes nHidden in storage order and downstream
+      ipkColumnPresent logic relies on ipkColumn = -1 for the no-IDLIST
+      path. }
+    nHidden := 0;
+    if (pTab^.tabFlags and (TF_HasGenerated or TF_HasHidden)) <> 0 then
+    begin
+      for i := 0 to i32(pTab^.nCol) - 1 do
+        if (pTab^.aCol[i].colFlags and COLFLAG_NOINSERT) <> 0 then
+          Inc(nHidden);
+    end;
+    if nColumn <> (i32(pTab^.nCol) - nHidden) then
+    begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'table %S has %d columns but %d values were supplied',
+        [@SrcListItems(pTabList)[0], i32(pTab^.nCol) - nHidden, nColumn]));
+      goto insert_cleanup;
+    end;
   end;
   if pColumn <> nil then
   begin
