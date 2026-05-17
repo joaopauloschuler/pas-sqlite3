@@ -53376,57 +53376,107 @@ begin
     matches default-build behaviour exactly until then. }
 end;
 
-{ sqlite3CreateFunc — register a user-defined SQL function. }
+{ sqlite3CreateFunc — register a user-defined SQL function.  Faithful port
+  of main.c:1931..2057.  Honours SQLITE_ANY (registers three encodings),
+  the "delete non-existent function is a no-op" gate, and the active-VM
+  busy/expire arm. }
 function sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
   nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
   xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
   pDestructor: Pointer): i32;
 var
-  p: PTFuncDef;
-  encByte: u8;
-  pDest: PTFuncDestructor;
+  p:        PTFuncDef;
+  extraFlags: u32;
+  encMasked: i32;
+  rc:       i32;
+  pDest:    PTFuncDestructor;
+const
+  SQLITE_FUNC_UNSAFE_LOCAL = $00040000;  { SQLITE_FUNC_UNSAFE bit, see sqliteInt.h }
 begin
-  if (zFunctionName = nil) or (nArg < -1) or (nArg > SQLITE_MAX_FUNCTION_ARG) then begin
+  { main.c:1949..1957 — argument validation. }
+  if (zFunctionName = nil)
+     or ((xSFunc <> nil) and (xFinal <> nil))
+     or ((xFinal = nil) <> (xStep = nil))
+     or ((xValue = nil) <> (xInverse = nil))
+     or (nArg < -1) or (nArg > SQLITE_MAX_FUNCTION_ARG)
+     or (sqlite3Strlen30(zFunctionName) > 255) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  { Strip flags from enc; keep only encoding bits }
-  encByte := u8(enc and $03);
-  if encByte = 0 then encByte := SQLITE_UTF8;
-  p := sqlite3FindFunction(db, zFunctionName, nArg, encByte, 1);
-  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  { Clear old destructor if any }
-  if (p^.funcFlags and SQLITE_FUNC_EPHEM) = 0 then begin
-    pDest := PTFuncDestructor(p^.u);
-    if pDest <> nil then begin
-      Dec(pDest^.nRef);
-      if pDest^.nRef = 0 then begin
-        pDest^.xDestroy(pDest^.pUserData);
-        sqlite3DbFree(db, pDest);
-      end;
+
+  { main.c:1961..1964 — split extraFlags off encoding. }
+  extraFlags := u32(enc) and (SQLITE_DETERMINISTIC or SQLITE_DIRECTONLY or
+                              SQLITE_SUBTYPE or SQLITE_INNOCUOUS);
+  encMasked  := enc and (SQLITE_FUNC_ENCMASK or SQLITE_ANY);
+
+  { main.c:1969 — INNOCUOUS bit is inverted vs FUNC_UNSAFE. }
+  extraFlags := extraFlags xor SQLITE_FUNC_UNSAFE_LOCAL;
+
+  { main.c:1980..2007 — encoding normalisation; SQLITE_ANY expands into
+    three recursive registrations.  SQLITE_UTF16 maps to NATIVE. }
+  case encMasked of
+    SQLITE_UTF16: encMasked := SQLITE_UTF16NATIVE;
+    SQLITE_ANY: begin
+      rc := sqlite3CreateFunc(db, zFunctionName, nArg,
+              i32((u32(SQLITE_UTF8) or extraFlags) xor SQLITE_FUNC_UNSAFE_LOCAL),
+              pUserData, xSFunc, xStep, xFinal, xValue, xInverse, pDestructor);
+      if rc = SQLITE_OK then
+        rc := sqlite3CreateFunc(db, zFunctionName, nArg,
+                i32((u32(SQLITE_UTF16LE) or extraFlags) xor SQLITE_FUNC_UNSAFE_LOCAL),
+                pUserData, xSFunc, xStep, xFinal, xValue, xInverse, pDestructor);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      encMasked := SQLITE_UTF16BE;
     end;
-  end;
-  p^.funcFlags  := u32(enc and (SQLITE_DETERMINISTIC or
-                    SQLITE_DIRECTONLY or SQLITE_SUBTYPE or SQLITE_INNOCUOUS));
-  p^.funcFlags  := p^.funcFlags or encByte;
-  p^.pUserData  := pUserData;
-  { main.c:2050 — `p->xSFunc = xSFunc ? xSFunc : xStep;`.  The xStep
-    fallback is what makes aggregate-only registrations findable at
-    runtime: sqlite3FindFunction only returns a hit when xSFunc<>nil
-    (codegen.pas:42378). }
-  if xSFunc <> nil then
-    p^.xSFunc   := TxSFuncProc(xSFunc)
+    SQLITE_UTF8, SQLITE_UTF16LE, SQLITE_UTF16BE: ;
   else
-    p^.xSFunc   := TxSFuncProc(xStep);
-  p^.xFinalize  := TxFinalProc(xFinal);
-  p^.xValue     := TxValueProc(xValue);
-  p^.xInverse   := TxInverseProc(xInverse);
-  p^.nArg       := i16(nArg);
-  if pDestructor <> nil then begin
-    pDest := PTFuncDestructor(pDestructor);
-    Inc(pDest^.nRef);
-    p^.u := pDest;
-  end else
+    encMasked := SQLITE_UTF8;
+  end;
+
+  { main.c:2017..2031 — replace-or-delete gate. }
+  p := sqlite3FindFunction(db, zFunctionName, nArg, u8(encMasked), 0);
+  if (p <> nil)
+     and ((p^.funcFlags and SQLITE_FUNC_ENCMASK) = u32(encMasked))
+     and (p^.nArg = i16(nArg)) then begin
+    if db^.nVdbeActive <> 0 then begin
+      sqlite3ErrorWithMsg(db, SQLITE_BUSY,
+        'unable to delete/modify user-function due to active statements');
+      Result := SQLITE_BUSY; Exit;
+    end else begin
+      sqlite3ExpirePreparedStatements(db, 0);
+    end;
+  end else if (xSFunc = nil) and (xFinal = nil) then begin
+    { Trying to delete a function that does not exist.  main.c:2027..2030. }
+    Result := SQLITE_OK; Exit;
+  end;
+
+  p := sqlite3FindFunction(db, zFunctionName, nArg, u8(encMasked), 1);
+  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+  { main.c:2041 functionDestroy — fire prior destructor if its refcount
+    reaches zero.  Only applies when this slot was previously populated. }
+  pDest := PTFuncDestructor(p^.u);
+  if pDest <> nil then begin
+    Dec(pDest^.nRef);
+    if pDest^.nRef = 0 then begin
+      pDest^.xDestroy(pDest^.pUserData);
+      sqlite3DbFree(db, pDest);
+    end;
     p^.u := nil;
+  end;
+
+  if pDestructor <> nil then begin
+    Inc(PTFuncDestructor(pDestructor)^.nRef);
+  end;
+  p^.u := pDestructor;
+  p^.funcFlags := (p^.funcFlags and SQLITE_FUNC_ENCMASK) or extraFlags;
+  if xSFunc <> nil then
+    p^.xSFunc := TxSFuncProc(xSFunc)
+  else
+    p^.xSFunc := TxSFuncProc(xStep);
+  p^.xFinalize := TxFinalProc(xFinal);
+  p^.xValue    := TxValueProc(xValue);
+  p^.xInverse  := TxInverseProc(xInverse);
+  p^.pUserData := pUserData;
+  p^.nArg      := i16(nArg);
   Result := SQLITE_OK;
 end;
 
