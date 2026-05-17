@@ -44839,6 +44839,57 @@ begin
   if (pIndex^.aColExpr <> nil) and (pIndex^.aColExpr = pList) then
     pList := nil;
 
+  { Equivalent-constraint dedup — port of build.c:4315..4379.  Only fires
+    on the implicit-index path (CREATE TABLE … UNIQUE / PRIMARY KEY,
+    pTab==pParse->pNewTable).  If any prior auto-index on this table has
+    identical key columns AND collations, drop the new one rather than
+    publish a redundant index.  Required for index-16.{1..4} —
+    `CREATE TABLE t7(c UNIQUE PRIMARY KEY)` etc. should leave a single
+    sqlite_autoindex row, not two.  (divbug.87.025) }
+  if (pTab = pParse^.pNewTable) and (pIndex <> nil) then
+  begin
+    pLoop := pTab^.pIndex;
+    while pLoop <> nil do
+    begin
+      if u32(pLoop^.nKeyCol) = u32(pIndex^.nKeyCol) then
+      begin
+        jj := 0;
+        while jj < i32(pLoop^.nKeyCol) do
+        begin
+          if (pLoop^.aiColumn + jj)^ <> (pIndex^.aiColumn + jj)^ then Break;
+          if ((PPAnsiChar(pLoop^.azColl) + jj)^ <> nil)
+             and ((PPAnsiChar(pIndex^.azColl) + jj)^ <> nil)
+             and (sqlite3StrICmp((PPAnsiChar(pLoop^.azColl) + jj)^,
+                                  (PPAnsiChar(pIndex^.azColl) + jj)^) <> 0) then
+            Break;
+          Inc(jj);
+        end;
+        if jj = i32(pLoop^.nKeyCol) then
+        begin
+          if pLoop^.onError <> pIndex^.onError then
+          begin
+            if (pLoop^.onError <> OE_Default) and (pIndex^.onError <> OE_Default) then
+              sqlite3ErrorMsg(pParse,
+                PAnsiChar('conflicting ON CONFLICT clauses specified'));
+            if pLoop^.onError = OE_Default then
+              pLoop^.onError := pIndex^.onError;
+          end;
+          if idxType = SQLITE_IDXTYPE_PRIMARYKEY then
+            pLoop^.idxFlags := (pLoop^.idxFlags and not u32($03))
+                                or u32(SQLITE_IDXTYPE_PRIMARYKEY);
+          if InRenameObject(pParse) then
+          begin
+            pIndex^.pNext := pParse^.pNewIndex;
+            pParse^.pNewIndex := pIndex;
+            pIndex := nil;
+          end;
+          goto exit_create_index;
+        end;
+      end;
+      pLoop := pLoop^.pNext;
+    end;
+  end;
+
   { Codegen / hash-publish phase. }
   if not InRenameObject(pParse) then begin
     if db^.init.busy <> 0 then begin
