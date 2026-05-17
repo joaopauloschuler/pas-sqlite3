@@ -44497,12 +44497,14 @@ begin
       (e.g. CREATE INDEX i ON t(f4) where f4 is not in t) emits the
       "no such column: f4" diagnostic up-front, matching C's
       `if(pParse->nErr) goto exit_create_index;` (9.4.divbug.58).
-      Skip on init.busy — schema-reload reparse should not re-resolve. }
-    if db^.init.busy = 0 then begin
-      sqlite3StringToId(pColExpr);
-      sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil);
-      if pParse^.nErr <> 0 then goto exit_create_index;
-    end;
+      9.4.divbug.87.072 — must run UNCONDITIONALLY (no init.busy gate), as
+      C build.c:4217..4219 does: when reloading the schema from sqlite_master
+      the resolved aColExpr is required by upsert target matching
+      (sqlite3UpsertAnalyzeTarget at upsert.c:181 expects TK_COLUMN nodes,
+      not raw TK_ID/TK_STRING tokens). }
+    sqlite3StringToId(pColExpr);
+    sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil);
+    if pParse^.nErr <> 0 then goto exit_create_index;
     { 10.1.bug.108: peel any TK_COLLATE wrapper to expose the underlying
       column expression, and capture the wrapper's zToken as the index
       column's collation name.  Mirrors build.c:4253..4276 (TK_COLLATE
