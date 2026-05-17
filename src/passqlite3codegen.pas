@@ -51849,6 +51849,7 @@ var
   iDbIc:      i32;
   nIdxIc:     i32;
   aRootIc:    PPgno;
+  pObjTabIc:  PTable2;
   pTblsIc:    passqlite3util.PHash;
   xIc:        passqlite3util.PHashElem;
   pTabIc:     PTable2;
@@ -52834,15 +52835,28 @@ begin
       table-name branch — tracked as a follow-up).  Default 100 from
       SQLITE_INTEGRITY_CHECK_ERROR_MAX. }
     mxErrIc := 100;
+    pObjTabIc := nil;
     if (pValue <> nil) and (Length(zRight) > 0) then
     begin
       if sqlite3GetInt32(PAnsiChar(zRight), @mxErrIc) <> 0 then
       begin
         if mxErrIc <= 0 then mxErrIc := 100;
+      end
+      else
+      begin
+        { pragma.c:1725..1728 — non-integer argument is a table name:
+          restrict the integrity_check to that single table.  Without
+          this, divbug.71.b: `PRAGMA quick_check('t1')` walked every
+          table; on writable_schema-remapped rootpages btree reported
+          "2nd reference to page" / "never used" diagnostics that
+          should have been suppressed.  Use iDb hint when explicit. }
+        if iDb >= 0 then
+          pObjTabIc := sqlite3LocateTable(pParse, 0,
+            PAnsiChar(zRight), db^.aDb[iDb].zDbSName)
+        else
+          pObjTabIc := sqlite3LocateTable(pParse, 0,
+            PAnsiChar(zRight), nil);
       end;
-      { else branch — pObjTab via sqlite3LocateTable — not yet ported.
-        Without a real pObjTab the walk simply covers every table, which
-        is a superset; on clean DBs this still emits "ok". }
     end;
 
     { pragma.c:1729 — reg[1] holds errors-left counter (mxErr-1 because
@@ -52872,7 +52886,8 @@ begin
         pTabIc := PTable2(xIc^.data);
         { tableSkipIntegrityCheck (pragma.c:402): with pObjTab=NULL the
           only skip predicate is TF_Imposter. }
-        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0) then
+        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0)
+           and ((pObjTabIc = nil) or (pTabIc = pObjTabIc)) then
         begin
           if HasRowid(pTabIc) then Inc(cntIc);
           pIdxIc := pTabIc^.pIndex;
@@ -52893,16 +52908,33 @@ begin
         10727), unlike C VDBE which passes &aRoot[1].  So we lay out
         the array as plain [root0..rootN-1] with no leading count
         sentinel — btree.pas then sees aRoot[0]=firstRoot (non-zero,
-        bPartial=0) which matches a full check.  Lifetime is owned by
-        the VDBE via P4_INTARRAY. }
-      aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc)));
+        bPartial=0) which matches a full check.
+
+        divbug.71.b: when pObjTab restricts the walk to one table, we
+        must signal a "partial" check so btree.pas does not flag the
+        unlisted rootpages as "never used".  C does this by prepending
+        an aRoot[0]==0 sentinel (pragma.c:1763, btree.c:11148..11151);
+        we do the same here — alloc cnt+1 cells, write 0 at index 0,
+        fill roots from index 1, and pass nRoot=cnt+1 to OP_IntegrityCk.
+        Lifetime is owned by the VDBE via P4_INTARRAY. }
+      if pObjTabIc <> nil then
+        aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc + 1)))
+      else
+        aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc)));
       if aRootIc = nil then Break;
-      cntIc := 0;
+      if pObjTabIc <> nil then
+      begin
+        aRootIc[0] := 0;
+        cntIc := 1;     { fill subsequent roots starting at index 1 }
+      end
+      else
+        cntIc := 0;
       xIc := pTblsIc^.first;
       while xIc <> nil do
       begin
         pTabIc := PTable2(xIc^.data);
-        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0) then
+        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0)
+           and ((pObjTabIc = nil) or (pTabIc = pObjTabIc)) then
         begin
           if HasRowid(pTabIc) then
           begin
@@ -52975,7 +53007,8 @@ begin
       while xIc <> nil do
       begin
         pTabIc := PTable2(xIc^.data);
-        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0) then
+        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0)
+           or ((pObjTabIc <> nil) and (pTabIc <> pObjTabIc)) then
         begin xIc := xIc^.next; Continue; end;
         if HasRowid(pTabIc) then
         begin
@@ -53014,7 +53047,8 @@ begin
       while xIc <> nil do
       begin
         pTabIc := PTable2(xIc^.data);
-        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0) then
+        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0)
+           or ((pObjTabIc <> nil) and (pTabIc <> pObjTabIc)) then
         begin xIc := xIc^.next; Continue; end;
         if pTabIc^.eTabType <> TABTYP_NORM then
         begin xIc := xIc^.next; Continue; end;
@@ -53365,6 +53399,8 @@ begin
         { tableSkipIntegrityCheck (pragma.c:402) with pObjTab=NULL —
           TF_Imposter ($00020000) is the only skip predicate here. }
         if (pTabIc^.tabFlags and u32($00020000)) <> 0 then
+        begin xIc := xIc^.next; Continue; end;
+        if (pObjTabIc <> nil) and (pTabIc <> pObjTabIc) then
         begin xIc := xIc^.next; Continue; end;
         if pTabIc^.eTabType = TABTYP_NORM then
         begin xIc := xIc^.next; Continue; end;          { IsOrdinaryTable }
