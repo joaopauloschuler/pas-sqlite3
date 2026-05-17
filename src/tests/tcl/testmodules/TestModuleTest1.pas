@@ -3821,6 +3821,51 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.024 — test1.c:6873..6903 file_control_data_version
+  DB ?DBNAME?.  Thin Tcl wrapper over
+  sqlite3_file_control(db, zDb, SQLITE_FCNTL_DATA_VERSION, &iVers).
+  objc==2 (no DBNAME) → zDb=NULL.  On rc<>0 sets result to sqlite3ErrName
+  and returns TCL_ERROR; otherwise returns "%u" of iVers. }
+function file_control_data_version(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  iVers: cuint;
+  zDb:   PAnsiChar;
+  rc:    cint;
+  sBuf:  AnsiString;
+begin
+  db := nil;
+  iVers := 0;
+  if (objc <> 3) and (objc <> 2) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB [DBNAME]'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if objc = 3 then
+    zDb := Tcl_GetString(objv[2])
+  else
+    zDb := nil;
+  rc := sqlite3_file_control(db, zDb, SQLITE_FCNTL_DATA_VERSION, @iVers);
+  if rc <> 0 then
+  begin
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  { C: sqlite3_snprintf("%u",iVers); decimal of unsigned int. }
+  Str(iVers, sBuf);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(PAnsiChar(sBuf), -1));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.87.005 — test1.c:1740..1791 test_table_column_metadata.
   Usage: sqlite3_table_column_metadata DB dbname tblname ?colname?
   Returns a 5-element list: datatype collseq notnull primarykey autoinc.
@@ -4831,6 +4876,9 @@ begin
   { 9.4.divbug.88.006 — file_control_chunksize_test (test1.c:9247 / 6912..6941). }
   Tcl_CreateObjCommand(interp, PChar('file_control_chunksize_test'),
     @file_control_chunksize_test, nil, nil);
+  { 9.4.divbug.88.024 — file_control_data_version (test1.c:9249 / 6873..6903). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_data_version'),
+    @file_control_data_version, nil, nil);
   { 9.4.divbug.62.e — sqlite3_create_function_v2 / _create_window_function /
     _load_extension / _simulate_device / _user_version
     (test1.c:9262 + 9183 + test_window.c:337). }
