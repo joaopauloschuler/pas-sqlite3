@@ -52648,6 +52648,30 @@ begin
     Exit;
   end;
 
+  { PragTyp_WAL_CHECKPOINT (pragma.c:2393..2411).  9.4.divbug.88.064.
+    Without this arm the pragma compiled to a no-op so OP_Checkpoint
+    was never emitted; resolveP2Values then left Vdbe.readOnly = 1 and
+    sqlite3_stmt_readonly("PRAGMA wal_checkpoint") returned 1 instead
+    of 0 (capi3d-2.7 / capi3d-2.7.explain / capi3d-2.7.eqp). }
+  if SameText(zName, 'wal_checkpoint') then begin
+    if (pId2 <> nil) and (pId2^.z <> nil) and (pId2^.n > 0) then
+      iVal := iDb
+    else
+      iVal := SQLITE_MAX_ATTACHED + 2; { SQLITE_MAX_DB_INTERNAL — inlined to avoid main uses cycle. }
+    eModeJm := 0; { SQLITE_CHECKPOINT_PASSIVE }
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if      sqlite3StrICmp(PAnsiChar(zRight), 'full')     = 0 then eModeJm := 1  { _FULL }
+      else if sqlite3StrICmp(PAnsiChar(zRight), 'restart')  = 0 then eModeJm := 2  { _RESTART }
+      else if sqlite3StrICmp(PAnsiChar(zRight), 'truncate') = 0 then eModeJm := 3  { _TRUNCATE }
+      else if sqlite3StrICmp(PAnsiChar(zRight), 'noop')     = 0 then eModeJm := -1; { _NOOP }
+    end;
+    pParse^.nMem := 3;
+    sqlite3VdbeAddOp3(v, OP_Checkpoint, iVal, eModeJm, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 3);
+    Exit;
+  end;
+
   { PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429).  Write arm calls
     sqlite3_wal_autocheckpoint(db, atoi(zRight)) at compile time, which
     installs sqlite3WalDefaultHook (positive N) or clears the hook (N<=0).
