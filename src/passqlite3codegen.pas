@@ -29413,6 +29413,25 @@ begin
     end;
     Result := SQLITE_OK; Exit;
   end;
+  { 9.4.divbug.87.020 — DISTINCT over a no-FROM SELECT yields exactly one
+    row, so DISTINCT is a trivial no-op.  Strip SF_Distinct before the
+    fast-path gate below so `SELECT DISTINCT <expr-list>;` reaches the
+    same OP_Explain / OP_Copy / OP_ResultRow body as the non-DISTINCT
+    flavour.  Without this strip the gate excludes SF_Distinct → the
+    statement falls through every later codegen arm (no GROUP BY, no
+    aggregate, no source) and sqlite3Select returns SQLITE_OK without
+    coding any expression — oversized hex literals never surface their
+    "hex literal too big" error (hexlit-401 / hexlist-402).  Mirrors
+    C select.c:8253..8263 where SF_Distinct flows through the WhereBegin
+    no-FROM body and still drives sqlite3ExprCode → codeInteger →
+    sqlite3ErrorMsg. }
+  if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
+     and ((p^.selFlags and SF_Distinct) <> 0)
+     and ((p^.selFlags and (SF_Aggregate or SF_Compound)) = 0)
+     and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pWin = nil)
+  then
+    p^.selFlags := p^.selFlags and not u32(SF_Distinct);
   { No-FROM fast path — `SELECT <expr-list>;` with no source table.
     Emit OP_Explain + per-result-col sqlite3ExprCode + OP_ResultRow.
     Mirrors the tail of selectInnerLoop for SRT_Output when WhereBegin
