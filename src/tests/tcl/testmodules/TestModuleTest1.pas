@@ -2303,6 +2303,46 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_initialize.
+  test_multiplex.c:1227..1256 (registered :1357,1364).
+  STUB: full multiplex VFS port (test_multiplex.c, ~1400 lines, chunk-file
+  shim VFS) is out of scope; register the Tcl command and return SQLITE_OK
+  so delete_db.test / multiplex4.test prologues advance.  Subtests that
+  exercise actual chunking will FAIL deeper (tracked as 88.069). }
+function tcl_test_multiplex_initialize(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NAME MAKEDEFAULT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_shutdown.
+  test_multiplex.c:1258..1284 (registered :1358,1364).  STUB. }
+function tcl_test_multiplex_shutdown(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if (objc <> 1) and (objc <> 2) then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?-force?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
+{ 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_control.
+  test_multiplex.c:1286..1354 (registered :1359,1364).  STUB. }
+function tcl_test_multiplex_control(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
 { 9.4.divbug.88.034 — sqlite3_enable_shared_cache (test1.c:1665..1699).
   Usage: sqlite3_enable_shared_cache ?BOOLEAN?
   Returns the *previous* value of sqlite3GlobalConfig.sharedCacheEnabled.
@@ -5539,6 +5579,14 @@ begin
     @tcl_test_register_cksumvfs, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_unregister_cksumvfs'),
     @tcl_test_unregister_cksumvfs, nil, nil);
+  { 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_* STUBS
+    (test_multiplex.c:1357..1364).  Full multiplex shim VFS port deferred. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_multiplex_initialize'),
+    @tcl_test_multiplex_initialize, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_multiplex_shutdown'),
+    @tcl_test_multiplex_shutdown, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_multiplex_control'),
+    @tcl_test_multiplex_control, nil, nil);
   { 9.4.divbug.88.034 — sqlite3_enable_shared_cache (test1.c:9275). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_enable_shared_cache'),
     @tcl_test_enable_shared, nil, nil);
