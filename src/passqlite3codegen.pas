@@ -5516,7 +5516,6 @@ begin
         only), so nExpr-1=2 → one iteration, then the else clause.
         iif(cond,a) with 2 args falls through to OP_Function (not registered
         inline). }
-      Assert(n = 3);
       items := ExprListItems(pFarg);
       i := sqlite3VdbeMakeLabel(pParse);   { endLabel }
       r1 := 0;                              { loop counter — pairs of WHEN/THEN }
@@ -56699,7 +56698,7 @@ begin
   aBuiltinFuncs[23].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
   MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC or SQLITE_FUNC_INLINE,  @ifnullFunc,     nil, 'ifnull');
   aBuiltinFuncs[24].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
-  MakeFD(aBuiltinFuncs[25], 3, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'iif');
+  MakeFD(aBuiltinFuncs[25],-4, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'iif');
   aBuiltinFuncs[25].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
   MakeFD(aBuiltinFuncs[26], 1, FUNC_ENC,  @quoteFunc,      nil, 'quote');
   MakeFD(aBuiltinFuncs[27], 1, FUNC_ENC,  @unicodeFunc,    nil, 'unicode');
@@ -56865,7 +56864,7 @@ begin
     `iif(c,a,b)` via INLINE_FUNC (func.c:3430).  Same inlined codegen
     branch (INLINEFUNC_iif); only the name differs.  Resolves
     "no such function: if" (qrf01-13.x). }
-  MakeFD(aBuiltinFuncs[83], 3, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'if');
+  MakeFD(aBuiltinFuncs[83],-4, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'if');
   aBuiltinFuncs[83].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
 end;
 
