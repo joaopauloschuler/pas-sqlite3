@@ -2964,7 +2964,11 @@ begin
        end;
     37: { ccons ::= DEFAULT scantok ID|INDEXED }
        begin
-         pTmp := sqlite3ExprAlloc(pPse^.db, TK_STRING, @yymsp[0].minor.yy0, 0);
+         { parse.y:400..407 — tokenExpr always dequotes; without dequote=1
+           the stored DEFAULT zToken keeps the surrounding "..." which
+           leaks into EXPLAIN P4_MEM rendering and into bound values
+           (misc3-6.11-utf8, divbug.87.053). }
+         pTmp := sqlite3ExprAlloc(pPse^.db, TK_STRING, @yymsp[0].minor.yy0, 1);
          if pTmp <> nil then
            sqlite3ExprIdToTrueFalse(pTmp);
          sqlite3AddDefaultValue(pPse, pTmp, yymsp[0].minor.yy0.z,
