@@ -9553,6 +9553,48 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc);
   end;
 
+  { 9.4.divbug.87.019 — recursive deep walk of FROM-subquery interiors.
+    For each level of nested FROM-subquery, run ResolveOuterRefs /
+    ResolveOuterIDs against the OUTERmost pSrc so deeply-nested TK_DOT
+    and bare TK_ID outer refs (e.g. having-5.2's `Col0` two levels deep)
+    get pre-resolved before the inner per-Select resolver runs.  Mirrors
+    resolve.c's NameContext-chain walk (lookupName resolve.c:341..706)
+    which climbs pNC->pNext to arbitrary depth. }
+  procedure WalkDeepFromSubqueries(pSel: PSelect; pOuterSrc: PSrcList);
+  var
+    base_d: PSrcItem;
+    pIt_d:  PSrcItem;
+    j_d:    i32;
+    pDeep_: PSelect;
+  begin
+    if (pSel = nil) or (pSel^.pSrc = nil) or (pOuterSrc = nil) then Exit;
+    base_d := SrcListItems(pSel^.pSrc);
+    for j_d := 0 to pSel^.pSrc^.nSrc - 1 do
+    begin
+      pIt_d := PSrcItem(PByte(base_d) + j_d * SizeOf(TSrcItem));
+      if (pIt_d^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
+      if pIt_d^.u4.pSubq = nil then Continue;
+      pDeep_ := pIt_d^.u4.pSubq^.pSelect;
+      while pDeep_ <> nil do
+      begin
+        ResolveOuterRefsInList(pDeep_^.pEList,   pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefs(pDeep_^.pWhere,         pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefs(pDeep_^.pHaving,        pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefsInList(pDeep_^.pGroupBy, pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefsInList(pDeep_^.pOrderBy, pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDsInList(pDeep_^.pEList,    pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDs(pDeep_^.pWhere,          pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDs(pDeep_^.pHaving,         pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDsInList(pDeep_^.pGroupBy,  pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDsInList(pDeep_^.pOrderBy,  pOuterSrc, pDeep_^.pSrc);
+        { Recurse: this deep SELECT may itself have FROM-subqueries whose
+          interiors still reference the outermost pSrc. }
+        WalkDeepFromSubqueries(pDeep_, pOuterSrc);
+        pDeep_ := pDeep_^.pPrior;
+      end;
+    end;
+  end;
+
   { 9.4.divbug.17 — nested-aggregate outward binding.  Mirrors the
     resolve.c:1337..1352 `pNC2` loop: an aggregate function call that
     appears textually inside a subquery but whose arguments only
@@ -10151,6 +10193,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           sqlite3Select) returns immediately without re-processing. }
         pInner := pE^.x.pSelect;
         bCorr  := False;
+        { 9.4.divbug.87.019 — pre-resolve outer refs inside deeply nested
+          FROM-subqueries BEFORE expanding pInner.  sqlite3SelectExpand
+          recursively calls sqlite3SelectPrep on every FROM-subquery's
+          pSelect (codegen.pas:26617) which runs the per-Select resolver
+          on its WHERE/HAVING/etc — if a bare TK_ID there names an OUTER
+          column (e.g. having-5.2's `Col0` inside
+          `(SELECT * FROM (SELECT 1) WHERE Col0=1)` nested inside the
+          EXISTS subquery), that resolver raises "no such column" before
+          our post-expand WalkDeep ever runs.  Pre-binding those TK_IDs
+          to TK_COLUMN against the outermost pSrc closes the gap.  Safe
+          even though pDeep^.pSrc items haven't been expanded yet:
+          ColumnInSrcList loops items and Continues on pSTab=nil so the
+          inner-scope test still returns false for columns the inner FROM
+          really doesn't have. }
+        if (p^.pSrc <> nil)
+           and ((pInner^.selFlags and SF_HasTypeInfo) = 0) then
+        begin
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            WalkDeepFromSubqueries(pCompArm, p^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
+        end;
         { Step 1: expand inner pSrc (assign cursors to inner FROM tables). }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
           sqlite3SelectExpand(pParse, pInner);
@@ -10235,37 +10301,21 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           item's interior expressions and apply ResolveOuterRefs /
           ResolveOuterIDs against the OUTER pSrc.  Mirrors resolve.c's
           NameContext-chain walk in lookupName (resolve.c:341..706) which
-          climbs pNC->pNext until it finds a binding. }
+          climbs pNC->pNext until it finds a binding.
+
+          9.4.divbug.87.019 — recurse through every level of FROM-subquery
+          nesting (having-5.2 needs the third level: outer pSrc has Col0,
+          EXISTS subquery wraps a FROM-subquery whose own FROM-subquery's
+          WHERE references Col0).  Without the recursion the bare TK_ID
+          Col0 inside the doubly-nested WHERE never reaches ResolveOuterIDs
+          against the outermost pSrc and the inner resolver later raises
+          "no such column: Col0". }
         if p^.pSrc <> nil then
         begin
           pCompArm := pInner;
           while pCompArm <> nil do
           begin
-            if pCompArm^.pSrc <> nil then
-            begin
-              base := SrcListItems(pCompArm^.pSrc);
-              for i := 0 to pCompArm^.pSrc^.nSrc - 1 do
-              begin
-                pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
-                if (pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
-                if pItem^.u4.pSubq = nil then Continue;
-                pDeep := pItem^.u4.pSubq^.pSelect;
-                while pDeep <> nil do
-                begin
-                  ResolveOuterRefsInList(pDeep^.pEList,   p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterRefs(pDeep^.pWhere,         p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterRefs(pDeep^.pHaving,        p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterRefsInList(pDeep^.pGroupBy, p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterRefsInList(pDeep^.pOrderBy, p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterIDsInList(pDeep^.pEList,    p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterIDs(pDeep^.pWhere,          p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterIDs(pDeep^.pHaving,         p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterIDsInList(pDeep^.pGroupBy,  p^.pSrc, pDeep^.pSrc);
-                  ResolveOuterIDsInList(pDeep^.pOrderBy,  p^.pSrc, pDeep^.pSrc);
-                  pDeep := pDeep^.pPrior;
-                end;
-              end;
-            end;
+            WalkDeepFromSubqueries(pCompArm, p^.pSrc);
             pCompArm := pCompArm^.pPrior;
           end;
         end;
