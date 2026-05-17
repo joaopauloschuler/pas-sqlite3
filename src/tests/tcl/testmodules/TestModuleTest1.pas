@@ -2287,6 +2287,37 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.034 — sqlite3_enable_shared_cache (test1.c:1665..1699).
+  Usage: sqlite3_enable_shared_cache ?BOOLEAN?
+  Returns the *previous* value of sqlite3GlobalConfig.sharedCacheEnabled.
+  With an argument, also calls sqlite3_enable_shared_cache(enable). }
+function tcl_test_enable_shared(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: cint;
+  enable: cint;
+  ret: cint;
+begin
+  enable := 0;
+  if (objc <> 2) and (objc <> 1) then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?BOOLEAN?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  ret := sqlite3GlobalConfig.sharedCacheEnabled;
+  if objc = 2 then begin
+    if Tcl_GetBooleanFromObj(interp, objv[1], @enable) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+    rc := sqlite3_enable_shared_cache(enable);
+    if rc <> SQLITE_OK then begin
+      Tcl_SetResult(interp, PChar(sqlite3ErrStr(rc)), TCL_STATIC);
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(ret));
+  Result := TCL_OK;
+end;
+
 { 9.4.divbug.88.023 — decode_hexdb TEXT (test1.c:8837..8910).
   Parses dbtotxt(1) output back into a raw SQLite database byte-array so
   Tcl scripts can run `db deserialize [decode_hexdb $hex]`.  Three line
@@ -5368,6 +5399,9 @@ begin
     @tcl_test_register_cksumvfs, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_unregister_cksumvfs'),
     @tcl_test_unregister_cksumvfs, nil, nil);
+  { 9.4.divbug.88.034 — sqlite3_enable_shared_cache (test1.c:9275). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_enable_shared_cache'),
+    @tcl_test_enable_shared, nil, nil);
   { 9.4.divbug.88.023 — decode_hexdb TEXT (test1.c:8837..8910). }
   Tcl_CreateObjCommand(interp, PChar('decode_hexdb'),
     @tcl_test_decode_hexdb, nil, nil);
