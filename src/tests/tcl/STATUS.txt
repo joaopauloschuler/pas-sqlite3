@@ -247,7 +247,7 @@ pas-soft	../sqlite3/test/delete_db.test	9.4.4.g-unbucketed
 pas-soft	../sqlite3/test/descidx1.test	9.4.4.g-unbucketed
 pas-soft	../sqlite3/test/descidx2.test	9.4.4.g-unbucketed
 pas-strict	../sqlite3/test/descidx3.test	-
-pas-soft	../sqlite3/test/diskfull.test	9.4.4.g-unbucketed
+pas-strict	../sqlite3/test/diskfull.test	-
 pas-strict	../sqlite3/test/distinct.test	-
 pas-soft	../sqlite3/test/distinct2.test	9.4.divbug.39-residual
 pas-strict	../sqlite3/test/distinctagg.test	-
