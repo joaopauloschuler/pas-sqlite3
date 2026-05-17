@@ -1138,7 +1138,7 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.003** `cacheflush` — ported `sqlite3_db_cacheflush` Tcl trampoline (test1.c:6383..6411, register at 9173) to `TestModuleTest1.pas`.  Engine entry already present (passqlite3main.pas:4391, main.c:921).  cacheflush.test now executes — 35/42 PASS; 7 residual failures in cacheflush-2.1.5/2.2.x are a deeper engine bug (rollback-after-flush page-cache loses uncommitted data), not blocking 88.003.
   - [ ] **9.4.divbug.88.004** `capi3d` — SOURCE-ERROR: invalid command name "sqlite3_prepare16"
   - [X] **9.4.divbug.88.005** `capi3e` — ported sqlite3_open / _v2 / _16 Tcl trampolines (TestModuleTest1.pas test_open / test_open_v2 / test_open16; C ref test1.c:5395..5517, registered :9140..9142). Cited "invalid command name sqlite3_open" cleared; capi3e advances past prologue and surfaces deeper missing trampolines (sqlite3_close, etc.) — tracked separately.
-  - [ ] **9.4.divbug.88.006** `chunksize` — SOURCE-ERROR: invalid command name "file_control_chunksize_test"
+  - [X] **9.4.divbug.88.006** `chunksize` — ported file_control_chunksize_test Tcl trampoline (TestModuleTest1.pas; C ref test1.c:6912..6941, registered :9247).  Wraps sqlite3_file_control(db, zDb, SQLITE_FCNTL_CHUNK_SIZE, &nSize); empty zDb→NULL; rc<>0→sqlite3ErrName + TCL_ERROR.  chunksize.test now PASS (6/51).  fallocate.test (.036) still FAILs on deeper assertions, no longer on missing cmd.
   - [ ] **9.4.divbug.88.007** `cksumvfs` — SOURCE-ERROR: invalid command name "sqlite3_register_cksumvfs"
   - [X] **9.4.divbug.88.008** `close` — cured by .005's sqlite3_open trampoline port (TestModuleTest1.pas test_open; C ref test1.c:5395..5417, registered :9140). Cited "invalid command name sqlite3_open" cleared; close-1.0 PASS, close-1.1+ now block on sqlite3_close_v2 / sqlite3_blob_open trampolines — tracked separately.
   - [X] **9.4.divbug.88.009** `collate7` — sqlite3_create_collation_v2 Tcl trampoline ported (TestModuleTest1.pas tcl_test_create_collation_v2 + testCreateCollation{Cmp,Del}; C ref test1.c:1858..1935, registered :9237). collate7-1.1 now PASS; 1.2+ block on separate `sqlite_delete_collation` cmd (test1.c:6056) — tracked separately.
@@ -1168,7 +1168,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.033** `e_walauto` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [ ] **9.4.divbug.88.034** `enc3` — SOURCE-ERROR: invalid command name "sqlite3_enable_shared_cache"
   - [ ] **9.4.divbug.88.035** `errmsg` — SOURCE-ERROR: invalid command name "verify_ex_errcode"
-  - [ ] **9.4.divbug.88.036** `fallocate` — SOURCE-ERROR: invalid command name "file_control_chunksize_test"
+  - [ ] **9.4.divbug.88.036** `fallocate` — chunksize_test cmd now resolves (.006); fallocate.test still FAIL on deeper assertions — needs re-triage.
   - [ ] **9.4.divbug.88.037** `filectrl` — ! filectrl-1.1 error: invalid command name "file_control_test"
   - [ ] **9.4.divbug.88.038** `filefmt` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [ ] **9.4.divbug.88.039** `hook` — SOURCE-ERROR: invalid command name "verify_ex_errcode"

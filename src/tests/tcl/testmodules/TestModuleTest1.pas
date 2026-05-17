@@ -3645,6 +3645,50 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.006 — test1.c:6912..6941 file_control_chunksize_test
+  DB DBNAME SIZE.  Thin Tcl wrapper over
+  sqlite3_file_control(db, zDb, SQLITE_FCNTL_CHUNK_SIZE, &nSize).
+  Empty zDb → NULL.  On rc<>0 sets result to sqlite3ErrName and returns
+  TCL_ERROR (matches C). }
+function file_control_chunksize_test(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  nSize: cint;
+  zDb:   PAnsiChar;
+  rc:    cint;
+begin
+  db := nil;
+  nSize := 0;
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB DBNAME SIZE'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[3], @nSize) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zDb := Tcl_GetString(objv[2]);
+  if (zDb <> nil) and (zDb^ = #0) then zDb := nil;
+  rc := sqlite3_file_control(db, zDb, SQLITE_FCNTL_CHUNK_SIZE, @nSize);
+  if rc <> 0 then
+  begin
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.87.005 — test1.c:1740..1791 test_table_column_metadata.
   Usage: sqlite3_table_column_metadata DB dbname tblname ?colname?
   Returns a 5-element list: datatype collseq notnull primarykey autoinc.
@@ -4646,6 +4690,9 @@ begin
   { 9.4.divbug.63.b — file_control_reservebytes (test1.c:9258 / 7249..7276). }
   Tcl_CreateObjCommand(interp, PChar('file_control_reservebytes'),
     @file_control_reservebytes, nil, nil);
+  { 9.4.divbug.88.006 — file_control_chunksize_test (test1.c:9247 / 6912..6941). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_chunksize_test'),
+    @file_control_chunksize_test, nil, nil);
   { 9.4.divbug.62.e — sqlite3_create_function_v2 / _create_window_function /
     _load_extension / _simulate_device / _user_version
     (test1.c:9262 + 9183 + test_window.c:337). }
