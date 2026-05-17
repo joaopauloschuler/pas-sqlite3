@@ -23027,10 +23027,22 @@ begin
         viaCoroutine levels skip this block (mirrors C's `continue`
         after translateColumnToCopy). }
       pIdxR := nil;
-      if (not viaCoroLevel)
+      { where.c:7745..7748 — when the level drives a RIGHT JOIN, C calls
+        sqlite3WhereRightJoinLoop with `continue`, which BOTH skips the
+        index-rewrite block below AND defers RHS-table OP_Column emission
+        intact (so the addrSubrtn body reads from the table cursor that
+        the inner sub-WhereBegin will reposition during the unmatched-rows
+        pass — see wherecode.c:2880..2902).  If we rewrite OP_Column to use
+        the outer iIdxCur here, the unmatched pass would later OP_NullRow
+        that cursor (wherecode.c:2902), and every result column served by
+        the index would come back NULL (divbug 9.4.divbug.87.041: join7-1.20
+        — `c` read NULL instead of 5 for the right-unmatched t2 row).
+        The Pas port invokes sqlite3WhereRightJoinLoop in a separate pass
+        below (line ~23103+); here we simply gate the rewrite off. }
+      if (not viaCoroLevel) and (pLevel^.pRJ = nil)
          and ((pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0) then
         pIdxR := pLoop^.u.btree.pIndex
-      else if (not viaCoroLevel)
+      else if (not viaCoroLevel) and (pLevel^.pRJ = nil)
               and ((pLoop^.wsFlags and WHERE_MULTI_OR) <> 0) then
         pIdxR := pLevel^.u.pCoveringIdx;
       if (pIdxR <> nil) and (db^.mallocFailed = 0) then
