@@ -9300,6 +9300,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     part matches pOuterSrc but NOT pInnerSrc.  Modifies the expr tree in
     place (converts matching TK_DOT to TK_COLUMN with the outer cursor).
     Used after detecting correlated references to fully bind them. }
+  procedure ResolveOuterRefsInList(pList: PExprList; pOuterSrc: PSrcList;
+                                   pInnerSrc: PSrcList); forward;
+
   procedure ResolveOuterRefs(pW: PExpr; pOuterSrc: PSrcList;
                               pInnerSrc: PSrcList);
   var
@@ -9383,6 +9386,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           for j := 0 to pW^.x.pList^.nExpr - 1 do
             ResolveOuterRefs(ExprListItems(pW^.x.pList)[j].pExpr,
                               pOuterSrc, pInnerSrc);
+        end;
+      end
+      else
+      begin
+        { 9.4.divbug.87.016 — recurse into x.pSelect so doubly-nested
+          correlated TK_DOT refs (e.g. innermost `t3.x=t1.id` inside an
+          outer subquery whose own pSrc is t2) get pre-resolved against
+          the outermost pOuterSrc.  The deeper SELECT's own pSrc takes
+          over as the "inner" filter so its own table aliases don't
+          get rewritten as outer.  Mirrors C's sqlite3WalkExpr →
+          sqlite3WalkSelect descent + lookupName pNC->pNext climb
+          (resolve.c:341..706, 1378..1390). }
+        if pW^.x.pSelect <> nil then
+        begin
+          ResolveOuterRefsInList(pW^.x.pSelect^.pEList,
+                                  pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefs(pW^.x.pSelect^.pWhere,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefs(pW^.x.pSelect^.pHaving,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefsInList(pW^.x.pSelect^.pGroupBy,
+                                  pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefsInList(pW^.x.pSelect^.pOrderBy,
+                                  pOuterSrc, pW^.x.pSelect^.pSrc);
         end;
       end;
     end;
@@ -26036,9 +26063,24 @@ begin
 
     if not isStar then
     begin
-      { Carry the original entry intact — transfer ownership to pNew. }
+      { Carry the original entry intact — transfer ownership to pNew.
+        select.c:6131..6136 — also propagate zEName + fg.eEName so that
+        result-column aliases survive `*` co-existence; otherwise
+        `SELECT *, 1 AS q FROM t` loses the AS-name and the synthesised
+        view column becomes `column2` (9.4.divbug.87.016). }
       pNew := sqlite3ExprListAppend(pParse, pNew, pE);
       items[k].pExpr := nil;
+      if pNew <> nil then
+      begin
+        with PExprListItem(PByte(ExprListItems(pNew)) +
+             (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM)^ do
+        begin
+          zEName := items[k].zEName;
+          fg.eBits := (fg.eBits and not u8($03)) or
+                      (items[k].fg.eBits and u8($03));
+        end;
+        items[k].zEName := nil;
+      end;
       Continue;
     end;
 
