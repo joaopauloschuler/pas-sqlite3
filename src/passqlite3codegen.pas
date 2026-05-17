@@ -8680,17 +8680,44 @@ end;
   instead of raising "no such column: hello" the way the C reference
   does (and the way SELECT hello FROM t already does via the heavier
   sqlite3ResolveSelectNames walker). }
-procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr);
+procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr; ncIsDDL: Boolean);
 var
   i:      i32;
   pList_: PExprList;
   pFnDef: PTFuncDef;
+  dqsOK:  Boolean;
+  dbFlags: u64;
 begin
   if pE = nil then Exit;
   if pParse = nil then Exit;
   if pParse^.nErr > 0 then Exit;
   if pE^.op = TK_ID then
   begin
+    { 9.4.divbug.70 — port resolve.c:719..746 areDoubleQuotedStringsEnabled.
+      Before erroring on an unresolved bare TK_ID, if it carries EP_DblQuoted
+      and DQS is enabled for the current context (DDL vs DML), demote to
+      TK_STRING so it lexes as a legacy string literal.  DDL context (CHECK
+      constraints, CREATE INDEX expressions) accepts DqsDDL, or
+      (writable_schema && DqsDML).  DML context accepts DqsDML. }
+    if (pE^.flags and EP_DblQuoted) <> 0 then
+    begin
+      dbFlags := pParse^.db^.flags;
+      if ncIsDDL then
+      begin
+        dqsOK := (sqlite3WritableSchema(pParse^.db) <> 0)
+                 and ((dbFlags and u64($40000000)) <> 0);
+        if not dqsOK then
+          dqsOK := (dbFlags and u64($20000000)) <> 0;
+      end
+      else
+        dqsOK := (dbFlags and u64($40000000)) <> 0;
+      if dqsOK then
+      begin
+        pE^.op := TK_STRING;
+        FillChar(pE^.y, SizeOf(pE^.y), 0);
+        Exit;
+      end;
+    end;
     if sqlite3ExprIdToTrueFalse(pE) = 0 then
     begin
       if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
@@ -8764,14 +8791,14 @@ begin
     end;
   end;
   if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
-  flagUnresolvedTKID(pParse, pE^.pLeft);
-  flagUnresolvedTKID(pParse, pE^.pRight);
+  flagUnresolvedTKID(pParse, pE^.pLeft, ncIsDDL);
+  flagUnresolvedTKID(pParse, pE^.pRight, ncIsDDL);
   if (pE^.flags and EP_xIsSelect) = 0 then
   begin
     pList_ := pE^.x.pList;
     if pList_ <> nil then
       for i := 0 to pList_^.nExpr - 1 do
-        flagUnresolvedTKID(pParse, ExprListItems(pList_)[i].pExpr);
+        flagUnresolvedTKID(pParse, ExprListItems(pList_)[i].pExpr, ncIsDDL);
   end;
 end;
 
@@ -9237,7 +9264,8 @@ begin
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil)
        and (pNC^.pSrcList^.nSrc > 0) then
     begin
-      flagUnresolvedTKID(pNC^.pParse, pExpr);
+      flagUnresolvedTKID(pNC^.pParse, pExpr,
+        (pNC^.ncFlags and NC_IsDDL) <> 0);
       if pNC^.pParse^.nErr > 0 then
       begin
         Result := SQLITE_ERROR; Exit;
