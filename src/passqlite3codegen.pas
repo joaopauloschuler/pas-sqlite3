@@ -52442,8 +52442,14 @@ begin
                                   sqlite3Atoi(PChar(zRight)));
       sqlite3VdbeChangeP5(v, 1);
       if addrOp = 0 then ;
-    end else if pValue = nil then begin
-      { Read arm. }
+    end else begin
+      { Read arm.  C's pragma.c:2326..2362 gates the write arm on
+        `zRight && (mPragFlg & PragFlg_ReadOnly)==0` then falls through
+        to the read arm for the ReadOnly case (data_version, freelist_count)
+        even when a value was supplied (silent no-op write + return the
+        cookie).  Without falling through, `PRAGMA data_version=1234;
+        PRAGMA data_version;` returned `[1]` instead of `[1 1]` — pragma3-102
+        (9.4.divbug.69). }
       sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
       sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, iCookie);
       sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
