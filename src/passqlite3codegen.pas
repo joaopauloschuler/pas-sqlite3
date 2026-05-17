@@ -29258,6 +29258,10 @@ var
                                      sqlite3WhereIsDistinct (NOOP, UNORDERED,
                                      UNIQUE, ORDERED). }
   wctrlFlagsSel: u16;
+  { 9.4.divbug.89.002 — locals for SRT_EphemTab opener back-scan. }
+  bEphTabAlreadyOpen: Boolean;
+  iEphScan: i32;
+  pEphScanOp: PVdbeOp;
   regPrevTnct: i32;                { regPrev for ORDERED dedup arm. }
   iJumpTnct:   i32;
   pCollTnct:   PCollSeq;
@@ -29886,6 +29890,53 @@ begin
   if pDest^.eDest = SRT_Output then begin
     if sqlite3GetVdbe(pParse) <> nil then
       sqlite3GenerateColumnNames(pParse, p);
+  end;
+
+  { 9.4.divbug.89.002 — SRT_EphemTab opener (port of select.c:8223..8237
+    tag-select-0630).  When the destination is an ephemeral rowid table
+    and the caller has NOT pre-opened the cursor at iSDParm, emit
+    OP_OpenEphemeral here so the disposal arms (NewRowid/Insert into
+    iSDParm) land on a live cursor.
+
+    Symptom without this: sqlite3MaterializeView (codegen.pas:36000)
+    reserves iCur via pParse->nTab++ and recurses into sqlite3Select
+    with SRT_EphemTab + iSDParm=iCur, then sqlite3Update emits
+    OP_NewRowid iCur,... — apCsr[iCur] is nil → SIGSEGV at VDBE
+    OP_NewRowid (e_changes-4.3.2).
+
+    Audit for double-Open:  Pas has several per-arm sites that pre-open
+    a cursor and then recurse with SRT_EphemTab on that same cursor
+    (codegen.pas 30613, 31053/55, 31858, 32623, 32868).  Back-scan the
+    VDBE for a prior OP_OpenEphemeral on the same P1 and skip when
+    found — keeps pre-arm callers untouched.
+
+    Placed BEFORE all per-arm gates (pPrior compound, FROM-subquery
+    coroutine/materialise) so the cursor is open before any disposal
+    arm runs at any nesting level.  pEList is read from p^ directly
+    (not yet hoisted into a local at this point in the function). }
+  if pDest^.eDest = SRT_EphemTab then
+  begin
+    v := sqlite3GetVdbe(pParse);
+    if (v <> nil) and (p^.pEList <> nil) then
+    begin
+      bEphTabAlreadyOpen := False;
+      iEphScan := sqlite3VdbeCurrentAddr(v) - 1;
+      while iEphScan >= 0 do
+      begin
+        pEphScanOp := sqlite3VdbeGetOp(v, iEphScan);
+        if pEphScanOp = nil then break;
+        if (pEphScanOp^.opcode = OP_OpenEphemeral)
+           and (pEphScanOp^.p1 = pDest^.iSDParm) then
+        begin
+          bEphTabAlreadyOpen := True;
+          break;
+        end;
+        Dec(iEphScan);
+      end;
+      if not bEphTabAlreadyOpen then
+        sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pDest^.iSDParm,
+                          p^.pEList^.nExpr);
+    end;
   end;
 
   if p^.pPrior <> nil then begin
