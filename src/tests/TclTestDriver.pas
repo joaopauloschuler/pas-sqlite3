@@ -398,7 +398,17 @@ begin
     sb.Add('proc source {path args} {');
     sb.Add('  set tail [file tail $path]');
     sb.Add('  if {$tail eq "tester.tcl"} {');
+    { 9.4.divbug.91.009: preserve caller-set ::testdir across the tester_min
+      reroute.  Upstream mallocAll.test / memleak.test do
+        set testdir [file dirname $argv0]
+        source $testdir/tester.tcl
+      then later glob $testdir/*malloc*.test — but tester_min.tcl resets
+      ::testdir to its own location, clobbering the caller's value.  Snapshot
+      and restore so the upstream wrapper-test pattern works. }
+    sb.Add('    set __saved_testdir_exists [info exists ::testdir]');
+    sb.Add('    if {$__saved_testdir_exists} { set __saved_testdir $::testdir }');
     sb.Add('    set __r [uplevel 1 [list __orig_source $::pas_shim_dir/tester_min.tcl]]');
+    sb.Add('    if {$__saved_testdir_exists} { set ::testdir $__saved_testdir }');
     { 9.4.8.d: re-apply the cov wrap after tester_min re-installs
       finalize_testing; harmless no-op when --coverage is off (the
       proc is undefined in that case). }
@@ -446,6 +456,15 @@ begin
       sb.Add('}');
       sb.Add('__pas_install_cov_wrap');
     end;
+    { 9.4.divbug.91.009/010: set ::argv0 to the absolute test path so the
+      upstream `set testdir [file dirname $argv0]` pattern (mallocAll.test,
+      memleak.test, …) resolves $testdir to the real test/ directory.
+      Also clear ::argv: tclsh -, the bare-dash stdin invocation we spawn,
+      leaves a stray "-" in ::argv that memleak.test (`set FILELIST $argv`)
+      then tries to `source` as a filename. }
+    sb.Add('set ::argv0 {' + testAbsPath + '}');
+    sb.Add('set ::argv {}');
+    sb.Add('set ::argc 0');
     sb.Add('if {[catch {source ' + testAbsPath + '} __err __opts]} {');
     sb.Add('  puts stderr "SOURCE-ERROR: $__err"');
     sb.Add('}');
