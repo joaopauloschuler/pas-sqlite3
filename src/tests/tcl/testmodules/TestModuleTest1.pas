@@ -3793,6 +3793,44 @@ begin
   if argc = 0 then ;
 end;
 
+{ 9.4.divbug.88.052 — test1.c:764..774 hex16: hex-encode the low byte of
+  each UTF-16 code unit of arg[0] (UTF-16 SQL function). }
+procedure hex16Func(pCtx: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+  PUInt16Arr = ^TUInt16Arr;
+  TUInt16Arr = array[0..16383] of Word;
+const
+  cHex: array[0..15] of AnsiChar = '0123456789abcdef';
+var
+  z:    PUInt16Arr;
+  i:    cint;
+  zBuf: array[0..399] of AnsiChar;
+  b:    Byte;
+  w:    Word;
+  pa:   PValueArr;
+begin
+  pa := PValueArr(argv);
+  z := PUInt16Arr(sqlite3_value_text16(pa^[0]));
+  i := 0;
+  while (i < (SizeOf(zBuf) div 4) - 4) and (z <> nil) and (z^[i] <> 0) do
+  begin
+    w := z^[i] and $00FF;
+    { Match C "%04x" of (z[i] & 0xff): always 4 hex chars, high byte 00. }
+    zBuf[i * 4]     := '0';
+    zBuf[i * 4 + 1] := '0';
+    b := Byte(w);
+    zBuf[i * 4 + 2] := cHex[b shr 4];
+    zBuf[i * 4 + 3] := cHex[b and $0F];
+    Inc(i);
+  end;
+  zBuf[i * 4] := #0;
+  sqlite3_result_text(pCtx, @zBuf[0], -1, SQLITE_TRANSIENT);
+  if argc = 0 then ;
+end;
+
 { test1.c:866..888 — tkt2213func: pointer-stability probe.
   Calls sqlite3_value_text 3x; errors if pointers diverge; otherwise
   returns a fresh copy via sqlite3_malloc owned by sqlite3_free. }
@@ -4046,6 +4084,11 @@ begin
     rc := sqlite3_create_function(db, PChar('hex8'), 1,
             SQLITE_UTF8 or SQLITE_DETERMINISTIC, nil,
             @hex8Func, nil, nil);
+  { 9.4.divbug.88.052 — hex16 UTF-16 helper (test1.c:1126..1129). }
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('hex16'), 1,
+            SQLITE_UTF16 or SQLITE_DETERMINISTIC, nil,
+            @hex16Func, nil, nil);
   if rc = SQLITE_OK then
     rc := sqlite3_create_function(db, PChar('tkt2213func'), 1, SQLITE_ANY,
             nil, @tkt2213Function, nil, nil);

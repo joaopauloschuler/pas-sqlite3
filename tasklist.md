@@ -1184,7 +1184,7 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.049** `main` — ported `db complete SQL` arm (tclsqlite.c:2844 → PasTclSqlite.pas:4183); main.test now PASS 218/218.
   - [x] **9.4.divbug.88.050** `memsubsys1` — SOURCE-ERROR: invalid command name "sqlite3_config_lookaside"
   - [x] **9.4.divbug.88.051** `memsubsys2` — SOURCE-ERROR: invalid command name "sqlite3_config_memstatus"
-  - [ ] **9.4.divbug.88.052** `misc6` — ! misc6-1.1 error: invalid command name "sqlite_bind"
+  - [x] **9.4.divbug.88.052** `misc6` — `sqlite_bind` symptom cleared previously (88.002).  Current trigger was missing `hex16` UTF-16 SQL helper at misc6-1.3; ported `hex16Func` (test1.c:764..774) and wired registration in `test_create_function` (test1.c:1126..1129) at `src/tests/tcl/testmodules/TestModuleTest1.pas`.  misc6.test → PASS 4/22.
   - [X] **9.4.divbug.88.053** `misuse` — ported `clang_sanitize_address` stub (always 0, honours OMIT_MISUSE env), TestModuleTest1.pas:2261; cite test1.c:272..291. SOURCE-ERROR cleared (22 pass / 35 fail vs 19 / 37 before).
   - [ ] **9.4.divbug.88.054** `mjournal` — SOURCE-ERROR: invalid command name "testvfs"
   - [X] **9.4.divbug.88.055** `multiplex4` — STUB multiplex Tcl trampolines (see 88.025; test_multiplex.c:1227..1364).  SOURCE-ERROR cleared; multiplex4 now 0 PASS / 17 FAIL (was 0/0 source-error) — every subtest exercises real chunking, so all fail until 88.069 lands the real shim.
