@@ -782,6 +782,29 @@ proc do_eqp_test {name sql res} {
   }
 }
 
+# do_vmstep_test — upstream tester.tcl:913..933.  Run SQL and verify
+# that the number of "vmsteps" required is greater than or less than
+# some constant.  If $nstep starts with "+", asserts vmstep>=N;
+# otherwise asserts vmstep<=N.
+proc do_vmstep_test {tn sql nstep {res {}}} {
+  uplevel [list do_execsql_test $tn.0 $sql $res]
+
+  set vmstep [db status vmstep]
+  if {[string range $nstep 0 0]=="+"} {
+    set body "if {$vmstep<$nstep} {
+      error \"got $vmstep, expected more than [string range $nstep 1 end]\"
+    }"
+  } else {
+    set body "if {$vmstep>$nstep} {
+      error \"got $vmstep, expected less than $nstep\"
+    }"
+  }
+
+  # set name "$tn.vmstep=$vmstep,expect=$nstep"
+  set name "$tn.1"
+  uplevel [list do_test $name $body {}]
+}
+
 # ===========================================================================
 # Fault-injection helpers — do_malloc_test (task 9.4.2.g.9) and
 # do_ioerr_test (task 9.4.2.g.10).

@@ -1191,7 +1191,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.056** `nan` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
   - [ ] **9.4.divbug.88.057** `nolock` — SOURCE-ERROR: invalid command name "testvfs"
   - [x] **9.4.divbug.88.058** `normalize` — ported sqlite3_normalize Tcl cmd (test1.c:5550..5572) wrapping passqlite3normalize.sqlite3_normalize; SOURCE-ERROR cleared, test now runs (69/114 pass on real assertions).
-  - [ ] **9.4.divbug.88.059** `notnull2` — SOURCE-ERROR: invalid command name "do_vmstep_test"
+  - [X] **9.4.divbug.88.059** `notnull2` — ported `do_vmstep_test` 1:1 from tester.tcl:913..933 into tester_min.tcl; SOURCE-ERROR cleared; notnull2.test FAIL-line 1→28 (downstream).
   - [x] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit" → same trampoline as 88.042 (test1.c:6075..6098); trans3.test now PASS 8/70.
   - [ ] **9.4.divbug.88.061** `upfrom4` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
   - [x] **9.4.divbug.88.062** `varint` — ported btree_varint_test Tcl cmd (test3.c:429..502, registered test3.c:675) using sqlite3PutVarint/sqlite3GetVarint/sqlite3GetVarint32; SOURCE-ERROR cleared, varint-1.1 PASSES (160 pass / 88 fail; remaining failures are a separate GetVarint32 codec divergence, not the trampoline).
