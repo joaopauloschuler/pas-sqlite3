@@ -2287,6 +2287,173 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.023 — decode_hexdb TEXT (test1.c:8837..8910).
+  Parses dbtotxt(1) output back into a raw SQLite database byte-array so
+  Tcl scripts can run `db deserialize [decode_hexdb $hex]`.  Three line
+  shapes are recognised; everything else is silently skipped, matching
+  the C sscanf-based dispatch:
+    "| size <n> pagesize <p>"       — allocate the buffer (rounds n up).
+    "| page <j> offset <k>"         — set iOffset for subsequent hex lines.
+    "| <off>: hh hh hh ... (x16)"   — store 16 bytes at iOffset+off.
+  Leading whitespace on every logical line is skipped, as in C
+  (test1.c:8868). }
+
+{ Hex digit -> value; -1 if not hex.  Mirrors C sscanf("%x"). }
+function hexdb_hexval(c: AnsiChar): cint;
+begin
+  case c of
+    '0'..'9': Result := Ord(c) - Ord('0');
+    'a'..'f': Result := Ord(c) - Ord('a') + 10;
+    'A'..'F': Result := Ord(c) - Ord('A') + 10;
+  else
+    Result := -1;
+  end;
+end;
+
+{ Skip ASCII spaces/tabs in zIn starting at i; bump i in place. }
+procedure hexdb_skip_ws(zIn: PAnsiChar; var i: cint);
+begin
+  while (zIn[i] = ' ') or (zIn[i] = #9) do Inc(i);
+end;
+
+{ Skip an unsigned decimal integer; on success returns True and writes
+  the value into v and advances i.  Returns False if no digit at i. }
+function hexdb_parse_uint(zIn: PAnsiChar; var i: cint; out v: cint): Boolean;
+var
+  acc: cint;
+  any: Boolean;
+begin
+  any := False;
+  acc := 0;
+  while (zIn[i] >= '0') and (zIn[i] <= '9') do begin
+    acc := acc * 10 + (Ord(zIn[i]) - Ord('0'));
+    Inc(i);
+    any := True;
+  end;
+  v := acc;
+  Result := any;
+end;
+
+{ Match a literal needle starting at i; on success advance i and return
+  True.  Used in lieu of sscanf format-literals. }
+function hexdb_match_lit(zIn: PAnsiChar; var i: cint; needle: PAnsiChar): Boolean;
+var
+  j: cint;
+begin
+  j := 0;
+  while needle[j] <> #0 do begin
+    if zIn[i + j] <> needle[j] then begin
+      Result := False; Exit;
+    end;
+    Inc(j);
+  end;
+  Inc(i, j);
+  Result := True;
+end;
+
+function tcl_test_decode_hexdb(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zIn: PAnsiChar;
+  a: PByte;
+  n: cint;
+  i, iNext, iSave: cint;
+  iOffset: cint;
+  j, k: cint;
+  x: array[0..15] of cuint;
+  pgsz: cint;
+  ii, hi, lo: cint;
+  ok: Boolean;
+begin
+  a := nil;
+  n := 0;
+  iOffset := 0;
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('HEXDB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zIn := Tcl_GetString(objv[1]);
+  i := 0;
+  while zIn[i] <> #0 do begin
+    iNext := i;
+    while (zIn[iNext] <> #0) and (zIn[iNext] <> #10) do Inc(iNext);
+    if zIn[iNext] = #10 then Inc(iNext);
+    hexdb_skip_ws(zIn, i);
+    if a = nil then begin
+      iSave := i;
+      ok := hexdb_match_lit(zIn, i, '| size ');
+      if ok then ok := hexdb_parse_uint(zIn, i, n);
+      if ok then ok := hexdb_match_lit(zIn, i, ' pagesize ');
+      if ok then ok := hexdb_parse_uint(zIn, i, pgsz);
+      if not ok then begin
+        i := iNext;
+        Continue;
+      end;
+      if (pgsz < 512) or (pgsz > 65536) or ((pgsz and (pgsz - 1)) <> 0) then begin
+        Tcl_AppendResult(interp, PChar('bad ''pagesize'' field'), Pointer(nil));
+        Result := TCL_ERROR; Exit;
+      end;
+      n := (n + pgsz - 1) and not (pgsz - 1);
+      if n < 512 then begin
+        Tcl_AppendResult(interp, PChar('bad ''size'' field'), Pointer(nil));
+        Result := TCL_ERROR; Exit;
+      end;
+      GetMem(a, n);
+      if a = nil then begin
+        Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+        Result := TCL_ERROR; Exit;
+      end;
+      FillChar(a^, n, 0);
+      i := iNext;
+      // suppress unused warning on iSave
+      if iSave < 0 then ;
+      Continue;
+    end;
+    { Try "| page J offset K". }
+    iSave := i;
+    ok := hexdb_match_lit(zIn, i, '| page ');
+    if ok then ok := hexdb_parse_uint(zIn, i, j);
+    if ok then ok := hexdb_match_lit(zIn, i, ' offset ');
+    if ok then ok := hexdb_parse_uint(zIn, i, k);
+    if ok then begin
+      iOffset := k;
+      i := iNext;
+      Continue;
+    end;
+    { Try "| OFF: hh hh hh hh hh hh hh hh hh hh hh hh hh hh hh hh". }
+    i := iSave;
+    ok := hexdb_match_lit(zIn, i, '| ');
+    if ok then ok := hexdb_parse_uint(zIn, i, j);
+    if ok then ok := hexdb_match_lit(zIn, i, ':');
+    if ok then begin
+      for ii := 0 to 15 do begin
+        hexdb_skip_ws(zIn, i);
+        hi := hexdb_hexval(zIn[i]);
+        if hi < 0 then begin ok := False; Break; end;
+        Inc(i);
+        lo := hexdb_hexval(zIn[i]);
+        if lo >= 0 then begin
+          Inc(i);
+          x[ii] := cuint((hi shl 4) or lo);
+        end else begin
+          x[ii] := cuint(hi);
+        end;
+      end;
+    end;
+    if ok then begin
+      k := iOffset + j;
+      if (k + 16) <= n then begin
+        for ii := 0 to 15 do
+          (a + (k + ii))^ := Byte(x[ii] and $ff);
+      end;
+    end;
+    i := iNext;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(a, n));
+  if a <> nil then FreeMem(a);
+  Result := TCL_OK;
+end;
+
 { test1.c:2288..2330 — sqlite3_stmt_status STMT PARAMETER RESETFLAG. }
 function tcl_test_stmt_status(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
@@ -5201,6 +5368,9 @@ begin
     @tcl_test_register_cksumvfs, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_unregister_cksumvfs'),
     @tcl_test_unregister_cksumvfs, nil, nil);
+  { 9.4.divbug.88.023 — decode_hexdb TEXT (test1.c:8837..8910). }
+  Tcl_CreateObjCommand(interp, PChar('decode_hexdb'),
+    @tcl_test_decode_hexdb, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_status'),
     @tcl_test_stmt_status, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_stmt_busy'),

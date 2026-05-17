@@ -1155,7 +1155,7 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.020** `corruptI` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptI now 0/17.
   - [ ] **9.4.divbug.88.021** `corruptJ` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptJ now 0/13.
   - [ ] **9.4.divbug.88.022** `corruptK` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptK now 0/47.
-  - [ ] **9.4.divbug.88.023** `corruptN` — ! corruptN-1.0 error: invalid command name "decode_hexdb"
+  - [X] **9.4.divbug.88.023** `corruptN` — ported decode_hexdb Tcl cmd (test1.c:8837..8910) into TestModuleTest1.pas:2290..2452; prologue cleared, driver now executes 17/256 corruptN-1.* subtests instead of SOURCE-ERROR'ing at line 1.
   - [X] **9.4.divbug.88.024** `dataversion1` — ported file_control_data_version Tcl trampoline (TestModuleTest1.pas; C ref test1.c:6873..6903, registered :9249).  Wraps sqlite3_file_control(db, zDb, SQLITE_FCNTL_DATA_VERSION, &iVers); objc==2→zDb=NULL; rc<>0→sqlite3ErrName + TCL_ERROR; success returns decimal of unsigned int.  dataversion1 now PASS (8/78).
   - [ ] **9.4.divbug.88.025** `delete_db` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"
   - [ ] **9.4.divbug.88.026** `e_createtable` — SOURCE-ERROR: invalid command name "do_select_tests"
