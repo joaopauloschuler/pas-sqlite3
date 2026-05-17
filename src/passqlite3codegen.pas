@@ -25416,6 +25416,120 @@ begin
   Result := sqlite3VdbeCreate(pParse);
 end;
 
+{ columnType — derive the declaration type of an expression, mirroring
+  C columnType() at select.c:1918..2064 with the NON-SQLITE_ENABLE_COLUMN_METADATA
+  arms only (this port does not define SQLITE_ENABLE_COLUMN_METADATA, so the
+  zOrigDb/zOrigTab/zOrigCol out-parameters are omitted).  TK_COLUMN walks the
+  NameContext chain to locate the source table/sub-select; TK_SELECT recurses
+  into the single result column of the sub-select. }
+function columnTypeImpl(pNC: PNameContext; pExpr: PExpr): PAnsiChar;
+var
+  zType:    PAnsiChar;
+  j:        i32;
+  pTab:     PTable2;
+  pS:       PSelect;
+  iCol:     i32;
+  pTabList: PSrcList;
+  items:    PSrcItem;
+  sNC:      TNameContext;
+  pInner:   PExpr;
+begin
+  zType := nil;
+  Assert(pExpr <> nil);
+  Assert(pNC^.pSrcList <> nil);
+  case pExpr^.op of
+    TK_COLUMN:
+    begin
+      pTab := nil;
+      pS   := nil;
+      iCol := pExpr^.iColumn;
+      while (pNC <> nil) and (pTab = nil) do
+      begin
+        pTabList := pNC^.pSrcList;
+        items := SrcListItems(pTabList);
+        j := 0;
+        while (j < pTabList^.nSrc) and (items[j].iCursor <> pExpr^.iTable) do
+          Inc(j);
+        if j < pTabList^.nSrc then
+        begin
+          pTab := items[j].pSTab;
+          if (items[j].fg.fgBits and u8($04)) <> 0 then  { isSubquery }
+          begin
+            if items[j].u4.pSubq <> nil then
+              pS := items[j].u4.pSubq^.pSelect;
+          end
+          else
+            pS := nil;
+        end
+        else
+          pNC := pNC^.pNext;
+      end;
+      if pTab = nil then
+      begin
+        Result := nil; Exit;
+      end;
+      if pS <> nil then
+      begin
+        { Sub-select / view in FROM clause: recurse into the result column. }
+        if (iCol < pS^.pEList^.nExpr) and (iCol >= 0) then
+        begin
+          pInner := ExprListItems(pS^.pEList)[iCol].pExpr;
+          FillChar(sNC, SizeOf(sNC), 0);
+          sNC.pSrcList := pS^.pSrc;
+          sNC.pNext    := pNC;
+          sNC.pParse   := pNC^.pParse;
+          zType := columnTypeImpl(@sNC, pInner);
+        end;
+      end
+      else
+      begin
+        { Real table or CTE.  iCol < 0 means the rowid. }
+        if iCol < 0 then
+          zType := 'INTEGER'
+        else
+          zType := sqlite3ColumnType(@pTab^.aCol[iCol], nil);
+      end;
+    end;
+    TK_SELECT:
+    begin
+      Assert(ExprUseXSelect(pExpr));
+      pS := pExpr^.x.pSelect;
+      pInner := ExprListItems(pS^.pEList)[0].pExpr;
+      FillChar(sNC, SizeOf(sNC), 0);
+      sNC.pSrcList := pS^.pSrc;
+      sNC.pNext    := pNC;
+      sNC.pParse   := pNC^.pParse;
+      zType := columnTypeImpl(@sNC, pInner);
+    end;
+  end;
+  Result := zType;
+end;
+
+{ generateColumnTypes — emit COLNAME_DECLTYPE for each result column.
+  Mirrors select.c:2070..2107 (non-SQLITE_ENABLE_COLUMN_METADATA arm). }
+procedure generateColumnTypesImpl(pParse: PParse; pTabList: PSrcList;
+  pEList: PExprList);
+var
+  v:     PVdbe;
+  i:     i32;
+  sNC:   TNameContext;
+  items: PExprListItem;
+  zType: PAnsiChar;
+begin
+  v := pParse^.pVdbe;
+  if (v = nil) or (pEList = nil) then Exit;
+  FillChar(sNC, SizeOf(sNC), 0);
+  sNC.pSrcList := pTabList;
+  sNC.pParse   := pParse;
+  sNC.pNext    := nil;
+  items := ExprListItems(pEList);
+  for i := 0 to pEList^.nExpr - 1 do
+  begin
+    zType := columnTypeImpl(@sNC, items[i].pExpr);
+    sqlite3VdbeSetColName(v, i, COLNAME_DECLTYPE, zType, SQLITE_TRANSIENT);
+  end;
+end;
+
 { sqlite3GenerateColumnNames — emit OP_ColumnName for each SELECT result }
 procedure sqlite3GenerateColumnNames(pParse: PParse; pSelect: PSelect);
 var
@@ -25492,6 +25606,8 @@ begin
       sqlite3VdbeSetColName(v, i, COLNAME_NAME, zName, SQLITE_DYNAMIC);
     end;
   end;
+  { select.c:2202 — populate COLNAME_DECLTYPE slots. }
+  generateColumnTypesImpl(pParse, pTabList, pEList);
 end;
 
 { sqlite3ColumnsFromExprList — build a Column array from an ExprList }
