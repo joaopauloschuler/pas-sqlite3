@@ -3525,6 +3525,70 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.87.005 — test1.c:1740..1791 test_table_column_metadata.
+  Usage: sqlite3_table_column_metadata DB dbname tblname ?colname?
+  Returns a 5-element list: datatype collseq notnull primarykey autoinc.
+  When zDb is "" pass NULL to engine.  colname omitted → table-exists
+  probe. }
+function tcl_test_table_column_metadata(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:            PTsqlite3;
+  zDb, zTbl, zCol: PAnsiChar;
+  rc:            cint;
+  pRet:          PTclObj;
+  zDatatype:     PAnsiChar;
+  zCollseq:      PAnsiChar;
+  notnull:       cint;
+  primarykey:    cint;
+  autoincrement: cint;
+begin
+  db := nil;
+  if (objc <> 5) and (objc <> 4) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('DB dbname tblname colname'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zDb := Tcl_GetString(objv[2]);
+  zTbl := Tcl_GetString(objv[3]);
+  if objc = 5 then
+    zCol := Tcl_GetString(objv[4])
+  else
+    zCol := nil;
+  if (zDb <> nil) and (zDb^ = #0) then zDb := nil;
+
+  zDatatype     := nil;
+  zCollseq      := nil;
+  notnull       := 0;
+  primarykey    := 0;
+  autoincrement := 0;
+
+  rc := sqlite3_table_column_metadata(db, zDb, zTbl, zCol,
+    @zDatatype, @zCollseq, @notnull, @primarykey, @autoincrement);
+
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, sqlite3_errmsg(db), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+
+  pRet := Tcl_NewObj;
+  Tcl_ListObjAppendElement(nil, pRet, Tcl_NewStringObj(zDatatype, -1));
+  Tcl_ListObjAppendElement(nil, pRet, Tcl_NewStringObj(zCollseq, -1));
+  Tcl_ListObjAppendElement(nil, pRet, Tcl_NewIntObj(notnull));
+  Tcl_ListObjAppendElement(nil, pRet, Tcl_NewIntObj(primarykey));
+  Tcl_ListObjAppendElement(nil, pRet, Tcl_NewIntObj(autoincrement));
+  Tcl_SetObjResult(interp, pRet);
+
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.62.e — test1.c:1947..1972 CreateFunctionV2 trampoline
   record + cf2Func / cf2Step / cf2Final / cf2Destroy helpers.  cf2Func /
   cf2Step / cf2Final are intentional no-ops (upstream uses these only to
@@ -4168,6 +4232,9 @@ begin
     @tcl_test_simulate_device, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_user_version'),
     @tcl_test_user_version, nil, nil);
+  { 9.4.divbug.87.005 — sqlite3_table_column_metadata (test1.c:9279). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_table_column_metadata'),
+    @tcl_test_table_column_metadata, nil, nil);
   Result := TCL_OK;
 end;
 
