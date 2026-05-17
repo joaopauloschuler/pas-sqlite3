@@ -2103,6 +2103,22 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ os_unix.c:1620..1635 — fileHasMoved.
+  Returns TRUE if pFile has been renamed or unlinked since open.
+  9.4.divbug.81: stat(zPath) failing OR a different inode now sitting at
+  zPath both signal the database file moved out from under us. }
+function fileHasMoved(pFile: PunixFile): Boolean;
+var
+  buf : Stat;
+begin
+  if (pFile^.pInode = nil) or (pFile^.zPath = nil) then begin
+    Result := False;
+    Exit;
+  end;
+  Result := (FpStat(pFile^.zPath, buf) <> 0)
+            or (u64(buf.st_ino) <> pFile^.pInode^.fileId.ino);
+end;
+
 { os_unix.c ~4050: unixFileControl_impl — handle FCNTL opcodes }
 function unixFileControl_impl(pFile: Psqlite3_file; op: cint;
                               pArg: Pointer): cint; cdecl;
@@ -2156,6 +2172,15 @@ begin
     end;
     SQLITE_FCNTL_VFS_POINTER: begin
       PPointer(pArg)^ := pf^.pVfs;
+      Result := SQLITE_OK;
+    end;
+    SQLITE_FCNTL_HAS_MOVED: begin
+      { os_unix.c:4203..4206 — return 1 in *pArg iff the open file's
+        inode no longer matches what's at zPath on disk (renamed or
+        unlinked since open).  9.4.divbug.81 — required by pager
+        databaseIsUnmoved() to surface SQLITE_READONLY_DBMOVED for
+        pager4-1.3/.4/.9/.10/.11. }
+      PcInt(pArg)^ := Ord(fileHasMoved(pf));
       Result := SQLITE_OK;
     end;
     SQLITE_FCNTL_VFSNAME: begin

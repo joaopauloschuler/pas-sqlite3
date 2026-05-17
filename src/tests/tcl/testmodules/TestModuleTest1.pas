@@ -5443,6 +5443,32 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.81 — test1.c:6458..6480 test_db_readonly.
+  Usage: sqlite3_db_readonly DB DBNAME.  Returns 1 if DBNAME is readonly,
+  0 if read/write, -1 if DBNAME is not a database on DB.  Engine entry:
+  passqlite3main.pas:4373 (main.c:5001). }
+function test_db_readonly(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:      PTsqlite3;
+  zDbName: PAnsiChar;
+begin
+  db := nil;
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB DBNAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zDbName := Tcl_GetString(objv[2]);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_db_readonly(db, zDbName)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.042 + 9.4.divbug.88.060 — test1.c:6075..6098 get_autocommit.
   Usage: sqlite3_get_autocommit DB.  Returns 1 if DB is in auto-commit mode,
   0 otherwise.  Required by ioerr.test and trans3.test (trans3-1.3.1). }
@@ -5486,6 +5512,9 @@ begin
   { 9.4.divbug.88.003 — test1.c:9173 sqlite3_db_cacheflush. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_cacheflush'),
     @test_db_cacheflush, nil, nil);
+  { 9.4.divbug.81 — test1.c:9176 sqlite3_db_readonly. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_db_readonly'),
+    @test_db_readonly, nil, nil);
   { 9.4.divbug.35 — fpnum_compare for fuzzy float-string equality
     fallback used by tester.tcl do_test (tester.tcl:789..792). }
   Tcl_CreateObjCommand(interp, PChar('fpnum_compare'),
