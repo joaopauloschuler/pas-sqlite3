@@ -27198,6 +27198,10 @@ var
   bSynthUsing: i32;
   pE1, pE2, pEq: PExpr;
   pLeftSrc: PSrcItem;
+  { 9.4.divbug.89.014 — LTORJ coalesce arm locals (select.c:596..633). }
+  pFuncArgs: PExprList;
+  pFunc:     PExpr;
+  iLtoR_LT, iLtoR_LC: i32;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -27457,7 +27461,76 @@ begin
                                        (Bitmask(1) shl (BMS - 1));
             end;
             sqlite3SrcItemColumnUsed(pLeftSrc, iLeftCol);
-            if (pItem^.fg.jointype and JT_LEFT) <> 0 then
+            { 9.4.divbug.89.014 — port select.c:596..633.  When ANY RIGHT or
+              FULL JOIN is in this FROM clause (LTORJ marker on a[0]), the
+              USING-emitted left side must be a coalesce() over every prior
+              FROM term that also has zName.  Without this, when the RIGHT
+              JOIN's unmatched-right scan emits a row, the next USING-eq
+              compares NULL (from the first matched left table) against the
+              following table's column, dropping rows that should match. }
+            if ((SrcListItems(pSrc)[0].fg.jointype and JT_LTORJ) <> 0)
+               and (pParse^.nErr = 0) then
+            begin
+              pFuncArgs := nil;
+              pE1^.flags := pE1^.flags or EP_CanBeNull;
+              iLtoR_LT := iLeftTab;
+              iLtoR_LC := iLeftCol;
+              while tableAndColumnIndex(pSrc, iLtoR_LT + 1, i - 1,
+                                        zSynthName, @iLtoR_LT, @iLtoR_LC,
+                                        bSynthUsing) <> 0 do
+              begin
+                pLeftSrc := PSrcItem(PByte(base) +
+                                     iLtoR_LT * SizeOf(TSrcItem));
+                if ((pLeftSrc^.fg.fgBits2 and $08) = 0)
+                   or (sqlite3IdListIndex(pLeftSrc^.u3.pUsing,
+                                          zSynthName) < 0) then
+                begin
+                  sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString(
+                    'ambiguous reference to ' + string(zSynthName) +
+                    ' in USING()')));
+                  Break;
+                end;
+                pFuncArgs := sqlite3ExprListAppend(pParse, pFuncArgs, pE1);
+                pE1 := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+                if pE1 = nil then
+                begin
+                  sqlite3ExprListDelete(pParse^.db, pFuncArgs);
+                  Exit;
+                end;
+                pE1^.iTable := pLeftSrc^.iCursor;
+                pE1^.y.pTab := pLeftSrc^.pSTab;
+                if (pLeftSrc^.pSTab <> nil)
+                   and (pLeftSrc^.pSTab^.iPKey = i16(iLtoR_LC)) then
+                  pE1^.iColumn := -1
+                else
+                begin
+                  pE1^.iColumn := i16(iLtoR_LC);
+                  if iLtoR_LC < BMS - 1 then
+                    pLeftSrc^.colUsed := pLeftSrc^.colUsed or
+                                           (Bitmask(1) shl iLtoR_LC)
+                  else
+                    pLeftSrc^.colUsed := pLeftSrc^.colUsed or
+                                           (Bitmask(1) shl (BMS - 1));
+                end;
+                pE1^.flags := pE1^.flags or EP_CanBeNull;
+                sqlite3SrcItemColumnUsed(pLeftSrc, iLtoR_LC);
+              end;
+              if pFuncArgs <> nil then
+              begin
+                pFuncArgs := sqlite3ExprListAppend(pParse, pFuncArgs, pE1);
+                pFunc := sqlite3ExprAlloc(pParse^.db, TK_FUNCTION, nil, 0);
+                if pFunc = nil then
+                begin
+                  sqlite3ExprListDelete(pParse^.db, pFuncArgs);
+                  Exit;
+                end;
+                pFunc^.u.zToken := PAnsiChar('coalesce');
+                pFunc^.x.pList  := pFuncArgs;
+                pFunc^.affExpr  := AnsiChar(SQLITE_AFF_DEFER);
+                pE1 := pFunc;
+              end;
+            end
+            else if (pItem^.fg.jointype and JT_LEFT) <> 0 then
               pE1^.flags := pE1^.flags or EP_CanBeNull;
             pE2 := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
             if pE2 = nil then
