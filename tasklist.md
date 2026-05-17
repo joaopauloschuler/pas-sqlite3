@@ -1059,10 +1059,181 @@ acceptance gate for this section.
 - [ ] **9.4.divbug.85** `collate5.test` pas-strict regression — 6 errors / 159 ran on shard 0/4 surfaced 2026-05-16; STATUS.txt:172 lists the file as `pas-strict` with no cite, so the strict gate now fires `REGRESSION (pas-strict FAIL): ../sqlite3/test/collate5.test`.  Triage: bisect against the last known-green run (shard-0 log at `/tmp/tcl-shard0.log`, per-test dump in `bin/tcl-failure-logs/collate5.test.{out,err}`); likely a collation-driver regression introduced after the file was baselined.  Blocks the tcl-nightly aggregate gate from passing.
 - [ ] **9.4.divbug.86** Sibling-of-.84 driver-timeout family — `pragma4.test`, `printf.test`, `securedel.test` all exceed the 20 s per-test watchdog under shard 2/4 (2026-05-16 run), consuming the entire shard budget and preventing it from completing 240 entries (only 99 done before the 25-min outer timeout).  STATUS.txt currently lists them as `pas-soft` citing the closed `9.4.divbug.62` / `9.4.4.g-unbucketed` — those cites covered the original failure mode, not the new hang.  Action: same as .84 — either raise the per-test budget, port the missing functionality, or move the entries to `SKIP.md` so shard 2 can finish and the strict gate becomes meaningful.
 - [ ] **9.4.divbug.87** Result divergence cluster (carved from `9.4.4.g-unbucketed` 2026-05-16) — **73 pas-soft tests** emit `got:` lines that do not match the C oracle.  Subdivided into `result-divergence` (68: e.g. `backup5`, `badutf`, `capi2`, `colmeta`, …) and `malformed-corrupt-vector` (5: `backup4`, `corruptM`, `in2`, `rowhash`, …).  Each test needs an individual bisect; this single bullet placeholds until root-cause splits emerge.  Full list classified in `/tmp/unbk_sig2.tsv` from the 2026-05-16 sweep.
+  - [ ] **9.4.divbug.87.001** `backup4` — ! backup4-1.2 error: database disk image is malformed
+  - [ ] **9.4.divbug.87.002** `backup5` — ! backup5-1.6 got: [SQLITE_CORRUPT SQLITE_CORRUPT]
+  - [ ] **9.4.divbug.87.003** `badutf` — ! badutf-1.1 got: [0 {{253830}}]
+  - [ ] **9.4.divbug.87.004** `capi2` — ! capi2-1.5 got: [name rowid {} {}]
+  - [ ] **9.4.divbug.87.005** `colmeta` — ! colmeta-1.1 got: [1 {invalid command name "sqlite3_table_column_metadata"}]
+  - [ ] **9.4.divbug.87.006** `corruptC` — ! corruptC-2.1 got: [0 {{*** in database main ***
+  - [ ] **9.4.divbug.87.007** `corruptM` — malformed database schema (t1)}]
+  - [ ] **9.4.divbug.87.008** `delete4` — ! delete4-6.0 got: [1 3 5]
+  - [ ] **9.4.divbug.87.009** `descidx1` — ! descidx1-2.1 got: [4 5 6]
+  - [ ] **9.4.divbug.87.010** `diskfull` — ! diskfull-2.2.2 got: [{*** in database main ***
+  - [ ] **9.4.divbug.87.011** `eval` — ! eval-2.3 got: [1 {} {} 2 {} {} 3 {} {} 4 {} {}]
+  - [ ] **9.4.divbug.87.012** `exec` — ! exec-1.2 got: [0 {{1} {2}}]
+  - [ ] **9.4.divbug.87.013** `exprfault` — ! exprfault-1.1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [ ] **9.4.divbug.87.014** `exprfault2` — ! exprfault2-1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [ ] **9.4.divbug.87.015** `func3` — ! func3-1.2 got: [1]
+  - [ ] **9.4.divbug.87.016** `fuzz-oss1` — ! fuzz-oss1-skrooge error: no such column: v_operation_tmp1.id
+  - [ ] **9.4.divbug.87.017** `gcfault` — ! gcfault-1.utf16.3.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [ ] **9.4.divbug.87.018** `gencol1` — ! gencol1-2.1.150 error: table t1 has 6 columns but 3 values were supplied
+  - [ ] **9.4.divbug.87.019** `having` — ! having-5.2 error: no such column: Col0
+  - [ ] **9.4.divbug.87.020** `hexlit` — ! hexlist-401 got: [0 {}]
+  - [ ] **9.4.divbug.87.021** `in2` — ! in2-571 error: database disk image is malformed
+  - [ ] **9.4.divbug.87.022** `in5` — ! in5-2.3 got: [1]
+  - [ ] **9.4.divbug.87.023** `in6` — ! in6-1.5 got: [104]
+  - [ ] **9.4.divbug.87.024** `in7` — ! in7-1.1.2 got: [1]
+  - [ ] **9.4.divbug.87.025** `index` — ! index-16.1 got: [2]
+  - [ ] **9.4.divbug.87.026** `index3` — ! index3-1.4 got: [{*** in database main ***
+  - [ ] **9.4.divbug.87.027** `index8` — ! 1.1eqp got: [5 0 220 {SCAN t1 USING INDEX t1abd}]
+  - [ ] **9.4.divbug.87.028** `index9` — ! index9-1.1 got: [t1]
+  - [ ] **9.4.divbug.87.029** `indexA` — ! indexA-1.2 got: [2 0 216 {SCAN t1}]
+  - [ ] **9.4.divbug.87.030** `indexedby` — ! indexedby-8.1 got: [5 0 49 {SEARCH t1 USING INDEX i1 (a=?)}]
+  - [ ] **9.4.divbug.87.031** `indexexpr3` — ! indexexpr3-1.1 got: [1 one three two]
+  - [ ] **9.4.divbug.87.032** `insert` — no such column: t3.a}]
+  - [ ] **9.4.divbug.87.033** `insert2` — ! insert2-1.2.1 got: [0]
+  - [ ] **9.4.divbug.87.034** `insert3` — ! insert3-2.2 error: UNIQUE constraint failed: t2.a
+  - [ ] **9.4.divbug.87.035** `insertfault` — ! insertfault-1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [ ] **9.4.divbug.87.036** `instrfault` — ! instrfault-1.utf8.1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [ ] **9.4.divbug.87.037** `intpkey` — ! intpkey-3.8 got: [11 hello world 1]
+  - [ ] **9.4.divbug.87.038** `intreal` — ! intreal-3.0 error: string or blob too big
+  - [ ] **9.4.divbug.87.039** `istrue` — ! istrue-520 error: CHECK constraint failed: b IS TRUE
+  - [ ] **9.4.divbug.87.040** `join5` — ! join5-3.1 got: [1 {} a {} 1 {} b {} 1 {} c {}]
+  - [ ] **9.4.divbug.87.041** `join7` — ! join7-1.20 got: [NULL NULL 1 NULL 1 3 1 4]
+  - [ ] **9.4.divbug.87.042** `join9` — ! join9-1.200 error: ambiguous column name: id
+  - [ ] **9.4.divbug.87.043** `joinC` — ! joinC-34 got: [15 15 15 15 15 15]
+  - [ ] **9.4.divbug.87.044** `joinI` — ! joinI-7.1 got: [{} {} 555]
+  - [ ] **9.4.divbug.87.045** `limit` — ! limit-2.2 got: [32]
+  - [ ] **9.4.divbug.87.046** `limit2` — ! limit2-100.3 got: [0]
+  - [ ] **9.4.divbug.87.047** `lock` — ! lock-2.8b got: [0]
+  - [ ] **9.4.divbug.87.048** `lock7` — ! lock7-1.2 got: []
+  - [ ] **9.4.divbug.87.049** `minmax` — ! minmax-1.6 got: [19]
+  - [ ] **9.4.divbug.87.050** `minmax2` — ! minmax2-1.6 got: [19]
+  - [ ] **9.4.divbug.87.051** `minmax3` — ! minmax3-1.2.3 got: [II 5]
+  - [ ] **9.4.divbug.87.052** `misc2` — ! misc2-1.2 got: [0 {}]
+  - [ ] **9.4.divbug.87.053** `misc3` — ! misc3-6.11-utf8 got: [1 1 0 1]
+  - [ ] **9.4.divbug.87.054** `misc4` — ! misc4-1.2.1 got: [SQLITE_ERROR SQLITE_ERROR]
+  - [ ] **9.4.divbug.87.055** `misc5` — ! misc5-3.1 got: []
+  - [ ] **9.4.divbug.87.056** `mmapwarm` — ! mmapwarm-1.0 got: [127]
+  - [ ] **9.4.divbug.87.057** `notnullfault` — ! notnullfault-1.baseline error: wrong # args: should be "set varName ?newValue?"
+  - [ ] **9.4.divbug.87.058** `null` — ! null-6.4 error: 1st ORDER BY term does not match any column in the result set
+  - [ ] **9.4.divbug.87.059** `nulls1` — ! nulls1-5.3 got: [
+  - [ ] **9.4.divbug.87.060** `orderby5` — ! orderby5-3.0 got: [4 0 59 {SEARCH t3 USING INDEX t3bcde (b=? AND c=?)} 18 0 0 {USE TEMP B-TREE FOR LAST TERM OF ORDER BY}]
+  - [ ] **9.4.divbug.87.061** `orderbyA` — ! orderbyA-1.1.2.1.1 got: [1]
+  - [ ] **9.4.divbug.87.062** `quickcheck` — ! quickcheck-1.0 error: table t1 has 3 columns but 2 values were supplied
+  - [ ] **9.4.divbug.87.063** `resolver01` — ! resolver01-3.5 got: [1 {no such column: yy}]
+  - [ ] **9.4.divbug.87.064** `rowhash` — SOURCE-ERROR: database disk image is malformed
+  - [ ] **9.4.divbug.87.065** `savepoint6` — ! savepoint6-normal.8.2 error: database disk image is malformed
+  - [ ] **9.4.divbug.87.066** `securedel` — ! securedel-1.0 got: [0]
+  - [ ] **9.4.divbug.87.067** `tkt2920` — ! tkt2920-1.3 got: [0 {}]
+  - [ ] **9.4.divbug.87.068** `tkt3442` — ! tkt3442-1.3 error: no such column: "5000" - should this be a string literal in single-quotes?
+  - [ ] **9.4.divbug.87.069** `tkt3718` — ! tkt3718-2.2 got: [1 2 3 4 5 6 7 8 9 10 11 12]
+  - [ ] **9.4.divbug.87.070** `transitive1` — ! transitive1-410 got: []
+  - [ ] **9.4.divbug.87.071** `upfrom1` — ! upfrom1-1.1.4 got: [1 {} {} 4 5 6 7 {} {}]
+  - [ ] **9.4.divbug.87.072** `upsert1` — ! upsert1-200 got: [1 {ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint}]
+  - [ ] **9.4.divbug.87.073** `upsert4` — ! upsert4-1.1.7 got: [1 {} one 2 {} {} 3 {} three]
 - [ ] **9.4.divbug.88** Tcl-bridge command/subcommand long-tail (carved from `9.4.4.g-unbucketed` 2026-05-16) — **62 pas-soft tests** still hit bridge gaps after `9.4.divbug.62/.63/.64/.65` closed the high-frequency surface.  Subdivided into `invalid/unknown command` (55: `badutf2`, `bindxfer`, `cacheflush`, `capi3d`, …) and `unknown subcommand "null"` / `db <other-subcmd>` (7: `indexexpr1`, `joinH`, `join`, `json102`, …).  Port the remaining `db ?subcommand?` and top-level Tcl-bridge entry points until the cluster drains.
+  - [ ] **9.4.divbug.88.001** `badutf2` — ! badutf2-4.0 error: invalid command name "sqlite3_expired"
+  - [ ] **9.4.divbug.88.002** `bindxfer` — ! bindxfer-1.5 error: invalid command name "sqlite_bind"
+  - [ ] **9.4.divbug.88.003** `cacheflush` — ! cacheflush-1.1.2 error: invalid command name "sqlite3_db_cacheflush"
+  - [ ] **9.4.divbug.88.004** `capi3d` — SOURCE-ERROR: invalid command name "sqlite3_prepare16"
+  - [ ] **9.4.divbug.88.005** `capi3e` — ! capi3e-1.1.1 error: invalid command name "sqlite3_open"
+  - [ ] **9.4.divbug.88.006** `chunksize` — SOURCE-ERROR: invalid command name "file_control_chunksize_test"
+  - [ ] **9.4.divbug.88.007** `cksumvfs` — SOURCE-ERROR: invalid command name "sqlite3_register_cksumvfs"
+  - [ ] **9.4.divbug.88.008** `close` — ! close-1.1 error: invalid command name "sqlite3_open"
+  - [ ] **9.4.divbug.88.009** `collate7` — ! collate7-1.1 error: invalid command name "sqlite3_create_collation_v2"
+  - [ ] **9.4.divbug.88.010** `colname` — ! colname-2.1 error: invalid command name "execsql2"
+  - [ ] **9.4.divbug.88.011** `corrupt` — ! corrupt-2.1.8 error: invalid command name "btree_from_db"
+  - [ ] **9.4.divbug.88.012** `corrupt2` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.013** `corrupt3` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.014** `corrupt4` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.015** `corrupt6` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.016** `corrupt7` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.017** `corruptE` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.018** `corruptG` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.019** `corruptH` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.020** `corruptI` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.021** `corruptJ` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.022** `corruptK` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.023** `corruptN` — ! corruptN-1.0 error: invalid command name "decode_hexdb"
+  - [ ] **9.4.divbug.88.024** `dataversion1` — SOURCE-ERROR: invalid command name "file_control_data_version"
+  - [ ] **9.4.divbug.88.025** `delete_db` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"
+  - [ ] **9.4.divbug.88.026** `e_createtable` — SOURCE-ERROR: invalid command name "do_select_tests"
+  - [ ] **9.4.divbug.88.027** `e_dropview` — SOURCE-ERROR: invalid command name "do_select_tests"
+  - [ ] **9.4.divbug.88.028** `e_reindex` — SOURCE-ERROR: invalid command name "do_select_tests"
+  - [ ] **9.4.divbug.88.029** `e_select2` — SOURCE-ERROR: invalid command name "drop_all_tables"
+  - [ ] **9.4.divbug.88.030** `e_update` — SOURCE-ERROR: invalid command name "do_select_tests"
+  - [ ] **9.4.divbug.88.031** `e_uri` — SOURCE-ERROR: invalid command name "sqlite3_close"
+  - [ ] **9.4.divbug.88.032** `e_wal` — SOURCE-ERROR: invalid command name "testvfs"
+  - [ ] **9.4.divbug.88.033** `e_walauto` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.034** `enc3` — SOURCE-ERROR: invalid command name "sqlite3_enable_shared_cache"
+  - [ ] **9.4.divbug.88.035** `errmsg` — SOURCE-ERROR: invalid command name "verify_ex_errcode"
+  - [ ] **9.4.divbug.88.036** `fallocate` — SOURCE-ERROR: invalid command name "file_control_chunksize_test"
+  - [ ] **9.4.divbug.88.037** `filectrl` — ! filectrl-1.1 error: invalid command name "file_control_test"
+  - [ ] **9.4.divbug.88.038** `filefmt` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.039** `hook` — SOURCE-ERROR: invalid command name "verify_ex_errcode"
+  - [ ] **9.4.divbug.88.040** `indexexpr1` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.041** `interrupt2` — SOURCE-ERROR: invalid command name "testvfs"
+  - [ ] **9.4.divbug.88.042** `ioerr` — SOURCE-ERROR: invalid command name "sqlite3_get_autocommit"
+  - [ ] **9.4.divbug.88.043** `join` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.044** `joinH` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.045** `json102` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.046** `json502` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.047** `laststmtchanges` — ! laststmtchanges-1.2.1 error: invalid command name "sqlite3_exec_printf"
+  - [ ] **9.4.divbug.88.048** `lock5` — SOURCE-ERROR: invalid command name "db2"
+  - [ ] **9.4.divbug.88.049** `main` — ! main-1.1 error: unknown subcommand "complete" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.050** `memsubsys1` — SOURCE-ERROR: invalid command name "sqlite3_config_lookaside"
+  - [ ] **9.4.divbug.88.051** `memsubsys2` — SOURCE-ERROR: invalid command name "sqlite3_config_memstatus"
+  - [ ] **9.4.divbug.88.052** `misc6` — ! misc6-1.1 error: invalid command name "sqlite_bind"
+  - [ ] **9.4.divbug.88.053** `misuse` — SOURCE-ERROR: invalid command name "clang_sanitize_address"
+  - [ ] **9.4.divbug.88.054** `mjournal` — SOURCE-ERROR: invalid command name "testvfs"
+  - [ ] **9.4.divbug.88.055** `multiplex4` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"
+  - [ ] **9.4.divbug.88.056** `nan` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.057** `nolock` — SOURCE-ERROR: invalid command name "testvfs"
+  - [ ] **9.4.divbug.88.058** `normalize` — ! normalize-100 error: invalid command name "sqlite3_normalize"
+  - [ ] **9.4.divbug.88.059** `notnull2` — SOURCE-ERROR: invalid command name "do_vmstep_test"
+  - [ ] **9.4.divbug.88.060** `trans3` — ! trans3-1.3.1 error: invalid command name "sqlite3_get_autocommit"
+  - [ ] **9.4.divbug.88.061** `upfrom4` — SOURCE-ERROR: unknown subcommand "null" - implemented in 9.4.2.d..o
+  - [ ] **9.4.divbug.88.062** `varint` — ! varint-1.1 error: invalid command name "btree_varint_test"
 - [ ] **9.4.divbug.89** Empty driver diagnostic (carved from `9.4.4.g-unbucketed` 2026-05-16) — **12 pas-soft tests** (`corruptB`, `e_changes`, `e_totalchanges`, `fuzz`, `index4`, `index5`, `join6`, `joinA`, `joinB`, `joinD`, `manydb`, `tkt3080`) FAIL but `bin/tcl-failure-logs/<base>.{err,out}` capture no diagnostic — driver swallows the message or the tests abort outside `tcltest`.  Action: instrument `TclTestDriver` to dump the last N lines of stdout/stderr on any non-PASS exit so these become triageable.
+  - [ ] **9.4.divbug.89.001** `corruptB` — malformed}]
+  - [ ] **9.4.divbug.89.002** `e_changes` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.003** `e_totalchanges` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.004** `fuzz` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.005** `index4` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.006** `index5` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.007** `join6` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.008** `joinA` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.009** `joinB` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.010** `joinD` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.011** `manydb` — (UNKNOWN-empty-log, no log captured)
+  - [ ] **9.4.divbug.89.012** `tkt3080` — SOURCE-ERROR:
 - [ ] **9.4.divbug.90** Extension / SQL function / VFS registration residue (sibling of `9.4.divbug.66`, carved from `9.4.4.g-unbucketed` 2026-05-16) — **8 pas-soft tests**: 6 `no such extension` (`btree02`, `extension01`, `func4`, `indexexpr2`, …), 1 `no such function` (`func9`), 1 `no such vfs: devsym` (`io`).  Each pin in the C build is a known extension/function/VFS shim; port or auto-register at db-open following the `.66` template.
+  - [ ] **9.4.divbug.90.001** `btree02` — SOURCE-ERROR: no such extension: eval
+  - [ ] **9.4.divbug.90.002** `extension01` — SOURCE-ERROR: no such extension: fileio
+  - [ ] **9.4.divbug.90.003** `func4` — SOURCE-ERROR: no such extension: totype
+  - [ ] **9.4.divbug.90.004** `func9` — ! func9-210 error: no such function: unistr_quote
+  - [ ] **9.4.divbug.90.005** `indexexpr2` — SOURCE-ERROR: no such extension: explain
+  - [ ] **9.4.divbug.90.006** `io` — SOURCE-ERROR: no such vfs: devsym
+  - [ ] **9.4.divbug.90.007** `memdb` — ! memdb-7.1 error: no such extension: wholenumber
+  - [ ] **9.4.divbug.90.008** `misc8` — SOURCE-ERROR: no such extension: eval
 - [ ] **9.4.divbug.91** Tcl harness helper gaps (carved from `9.4.4.g-unbucketed` 2026-05-16) — **16 pas-soft tests** on missing test-harness plumbing (engine behaviour not exercised): `md5sum` Tcl command (5: `backup_ioerr`, `backup`, `fuzz3`, `interrupt`, …); arbitrary missing tclvars (4: `join3`, `savepoint2`, `tkt3992`, `types`); `cmdlinearg(soft-heap-limit)` array (2: `avtrans`, `capi3b`); `SQLITE_MAX_VARIABLE_NUMBER` tcl-const (1: `bind`); `QRF not available in this build` build-flag gap (2: `qrf01`, `qrf02`); `no files matched glob "*malloc*.test"` (1: `mallocAll`); `couldn't read file "-"` stdin input (1: `memleak`).  Wire each helper in `tester_min.tcl` (or upstream the missing testfixture commands) to drain the cluster.
+  - [ ] **9.4.divbug.91.001** `avtrans` — SOURCE-ERROR: can't read "cmdlinearg(soft-heap-limit)": no such variable
+  - [ ] **9.4.divbug.91.002** `backup` — SOURCE-ERROR: no such function: md5sum
+  - [ ] **9.4.divbug.91.003** `backup_ioerr` — SOURCE-ERROR: no such function: md5sum
+  - [ ] **9.4.divbug.91.004** `bind` — SOURCE-ERROR: can't read "SQLITE_MAX_VARIABLE_NUMBER": no such variable
+  - [ ] **9.4.divbug.91.005** `capi3b` — SOURCE-ERROR: can't read "cmdlinearg(soft-heap-limit)": no such variable
+  - [ ] **9.4.divbug.91.006** `fuzz3` — SOURCE-ERROR: no such function: md5sum
+  - [ ] **9.4.divbug.91.007** `interrupt` — SOURCE-ERROR: no such function: md5sum
+  - [ ] **9.4.divbug.91.008** `join3` — SOURCE-ERROR: can't read "bitmask_size": no such variable
+  - [ ] **9.4.divbug.91.009** `mallocAll` — SOURCE-ERROR: no files matched glob pattern "/home/bpsa/app/pas-sqlite3/src/tests/tcl/*malloc*.test"
+  - [ ] **9.4.divbug.91.010** `memleak` — SOURCE-ERROR: couldn't read file "-": no such file or directory
+  - [ ] **9.4.divbug.91.011** `qrf01` — ! qrf01-1.10 error: QRF not available in this build
+  - [ ] **9.4.divbug.91.012** `qrf02` — SOURCE-ERROR: QRF not available in this build
+  - [ ] **9.4.divbug.91.013** `savepoint2` — SOURCE-ERROR: can't read "::sig(one)": no such variable
+  - [ ] **9.4.divbug.91.014** `tkt3992` — ! tkt3992-2.3 error: can't read "res": no such variable
+  - [ ] **9.4.divbug.91.015** `trans2` — ! trans2-1.1 error: no such function: md5sum
+  - [ ] **9.4.divbug.91.016** `types` — SOURCE-ERROR: can't read "sqlite_options(utf16)": no such element in array
 
 ---
 
