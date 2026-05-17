@@ -10047,6 +10047,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pMatch: PSrcItem;
     matchCol: i32;
     cnt:    i32;
+    pFJMatch: PExprList;  { 9.4.divbug.89.013 — FULL JOIN coalesce gather (resolve.c:297) }
+    effCol: i16;          { iCol with IPK→-1 alias applied (resolve.c:466) }
+    matchEffCol: i16;     { stored per-match effective column for extendFJMatch }
+    pNewFJ: PExpr;        { temp for synthesised coalesce arg expression }
     pCompArm: PSelect;   { 9.4.divbug.75 — walks pInner^.pPrior chain }
     pDeep: PSelect;      { 9.4.divbug.76 — walks FROM-subquery interior selects }
     zDb: PAnsiChar;        { 9.4.divbug.87.058 — 3-part qualifier `db.tab.col` }
@@ -10245,6 +10249,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       cnt := 0;
       pMatch := nil;
       matchCol := 0;
+      matchEffCol := 0;
+      pFJMatch := nil;
       for i := 0 to pSrc^.nSrc - 1 do
       begin
         pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
@@ -10256,15 +10262,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             column refs (resolve.c lookupName:438..462).  USING-masked
             duplicates of the column on a non-RIGHT JOIN keep the
             left-most match; otherwise cnt rises and we error below.
-            9.4.divbug.87.042 — port the RIGHT/FULL arms of
-            resolve.c:449..461.  For a RIGHT JOIN (JT_RIGHT, no JT_LEFT)
-            on a USING-coalesced column, discard the left match and use
-            the right-most one (cnt=0 then Inc).  FULL JOIN (both
-            JT_LEFT and JT_RIGHT) would build a coalesce() via
-            extendFJMatch — not yet ported; for now, keep the left-most
-            match (matches at least the bare-column visibility, but the
-            result columns will be wrong for unmatched right-side rows
-            on FULL JOIN — tracked separately). }
+            9.4.divbug.87.042 — port the RIGHT arm of resolve.c:449..461.
+            9.4.divbug.89.013 — port the FULL JOIN coalesce arm via
+            extendFJMatch (resolve.c:208..223, 458..461). }
           if cnt > 0 then
           begin
             if ((pItem^.fg.fgBits2 and $08) <> 0)  { isUsing }
@@ -10275,20 +10275,99 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                 Continue                                  { LEFT/INNER: keep left }
               else if (pItem^.fg.jointype and JT_LEFT) = 0 then
               begin
-                { Pure RIGHT JOIN: use the right-most table. }
+                { Pure RIGHT JOIN: use the right-most table.
+                  resolve.c:455..457 — also drop any FULL-JOIN coalesce
+                  candidates accumulated to the left. }
                 cnt := 0;
+                if pFJMatch <> nil then
+                begin
+                  sqlite3ExprListDelete(pParse^.db, pFJMatch);
+                  pFJMatch := nil;
+                end;
+              end
+              else
+              begin
+                { FULL JOIN: synthesise a coalesce() arg pointing at the
+                  prior match.  resolve.c:459..460. }
+                pNewFJ := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+                if pNewFJ <> nil then
+                begin
+                  pNewFJ^.iTable  := pMatch^.iCursor;
+                  pNewFJ^.iColumn := matchEffCol;
+                  pNewFJ^.y.pTab  := pMatch^.pSTab;
+                  ExprSetProperty(pNewFJ, EP_CanBeNull);
+                  pFJMatch := sqlite3ExprListAppend(pParse, pFJMatch, pNewFJ);
+                end;
               end;
-              { else FULL JOIN: extendFJMatch path not yet ported;
-                fall through and Inc(cnt) so duplicates remain detectable. }
+            end
+            else
+            begin
+              { Non-USING duplicate — genuine ambiguity.  resolve.c:443..447
+                clears pFJMatch and lets cnt rise so the tail emits the
+                "ambiguous column name" error. }
+              if pFJMatch <> nil then
+              begin
+                sqlite3ExprListDelete(pParse^.db, pFJMatch);
+                pFJMatch := nil;
+              end;
             end;
           end;
           Inc(cnt);
           pMatch := pItem;
           matchCol := iCol;
+          { resolve.c:466 — IPK aliases to iColumn=-1. }
+          if pItem^.pSTab^.iPKey = iCol then
+            matchEffCol := i16(-1)
+          else
+            matchEffCol := i16(iCol);
+        end;
+      end;
+      { 9.4.divbug.89.013 — resolve.c:761..782.  If a FULL JOIN coalesce
+        set was accumulated and matches cnt-1, append the right-most
+        match and rewrite pE in place as TK_FUNCTION 'coalesce'. }
+      if (cnt > 1) and (pFJMatch <> nil) then
+      begin
+        if pFJMatch^.nExpr = cnt - 1 then
+        begin
+          pNewFJ := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+          if pNewFJ <> nil then
+          begin
+            pNewFJ^.iTable  := pMatch^.iCursor;
+            pNewFJ^.iColumn := matchEffCol;
+            pNewFJ^.y.pTab  := pMatch^.pSTab;
+            ExprSetProperty(pNewFJ, EP_CanBeNull);
+            pFJMatch := sqlite3ExprListAppend(pParse, pFJMatch, pNewFJ);
+          end;
+          if ExprHasProperty(pE, EP_Leaf) then
+            ExprClearProperty(pE, EP_Leaf)
+          else
+          begin
+            pE^.pLeft  := nil;  { TK_ID is leaf-shaped; no children to free }
+            pE^.pRight := nil;
+          end;
+          pE^.op       := TK_FUNCTION;
+          pE^.u.zToken := PAnsiChar('coalesce');
+          pE^.x.pList  := pFJMatch;
+          pFJMatch := nil;
+          { Mark every contributing source's colUsed (resolve.c:826..828
+            via the per-arg sqlite3ExprColUsed walk; emulate by setting
+            each arg's source).  The arg list itself was built with the
+            correct iTable/iColumn so subsequent passes set colUsed. }
+          Exit;
+        end
+        else
+        begin
+          sqlite3ExprListDelete(pParse^.db, pFJMatch);
+          pFJMatch := nil;
         end;
       end;
       if cnt > 1 then
       begin
+        if pFJMatch <> nil then
+        begin
+          sqlite3ExprListDelete(pParse^.db, pFJMatch);
+          pFJMatch := nil;
+        end;
         sqlite3ErrorMsg(pParse,
           PAnsiChar('ambiguous column name: ' + AnsiString(pE^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
