@@ -8561,13 +8561,19 @@ begin
     sqlite3PagerUnref(pOvflPage);
   end;
   if (nIn <> 0) and (nErrAtStart = pCheck^.nErr) then begin
+    { btree.c:10768 — C computes `expected-N` with both as u32, so over-
+      counting (N decremented past zero) wraps mod 2^32 and %u prints
+      the wrapped 32-bit value (e.g. expected=2, N=u32(-1) → diff=3).
+      FPC widens u32-u32 to 64 bits in array-of-const, so without an
+      explicit mask we print 18446744069414584323 instead of 3
+      (9.4.divbug.88.012 corrupt2-14.3/.5). }
     if isFreeList <> 0 then
       checkAppendMsg(pCheck, 'size is %u but should be %u',
-                     [expected - nIn, expected])
+                     [u32((expected - nIn) and $FFFFFFFF), expected])
     else
       checkAppendMsg(pCheck,
                      'overflow list length is %u but should be %u',
-                     [expected - nIn, expected]);
+                     [u32((expected - nIn) and $FFFFFFFF), expected]);
   end;
 end;
 
