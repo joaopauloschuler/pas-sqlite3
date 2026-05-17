@@ -10339,6 +10339,556 @@ begin
   arDotCommand(p, 0, args, nArg);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1a.1.1  `.bail on|off`            shell.c.in:9104..9110
+  Sets bail_on_error.  Mirrors C's booleanValue() recogniser. }
+function cmdBail(const args: array of AnsiString; nArg: SizeInt): i32;
+begin
+  Result := 0;
+  if nArg = 1 then
+    bail_on_error := parseOnOff(args[0], bail_on_error)
+  else begin
+    shellEPutZ('Usage: .bail on|off'#10);
+    Result := 1;
+  end;
+end;
+
+{ 10.1a.1.2  `.timeout MS`              shell.c.in:11881..11884
+  Wraps sqlite3_busy_timeout. }
+function cmdTimeout(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt): i32;
+var
+  ms: i32;
+begin
+  openDb(p, 0);
+  if nArg >= 1 then ms := StrToIntDef(args[0], 0) else ms := 0;
+  sqlite3_busy_timeout(p^.db, ms);
+  Result := 0;
+end;
+
+{ 10.1a.1.3  `.version`                 shell.c.in:11978..11996
+  Print library version + sourceid + (when available) compiler tag.
+  Pas port is FPC-only — emit a single fpc-<version> tag mirroring
+  the gcc-<__VERSION__> arm at shell.c.in:11993..11995. }
+function cmdVersion(p: PShellState): i32;
+var
+  zPtrSz: AnsiString;
+begin
+  if SizeOf(Pointer) = 8 then zPtrSz := '64-bit' else zPtrSz := '32-bit';
+  shellSPutZ(Format('SQLite %s %s'#10,
+    [AnsiString(sqlite3_libversion), AnsiString(sqlite3_sourceid)]));
+  shellSPutZ(Format('fpc-%d.%d.%d (%s)'#10,
+    [FPC_VERSION, FPC_RELEASE, FPC_PATCH, zPtrSz]));
+  Result := 0;
+end;
+
+{ 10.1a.1.4  `.prompt MAIN ?CONTINUE?`  shell.c.in:10438..10445
+  Update the two REPL prompt strings.  Upstream uses a fixed-size
+  buffer + shell_strncpy; the Pas backing storage is AnsiString so we
+  just assign. }
+function cmdPrompt(const args: array of AnsiString; nArg: SizeInt): i32;
+begin
+  if nArg >= 1 then mainPromptStr := args[0];
+  if nArg >= 2 then continuePromptStr := args[1];
+  Result := 0;
+end;
+
+{ 10.1a.1.6  `.limit ?NAME? ?VAL?`      shell.c.in:10002..10061
+  13-entry name/code table; case-insensitive prefix match; on success
+  print "%20s %d\n" current value (or set then print on `.limit NAME VAL`).
+  Ambiguous prefix and unknown name both emit C-parity errors on stderr. }
+type
+  TLimitEntry = record
+    name: AnsiString;
+    code: i32;
+  end;
+const
+  aLimit: array[0..12] of TLimitEntry = (
+    (name: 'length';              code: SQLITE_LIMIT_LENGTH),
+    (name: 'sql_length';          code: SQLITE_LIMIT_SQL_LENGTH),
+    (name: 'column';              code: SQLITE_LIMIT_COLUMN),
+    (name: 'expr_depth';          code: SQLITE_LIMIT_EXPR_DEPTH),
+    (name: 'parser_depth';        code: 12 { SQLITE_LIMIT_PARSER_DEPTH }),
+    (name: 'compound_select';     code: SQLITE_LIMIT_COMPOUND_SELECT),
+    (name: 'vdbe_op';             code: SQLITE_LIMIT_VDBE_OP),
+    (name: 'function_arg';        code: SQLITE_LIMIT_FUNCTION_ARG),
+    (name: 'attached';            code: SQLITE_LIMIT_ATTACHED),
+    (name: 'like_pattern_length'; code: SQLITE_LIMIT_LIKE_PATTERN_LENGTH),
+    (name: 'variable_number';     code: SQLITE_LIMIT_VARIABLE_NUMBER),
+    (name: 'trigger_depth';       code: SQLITE_LIMIT_TRIGGER_DEPTH),
+    (name: 'worker_threads';      code: SQLITE_LIMIT_WORKER_THREADS)
+  );
+
+function cmdLimit(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
+var
+  i, iLimit, n2, newVal: i32;
+  zArgLc: AnsiString;
+begin
+  Result := 0;
+  openDb(p, 0);
+  if nArg = 0 then begin
+    for i := 0 to High(aLimit) do
+      shellSPutZ(Format('%20s %d'#10,
+        [aLimit[i].name, sqlite3_limit(p^.db, aLimit[i].code, -1)]));
+    Exit;
+  end;
+  if nArg > 2 then begin
+    shellEPutZ('Usage: .limit NAME ?NEW-VALUE?'#10);
+    Result := 1;
+    Exit;
+  end;
+  iLimit := -1;
+  zArgLc := LowerCase(args[0]);
+  n2 := Length(zArgLc);
+  for i := 0 to High(aLimit) do begin
+    if (Length(aLimit[i].name) >= n2)
+       and (Copy(LowerCase(aLimit[i].name), 1, n2) = zArgLc) then
+    begin
+      if iLimit < 0 then iLimit := i
+      else begin
+        shellEPutZ(Format('ambiguous limit: "%s"'#10, [args[0]]));
+        Result := 1;
+        Exit;
+      end;
+    end;
+  end;
+  if iLimit < 0 then begin
+    shellEPutZ(Format('unknown limit: "%s"'#10 +
+      'enter ".limits" with no arguments for a list.'#10, [args[0]]));
+    Result := 1;
+    Exit;
+  end;
+  if nArg = 2 then begin
+    newVal := StrToIntDef(args[1], 0);
+    sqlite3_limit(p^.db, aLimit[iLimit].code, newVal);
+  end else
+    shellSPutZ(Format('%20s %d'#10,
+      [aLimit[iLimit].name,
+       sqlite3_limit(p^.db, aLimit[iLimit].code, -1)]));
+end;
+
+{ 10.1a.1.10 `.intck ?STEPS_PER_UNLOCK?` shell.c.in:9964..9978 + 7091..7121
+  Wraps the already-ported passqlite3intck. STEPS_PER_UNLOCK=0 → no
+  periodic unlock; negative is rejected with the C usage banner. }
+function cmdIntck(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
+var
+  iArg, nStep, nError: Int64;
+  pCk: PIntck;
+  zMsg, zErr: PAnsiChar;
+  rc: i32;
+begin
+  Result := 0;
+  iArg := 0;
+  if nArg = 1 then begin
+    iArg := StrToInt64Def(args[0], 0);
+    if iArg = 0 then iArg := -1;
+  end;
+  if ((nArg <> 0) and (nArg <> 1)) or (iArg < 0) then begin
+    shellEPutZ('Usage: .intck STEPS_PER_UNLOCK'#10);
+    Result := 1;
+    Exit;
+  end;
+  if nArg = 0 then iArg := 0;
+  openDb(p, 0);
+  pCk := nil;
+  rc := sqlite3_intck_open(p^.db, 'main', @pCk);
+  if rc = SQLITE_OK then begin
+    nStep := 0;
+    nError := 0;
+    while sqlite3_intck_step(pCk) = SQLITE_OK do begin
+      zMsg := sqlite3_intck_message(pCk);
+      if zMsg <> nil then begin
+        shellSPutZ(AnsiString(zMsg) + #10);
+        Inc(nError);
+      end;
+      Inc(nStep);
+      if (iArg <> 0) and ((nStep mod iArg) = 0) then
+        sqlite3_intck_unlock(pCk);
+    end;
+    zErr := nil;
+    rc := sqlite3_intck_error(pCk, @zErr);
+    if zErr <> nil then
+      shellEPutZ(AnsiString(zErr) + #10);
+    sqlite3_intck_close(pCk);
+    shellSPutZ(Format('%d steps, %d errors'#10, [nStep, nError]));
+  end;
+  Result := rc;
+end;
+
+{ 10.1a.1.9  `.load FILE ?ENTRY?`        shell.c.in:10069..10088
+  Wraps sqlite3_load_extension. Pas engine is built with
+  SQLITE_OMIT_LOAD_EXTENSION (main.pas:332) — sqlite3_load_extension
+  returns SQLITE_ERROR + "extension loading is disabled" which we
+  surface verbatim, matching upstream OMIT build behaviour. }
+function cmdLoad(p: PShellState; const args: array of AnsiString;
+                 nArg: SizeInt): i32;
+var
+  zFile, zProc: PAnsiChar;
+  zErrMsg: PAnsiChar;
+  rc: i32;
+begin
+  Result := 0;
+  failIfSafeMode(p, 'cannot run .load in safe mode');
+  if (nArg < 1) or (Length(args[0]) = 0) then begin
+    shellEPutZ('Usage: .load FILE ?ENTRYPOINT?'#10);
+    Result := 1;
+    Exit;
+  end;
+  zFile := PAnsiChar(args[0]);
+  if nArg >= 2 then zProc := PAnsiChar(args[1]) else zProc := nil;
+  openDb(p, 0);
+  zErrMsg := nil;
+  rc := sqlite3_load_extension(p^.db, zFile, zProc, @zErrMsg);
+  if rc <> SQLITE_OK then begin
+    if zErrMsg <> nil then
+      shellEPutZ(AnsiString(zErrMsg) + #10)
+    else
+      shellEPutZ(Format('Error: %s'#10,
+        [AnsiString(sqlite3_errmsg(p^.db))]));
+    sqlite3_free(zErrMsg);
+    Result := 1;
+  end;
+end;
+
+{ 10.1a.1.7  `.imposter INDEX IMPOSTER` shell.c.in:9781..9876
+  Installs a fake table that reads an index (or WITHOUT ROWID table)
+  root-page in raw storage order.  Depends on the typed
+  sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER,...) overload added in
+  passqlite3main.pas.  `.imposter off` resets all schemas. }
+function cmdImposter(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
+var
+  zSql, zCollist, zNewCol: PAnsiChar;
+  pStmt: PVdbe;
+  tnum, isWO, lenPK, i: i32;
+  rc: i32;
+  zCol: PAnsiChar;
+  zLabel: AnsiString;
+  zSqlTab: PAnsiChar;
+  szCollist: i32;
+begin
+  Result := 0;
+  zCollist := nil;
+  tnum := 0;
+  isWO := 0;
+  lenPK := 0;
+  { nArg here is the count of POST-azArg[0] arguments (the dot-cmd
+    name was already consumed by the dispatcher).  C requires
+    nArg==3 (.imposter X Y) or nArg==2 with azArg[1]="off"; in our
+    indexing that maps to nArg=2 or (nArg=1 and args[0]="off"). }
+  if not ((nArg = 2) or ((nArg = 1) and (SameText(args[0], 'off')))) then
+  begin
+    shellEPutZ('Usage: .imposter INDEX IMPOSTER'#10 +
+               '       .imposter off'#10);
+    Result := 1;
+    Exit;
+  end;
+  openDb(p, 0);
+  if nArg = 1 then begin
+    sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, p^.db,
+                         PAnsiChar('main'), 0, 1);
+    Exit;
+  end;
+  zSql := sqlite3MPrintf(nil,
+    'SELECT rootpage, 0 FROM sqlite_schema'
+    + ' WHERE type=''index'' AND lower(name)=lower(''%q'')'
+    + 'UNION ALL '
+    + 'SELECT rootpage, 1 FROM sqlite_schema'
+    + ' WHERE type=''table'' AND lower(name)=lower(''%q'')'
+    + '   AND sql LIKE ''%%without%%rowid%%''',
+    [PAnsiChar(args[0]), PAnsiChar(args[0])]);
+  pStmt := nil;
+  sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, nil);
+  sqlite3_free(zSql);
+  if sqlite3_step(pStmt) = SQLITE_ROW then begin
+    tnum := sqlite3_column_int(pStmt, 0);
+    isWO := sqlite3_column_int(pStmt, 1);
+  end;
+  sqlite3_finalize(pStmt);
+  zSql := sqlite3MPrintf(nil, 'PRAGMA index_xinfo=''%q''',
+    [PAnsiChar(args[0])]);
+  rc := sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, nil);
+  sqlite3_free(zSql);
+  i := 0;
+  while (rc = SQLITE_OK) and (sqlite3_step(pStmt) = SQLITE_ROW) do begin
+    zCol := PAnsiChar(sqlite3_column_text(pStmt, 2));
+    Inc(i);
+    if zCol = nil then begin
+      if sqlite3_column_int(pStmt, 1) = -1 then
+        zCol := PAnsiChar('_ROWID_')
+      else begin
+        zLabel := Format('expr%d', [i]);
+        zCol := PAnsiChar(zLabel);
+      end;
+    end;
+    if (isWO <> 0) and (lenPK = 0)
+       and (sqlite3_column_int(pStmt, 5) = 0)
+       and (zCollist <> nil) then
+      lenPK := i32(StrLen(zCollist));
+    if zCollist = nil then
+      zCollist := sqlite3MPrintf(nil, '"%w"', [zCol])
+    else begin
+      zNewCol := sqlite3MPrintf(nil, '%s,"%w"', [zCollist, zCol]);
+      sqlite3_free(zCollist);
+      zCollist := zNewCol;
+    end;
+  end;
+  sqlite3_finalize(pStmt);
+  if (i = 0) or (tnum = 0) then begin
+    shellEPutZ(Format('no such index: "%s"'#10, [args[0]]));
+    Result := 1;
+    sqlite3_free(zCollist);
+    Exit;
+  end;
+  if lenPK = 0 then lenPK := 100000;
+  szCollist := i32(StrLen(zCollist));
+  if lenPK > szCollist then lenPK := szCollist;
+  zSqlTab := sqlite3MPrintf(nil,
+    'CREATE TABLE "%w"(%s,PRIMARY KEY(%.*s))WITHOUT ROWID',
+    [PAnsiChar(args[1]), zCollist, lenPK, zCollist]);
+  sqlite3_free(zCollist);
+  rc := sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, p^.db,
+                             PAnsiChar('main'), 2, tnum);
+  if rc = SQLITE_OK then begin
+    rc := sqlite3_exec(p^.db, zSqlTab, nil, nil, nil);
+    sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER, p^.db,
+                         PAnsiChar('main'), 0, 0);
+    if rc <> 0 then
+      shellEPutZ(Format('Error in [%s]: %s'#10,
+        [AnsiString(zSqlTab), AnsiString(sqlite3_errmsg(p^.db))]))
+    else
+      shellSPutZ(Format('%s;'#10, [AnsiString(zSqlTab)]));
+  end else begin
+    shellEPutZ(Format('SQLITE_TESTCTRL_IMPOSTER returns %d'#10, [rc]));
+    rc := 1;
+  end;
+  sqlite3_free(zSqlTab);
+  Result := rc;
+end;
+
+{ 10.1a.1.8  `.progress N` callback.  shell.c.in:2490..2510.  Returns
+  non-zero to interrupt the running statement when the configured
+  limit is reached.  Mirrors C `progress_handler`. }
+function shellProgressHandler(pClientData: Pointer): i32; cdecl;
+var
+  p: PShellState;
+  elapsed: Double;
+begin
+  p := PShellState(pClientData);
+  Inc(p^.nProgress);
+  if ((p^.flgProgress and SHELL_PROGRESS_TMOUT) <> 0)
+     and (shellTimerBeginNs <> 0) then begin
+    elapsed := (shellTimeOfDayUs - shellTimerBeginNs) * 0.000001;
+    if elapsed >= p^.tmProgress then begin
+      shellSPutZ(Format('Progress timeout after %.6f seconds'#10,
+        [elapsed]));
+      Result := 1; Exit;
+    end;
+  end;
+  if (p^.nProgress >= p^.mxProgress) and (p^.mxProgress > 0) then begin
+    shellSPutZ(Format('Progress limit reached (%u)'#10, [p^.nProgress]));
+    if (p^.flgProgress and SHELL_PROGRESS_RESET) <> 0 then p^.nProgress := 0;
+    if (p^.flgProgress and SHELL_PROGRESS_ONCE) <> 0 then p^.mxProgress := 0;
+    Result := 1; Exit;
+  end;
+  if (p^.flgProgress and SHELL_PROGRESS_QUIET) = 0 then
+    shellSPutZ(Format('Progress %u'#10, [p^.nProgress]));
+  Result := 0;
+end;
+
+{ 10.1a.1.8  `.progress N`               shell.c.in:10380..10435
+  Installs a sqlite3_progress_handler firing every N VDBE opcodes with
+  --quiet/--reset/--once/--limit/--timeout flag parsing. }
+function cmdProgress(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt): i32;
+var
+  i: i32;
+  nn: i32;
+  z: AnsiString;
+begin
+  Result := 0;
+  nn := 0;
+  p^.flgProgress := 0;
+  p^.mxProgress := 0;
+  p^.nProgress := 0;
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 1) and (z[1] = '-') then begin
+      Delete(z, 1, 1);
+      if (Length(z) >= 1) and (z[1] = '-') then Delete(z, 1, 1);
+      if (z = 'quiet') or (z = 'q') then begin
+        p^.flgProgress := p^.flgProgress or SHELL_PROGRESS_QUIET;
+        Inc(i); Continue;
+      end;
+      if z = 'reset' then begin
+        p^.flgProgress := p^.flgProgress or SHELL_PROGRESS_RESET;
+        Inc(i); Continue;
+      end;
+      if z = 'once' then begin
+        p^.flgProgress := p^.flgProgress or SHELL_PROGRESS_ONCE;
+        Inc(i); Continue;
+      end;
+      if z = 'timeout' then begin
+        if i = nArg - 1 then begin
+          shellDotError(p, i + 1, 'missing argument', '');
+          Result := 1; Exit;
+        end;
+        Inc(i);
+        Val(args[i], p^.tmProgress);
+        if p^.tmProgress > 0.0 then begin
+          p^.flgProgress := SHELL_PROGRESS_QUIET or SHELL_PROGRESS_TMOUT;
+          if nn = 0 then nn := 100;
+        end;
+        Inc(i); Continue;
+      end;
+      if z = 'limit' then begin
+        if i + 1 >= nArg then begin
+          shellEPutZ('Error: missing argument on --limit'#10);
+          Result := 1; Exit;
+        end else begin
+          Inc(i);
+          p^.mxProgress := u32(shellIntegerValue(args[i]));
+        end;
+        Inc(i); Continue;
+      end;
+      shellEPutZ(Format('Error: unknown option: "%s"'#10, [args[i]]));
+      Result := 1; Exit;
+    end else begin
+      nn := i32(shellIntegerValue(z));
+    end;
+    Inc(i);
+  end;
+  openDb(p, 0);
+  sqlite3_progress_handler(p^.db, nn, @shellProgressHandler, p);
+end;
+
+{ 10.1a.1.10  safeModeAuth — shell.c.in:2209..2256
+  Restrictive authorizer used when `.auth ON` runs and the shell is
+  in safe-mode-persist, or when --safe is in effect.  Denies ATTACH
+  and a fixed allow-list of dangerous SQL functions via failIfSafeMode
+  (which terminates the process when bSafeMode is set). }
+function safeModeAuth(pClientData: Pointer; op: i32;
+                      zA1, zA2, zA3, zA4: PAnsiChar): i32; cdecl;
+const
+  azProhibited: array[0..7] of PAnsiChar = (
+    'edit', 'fts3_tokenizer', 'load_extension', 'readfile',
+    'realpath', 'writefile', 'zipfile', 'zipfile_cds');
+var
+  ps: PShellState;
+  i: i32;
+begin
+  ps := PShellState(pClientData);
+  case op of
+    SQLITE_ATTACH_AUTH:
+      failIfSafeMode(ps, 'cannot run ATTACH in safe mode');
+    SQLITE_FUNCTION_AUTH:
+      for i := 0 to High(azProhibited) do
+        if sqlite3_stricmp(zA2, azProhibited[i]) = 0 then
+          failIfSafeMode(ps,
+            'cannot use the ' + AnsiString(azProhibited[i]) +
+            '() function in safe mode');
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ 10.1a.1.10  shellAuth — shell.c.in:2258..2302
+  Audit authorizer: prints "authorizer: <ACTION> <z1> <z2> <z3> <z4>"
+  for every authorizable action.  Strings are emitted via the C-string
+  escape vocabulary (see cEscapeStr above) or "NULL" when nil.  When
+  bSafeMode is also set, defers the safe-mode filter to safeModeAuth. }
+function shellAuth(pClientData: Pointer; op: i32;
+                   zA1, zA2, zA3, zA4: PAnsiChar): i32; cdecl;
+const
+  azAction: array[0..33] of PAnsiChar = (
+    nil,
+    'CREATE_INDEX',         'CREATE_TABLE',         'CREATE_TEMP_INDEX',
+    'CREATE_TEMP_TABLE',    'CREATE_TEMP_TRIGGER',  'CREATE_TEMP_VIEW',
+    'CREATE_TRIGGER',       'CREATE_VIEW',          'DELETE',
+    'DROP_INDEX',           'DROP_TABLE',           'DROP_TEMP_INDEX',
+    'DROP_TEMP_TABLE',      'DROP_TEMP_TRIGGER',    'DROP_TEMP_VIEW',
+    'DROP_TRIGGER',         'DROP_VIEW',            'INSERT',
+    'PRAGMA',               'READ',                 'SELECT',
+    'TRANSACTION',          'UPDATE',               'ATTACH',
+    'DETACH',               'ALTER_TABLE',          'REINDEX',
+    'ANALYZE',              'CREATE_VTABLE',        'DROP_VTABLE',
+    'FUNCTION',             'SAVEPOINT',            'RECURSIVE');
+var
+  ps: PShellState;
+  az: array[0..3] of PAnsiChar;
+  i: i32;
+  zName: PAnsiChar;
+begin
+  ps := PShellState(pClientData);
+  az[0] := zA1; az[1] := zA2; az[2] := zA3; az[3] := zA4;
+  if (op >= 0) and (op <= High(azAction)) and (azAction[op] <> nil) then
+    zName := azAction[op]
+  else
+    zName := PAnsiChar('???');
+  Write('authorizer: ', AnsiString(zName));
+  for i := 0 to 3 do begin
+    Write(' ');
+    if az[i] <> nil then
+      outputCString(AnsiString(az[i]))
+    else
+      Write('NULL');
+  end;
+  WriteLn;
+  if ps^.bSafeMode <> 0 then
+    safeModeAuth(pClientData, op, zA1, zA2, zA3, zA4);
+  Result := SQLITE_OK;
+end;
+
+{ 10.1a.1.10  `.auth ON|OFF`             shell.c.in:9006..9022
+  Installs shellAuth for ON, safeModeAuth for OFF when bSafeModePersist
+  is set, or clears the authorizer entirely otherwise. }
+function cmdAuth(p: PShellState; const args: array of AnsiString;
+                 nArg: SizeInt): i32;
+begin
+  Result := 0;
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .auth ON|OFF'#10);
+    Result := 1;
+    Exit;
+  end;
+  openDb(p, 0);
+  if parseOnOff(args[0], 0) <> 0 then
+    sqlite3_set_authorizer(p^.db, @shellAuth, p)
+  else if p^.bSafeModePersist <> 0 then
+    sqlite3_set_authorizer(p^.db, @safeModeAuth, p)
+  else
+    sqlite3_set_authorizer(p^.db, nil, nil);
+end;
+
+{ 10.1a.1.5  `.nonce STRING`            shell.c.in:10116..10128
+  When ShellState.zNonce matches, clear bSafeMode for the *next*
+  command and return 0 immediately (caller-side bSafeMode reset
+  bypassed).  Mismatch is a hard exit — matches upstream cli_exit(1). }
+function cmdNonce(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
+var
+  zArg, zNonceS: AnsiString;
+begin
+  Result := 0;
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .nonce NONCE'#10);
+    Result := 1;
+    Exit;
+  end;
+  zArg := args[0];
+  if p^.zNonce = nil then zNonceS := '' else zNonceS := AnsiString(p^.zNonce);
+  if (zNonceS = '') or (zArg <> zNonceS) then begin
+    shellEPutZ(Format('line %d: incorrect nonce: "%s"'#10,
+      [p^.lineno, zArg]));
+    Halt(1);
+  end;
+  p^.bSafeMode := 0;
+  { Return 0; the do-not-reset signalling is implicit — bSafeMode is
+    already 0 and the C trailing reset is harmless in the Pas build. }
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
@@ -10432,6 +10982,22 @@ begin
     WriteLn;
     Exit;
   end;
+  { 10.1a.1.1..5  bite-sized handlers (.bail/.timeout/.version/.prompt/.nonce). }
+  if zCmd = 'bail'      then begin Result := cmdBail(args, nArg); Exit; end;
+  if zCmd = 'timeout'   then begin Result := cmdTimeout(p, args, nArg); Exit; end;
+  if zCmd = 'version'   then begin Result := cmdVersion(p); Exit; end;
+  if zCmd = 'prompt'    then begin Result := cmdPrompt(args, nArg); Exit; end;
+  if zCmd = 'nonce'     then begin Result := cmdNonce(p, args, nArg); Exit; end;
+  if zCmd = 'auth'      then begin Result := cmdAuth(p, args, nArg); Exit; end;
+  { 10.1a.1.6/.9/.10  .limit / .load / .intck — dot-command wrappers. }
+  if (zCmd = 'limit') or (zCmd = 'limits') then begin
+    Result := cmdLimit(p, args, nArg); Exit;
+  end;
+  if zCmd = 'intck'     then begin Result := cmdIntck(p, args, nArg); Exit; end;
+  if zCmd = 'load'      then begin Result := cmdLoad(p, args, nArg); Exit; end;
+  { 10.1a.1.7/.8  .imposter / .progress — TESTCTRL_IMPOSTER + progress_handler. }
+  if zCmd = 'imposter'  then begin Result := cmdImposter(p, args, nArg); Exit; end;
+  if zCmd = 'progress'  then begin Result := cmdProgress(p, args, nArg); Exit; end;
 
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));

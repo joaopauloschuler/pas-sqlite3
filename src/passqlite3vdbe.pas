@@ -1439,9 +1439,9 @@ function  sqlite3VdbeSerialType(pMem: PMem; file_format: i32; pLen: Pu32): u32;
 function  sqlite3VdbeSerialTypeLen(serialType: u32): u32;
 function  sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
 function  sqlite3VdbeSerialPut(buf: Pu8; pMem: PMem; serial_type: u32): u32;
-procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem); inline;
 function  sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
-                                  p: Pointer): Pointer; { returns UnpackedRecord* }
+                                  p: Pointer): Pointer; inline; { returns UnpackedRecord* }
 function  sqlite3VdbeAllocUnpackedRecord(pKeyInfo: PKeyInfo): Pointer;
 function  sqlite3VdbeRecordCompareWithSkip(nKey1: i32; pKey1: Pointer;
                                            pPKey2: Pointer; bSkip: i32): i32;
@@ -1574,13 +1574,25 @@ type
                                 out ppBlob: Psqlite3_blob): i32;
   TBlobReopenFn      = function(pBlob: Psqlite3_blob; iRow: i64): i32;
   TGetTokenFn        = function(z: PByte; tokenType: Pi32): i64;
+  { pCtx is PValueNewStat4Ctx (declared later in this unit).  Typed as
+    raw Pointer here because TValueFromExprFn precedes that declaration. }
   TValueFromExprFn   = function(db: Psqlite3; pExpr: Pointer;
                                 enc: u8; affinity: u8;
-                                out ppVal: Psqlite3_value): i32;
+                                out ppVal: Psqlite3_value;
+                                pCtx: Pointer): i32;
   TKeyInfoUnrefFn    = procedure(p: Pointer);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  { Trampoline for the codegen-private pair (pIdx^.nColumn + sqlite3KeyInfoOfIndex)
+    used by valueNew()'s STAT4 arm.  Returns the index's nColumn (rowid included);
+    writes the *unreffed* KeyInfo pointer (or nil on OOM) into ppKeyInfo.  vdbe.pas
+    cannot reach PIndex2/PKeyInfo2 layouts directly. }
+  TKeyInfoOfIndexFn  = function(pParse: PParse; pIdx: PIndex;
+                                out ppKeyInfo: Pointer): i32;
+{$ENDIF}
   TPrepareV2Fn       = function(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                                 ppStmt: PPointer;
                                 pzTail: PPointer): i32; cdecl;
+  TRepreparFn        = function(p: PVdbe): i32;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1601,11 +1613,22 @@ var
                                                  needs PExpr layout. }
   gKeyInfoUnref:           TKeyInfoUnrefFn;  { wired by passqlite3codegen —
                                                 releases per-BtShared KeyInfo cache. }
+{$IFDEF SQLITE_ENABLE_STAT4}
+  gKeyInfoOfIndex:         TKeyInfoOfIndexFn;  { wired by passqlite3codegen —
+                                                  STAT4 valueNew dependency.
+                                                  Returns pIdx^.nColumn; out
+                                                  ppKeyInfo := KeyInfo (unref'd). }
+{$ENDIF}
   gPrepareV2:              TPrepareV2Fn;     { wired by passqlite3main — used
                                                 by pragmaVtab xFilter to prepare
                                                 the synthesised "PRAGMA name(arg)"
                                                 statement.  Codegen cannot import
                                                 main directly (circular). }
+  gReprepare:              TRepreparFn;      { wired by passqlite3main — invoked
+                                                by sqlite3_step on SQLITE_SCHEMA
+                                                to recompile the statement
+                                                against the new schema.  See
+                                                vdbeapi.c:911 wrapper. }
 {$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
 type
   TVdbePreUpdateHookFn = procedure(v: Pointer; pCsr: PVdbeCursor; op: i32;
@@ -1638,6 +1661,43 @@ function  sqlite3ValueFromExpr(db: Psqlite3; pExpr: Pointer;
 function  sqlite3Stat4Column(db: Psqlite3; pRec: Pointer; nRec: i32;
                              iCol: i32; var ppVal: Psqlite3_value): i32;
 procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+
+type
+  { ValueNewStat4Ctx — vdbemem.c:1614..1619.  Context object passed by
+    sqlite3Stat4ProbeSetValue() through to valueNew().  ppRec points to the
+    caller's UnpackedRecord* slot so valueNew can allocate-on-first-use.
+    iVal is the column index within that record being populated.
+    Type declared unconditionally so valueNew()'s signature compiles in both
+    builds; the body's STAT4 arm is the only consumer (non-STAT4 path passes
+    nil and falls through to sqlite3ValueNew). }
+  PValueNewStat4Ctx = ^TValueNewStat4Ctx;
+  TValueNewStat4Ctx = record
+    pParse: PParse;
+    pIdx:   PIndex;
+    ppRec:  ^PUnpackedRecord;
+    iVal:   i32;
+  end;
+{$IFDEF SQLITE_ENABLE_STAT4}
+  { Trampoline for valueFromFunction (vdbemem.c:1701..1799).  The C body
+    reads PExpr internals (flags / x.pList / u.zToken) and calls
+    sqlite3FindFunction + sqlite3Stat4ValueFromExpr + sqlite3ErrorMsg —
+    all of which live in passqlite3codegen.  Real body wired at init. }
+type
+  TValueFromFunctionFn = function(db: Psqlite3; pExpr: Pointer;
+                                  enc: u8; aff: u8;
+                                  out ppVal: Psqlite3_value;
+                                  pCtx: PValueNewStat4Ctx): i32;
+var
+  gValueFromFunctionImpl: TValueFromFunctionFn;
+{ valueNew exposed for codegen's valueFromFunctionImpl (STAT4 only). }
+function valueNew(db: Psqlite3; p: PValueNewStat4Ctx): Psqlite3_value;
+{ valueFromFunction exposed for codegen's valueFromExprTrampoline TK_FUNCTION
+  arm (STAT4 only).  See implementation at line ~13646. }
+function valueFromFunction(db: Psqlite3; pExpr: Pointer;
+                           enc: u8; aff: u8;
+                           out ppVal: Psqlite3_value;
+                           pCtx: PValueNewStat4Ctx): i32;
+{$ENDIF}
 function  sqlite3VdbeChangeEncoding(pMem: PMem; desiredEnc: i32): i32;
 function  sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
 function  sqlite3VdbeMemHandleBom(pMem: PMem): i32;
@@ -1807,7 +1867,8 @@ function  sqlite3VdbeExec(v: PVdbe): i32;
   ---------------------------------------------------------------------- }
 type
   TVdbeParseSchemaExec = function(db: PTsqlite3; iDb: i32;
-                                  zWhere: PAnsiChar; p5: u16): i32;
+                                  zWhere: PAnsiChar; p5: u16;
+                                  pzErrMsg: PPAnsiChar): i32;
 var
   vdbeParseSchemaExec: TVdbeParseSchemaExec = nil;
 
@@ -1854,6 +1915,14 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
   elides sorts.  Always present here; harmless when unused. }
 var
   sqlite3_sort_count: i32 = 0;
+
+{ 9.4.divbug.73 — Test-only global incremented by OP_SeekGE/GT/LT/LE on
+  success (vdbe.c:4975), by OP_Next/Prev/SorterNext on success (vdbe.c:6532),
+  and decremented by OP_Sort/OP_SorterSort (vdbe.c:6351).  Read by regression
+  tests via the Tcl-linked `sqlite_search_count` variable (test1.c:9366) to
+  count B-tree-driven row visits.  rowid-4.5 / rowid-4.5.1 expect 3 here. }
+var
+  sqlite3_search_count: i32 = 0;
 
 implementation
 
@@ -1984,7 +2053,7 @@ end;
   Source: vdbeaux.c sqlite3VdbeSerialGet().
   ============================================================================ }
 
-procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem); inline;
 var
   x: u64;
   y: u32;
@@ -2198,7 +2267,7 @@ end;
   using sqlite3VdbeSerialGet / sqlite3VdbeSerialTypeLen.  Returns p (the
   C reference is void; the Pascal signature returns Pointer historically). }
 function sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
-                                 p: Pointer): Pointer;
+                                 p: Pointer): Pointer; inline;
 var
   pUR:        PUnpackedRecord;
   aKey:       Pu8;
@@ -2210,12 +2279,18 @@ var
   pMm:        PMem;
   enc:        u8;
   pDb:        Psqlite3;
+  nAllField:  i32;  { hoisted from pUR^.nField to avoid repeated deref in loop;
+                      task 12.2.candidate.7 (nAllField is the C-side KeyInfo
+                      header field; in this routine the loop bound is the
+                      unpacked-record's own nField, which mirrors the same
+                      caller-supplied count). }
 begin
   pUR  := PUnpackedRecord(p);
   aKey := Pu8(pKey);
   pMm  := PMem(pUR^.aMem);
   enc  := Pu8(pKeyInfo)[4];
   pDb  := PPointer(Pu8(pKeyInfo) + 16)^;
+  nAllField := pUR^.nField;
   pUR^.default_rc := 0;
   { getVarint32 macro fast path: high-bit clear means single-byte varint. }
   if (aKey[0] and $80) = 0 then begin
@@ -2240,11 +2315,11 @@ begin
     sqlite3VdbeSerialGet(@aKey[d], serialType, pMm);
     Inc(d, sqlite3VdbeSerialTypeLen(serialType));
     Inc(u);
-    if u >= u16(pUR^.nField) then break;
+    if u >= u16(nAllField) then break;
     Inc(pMm);
   end;
   if (d > u32(nKey)) and (u <> 0) then begin
-    if u < u16(pUR^.nField) then
+    if u < u16(nAllField) then
       sqlite3VdbeMemSetNull(pMm);
   end;
   pUR^.nField := i32(u);
@@ -3816,6 +3891,16 @@ begin
   resolveP2Values(p, @nArg);
 
   p^.vdbeFlags := p^.vdbeFlags and not (VDBF_UsesStmtJournal or VDBF_EXPIRED_MASK);
+  { vdbeaux.c:2694 — p->usesStmtJournal = pParse->isMultiWrite && pParse->mayAbort.
+    Without this assignment the statement-journal arm in OP_Transaction is never
+    taken, so a constraint-aborted CREATE INDEX (or any failing multi-write DDL)
+    leaves the sqlite_master insert + freshly allocated btree root page
+    committed when the enclosing transaction commits — yielding integrity_check
+    "Page N: never used" (9.4.divbug.87.026, index3-1.4). }
+  { Parse offsets: isMultiWrite is u8 @32; parseFlags is u32 @40, mayAbort=bit 1. }
+  if (PByte(PByte(pParse) + 32)^ <> 0) and
+     ((PUInt32(PByte(pParse) + 40)^ and u32(1 shl 1)) <> 0) then
+    p^.vdbeFlags := p^.vdbeFlags or VDBF_UsesStmtJournal;
 
   { Port of vdbeaux.c:2695..2699 — propagate Parse.explain into the Vdbe and
     set the EXPLAIN result-column count.  EXPLAIN emits 8 columns
@@ -4991,6 +5076,8 @@ begin
   rc := sqlite3BtreeTableMoveto(p^.uc.pCursor, u64(p^.movetoTarget), 0, @resMoveto);
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
   if resMoveto <> 0 then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+  { 9.4.divbug.73 — vdbeaux.c:3812..3814 SQLITE_TEST counter (lazy seek lands) }
+  Inc(sqlite3_search_count);
   p^.deferredMoveto := 0;
   p^.cacheStatus := CACHE_STALE;
   Result := SQLITE_OK;
@@ -5798,9 +5885,41 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ vdbeapi.c:739 — doWalCallbacks.  Invoked from sqlite3Step after a
+  statement commits (rc=DONE && db->autoCommit).  Walks every attached
+  Btree, drains its pager's pending wal-frame count via
+  sqlite3PagerWalCallback, and fires the registered xWalCallback for
+  any database that wrote frames.  Without this, db.wal_hook never
+  observes the frames a COMMIT just flushed (9.4.divbug.37). }
+function doWalCallbacks(db: PTsqlite3): i32;
+type
+  TWalCb = function(p: Pointer; db: PTsqlite3; zDb: PAnsiChar;
+                    nFrame: i32): i32; cdecl;
+var
+  i      : i32;
+  pBt    : PBtree;
+  nEntry : i32;
+begin
+  Result := SQLITE_OK;
+  if db = nil then Exit;
+  for i := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt <> nil then begin
+      sqlite3BtreeEnter(pBt);
+      nEntry := sqlite3PagerWalCallback(sqlite3BtreePager(pBt));
+      sqlite3BtreeLeave(pBt);
+      if (nEntry > 0) and (db^.xWalCallback <> nil) and (Result = SQLITE_OK) then
+        Result := TWalCb(db^.xWalCallback)(db^.pWalArg, db,
+                    db^.aDb[i].zDbSName, nEntry);
+    end;
+  end;
+end;
+
 { --- sqlite3_step / sqlite3_reset / sqlite3_finalize (vdbeapi.c:771) --- }
 
-function sqlite3_step(pStmt: PVdbe): i32;
+{ Inner step (vdbeapi.c:771 sqlite3Step) — public sqlite3_step (vdbeapi.c:911)
+  is the wrapper below that catches SQLITE_SCHEMA and reprepares. }
+function sqlite3StepInternal(pStmt: PVdbe): i32;
 type
   { vdbeapi.c:72 — legacy sqlite3_profile callback shape. }
   TVdbeLegacyProfileFn = procedure(p: Pointer; zSql: PAnsiChar; tm: u64); cdecl;
@@ -5815,6 +5934,25 @@ begin
   { Auto-reset if in HALT state (vdbeapi.c:846) }
   if pStmt^.eVdbeState = VDBE_HALT_STATE then begin
     sqlite3VdbeReset(pStmt);
+  end;
+
+  { vdbeapi.c:779..792 — expired-stmt short-circuit.  Must precede the
+    READY→RUN transition so we don't bump counters or run any opcodes.
+    Sets p^.rc=SCHEMA so sqlite3_finalize returns SCHEMA, while step
+    itself returns SQLITE_ERROR (folded to 0xff later).  When prepared
+    with SAVESQL the real db error is surfaced via TransferError. }
+  if (pStmt^.eVdbeState = VDBE_READY_STATE)
+     and ((pStmt^.vdbeFlags and VDBF_EXPIRED_MASK) <> 0) then begin
+    pStmt^.rc := SQLITE_SCHEMA;
+    rc := SQLITE_ERROR;
+    if (pStmt^.prepFlags and SQLITE_PREPARE_SAVESQL) <> 0 then
+      rc := sqlite3VdbeTransferError(pStmt);
+    if db <> nil then begin
+      db^.errCode := rc;
+      Result := rc and db^.errMask;
+    end else
+      Result := rc;
+    Exit;
   end;
 
   { Transition READY → RUN — vdbeapi.c:815..819 }
@@ -5863,6 +6001,13 @@ begin
   end;
 
   pStmt^.pResultRow := nil;
+  { vdbeapi.c:878..883 — on clean commit, invoke wal_hook callbacks
+    (9.4.divbug.37).  Must precede the error-transfer arm so a hook
+    failure can override rc. }
+  if (rc = SQLITE_DONE) and (db <> nil) and (db^.autoCommit <> 0) then begin
+    pStmt^.rc := doWalCallbacks(db);
+    if pStmt^.rc <> SQLITE_OK then rc := SQLITE_ERROR;
+  end;
   if db <> nil then begin
     { vdbeapi.c:884 — transfer p^.zErrMsg into db^.pErr so sqlite3_errmsg
       returns the real cause.  C gates on SQLITE_PREPARE_SAVESQL to also
@@ -5875,6 +6020,61 @@ begin
     { vdbeapi.c sqlite3Step tail — fold extended → primary unless the
       app opted in via sqlite3_extended_result_codes(...,1). }
     rc := rc and db^.errMask;
+  end;
+  Result := rc;
+end;
+
+{ vdbeapi.c:911 — public sqlite3_step wrapper.  Catches SQLITE_SCHEMA from
+  the inner step, invokes sqlite3Reprepare (via gReprepare trampoline; main
+  owns the body) and retries up to SQLITE_MAX_SCHEMA_RETRY times.  Without
+  this loop a prepared statement that survives a concurrent schema change
+  (e.g. backup overwrite — backup5-1.6) keeps returning SQLITE_SCHEMA or,
+  worse, decodes stale b-tree pages and surfaces bogus SQLITE_CORRUPT. }
+function sqlite3_step(pStmt: PVdbe): i32;
+var
+  rc:      i32;
+  cnt:     i32;
+  savedPc: i32;
+  db:      PTsqlite3;
+  zErr:    PAnsiChar;
+begin
+  if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  db  := pStmt^.db;
+  cnt := 0;
+  rc  := sqlite3StepInternal(pStmt);
+  while (rc = SQLITE_SCHEMA) and (cnt < SQLITE_MAX_SCHEMA_RETRY)
+        and Assigned(gReprepare) do begin
+    Inc(cnt);
+    savedPc := pStmt^.pc;
+    rc := gReprepare(pStmt);
+    if rc <> SQLITE_OK then begin
+      { Reprepare failed — copy the parser error from db^.pErr into the
+        stmt so sqlite3_errmsg() returns it after sqlite3_finalize.
+        Matches vdbeapi.c:929..945. }
+      if (db <> nil) and (db^.pErr <> nil) then
+        zErr := PAnsiChar(sqlite3_value_text(db^.pErr))
+      else
+        zErr := nil;
+      sqlite3DbFree(db, pStmt^.zErrMsg);
+      if (db = nil) or (db^.mallocFailed = 0) then begin
+        if zErr <> nil then
+          pStmt^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db, zErr))
+        else
+          pStmt^.zErrMsg := nil;
+        pStmt^.rc := rc;
+        if db <> nil then db^.errCode := rc;
+      end else begin
+        pStmt^.zErrMsg := nil;
+        pStmt^.rc      := SQLITE_NOMEM;
+        rc             := SQLITE_NOMEM;
+        if db <> nil then db^.errCode := SQLITE_NOMEM;
+      end;
+      Break;
+    end;
+    sqlite3_reset(pStmt);
+    if savedPc >= 0 then
+      pStmt^.minWriteFileFormat := 254;
+    rc := sqlite3StepInternal(pStmt);
   end;
   Result := rc;
 end;
@@ -6533,6 +6733,12 @@ begin
     Without this, tied records sort to a random side and group_concat /
     aggregate row order becomes heap-layout-dependent (bug 6.13 residual). }
   pUR^.default_rc := 0;
+  { 9.4.divbug.30 — match vdbesort.c:1358 vdbeSortAllocUnpacked: cap nField
+    at pKeyInfo->nKeyField so RecordUnpack/RecordCompare only walk the key
+    columns, leaving the data columns untouched.  Otherwise ORDER BY ties
+    under a non-default collation (e.g. NOCASE) fall through to BINARY
+    memcmp on the data column and lose insertion-order stability. }
+  pUR^.nField := i32(Pu16(PByte(pSorter^.pKeyInfo) + 6)^);  { TKeyInfo.nKeyField @6 }
   aLen   := Pi32(PByte(pA) + 8)^;
   bLen   := Pi32(PByte(pB) + 8)^;
   aBytes := PByte(pA) + SORTER_REC_HDR;
@@ -6808,8 +7014,19 @@ end;
 { --- stub helpers needed by OP_Halt and abort path --- }
 
 function sqlite3ErrStr(rc: i32): PAnsiChar;
+{ Port of main.c:1648.  Match the C two-phase lookup: handle the
+  extended ABORT_ROLLBACK / ROW / DONE codes first, otherwise mask
+  off the high bits before consulting the primary-code table.
+  9.4.divbug.71: previously this routine returned "unknown error" for
+  SQLITE_ABORT_ROLLBACK because the bare `case` matched neither the
+  extended value nor any of the primary codes. }
 begin
   case rc of
+    SQLITE_ABORT_ROLLBACK: begin Result := 'abort due to ROLLBACK'; Exit; end;
+    SQLITE_ROW:            begin Result := 'another row available'; Exit; end;
+    SQLITE_DONE:           begin Result := 'no more rows available'; Exit; end;
+  end;
+  case (rc and $FF) of
     SQLITE_OK:       Result := 'not an error';
     SQLITE_ERROR:    Result := 'SQL logic error';
     SQLITE_INTERNAL: Result := 'internal SQLite error';
@@ -6836,9 +7053,7 @@ begin
     SQLITE_NOTADB:   Result := 'file is not a database';
     SQLITE_NOTICE:   Result := 'notification message';
     SQLITE_WARNING:  Result := 'warning message';
-    SQLITE_ROW:      Result := 'another row available';
-    SQLITE_DONE:     Result := 'no more rows available';
-  else                Result := 'unknown error';
+  else               Result := 'unknown error';
   end;
 end;
 
@@ -7696,6 +7911,7 @@ var
   iSet:     i32;              { OP_RowSetTest: batch number }
   exists:   i32;              { OP_RowSetTest: membership result }
   xLim:     i64;              { OP_OffsetLimit: combined limit }
+  xOfs:     i64;              { OP_OffsetLimit: clamped offset (max(0,r[P3])) }
   newMax:   Pgno;             { OP_MaxPgcnt: new max page count }
   pBtArg:   PBtree;           { OP_MaxPgcnt/Pagecount: btree }
   { 6.bis.3a locals — vtab opcode wiring }
@@ -7754,6 +7970,22 @@ var
   pCycleOp: PVdbeOp;
   t0Cycle:  u64;
   {$ENDIF}
+  { OP_TypeCheck locals (vdbe.c:3305) — 9.4.divbug.71.
+    PTable is an opaque Pointer in vdbe.pas; we reach into TTable/TColumn
+    via the byte-offset pattern used elsewhere in this file (sizeof TColumn
+    = 16, TTable fields zName@0, aCol@8, nCol@54). }
+  pTabBaseTC: Pu8;            { TTable base pointer }
+  aColBaseTC: Pu8;            { aCol base pointer (=pTabBaseTC + 8 deref) }
+  pColTC:     Pu8;            { current TColumn entry }
+  zTabNameTC: PAnsiChar;
+  zColNameTC: PAnsiChar;
+  iTC, nColTC, eCTypeTC: i32;
+  affTC:      u8;
+  colFlagsTC: u16;
+  typeFlagsTC: u8;
+  zMemTypeTC: PAnsiChar;
+  zStdTypeTC: PAnsiChar;
+  zErrMsgTC:  PAnsiChar;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -8312,6 +8544,8 @@ begin
         if rc <> SQLITE_OK then goto abort_due_to_error;
         if (eqOnly <> 0) and (rSeek.eqSeen = 0) then goto seek_not_found;
       end;
+      { 9.4.divbug.73 — vdbe.c:4974..4976 SQLITE_TEST counter (table+index arms) }
+      Inc(sqlite3_search_count);
       if oc >= OP_SeekGE then begin
         if (res < 0) or ((res = 0) and (oc = OP_SeekGT)) then begin
           res := 0;
@@ -9541,11 +9775,34 @@ begin
             PPMem(PByte(pCtxAgg) + ((SizeOf(Tsqlite3_context)+7) and not 7)));
       end;
       if pCtxAgg^.isError <> 0 then begin
+        { Mirror vdbe.c:7928..7942 — when xSFunc reported an error via
+          sqlite3_result_error, the message sits as TEXT in pCtx^.pOut.
+          Lift it into the vdbe's zErrMsg BEFORE we release pOut, else
+          OP_AggFinal / sqlite3_step report a generic "SQL logic error".
+          Ported for 9.4.divbug.51 (json_group_array(BLOB) sub-case). }
         rc := pCtxAgg^.isError;
-        pCtxAgg^.isError := 0;
+        if rc > 0 then
+          sqlite3VdbeError(v, PAnsiChar(sqlite3_value_text(
+            Psqlite3_value(pCtxAgg^.pOut))));
+        { Magnet wiring (vdbe.c:7933..7938).  min/max's skipFlag uses
+          isError=-1 as a non-rc carrier — set the magnet register so
+          updateAccumulator's OP_If gate skips bare-column reload on
+          this non-bumping row.  Required for `SELECT bare, max(x)`
+          sticky-row semantics (divbug.14 residual aggorderby-4.1). }
+        if pCtxAgg^.skipFlag <> 0 then begin
+          { Preceding op must be OP_CollSeq; its p1 is the magnet reg. }
+          if (PtrUInt(pOp) >= PtrUInt(aOp) + SizeOf(TVdbeOp))
+             and ((pOp - 1)^.opcode = OP_CollSeq) then
+          begin
+            ii := (pOp - 1)^.p1;
+            if ii > 0 then sqlite3VdbeMemSetInt64(@aMem[ii], 1);
+          end;
+          pCtxAgg^.skipFlag := 0;
+        end;
         sqlite3VdbeMemRelease(pCtxAgg^.pOut);
         pCtxAgg^.pOut^.flags := MEM_Null;
-        if rc <> 0 then goto abort_due_to_error;
+        pCtxAgg^.isError := 0;
+        if rc > 0 then goto abort_due_to_error;
       end;
     end;
 
@@ -9898,6 +10155,17 @@ begin
       P1=db-index, P2=wrflag(0=read,1=write,2=exclusive), P3=cookie, P4=gen, P5=scheckflag }
     OP_Transaction: begin
       iMeta5g := 0;
+      { vdbe.c:4113..4123 — PRAGMA query_only / prior CORRUPT in txn
+        prohibit a write-transaction open. }
+      if (pOp^.p2 <> 0) and
+         ((db^.flags and (SQLITE_QueryOnly or SQLITE_CorruptRdOnly)) <> 0) then
+      begin
+        if (db^.flags and SQLITE_QueryOnly) <> 0 then
+          rc := SQLITE_READONLY
+        else
+          rc := SQLITE_CORRUPT;
+        goto abort_due_to_error;
+      end;
       if pOp^.p1 >= 0 then begin
         pDbb := @db^.aDb[pOp^.p1];
         pX   := PBtree(pDbb^.pBt);
@@ -9911,10 +10179,63 @@ begin
             end;
             goto abort_due_to_error;
           end;
-          { Schema cookie check — only when p5≠0 and schema is fully ported }
-          { Skipped for now: pDb->pSchema->iGeneration not yet accessible }
+
+          { vdbe.c:4140..4161 — open a statement-journal savepoint if this VM
+            uses one (usesStmtJournal = isMultiWrite && mayAbort) and we are
+            opening a write transaction nested inside an outer BEGIN…COMMIT
+            (autoCommit=0) or with concurrent readers (nVdbeRead>1).  Without
+            this arm an aborted CREATE INDEX inside a user transaction cannot
+            be rolled back at the btree level — the sqlite_master row + freshly
+            allocated root page survive the COMMIT and integrity_check reports
+            "Page N: never used" (9.4.divbug.87.026, index3-1.4). }
+          if ((v^.vdbeFlags and VDBF_UsesStmtJournal) <> 0)
+             and (pOp^.p2 <> 0)
+             and ((db^.autoCommit = 0) or (db^.nVdbeRead > 1)) then begin
+            if v^.iStatement = 0 then begin
+              Inc(db^.nStatement);
+              v^.iStatement := db^.nSavepoint + db^.nStatement;
+            end;
+            rc := sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, v^.iStatement - 1);
+            if rc = SQLITE_OK then
+              rc := sqlite3BtreeBeginStmt(pX, v^.iStatement);
+            { Snapshot deferred-FK counters for matching statement-rollback. }
+            v^.nStmtDefCons    := db^.nDeferredCons;
+            v^.nStmtDefImmCons := db^.nDeferredImmCons;
+          end;
+          { Schema cookie check — vdbe.c:4163..4198.
+            When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
+            P3 (cookie at prepare time) and pSchema->iGeneration against P4.i
+            (generation at prepare time).  Mismatch → SQLITE_SCHEMA so the
+            sqlite3_step() wrapper can reprepare via sqlite3Reprepare().
+            Without this gate, statements like SELECT against a table dropped
+            by a concurrent backup keep using stale schema and the cursor
+            decodes raw pages as the gone table — surfaces as bogus
+            SQLITE_CORRUPT (backup5-1.6).  C cite: vdbe.c:4163..4197. }
+          if (rc = SQLITE_OK) and (pOp^.p5 <> 0) then begin
+            if pDbb^.pSchema <> nil then begin
+              if (iMeta5g <> pOp^.p3) or
+                 (PSchema(pDbb^.pSchema)^.iGeneration <> pOp^.p4.i) then
+              begin
+                sqlite3DbFree(db, v^.zErrMsg);
+                v^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db,
+                  'database schema has changed'));
+                { Only reset the schema if the on-disk cookie has changed; a
+                  pure iGeneration mismatch (e.g. v-table reload) keeps the
+                  cached schema alive — vdbe.c:4187..4190. }
+                if PSchema(pDbb^.pSchema)^.schema_cookie <> iMeta5g then begin
+                  if Assigned(gResetOneSchema) then
+                    gResetOneSchema(db, pOp^.p1);
+                end;
+                v^.vdbeFlags :=
+                  (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+                rc := SQLITE_SCHEMA;
+                v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_ChangeCntOn);
+              end;
+            end;
+          end;
         end;
       end;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_Savepoint ────── (vdbe.c:3823)
@@ -10392,6 +10713,8 @@ begin
       { vdbe.c:6349..6351 — SQLITE_TEST-guarded sort counter, read by
         regression tests to confirm sorts are elided when possible. }
       Inc(sqlite3_sort_count);
+      { 9.4.divbug.73 — vdbe.c:6351 dec search_count (Sort masquerades as Rewind) }
+      Dec(sqlite3_search_count);
       Inc(v^.aCounter[SQLITE_STMTSTATUS_SORT]);
       { Fall through to OP_Rewind logic }
       pCur  := v^.apCsr[pOp^.p1];
@@ -10575,7 +10898,7 @@ begin
           through the hook.  vdbe.c:7136..7144 clears the schema and
           re-runs sqlite3InitOne when p4 is nil; the hook implementation
           in main.pas mirrors that distinction by detecting nil zWhere. }
-        rc := vdbeParseSchemaExec(db, pOp^.p1, pOp^.p4.z, pOp^.p5);
+        rc := vdbeParseSchemaExec(db, pOp^.p1, pOp^.p4.z, pOp^.p5, @v^.zErrMsg);
         if rc <> SQLITE_OK then begin
           sqlite3ResetAllSchemasOfConnection(db);
           if rc = SQLITE_NOMEM then goto no_mem;
@@ -10695,13 +11018,19 @@ begin
       if pIn1^.u.i = 0 then goto jump_to_p2;
     end;
 
-    { ────── OP_OffsetLimit ────── (vdbe.c:7740) }
+    { ────── OP_OffsetLimit ────── (vdbe.c:7740)
+      Synopsis: if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1)
+      9.4.divbug.46: must clamp r[P3] (OFFSET) to 0 before adding —
+      C does `pIn3->u.i>0?pIn3->u.i:0`.  A negative OFFSET (e.g.
+      `LIMIT 5 OFFSET -2`) otherwise shrinks the Top-N B-tree cap
+      from LIMIT to LIMIT+OFFSET, returning fewer rows than expected. }
     OP_OffsetLimit: begin
       pIn1  := @aMem[pOp^.p1];
       pIn3  := @aMem[pOp^.p3];
       pOut  := out2Prerelease(v, pOp);
       xLim  := pIn1^.u.i;
-      if (xLim <= 0) or (sqlite3AddInt64(@xLim, pIn3^.u.i) <> 0) then
+      if pIn3^.u.i > 0 then xOfs := pIn3^.u.i else xOfs := 0;
+      if (xLim <= 0) or (sqlite3AddInt64(@xLim, xOfs) <> 0) then
         pOut^.u.i := -1
       else
         pOut^.u.i := xLim;
@@ -10811,8 +11140,14 @@ begin
         op_program_run:
         pFrame := nil; { suppress unused label warning }
         if (pRtMem^.flags and MEM_Blob) = 0 then begin
+          { Port of vdbe.c:7521..7523 — bump nMem by 1 whenever the trigger
+            sub-program uses no cursors so apCsr (placed at &aMem[nMem]) does
+            not overlap the last register slot.  Previously gated only on
+            nProgMem=0, which silently corrupted apCsr for any trigger body
+            that allocated registers but no cursors (e.g. SELECT 1, RAISE())
+            — bug 9.4.divbug.87.052. }
           nProgMem := pProgSub^.nMem + pProgSub^.nCsr;
-          if nProgMem = 0 then nProgMem := 1;
+          if pProgSub^.nCsr = 0 then Inc(nProgMem);
           nByteProg := i64(ROUND8(SizeOf(TVdbeFrame)))
                      + i64(nProgMem) * i64(SizeOf(TMem))
                      + i64(pProgSub^.nCsr) * i64(SizeOf(PVdbeCursor))
@@ -11241,9 +11576,112 @@ begin
       end;
     end;
 
-    { ────── OP_TypeCheck ────── (vdbe.c:3305) — deferred }
+    { ────── OP_TypeCheck ────── (vdbe.c:3305) — 9.4.divbug.71
+      Verify the values in registers P1..P1+P2-1 conform to the column
+      types of the STRICT table P4.  On mismatch emit
+      "cannot store <type> value in <COLTYPE> column <tbl>.<col>" and
+      return SQLITE_CONSTRAINT_DATATYPE.
+
+      Field offsets (verified against passqlite3codegen.TTable / TColumn):
+        TTable:   zName@0(ptr) aCol@8(ptr) nCol@54(i16)
+        TColumn:  zCnName@0(ptr) typeFlags@8(u8) affinity@9(u8)
+                  colFlags@14(u16);  sizeof TColumn = 16
+        eCType  = (typeFlags >> 4) & 0xF   (1=ANY 2=BLOB 3=INT 4=INTEGER
+                                            5=REAL 6=TEXT)
+        COLFLAG_GENERATED = $0060 (STORED|VIRTUAL); COLFLAG_VIRTUAL = $0020 }
     OP_TypeCheck: begin
-      { Type checking requires table schema (Phase 6) }
+      pTabBaseTC := Pu8(pOp^.p4.pTab);
+      aColBaseTC := Pu8(PPointer(pTabBaseTC + 8)^);
+      pIn1       := @aMem[pOp^.p1];
+      if pOp^.p3 < 2 then begin
+        iTC    := 0;
+        nColTC := PSmallInt(pTabBaseTC + 54)^;
+      end else begin
+        iTC    := pOp^.p3 - 2;
+        nColTC := iTC + 1;
+      end;
+      zErrMsgTC := nil;
+      eCTypeTC  := -1;
+      while iTC < nColTC do begin
+        pColTC      := aColBaseTC + (iTC * 16);
+        colFlagsTC  := Pu16(pColTC + 14)^;
+        if ((colFlagsTC and $0060) <> 0) and (pOp^.p3 < 2) then begin
+          if (colFlagsTC and $0020) <> 0 then begin
+            Inc(iTC);
+            Continue;
+          end;
+          if pOp^.p3 <> 0 then begin
+            Inc(pIn1);
+            Inc(iTC);
+            Continue;
+          end;
+        end;
+        affTC := Pu8(pColTC + 9)^;
+        applyAffinity(pIn1, AnsiChar(affTC), enc);
+        eCTypeTC := -1;
+        if (pIn1^.flags and MEM_Null) = 0 then begin
+          typeFlagsTC := Pu8(pColTC + 8)^;
+          eCTypeTC := (typeFlagsTC shr 4) and $0F;
+          case eCTypeTC of
+            2: { COLTYPE_BLOB }
+              if (pIn1^.flags and MEM_Blob) <> 0 then eCTypeTC := -1;
+            3, 4: { COLTYPE_INT / INTEGER }
+              if (pIn1^.flags and MEM_Int) <> 0 then eCTypeTC := -1;
+            6: { COLTYPE_TEXT }
+              if (pIn1^.flags and MEM_Str) <> 0 then eCTypeTC := -1;
+            5: begin { COLTYPE_REAL }
+              if (pIn1^.flags and MEM_Int) <> 0 then begin
+                if (pIn1^.u.i <= 140737488355327) and
+                   (pIn1^.u.i >= -140737488355328) then begin
+                  pIn1^.flags := pIn1^.flags or MEM_IntReal;
+                  pIn1^.flags := pIn1^.flags and not u16(MEM_Int);
+                end else begin
+                  pIn1^.u.r   := Double(pIn1^.u.i);
+                  pIn1^.flags := pIn1^.flags or MEM_Real;
+                  pIn1^.flags := pIn1^.flags and not u16(MEM_Int);
+                end;
+                eCTypeTC := -1;
+              end else if (pIn1^.flags and (MEM_Real or MEM_IntReal)) <> 0 then
+                eCTypeTC := -1;
+            end;
+          else
+            eCTypeTC := -1;  { COLTYPE_ANY and any other: accept anything }
+          end;
+        end;
+        if eCTypeTC >= 0 then Break;  { mismatch — pIn1, iTC pin error site }
+        Inc(pIn1);
+        Inc(iTC);
+      end;
+      if eCTypeTC >= 0 then begin
+        { vdbeMemTypeName: SQLITE_INTEGER=1..SQLITE_NULL=5 }
+        case sqlite3_value_type(pIn1) of
+          1: zMemTypeTC := 'INT';
+          2: zMemTypeTC := 'REAL';
+          3: zMemTypeTC := 'TEXT';
+          4: zMemTypeTC := 'BLOB';
+        else
+          zMemTypeTC := 'NULL';
+        end;
+        case eCTypeTC of
+          1: zStdTypeTC := 'ANY';
+          2: zStdTypeTC := 'BLOB';
+          3: zStdTypeTC := 'INT';
+          4: zStdTypeTC := 'INTEGER';
+          5: zStdTypeTC := 'REAL';
+          6: zStdTypeTC := 'TEXT';
+        else
+          zStdTypeTC := '';
+        end;
+        zTabNameTC := PPAnsiChar(pTabBaseTC + 0)^;
+        zColNameTC := PPAnsiChar(pColTC + 0)^;
+        zErrMsgTC := sqlite3MPrintf(Psqlite3db(db),
+          'cannot store %s value in %s column %s.%s',
+          [zMemTypeTC, zStdTypeTC, zTabNameTC, zColNameTC]);
+        sqlite3VdbeError(v, zErrMsgTC);
+        sqlite3DbFree(db, zErrMsgTC);
+        rc := SQLITE_CONSTRAINT_DATATYPE;
+        goto abort_due_to_error;
+      end;
     end;
 
     { ────── OP_PureFunc ────── — same as OP_Function (already handled) }
@@ -11555,6 +11993,8 @@ begin
     if rc = SQLITE_OK then begin
       pCur^.nullRow := 0;
       Inc(v^.aCounter[pOp^.p5]);
+      { 9.4.divbug.73 — vdbe.c:6531..6533 SQLITE_TEST counter on Next/Prev/SorterNext }
+      Inc(sqlite3_search_count);
       goto jump_to_p2_and_check_for_interrupt;
     end;
     if rc <> SQLITE_DONE then goto abort_due_to_error;
@@ -13525,6 +13965,95 @@ begin
   Result := Psqlite3_value(p);
 end;
 
+{ valueNew — port of vdbemem.c:1632..1672.  STAT4-aware factory: if pCtx is
+  nil, falls through to sqlite3ValueNew(db); otherwise allocates (on first
+  call) the UnpackedRecord that will be returned to the caller of
+  sqlite3Stat4ProbeSetValue, and returns a pointer to its iVal'th aMem cell.
+  Static in C — kept file-private here too.  STAT4 body gated behind the
+  ifdef; default build collapses to the plain sqlite3ValueNew path. }
+function valueNew(db: Psqlite3; p: PValueNewStat4Ctx): Psqlite3_value;
+{$IFDEF SQLITE_ENABLE_STAT4}
+var
+  pRec:     PUnpackedRecord;
+  pIdx:     PIndex;
+  nByte:    i64;
+  i:        i32;
+  nCol:     i32;
+  pKeyInfo: Pointer;
+  aMm:      PMem;
+{$ENDIF}
+begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+  if p <> nil then begin
+    pRec := p^.ppRec^;
+    if pRec = nil then begin
+      pIdx := p^.pIdx;
+      if Assigned(gKeyInfoOfIndex) then
+        nCol := gKeyInfoOfIndex(p^.pParse, pIdx, pKeyInfo)
+      else begin
+        pKeyInfo := nil;
+        nCol := 0;
+      end;
+      nByte := i64(SizeOf(TMem)) * nCol + ROUND8(SizeOf(TUnpackedRecord));
+      pRec := PUnpackedRecord(sqlite3DbMallocZero(db, u64(nByte)));
+      if pRec <> nil then begin
+        pRec^.pKeyInfo := pKeyInfo;
+        if pRec^.pKeyInfo <> nil then begin
+          { C asserts pKeyInfo->nAllField==nCol and pKeyInfo->enc==ENC(db);
+            elided here (codegen owns those fields). }
+          aMm := PMem(PByte(pRec) + ROUND8(SizeOf(TUnpackedRecord)));
+          pRec^.aMem := aMm;
+          for i := 0 to nCol - 1 do begin
+            aMm[i].flags := MEM_Null;
+            aMm[i].db    := db;
+          end;
+        end else begin
+          sqlite3DbFreeNN(db, pRec);
+          pRec := nil;
+        end;
+      end;
+      if pRec = nil then begin
+        Result := nil;
+        Exit;
+      end;
+      p^.ppRec^ := pRec;
+    end;
+    pRec^.nField := u16(p^.iVal + 1);
+    aMm := PMem(pRec^.aMem);
+    sqlite3VdbeMemSetNull(@aMm[p^.iVal]);
+    Result := Psqlite3_value(@aMm[p^.iVal]);
+    Exit;
+  end;
+{$ENDIF}
+  { Non-STAT4 path mirrors `return sqlite3ValueNew(db)` (vdbemem.c:1671).
+    p is unreferenced in this build; FPC tolerates unused param. }
+  Result := sqlite3ValueNew(db);
+end;
+
+{ valueFromFunction — port of vdbemem.c:1701..1799.  Pre-evaluates a
+  deterministic scalar function call at planner time so its constant result
+  becomes a probe value into pIdx^.aSample[].  Body lives in
+  passqlite3codegen.valueFromFunctionImpl (needs PExpr layout and
+  sqlite3FindFunction / sqlite3Stat4ValueFromExpr / sqlite3ErrorMsg, all
+  codegen-owned).  Default build collapses to SQLITE_OK with *ppVal=nil,
+  matching the C `#define valueFromFunction(...) SQLITE_OK` non-STAT4 arm
+  at vdbemem.c:1782. }
+function valueFromFunction(db: Psqlite3; pExpr: Pointer;
+                           enc: u8; aff: u8;
+                           out ppVal: Psqlite3_value;
+                           pCtx: PValueNewStat4Ctx): i32;
+begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+  if Assigned(gValueFromFunctionImpl) then
+  begin
+    Result := gValueFromFunctionImpl(db, pExpr, enc, aff, ppVal, pCtx);
+    Exit;
+  end;
+{$ENDIF}
+  ppVal  := nil;
+  Result := SQLITE_OK;
+end;
+
 procedure sqlite3ValueSetStr(v: Psqlite3_value; n: i32; z: Pointer;
                              enc: u8; xDel: TxDelProc);
 begin
@@ -13579,16 +14108,19 @@ begin
   ppVal := nil;
   if pExpr = nil then begin Result := 0; Exit; end;
   if Assigned(gValueFromExprImpl) then
-    Result := gValueFromExprImpl(db, pExpr, enc, affinity, ppVal)
+    Result := gValueFromExprImpl(db, pExpr, enc, affinity, ppVal, nil)
   else
     Result := SQLITE_OK;
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3Stat4Column / sqlite3Stat4ProbeFree — STAT4 stubs (Phase 6)
+  sqlite3Stat4Column / sqlite3Stat4ProbeFree — real bodies (vdbemem.c:2149..2210)
+  STAT4-gated in C; non-STAT4 build keeps a stub form so the unit-interface
+  forward decls (vdbe.pas:1655..1657) and the codegen call site link cleanly.
   ----------------------------------------------------------------------- }
 function sqlite3Stat4Column(db: Psqlite3; pRec: Pointer; nRec: i32;
                             iCol: i32; var ppVal: Psqlite3_value): i32;
+{$IFDEF SQLITE_ENABLE_STAT4}
 var
   t:     u32;
   nHdr:  u32;
@@ -13598,7 +14130,9 @@ var
   i:     i32;
   a:     Pu8;
   pM:    PMem;
+{$ENDIF}
 begin
+{$IFDEF SQLITE_ENABLE_STAT4}
   t := 0; nHdr := 0; iHdr := 0; szField := 0;
   a := Pu8(pRec);
   pM := PMem(ppVal);
@@ -13631,6 +14165,13 @@ begin
   sqlite3VdbeSerialGet(@a[iFstield - szField], t, pM);
   pM^.enc := vdbeDbEnc(db);
   Result := SQLITE_OK;
+{$ELSE}
+  { Non-STAT4 build: stat4 sample blobs are never produced, so this is
+    unreachable in practice.  Return OK with *ppVal untouched. }
+  ppVal := ppVal; { silence FPC unused-out hint }
+  if (db = nil) or (pRec = nil) or (nRec = 0) or (iCol = 0) then ;
+  Result := SQLITE_OK;
+{$ENDIF}
 end;
 
 { sqlite3Stat4ProbeFree — port of vdbemem.c:2194.
@@ -13641,6 +14182,7 @@ end;
   record itself.  Dead-code in the default build (gated on SQLITE_ENABLE_STAT4
   in the C reference) but matches C 1:1 once where.c stat4 paths are wired. }
 procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+{$IFDEF SQLITE_ENABLE_STAT4}
 var
   p:        PUnpackedRecord;
   nCol:     i32;
@@ -13649,7 +14191,9 @@ var
   i:        i32;
   db:       Psqlite3;
   pKeyInfo: Pointer;
+{$ENDIF}
 begin
+{$IFDEF SQLITE_ENABLE_STAT4}
   if pRec = nil then Exit;
   p := PUnpackedRecord(pRec);
   pKeyInfo := p^.pKeyInfo;
@@ -13674,6 +14218,12 @@ begin
     sqlite3DbFreeNN(db, pRec)
   else
     sqlite3DbFree(nil, pRec);
+{$ELSE}
+  { Non-STAT4 build: STAT4 probe records are never built so the only callers
+    (where.c:4303 path, gated in C) never reach this in practice.  Keep a
+    NULL-tolerant stub so the where.c port can call it unconditionally. }
+  if pRec = nil then ;
+{$ENDIF}
 end;
 
 { btreeMovetoIndexImpl — registered into btree.pas as the index-cursor arm

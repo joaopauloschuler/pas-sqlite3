@@ -530,6 +530,8 @@ function sqlite3_test_control(op: i32; db: PTsqlite3; a: i32): i32; cdecl; overl
 function sqlite3_test_control(op: i32; db: PTsqlite3; pN: Pi32): i32; cdecl; overload;
 function sqlite3_test_control(op: i32; mode: i32; pVal: Pu32): i32; cdecl; overload;
 function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl; overload;
+function sqlite3_test_control(op: i32; db: PTsqlite3; zDbName: PAnsiChar;
+                              mode: i32; tnum: i32): i32; cdecl; overload;
 
 { Phase 8.4.1 — TRACEFLAGS storage.  Mirrors sqliteInt.h:1119/1163.
   10.1.42 update: the consumer-side TREETRACE / WHERETRACE arms now
@@ -2134,8 +2136,18 @@ begin
      and (sqlite3GlobalConfig.inProgress = 0) then begin
     sqlite3GlobalConfig.inProgress := 1;
 
-    { Reset the global builtin-functions hash and re-populate. }
-    FillChar(sqlite3BuiltinFunctions, SizeOf(sqlite3BuiltinFunctions), 0);
+    { Populate the global builtin-functions hash.  Unlike C main.c:286..287
+      we do NOT FillChar(sqlite3BuiltinFunctions, ...) here: the Pascal
+      port's sqlite3RegisterBuiltinFunctions is idempotent (guarded by
+      registerBuiltinFunctionsDone and equivalents for date/json/window/
+      alter/analyze) because the bucket-chain links live in the static
+      aBuiltinFuncs[] / aBuiltinAgg[] FuncDef arrays themselves.  Zeroing
+      the hash heads then bailing out of the idempotent register would
+      leave an empty hash — every subsequent sqlite3FindFunction returns
+      nil and the connection sees "no such function: length", "zeroblob",
+      etc. after a sqlite3_shutdown / sqlite3_initialize cycle
+      (9.4.divbug.66 — exposed by test_set_config_pagecache invoked by
+      zeroblob.test, percentile, regexp1/2, tkt3918, without_rowid1/6/7). }
     sqlite3RegisterBuiltinFunctions;
 
     if sqlite3GlobalConfig.isPCacheInit = 0 then
@@ -3005,13 +3017,78 @@ end;
   for now any caller-side error simply sets pData^.rc to a corruption
   code, which is exactly what the surrounding sqlite3InitCallback
   branches need to ferry the failure out through OP_ParseSchema. }
-procedure initCorruptSchema(pData: PInitData; {%H-}argv: PPAnsiChar;
-                            {%H-}zExtra: PAnsiChar);
+procedure initCorruptSchema(pData: PInitData; argv: PPAnsiChar;
+                            zExtra: PAnsiChar);
+var
+  db        : PTsqlite3;
+  zObj      : PAnsiChar;
+  z, z2     : PAnsiChar;
+  zAlterTyp : PAnsiChar;
+  zArg0     : PAnsiChar;
+  zArg1     : PAnsiChar;
 begin
-  if pData^.db^.mallocFailed <> 0 then
-    pData^.rc := SQLITE_NOMEM
-  else
-    pData^.rc := SQLITE_CORRUPT;
+  db := pData^.db;
+  if db^.mallocFailed <> 0 then begin
+    pData^.rc := SQLITE_NOMEM;
+    Exit;
+  end;
+  { Faithful port of prepare.c:22 corruptSchema.
+    - keep any pre-existing message (prepare.c:30..31);
+    - ALTER reparse paths wrap the failure as
+      "error in <type> <name> after <kind>: <extra>" (prepare.c:32..44);
+    - SQLITE_WriteSchema swallows the message and forces CORRUPT
+      (prepare.c:45..46);
+    - otherwise format "malformed database schema (<NAME>) [- <extra>]"
+      into pData^.pzErrMsg^ (prepare.c:47..52). }
+  if (pData^.pzErrMsg <> nil) and (pData^.pzErrMsg^ <> nil)
+     and (pData^.pzErrMsg^[0] <> #0) then begin
+    { prior message wins }
+  end else if (pData^.mInitFlags and INITFLAG_AlterMask) <> 0 then begin
+    { ALTER-reparse arm — prepare.c:32..44.
+      argv[0] = type, argv[1] = name. }
+    case (pData^.mInitFlags and INITFLAG_AlterMask) of
+      INITFLAG_AlterRename:   zAlterTyp := 'rename';
+      INITFLAG_AlterDrop:     zAlterTyp := 'drop column';
+      INITFLAG_AlterAdd:      zAlterTyp := 'add column';
+      INITFLAG_AlterDropCons: zAlterTyp := 'drop constraint';
+    else
+      zAlterTyp := '?';
+    end;
+    if argv <> nil then begin
+      zArg0 := argv^;
+      zArg1 := (argv + 1)^;
+    end else begin
+      zArg0 := nil;
+      zArg1 := nil;
+    end;
+    if zArg0 = nil then zArg0 := '?';
+    if zArg1 = nil then zArg1 := '?';
+    if zExtra = nil then zExtra := '';
+    if pData^.pzErrMsg <> nil then begin
+      sqlite3DbFree(db, pData^.pzErrMsg^);
+      pData^.pzErrMsg^ := sqlite3MPrintf(db,
+        'error in %s %s after %s: %s',
+        [zArg0, zArg1, zAlterTyp, zExtra]);
+    end;
+    pData^.rc := SQLITE_ERROR;
+    Exit;
+  end else if (db^.flags and SQLITE_WriteSchema) <> 0 then begin
+    { writable_schema → no formatted message }
+  end else if pData^.pzErrMsg <> nil then begin
+    if (argv <> nil) and ((argv + 1)^ <> nil) then
+      zObj := (argv + 1)^
+    else
+      zObj := PAnsiChar('?');
+    z := sqlite3MPrintf(db, 'malformed database schema (%s)', [zObj]);
+    if (zExtra <> nil) and (zExtra[0] <> #0) then begin
+      z2 := sqlite3MPrintf(db, '%s - %s', [z, zExtra]);
+      sqlite3DbFree(db, z);
+      z := z2;
+    end;
+    sqlite3DbFree(db, pData^.pzErrMsg^);
+    pData^.pzErrMsg^ := z;
+  end;
+  pData^.rc := SQLITE_CORRUPT;
 end;
 
 { Faithful port of prepare.c:96 sqlite3InitCallback.
@@ -3166,7 +3243,8 @@ function sqlite3InitOne(db: PTsqlite3; iDb: i32; pzErrMsg: PPAnsiChar;
                         mFlags: u32): i32; forward;
 
 function execParseSchemaImpl(db: PTsqlite3; iDb: i32;
-                             zWhere: PAnsiChar; {%H-}p5: u16): i32;
+                             zWhere: PAnsiChar; {%H-}p5: u16;
+                             pzErrMsg: PPAnsiChar): i32;
 var
   initData : TInitData;
   zSql     : PAnsiChar;
@@ -3188,7 +3266,7 @@ begin
   if zWhere = nil then begin
     sqlite3SchemaClear(db^.aDb[iDb].pSchema);
     db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
-    rc := sqlite3InitOne(db, iDb, nil, p5);
+    rc := sqlite3InitOne(db, iDb, pzErrMsg, p5);
     if rc = SQLITE_OK then
       db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
     Result := rc;
@@ -3231,7 +3309,7 @@ begin
   end;
   initData.db         := db;
   initData.iDb        := iDb;
-  initData.pzErrMsg   := nil;
+  initData.pzErrMsg   := pzErrMsg;
   initData.rc         := SQLITE_OK;
   initData.mInitFlags := 0;
   initData.nInitRow   := 0;
@@ -4976,6 +5054,7 @@ const
   SQLITE_TESTCTRL_BYTEORDER_OP            = 22;
   SQLITE_TESTCTRL_ISINIT_OP               = 23;
   SQLITE_TESTCTRL_SORTER_MMAP_OP          = 24;
+  SQLITE_TESTCTRL_IMPOSTER_OP             = 25;
   SQLITE_TESTCTRL_PRNG_SEED_OP            = 28;
   SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP  = 29;
   SQLITE_TESTCTRL_TRACEFLAGS_OP           = 31;
@@ -5138,6 +5217,38 @@ end;
 function sqlite3_test_control(op: i32; pVal: Pi32): i32; cdecl;
 begin
   Result := testCtrlImpl(op, 0, Pointer(pVal), nil, nil);
+end;
+
+{ main.c:4593..4625 — SQLITE_TESTCTRL_IMPOSTER(db, zDbName, mode, tnum).
+  Enables imposter mode on iDb so a single CREATE TABLE installs a fake
+  table reading an existing b-tree root.  mode=0 disables; with tnum>0
+  also reset all schemas so prior imposters disappear. }
+function sqlite3_test_control(op: i32; db: PTsqlite3; zDbName: PAnsiChar;
+                              mode: i32; tnum: i32): i32; cdecl;
+var
+  iDb: i32;
+begin
+  Result := 0;
+  if op <> SQLITE_TESTCTRL_IMPOSTER_OP then Exit;
+  if db = nil then Exit;
+  sqlite3_mutex_enter(db^.mutex);
+  iDb := sqlite3FindDbName(db, zDbName);
+  if iDb >= 0 then begin
+    db^.init.iDb     := u8(iDb);
+    db^.init.busy    := u8(mode);
+    { Pas Tsqlite3InitInfo.flags layout (passqlite3util.pas:422):
+      bit 1 ($02) = imposterTable "on" (corresponds to any non-zero
+      C `init.imposterTable` value); bit 2 ($04) = readonly arm
+      (corresponds to C `init.imposterTable>=2`).  C mode==1 sets
+      $02 alone, mode==2 sets $02|$04, mode==0 clears both. }
+    db^.init.flags := db^.init.flags and not u8($06);
+    if mode >= 1 then db^.init.flags := db^.init.flags or $02;
+    if mode >= 2 then db^.init.flags := db^.init.flags or $04;
+    db^.init.newTnum := u32(tnum);
+    if (db^.init.busy = 0) and (tnum > 0) then
+      sqlite3ResetAllSchemasOfConnection(db);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
 end;
 
 { ----------------------------------------------------------------------
@@ -6151,6 +6262,15 @@ initialization
   vdbeRunVacuum := @runVacuumImpl;
   passqlite3codegen.gSqlite3Init :=
     passqlite3codegen.TSqlite3InitFn(@sqlite3Init);
+  { 9.4.divbug.87.047 — wire sqlite3_busy_timeout for PragTyp_BUSY_TIMEOUT
+    write arm (codegen.pas can't `uses passqlite3main`). }
+  passqlite3codegen.gBusyTimeout :=
+    passqlite3codegen.TBusyTimeoutFn(@sqlite3_busy_timeout);
+  { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint + sqlite3WalDefaultHook
+    pointer for PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429). }
+  passqlite3codegen.gWalAutoCheckpoint :=
+    passqlite3codegen.TWalAutoCheckpointFn(@sqlite3_wal_autocheckpoint);
+  passqlite3codegen.gWalDefaultHook := @sqlite3WalDefaultHook;
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)
@@ -6161,6 +6281,12 @@ initialization
   { Phase 6.8.0 — wire sqlite3_prepare_v2 trampoline so the pragma vtab
     xFilter (codegen.pas) can prepare its synthesised PRAGMA statement. }
   passqlite3vdbe.gPrepareV2 := passqlite3vdbe.TPrepareV2Fn(@sqlite3_prepare_v2);
+
+  { Wire sqlite3Reprepare so passqlite3vdbe.sqlite3_step (vdbeapi.c:911
+    wrapper) can recompile the statement against a new schema on
+    SQLITE_SCHEMA — required for backup-induced schema changes to surface
+    as SQLITE_ERROR ("no such table") rather than CORRUPT (backup5-1.6). }
+  passqlite3vdbe.gReprepare := @sqlite3Reprepare;
 
   { Phase 6.27 — wire sqlite3_exec into codegen's analysisLoadTrampoline so
     the sqlite_stat1 SELECT (analyze.c:1974) lands real rows into the

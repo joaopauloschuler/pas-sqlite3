@@ -106,6 +106,20 @@ if [ "${SQLITE_ENABLE_STMT_SCANSTATUS:-0}" != "0" ]; then
   DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STMT_SCANSTATUS"
   echo "SQLITE_ENABLE_STMT_SCANSTATUS=${SQLITE_ENABLE_STMT_SCANSTATUS} — passing -dSQLITE_ENABLE_STMT_SCANSTATUS to fpc (NCYCLE hwtime bracket enabled)."
 fi
+# 10.1.42.b.7.prereq.a — opt-in SQLITE_ENABLE_STAT4 gate.  Adds the
+# IndexSample record + 5 STAT4 tail fields to TIndex (passqlite3codegen.pas
+# near :1109).  Default-off because the collection arms (prereq.b) and
+# the where.c estimators (prereq.c) are not yet ported; flipping this
+# at the prereq.a boundary lights up the record-shape only.  Opt in
+# with:
+#   STAT4=1 ./src/tests/build.sh
+# Mirrors the SQLITE_ENABLE_STMT_SCANSTATUS pattern above; upstream
+# uses -DSQLITE_ENABLE_STAT4 in CFLAGS to flip the same switch
+# tree-wide.
+if [ "${STAT4:-0}" != "0" ]; then
+  DEBUG_FLAGS="$DEBUG_FLAGS -dSQLITE_ENABLE_STAT4"
+  echo "STAT4=${STAT4} — passing -dSQLITE_ENABLE_STAT4 to fpc (IndexSample + Index2 STAT4 fields enabled)."
+fi
 FPC_FLAGS="-O3 $DEBUG_FLAGS -Fu$SRC_DIR -Fu$SCRIPT_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {
@@ -204,6 +218,7 @@ compile_test TestShellArchive
 compile_test TestShellDbinfo
 compile_test TestShellFilectrl
 compile_test TestShellMisc
+compile_test TestCliParity
 compile_test TestVtabLateral
 compile_test TestExplainParity
 compile_test TestBytecodeParity

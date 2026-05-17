@@ -28,6 +28,8 @@ uses
   TestModuleFunc,
   TestModuleMalloc,
   TestModuleIoerr,
+  TestModuleCrash,
+  TestModuleVfs,
   PasTclSqlite;
 
 exports

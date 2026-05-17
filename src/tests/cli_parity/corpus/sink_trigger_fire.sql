@@ -1,0 +1,18 @@
+-- kitchen sink: trigger fires + observe side effects
+CREATE TABLE src(id INTEGER PRIMARY KEY, v INTEGER);
+CREATE TABLE log(id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, v INTEGER);
+CREATE TRIGGER ai AFTER INSERT ON src BEGIN
+  INSERT INTO log(op, v) VALUES('ins', NEW.v);
+END;
+CREATE TRIGGER au AFTER UPDATE ON src BEGIN
+  INSERT INTO log(op, v) VALUES('upd', NEW.v);
+END;
+CREATE TRIGGER ad AFTER DELETE ON src BEGIN
+  INSERT INTO log(op, v) VALUES('del', OLD.v);
+END;
+INSERT INTO src VALUES(1,10),(2,20),(3,30);
+UPDATE src SET v=v+1 WHERE id=2;
+DELETE FROM src WHERE id=3;
+.headers on
+.mode list
+SELECT id, op, v FROM log ORDER BY id;

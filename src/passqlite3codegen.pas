@@ -403,6 +403,13 @@ type
   PWhereMaskSet = ^TWhereMaskSet;
   PTable2   = ^TTable;   { upgraded from Pointer stub — TTable defined below }
   PIndex2   = ^TIndex;   { upgraded from Pointer stub — TIndex defined below }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  PIndexSample = ^TIndexSample;   { 10.1.42.b.7.prereq.a — STAT4 sample header }
+  { tRowcnt u64-array view; impl-section duplicate is preserved as-is. }
+  TRowCntArr = array[0..1024*1024-1] of u64;
+  PRowCntArr = ^TRowCntArr;
+  PRowcnt    = ^u64;             { tRowcnt scalar pointer — used by Stat4 estimators }
+  {$ENDIF}
   PColumn   = ^TColumn;
   PPColumn  = ^PColumn;
   PKeyInfo2 = ^TKeyInfo;  { TKeyInfo defined below; avoids shadowing vdbe.pas PKeyInfo=Pointer }
@@ -1102,10 +1109,33 @@ type
     aHx:        array[0..15] of u8; { 16 bytes @ 104 }
   end;
 
-  { --- TIndex (sizeof=112) --- }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { --- TIndexSample (analyze.c:2856..2862; sizeof=32 with tRowcnt=u64) ---
+    10.1.42.b.7.prereq.a — bare record only; collection arms in prereq.b.
+      void    *p          @ 0    sampled record bytes (sqlite3DbMalloc'd)
+      int      n          @ 8    record length
+      tRowcnt *anEq       @ 16   per-prefix equality counts  (tRowcnt = u64)
+      tRowcnt *anLt       @ 24   per-prefix less-than counts
+      tRowcnt *anDLt      @ 32   per-prefix distinct-less-than counts
+    Trailing pointer triplet (anEq/anLt/anDLt) lives in a single allocation
+    sized 3*nSampleCol*sizeof(tRowcnt); prereq.b wires that. }
+  TIndexSample = record
+    p:     Pointer;   { 8 bytes @ 0  — sampled record blob }
+    n:     i32;       { 4 bytes @ 8  — record length }
+    _pad12: i32;      { 4 bytes @ 12 — natural alignment before pointer trio }
+    anEq:  ^u64;      { 8 bytes @ 16 — tRowcnt = u64 in this build }
+    anLt:  ^u64;      { 8 bytes @ 24 }
+    anDLt: ^u64;      { 8 bytes @ 32 }
+  end;
+  {$ENDIF}
+
+  { --- TIndex (sizeof=112 default; +40 under SQLITE_ENABLE_STAT4) --- }
   { Bitfield group at offset 100 (4-byte bitfield storage unit):
     idxType(2)+bUnordered(1)+uniqNotNull(1)+isResized(1)+isCovering(1)+
-    noSkipScan(1)+hasStat1(1)+bNoQuery(1)+bAscKeyBug(1)+bHasVCol(1)+bHasExpr(1) }
+    noSkipScan(1)+hasStat1(1)+bNoQuery(1)+bAscKeyBug(1)+bHasVCol(1)+bHasExpr(1)
+    STAT4 tail (sqliteInt.h:2819..2825) appears after colNotIdxed when
+    -dSQLITE_ENABLE_STAT4 is in flight; default-off keeps the layout at
+    exactly 112 bytes (TestWhereBasic T28). }
   TIndex = record
     zName:         PAnsiChar;   { 8 bytes @ 0 }
     aiColumn:      Pi16;        { 8 bytes @ 8 }
@@ -1126,6 +1156,20 @@ type
     _pad99:        u8;          { 1 byte  @ 99 (padding before bitfield unit) }
     idxFlags:      u32;         { 4 bytes @ 100: packed bitfields }
     colNotIdxed:   Bitmask;     { 8 bytes @ 104 }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { 10.1.42.b.7.prereq.a/c.6 — STAT4 tail (sqliteInt.h:2819..2826).
+      Layout: nSample/mxSample/nSampleCol pack into 12 bytes (with 4-byte
+      tail pad), then 4x 8-byte pointers/u64 — total 48 bytes contributed
+      at default 8-byte struct alignment. }
+    nSample:     i32;            { 4 bytes — # elements in aSample[] }
+    mxSample:    i32;            { 4 bytes — slots allocated to aSample[] }
+    nSampleCol:  i32;            { 4 bytes — width of IndexSample.anEq[] etc. }
+    _padStat4:   i32;            { 4 bytes — natural alignment before pointers }
+    aAvgEq:      ^u64;           { 8 bytes — tRowcnt avg-nEq for keys not in aSample }
+    aSample:     PIndexSample;   { 8 bytes — left-most-key sample vector }
+    aiRowEst:    ^u64;           { 8 bytes — non-log stat1 row counts per prefix (prereq.c.6) }
+    nRowEst0:    u64;            { 8 bytes — non-log total rows in index (prereq.c.6) }
+    {$ENDIF}
   end;
 
   { --- TKeyInfo (sizeof=32; aColl[FLEXARRAY] follows) --- }
@@ -1418,7 +1462,7 @@ type
     _padScan:    i32;          { 4 bytes @ 124 (8-byte align of trailer) }
   end;
 
-  { --- TWhereLoopBuilder (sizeof=40) --- }
+  { --- TWhereLoopBuilder (sizeof=40 base; +16 under STAT4 for pRec/nRecValid) --- }
   TWhereLoopBuilder = record
     pWInfo:     PWhereInfo;    { 8 bytes @ 0 }
     pWC:        PWhereClause;  { 8 bytes @ 8 }
@@ -1428,6 +1472,16 @@ type
     bldFlags2:  u8;            { 1 byte  @ 33 }
     _pad34:     u16;           { 2 bytes @ 34 }
     iPlanLimit: u32;           { 4 bytes @ 36 }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { 10.1.42.b.7.prereq.c.9 — STAT4 probe state carried across the
+      whereLoopAddBtreeIndex recursion.  pRec is the UnpackedRecord
+      progressively populated by sqlite3Stat4ProbeSetValue; nRecValid is
+      the number of leading index columns for which pRec carries an
+      extracted value (where.c whereInt.h:330..331). }
+    pRec:       PUnpackedRecord;  { 8 bytes @ 40 }
+    nRecValid:  i32;              { 4 bytes @ 48 }
+    _padSTAT4:  i32;              { 4 bytes @ 52 — alignment }
+    {$ENDIF}
   end;
 
   { --- TWhereInfo (sizeof=856 base; a[FLEXARRAY] of TWhereLevel follows) --- }
@@ -1579,6 +1633,7 @@ const
   WHERE_GROUPBY          = u16($0040);
   WHERE_DISTINCTBY       = u16($0080);
   WHERE_WANT_DISTINCT    = u16($0100);
+  WHERE_AGG_DISTINCT     = u16($0400);
   WHERE_SORTBYGROUP      = u16($0200);
   WHERE_ORDERBY_LIMIT    = u16($0800);
   WHERE_RIGHT_JOIN       = u16($1000);
@@ -1611,6 +1666,7 @@ const
   SQLITE_SkipScan       = u32($00004000);
   SQLITE_SeekScan       = u32($00020000);
   SQLITE_BloomFilter    = u32($00080000);
+  SQLITE_IndexedExpr    = u32($01000000);  { Pull exprs from index (sqliteInt.h:1926) }
   SQLITE_BloomPulldown  = u32($00100000);  { Run Bloom filters early (sqliteInt.h:1921) }
   SQLITE_OnePass        = u32($08000000);
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
@@ -1646,6 +1702,9 @@ const
   TERM_IS        = u16($0800);
   TERM_VARSELECT = u16($1000);
   TERM_HEURTRUTH = u16($2000);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  TERM_HIGHTRUTH = u16($4000);  { whereInt.h:317 — only defined under STAT4 }
+  {$ENDIF}
   TERM_SLICE     = u16($8000);
 
   { SQLITE_BLDF* (WhereLoopBuilder bldFlags) }
@@ -1849,6 +1908,11 @@ function  whereIsCoveringIndex(pWInfo: PWhereInfo; pIdx: PIndex2;
 procedure whereIndexedExprCleanup(db: PTsqlite3; pObject: Pointer); cdecl;
 procedure wherePartIdxExpr(pParse: PParse; pIdx: PIndex2; pPart: PExpr;
   pMask: PBitmask; iIdxCur: i32; pItem: PSrcItem);
+procedure whereAddIndexedExpr(pParse: PParse; pIdx: PIndex2; iIdxCur: i32;
+  pTabItem: PSrcItem);
+function sqlite3IndexedExprLookup(pParse: PParse; pExpr: PExpr;
+  target: i32): i32;
+function sqlite3ExprCanReturnSubtype(pParse: PParse; pExpr: PExpr): i32;
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — auto-index pre-flight cluster
   (where.c:832..925).  Pure analysis helpers fed to whereLoopAddBtree's
@@ -1872,6 +1936,39 @@ function  columnIsGoodIndexCandidate(pTab: PTable2; iCol: i32): i32;
 function  termCanDriveIndex(pTerm: PWhereTerm; pSrc: PSrcItem;
   notReady: Bitmask): i32;
 function  indexHasStat1(pIdx: PIndex2): i32; inline;
+
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ 10.1.42.b.7.prereq.c.7 — whereKeyStats (where.c:1718..1902).
+  Binary search over pIdx^.aSample[] returning an interpolated count vector
+  in aStat[0..1]: rows < pRec and rows == pRec.  Index returned identifies
+  the smallest virtual sample >= pRec (in the field-prefix-expanded space).
+  Consumers (prereq.c.8/.c.9): whereRangeSkipScanEst / whereEqualScanEst /
+  whereInScanEst. }
+function  whereKeyStats(pParse: PParse; pIdx: PIndex2;
+  pRec: PUnpackedRecord; roundUp: i32; aStat: PRowCntArr): i32;
+{ 10.1.42.b.7.prereq.c.8 — whereRangeSkipScanEst (where.c:1980..2049).
+  Sample-driven selectivity estimate for skip-scan range queries.  See
+  body comment near the implementation for details. }
+function  whereRangeSkipScanEst(pParse: PParse;
+                                pLower, pUpper: PWhereTerm;
+                                pLoop: PWhereLoop;
+                                pbDone: Pi32): i32;
+{ 10.1.42.b.7.prereq.c.9 — equality / IN sample-driven estimators
+  (where.c:2274..2330 and 2338..2380). }
+function  whereEqualScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                            pExpr: PExpr; pnRow: PRowcnt): i32;
+function  whereInScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                         pList: PExprList; pnRow: PRowcnt): i32;
+{ Interface forward — body lives later in implementation (vdbemem.c:2127). }
+function  sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
+                                    aff: u8;
+                                    apVal: PPointer): i32;
+{ Interface forward — body at vdbemem.c:2082..2115 port (impl section). }
+function  sqlite3Stat4ProbeSetValue(pParse: PParse; pIdx: PIndex;
+                                    ppRec: PPointer; pExpr: PExpr;
+                                    nElem, iVal: i32;
+                                    pnExtract: Pi32): i32;
+{$ENDIF}
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — UNIQUE-index DISTINCT cluster
   (where.c:583..627).  Two leaf helpers feeding the (b) branch of
@@ -2927,10 +3024,20 @@ type
     Allows codegen to drive on-disk schema reload without a circular
     use clause back into passqlite3main. }
   TSqlite3InitFn = function(db: PTsqlite3; pzErrMsg: PPAnsiChar): i32;
+  { 9.4.divbug.87.047 — wire sqlite3_busy_timeout (passqlite3main) into
+    PragTyp_BUSY_TIMEOUT write arm without circular uses. }
+  TBusyTimeoutFn = function(db: PTsqlite3; ms: i32): i32;
+  { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint (passqlite3main) and
+    sqlite3WalDefaultHook pointer into PragTyp_WAL_AUTOCHECKPOINT without
+    circular uses.  Both must be installed by passqlite3main at unit init. }
+  TWalAutoCheckpointFn = function(db: PTsqlite3; nFrame: i32): i32;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
   gSqlite3Init:      TSqlite3InitFn;
+  gBusyTimeout:      TBusyTimeoutFn;
+  gWalAutoCheckpoint: TWalAutoCheckpointFn;
+  gWalDefaultHook:   Pointer;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -3816,18 +3923,97 @@ end;
 { Phase 6.7 window stubs — real implementations follow at end of file }
 
 { Stubs for rename/auth/cleanup (Phase 6.5/6.6) }
+{ sqlite3AffinityType — port of build.c:1651..1717.  Scan zIn for the
+  substrings CHAR/CLOB/TEXT/BLOB/REAL/FLOA/DOUB/INT using a rolling 4-byte
+  lowercase hash; precedence is INT > TEXT-family > BLOB(only if still
+  NUMERIC/REAL) > REAL-family(only if NUMERIC).  Default NUMERIC.
+  The first-character switch was a stub that mis-ranked compound type
+  names like 'NATIONAL CHARACTER(15)' (→ NUMERIC) and 'LONG INTEGER'
+  (→ BLOB).  See 9.4.divbug.40.b. }
 function sqlite3AffinityType(zIn: PAnsiChar; pColl: Pointer): AnsiChar;
+var
+  h:     u32;
+  aff:   AnsiChar;
+  zChar: PAnsiChar;
+  pCol:  PColumn;
+  v:     i32;
+  x:     u8;
+  p:     PAnsiChar;
 begin
-  { Minimal implementation: recognise type names }
   if zIn = nil then begin Result := AnsiChar(SQLITE_AFF_BLOB); Exit; end;
-  case UpCase(Char(zIn[0])) of
-    'I': Result := AnsiChar(SQLITE_AFF_INTEGER);
-    'R', 'F', 'D': Result := AnsiChar(SQLITE_AFF_REAL);
-    'T', 'C', 'V': Result := AnsiChar(SQLITE_AFF_TEXT);
-    'N': Result := AnsiChar(SQLITE_AFF_NUMERIC);
-  else
-    Result := AnsiChar(SQLITE_AFF_BLOB);
+  h     := 0;
+  aff   := AnsiChar(SQLITE_AFF_NUMERIC);
+  zChar := nil;
+  p     := zIn;
+  while p^ <> #0 do
+  begin
+    x := u8(Byte(p^));
+    h := (h shl 8) + u32(u8(sqlite3UpperToLower[x]));
+    Inc(p);
+    if h = (u32(Ord('c')) shl 24) + (u32(Ord('h')) shl 16) + (u32(Ord('a')) shl 8) + u32(Ord('r')) then
+    begin
+      aff := AnsiChar(SQLITE_AFF_TEXT);
+      zChar := p;
+    end
+    else if h = (u32(Ord('c')) shl 24) + (u32(Ord('l')) shl 16) + (u32(Ord('o')) shl 8) + u32(Ord('b')) then
+      aff := AnsiChar(SQLITE_AFF_TEXT)
+    else if h = (u32(Ord('t')) shl 24) + (u32(Ord('e')) shl 16) + (u32(Ord('x')) shl 8) + u32(Ord('t')) then
+      aff := AnsiChar(SQLITE_AFF_TEXT)
+    else if (h = (u32(Ord('b')) shl 24) + (u32(Ord('l')) shl 16) + (u32(Ord('o')) shl 8) + u32(Ord('b')))
+        and ((aff = AnsiChar(SQLITE_AFF_NUMERIC)) or (aff = AnsiChar(SQLITE_AFF_REAL))) then
+    begin
+      aff := AnsiChar(SQLITE_AFF_BLOB);
+      if p^ = '(' then zChar := p;
+    end
+    else if (h = (u32(Ord('r')) shl 24) + (u32(Ord('e')) shl 16) + (u32(Ord('a')) shl 8) + u32(Ord('l')))
+        and (aff = AnsiChar(SQLITE_AFF_NUMERIC)) then
+      aff := AnsiChar(SQLITE_AFF_REAL)
+    else if (h = (u32(Ord('f')) shl 24) + (u32(Ord('l')) shl 16) + (u32(Ord('o')) shl 8) + u32(Ord('a')))
+        and (aff = AnsiChar(SQLITE_AFF_NUMERIC)) then
+      aff := AnsiChar(SQLITE_AFF_REAL)
+    else if (h = (u32(Ord('d')) shl 24) + (u32(Ord('o')) shl 16) + (u32(Ord('u')) shl 8) + u32(Ord('b')))
+        and (aff = AnsiChar(SQLITE_AFF_NUMERIC)) then
+      aff := AnsiChar(SQLITE_AFF_REAL)
+    else if (h and $00FFFFFF) = (u32(Ord('i')) shl 16) + (u32(Ord('n')) shl 8) + u32(Ord('t')) then
+    begin
+      aff := AnsiChar(SQLITE_AFF_INTEGER);
+      Break;
+    end;
   end;
+
+  pCol := PColumn(pColl);
+  if pCol <> nil then
+  begin
+    v := 0;
+    if u8(aff) < SQLITE_AFF_NUMERIC then
+    begin
+      if zChar <> nil then
+      begin
+        while zChar^ <> #0 do
+        begin
+          if sqlite3Isdigit(u8(Byte(zChar^))) <> 0 then
+          begin
+            { Inline minimal positive decimal parse for BLOB(k)/VARCHAR(k)/CHAR(k). }
+            v := 0;
+            while (zChar^ <> #0) and (sqlite3Isdigit(u8(Byte(zChar^))) <> 0) do
+            begin
+              v := v * 10 + (Ord(zChar^) - Ord('0'));
+              Inc(zChar);
+              if v > 1000000 then begin v := 1000000; Break; end;
+            end;
+            Break;
+          end;
+          Inc(zChar);
+        end;
+      end
+      else
+        v := 16;
+    end;
+    v := v div 4 + 1;
+    if v > 255 then v := 255;
+    pCol^.szEst := u8(v);
+  end;
+  Result := aff;
 end;
 
 { sqlite3ParserAddCleanup implemented in Phase 6.5 section below }
@@ -5184,6 +5370,7 @@ var
   c:     i32;
   value: i64;
   z:     PAnsiChar;
+  zMsg:  PAnsiChar;
 begin
   v := pParse^.pVdbe;
   if (pExpr^.flags and EP_IntValue) <> 0 then
@@ -5201,7 +5388,20 @@ begin
        or ((negFlag <> 0) and (value = i64($8000000000000000))) then
     begin
       if sqlite3_strnicmp(z, '0x', 2) = 0 then
-        sqlite3ErrorMsg(pParse, 'hex literal too big')
+      begin
+        { expr.c:4340..4341 — "hex literal too big: %s%#T".  %s is the
+          negFlag prefix ("-" or ""), %#T renders pExpr^.u.zToken
+          (printf.c:957..962).  Build via sqlite3MPrintf with a %s
+          surrogate for the zToken — we don't have a %#T Expr*
+          dispatch in the Pascal printf, and zToken is already in
+          hand so the substitution is byte-identical. }
+        if negFlag <> 0 then
+          zMsg := sqlite3MPrintf(pParse^.db, 'hex literal too big: -%s', [z])
+        else
+          zMsg := sqlite3MPrintf(pParse^.db, 'hex literal too big: %s', [z]);
+        sqlite3ErrorMsg(pParse, zMsg);
+        if zMsg <> nil then sqlite3DbFree(pParse^.db, zMsg);
+      end
       else
         codeReal(v, z, negFlag, iMem);
     end
@@ -5322,7 +5522,6 @@ begin
         only), so nExpr-1=2 → one iteration, then the else clause.
         iif(cond,a) with 2 args falls through to OP_Function (not registered
         inline). }
-      Assert(n = 3);
       items := ExprListItems(pFarg);
       i := sqlite3VdbeMakeLabel(pParse);   { endLabel }
       r1 := 0;                              { loop counter — pairs of WHEN/THEN }
@@ -5657,7 +5856,24 @@ begin
   done := False;
   repeat
     if pExpr = nil then op := TK_NULL
+    else if (pParse^.pIdxEpr <> nil)
+            and (not ExprHasProperty(pExpr, EP_Leaf)) then
+    begin
+      { expr.c:4946..4951 — try the indexed-expression lookup before
+        falling through to the per-op dispatch. }
+      r1 := sqlite3IndexedExprLookup(pParse, pExpr, target);
+      if r1 >= 0 then
+      begin
+        Result := r1;
+        done := True;
+        op := TK_NULL;  { unused — done short-circuits the loop }
+      end
+      else
+        op := pExpr^.op;
+    end
     else op := pExpr^.op;
+
+    if done then break;
 
     case op of
       TK_INTEGER:
@@ -6160,6 +6376,35 @@ begin
             done := True;
           end;
         end;
+    TK_SELECT_COLUMN:
+      begin
+        { Port of expr.c:5470..5484 — extract one column of a vector SELECT.
+          Generated by sqlite3ExprListAppendVector for the row-value SET form
+          "UPDATE t SET (a,b)=(SELECT x,y FROM ...)" and for vector IN.  The
+          pLeft TK_SELECT is materialised once (iTable=0 sentinel); subsequent
+          siblings reuse pLeft^.iTable as the first-result-register.  The
+          column-count check (pExpr^.iTable vs the SELECT arity) is also from
+          C since the parser deferred it when the RHS is TK_SELECT. }
+        pLeft := pExpr^.pLeft;
+        if (pLeft^.iTable = 0) or (i32(pParse^.withinRJSubrtn) > i32(pLeft^.op2)) then
+        begin
+          pLeft^.iTable := sqlite3CodeSubselect(pParse, pLeft);
+          pLeft^.op2 := pParse^.withinRJSubrtn;
+        end;
+        Assert((pLeft^.op = TK_SELECT) or (pLeft^.op = TK_ERROR));
+        n := sqlite3ExprVectorSize(pLeft);
+        if pExpr^.iTable <> n then
+        begin
+          z := sqlite3MPrintf(Psqlite3db(pParse^.db),
+            '%d columns assigned %d values', [pExpr^.iTable, n]);
+          if z <> nil then begin
+            sqlite3ErrorMsg(pParse, z);
+            sqlite3DbFree(pParse^.db, z);
+          end;
+        end;
+        Result := pLeft^.iTable + pExpr^.iColumn;
+        done := True;
+      end;
     TK_EXISTS, TK_SELECT:
       begin
         { Port of expr.c:5453..5468 — scalar subquery / EXISTS scalar codegen.
@@ -6342,6 +6587,48 @@ begin
         begin
           Result := pExpr^.pAggInfo^.iFirstReg + pExpr^.pAggInfo^.nColumn
                     + pExpr^.iAgg;
+          done := True;
+        end;
+      end;
+    TK_VECTOR:
+      begin
+        { Port of expr.c:5597..5600.  A bare row-value vector reached
+          codegen in scalar context — `SELECT (1,2)`, `(a,b)+1`, etc.
+          C raises "row value misused" and falls through (no OP). }
+        sqlite3ErrorMsg(pParse, 'row value misused');
+        done := True;
+      end;
+    TK_RAISE:
+      begin
+        { Port of expr.c:5727..5752 — RAISE(action, msg) inside a trigger
+          program.  Emits OP_Halt that the VDBE turns into the requested
+          conflict action (ROLLBACK/ABORT/FAIL/IGNORE).  Outside a trigger
+          (and not a nested parse) it is a hard error. }
+        if (pParse^.pTriggerTab = nil) and (pParse^.nested = 0) then
+        begin
+          sqlite3ErrorMsg(pParse,
+            'RAISE() may only be used within a trigger-program');
+          Result := 0;
+          done := True;
+        end
+        else
+        begin
+          if pExpr^.affExpr = AnsiChar(OE_Abort) then
+            sqlite3MayAbort(pParse);
+          if pExpr^.affExpr = AnsiChar(OE_Ignore) then
+          begin
+            sqlite3VdbeAddOp2(v, OP_Halt, SQLITE_OK, OE_Ignore);
+          end
+          else
+          begin
+            r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+            if pParse^.pTriggerTab <> nil then
+              sqlite3VdbeAddOp3(v, OP_Halt, SQLITE_CONSTRAINT_TRIGGER,
+                                i32(Ord(pExpr^.affExpr)), r1)
+            else
+              sqlite3VdbeAddOp3(v, OP_Halt, SQLITE_ERROR,
+                                i32(Ord(pExpr^.affExpr)), r1);
+          end;
           done := True;
         end;
       end;
@@ -8399,23 +8686,58 @@ end;
   instead of raising "no such column: hello" the way the C reference
   does (and the way SELECT hello FROM t already does via the heavier
   sqlite3ResolveSelectNames walker). }
-procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr);
+procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr; ncIsDDL: Boolean);
 var
   i:      i32;
   pList_: PExprList;
   pFnDef: PTFuncDef;
+  dqsOK:  Boolean;
+  dbFlags: u64;
 begin
   if pE = nil then Exit;
   if pParse = nil then Exit;
   if pParse^.nErr > 0 then Exit;
   if pE^.op = TK_ID then
   begin
+    { 9.4.divbug.70 — port resolve.c:719..746 areDoubleQuotedStringsEnabled.
+      Before erroring on an unresolved bare TK_ID, if it carries EP_DblQuoted
+      and DQS is enabled for the current context (DDL vs DML), demote to
+      TK_STRING so it lexes as a legacy string literal.  DDL context (CHECK
+      constraints, CREATE INDEX expressions) accepts DqsDDL, or
+      (writable_schema && DqsDML).  DML context accepts DqsDML. }
+    if (pE^.flags and EP_DblQuoted) <> 0 then
+    begin
+      dbFlags := pParse^.db^.flags;
+      if ncIsDDL then
+      begin
+        dqsOK := (sqlite3WritableSchema(pParse^.db) <> 0)
+                 and ((dbFlags and u64($40000000)) <> 0);
+        if not dqsOK then
+          dqsOK := (dbFlags and u64($20000000)) <> 0;
+      end
+      else
+        dqsOK := (dbFlags and u64($40000000)) <> 0;
+      if dqsOK then
+      begin
+        pE^.op := TK_STRING;
+        FillChar(pE^.y, SizeOf(pE^.y), 0);
+        Exit;
+      end;
+    end;
     if sqlite3ExprIdToTrueFalse(pE) = 0 then
     begin
       if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
       begin
-        sqlite3ErrorMsg(pParse,
-          PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+        { resolve.c:789..793 — append "should this be a string literal in
+          single-quotes?" hint when the bare identifier was double-quoted. }
+        if (pE^.flags and EP_DblQuoted) <> 0 then
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: "'
+                      + AnsiString(pE^.u.zToken)
+                      + '" - should this be a string literal in single-quotes?'))
+        else
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
       end;
     end;
@@ -8475,14 +8797,14 @@ begin
     end;
   end;
   if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
-  flagUnresolvedTKID(pParse, pE^.pLeft);
-  flagUnresolvedTKID(pParse, pE^.pRight);
+  flagUnresolvedTKID(pParse, pE^.pLeft, ncIsDDL);
+  flagUnresolvedTKID(pParse, pE^.pRight, ncIsDDL);
   if (pE^.flags and EP_xIsSelect) = 0 then
   begin
     pList_ := pE^.x.pList;
     if pList_ <> nil then
       for i := 0 to pList_^.nExpr - 1 do
-        flagUnresolvedTKID(pParse, ExprListItems(pList_)[i].pExpr);
+        flagUnresolvedTKID(pParse, ExprListItems(pList_)[i].pExpr, ncIsDDL);
   end;
 end;
 
@@ -8544,22 +8866,60 @@ end;
 
 { resolveUpsertExcludedRefs — walk pE rewriting any excluded.<col> qualified
   references against pUpsert->pUpsertSrc->a[0].pSTab.  Mirrors resolve.c
-  lookupName's NC_UUpsert arm (resolve.c:547..588). }
-procedure resolveUpsertExcludedRefs(pUpsert: PUpsert; pE: PExpr);
+  lookupName's NC_UUpsert arm (resolve.c:547..588).
+
+  C resolve.c:522 only enters this arm when the qualified name failed to
+  match any table in pSrcList (`cnt==0`).  Hence if the *outer* SrcList
+  contains a real table aliased/named "excluded" (the very case
+  upsert3-200 exercises — `CREATE TABLE excluded(...)`), the standard
+  resolver wins and `excluded.c` reads the existing row's c rather than
+  the proposed-insert register.  Bug 9.4.divbug.74 was an unconditional
+  rewrite that bypassed that precedence. }
+procedure resolveUpsertExcludedRefs(pNC: PNameContext; pE: PExpr); forward;
+
+function upsertExcludedShadowed(pSrc: PSrcList): Boolean;
 var
-  pItem:  PSrcItem;
-  iCol:   i32;
-  pList:  PExprList;
   i:      i32;
-  items:  PExprListItem;
+  sItems: PSrcItem;
+  zNm:    PAnsiChar;
 begin
-  if (pE = nil) or (pUpsert = nil) or (pUpsert^.pUpsertSrc = nil) then Exit;
+  Result := False;
+  if (pSrc = nil) or (pSrc^.nSrc <= 0) then Exit;
+  sItems := SrcListItems(pSrc);
+  if sItems = nil then Exit;
+  for i := 0 to pSrc^.nSrc - 1 do
+  begin
+    if sItems[i].zAlias <> nil then
+      zNm := sItems[i].zAlias
+    else
+      zNm := sItems[i].zName;
+    if (zNm <> nil) and (sqlite3StrICmp(zNm, 'excluded') = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure resolveUpsertExcludedRefs(pNC: PNameContext; pE: PExpr);
+var
+  pUps:  PUpsert;
+  pItem: PSrcItem;
+  iCol:  i32;
+  pList: PExprList;
+  i:     i32;
+  items: PExprListItem;
+begin
+  if (pE = nil) or (pNC = nil) then Exit;
+  pUps := pNC^.uNC.pUpsert;
+  if (pUps = nil) or (pUps^.pUpsertSrc = nil) then Exit;
   if (pE^.op = TK_DOT)
      and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
      and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
-     and (sqlite3StrICmp(pE^.pLeft^.u.zToken, 'excluded') = 0) then
+     and (sqlite3StrICmp(pE^.pLeft^.u.zToken, 'excluded') = 0)
+     and (not upsertExcludedShadowed(pNC^.pSrcList)) then
   begin
-    pItem := SrcListItems(pUpsert^.pUpsertSrc);
+    pItem := SrcListItems(pUps^.pUpsertSrc);
     if (pItem <> nil) and (pItem^.pSTab <> nil) then
     begin
       iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.u.zToken);
@@ -8571,28 +8931,28 @@ begin
       if (iCol >= -1) and (iCol < pItem^.pSTab^.nCol) then
       begin
         { Mirror resolve.c:574..587 — collapse excluded.<col> directly to
-          TK_REGISTER pointing at pUpsert->regData + iCol (storage order). }
+          TK_REGISTER pointing at pUps->regData + iCol (storage order). }
         pE^.op      := TK_REGISTER;
         pE^.op2     := TK_COLUMN;
         pE^.iColumn := i16(iCol);
         pE^.y.pTab  := pItem^.pSTab;
         { sqlite3TableColumnToStorage simplified — iCol<0 returns iCol;
           TF_HasVirtual not exercised in the upsert path. }
-        pE^.iTable  := pUpsert^.regData + iCol;
+        pE^.iTable  := pUps^.regData + iCol;
         pE^.pLeft   := nil;
         pE^.pRight  := nil;
         Exit;
       end;
     end;
   end;
-  if pE^.pLeft  <> nil then resolveUpsertExcludedRefs(pUpsert, pE^.pLeft);
-  if pE^.pRight <> nil then resolveUpsertExcludedRefs(pUpsert, pE^.pRight);
+  if pE^.pLeft  <> nil then resolveUpsertExcludedRefs(pNC, pE^.pLeft);
+  if pE^.pRight <> nil then resolveUpsertExcludedRefs(pNC, pE^.pRight);
   if not ExprUseXSelect(pE) and (pE^.x.pList <> nil) then
   begin
     pList := pE^.x.pList;
     items := ExprListItems(pList);
     for i := 0 to pList^.nExpr - 1 do
-      resolveUpsertExcludedRefs(pUpsert, items[i].pExpr);
+      resolveUpsertExcludedRefs(pNC, items[i].pExpr);
   end;
 end;
 
@@ -8837,6 +9197,48 @@ begin
   resolveSubqueryOuterRefs(pParse, pOuterSrc, pE^.pRight);
 end;
 
+{ 9.4.divbug.87.039 — rewriteTrueFalseAndTruth: always-on companion to
+  flagUnresolvedTKID that *only* performs the TK_ID→TK_TRUEFALSE and
+  TK_IS/TK_ISNOT+TK_TRUEFALSE→TK_TRUTH rewrites C does in resolveExprStep
+  (resolve.c:1402..1415 + resolve.c lookupName tail).  Unlike
+  flagUnresolvedTKID it never emits "no such column" errors, so it is safe
+  to invoke for contexts with no pSrcList (e.g. INSERT VALUES, where the
+  bare TK_ID 'true' otherwise stays as TK_ID and sqlite3ExprCode silently
+  emits OP_Null into the destination register).  Without this walk, single-
+  row `INSERT INTO t(c) VALUES(true)` stored NULL instead of 1, and any
+  `CHECK(c IS TRUE)` constraint then fired even on legitimate inserts. }
+procedure rewriteTrueFalseAndTruth(pE: PExpr);
+var
+  i: i32;
+  pList_: PExprList;
+begin
+  if pE = nil then Exit;
+  if pE^.op = TK_ID then
+  begin
+    sqlite3ExprIdToTrueFalse(pE);
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  rewriteTrueFalseAndTruth(pE^.pLeft);
+  rewriteTrueFalseAndTruth(pE^.pRight);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+        rewriteTrueFalseAndTruth(ExprListItems(pList_)[i].pExpr);
+  end;
+  if (pE^.op = TK_IS) or (pE^.op = TK_ISNOT) then
+  begin
+    if (pE^.pRight <> nil)
+       and (sqlite3ExprSkipCollateAndLikely(pE^.pRight)^.op = TK_TRUEFALSE) then
+    begin
+      pE^.op2 := pE^.op;
+      pE^.op  := TK_TRUTH;
+    end;
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -8846,13 +9248,30 @@ begin
     if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
       resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
     if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
-      resolveUpsertExcludedRefs(pNC^.uNC.pUpsert, pExpr);
+      resolveUpsertExcludedRefs(pNC, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
       resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr);
-    if pNC^.pParse <> nil then
+    { Unconditional TK_ID→TK_TRUEFALSE and TK_IS+TK_TRUEFALSE→TK_TRUTH
+      rewrite — port of resolve.c:1402..1415 and resolve.c lookupName tail.
+      Runs regardless of pSrcList so INSERT VALUES, CHECK, DEFAULT and any
+      other no-SrcList context still get TRUE/FALSE folded properly.  The
+      err-emitting leftover-sweep below remains pSrcList-gated. }
+    rewriteTrueFalseAndTruth(pExpr);
+    { 9.4.divbug.76 — when the current NameContext has no pSrcList (i.e. the
+      enclosing SELECT has no FROM clause, e.g. tkt3346-1.1's inner
+      `(SELECT x.b='alice' AS y)`), any leftover TK_DOT / bare TK_ID does
+      NOT necessarily mean the reference is bad — it may bind to an outer
+      NameContext.  Mirror resolve.c lookupName (resolve.c:341..706) which
+      walks pNC->pNext before raising the error.  Skip the leftover-sweep
+      here; the outer resolver (codegen.pas:10145..10162) will run
+      ResolveOuterRefs against the outer pSrc, and any genuinely unbound
+      reference is reported by the outer level's flagUnresolvedTKID. }
+    if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil)
+       and (pNC^.pSrcList^.nSrc > 0) then
     begin
-      flagUnresolvedTKID(pNC^.pParse, pExpr);
+      flagUnresolvedTKID(pNC^.pParse, pExpr,
+        (pNC^.ncFlags and NC_IsDDL) <> 0);
       if pNC^.pParse^.nErr > 0 then
       begin
         Result := SQLITE_ERROR; Exit;
@@ -8944,6 +9363,9 @@ end;
       error in that case. }
 procedure resolveAlias(pParse: PParse; pEList: PExprList; iCol: i32;
   pExpr: PExpr; nSubquery: i32); forward;
+
+procedure resolveOutOfRangeError(pParse: PParse; zType: PAnsiChar;
+  i: i32; mx: i32; pError: PExpr); forward;
 
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
@@ -9049,6 +9471,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     part matches pOuterSrc but NOT pInnerSrc.  Modifies the expr tree in
     place (converts matching TK_DOT to TK_COLUMN with the outer cursor).
     Used after detecting correlated references to fully bind them. }
+  procedure ResolveOuterRefsInList(pList: PExprList; pOuterSrc: PSrcList;
+                                   pInnerSrc: PSrcList); forward;
+
   procedure ResolveOuterRefs(pW: PExpr; pOuterSrc: PSrcList;
                               pInnerSrc: PSrcList);
   var
@@ -9132,6 +9557,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           for j := 0 to pW^.x.pList^.nExpr - 1 do
             ResolveOuterRefs(ExprListItems(pW^.x.pList)[j].pExpr,
                               pOuterSrc, pInnerSrc);
+        end;
+      end
+      else
+      begin
+        { 9.4.divbug.87.016 — recurse into x.pSelect so doubly-nested
+          correlated TK_DOT refs (e.g. innermost `t3.x=t1.id` inside an
+          outer subquery whose own pSrc is t2) get pre-resolved against
+          the outermost pOuterSrc.  The deeper SELECT's own pSrc takes
+          over as the "inner" filter so its own table aliases don't
+          get rewritten as outer.  Mirrors C's sqlite3WalkExpr →
+          sqlite3WalkSelect descent + lookupName pNC->pNext climb
+          (resolve.c:341..706, 1378..1390). }
+        if pW^.x.pSelect <> nil then
+        begin
+          ResolveOuterRefsInList(pW^.x.pSelect^.pEList,
+                                  pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefs(pW^.x.pSelect^.pWhere,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefs(pW^.x.pSelect^.pHaving,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefsInList(pW^.x.pSelect^.pGroupBy,
+                                  pOuterSrc, pW^.x.pSelect^.pSrc);
+          ResolveOuterRefsInList(pW^.x.pSelect^.pOrderBy,
+                                  pOuterSrc, pW^.x.pSelect^.pSrc);
         end;
       end;
     end;
@@ -9273,6 +9722,48 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     ResolveOuterIDs(pW^.pRight, pOuterSrc, pInnerSrc);
     if (pW^.flags and EP_xIsSelect) = 0 then
       ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc);
+  end;
+
+  { 9.4.divbug.87.019 — recursive deep walk of FROM-subquery interiors.
+    For each level of nested FROM-subquery, run ResolveOuterRefs /
+    ResolveOuterIDs against the OUTERmost pSrc so deeply-nested TK_DOT
+    and bare TK_ID outer refs (e.g. having-5.2's `Col0` two levels deep)
+    get pre-resolved before the inner per-Select resolver runs.  Mirrors
+    resolve.c's NameContext-chain walk (lookupName resolve.c:341..706)
+    which climbs pNC->pNext to arbitrary depth. }
+  procedure WalkDeepFromSubqueries(pSel: PSelect; pOuterSrc: PSrcList);
+  var
+    base_d: PSrcItem;
+    pIt_d:  PSrcItem;
+    j_d:    i32;
+    pDeep_: PSelect;
+  begin
+    if (pSel = nil) or (pSel^.pSrc = nil) or (pOuterSrc = nil) then Exit;
+    base_d := SrcListItems(pSel^.pSrc);
+    for j_d := 0 to pSel^.pSrc^.nSrc - 1 do
+    begin
+      pIt_d := PSrcItem(PByte(base_d) + j_d * SizeOf(TSrcItem));
+      if (pIt_d^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
+      if pIt_d^.u4.pSubq = nil then Continue;
+      pDeep_ := pIt_d^.u4.pSubq^.pSelect;
+      while pDeep_ <> nil do
+      begin
+        ResolveOuterRefsInList(pDeep_^.pEList,   pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefs(pDeep_^.pWhere,         pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefs(pDeep_^.pHaving,        pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefsInList(pDeep_^.pGroupBy, pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterRefsInList(pDeep_^.pOrderBy, pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDsInList(pDeep_^.pEList,    pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDs(pDeep_^.pWhere,          pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDs(pDeep_^.pHaving,         pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDsInList(pDeep_^.pGroupBy,  pOuterSrc, pDeep_^.pSrc);
+        ResolveOuterIDsInList(pDeep_^.pOrderBy,  pOuterSrc, pDeep_^.pSrc);
+        { Recurse: this deep SELECT may itself have FROM-subqueries whose
+          interiors still reference the outermost pSrc. }
+        WalkDeepFromSubqueries(pDeep_, pOuterSrc);
+        pDeep_ := pDeep_^.pPrior;
+      end;
+    end;
   end;
 
   { 9.4.divbug.17 — nested-aggregate outward binding.  Mirrors the
@@ -9417,6 +9908,130 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                            pOuterSrc, pInnerSrc, bFound);
   end;
 
+  { Recursive helper for 9.4.divbug.59 — given a nested-from wrapper pWrap,
+    locate the pEList-index inside pWrap^.pSelect^.pEList that corresponds
+    to qualifier (zTab, zCol).  Each pEList entry is a TK_COLUMN whose
+    iTable refers to a SrcItem in the wrapper's own pSrc.  If that
+    referenced item is the leaf table named zTab, match by column index.
+    If it's itself a nested-from wrapper, recurse into it: that wrapper's
+    pSTab is built from its pEList so the inner index becomes the iColumn
+    referenced by the outer pEList entry. }
+  function FindWrapperEListIdx(pWrap: PSrcItem; zTab_, zCol_: PAnsiChar;
+    out idx_: i32): Boolean;
+  var
+    pSel:    PSelect;
+    pInnerS: PSrcList;
+    pInnerB: PSrcItem;
+    pE2:     PExpr;
+    pELst:   PExprList;
+    items_:  PExprListItem;
+    j, k:    i32;
+    pRef:    PSrcItem;
+    iInnerCol: i32;
+    subIdx:  i32;
+    iColL:   i32;
+  begin
+    Result := False;
+    if pWrap^.u4.pSubq = nil then Exit;
+    pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    pELst := pSel^.pEList;
+    pInnerS := pSel^.pSrc;
+    if (pELst = nil) or (pInnerS = nil) then Exit;
+    items_ := ExprListItems(pELst);
+    pInnerB := SrcListItems(pInnerS);
+    for j := 0 to pELst^.nExpr - 1 do
+    begin
+      pE2 := items_[j].pExpr;
+      if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Continue;
+      pRef := nil;
+      for k := 0 to pInnerS^.nSrc - 1 do
+      begin
+        pInnerB := SrcListItems(pInnerS);
+        Inc(pInnerB, k);
+        if pInnerB^.iCursor = pE2^.iTable then
+        begin pRef := pInnerB; Break; end;
+      end;
+      if pRef = nil then Continue;
+      iInnerCol := pE2^.iColumn;
+      { Leaf table reference? }
+      if ((pRef^.fg.fgBits2 and $40) = 0)
+         or ((pRef^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
+      begin
+        if pRef^.pSTab = nil then Continue;
+        { Match by alias-or-name on the leaf table. }
+        if pRef^.zAlias <> nil then
+        begin
+          if sqlite3StrICmp(pRef^.zAlias, zTab_) <> 0 then Continue;
+        end else if sqlite3StrICmp(pRef^.pSTab^.zName, zTab_) <> 0 then
+          Continue;
+        iColL := sqlite3ColumnIndex(pRef^.pSTab, zCol_);
+        if iColL <> iInnerCol then Continue;
+        idx_ := j;
+        Result := True;
+        Exit;
+      end
+      else
+      begin
+        { Inner item is itself a nested-from wrapper.  Its pSTab^.aCol[k]
+          is the k-th entry of its own pEList; recurse to find whether the
+          (zTab, zCol) maps to that k. }
+        if not FindWrapperEListIdx(pRef, zTab_, zCol_, subIdx) then Continue;
+        if subIdx <> iInnerCol then Continue;
+        idx_ := j;
+        Result := True;
+        Exit;
+      end;
+    end;
+  end;
+
+  { 9.4.divbug.59 — port of resolve.c:351..417 nested-from arm, adapted
+    to the Pas expandStar slice.  The C resolver matches zTab.zCol against
+    the wrapper's pEList via sqlite3MatchEName, then binds pE to
+    (pMatch->iCursor, j) — flattenSubquery later rewrites that to the inner
+    table cursor.  Pas expandStar produces TK_COLUMN entries (with inner
+    cursor / col already wired) but no zEName; so we locate the inner
+    (cursor, col, pTab) triple by walking the wrapper's pSrc, then find the
+    pEList entry whose TK_COLUMN refers to that triple and bind the outer
+    pE to (wrapper.iCursor, pEList-index, wrapper.pSTab).  After
+    flattenSubquery, the wrapper.iCursor binding is substituted to the inner
+    cursor; if flatten is skipped, the wrapper materialises and the read
+    from (wrapper.iCursor, j) yields the inner column value. }
+  function ResolveNestedFromDot(pItem: PSrcItem; pE: PExpr): Boolean;
+  var
+    pSel:     PSelect;
+    pEList_:  PExprList;
+    items:    PExprListItem;
+    j:        i32;
+    zCol_:    PAnsiChar;
+    zTab_:    PAnsiChar;
+  begin
+    Result := False;
+    pSel   := PSubquery(pItem^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    zCol_  := pE^.pRight^.u.zToken;
+    zTab_  := pE^.pLeft^.u.zToken;
+    j := -1;
+    if not FindWrapperEListIdx(pItem, zTab_, zCol_, j) then Exit;
+    pEList_ := pSel^.pEList;
+    if (pEList_ = nil) or (j < 0) or (j >= pEList_^.nExpr) then Exit;
+    items := ExprListItems(pEList_);
+    pE^.op      := TK_COLUMN;
+    pE^.iTable  := pItem^.iCursor;
+    pE^.iColumn := i16(j);
+    pE^.y.pTab  := pItem^.pSTab;
+    pE^.pLeft   := nil;
+    pE^.pRight  := nil;
+    items[j].fg.eBits := items[j].fg.eBits or $40;  { bUsed }
+    if j < BMS - 1 then
+      pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
+    else
+      pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+    if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+      ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
+    Result := True;
+  end;
+
   procedure ResolveExpr(pE: PExpr);
   var
     pSrc:   PSrcList;
@@ -9432,6 +10047,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pMatch: PSrcItem;
     matchCol: i32;
     cnt:    i32;
+    pFJMatch: PExprList;  { 9.4.divbug.89.013 — FULL JOIN coalesce gather (resolve.c:297) }
+    effCol: i16;          { iCol with IPK→-1 alias applied (resolve.c:466) }
+    matchEffCol: i16;     { stored per-match effective column for extendFJMatch }
+    pNewFJ: PExpr;        { temp for synthesised coalesce arg expression }
+    pCompArm: PSelect;   { 9.4.divbug.75 — walks pInner^.pPrior chain }
+    pDeep: PSelect;      { 9.4.divbug.76 — walks FROM-subquery interior selects }
+    zDb: PAnsiChar;        { 9.4.divbug.87.058 — 3-part qualifier `db.tab.col` }
+    pDbSchema: Pointer;
   begin
     if pE = nil then Exit;
     { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
@@ -9445,6 +10068,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       pE^.iTable  := pItem^.iCursor;
       pE^.iColumn := pE^.iColumn - 1;
       pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+      if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+        ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
       Exit;
     end;
     { NEW.x / OLD.x trigger pseudo-table refs — bind against
@@ -9464,6 +10089,43 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       Mirrors resolve.c:lookupName qualified-ref handling. }
     if pE^.op = TK_DOT then
     begin
+      { 9.4.divbug.87.058 — three-part qualifier `db.tab.col`
+        (resolve.c:1083..1098 sqlite3ResolveExprNames TK_DOT arm).  Parser
+        builds TK_DOT(TK_ID(db), TK_DOT(TK_ID(tab), TK_ID(col))).  Validate
+        the schema name; if known, rewrite pE in place to the 2-part shape
+        and remember the schema so the per-SrcItem loop can require it. }
+      pDbSchema := nil;
+      if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+         and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_DOT)
+         and (pE^.pRight^.pLeft <> nil) and (pE^.pRight^.pLeft^.op = TK_ID)
+         and (pE^.pRight^.pRight <> nil) and (pE^.pRight^.pRight^.op = TK_ID)
+         and (pParse^.db <> nil) then
+      begin
+        zDb := pE^.pLeft^.u.zToken;
+        if zDb <> nil then
+        begin
+          for i := 0 to pParse^.db^.nDb - 1 do
+          begin
+            if (pParse^.db^.aDb[i].zDbSName <> nil)
+               and (sqlite3StrICmp(pParse^.db^.aDb[i].zDbSName, zDb) = 0) then
+            begin
+              pDbSchema := pParse^.db^.aDb[i].pSchema;
+              Break;
+            end;
+          end;
+          if (pDbSchema = nil) and (sqlite3StrICmp(zDb, 'main') = 0)
+             and (pParse^.db^.nDb > 0) then
+            pDbSchema := pParse^.db^.aDb[0].pSchema;
+        end;
+        if pDbSchema <> nil then
+        begin
+          { Collapse to 2-part: discard the db node, hoist the inner TK_DOT
+            arms.  The inner TK_DOT node itself is leaked into the parse
+            arena (freed at parse end); pLeft/pRight TK_IDs reattach. }
+          pE^.pLeft  := pE^.pRight^.pLeft;
+          pE^.pRight := pE^.pRight^.pRight;
+        end;
+      end;
       if (p^.pSrc <> nil)
          and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
@@ -9474,6 +10136,26 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
+          { 9.4.divbug.87.058 — when zDb was supplied, skip sources whose
+            table belongs to a different schema (resolve.c:420..425). }
+          if (pDbSchema <> nil) and (pItem^.pSTab^.pSchema <> pDbSchema) then
+            Continue;
+          { 9.4.divbug.59 — nested-from arm (resolve.c:351..417).
+            When a parenthesised FROM-clause subset becomes one SrcItem with
+            SF_NestedFrom (e.g. `t1 JOIN (t2 JOIN t3 USING(a)) USING(a)`),
+            the inner tables' qualified names (t2.a, t3.a) are not in
+            outer pSrc.  Each entry of the nested subquery's pEList carries
+            ENAME_TAB with zEName encoded as "[db.]tab.col" — sqlite3MatchEName
+            tests the triple.  Stop at first ENAME_TAB match with bUsingTerm
+            (USING-shared column, since both sides project the same span). }
+          if ((pItem^.fg.fgBits2 and $40) <> 0)  { isNestedFrom }
+             and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+             and (pItem^.u4.pSubq <> nil)
+             and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil)
+             and (PSubquery(pItem^.u4.pSubq)^.pSelect^.pEList <> nil) then
+          begin
+            if ResolveNestedFromDot(pItem, pE) then Exit;
+          end;
           if pItem^.zAlias <> nil then
           begin
             if sqlite3StrICmp(pItem^.zAlias, pE^.pLeft^.u.zToken) <> 0 then Continue;
@@ -9485,7 +10167,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           begin
             pE^.op      := TK_COLUMN;
             pE^.iTable  := pItem^.iCursor;
-            pE^.iColumn := i16(iCol);
+            { 9.4.divbug.30 — IPK alias to iColumn=-1 (resolve.c:871). }
+            if pItem^.pSTab^.iPKey = iCol then
+            begin
+              pE^.iColumn := i16(-1);
+              pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            end
+            else
+              pE^.iColumn := i16(iCol);
             pE^.y.pTab  := pItem^.pSTab;
             pE^.pLeft   := nil;
             pE^.pRight  := nil;
@@ -9493,6 +10182,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
             else
               pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+            { 9.4.divbug.87.040 — port resolve.c:509..511.  Columns from a
+              JT_LEFT/JT_LTORJ source can become NULL on outer-join misses;
+              flag so sqlite3ExprCanBeNull (expr.c:2982) returns true and
+              codeAllEqualityTerms emits the OP_IsNull skip-search guard. }
+            if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+              ExprSetProperty(pE, EP_CanBeNull);
             Exit;
           end;
           { 9.4.divbug.19 — qualified rowid alias (Tab.rowid / sp.oid).
@@ -9511,14 +10206,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             pE^.pLeft   := nil;
             pE^.pRight  := nil;
             pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+              ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
             Exit;
           end;
         end;
       end;
       { Unresolved TK_DOT — mirror resolve.c lookupName cnt==0 tail:
         emit "no such column: zTab.zCol" and stamp the offset so the
-        CLI caret marker can anchor under the qualifier. }
-      if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+        CLI caret marker can anchor under the qualifier.
+
+        9.4.divbug.76 — when this SELECT has no FROM clause (p^.pSrc=nil)
+        we cannot tell whether the qualifier names an outer table; the C
+        resolver in this case walks NC->pNext until a match is found or
+        until pNC is null and only then raises the error (resolve.c
+        lookupName loop @341..706).  The Pascal port's recursive
+        sqlite3SelectPrep at codegen.pas:26252 invokes us without an outer
+        NameContext, so we cannot resolve the qualifier here.  Defer the
+        error: leave the TK_DOT intact so the parent level's resolver
+        (which DOES see the outer pSrc via ResolveOuterRefs at
+        codegen.pas:10145..10162) gets a chance to bind it.  If it remains
+        unresolved at codegen time the codegen path (sqlite3ExprCodeTarget)
+        raises the same "no such column" error against the parent. }
+      if (p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0)
+         and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
          and (pE^.pLeft^.u.zToken <> nil)
          and (pE^.pRight^.u.zToken <> nil) then
@@ -9538,6 +10249,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       cnt := 0;
       pMatch := nil;
       matchCol := 0;
+      matchEffCol := 0;
+      pFJMatch := nil;
       for i := 0 to pSrc^.nSrc - 1 do
       begin
         pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
@@ -9548,22 +10261,113 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           { 10.1.bug.97 — count matches across sources to detect ambiguous
             column refs (resolve.c lookupName:438..462).  USING-masked
             duplicates of the column on a non-RIGHT JOIN keep the
-            left-most match; otherwise cnt rises and we error below. }
+            left-most match; otherwise cnt rises and we error below.
+            9.4.divbug.87.042 — port the RIGHT arm of resolve.c:449..461.
+            9.4.divbug.89.013 — port the FULL JOIN coalesce arm via
+            extendFJMatch (resolve.c:208..223, 458..461). }
           if cnt > 0 then
           begin
             if ((pItem^.fg.fgBits2 and $08) <> 0)  { isUsing }
                and (sqlite3IdListIndex(pItem^.u3.pUsing,
-                      PAnsiChar(pE^.u.zToken)) >= 0)
-               and ((pItem^.fg.jointype and JT_RIGHT) = 0) then
-              Continue;
+                      PAnsiChar(pE^.u.zToken)) >= 0) then
+            begin
+              if (pItem^.fg.jointype and JT_RIGHT) = 0 then
+                Continue                                  { LEFT/INNER: keep left }
+              else if (pItem^.fg.jointype and JT_LEFT) = 0 then
+              begin
+                { Pure RIGHT JOIN: use the right-most table.
+                  resolve.c:455..457 — also drop any FULL-JOIN coalesce
+                  candidates accumulated to the left. }
+                cnt := 0;
+                if pFJMatch <> nil then
+                begin
+                  sqlite3ExprListDelete(pParse^.db, pFJMatch);
+                  pFJMatch := nil;
+                end;
+              end
+              else
+              begin
+                { FULL JOIN: synthesise a coalesce() arg pointing at the
+                  prior match.  resolve.c:459..460. }
+                pNewFJ := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+                if pNewFJ <> nil then
+                begin
+                  pNewFJ^.iTable  := pMatch^.iCursor;
+                  pNewFJ^.iColumn := matchEffCol;
+                  pNewFJ^.y.pTab  := pMatch^.pSTab;
+                  ExprSetProperty(pNewFJ, EP_CanBeNull);
+                  pFJMatch := sqlite3ExprListAppend(pParse, pFJMatch, pNewFJ);
+                end;
+              end;
+            end
+            else
+            begin
+              { Non-USING duplicate — genuine ambiguity.  resolve.c:443..447
+                clears pFJMatch and lets cnt rise so the tail emits the
+                "ambiguous column name" error. }
+              if pFJMatch <> nil then
+              begin
+                sqlite3ExprListDelete(pParse^.db, pFJMatch);
+                pFJMatch := nil;
+              end;
+            end;
           end;
           Inc(cnt);
           pMatch := pItem;
           matchCol := iCol;
+          { resolve.c:466 — IPK aliases to iColumn=-1. }
+          if pItem^.pSTab^.iPKey = iCol then
+            matchEffCol := i16(-1)
+          else
+            matchEffCol := i16(iCol);
+        end;
+      end;
+      { 9.4.divbug.89.013 — resolve.c:761..782.  If a FULL JOIN coalesce
+        set was accumulated and matches cnt-1, append the right-most
+        match and rewrite pE in place as TK_FUNCTION 'coalesce'. }
+      if (cnt > 1) and (pFJMatch <> nil) then
+      begin
+        if pFJMatch^.nExpr = cnt - 1 then
+        begin
+          pNewFJ := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+          if pNewFJ <> nil then
+          begin
+            pNewFJ^.iTable  := pMatch^.iCursor;
+            pNewFJ^.iColumn := matchEffCol;
+            pNewFJ^.y.pTab  := pMatch^.pSTab;
+            ExprSetProperty(pNewFJ, EP_CanBeNull);
+            pFJMatch := sqlite3ExprListAppend(pParse, pFJMatch, pNewFJ);
+          end;
+          if ExprHasProperty(pE, EP_Leaf) then
+            ExprClearProperty(pE, EP_Leaf)
+          else
+          begin
+            pE^.pLeft  := nil;  { TK_ID is leaf-shaped; no children to free }
+            pE^.pRight := nil;
+          end;
+          pE^.op       := TK_FUNCTION;
+          pE^.u.zToken := PAnsiChar('coalesce');
+          pE^.x.pList  := pFJMatch;
+          pFJMatch := nil;
+          { Mark every contributing source's colUsed (resolve.c:826..828
+            via the per-arg sqlite3ExprColUsed walk; emulate by setting
+            each arg's source).  The arg list itself was built with the
+            correct iTable/iColumn so subsequent passes set colUsed. }
+          Exit;
+        end
+        else
+        begin
+          sqlite3ExprListDelete(pParse^.db, pFJMatch);
+          pFJMatch := nil;
         end;
       end;
       if cnt > 1 then
       begin
+        if pFJMatch <> nil then
+        begin
+          sqlite3ExprListDelete(pParse^.db, pFJMatch);
+          pFJMatch := nil;
+        end;
         sqlite3ErrorMsg(pParse,
           PAnsiChar('ambiguous column name: ' + AnsiString(pE^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
@@ -9573,13 +10377,23 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         pE^.op      := TK_COLUMN;
         pE^.iTable  := pMatch^.iCursor;
-        pE^.iColumn := i16(matchCol);
+        { 9.4.divbug.30 — port resolve.c:863..887 (sqlite3CreateColumnExpr):
+          alias INTEGER PRIMARY KEY column to iColumn=-1.  Without this,
+          ORDER BY <ipk-name> diverges from C in wherePathSatisfiesOrderBy. }
+        if pMatch^.pSTab^.iPKey = matchCol then
+          pE^.iColumn := i16(-1)
+        else
+          pE^.iColumn := i16(matchCol);
         pE^.y.pTab  := pMatch^.pSTab;
         if matchCol < BMS - 1 then
           pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
         else
           pMatch^.colUsed := pMatch^.colUsed or
                              (Bitmask(1) shl (BMS - 1));
+        if pE^.iColumn = -1 then
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        if (pMatch^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+          ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
         Exit;
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 10 — rowid pseudo-column.
@@ -9602,6 +10416,24 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pE^.iColumn := i16(-1);
           pE^.y.pTab  := pItem^.pSTab;
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+          if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+            ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
+          Exit;
+        end;
+      end;
+      { 9.4.divbug.87.068 — port resolve.c:719..746.  Before erroring on an
+        unresolved bare TK_ID, if it carries EP_DblQuoted *and* DQS-DML is
+        enabled (sqlite3_db_config SQLITE_DBCONFIG_DQS_DML 1, default off in
+        modern builds), demote the identifier to TK_STRING so it lexes as a
+        legacy double-quoted string literal.  SELECTs are DML, hence the
+        DqsDML bit (areDoubleQuotedStringsEnabled, resolve.c:161..172). }
+      if (pE^.flags and EP_DblQuoted) <> 0 then
+      begin
+        if (pParse^.db^.init.busy <> 0)
+           or ((pParse^.db^.flags and u64($40000000)) <> 0) then
+        begin
+          pE^.op := TK_STRING;
+          FillChar(pE^.y, SizeOf(pE^.y), 0);
           Exit;
         end;
       end;
@@ -9612,8 +10444,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
         begin
-          sqlite3ErrorMsg(pParse,
-            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+          { resolve.c:789..793 — when the bare identifier was a
+            double-quoted string literal that failed column lookup,
+            append the "should this be a string literal in single-
+            quotes?" hint.  Otherwise plain "no such column: X". }
+          if (pE^.flags and EP_DblQuoted) <> 0 then
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: "'
+                        + AnsiString(pE^.u.zToken)
+                        + '" - should this be a string literal in single-quotes?'))
+          else
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
           { resolve.c:796 — record the offending token offset so the CLI
             caret marker can anchor under the column name. }
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
@@ -9626,12 +10468,29 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       emit "no such column: X" (resolve.c:784..795). }
     if pE^.op = TK_ID then
     begin
+      { 9.4.divbug.87.068 — same DQS demotion arm for the no-FROM path. }
+      if (pE^.flags and EP_DblQuoted) <> 0 then
+      begin
+        if (pParse^.db^.init.busy <> 0)
+           or ((pParse^.db^.flags and u64($40000000)) <> 0) then
+        begin
+          pE^.op := TK_STRING;
+          FillChar(pE^.y, SizeOf(pE^.y), 0);
+          Exit;
+        end;
+      end;
       if sqlite3ExprIdToTrueFalse(pE) = 0 then
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
         begin
-          sqlite3ErrorMsg(pParse,
-            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+          if (pE^.flags and EP_DblQuoted) <> 0 then
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: "'
+                        + AnsiString(pE^.u.zToken)
+                        + '" - should this be a string literal in single-quotes?'))
+          else
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
         end;
         Exit;
@@ -9688,6 +10547,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           sqlite3Select) returns immediately without re-processing. }
         pInner := pE^.x.pSelect;
         bCorr  := False;
+        { 9.4.divbug.87.019 — pre-resolve outer refs inside deeply nested
+          FROM-subqueries BEFORE expanding pInner.  sqlite3SelectExpand
+          recursively calls sqlite3SelectPrep on every FROM-subquery's
+          pSelect (codegen.pas:26617) which runs the per-Select resolver
+          on its WHERE/HAVING/etc — if a bare TK_ID there names an OUTER
+          column (e.g. having-5.2's `Col0` inside
+          `(SELECT * FROM (SELECT 1) WHERE Col0=1)` nested inside the
+          EXISTS subquery), that resolver raises "no such column" before
+          our post-expand WalkDeep ever runs.  Pre-binding those TK_IDs
+          to TK_COLUMN against the outermost pSrc closes the gap.  Safe
+          even though pDeep^.pSrc items haven't been expanded yet:
+          ColumnInSrcList loops items and Continues on pSTab=nil so the
+          inner-scope test still returns false for columns the inner FROM
+          really doesn't have. }
+        if (p^.pSrc <> nil)
+           and ((pInner^.selFlags and SF_HasTypeInfo) = 0) then
+        begin
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            WalkDeepFromSubqueries(pCompArm, p^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
+        end;
         { Step 1: expand inner pSrc (assign cursors to inner FROM tables). }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
           sqlite3SelectExpand(pParse, pInner);
@@ -9695,50 +10578,100 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pWhere) — correlation can live in pEList, pHaving, pGroupBy,
           pOrderBy.  Without this, an inner subquery whose ONLY outer
           reference is in (e.g.) the projection list would lose the
-          SF_Correlated marker. }
+          SF_Correlated marker.
+
+          9.4.divbug.75 — walk the entire compound pPrior chain so each
+          arm of a UNION/INTERSECT/EXCEPT subquery has its own outer-ref
+          scan against its own pSrc.  Without this, refs like `P.pk`
+          living in the LEFT arm of an EXCEPT subquery (select7-4.1) are
+          never tagged as correlated and the inner resolver later raises
+          "no such column: P.pk".  Mirrors resolve.c's per-Select walker
+          dispatch (resolve.c:1382..1388 lookups run per compound arm via
+          sqlite3WalkSelect descending pPrior). }
         if p^.pSrc <> nil then
         begin
-          if ExprListRefsOuterTable(pInner^.pEList,
-                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprRefsOuterTable(pInner^.pWhere,
-                                p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprRefsOuterTable(pInner^.pHaving,
-                                p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprListRefsOuterTable(pInner^.pGroupBy,
-                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprListRefsOuterTable(pInner^.pOrderBy,
-                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
-          { 10.1.bug.131 — also detect unqualified TK_ID outer refs. }
-          if ExprListRefsOuterID(pInner^.pEList,
-                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprRefsOuterID(pInner^.pWhere,
-                             p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprRefsOuterID(pInner^.pHaving,
-                             p^.pSrc, pInner^.pSrc)   then bCorr := True;
-          if ExprListRefsOuterID(pInner^.pGroupBy,
-                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
-          if ExprListRefsOuterID(pInner^.pOrderBy,
-                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            if ExprListRefsOuterTable(pCompArm^.pEList,
+                                      p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprRefsOuterTable(pCompArm^.pWhere,
+                                  p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprRefsOuterTable(pCompArm^.pHaving,
+                                  p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprListRefsOuterTable(pCompArm^.pGroupBy,
+                                      p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprListRefsOuterTable(pCompArm^.pOrderBy,
+                                      p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            { 10.1.bug.131 — also detect unqualified TK_ID outer refs. }
+            if ExprListRefsOuterID(pCompArm^.pEList,
+                                   p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprRefsOuterID(pCompArm^.pWhere,
+                               p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprRefsOuterID(pCompArm^.pHaving,
+                               p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
+            if ExprListRefsOuterID(pCompArm^.pGroupBy,
+                                   p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            if ExprListRefsOuterID(pCompArm^.pOrderBy,
+                                   p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            pCompArm := pCompArm^.pPrior;
+          end;
         end;
         { Step 3: resolve outer-ref TK_DOT nodes against the outer pSrc
           BEFORE the inner resolver runs.  Matching nodes become TK_COLUMN
           bound to the outer cursor; non-matching TK_DOTs stay in place
           and the inner resolver below will emit the proper "no such
           column" error if they don't match the inner FROM either.
-          Walks every clause that can contain expressions. }
+          Walks every clause that can contain expressions.
+
+          9.4.divbug.75 — also walks pPrior chain so each compound arm's
+          outer refs are rewritten against its own pSrc before inner
+          resolution. }
         if (p^.pSrc <> nil) and bCorr then
         begin
-          ResolveOuterRefsInList(pInner^.pEList,   p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefs(pInner^.pWhere,         p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
-          ResolveOuterRefsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
-          { 10.1.bug.131 — bare-TK_ID outer refs alongside TK_DOT. }
-          ResolveOuterIDsInList(pInner^.pEList,   p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDs(pInner^.pWhere,         p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
-          ResolveOuterIDsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            ResolveOuterRefsInList(pCompArm^.pEList,   p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefs(pCompArm^.pWhere,         p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterRefsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            { 10.1.bug.131 — bare-TK_ID outer refs alongside TK_DOT. }
+            ResolveOuterIDsInList(pCompArm^.pEList,   p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDs(pCompArm^.pWhere,         p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
+            ResolveOuterIDsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
+        end;
+        { 9.4.divbug.76 — when the inner subquery has a FROM-clause subquery
+          (deeper-level nesting like tkt3346-1.1's
+            `(SELECT y FROM (SELECT x.b='alice' AS y))` inside the OUTER's
+            pEList), the deeper SELECT may carry outer-table references that
+          could not be resolved at SelectExpand time (no outer NameContext
+          was available via codegen.pas:26252).  Walk each FROM-subquery
+          item's interior expressions and apply ResolveOuterRefs /
+          ResolveOuterIDs against the OUTER pSrc.  Mirrors resolve.c's
+          NameContext-chain walk in lookupName (resolve.c:341..706) which
+          climbs pNC->pNext until it finds a binding.
+
+          9.4.divbug.87.019 — recurse through every level of FROM-subquery
+          nesting (having-5.2 needs the third level: outer pSrc has Col0,
+          EXISTS subquery wraps a FROM-subquery whose own FROM-subquery's
+          WHERE references Col0).  Without the recursion the bare TK_ID
+          Col0 inside the doubly-nested WHERE never reaches ResolveOuterIDs
+          against the outermost pSrc and the inner resolver later raises
+          "no such column: Col0". }
+        if p^.pSrc <> nil then
+        begin
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            WalkDeepFromSubqueries(pCompArm, p^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
         end;
         { Step 4: resolve inner clauses against inner pSrc. }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
@@ -9763,6 +10696,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           FindNestedAggListToOuter(pInner^.pEList, p^.pSrc, pInner^.pSrc,
                                    bNestedAgg);
           FindNestedAggToOuter(pInner^.pHaving, p^.pSrc, pInner^.pSrc,
+                               bNestedAgg);
+          { 9.4.divbug.24.b.3 — aggregate function may also live in the
+            inner subquery's WHERE clause, e.g. aggnested-3.11:
+              (SELECT count(*) FROM t2 WHERE value2=max(value1))
+            without this scan, max(value1) stays TK_FUNCTION and the
+            inner codegen emits OP_Function dispatch on an aggregate
+            FuncDef whose xFunc=NULL → SIGSEGV. }
+          FindNestedAggToOuter(pInner^.pWhere, p^.pSrc, pInner^.pSrc,
                                bNestedAgg);
           if bNestedAgg then
             p^.selFlags := p^.selFlags or SF_Aggregate;
@@ -9837,6 +10778,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end
         else if (pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0 then
           ExprSetProperty(pE, EP_Unlikely);
+        { divbug.14 (residual aggorderby-1.3) — resolve.c:1288..1290.  If
+          the resolved FuncDef is NOT an aggregate (xFinalize nil) and the
+          TK_FUNCTION node carries an attached ORDER BY (parser put it in
+          pLeft as a TK_ORDER node), raise
+            "ORDER BY may not be used with non-aggregate <name>()". }
+        if (pDef_ <> nil) and (not Assigned(pDef_^.xFinalize))
+           and (pE^.pLeft <> nil) then
+        begin
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+            'ORDER BY may not be used with non-aggregate %s()',
+            [pE^.u.zToken]));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        end;
       end;
     end;
   end;
@@ -9918,8 +10872,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     AS-name match is found in p^.pEList.  In C, GROUP BY skips this step
     because lookupName's NC_UEList fallback handles it; the Pas port
     invokes this for GROUP BY too because its simplified ResolveExpr
-    lacks the NC_UEList fallback. }
-  procedure ResolveAliasOrderByCol(pList: PExprList);
+    lacks the NC_UEList fallback.
+
+    9.4.divbug.87.063 — for GROUP BY (forGroupBy=True) we must still
+    honour C's resolve.c:1797 "skip alias arm" by NOT pre-tagging when
+    the bare TK_ID also matches a column in the FROM clause.  Ticket
+    [1c69be2dafc28] (resolver01-5.1): `SELECT count(*), substr(m,2,1)
+    AS m FROM t5 GROUP BY m` must group by input t5.m (3 distinct
+    values) rather than the alias substr(m,2,1) (2 distinct).  The
+    alias-tag path is kept as a fallback for the case where no input
+    column matches (resolver01-5.3 `GROUP BY mx`). }
+  function ColumnInFromClause(zName: PAnsiChar): Boolean; forward;
+
+  procedure ResolveAliasOrderByCol(pList: PExprList; forGroupBy: Boolean);
   var
     i, iCol: i32;
     items: PExprListItem;
@@ -9932,6 +10897,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if items[i].u.x.iOrderByCol <> 0 then Continue;
       pE2 := sqlite3ExprSkipCollateAndLikely(items[i].pExpr);
       if pE2 = nil then Continue;
+      if forGroupBy and (pE2^.op = TK_ID) and (pE2^.u.zToken <> nil)
+         and ColumnInFromClause(pE2^.u.zToken) then
+        Continue;
       iCol := ResolveAsName(p^.pEList, pE2);
       if iCol > 0 then
         items[i].u.x.iOrderByCol := u16(iCol);
@@ -9973,14 +10941,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     sqlite3ResolveOrderGroupBy call rewrites it into a copy of the iCol-th
     result-set expression.  Without this, "ORDER BY 1" codes a literal
     Integer 1 and the sort becomes a no-op. }
-  procedure ResolveIntegerOrderByCol(pList: PExprList);
+  procedure ResolveIntegerOrderByCol(pList: PExprList; zType: PAnsiChar);
   var
     i, iCol: i32;
     items: PExprListItem;
     pE2: PExpr;
+    nResult: i32;
   begin
     if (pList = nil) or (p^.pEList = nil) then Exit;
     items := ExprListItems(pList);
+    nResult := p^.pEList^.nExpr;
     for i := 0 to pList^.nExpr - 1 do
     begin
       if items[i].u.x.iOrderByCol <> 0 then Continue;
@@ -9988,11 +10958,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if pE2 = nil then Continue;
       if sqlite3ExprIsInteger(pE2, @iCol, nil) <> 0 then
       begin
-        if (iCol >= 1) and (iCol <= $FFFF) then
-          items[i].u.x.iOrderByCol := u16(iCol);
-        { Out-of-range integers are left for sqlite3ResolveOrderGroupBy /
-          downstream codegen to flag; iOrderByCol stays 0 so the term keeps
-          its literal-Integer form. }
+        { resolve.c:1812..1818 — integer ORDER BY/GROUP BY term out of the
+          1..0xffff window is an error.  Without this gate negative-integer
+          terms like `ORDER BY -1` silently produce empty iOrderByCol and
+          the term is left as a constant expression (select1-4.10.2 wants
+          the diagnostic). }
+        if (iCol < 1) or (iCol > $FFFF) then
+        begin
+          resolveOutOfRangeError(pParse, zType, i + 1, nResult, pE2);
+          Exit;
+        end;
+        items[i].u.x.iOrderByCol := u16(iCol);
       end;
     end;
   end;
@@ -10175,7 +11151,34 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
-  procedure ResolveAliasInHavingList(pList: PExprList);
+  { 9.4.divbug.70.c — forward decl so that the alias arm below can
+    consult ExprIsOrContainsAggregate when descending into the args of
+    an aggregate function call inside HAVING.  Mirrors resolve.c:670..683
+    aliased-aggregate misuse detection (NC_AllowAgg=0 context applies
+    inside another aggregate's argument list). }
+  function ExprIsOrContainsAggregate(pX: PExpr): i32; forward;
+
+  function IsAggregateFunctionCall(pX: PExpr): Boolean;
+  var
+    pDef: PTFuncDef;
+    n:    i32;
+  begin
+    Result := False;
+    if pX = nil then Exit;
+    if (pX^.op <> TK_FUNCTION) or (pX^.u.zToken = nil) then Exit;
+    if not ExprUseXList(pX) then Exit;
+    if pX^.x.pList <> nil then n := pX^.x.pList^.nExpr else n := 0;
+    pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, n,
+                                pParse^.db^.enc, 0);
+    if (pDef = nil) and (n <> 0) then
+      pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
+                                  pParse^.db^.enc, 0);
+    Result := (pDef <> nil) and Assigned(pDef^.xFinalize);
+  end;
+
+  procedure ResolveAliasInHavingEx(pE: PExpr; inAgg: Boolean); forward;
+
+  procedure ResolveAliasInHavingList(pList: PExprList; inAgg: Boolean);
   var
     i:     i32;
     items: PExprListItem;
@@ -10183,12 +11186,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if pList = nil then Exit;
     items := ExprListItems(pList);
     for i := 0 to pList^.nExpr - 1 do
-      ResolveAliasInHaving(items[i].pExpr);
+      ResolveAliasInHavingEx(items[i].pExpr, inAgg);
   end;
 
-  procedure ResolveAliasInHaving(pE: PExpr);
+  procedure ResolveAliasInHavingEx(pE: PExpr; inAgg: Boolean);
   var
-    iCol: i32;
+    iCol:    i32;
+    items:   PExprListItem;
+    pOrig:   PExpr;
+    zAs:     PAnsiChar;
+    aggKind: i32;
+    childAgg: Boolean;
   begin
     if pE = nil then Exit;
     if pE^.op = TK_DOT then Exit;
@@ -10200,21 +11208,53 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if sqlite3IsRowid(pE^.u.zToken) <> 0 then Exit;
       iCol := ResolveAsName(p^.pEList, pE);
       if iCol > 0 then
+      begin
+        if inAgg then
+        begin
+          items := ExprListItems(p^.pEList);
+          pOrig := items[iCol - 1].pExpr;
+          zAs := items[iCol - 1].zEName;
+          aggKind := ExprIsOrContainsAggregate(pOrig);
+          if aggKind = 1 then
+          begin
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('misuse of aliased aggregate ' + AnsiString(zAs)));
+            Exit;
+          end;
+          if aggKind = 2 then
+          begin
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('misuse of aliased window function ' + AnsiString(zAs)));
+            Exit;
+          end;
+        end;
         resolveAlias(pParse, p^.pEList, iCol - 1, pE, 0);
+      end;
       Exit;
     end;
-    ResolveAliasInHaving(pE^.pLeft);
-    ResolveAliasInHaving(pE^.pRight);
+    ResolveAliasInHavingEx(pE^.pLeft, inAgg);
+    ResolveAliasInHavingEx(pE^.pRight, inAgg);
     if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
     begin
       if not ExprHasProperty(pE, EP_xIsSelect) then
-        ResolveAliasInHavingList(pE^.x.pList);
+      begin
+        { 9.4.divbug.70.c — set inAgg when descending into the args of an
+          aggregate function call (resolve.c clears NC_AllowAgg in that
+          context, so aliased aggregates trip the misuse arm). }
+        childAgg := inAgg or IsAggregateFunctionCall(pE);
+        ResolveAliasInHavingList(pE^.x.pList, childAgg);
+      end;
       { Subselects: skip — they have their own pEList scope; avoid
         accidentally rebinding a correlated alias reference. }
       if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
          and (pE^.y.pWin^.pFilter <> nil) then
-        ResolveAliasInHaving(pE^.y.pWin^.pFilter);
+        ResolveAliasInHavingEx(pE^.y.pWin^.pFilter, inAgg);
     end;
+  end;
+
+  procedure ResolveAliasInHaving(pE: PExpr);
+  begin
+    ResolveAliasInHavingEx(pE, False);
   end;
 
   { ResolveAliasInWhere — mirrors ResolveAliasInHaving but enforces
@@ -10419,10 +11459,69 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     RewriteAggToAggFuncList(pList);
   end;
 
+  { 9.4.divbug.70.c — port of resolve.c:1245..1265 misuse detection for
+    aggregates nested inside aggregate-function argument lists.  C clears
+    NC_AllowAgg before resolving an aggregate's args; the pas resolver
+    skips that, so we re-walk the resolved tree and complain if any
+    aggregate function call has another aggregate (or window) call inside
+    its argument list.  Mirrors the "misuse of aggregate function NAME()"
+    text emitted at resolve.c:1262. }
+  procedure CheckNestedAggInList(pList: PExprList); forward;
+
+  procedure CheckNestedAggInExpr(pX: PExpr; inAgg: Boolean);
+  var
+    childAgg: Boolean;
+    j:        i32;
+    items:    PExprListItem;
+  begin
+    if pX = nil then Exit;
+    if pParse^.nErr > 0 then Exit;
+    if (pX^.op = TK_AGG_FUNCTION) or IsAggregateFunctionCall(pX) then
+    begin
+      if inAgg and (pX^.u.zToken <> nil)
+         and ((pX^.flags and EP_IntValue) = 0) then
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+          'misuse of aggregate function %s()', [pX^.u.zToken]));
+        Exit;
+      end;
+      childAgg := True;
+    end
+    else
+      childAgg := inAgg;
+    if not ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then
+    begin
+      CheckNestedAggInExpr(pX^.pLeft,  childAgg);
+      CheckNestedAggInExpr(pX^.pRight, childAgg);
+      if not ExprHasProperty(pX, EP_xIsSelect) and (pX^.x.pList <> nil) then
+      begin
+        items := ExprListItems(pX^.x.pList);
+        for j := 0 to pX^.x.pList^.nExpr - 1 do
+          CheckNestedAggInExpr(items[j].pExpr, childAgg);
+      end;
+    end;
+  end;
+
+  procedure CheckNestedAggInList(pList: PExprList);
+  var
+    i:     i32;
+    items: PExprListItem;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      if pParse^.nErr > 0 then Exit;
+      CheckNestedAggInExpr(items[i].pExpr, False);
+    end;
+  end;
+
 var
   pTopSel:    PSelect;
   isCompound: Boolean;
   deferOB:    Boolean;
+  i_:         i32;          { 9.4.divbug.30 — ORDER BY alias walk index }
+  items_:     PExprListItem; { 9.4.divbug.30 — ORDER BY alias walk items }
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
@@ -10440,6 +11539,14 @@ begin
     handling it per-select here. }
   deferOB := isCompound and (p = pTopSel);
   ResolveExprList(p^.pEList);
+  { 9.4.divbug.70.c — port of resolve.c:1261..1265 nested-aggregate detection.
+    `SELECT SUM(min(f1))…` clears NC_AllowAgg when descending into SUM's args;
+    if min is then detected as aggregate, resolve.c emits
+    "misuse of aggregate function NAME()".  The pas resolver does not track
+    NC_AllowAgg, so re-scan pEList / pHaving / pOrderBy here for any aggregate
+    function call that contains a nested aggregate in its argument list. }
+  if pParse^.nErr = 0 then
+    CheckNestedAggInList(p^.pEList);
   { Phase 6.13.B.8 — resolve TABFUNC argument lists in pSrc so
     fitTabFuncArgs (called later inside sqlite3WhereBegin) sees fully
     bound TK_COLUMN references rather than raw TK_DOT/TK_ID.  C does
@@ -10465,18 +11572,38 @@ begin
     same iOrderByCol mechanism used for ORDER BY; sqlite3ResolveOrderGroupBy
     below rewrites the term into a copy of the matching result-set expr. }
   if p^.pGroupBy <> nil then
-    ResolveAliasOrderByCol(p^.pGroupBy);
+    ResolveAliasOrderByCol(p^.pGroupBy, True);
   ResolveExprList(p^.pGroupBy);
   if p^.pHaving <> nil then
     ResolveAliasInHaving(p^.pHaving);
-  ResolveExpr    (p^.pHaving);
+  { 9.4.divbug.70.c — skip ResolveExpr when ResolveAliasInHaving already
+    raised "misuse of aliased aggregate <m>", otherwise a stale TK_ID
+    left in place would trigger "no such column: m" and overwrite it. }
+  if pParse^.nErr = 0 then
+    ResolveExpr    (p^.pHaving);
 
   { resolve.c:1797..1806 — alias-arm runs BEFORE ResolveExprList on
     pOrderBy so a bare alias TK_ID gets tagged via iOrderByCol and is
     skipped by name resolution (which would otherwise fail with
     "no such column: rn"). }
   if (p^.pOrderBy <> nil) and (not deferOB) then
-    ResolveAliasOrderByCol(p^.pOrderBy);
+    ResolveAliasOrderByCol(p^.pOrderBy, False);
+
+  { 9.4.divbug.30 — port resolve.c:658..698 NC_UEList fallback for ORDER BY.
+    When an ORDER BY term is an expression *containing* a bare TK_ID alias
+    (e.g. `ORDER BY +x` where x is an AS-alias on a result column), the
+    integer/structural arms below don't catch it and ResolveExprList raises
+    "no such column: x".  The HAVING alias-rewriter already walks the tree
+    swapping alias TK_IDs for the underlying result-set expression; reuse
+    it here so bare aliases inside any ORDER BY sub-expression bind to the
+    alias target before name resolution (collate8-1.15). }
+  if (p^.pOrderBy <> nil) and (not deferOB) and (p^.pEList <> nil) then
+  begin
+    items_ := ExprListItems(p^.pOrderBy);
+    for i_ := 0 to p^.pOrderBy^.nExpr - 1 do
+      if items_[i_].u.x.iOrderByCol = 0 then
+        ResolveAliasInHaving(items_[i_].pExpr);
+  end;
 
   if not deferOB then
     ResolveExprList(p^.pOrderBy);
@@ -10496,7 +11623,7 @@ begin
     is not overridden by a coincidental structural match. }
   if (p^.pOrderBy <> nil) and (not deferOB) then
   begin
-    ResolveIntegerOrderByCol(p^.pOrderBy);
+    ResolveIntegerOrderByCol(p^.pOrderBy, 'ORDER');
     ResolveStructuralOrderByCol(p^.pOrderBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pOrderBy, 'ORDER');
   end;
@@ -10511,10 +11638,26 @@ begin
     ResolveCompoundOrderBy(pTopSel);
   if p^.pGroupBy <> nil then
   begin
-    ResolveIntegerOrderByCol(p^.pGroupBy);
+    ResolveIntegerOrderByCol(p^.pGroupBy, 'GROUP');
     ResolveStructuralOrderByCol(p^.pGroupBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pGroupBy, 'GROUP');
   end;
+
+  { 9.4.divbug.89.016 — port resolve.c:1888 LIMIT/OFFSET resolution.
+    C runs `sqlite3ResolveExprNames(&sNC, p->pLimit)` with an empty
+    NameContext: LIMIT may not reference any names, but its subexpressions
+    (in particular, embedded TK_SELECT scalar subqueries like
+    `LIMIT (SELECT ...)`) must be Prep'd here so the inner select gains
+    SF_Resolved BEFORE sqlite3SelectAddTypeInfo blanket-sets SF_HasTypeInfo
+    on the whole tree.  Without this, the inner LIMIT subquery's
+    SelectPrep call at codeSubselect time early-returns on SF_HasTypeInfo
+    and ResolveCompoundOrderBy never runs — an `ORDER BY 1` term then
+    reaches multiSelectByMerge with iOrderByCol=0 and trips the
+    AssertH (`multiSelectByMerge: iOrderByCol<=0`).  Reusing ResolveExpr
+    here also handles the OFFSET expression via pLimit^.pRight via the
+    standard recursion. }
+  if (pParse^.nErr = 0) and (p^.pLimit <> nil) then
+    ResolveExpr(p^.pLimit);
 
   { resolve.c:2079 — once ON clauses have been spliced into pWhere
     (selectExpander tags Select with SF_OnToWhere when it does this),
@@ -11982,8 +13125,14 @@ begin
       Inc(a);
     end;
   end;
-  if pWC^.a <> @pWC^.aStatic[0] then
-    sqlite3DbFree(db, pWC^.a);
+  { Do NOT free pWC^.a here.  Faithful to whereexpr.c:1759..1790 — when the
+    static slot pool overflows in whereClauseInsert the growth allocation
+    comes from sqlite3WhereMalloc (the WhereInfo arena), not from the heap.
+    Arena blocks are released wholesale by whereInfoFree via the pMemToFree
+    chain.  A direct sqlite3DbFree(pWC^.a) here would corrupt the heap by
+    freeing an arena interior pointer.  9.4.divbug.89.007..010. }
+  { db reference retained for parity with the C declaration. }
+  if db = nil then ;
 end;
 
 procedure whereOrInfoDelete(db: PTsqlite3; pOrInfo: PWhereOrInfo);
@@ -14935,6 +16084,158 @@ begin
   end;
 end;
 
+{ exprNodeCanReturnSubtype — expr.c:4704..4720.  Walker callback used by
+  sqlite3ExprCanReturnSubtype: only a TK_FUNCTION may return a subtype.
+  If the function carries SQLITE_RESULT_SUBTYPE, set walker eCode=1 and
+  prune; otherwise descend (assume pass-through). }
+function exprNodeCanReturnSubtype(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  n: i32;
+  pDef: PTFuncDef;
+  db: PTsqlite3;
+begin
+  if pExpr^.op <> TK_FUNCTION then begin Result := WRC_Prune; Exit; end;
+  db := pWalker^.pParse^.db;
+  if pExpr^.x.pList <> nil then n := pExpr^.x.pList^.nExpr else n := 0;
+  pDef := PTFuncDef(sqlite3FindFunction(db, pExpr^.u.zToken, n, db^.enc, 0));
+  if (pDef = nil) or ((pDef^.funcFlags and SQLITE_RESULT_SUBTYPE) <> 0) then
+  begin
+    pWalker^.eCode := 1;
+    Result := WRC_Prune;
+    Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3ExprCanReturnSubtype — expr.c:4730..4737.  Returns 1 if pExpr
+  might return a subtype-carrying value. }
+function sqlite3ExprCanReturnSubtype(pParse: PParse; pExpr: PExpr): i32;
+var w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.pParse := pParse;
+  w.xExprCallback := @exprNodeCanReturnSubtype;
+  sqlite3WalkExpr(@w, pExpr);
+  Result := i32(w.eCode);
+end;
+
+{ sqlite3IndexedExprLookup — expr.c:4746..4807.  Scan pParse^.pIdxEpr;
+  if pExpr matches an indexed-expression entry, emit OP_Column to read
+  the value from the index cursor and return target.  Return -1 if no
+  match. }
+function sqlite3IndexedExprLookup(pParse: PParse; pExpr: PExpr;
+  target: i32): i32;
+var
+  p:        PIndexedExpr;
+  v:        PVdbe;
+  exprAff:  u8;
+  iDataCur: i32;
+  addr:     i32;
+  pSave:    PIndexedExpr;
+begin
+  p := PIndexedExpr(pParse^.pIdxEpr);
+  while p <> nil do
+  begin
+    iDataCur := p^.iDataCur;
+    if iDataCur < 0 then begin p := p^.pIENext; Continue; end;
+    if pParse^.iSelfTab <> 0 then
+    begin
+      if p^.iDataCur <> pParse^.iSelfTab - 1 then
+        begin p := p^.pIENext; Continue; end;
+      iDataCur := -1;
+    end;
+    if sqlite3ExprCompare(nil, pExpr, p^.pExpr, iDataCur) <> 0 then
+      begin p := p^.pIENext; Continue; end;
+    Assert((p^.aff >= SQLITE_AFF_BLOB) and (p^.aff <= SQLITE_AFF_NUMERIC));
+    exprAff := u8(sqlite3ExprAffinity(pExpr));
+    if ((exprAff <= SQLITE_AFF_BLOB) and (p^.aff <> SQLITE_AFF_BLOB))
+       or ((exprAff = SQLITE_AFF_TEXT) and (p^.aff <> SQLITE_AFF_TEXT))
+       or ((exprAff >= SQLITE_AFF_NUMERIC) and (p^.aff <> SQLITE_AFF_NUMERIC)) then
+    begin
+      p := p^.pIENext; Continue;
+    end;
+    if ExprHasProperty(pExpr, EP_SubtArg)
+       and (sqlite3ExprCanReturnSubtype(pParse, pExpr) <> 0) then
+    begin
+      p := p^.pIENext; Continue;
+    end;
+    v := pParse^.pVdbe;
+    Assert(v <> nil);
+    if p^.bMaybeNullRow <> 0 then
+    begin
+      addr := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_IfNullRow, p^.iIdxCur, addr + 3, target);
+      sqlite3VdbeAddOp3(v, OP_Column, p^.iIdxCur, p^.iIdxCol, target);
+      sqlite3VdbeGoto(v, 0);
+      pSave := PIndexedExpr(pParse^.pIdxEpr);
+      pParse^.pIdxEpr := nil;
+      sqlite3ExprCode(pParse, pExpr, target);
+      pParse^.pIdxEpr := pSave;
+      sqlite3VdbeJumpHere(v, addr + 2);
+    end
+    else
+    begin
+      sqlite3VdbeAddOp3(v, OP_Column, p^.iIdxCur, p^.iIdxCol, target);
+    end;
+    Result := target;
+    Exit;
+  end;
+  Result := -1;
+end;
+
+{ whereAddIndexedExpr — where.c:6668..6716.  Walk all expression
+  columns of pIdx (XN_EXPR slots, plus VIRTUAL generated columns)
+  and add IndexedExpr entries to pParse^.pIdxEpr so subsequent
+  expression code-gen can substitute index reads. }
+procedure whereAddIndexedExpr(pParse: PParse; pIdx: PIndex2; iIdxCur: i32;
+  pTabItem: PSrcItem);
+var
+  i, j:   i32;
+  pE:     PExpr;
+  pTab:   PTable2;
+  p:      PIndexedExpr;
+  db:     PTsqlite3;
+  jt:     u8;
+  pZAff:  PAnsiChar;
+begin
+  Assert(((pIdx^.idxFlags shr 11) and 1) <> 0);  { bHasExpr }
+  pTab := pIdx^.pTable;
+  db := pParse^.db;
+  for i := 0 to i32(pIdx^.nColumn) - 1 do
+  begin
+    j := pIdx^.aiColumn[i];
+    if j = XN_EXPR then
+      pE := ExprListItems(pIdx^.aColExpr)[i].pExpr
+    else if (j >= 0)
+            and ((pTab^.aCol[j].colFlags and COLFLAG_VIRTUAL) <> 0) then
+      pE := sqlite3ColumnExpr(pTab, @pTab^.aCol[j])
+    else
+      Continue;
+    if sqlite3ExprIsConstant(nil, pE) <> 0 then Continue;
+    p := PIndexedExpr(sqlite3DbMallocRaw(db, u64(SizeOf(TIndexedExpr))));
+    if p = nil then break;
+    p^.pIENext := PIndexedExpr(pParse^.pIdxEpr);
+    p^.pExpr := sqlite3ExprDup(db, pE, 0);
+    p^.iDataCur := pTabItem^.iCursor;
+    p^.iIdxCur := iIdxCur;
+    p^.iIdxCol := i;
+    jt := pTabItem^.fg.jointype;
+    if (jt and (JT_LEFT or JT_LTORJ or JT_RIGHT)) <> 0 then
+      p^.bMaybeNullRow := 1
+    else
+      p^.bMaybeNullRow := 0;
+    pZAff := sqlite3IndexAffinityStr(db, pIdx);
+    if pZAff <> nil then
+      p^.aff := u8(pIdx^.zColAff[i])
+    else
+      p^.aff := SQLITE_AFF_BLOB;
+    pParse^.pIdxEpr := p;
+    if p^.pIENext = nil then
+      sqlite3ParserAddCleanup(pParse, @whereIndexedExprCleanup,
+                              @pParse^.pIdxEpr);
+  end;
+end;
+
 { Process the WHERE clause of a partial index, looking for `col = constant`
   arms whose collation is BINARY and whose column has a TEXT/NUMERIC/INTEGER/
   REAL affinity (>= SQLITE_AFF_TEXT).  where.c:3914..3964.
@@ -15039,6 +16340,365 @@ function indexHasStat1(pIdx: PIndex2): i32; inline;
 begin
   Result := i32((pIdx^.idxFlags shr 7) and 1);
 end;
+
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ whereKeyStats — direct port of where.c:1718..1902.
+  Estimates location of pRec among samples in pIdx^.aSample[].  Writes:
+    aStat[0]  est. rows < pRec
+    aStat[1]  est. rows == pRec
+  Returns index into the virtual (nField-expanded) sample space of the
+  smallest sample >= pRec.  STAT4-only; called from range/equal/IN scan
+  estimators (prereq.c.8/.c.9). }
+function whereKeyStats(pParse: PParse; pIdx: PIndex2;
+  pRec: PUnpackedRecord; roundUp: i32; aStat: PRowCntArr): i32;
+var
+  aSample: PIndexSample;       { pIdx^.aSample[] — record-typed pointer }
+  pSmp:    PIndexSample;       { aSample[iSamp] — renamed: PIndexSample shadow }
+  pSmpPrev: PIndexSample;      { aSample[iSamp-1] for prefix-extension scan }
+  iCol:    i32;                { index of required stats in anEq[] etc. }
+  i:       i32;                { index of first sample >= pRec }
+  iSample: i32;                { smallest sample larger than or equal to pRec }
+  iMin:    i32;                { smallest sample not yet tested }
+  iTest:   i32;                { next sample to test }
+  res:     i32;                { result of comparison }
+  nField:  i32;                { number of fields in pRec }
+  iLower:  u64;                { anLt[]+anEq[] of largest sample pRec is > }
+  iSamp:   i32;                { aSample[] index of test sample }
+  n:       i32;                { number of fields in test sample }
+  iUpper:  u64;
+  iGap:    u64;
+begin
+  { Silence unused-parameter warning when SQLITE_DEBUG is off. }
+  if pParse = nil then ;
+
+  aSample := pIdx^.aSample;
+  iMin    := 0;
+  iLower  := 0;
+  res     := 0;
+  iCol    := 0;
+
+  Assert(pRec <> nil);
+  Assert(pIdx^.nSample > 0);
+  Assert(pRec^.nField > 0);
+
+  if (not HasRowid(pIdx^.pTable))
+     and ((pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY) then
+    nField := i32(pIdx^.nKeyCol)
+  else
+    nField := i32(pIdx^.nColumn);
+  if i32(pRec^.nField) < nField then
+    nField := i32(pRec^.nField);
+  iSample := pIdx^.nSample * nField;
+
+  repeat
+    iTest := (iMin + iSample) div 2;
+    iSamp := iTest div nField;
+    if iSamp > 0 then
+    begin
+      { Proposed effective sample is a prefix of aSample[iSamp]; find shortest
+        prefix of at least (1 + iTest%nField) fields greater than previous. }
+      n := (iTest mod nField) + 1;
+      pSmp     := @aSample[iSamp];
+      pSmpPrev := @aSample[iSamp - 1];
+      while n < nField do
+      begin
+        if pSmpPrev^.anLt[n - 1] <> pSmp^.anLt[n - 1] then Break;
+        Inc(n);
+      end;
+    end
+    else
+    begin
+      n := iTest + 1;
+      pSmp := @aSample[iSamp];
+    end;
+
+    pRec^.nField := u16(n);
+    res := passqlite3vdbe.sqlite3VdbeRecordCompare(pSmp^.n, pSmp^.p, pRec);
+    if res < 0 then
+    begin
+      iLower := pSmp^.anLt[n - 1] + pSmp^.anEq[n - 1];
+      iMin   := iTest + 1;
+    end
+    else if (res = 0) and (n < nField) then
+    begin
+      iLower := pSmp^.anLt[n - 1];
+      iMin   := iTest + 1;
+      res    := -1;
+    end
+    else
+    begin
+      iSample := iTest;
+      iCol    := n - 1;
+    end;
+  until (res = 0) or (iMin >= iSample);
+  i := iSample div nField;
+
+  if res = 0 then
+  begin
+    { pRec equal to sample i. }
+    Assert(iCol = nField - 1);
+    pSmp := @aSample[i];
+    aStat^[0] := pSmp^.anLt[iCol];
+    aStat^[1] := pSmp^.anEq[iCol];
+  end
+  else
+  begin
+    { (iCol+1)-field prefix of aSample[i] is first sample > pRec;
+      or i == nSample → pRec larger than all samples. }
+    if i >= pIdx^.nSample then
+      iUpper := pIdx^.nRowEst0
+    else
+    begin
+      pSmp   := @aSample[i];
+      iUpper := pSmp^.anLt[iCol];
+    end;
+    if iLower >= iUpper then
+      iGap := 0
+    else
+      iGap := iUpper - iLower;
+    if roundUp <> 0 then
+      iGap := (iGap * 2) div 3
+    else
+      iGap := iGap div 3;
+    aStat^[0] := iLower + iGap;
+    aStat^[1] := pIdx^.aAvgEq[nField - 1];
+  end;
+
+  { Restore pRec^.nField before returning. }
+  pRec^.nField := u16(nField);
+  Result := i;
+end;
+
+{ 10.1.42.b.7.prereq.c.8 — whereRangeSkipScanEst (where.c:1980..2049).
+
+  Estimate range-scan selectivity for a skip-scan candidate where the leading
+  index column is not equality-constrained.  Walks pIdx^.aSample[] counting how
+  many samples lie between the extracted lower / upper bound values:
+
+    nLower  := count of samples with sample[i].col[nEq] >= $L
+    nUpper  := count of samples with sample[i].col[nEq] >= $U   (default nSample
+              when $U cannot be extracted, 0 when $U exists in samples)
+
+  When at least one of $L / $U is extractable, the count difference nUpper-nLower
+  drives a LogEst adjustment applied to pLoop^.nOut:
+
+    nAdjust := sqlite3LogEst(p^.nSample) - sqlite3LogEst(nDiff)
+    pLoop^.nOut := pLoop^.nOut - nAdjust
+
+  Closed-range cases where nDiff degenerates to 1 fall through (caller will apply
+  the BETWEEN -75% / 1-64 default model).  *pbDone is set to 1 iff the adjustment
+  was applied; on the no-extract path it is left unchanged.  Returns SQLITE_OK
+  on success or an SQLite error code (typically NOMEM from value allocation). }
+function whereRangeSkipScanEst(pParse: PParse;
+                               pLower, pUpper: PWhereTerm;
+                               pLoop: PWhereLoop;
+                               pbDone: Pi32): i32;
+var
+  p:       PIndex2;
+  nEq:     i32;
+  db:      PTsqlite3;
+  nLower:  i32;
+  nUpper:  i32;
+  rc:      i32;
+  aff:     u8;
+  zAff:    PAnsiChar;
+  pColl:   Pointer;
+  p1, p2, pVal: Psqlite3_value;
+  i:       i32;
+  nDiff:   i32;
+  res:     i32;
+  nAdjust: i32;
+begin
+  p      := pLoop^.u.btree.pIndex;
+  nEq    := i32(pLoop^.u.btree.nEq);
+  db     := pParse^.db;
+  nLower := -1;
+  nUpper := p^.nSample + 1;
+  rc     := SQLITE_OK;
+
+  { sqlite3IndexColumnAffinity(db, p, nEq) — inlined as zColAff[nEq] with
+    sqlite3IndexAffinityStr lazy materialise (matches stat4ValueFromExpr at
+    codegen.pas:61621..61628). }
+  if p^.zColAff = nil then zAff := sqlite3IndexAffinityStr(db, p)
+  else                     zAff := p^.zColAff;
+  if zAff <> nil then aff := u8(zAff[nEq])
+  else                aff := u8(SQLITE_AFF_BLOB);
+
+  p1 := nil; p2 := nil; pVal := nil;
+
+  pColl := sqlite3LocateCollSeq(pParse, PPAnsiChar(p^.azColl)[nEq]);
+
+  if pLower <> nil then
+  begin
+    rc     := sqlite3Stat4ValueFromExpr(pParse, pLower^.pExpr^.pRight,
+                                        aff, PPointer(@p1));
+    nLower := 0;
+  end;
+  if (pUpper <> nil) and (rc = SQLITE_OK) then
+  begin
+    rc := sqlite3Stat4ValueFromExpr(pParse, pUpper^.pExpr^.pRight,
+                                    aff, PPointer(@p2));
+    if p2 <> nil then nUpper := 0
+    else              nUpper := p^.nSample;
+  end;
+
+  if (p1 <> nil) or (p2 <> nil) then
+  begin
+    i := 0;
+    while (rc = SQLITE_OK) and (i < p^.nSample) do
+    begin
+      rc := passqlite3vdbe.sqlite3Stat4Column(Psqlite3(db),
+              p^.aSample[i].p, p^.aSample[i].n, nEq, pVal);
+      if (rc = SQLITE_OK) and (p1 <> nil) then
+      begin
+        res := passqlite3vdbe.sqlite3MemCompare(p1, pVal, pColl);
+        if res >= 0 then Inc(nLower);
+      end;
+      if (rc = SQLITE_OK) and (p2 <> nil) then
+      begin
+        res := passqlite3vdbe.sqlite3MemCompare(p2, pVal, pColl);
+        if res >= 0 then Inc(nUpper);
+      end;
+      Inc(i);
+    end;
+    nDiff := nUpper - nLower;
+    if nDiff <= 0 then nDiff := 1;
+
+    { When both bounds extracted and counts are within one sample, fall through
+      to caller's default closed-range -75% model. }
+    if (nDiff <> 1) or (pUpper = nil) or (pLower = nil) then
+    begin
+      nAdjust := i32(sqlite3LogEst(u64(p^.nSample)))
+               - i32(sqlite3LogEst(u64(nDiff)));
+      pLoop^.nOut := i16(pLoop^.nOut - nAdjust);
+      pbDone^ := 1;
+      {$IFDEF SQLITE_DEBUG}
+      { WHERETRACE(0x20, "range skip-scan regions: %u..%u  adjust=%d est=%d")
+        (where.c:2036..2037). }
+      if (sqlite3WhereTrace and $20) <> 0 then
+        sqlite3DebugPrintf(
+          'range skip-scan regions: %u..%u  adjust=%d est=%d'#10,
+          [u32(nLower), u32(nUpper), -nAdjust, pLoop^.nOut]);
+      {$ENDIF}
+    end;
+  end
+  else
+  begin
+    Assert(pbDone^ = 0);
+  end;
+
+  sqlite3ValueFree(p1);
+  sqlite3ValueFree(p2);
+  sqlite3ValueFree(pVal);
+  Result := rc;
+end;
+
+{ 10.1.42.b.7.prereq.c.9 — whereEqualScanEst (where.c:2274..2318).
+  Estimate the number of rows matched by x=VALUE (or x IS NULL when pExpr=nil)
+  for the left-most column of pBuilder^.pNew^.u.btree.pIndex that has not yet
+  been probed.  Returns SQLITE_OK on success and writes the count into pnRow^;
+  returns SQLITE_NOTFOUND when an estimate cannot be produced. }
+function whereEqualScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                           pExpr: PExpr; pnRow: PRowcnt): i32;
+var
+  p:    PIndex2;
+  nEq:  i32;
+  pRec: PUnpackedRecord;
+  rc:   i32;
+  a:    array[0..1] of u64;
+  bOk:  i32;
+begin
+  p    := pBuilder^.pNew^.u.btree.pIndex;
+  nEq  := i32(pBuilder^.pNew^.u.btree.nEq);
+  pRec := pBuilder^.pRec;
+
+  Assert(nEq >= 1);
+  Assert(nEq <= i32(p^.nColumn));
+  Assert(p^.aSample <> nil);
+  Assert(p^.nSample > 0);
+  Assert(pBuilder^.nRecValid < nEq);
+
+  { No estimate possible without all preceding-column values. }
+  if pBuilder^.nRecValid < (nEq - 1) then
+  begin
+    Result := SQLITE_NOTFOUND;
+    Exit;
+  end;
+
+  { Optimization: a probe past the right edge always matches exactly one row. }
+  if nEq >= i32(p^.nColumn) then
+  begin
+    pnRow^ := 1;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  rc := sqlite3Stat4ProbeSetValue(pParse, PIndex(p), PPointer(@pRec), pExpr,
+                                  1, nEq - 1, @bOk);
+  pBuilder^.pRec := pRec;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  if bOk = 0 then begin Result := SQLITE_NOTFOUND; Exit; end;
+  pBuilder^.nRecValid := nEq;
+
+  whereKeyStats(pParse, p, pRec, 0, PRowCntArr(@a[0]));
+  {$IFDEF SQLITE_DEBUG}
+  { WHERETRACE(0x20, "equality scan regions %s(%d): %d") — where.c:2313. }
+  if (sqlite3WhereTrace and $20) <> 0 then
+    sqlite3DebugPrintf('equality scan regions %s(%d): %d'#10,
+                       [p^.zName, nEq - 1, i32(a[1])]);
+  {$ENDIF}
+  pnRow^ := a[1];
+  Result := rc;
+end;
+
+{ 10.1.42.b.7.prereq.c.9 — whereInScanEst (where.c:2338..2367).
+  Estimate rows matched by x IN (v1,v2,...) by summing the per-value estimates
+  from whereEqualScanEst.  Cap the result at the index's nRowEst0. }
+function whereInScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+                        pList: PExprList; pnRow: PRowcnt): i32;
+var
+  p:         PIndex2;
+  nRow0:     i64;
+  nRecValid: i32;
+  rc:        i32;
+  nEst:      u64;
+  nRowEst:   u64;
+  i:         i32;
+  pItem:     PExprListItem;
+begin
+  p         := pBuilder^.pNew^.u.btree.pIndex;
+  nRow0     := sqlite3LogEstToInt(p^.aiRowLogEst[0]);
+  nRecValid := pBuilder^.nRecValid;
+  rc        := SQLITE_OK;
+  nRowEst   := 0;
+
+  Assert(p^.aSample <> nil);
+  pItem := ExprListItems(pList);
+  i := 0;
+  while (rc = SQLITE_OK) and (i < pList^.nExpr) do
+  begin
+    nEst := u64(nRow0);
+    rc := whereEqualScanEst(pParse, pBuilder,
+            PExprListItem(PByte(pItem) + PtrUInt(i) * SZ_EXPRLIST_ITEM)^.pExpr,
+            @nEst);
+    nRowEst := nRowEst + nEst;
+    pBuilder^.nRecValid := nRecValid;
+    Inc(i);
+  end;
+
+  if rc = SQLITE_OK then
+  begin
+    if nRowEst > u64(nRow0) then nRowEst := u64(nRow0);
+    pnRow^ := nRowEst;
+    {$IFDEF SQLITE_DEBUG}
+    if (sqlite3WhereTrace and $20) <> 0 then
+      sqlite3DebugPrintf('IN row estimate: est=%d'#10, [i32(nRowEst)]);
+    {$ENDIF}
+  end;
+  Assert(pBuilder^.nRecValid = nRecValid);
+  Result := rc;
+end;
+{$ENDIF}
 
 function whereRangeAdjust(pTerm: PWhereTerm; nNew: i16): i16;
 var
@@ -15361,14 +17021,152 @@ var
   rc:    i32;
   nOut:  i32;
   nNew:  i32;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  p:        PIndex2;
+  nEq:      i32;
+  pRec:     PUnpackedRecord;
+  a:        array[0..1] of u64;
+  nBtm:     i32;
+  nTop:     i32;
+  iLower:   u64;
+  iUpper:   u64;
+  iLwrIdx:  i32;
+  iUprIdx:  i32;
+  pExprX:   PExpr;
+  n:        i32;
+  iNew:     u64;
+  mask:     u16;
+  bDone:    i32;
+  tmpW:     PWhereTerm;
+  tmpI:     i32;
+  {$ENDIF}
 begin
   rc   := SQLITE_OK;
   nOut := pLoop^.nOut;
 
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { 10.1.42.b.7.prereq.c.9 — STAT4 sample-driven range estimator
+    (where.c:2103..2223).  When nEq matches pBuilder^.nRecValid the existing
+    pRec key prefix can be probed against the histogram; otherwise fall
+    through to whereRangeSkipScanEst. }
+  p   := pLoop^.u.btree.pIndex;
+  nEq := i32(pLoop^.u.btree.nEq);
+  if (p^.nSample > 0) and (nEq < p^.nSampleCol)
+     and OptimizationEnabled(pParse^.db, SQLITE_Stat4) then
+  begin
+    if nEq = pBuilder^.nRecValid then
+    begin
+      pRec := pBuilder^.pRec;
+      nBtm := i32(pLoop^.u.btree.nBtm);
+      nTop := i32(pLoop^.u.btree.nTop);
+
+      iLwrIdx := -2;
+      iUprIdx := -1;
+
+      if pRec <> nil then
+        pRec^.nField := u16(pBuilder^.nRecValid);
+
+      if nEq = 0 then
+      begin
+        iLower := 0;
+        iUpper := p^.nRowEst0;
+      end
+      else
+      begin
+        whereKeyStats(pParse, p, pRec, 0, PRowCntArr(@a[0]));
+        iLower := a[0];
+        iUpper := a[0] + a[1];
+      end;
+
+      Assert((pLower = nil) or ((pLower^.eOperator and (WO_GT_WO or WO_GE)) <> 0));
+      Assert((pUpper = nil) or ((pUpper^.eOperator and (WO_LT or WO_LE)) <> 0));
+      Assert(p^.aSortOrder <> nil);
+      if p^.aSortOrder[nEq] <> 0 then
+      begin
+        { DESC index — swap pLower<->pUpper and nBtm<->nTop. }
+        tmpW := pLower; pLower := pUpper; pUpper := tmpW;
+        tmpI := nBtm;   nBtm   := nTop;    nTop   := tmpI;
+      end;
+
+      if pLower <> nil then
+      begin
+        pExprX := pLower^.pExpr^.pRight;
+        rc := sqlite3Stat4ProbeSetValue(pParse, PIndex(p), PPointer(@pRec),
+                                        pExprX, nBtm, nEq, @n);
+        if (rc = SQLITE_OK) and (n <> 0) then
+        begin
+          mask := WO_GT_WO or WO_LE;
+          if sqlite3ExprVectorSize(pExprX) > n then
+            mask := WO_LE or WO_LT;
+          iLwrIdx := whereKeyStats(pParse, p, pRec, 0, PRowCntArr(@a[0]));
+          if (pLower^.eOperator and mask) <> 0 then
+            iNew := a[0] + a[1]
+          else
+            iNew := a[0];
+          if iNew > iLower then iLower := iNew;
+          Dec(nOut);
+          pLower := nil;
+        end;
+      end;
+
+      if pUpper <> nil then
+      begin
+        pExprX := pUpper^.pExpr^.pRight;
+        rc := sqlite3Stat4ProbeSetValue(pParse, PIndex(p), PPointer(@pRec),
+                                        pExprX, nTop, nEq, @n);
+        if (rc = SQLITE_OK) and (n <> 0) then
+        begin
+          mask := WO_GT_WO or WO_LE;
+          if sqlite3ExprVectorSize(pExprX) > n then
+            mask := WO_LE or WO_LT;
+          iUprIdx := whereKeyStats(pParse, p, pRec, 1, PRowCntArr(@a[0]));
+          if (pUpper^.eOperator and mask) <> 0 then
+            iNew := a[0] + a[1]
+          else
+            iNew := a[0];
+          if iNew < iUpper then iUpper := iNew;
+          Dec(nOut);
+          pUpper := nil;
+        end;
+      end;
+
+      pBuilder^.pRec := pRec;
+      if rc = SQLITE_OK then
+      begin
+        if iUpper > iLower then
+        begin
+          nNew := i32(sqlite3LogEst(iUpper - iLower));
+          { Same-sample 4x discount (TUNING: where.c:2203..2208). }
+          if iLwrIdx = iUprIdx then nNew := nNew - 20;
+          Assert(20 = sqlite3LogEst(4));
+        end
+        else
+        begin
+          nNew := 10; Assert(10 = sqlite3LogEst(2));
+        end;
+        if nNew < nOut then nOut := nNew;
+        {$IFDEF SQLITE_DEBUG}
+        { 10.1.42.b.7.prereq.c.9 — re-enabled WHERETRACE 0x20 arm
+          (where.c:2215..2216). }
+        if (sqlite3WhereTrace and $20) <> 0 then
+          sqlite3DebugPrintf('STAT4 range scan: %u..%u  est=%d'#10,
+                             [u32(iLower), u32(iUpper), nOut]);
+        {$ENDIF}
+      end;
+    end
+    else
+    begin
+      bDone := 0;
+      rc := whereRangeSkipScanEst(pParse, pLower, pUpper, pLoop, @bDone);
+      if bDone <> 0 then begin Result := rc; Exit; end;
+    end;
+  end;
+  {$ELSE}
   { No-STAT4 build — pParse / pBuilder unused on this branch (matches
     UNUSED_PARAMETER at where.c:2225..2226). }
   if pParse = nil then ; { silence "unused" hint }
   if pBuilder = nil then ;
+  {$ENDIF}
 
   Assert((pLower <> nil) or (pUpper <> nil));
   Assert((pUpper = nil) or ((pUpper^.wtFlags and TERM_VNULL) = 0)
@@ -15471,6 +17269,10 @@ var
   nIter:         i16;
   aLTermArr:     PPWhereTerm;
   aLTermSlot:    PWhereTerm;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  nOutTRow:      u64;
+  pExprStat:     PExpr;
+  {$ENDIF}
 begin
   pWInfo := pBuilder^.pWInfo;
   pPrs   := pWInfo^.pParse;
@@ -15720,11 +17522,57 @@ begin
       end
       else
       begin
-        { No-STAT4 path — use stat1 row counts. }
-        pNew^.nOut := i16(pNew^.nOut
-                          + (pProbe^.aiRowLogEst[nEq] - pProbe^.aiRowLogEst[nEq - 1]));
-        if (eOp and WO_ISNULL) <> 0 then
-          pNew^.nOut := i16(pNew^.nOut + 10);
+        {$IFDEF SQLITE_ENABLE_STAT4}
+        { 10.1.42.b.7.prereq.c.9 — STAT4 sample-driven equality / IN estimator
+          (where.c:3484..3531).  Falls through to stat1 below when the sample
+          probe yields no estimate (nOutTRow == 0). }
+        nOutTRow := 0;
+        if (nInMul = 0)
+           and (pProbe^.nSample > 0)
+           and (pNew^.u.btree.nEq <= u16(pProbe^.nSampleCol))
+           and (((eOp and WO_IN) = 0) or ExprUseXList(pTerm^.pExpr))
+           and OptimizationEnabled(db, SQLITE_Stat4) then
+        begin
+          pExprStat := pTerm^.pExpr;
+          if (eOp and (WO_EQ or WO_ISNULL or WO_IS)) <> 0 then
+            rc := whereEqualScanEst(pPrs, pBuilder, pExprStat^.pRight, @nOutTRow)
+          else
+            rc := whereInScanEst(pPrs, pBuilder, pExprStat^.x.pList, @nOutTRow);
+          if rc = SQLITE_NOTFOUND then rc := SQLITE_OK;
+          if rc <> SQLITE_OK then Break;
+          if nOutTRow <> 0 then
+          begin
+            pNew^.nOut := sqlite3LogEst(nOutTRow);
+            if (nEq = 1)
+               and (pNew^.nOut + 10 > pProbe^.aiRowLogEst[0]) then
+            begin
+              {$IFDEF SQLITE_DEBUG}
+              { 10.1.42.b.7.prereq.c.9 — WHERETRACE 0x20 (where.c:3512..3517). }
+              if (sqlite3WhereTrace and $20) <> 0 then
+              begin
+                sqlite3DebugPrintf(
+                  'STAT4 determines term has low selectivity:'#10, []);
+                sqlite3WhereTermPrint(pTerm, 999);
+              end;
+              {$ENDIF}
+              pTerm^.wtFlags := pTerm^.wtFlags or TERM_HIGHTRUTH;
+              if (pTerm^.wtFlags and TERM_HEURTRUTH) <> 0 then
+                pBuilder^.bldFlags2 := pBuilder^.bldFlags2
+                                       or u8(SQLITE_BLDF2_2NDPASS);
+            end;
+            if pNew^.nOut > saved_nOut then pNew^.nOut := saved_nOut;
+            pNew^.nOut := i16(pNew^.nOut - nIn);
+          end;
+        end;
+        if nOutTRow = 0 then
+        {$ENDIF}
+        begin
+          { stat1 fallback. }
+          pNew^.nOut := i16(pNew^.nOut
+                            + (pProbe^.aiRowLogEst[nEq] - pProbe^.aiRowLogEst[nEq - 1]));
+          if (eOp and WO_ISNULL) <> 0 then
+            pNew^.nOut := i16(pNew^.nOut + 10);
+        end;
       end;
     end;
 
@@ -16300,7 +18148,13 @@ begin
     rc := whereLoopAddBtreeIndex(pBuilder, pSrc, pProbe, 0);
     if pBuilder^.bldFlags1 = SQLITE_BLDF1_INDEXED then
       pTab^.tabFlags := pTab^.tabFlags or TF_MaybeReanalyze;
-    { No STAT4 reset (sqlite3Stat4ProbeFree) — non-STAT4 build. }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { 10.1.42.b.7.prereq.c.9 — reset STAT4 probe state between candidate
+      indexes (where.c:4302..4306). }
+    passqlite3vdbe.sqlite3Stat4ProbeFree(pBuilder^.pRec);
+    pBuilder^.nRecValid := 0;
+    pBuilder^.pRec      := nil;
+    {$ENDIF}
 
   NextProbe:
     if (fgBits and u8($02)) <> 0 then  { isIndexedBy → only one probe }
@@ -17796,7 +19650,26 @@ begin
             if (pOBExpr^.op <> TK_COLUMN) and (pOBExpr^.op <> TK_AGG_COLUMN) then
               begin Inc(i); Continue; end;
             if pOBExpr^.iTable <> iCur then begin Inc(i); Continue; end;
-            if pOBExpr^.iColumn <> i16(iColumn) then begin Inc(i); Continue; end;
+            if pOBExpr^.iColumn <> i16(iColumn) then
+            begin
+              { 9.4.divbug.87.060 — Pas resolver leaves ORDER BY `a` as
+                iColumn=iPKey for an INTEGER PRIMARY KEY alias instead of
+                rewriting to XN_ROWID(-1) the way resolve.c:466/:562 do
+                (see MEMORY: generated_column_ipk_alias).  C's
+                where.c:5358 remaps the *index* slot iColumn==iPKey to
+                XN_ROWID, then the match at where.c:5393 compares
+                XN_ROWID==XN_ROWID.  Here pOBExpr^.iColumn still carries
+                the iPKey ordinal, so accept either form: if the index
+                slot is XN_ROWID and the table has an IPK, also match
+                pOBExpr^.iColumn = pTable^.iPKey. }
+              if (iColumn = XN_ROWID) and (pIndex <> nil)
+                 and (pIndex^.pTable <> nil)
+                 and (pIndex^.pTable^.iPKey >= 0)
+                 and (pOBExpr^.iColumn = pIndex^.pTable^.iPKey) then
+                { fall-through — treat as match }
+              else
+                begin Inc(i); Continue; end;
+            end;
           end
           else
           begin
@@ -17836,10 +19709,18 @@ begin
         if (isMatch <> 0)
            and ((obItems[i].fg.sortFlags and KEYINFO_ORDER_BIGNULL) <> 0) then
         begin
-          if j = i32(pLoop^.u.btree.nEq) then
-            pLoop^.wsFlags := pLoop^.wsFlags or WHERE_BIGNULL_SORT
-          else
-            isMatch := 0;
+          { 9.4.divbug.43: the C planner accepts BIGNULL ordering and the
+            wherecode emitter (wherecode.c:1933..1953 + 2030..2086 +
+            2134..2164 + where.c:7616..7620) generates a two-pass
+            NULL-then-non-NULL (or vice-versa) scan around regBignull/
+            addrBignull/OP_DecrJumpZero.  That two-pass codegen is not yet
+            ported (the assertion at codegen.pas:22592 explicitly defers
+            it).  Until it lands, refuse the index-satisfies-ORDER-BY
+            match whenever NULL ordering would diverge from the index's
+            natural NULL placement so the planner falls back to the
+            external sorter, which already honours sortFlags via
+            VdbeRecordCompare (btree.pas:3361). }
+          isMatch := 0;
         end;
         if isMatch <> 0 then
         begin
@@ -19214,9 +21095,24 @@ begin
     WHERE_TOP_LIMIT set; the existing Case-3 codegen at sqlite3WhereCodeOneLoopStart
     emits the OP_SeekGE / OP_SeekLE prologue and the per-row OP_Rowid /
     OP_Gt / OP_Lt loop-exit test, exactly mirroring the C reference for
-    `WHERE rowid BETWEEN x AND y`. }
+    `WHERE rowid BETWEEN x AND y`.
+
+    9.4.divbug.87.037 (intpkey-3.8): C's whereShortCut (where.c:6350..6440)
+    only short-circuits the cost-based planner on WHERE_ONEROW plans.  An
+    IPK-range plan must compete against any other index whose equality term
+    might be far more selective (e.g. `WHERE c='world' AND a>7` on a table
+    with INDEX i3(c,a) is hugely better served by i3).  When pTab has any
+    non-partial index, defer to whereLoopAddBtree / wherePathSolver instead
+    of taking this Pas-only shortcut.  Tables with no usable index keep the
+    shortcut so simple `WHERE rowid>?` cases don't pay the planner cost. }
   if pLoop^.wsFlags = 0 then
   begin
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      if pIdx^.pPartIdxWhere = nil then Exit(0);
+      pIdx := pIdx^.pNext;
+    end;
     pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_GT_WO or WO_GE, nil);
     while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
       pTerm := whereScanNext(@scan);
@@ -19352,6 +21248,30 @@ begin
         Exit(0);
       pIdx := pIdx^.pNext;
     end;
+    { TRIAGE (divbug.87.027..029): a partial-index that matches the query's
+      WHERE-clause is NOT considered here.  Deferring to the full planner
+      would correctly enter whereLoopAddBtree → whereUsablePartialIndex,
+      but the WhereEnd Index→table column rewrite arm (where.c:7732..7886)
+      is still deferred in this port (codegen.pas:22584).  Without it any
+      WHERE_IDX_ONLY plan that pas chooses would crash at runtime because
+      OP_Column refs against an unopened table cursor still reach the VDBE.
+      Left as a deeper deferred — fixing it requires porting that rewrite
+      in tandem.  index8-1.1eqp / index9-1.1..4.4 / indexA-1.2 remain
+      diverging. }
+    { 9.4.divbug.30 — when caller passed an ORDER BY / GROUP BY / DISTINCT,
+      the fallback SCAN below bypasses wherePathSolver and therefore the
+      wherePathSatisfiesOrderBy gate.  That means a plain `SELECT * FROM t
+      ORDER BY rowid` on a table with no usable index is forced through an
+      unnecessary external sorter (collate4-6.1/6.2 regression).  Defer to
+      the planner so the WHERE_IPK + rowid-order analysis can short-circuit
+      the sorter.  The C reference's whereShortCut never returns success on
+      a plain heap walk (where.c:6350..6417 only succeeds on WHERE_ONEROW),
+      so this matches upstream behaviour for the ORDER BY case. }
+    if (pWInfo^.pOrderBy <> nil)
+       or ((pWInfo^.wctrlFlags
+            and (WHERE_GROUPBY or WHERE_DISTINCTBY or WHERE_WANT_DISTINCT)) <> 0)
+    then
+      Exit(0);
     { Mirror where.c:4150 — a full rowid heap walk is WHERE_IPK (the IPK
       pseudo-index branch).  wsFlags=0 was Pas-only and left
       sqlite3WhereAddExplainText looking for a non-existent btree.pIndex on
@@ -19862,6 +21782,39 @@ begin
   pPrs^.pIdxPartExpr := saved_pIdxPartExpr;
 end;
 
+{ 9.4.divbug.83 — port where.c:6726..6738 whereReverseScanOrder.  Set
+  revMask bit for every FROM-list scan that should run in reverse order;
+  the only exception is a MATERIALIZED CTE whose body has its own ORDER
+  BY (its declared order is preserved).  Mirrors the C field accesses:
+  pItem->fg.isCte, pItem->u2.pCteUse->eM10d, pItem->fg.isSubquery,
+  pItem->u4.pSubq->pSelect->pOrderBy. }
+procedure whereReverseScanOrder(pWInfo: PWhereInfo);
+var
+  ii: Integer;
+  pItem: PSrcItem;
+  pSubq: PSubquery;
+  isCte_, hasOwnOB: Boolean;
+begin
+  pItem := SrcListItems(pWInfo^.pTabList);
+  for ii := 0 to pWInfo^.pTabList^.nSrc - 1 do
+  begin
+    isCte_   := (pItem[ii].fg.fgBits2 and u8($02)) <> 0;
+    hasOwnOB := False;
+    if isCte_
+       and (pItem[ii].u2.pCteUse <> nil)
+       and (pItem[ii].u2.pCteUse^.eM10d = u8(0))   { M10d_Yes }
+       and SrcItemIsSubquery(pItem[ii].fg)
+       and (pItem[ii].u4.pSubq <> nil) then
+    begin
+      pSubq := PSubquery(pItem[ii].u4.pSubq);
+      if (pSubq^.pSelect <> nil) and (pSubq^.pSelect^.pOrderBy <> nil) then
+        hasOwnOB := True;
+    end;
+    if not hasOwnOB then
+      pWInfo^.revMask := pWInfo^.revMask or (Bitmask(1) shl ii);
+  end;
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
@@ -20212,6 +22165,15 @@ begin
     sqlite3WhereCodeOneLoopStart Case 4.  Without this gate,
     `SELECT b FROM t WHERE a=N` silently returns 0 rows when N does
     not happen to coincide with an existing rowid. }
+  { 9.4.divbug.83 — apply whereReverseScanOrder up-front so both the
+    full-planner block (which Exits before reaching the second hook below)
+    and the inline single-table fast path see the same revMask.  C calls
+    whereReverseScanOrder once at where.c:7125; we mirror that here to
+    cover the fast path's plan-selected level-0 loop.  Idempotent: the
+    in-block call later will only re-OR the same bits. }
+  if (pWInfo^.pOrderBy = nil) and ((db^.flags and SQLITE_ReverseOrder) <> 0) then
+    whereReverseScanOrder(pWInfo);
+
   if fSingleTabCoroutine
      or (nTabList <> 1)
      or (whereShortCut(@sWLB) = 0)
@@ -20277,6 +22239,16 @@ begin
       pWInfo^.nRowOut := i16(pWInfo^.nRowOut - 30);
     end;
 
+    { 9.4.divbug.83 — port where.c:7124..7127 whereReverseScanOrder hook.
+      When PRAGMA reverse_unordered_selects=ON and the query has no ORDER
+      BY, flip every FROM-list scan into reverse order via revMask.  Skip
+      MATERIALIZED CTEs whose body has its own ORDER BY (they preserve
+      their declared order).  Without this the SQLITE_ReverseOrder flag is
+      latched but never consulted, so whereA-1.2 returns rows in insertion
+      order. }
+    if (pWInfo^.pOrderBy = nil) and ((db^.flags and SQLITE_ReverseOrder) <> 0) then
+      whereReverseScanOrder(pWInfo);
+
     if pParse^.nErr <> 0 then
     begin
       whereInfoFree(db, pWInfo);
@@ -20339,6 +22311,33 @@ begin
     begin
       whereInfoFree(db, pWInfo);
       Exit(nil);
+    end;
+
+    { where.c:7218..7237 — for DELETE/UPDATE plans (WHERE_ONEPASS_DESIRED)
+      that target a rowid table, clear WHERE_IDX_ONLY on the driving
+      WhereLoop so the per-level cursor-open arm below opens the table
+      cursor (the delete/update proper needs it live).  Gated 1:1 with
+      C: only fires when bOnerow OR (WHERE_ONEPASS_MULTIROW && !vtab &&
+      !MULTI_OR && SQLITE_OnePass enabled).  Earlier divbug.55 omitted
+      the gate, which mislabelled UPDATE/DELETE EQP for COVERING-INDEX
+      plans where chngKey suppresses MULTIROW (indexedby-8.1/8.3/11.10).
+      divbug.87.027..030 restores the gate. }
+    if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
+    begin
+      pLoop := whereInfoLevels(pWInfo)[0].pWLoop;
+      pTab  := SrcListItems(pTabList)[0].pSTab;
+      if HasRowid(pTab)
+         and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0)
+         and (pTab^.eTabType <> TABTYP_VTAB)
+         and (   ((pLoop^.wsFlags and WHERE_ONEROW) <> 0)
+              or (    ((wctrlFlags and WHERE_ONEPASS_MULTIROW) <> 0)
+                  and (((pLoop^.wsFlags and WHERE_MULTI_OR) = 0)
+                       or ((wctrlFlags and WHERE_DUPLICATES_OK) <> 0))
+                  and OptimizationEnabled(db, SQLITE_OnePass)) )
+      then
+      begin
+        pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
+      end;
     end;
 
     { where.c:7242..7423 — open a cursor for every level.
@@ -20460,6 +22459,14 @@ begin
           begin
             pLevel^.iIdxCur := pParse^.nTab;
             Inc(pParse^.nTab);
+            { where.c:7348..7350 — register IndexedExpr entries so the
+              expression code generator can substitute index reads for
+              CREATE INDEX ... ON <expr>() match-sites (9.4.divbug.87.031). }
+            if (pLoop^.u.btree.pIndex <> nil)
+               and (((pLoop^.u.btree.pIndex^.idxFlags shr 11) and 1) <> 0)
+               and OptimizationEnabled(db, SQLITE_IndexedExpr) then
+              whereAddIndexedExpr(pParse, pLoop^.u.btree.pIndex,
+                                  pLevel^.iIdxCur, pTabItem);
             if pLoop^.u.btree.pIndex <> nil then
             begin
               sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
@@ -20608,9 +22615,11 @@ begin
     the scan is not a MULTI-OR (or the caller granted DUPLICATES_OK),
     and the OnePass optimisation is enabled.
 
-    bFordelete / WHERE_IDX_ONLY clearing is deferred — Pas planner does
-    not currently emit covering-index DELETE plans, so the gate has no
-    work to do on those bits. }
+    For ONEPASS DELETE/UPDATE, also clear WHERE_IDX_ONLY when the table
+    has a rowid: the caller needs the table cursor open for the delete
+    proper, so the loop must scan the table-cursor side too.  This also
+    suppresses the "USING COVERING INDEX" tag in EQP output for
+    DELETE/UPDATE plans (where.c:7230..7234). }
   if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
   begin
     if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
@@ -20626,6 +22635,16 @@ begin
     begin
       pWInfo^.eOnePass := ONEPASS_MULTI;
       pWInfo^.aiCurOnePass[0] := pLevel^.iTabCur;
+    end;
+    { where.c:7230..7234 — for ONEPASS rowid tables, clear WHERE_IDX_ONLY
+      since the table cursor must be live for the delete itself.  This
+      also makes EQP report plain "USING INDEX" (not "USING COVERING
+      INDEX") for these DELETE/UPDATE plans (divbug.55). }
+    if (pWInfo^.eOnePass <> ONEPASS_OFF)
+       and HasRowid(pTab)
+       and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0) then
+    begin
+      pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
     end;
   end;
 
@@ -20868,6 +22887,19 @@ begin
     end;
     Assert((pStart <> nil) or (pEnd <> nil));
 
+    { 9.4.divbug.83 — port wherecode.c:1727..1731 bRev swap.  This inline
+      single-level fast path runs at level 0, so bRev = revMask bit 0.
+      When PRAGMA reverse_unordered_selects=ON (or the planner picked
+      this loop in reverse), the start/end bounds and the Rewind/Last
+      direction must flip together so the IPK-range scan walks rows in
+      descending rowid order. }
+    if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+    begin
+      pTerm  := pStart;
+      pStart := pEnd;
+      pEnd   := pTerm;
+    end;
+
     if pStart <> nil then
     begin
       Assert((pStart^.wtFlags and TERM_VNULL) = 0);
@@ -20887,6 +22919,8 @@ begin
       sqlite3VdbeAddOp3(v, op3, pLevel^.iTabCur, pLevel^.addrBrk, r1);
       sqlite3ReleaseTempReg(pParse, rTemp);
     end
+    else if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+      sqlite3VdbeAddOp2(v, OP_Last,   pLevel^.iTabCur, pLevel^.addrHalt)
     else
       sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrHalt);
 
@@ -20898,15 +22932,30 @@ begin
       Inc(pParse^.nMem);
       memEndValue := pParse^.nMem;
       sqlite3ExprCode(pParse, pX^.pRight, memEndValue);
+      { 9.4.divbug.83 — port wherecode.c:1794..1800 bRev branch of testOp.
+        Strict bounds (TK_LT / TK_GT) use Ge/Le; non-strict use Gt/Lt. }
       if (pX^.op = TK_LT) or (pX^.op = TK_GT_TK) then
-        testOp := OP_Ge
+      begin
+        if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+          testOp := OP_Le
+        else
+          testOp := OP_Ge;
+      end
       else
-        testOp := OP_Gt;
+      begin
+        if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+          testOp := OP_Lt
+        else
+          testOp := OP_Gt;
+      end;
       disableTerm(pLevel, pEnd);
     end;
 
     startAddr := sqlite3VdbeCurrentAddr(v);
-    pLevel^.op := OP_Next;
+    if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+      pLevel^.op := OP_Prev
+    else
+      pLevel^.op := OP_Next;
     pLevel^.p1 := pLevel^.iTabCur;
     pLevel^.p2 := startAddr;
     { 10.1.39.b — do NOT overwrite pLevel^.addrBody here.  In C
@@ -20960,7 +23009,13 @@ begin
     end
     else
     begin
-      sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
+      { 9.4.divbug.83 — port wherecode.c:2574..2576 aStart/aStep[bRev].
+        Reverse-order plain scan at level 0: Last+Prev instead of
+        Rewind+Next when revMask bit 0 is set. }
+      if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+        sqlite3VdbeAddOp2(v, OP_Last,   pLevel^.iTabCur, pLevel^.addrBrk)
+      else
+        sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
       { 10.1.39.b — keep addrBody = Rewind addr (from where.c:7467 mirror);
         track the post-Rewind landing site locally for OP_Next.p2. }
       startAddr := sqlite3VdbeCurrentAddr(v);
@@ -20969,7 +23024,10 @@ begin
         sqlite3VdbeAddOp0(v, OP_Noop);
         DoInRhsHoist;
       end;
-      pLevel^.op := OP_Next;
+      if (pWInfo^.revMask and Bitmask(1)) <> 0 then
+        pLevel^.op := OP_Prev
+      else
+        pLevel^.op := OP_Next;
       pLevel^.p1 := pLevel^.iTabCur;
       pLevel^.p2 := startAddr;
       { pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP — stmt-status counter
@@ -21192,18 +23250,21 @@ begin
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 20 — IN-loop tail.
 
-        Trimmed port of where.c:7628..7673.  For loops with WHERE_IN_ABLE
-        and a populated u.in.aInLoop[] (today set up by Case 2 IPK-IN in
-        sqlite3WhereBegin), resolve addrNxt at the OP_Next emission point,
-        walk aInLoop in reverse, patch the OP_IsNull jump to addrNxt
-        (addrInTop+1), emit OP_Next iCur, addrInTop, then patch the
-        OP_Rewind jump-on-empty (addrInTop-1) to land just past OP_Next so
-        the post-loop addrBrk resolution exits cleanly.
+        Port of where.c:7628..7673.  For loops with WHERE_IN_ABLE and a
+        populated u.in.aInLoop[]: resolve addrNxt at the OP_Next emission
+        point, walk aInLoop in reverse, patch the OP_IsNull jump to
+        addrNxt (addrInTop+1), optionally emit the LEFT-JOIN IfNotOpen
+        bypass and the WHERE_IN_EARLYOUT OP_IfNoHope skip, then emit
+        OP_Next iCur, addrInTop, and patch the OP_Rewind jump-on-empty
+        (addrInTop-1) to land just past OP_Next so the post-loop addrBrk
+        resolution exits cleanly.
 
-        The full C tail also handles WHERE_IN_EARLYOUT / iLeftJoin /
-        WHERE_IN_SEEKSCAN — none exercised by the IPK-IN single-level slice
-        today, so they stay deferred (will land alongside the composite
-        index-IN scan plan in a later sub-progress). }
+        9.4.divbug.87.023 — port the WHERE_IN_EARLYOUT / iLeftJoin
+        sub-arm (where.c:7637..7664).  Without OP_IfNoHope, the
+        multikey-IN-operator early-out optimisation never fires:
+        in6-1.5 expects sqlite_search_count=39 but got 104 because every
+        IN value did a full index lookup instead of bailing once the
+        prefix went past the matching range. }
       pLoop := pLevel^.pWLoop;
       if ((pLoop^.wsFlags and WHERE_IN_ABLE) <> 0)
          and (pLevel^.u.in_nIn > 0)
@@ -21216,7 +23277,40 @@ begin
           Inc(pIn, j - 1);
           sqlite3VdbeJumpHere(v, pIn^.addrInTop + 1);
           if pIn^.eEndLoopOp <> OP_Noop then
+          begin
+            if pIn^.nPrefix <> 0 then
+            begin
+              { bEarlyOut: emit OP_IfNoHope to abandon the IN loop when
+                no row in the index can match the current prefix. }
+              if ((pLoop^.wsFlags and WHERE_VIRTUALTABLE) = 0)
+                 and ((pLoop^.wsFlags and WHERE_IN_EARLYOUT) <> 0) then
+              begin
+                if pLevel^.iLeftJoin <> 0 then
+                begin
+                  { LEFT JOIN: cursor pIn^.iCur may not have been opened
+                    yet (e.g. `a=? AND b IN(...)` with NULL a).  Skip
+                    over the OP_IfNoHope + OP_Next (2 ops) when not open. }
+                  sqlite3VdbeAddOp2(v, OP_IfNotOpen, pIn^.iCur,
+                    sqlite3VdbeCurrentAddr(v) + 3);
+                end;
+                sqlite3VdbeAddOp4Int(v, OP_IfNoHope, pLevel^.iIdxCur,
+                  sqlite3VdbeCurrentAddr(v) + 2,
+                  pIn^.iBase, pIn^.nPrefix);
+                { Retarget the OP_IsNull against the left operand of IN
+                  so it jumps past the OP_IfNoHope.  Without this the
+                  OP_IsNull would also bypass the OP_Affinity opcode
+                  that OP_IfNoHope requires. }
+                sqlite3VdbeJumpHere(v, pIn^.addrInTop + 1);
+              end
+              else if pLevel^.iLeftJoin <> 0 then
+              begin
+                { LEFT JOIN with no early-out: skip just the OP_Next. }
+                sqlite3VdbeAddOp2(v, OP_IfNotOpen, pIn^.iCur,
+                  sqlite3VdbeCurrentAddr(v) + 2);
+              end;
+            end;
             sqlite3VdbeAddOp2(v, pIn^.eEndLoopOp, pIn^.iCur, pIn^.addrInTop);
+          end;
           sqlite3VdbeJumpHere(v, pIn^.addrInTop - 1);
         end;
       end;
@@ -21255,10 +23349,22 @@ begin
         viaCoroutine levels skip this block (mirrors C's `continue`
         after translateColumnToCopy). }
       pIdxR := nil;
-      if (not viaCoroLevel)
+      { where.c:7745..7748 — when the level drives a RIGHT JOIN, C calls
+        sqlite3WhereRightJoinLoop with `continue`, which BOTH skips the
+        index-rewrite block below AND defers RHS-table OP_Column emission
+        intact (so the addrSubrtn body reads from the table cursor that
+        the inner sub-WhereBegin will reposition during the unmatched-rows
+        pass — see wherecode.c:2880..2902).  If we rewrite OP_Column to use
+        the outer iIdxCur here, the unmatched pass would later OP_NullRow
+        that cursor (wherecode.c:2902), and every result column served by
+        the index would come back NULL (divbug 9.4.divbug.87.041: join7-1.20
+        — `c` read NULL instead of 5 for the right-unmatched t2 row).
+        The Pas port invokes sqlite3WhereRightJoinLoop in a separate pass
+        below (line ~23103+); here we simply gate the rewrite off. }
+      if (not viaCoroLevel) and (pLevel^.pRJ = nil)
          and ((pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0) then
         pIdxR := pLoop^.u.btree.pIndex
-      else if (not viaCoroLevel)
+      else if (not viaCoroLevel) and (pLevel^.pRJ = nil)
               and ((pLoop^.wsFlags and WHERE_MULTI_OR) <> 0) then
         pIdxR := pLevel^.u.pCoveringIdx;
       if (pIdxR <> nil) and (db^.mallocFailed = 0) then
@@ -23109,6 +25215,19 @@ begin
   begin
     Assert(pLimit^.op = TK_LIMIT);
     Assert(pLimit^.pLeft <> nil);
+    { 9.4.divbug.72 — reject row-value LIMIT / OFFSET vectors before
+      attempting to code them.  C raises this from inside sqlite3ExprCode's
+      TK_VECTOR arm (expr.c:5597..5600); in Pas the LIMIT path bypasses that
+      arm (the LIMIT expr is evaluated against an integer register without
+      first descending into TK_VECTOR), so without this explicit gate
+      `LIMIT (1,2)` is accepted silently — see expr.c:5597..5600 +
+      select.c:2538..2548. }
+    if (sqlite3ExprIsVector(pLimit^.pLeft) <> 0)
+       or ((pLimit^.pRight <> nil) and (sqlite3ExprIsVector(pLimit^.pRight) <> 0)) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Exit;
+    end;
     Inc(pParse^.nMem);
     iLimit    := pParse^.nMem;
     p^.iLimit := iLimit;
@@ -23824,6 +25943,7 @@ var
   apColl:      PPointer;
   pSItem:      PSrcItem;
   base:        Pointer;
+  savedAddrExplainRec: i32;
 label
   end_of_recursive;
 begin
@@ -23953,7 +26073,14 @@ begin
   pSetup        := pFirstRec^.pPrior;
   pSetup^.pNext := nil;
   pSetup^.selFlags := pSetup^.selFlags and (not u32(SF_Compound));
+  { ExplainQueryPlan((pParse, 1, "SETUP")) — select.c:2781.  Push a SETUP
+    node so the setup query's scans nest under it; sqlite3Select does not
+    auto-pop in this port, so save/restore addrExplain manually around the
+    recursion (mirrors the scalar-subquery pattern at codegen.pas:5514). }
+  savedAddrExplainRec := pParse^.addrExplain;
+  sqlite3VdbeExplain(pParse, 1, 'SETUP', []);
   rc := sqlite3Select(pParse, pSetup, @destQueue);
+  pParse^.addrExplain := savedAddrExplainRec;
   pSetup^.selFlags := pSetup^.selFlags or SF_Compound;
   pSetup^.pNext := p;
   if rc <> 0 then goto end_of_recursive;
@@ -23980,7 +26107,11 @@ begin
     fires normally; restore after. }
   pFirstRec^.pPrior := nil;
   pFirstRec^.selFlags := pFirstRec^.selFlags and (not u32(SF_Compound));
+  { ExplainQueryPlan((pParse, 1, "RECURSIVE STEP")) — select.c:2813. }
+  savedAddrExplainRec := pParse^.addrExplain;
+  sqlite3VdbeExplain(pParse, 1, 'RECURSIVE STEP', []);
   sqlite3Select(pParse, p, @destQueue);
+  pParse^.addrExplain := savedAddrExplainRec;
   pFirstRec^.selFlags := pFirstRec^.selFlags or SF_Compound;
   Assert(pFirstRec^.pPrior = nil);
   pFirstRec^.pPrior := pSetup;
@@ -24006,6 +26137,120 @@ begin
   if pParse^.pToplevel = nil then
     pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_OkConstFactor;
   Result := sqlite3VdbeCreate(pParse);
+end;
+
+{ columnType — derive the declaration type of an expression, mirroring
+  C columnType() at select.c:1918..2064 with the NON-SQLITE_ENABLE_COLUMN_METADATA
+  arms only (this port does not define SQLITE_ENABLE_COLUMN_METADATA, so the
+  zOrigDb/zOrigTab/zOrigCol out-parameters are omitted).  TK_COLUMN walks the
+  NameContext chain to locate the source table/sub-select; TK_SELECT recurses
+  into the single result column of the sub-select. }
+function columnTypeImpl(pNC: PNameContext; pExpr: PExpr): PAnsiChar;
+var
+  zType:    PAnsiChar;
+  j:        i32;
+  pTab:     PTable2;
+  pS:       PSelect;
+  iCol:     i32;
+  pTabList: PSrcList;
+  items:    PSrcItem;
+  sNC:      TNameContext;
+  pInner:   PExpr;
+begin
+  zType := nil;
+  Assert(pExpr <> nil);
+  Assert(pNC^.pSrcList <> nil);
+  case pExpr^.op of
+    TK_COLUMN:
+    begin
+      pTab := nil;
+      pS   := nil;
+      iCol := pExpr^.iColumn;
+      while (pNC <> nil) and (pTab = nil) do
+      begin
+        pTabList := pNC^.pSrcList;
+        items := SrcListItems(pTabList);
+        j := 0;
+        while (j < pTabList^.nSrc) and (items[j].iCursor <> pExpr^.iTable) do
+          Inc(j);
+        if j < pTabList^.nSrc then
+        begin
+          pTab := items[j].pSTab;
+          if (items[j].fg.fgBits and u8($04)) <> 0 then  { isSubquery }
+          begin
+            if items[j].u4.pSubq <> nil then
+              pS := items[j].u4.pSubq^.pSelect;
+          end
+          else
+            pS := nil;
+        end
+        else
+          pNC := pNC^.pNext;
+      end;
+      if pTab = nil then
+      begin
+        Result := nil; Exit;
+      end;
+      if pS <> nil then
+      begin
+        { Sub-select / view in FROM clause: recurse into the result column. }
+        if (iCol < pS^.pEList^.nExpr) and (iCol >= 0) then
+        begin
+          pInner := ExprListItems(pS^.pEList)[iCol].pExpr;
+          FillChar(sNC, SizeOf(sNC), 0);
+          sNC.pSrcList := pS^.pSrc;
+          sNC.pNext    := pNC;
+          sNC.pParse   := pNC^.pParse;
+          zType := columnTypeImpl(@sNC, pInner);
+        end;
+      end
+      else
+      begin
+        { Real table or CTE.  iCol < 0 means the rowid. }
+        if iCol < 0 then
+          zType := 'INTEGER'
+        else
+          zType := sqlite3ColumnType(@pTab^.aCol[iCol], nil);
+      end;
+    end;
+    TK_SELECT:
+    begin
+      Assert(ExprUseXSelect(pExpr));
+      pS := pExpr^.x.pSelect;
+      pInner := ExprListItems(pS^.pEList)[0].pExpr;
+      FillChar(sNC, SizeOf(sNC), 0);
+      sNC.pSrcList := pS^.pSrc;
+      sNC.pNext    := pNC;
+      sNC.pParse   := pNC^.pParse;
+      zType := columnTypeImpl(@sNC, pInner);
+    end;
+  end;
+  Result := zType;
+end;
+
+{ generateColumnTypes — emit COLNAME_DECLTYPE for each result column.
+  Mirrors select.c:2070..2107 (non-SQLITE_ENABLE_COLUMN_METADATA arm). }
+procedure generateColumnTypesImpl(pParse: PParse; pTabList: PSrcList;
+  pEList: PExprList);
+var
+  v:     PVdbe;
+  i:     i32;
+  sNC:   TNameContext;
+  items: PExprListItem;
+  zType: PAnsiChar;
+begin
+  v := pParse^.pVdbe;
+  if (v = nil) or (pEList = nil) then Exit;
+  FillChar(sNC, SizeOf(sNC), 0);
+  sNC.pSrcList := pTabList;
+  sNC.pParse   := pParse;
+  sNC.pNext    := nil;
+  items := ExprListItems(pEList);
+  for i := 0 to pEList^.nExpr - 1 do
+  begin
+    zType := columnTypeImpl(@sNC, items[i].pExpr);
+    sqlite3VdbeSetColName(v, i, COLNAME_DECLTYPE, zType, SQLITE_TRANSIENT);
+  end;
 end;
 
 { sqlite3GenerateColumnNames — emit OP_ColumnName for each SELECT result }
@@ -24084,6 +26329,8 @@ begin
       sqlite3VdbeSetColName(v, i, COLNAME_NAME, zName, SQLITE_DYNAMIC);
     end;
   end;
+  { select.c:2202 — populate COLNAME_DECLTYPE slots. }
+  generateColumnTypesImpl(pParse, pTabList, pEList);
 end;
 
 { sqlite3ColumnsFromExprList — build a Column array from an ExprList }
@@ -24209,16 +26456,25 @@ begin
   Result := SQLITE_OK;
 end;
 
-{ sqlite3SubqueryColumnTypes — fill Column type/affinity from SELECT exprs }
+{ sqlite3SubqueryColumnTypes — fill Column type/affinity from SELECT exprs.
+  Port of select.c:2346..2433.  Walks compound arms (pNext) to choose the
+  first non-NONE affinity, then downgrades to BLOB when later arms expose
+  a mixed-type clash (TEXT vs numeric or NUMERIC vs textual data) so a
+  UNION column with mixed-type members compares as BLOB — required to
+  give `data JOIN idmap USING(id)` the right P5 affinity in affinity3.
+  (divbug.16 residual). }
 procedure sqlite3SubqueryColumnTypes(pParse: PParse; pTab: PTable2;
   pSelect: PSelect; aff: AnsiChar);
 var
-  db:   PTsqlite3;
-  pSel: PSelect;
-  pCol: PColumn;
-  i:    i32;
-  pE:   PExpr;
+  db:    PTsqlite3;
+  pSel:  PSelect;
+  pS2:   PSelect;
+  pCol:  PColumn;
+  i:     i32;
+  m:     i32;
+  pE:    PExpr;
   items: PExprListItem;
+  s2items: PExprListItem;
   affC:  AnsiChar;
 begin
   db := pParse^.db;
@@ -24232,8 +26488,36 @@ begin
   begin
     pE := items[i].pExpr;
     if pE = nil then begin Inc(pCol); continue; end;
+    m := 0;
+    pS2 := pSel;
     affC := sqlite3ExprAffinity(pE);
+    { Walk forward through pNext while the affinity is still NONE — first
+      non-NONE arm wins (select.c:2378..2382). }
+    while (affC <= AnsiChar(SQLITE_AFF_NONE)) and (pS2^.pNext <> nil) do
+    begin
+      s2items := PExprListItem(PByte(pS2^.pEList) + SizeOf(TExprList));
+      m := m or sqlite3ExprDataType(s2items[i].pExpr);
+      pS2 := pS2^.pNext;
+      s2items := PExprListItem(PByte(pS2^.pEList) + SizeOf(TExprList));
+      affC := sqlite3ExprAffinity(s2items[i].pExpr);
+    end;
     if affC <= AnsiChar(SQLITE_AFF_NONE) then affC := aff;
+    { BLOB downgrade for compound mixed types (select.c:2386..2398). }
+    if (affC >= AnsiChar(SQLITE_AFF_TEXT))
+       and ((pS2^.pNext <> nil) or (pS2 <> pSel)) then
+    begin
+      pS2 := pS2^.pNext;
+      while pS2 <> nil do
+      begin
+        s2items := PExprListItem(PByte(pS2^.pEList) + SizeOf(TExprList));
+        m := m or sqlite3ExprDataType(s2items[i].pExpr);
+        pS2 := pS2^.pNext;
+      end;
+      if (affC = AnsiChar(SQLITE_AFF_TEXT)) and ((m and $01) <> 0) then
+        affC := AnsiChar(SQLITE_AFF_BLOB)
+      else if (affC >= AnsiChar(SQLITE_AFF_NUMERIC)) and ((m and $02) <> 0) then
+        affC := AnsiChar(SQLITE_AFF_BLOB);
+    end;
     pCol^.affinity := affC;
     Inc(pCol);
   end;
@@ -24475,9 +26759,24 @@ begin
 
     if not isStar then
     begin
-      { Carry the original entry intact — transfer ownership to pNew. }
+      { Carry the original entry intact — transfer ownership to pNew.
+        select.c:6131..6136 — also propagate zEName + fg.eEName so that
+        result-column aliases survive `*` co-existence; otherwise
+        `SELECT *, 1 AS q FROM t` loses the AS-name and the synthesised
+        view column becomes `column2` (9.4.divbug.87.016). }
       pNew := sqlite3ExprListAppend(pParse, pNew, pE);
       items[k].pExpr := nil;
+      if pNew <> nil then
+      begin
+        with PExprListItem(PByte(ExprListItems(pNew)) +
+             (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM)^ do
+        begin
+          zEName := items[k].zEName;
+          fg.eBits := (fg.eBits and not u8($03)) or
+                      (items[k].fg.eBits and u8($03));
+        end;
+        items[k].zEName := nil;
+      end;
       Continue;
     end;
 
@@ -24513,8 +26812,12 @@ begin
         { select.c:6251..6258 — for non-T.* expansion of a non-first FROM
           item that is part of a USING-style join, omit any column whose
           name appears in the USING IdList.  This is what NATURAL JOIN
-          and JOIN ... USING(col) need to coalesce duplicate columns. }
+          and JOIN ... USING(col) need to coalesce duplicate columns.
+          9.4.divbug.59: SF_NestedFrom wrappers must KEEP both sides'
+          USING columns so qualified refs (t3.a) resolve through the
+          wrapper. }
         if (i > 0) and (zTName = nil) and
+           ((p^.selFlags and SF_NestedFrom) = 0) and
            ((pItem^.fg.fgBits2 and $08) <> 0) and
            (pItem^.u3.pUsing <> nil) and
            (sqlite3IdListIndex(pItem^.u3.pUsing,
@@ -24523,7 +26826,15 @@ begin
         pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
         if pColExpr = nil then Continue;
         pColExpr^.iTable  := pItem^.iCursor;
-        pColExpr^.iColumn := i16(j);
+        { 9.4.divbug.30 — port resolve.c:863..887 (sqlite3CreateColumnExpr):
+          alias the INTEGER PRIMARY KEY column to iColumn=-1 so downstream
+          planner code (wherePathSatisfiesOrderBy at codegen.pas:18996) can
+          recognise the rowid match.  Without this, `SELECT * FROM t ORDER
+          BY a` on an IPK table forces a temp-btree sort (collate4-6.x). }
+        if pTab^.iPKey = j then
+          pColExpr^.iColumn := i16(-1)
+        else
+          pColExpr^.iColumn := i16(j);
         pColExpr^.y.pTab  := pTab;
         if j < BMS - 1 then
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
@@ -24903,6 +27214,10 @@ var
   bSynthUsing: i32;
   pE1, pE2, pEq: PExpr;
   pLeftSrc: PSrcItem;
+  { 9.4.divbug.89.014 — LTORJ coalesce arm locals (select.c:596..633). }
+  pFuncArgs: PExprList;
+  pFunc:     PExpr;
+  iLtoR_LT, iLtoR_LC: i32;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -25162,7 +27477,76 @@ begin
                                        (Bitmask(1) shl (BMS - 1));
             end;
             sqlite3SrcItemColumnUsed(pLeftSrc, iLeftCol);
-            if (pItem^.fg.jointype and JT_LEFT) <> 0 then
+            { 9.4.divbug.89.014 — port select.c:596..633.  When ANY RIGHT or
+              FULL JOIN is in this FROM clause (LTORJ marker on a[0]), the
+              USING-emitted left side must be a coalesce() over every prior
+              FROM term that also has zName.  Without this, when the RIGHT
+              JOIN's unmatched-right scan emits a row, the next USING-eq
+              compares NULL (from the first matched left table) against the
+              following table's column, dropping rows that should match. }
+            if ((SrcListItems(pSrc)[0].fg.jointype and JT_LTORJ) <> 0)
+               and (pParse^.nErr = 0) then
+            begin
+              pFuncArgs := nil;
+              pE1^.flags := pE1^.flags or EP_CanBeNull;
+              iLtoR_LT := iLeftTab;
+              iLtoR_LC := iLeftCol;
+              while tableAndColumnIndex(pSrc, iLtoR_LT + 1, i - 1,
+                                        zSynthName, @iLtoR_LT, @iLtoR_LC,
+                                        bSynthUsing) <> 0 do
+              begin
+                pLeftSrc := PSrcItem(PByte(base) +
+                                     iLtoR_LT * SizeOf(TSrcItem));
+                if ((pLeftSrc^.fg.fgBits2 and $08) = 0)
+                   or (sqlite3IdListIndex(pLeftSrc^.u3.pUsing,
+                                          zSynthName) < 0) then
+                begin
+                  sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString(
+                    'ambiguous reference to ' + string(zSynthName) +
+                    ' in USING()')));
+                  Break;
+                end;
+                pFuncArgs := sqlite3ExprListAppend(pParse, pFuncArgs, pE1);
+                pE1 := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+                if pE1 = nil then
+                begin
+                  sqlite3ExprListDelete(pParse^.db, pFuncArgs);
+                  Exit;
+                end;
+                pE1^.iTable := pLeftSrc^.iCursor;
+                pE1^.y.pTab := pLeftSrc^.pSTab;
+                if (pLeftSrc^.pSTab <> nil)
+                   and (pLeftSrc^.pSTab^.iPKey = i16(iLtoR_LC)) then
+                  pE1^.iColumn := -1
+                else
+                begin
+                  pE1^.iColumn := i16(iLtoR_LC);
+                  if iLtoR_LC < BMS - 1 then
+                    pLeftSrc^.colUsed := pLeftSrc^.colUsed or
+                                           (Bitmask(1) shl iLtoR_LC)
+                  else
+                    pLeftSrc^.colUsed := pLeftSrc^.colUsed or
+                                           (Bitmask(1) shl (BMS - 1));
+                end;
+                pE1^.flags := pE1^.flags or EP_CanBeNull;
+                sqlite3SrcItemColumnUsed(pLeftSrc, iLtoR_LC);
+              end;
+              if pFuncArgs <> nil then
+              begin
+                pFuncArgs := sqlite3ExprListAppend(pParse, pFuncArgs, pE1);
+                pFunc := sqlite3ExprAlloc(pParse^.db, TK_FUNCTION, nil, 0);
+                if pFunc = nil then
+                begin
+                  sqlite3ExprListDelete(pParse^.db, pFuncArgs);
+                  Exit;
+                end;
+                pFunc^.u.zToken := PAnsiChar('coalesce');
+                pFunc^.x.pList  := pFuncArgs;
+                pFunc^.affExpr  := AnsiChar(SQLITE_AFF_DEFER);
+                pE1 := pFunc;
+              end;
+            end
+            else if (pItem^.fg.jointype and JT_LEFT) <> 0 then
               pE1^.flags := pE1^.flags or EP_CanBeNull;
             pE2 := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
             if pE2 = nil then
@@ -26436,6 +28820,39 @@ begin
   end;
 end;
 
+{ fixDistinctOpenEph — select.c:1017..1042.  Runs after updateAccumulator
+  to retro-edit the OP_OpenEphemeral that resetAccumulatorSimple laid
+  down at pF^.iDistAddr based on eTnctType from sqlite3WhereIsDistinct:
+    NOOP / UNORDERED — keep the ephemeral (default-path dedup needs it).
+    UNIQUE           — noop the OpenEphemeral (WHERE loop already unique).
+    ORDERED          — rewrite into OP_Null over regPrev (iVal) so the
+                       first iteration's OP_Eq fails on Cleared-NULL. }
+procedure fixDistinctOpenEph(pParse: PParse; eTnctType: i32;
+  iVal: i32; iOpenEphAddr: i32);
+var
+  v:   PVdbe;
+  pOp: PVdbeOp;
+begin
+  if pParse^.nErr <> 0 then Exit;
+  if (eTnctType <> WHERE_DISTINCT_UNIQUE)
+     and (eTnctType <> WHERE_DISTINCT_ORDERED) then Exit;
+  v := pParse^.pVdbe;
+  sqlite3VdbeChangeToNoop(v, iOpenEphAddr);
+  pOp := sqlite3VdbeGetOp(v, iOpenEphAddr + 1);
+  if (pOp <> nil) and (pOp^.opcode = OP_Explain) then
+    sqlite3VdbeChangeToNoop(v, iOpenEphAddr + 1);
+  if eTnctType = WHERE_DISTINCT_ORDERED then
+  begin
+    pOp := sqlite3VdbeGetOp(v, iOpenEphAddr);
+    if pOp <> nil then
+    begin
+      pOp^.opcode := OP_Null;
+      pOp^.p1     := 1;
+      pOp^.p2     := iVal;
+    end;
+  end;
+end;
+
 { updateAccumulatorSimple — select.c:6799 (slim).  For each aggregate
   function, code its argument list into a contiguous temp range and emit
   OP_AggStep with the FuncDef attached as P4.  After the per-Func loop,
@@ -26444,7 +28861,7 @@ end;
   populated.  Slim variant: no FILTER / DISTINCT / ORDER BY / NEEDCOLL
   arms (rejected by gate). }
 procedure updateAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo;
-  regAcc: i32 = 0);
+  regAcc: i32 = 0; eDistinctType: i32 = WHERE_DISTINCT_UNORDERED);
 var
   v:       PVdbe;
   i, j, nArg, r1: i32;
@@ -26467,6 +28884,8 @@ begin
   Assert(pAggInfo^.iFirstReg > 0);
   if pParse^.nErr <> 0 then Exit;
   pAggInfo^.directMode := 1;
+  regHit := 0;
+  addrHitTest := 0;
   for i := 0 to pAggInfo^.nFunc - 1 do
   begin
     addrNext := 0;
@@ -26550,21 +28969,74 @@ begin
       regAgg := 0;
       regDistinct := 0;
     end;
-    { DISTINCT dedup — select.c:6902..6908 default WHERE_DISTINCT_UNORDERED
-      arm.  Skip the AggStep when the arg-record is already present in the
-      ephemeral table opened by resetAccumulatorSimple. }
+    { DISTINCT dedup — select.c:6902..6908 + codeDistinct (select.c:933).
+      Three-way dispatch on eDistinctType from sqlite3WhereIsDistinct:
+        UNIQUE   — WHERE loop already yields unique rows; nothing to do
+                   (fixDistinctOpenEph will noop the OpenEphemeral too).
+        ORDERED  — rows arrive sorted; compare against previous-row reg
+                   via OP_Ne/OP_Eq instead of an ephemeral b-tree.
+                   pF^.iDistinct is rewritten to the regPrev base.
+        UNORDERED/NOOP — default path: OP_Found / OP_MakeRecord /
+                   OP_IdxInsert into the per-Func ephemeral.
+      Bug 9.4.divbug.33: without this dispatch the port always emitted
+      the UNORDERED ephemeral even when an index on the DISTINCT column
+      made the rows arrive sorted/unique, causing distinctagg-3.x EXPLAIN
+      to find an extra OpenEphemeral the upstream test forbids. }
     if (pF^.iDistinct >= 0) and (pList <> nil) then
     begin
       if addrNext = 0 then
         addrNext := sqlite3VdbeMakeLabel(pParse);
-      r1 := sqlite3GetTempReg(pParse);
-      sqlite3VdbeAddOp4Int(v, OP_Found, pF^.iDistinct, addrNext,
-                           regDistinct, nArg);
-      sqlite3VdbeAddOp3(v, OP_MakeRecord, regDistinct, nArg, r1);
-      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iDistinct, r1,
-                           regDistinct, nArg);
-      sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
-      sqlite3ReleaseTempReg(pParse, r1);
+      case eDistinctType of
+        WHERE_DISTINCT_ORDERED:
+          begin
+            { codeDistinct WHERE_DISTINCT_ORDERED arm — select.c:946..970.
+              Allocate regPrev[0..nArg-1] to hold the previous row's
+              distinct key; for each column emit OP_Ne (skip if differs
+              partway through a multi-col key) and a terminal OP_Eq that
+              jumps to addrNext when the *full* key equals the previous
+              row.  fixDistinctOpenEph then rewrites the OpenEphemeral
+              into an OP_Null over regPrev so the first iteration's Eq
+              fails on the NULL-Cleared sentinel. }
+            r1 := pParse^.nMem + 1;     { regPrev base }
+            pParse^.nMem := pParse^.nMem + nArg;
+            pF^.iDistinct := r1;        { used by fixDistinctOpenEph }
+            { iJump destination: address right after the final OP_Eq. }
+            for j := 0 to nArg - 1 do
+            begin
+              if j < nArg - 1 then
+                sqlite3VdbeAddOp3(v, OP_Ne,
+                  regDistinct + j,
+                  sqlite3VdbeCurrentAddr(v) + (nArg - 1 - j) + 1,
+                  r1 + j)
+              else
+                sqlite3VdbeAddOp3(v, OP_Eq,
+                  regDistinct + j, addrNext, r1 + j);
+              sqlite3VdbeChangeP4(v, -1,
+                PAnsiChar(sqlite3ExprCollSeq(pParse,
+                  ExprListItems(pList)[j].pExpr)),
+                P4_COLLSEQ);
+              sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+            end;
+            sqlite3VdbeAddOp3(v, OP_Copy, regDistinct, r1, nArg - 1);
+          end;
+        WHERE_DISTINCT_UNIQUE:
+          begin
+            { Nothing to emit — WHERE loop already filters duplicates.
+              fixDistinctOpenEph will noop the OpenEphemeral. }
+          end;
+        else
+          begin
+            { Default — WHERE_DISTINCT_UNORDERED / NOOP. }
+            r1 := sqlite3GetTempReg(pParse);
+            sqlite3VdbeAddOp4Int(v, OP_Found, pF^.iDistinct, addrNext,
+                                 regDistinct, nArg);
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, regDistinct, nArg, r1);
+            sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iDistinct, r1,
+                                 regDistinct, nArg);
+            sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+            sqlite3ReleaseTempReg(pParse, r1);
+          end;
+      end;
     end;
     if pF^.iOBTab >= 0 then
     begin
@@ -26593,7 +29065,20 @@ begin
           if pCollAgg <> nil then break;
         end;
         if pCollAgg = nil then pCollAgg := pParse^.db^.pDfltColl;
-        sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
+        { select.c:6929 — allocate a fresh regHit before OP_CollSeq when
+          we have accumulator columns to populate.  Min/max AggStep sets
+          r[regHit]=1 when this row is NOT the new min/max; the
+          accumulator-column re-read loop below gates on regHit so the
+          bare-column captures fire only on the row that becomes the
+          new min/max (otherwise we'd capture a column from the last
+          row scanned, mis-pairing it with the aggregate value — bug
+          9.4.divbug.24.b: aggnested-3.3). }
+        if (regHit = 0) and (pAggInfo^.nAccumulator > 0) then
+        begin
+          Inc(pParse^.nMem);
+          regHit := pParse^.nMem;
+        end;
+        sqlite3VdbeAddOp4(v, OP_CollSeq, regHit, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
       end;
       sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
         pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
@@ -26604,13 +29089,12 @@ begin
     if addrNext <> 0 then sqlite3VdbeResolveLabel(v, addrNext);
     if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
   end;
-  { regHit guard — select.c:6943..6951.  When the caller passes regAcc
-    (the GROUP BY arm's iUseFlag), and there is at least one accumulator
-    column to populate, emit OP_If regHit, addrHitTest so the column
-    re-evaluation is skipped on subsequent rows of the same group (the
-    accumulator already holds the values from the first row). }
-  regHit := 0;
-  addrHitTest := 0;
+  { regHit guard — select.c:6943..6951.  If a NEEDCOLL (min/max) arm
+    above already allocated a dedicated regHit, use it (so the bare
+    column read fires only on the row that becomes the new min/max).
+    Otherwise fall back to regAcc — the GROUP BY iUseFlag — so the
+    column re-evaluation is skipped on subsequent rows of the same
+    group (accumulator already holds first-row values). }
   if (regHit = 0) and (pAggInfo^.nAccumulator > 0) then regHit := regAcc;
   if regHit <> 0 then
     addrHitTest := sqlite3VdbeAddOp1(v, OP_If, regHit);
@@ -26923,6 +29407,9 @@ var
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
   minMaxFlag:  u8;
+  pAggDistinct: PExprList;       { 9.4.divbug.33 }
+  distFlag:    u16;              { 9.4.divbug.33 }
+  eDistResult: i32;              { 9.4.divbug.33 }
   { DISTINCT codegen locals (select.c:8253..8260) — only the
     WHERE_DISTINCT_UNORDERED ephemeral-table path is implemented;
     UNIQUE/ORDERED optimisations stay deferred (matches a build that
@@ -26930,6 +29417,22 @@ var
   iTabTnct:    i32;
   pDistKey:    PKeyInfo2;
   rDistTmp:    i32;
+  addrDistinctEph: i32;            { addr of OP_OpenEphemeral for DISTINCT
+                                     dedup; -1 when not opened.  Used to
+                                     noop the eph when WHERE layer satisfies
+                                     DISTINCT (select.c:8292..8294 +
+                                     8905..8907 — divbug.55). }
+  eTnctTypeSel: i32;               { WHERE_DISTINCT_* result from
+                                     sqlite3WhereIsDistinct (NOOP, UNORDERED,
+                                     UNIQUE, ORDERED). }
+  wctrlFlagsSel: u16;
+  { 9.4.divbug.89.002 — locals for SRT_EphemTab opener back-scan. }
+  bEphTabAlreadyOpen: Boolean;
+  iEphScan: i32;
+  pEphScanOp: PVdbeOp;
+  regPrevTnct: i32;                { regPrev for ORDERED dedup arm. }
+  iJumpTnct:   i32;
+  pCollTnct:   PCollSeq;
   { GROUP BY aggregate locals — select.c:8454..8669 (groupBySort=1 only). }
   pGroupByLoc: PExprList;
   pHavingLoc:  PExpr;
@@ -26938,6 +29441,7 @@ var
   addrEnd:     i32;
   addrTopOfLoop: i32;
   addrSkip:    i32;
+  savedAddrExplainSub: i32;
   addrSetAbort: i32;
   addr1:       i32;
   addrOutputRow: i32;
@@ -27146,6 +29650,25 @@ begin
       p^.pOrderBy := nil;
     end;
     p^.selFlags := p^.selFlags and (not u32(SF_Distinct));
+  end;
+  { 9.4.divbug.44 — Pas-only workaround for the missing SRT_Set sort path.
+    C's selectInnerLoop/generateSortTail both implement an SRT_Set arm
+    (select.c:1384..1407 and 1837..1843) so an `IN (SELECT ... ORDER BY x)`
+    subquery sorts into the eph table and the set is populated correctly.
+    Our 31351..31354 sort gate only accepts SRT_Output / SRT_EphemTab /
+    SRT_Coroutine, and 31465..31470 bails on any other destination with a
+    leftover ORDER BY — so SRT_Set + ORDER BY produced an empty eph cursor
+    and the parent `b IN (…)` test always failed (misc3-4.3 returned 0).
+    Until the full SRT_Set sort path lands, drop the superfluous ORDER BY
+    for SRT_Set with no LIMIT (the set contents are order-independent —
+    see C's own comment at select.c:1386..1389).  With LIMIT the order
+    matters; leave that case alone so the existing bail still fires. }
+  if (pDest <> nil) and (pDest^.eDest = SRT_Set)
+     and (p^.pOrderBy <> nil) and (p^.pLimit = nil) then
+  begin
+    sqlite3ParserAddCleanup(pParse,
+      @sqlite3ExprListDeleteGeneric, p^.pOrderBy);
+    p^.pOrderBy := nil;
   end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
@@ -27523,6 +30046,7 @@ begin
      and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo)
      and (pDest^.eDest <> SRT_Queue) and (pDest^.eDest <> SRT_DistQueue)
      and (pDest^.eDest <> SRT_Upfrom)
+     and (pDest^.eDest <> SRT_Discard)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   { Mirror select.c:7682..7684 — emit OP_ResultRow column names early, so
@@ -27534,6 +30058,53 @@ begin
   if pDest^.eDest = SRT_Output then begin
     if sqlite3GetVdbe(pParse) <> nil then
       sqlite3GenerateColumnNames(pParse, p);
+  end;
+
+  { 9.4.divbug.89.002 — SRT_EphemTab opener (port of select.c:8223..8237
+    tag-select-0630).  When the destination is an ephemeral rowid table
+    and the caller has NOT pre-opened the cursor at iSDParm, emit
+    OP_OpenEphemeral here so the disposal arms (NewRowid/Insert into
+    iSDParm) land on a live cursor.
+
+    Symptom without this: sqlite3MaterializeView (codegen.pas:36000)
+    reserves iCur via pParse->nTab++ and recurses into sqlite3Select
+    with SRT_EphemTab + iSDParm=iCur, then sqlite3Update emits
+    OP_NewRowid iCur,... — apCsr[iCur] is nil → SIGSEGV at VDBE
+    OP_NewRowid (e_changes-4.3.2).
+
+    Audit for double-Open:  Pas has several per-arm sites that pre-open
+    a cursor and then recurse with SRT_EphemTab on that same cursor
+    (codegen.pas 30613, 31053/55, 31858, 32623, 32868).  Back-scan the
+    VDBE for a prior OP_OpenEphemeral on the same P1 and skip when
+    found — keeps pre-arm callers untouched.
+
+    Placed BEFORE all per-arm gates (pPrior compound, FROM-subquery
+    coroutine/materialise) so the cursor is open before any disposal
+    arm runs at any nesting level.  pEList is read from p^ directly
+    (not yet hoisted into a local at this point in the function). }
+  if pDest^.eDest = SRT_EphemTab then
+  begin
+    v := sqlite3GetVdbe(pParse);
+    if (v <> nil) and (p^.pEList <> nil) then
+    begin
+      bEphTabAlreadyOpen := False;
+      iEphScan := sqlite3VdbeCurrentAddr(v) - 1;
+      while iEphScan >= 0 do
+      begin
+        pEphScanOp := sqlite3VdbeGetOp(v, iEphScan);
+        if pEphScanOp = nil then break;
+        if (pEphScanOp^.opcode = OP_OpenEphemeral)
+           and (pEphScanOp^.p1 = pDest^.iSDParm) then
+        begin
+          bEphTabAlreadyOpen := True;
+          break;
+        end;
+        Dec(iEphScan);
+      end;
+      if not bEphTabAlreadyOpen then
+        sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pDest^.iSDParm,
+                          p^.pEList^.nExpr);
+    end;
   end;
 
   if p^.pPrior <> nil then begin
@@ -27663,6 +30234,25 @@ begin
     end;
     Result := SQLITE_OK; Exit;
   end;
+  { 9.4.divbug.87.020 — DISTINCT over a no-FROM SELECT yields exactly one
+    row, so DISTINCT is a trivial no-op.  Strip SF_Distinct before the
+    fast-path gate below so `SELECT DISTINCT <expr-list>;` reaches the
+    same OP_Explain / OP_Copy / OP_ResultRow body as the non-DISTINCT
+    flavour.  Without this strip the gate excludes SF_Distinct → the
+    statement falls through every later codegen arm (no GROUP BY, no
+    aggregate, no source) and sqlite3Select returns SQLITE_OK without
+    coding any expression — oversized hex literals never surface their
+    "hex literal too big" error (hexlit-401 / hexlist-402).  Mirrors
+    C select.c:8253..8263 where SF_Distinct flows through the WhereBegin
+    no-FROM body and still drives sqlite3ExprCode → codeInteger →
+    sqlite3ErrorMsg. }
+  if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
+     and ((p^.selFlags and SF_Distinct) <> 0)
+     and ((p^.selFlags and (SF_Aggregate or SF_Compound)) = 0)
+     and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pWin = nil)
+  then
+    p^.selFlags := p^.selFlags and not u32(SF_Distinct);
   { No-FROM fast path — `SELECT <expr-list>;` with no source table.
     Emit OP_Explain + per-result-col sqlite3ExprCode + OP_ResultRow.
     Mirrors the tail of selectInnerLoop for SRT_Output when WhereBegin
@@ -27673,7 +30263,7 @@ begin
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
           or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue)
           or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set)
-          or (pDest^.eDest = SRT_Mem))
+          or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Discard))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
@@ -27774,6 +30364,14 @@ begin
         in sqlite3CodeSubselect's destination init), so no further dispatch
         is needed.  Mirrors selectInnerLoop SRT_Mem arm (select.c:1325) which
         is a no-op when regResult == dest->iSDParm. }
+    end
+    else if pDest^.eDest = SRT_Discard then
+    begin
+      { SRT_Discard — `SELECT <expr-list>;` in a trigger body (codeTriggerProgram
+        @ TK_SELECT step).  Result columns were just evaluated above (the
+        evaluation matters for side-effects: RAISE() emits OP_Halt inside
+        ExprCode), but no per-row output is needed.  Mirrors selectInnerLoop's
+        SRT_Discard arm (select.c:1377..1380). }
     end
     else if (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue) then
     begin
@@ -27932,9 +30530,18 @@ begin
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine)
-          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table))
+          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
+          or (pDest^.eDest = SRT_Set))
   then
   begin
+    { 9.4.divbug.82 — SRT_Set admitted so IN-RHS subselect (sqlite3CodeRhsOfIN
+      Case-1) with an outer GROUP BY actually emits the inner Where-scan +
+      sorter + group-output subroutine.  Without it, GROUP BY + SRT_Set fell
+      through to the non-aggregate gate and the subroutine body collapsed
+      to OpenEphemeral + NullRow + Return — the IN-RHS eph was never
+      populated.  Disposal arm at the post-finalize result-render below
+      handles SRT_Set (MakeRecord with zAffSdst + IdxInsert).  Mirrors C
+      select.c:8456 (no eDest gate). }
     pItem := SrcListItems(p^.pSrc);
     pTab  := pItem^.pSTab;
     if p^.pSrc^.nSrc = 1 then
@@ -28162,6 +30769,33 @@ begin
       pWInfo      := nil;
       addrGBBodyStart := 0;
       addrGBLoopDone  := 0;
+
+      { 9.4.divbug.33 — DISTINCT-aggregate index ride (GROUP BY arm).
+        Mirrors select.c:8466..8481.  When there is exactly one aggregate
+        with iDistinct>=0, build pDistinct = pGroupBy ++ argExpr and pass
+        WHERE_WANT_DISTINCT|WHERE_AGG_DISTINCT to sqlite3WhereBegin so
+        the planner can probe whether an existing index already yields
+        rows unique on the (group, distinct-arg) tuple.  The matching
+        fixDistinctOpenEph call after the addrReset subroutine then
+        noops the per-group dedup ephemeral when eDist != NOOP. }
+      pAggDistinct := nil;
+      distFlag     := 0;
+      eDistResult  := WHERE_DISTINCT_NOOP;
+      if (not isGBSubquery)
+         and (pAggI2^.nFunc = 1)
+         and (pAggI2^.aFunc[0].iDistinct >= 0)
+         and (pAggI2^.aFunc[0].pFExpr <> nil)
+         and ExprUseXList(pAggI2^.aFunc[0].pFExpr)
+         and (pAggI2^.aFunc[0].pFExpr^.x.pList <> nil) then
+      begin
+        pE := sqlite3ExprDup(pParse^.db,
+                ExprListItems(pAggI2^.aFunc[0].pFExpr^.x.pList)[0].pExpr, 0);
+        pAggDistinct := sqlite3ExprListDup(pParse^.db, pGroupByLoc, 0);
+        pAggDistinct := sqlite3ExprListAppend(pParse, pAggDistinct, pE);
+        if pAggDistinct <> nil then
+          distFlag := WHERE_WANT_DISTINCT or WHERE_AGG_DISTINCT;
+      end;
+
       if isGBSubquery then
       begin
         addrGBLoopDone := sqlite3VdbeMakeLabel(pParse);
@@ -28215,12 +30849,21 @@ begin
         TreeTraceLine($2, 'WhereBegin');  { select.c:8518 }
         {$ENDIF}
         pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
-                                    nil, p, WHERE_GROUPBY, 0);
-        if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+                                    pAggDistinct, p,
+                                    WHERE_GROUPBY or distFlag, 0);
+        if pWInfo = nil then
+        begin
+          sqlite3ExprListDelete(pParse^.db, pAggDistinct);
+          Result := SQLITE_ERROR; Exit;
+        end;
         { 10.1.42.a.6.3 — adjust AggInfo for any indexed expressions that
           the planner wired up.  Mirrors select.c:8527..8529. }
         if pParse^.pIdxEpr <> nil then
           optimizeAggregateUseOfIndexedExpr(pParse, p, pAggI2, @sNCAgg);
+        { 9.4.divbug.33 — read back the planner's DISTINCT verdict so we
+          can (a) skip per-row dedup work in updateAccumulatorSimple and
+          (b) noop the OP_OpenEphemeral.  Mirrors select.c:8531. }
+        eDistResult := sqlite3WhereIsDistinct(pWInfo);
         {$IFDEF SQLITE_DEBUG}
         TreeTraceLine($2, 'WhereBegin returns');  { select.c:8532 }
         {$ENDIF}
@@ -28337,7 +30980,11 @@ begin
       sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
 
       sqlite3VdbeJumpHere(v, addr1);
-      updateAccumulatorSimple(pParse, pAggI2, iUseFlag);
+      { 9.4.divbug.33 — pass the planner's DISTINCT verdict so updateAcc
+        emits the matching dedup shape (NOOP/UNORDERED → ephemeral
+        Found/IdxInsert; UNIQUE → no dedup at all; ORDERED → register
+        compare).  Mirrors select.c:8692. }
+      updateAccumulatorSimple(pParse, pAggI2, iUseFlag, eDistResult);
       sqlite3VdbeAddOp2(v, OP_Integer, 1, iUseFlag);
 
       sqlite3VdbeAddOp2(v, OP_SorterNext, pAggI2^.sortingIdx, addrTopOfLoop);
@@ -28428,6 +31075,26 @@ begin
         sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
         sqlite3ReleaseTempReg(pParse, r2);
         sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else if pDest^.eDest = SRT_Set then
+      begin
+        { 9.4.divbug.82 — IN-RHS subselect (sqlite3CodeRhsOfIN Case-1) with
+          an outer GROUP BY hands an SRT_Set destination down here.  Without
+          this arm the grouped row is computed but never hashed into the
+          eph cursor at iSDParm, so the parent `x IN (SELECT … GROUP BY …)`
+          test always returns 0 (tkt-31338dca7e-3.1 cascade).  Mirrors the
+          C selectInnerLoop SRT_Set arm (select.c:1384..1407) — MakeRecord
+          with per-row affinity zAffSdst, then OP_IdxInsert into iSDParm.
+          Bloom-filter side-channel at iSDParm2 deferred. }
+        r1 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                          r1, pDest^.zAffSdst, nResultCol);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                             pDest^.iSdst, nResultCol);
+        if pDest^.iSDParm2 > 0 then
+          sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+                               pDest^.iSdst, nResultCol);
+        sqlite3ReleaseTempReg(pParse, r1);
       end;
       sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
 
@@ -28436,6 +31103,16 @@ begin
       resetAccumulatorSimple(pParse, pAggI2);
       sqlite3VdbeAddOp2(v, OP_Integer, 0, iUseFlag);
       sqlite3VdbeAddOp1(v, OP_Return, regReset);
+
+      { 9.4.divbug.33 — noop the per-Func iDistinct OpenEphemeral when
+        the WHERE engine already delivers rows unique on the distinct-arg
+        column.  Mirrors select.c:8750..8753. }
+      if (distFlag <> 0) and (eDistResult <> WHERE_DISTINCT_NOOP)
+         and (pAggI2^.nFunc > 0) then
+        fixDistinctOpenEph(pParse, eDistResult,
+                           pAggI2^.aFunc[0].iDistinct,
+                           pAggI2^.aFunc[0].iDistAddr);
+      sqlite3ExprListDelete(pParse^.db, pAggDistinct);
 
       sqlite3VdbeResolveLabel(v, addrEnd);
 
@@ -28502,6 +31179,22 @@ begin
     Falls back to the stub for non-constant LIMIT until that lands. }
   if (p^.pLimit <> nil) and (not isExists) then
   begin
+    { 9.4.divbug.72 — row-value LIMIT / OFFSET is illegal; C raises this
+      from sqlite3ExprCode TK_VECTOR arm (expr.c:5597..5600).  Emit the
+      diagnostic *before* the non-constant LIMIT bail so the error isn't
+      silently swallowed by the SQLITE_OK exit below. }
+    if (p^.pLimit^.pLeft <> nil)
+       and (sqlite3ExprIsVector(p^.pLimit^.pLeft) <> 0) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Result := SQLITE_ERROR; Exit;
+    end;
+    if (p^.pLimit^.pRight <> nil)
+       and (sqlite3ExprIsVector(p^.pLimit^.pRight) <> 0) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Result := SQLITE_ERROR; Exit;
+    end;
     if (p^.pLimit^.pLeft = nil)
        or (sqlite3ExprIsInteger(p^.pLimit^.pLeft, nil, pParse) = 0) then
     begin Result := SQLITE_OK; Exit; end;
@@ -29369,13 +32062,29 @@ begin
           begin
             { Aggregate-on-subquery arm — Phase 6.13(b)-coagg.  Materialise
               the subquery into an ephemeral rowid table at pItem^.iCursor,
-              then drive a Rewind/updateAccumulator/Next/Close scan. }
+              then drive a Rewind/updateAccumulator/Next/Close scan.
+
+              EQP: C codes this FROM-subquery as a co-routine
+              (fromClauseTermCanBeCoroutine returns 1 for the i==0,nSrc==1
+              case) and emits ExplainQueryPlan((pParse,1,"CO-ROUTINE %!S"))
+              before recursing into sqlite3Select (select.c:8054).  We keep
+              the materialise bytecode shape but reproduce the EQP node so
+              the recursive CTE's SETUP / RECURSIVE STEP children nest
+              correctly underneath.  sqlite3Select does not auto-pop in this
+              port, so save/restore addrExplain manually. }
+            savedAddrExplainSub := pParse^.addrExplain;
+            sqlite3VdbeExplain(pParse, 1, 'CO-ROUTINE %!S', [Pointer(pItem)]);
             sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
             sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
             if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
             begin
               Result := SQLITE_ERROR; Exit;
             end;
+            pParse^.addrExplain := savedAddrExplainSub;
+            { Outer scan of the materialised result — ExplainQueryPlan
+              "SCAN %!S" (where.c:6954 / wherecode.c sqlite3WhereExplainOneScan
+              for an ephemeral / co-routine source). }
+            sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
             addrEnd := sqlite3VdbeMakeLabel(pParse);
             addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
             if p^.pWhere <> nil then
@@ -29409,16 +32118,43 @@ begin
             minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
                                       @pMinMaxOrderBy);
 
+          { 9.4.divbug.33 — DISTINCT-aggregate index ride.  Mirrors
+            select.c:8849..8853: when there are no bare accumulator
+            columns and exactly one aggregate with iDistinct>=0, pass
+            its argument list to sqlite3WhereBegin as pDistinct +
+            WHERE_WANT_DISTINCT|WHERE_AGG_DISTINCT.  The WHERE engine
+            then probes whether an existing index already yields rows
+            unique on that column (sets pWInfo^.eDistinct), and
+            fixDistinctOpenEph below noops the ephemeral b-tree. }
+          pAggDistinct := nil;
+          distFlag     := 0;
+          if (pAggI2^.nAccumulator = 0)
+             and (pAggI2^.nFunc = 1)
+             and (pAggI2^.aFunc[0].iDistinct >= 0)
+             and ExprUseXList(pAggI2^.aFunc[0].pFExpr) then
+          begin
+            pAggDistinct := pAggI2^.aFunc[0].pFExpr^.x.pList;
+            if pAggDistinct <> nil then
+              distFlag := WHERE_WANT_DISTINCT or WHERE_AGG_DISTINCT;
+          end;
+
           {$IFDEF SQLITE_DEBUG}
           TreeTraceLine($2, 'WhereBegin');  { select.c:8871 }
           {$ENDIF}
           pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
-                                      pMinMaxOrderBy, nil, p, minMaxFlag, 0);
+                                      pMinMaxOrderBy, pAggDistinct, p,
+                                      u16(minMaxFlag) or distFlag, 0);
           if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
           {$IFDEF SQLITE_DEBUG}
           TreeTraceLine($2, 'WhereBegin returns');  { select.c:8877 }
           {$ENDIF}
-          updateAccumulatorSimple(pParse, pAggI2, regAcc);
+          eDistResult := sqlite3WhereIsDistinct(pWInfo);
+          updateAccumulatorSimple(pParse, pAggI2, regAcc, eDistResult);
+          if (eDistResult <> WHERE_DISTINCT_NOOP)
+             and (pAggI2^.nFunc > 0) then
+            fixDistinctOpenEph(pParse, eDistResult,
+              pAggI2^.aFunc[0].iDistinct,
+              pAggI2^.aFunc[0].iDistAddr);
           if regAcc <> 0 then
             sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
           if minMaxFlag <> WHERE_ORDERBY_NORMAL then
@@ -29712,6 +32448,16 @@ begin
        and (pItem^.u4.pSubq <> nil)
        and (pItem^.u4.pSubq^.pSelect <> nil)
        and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Aggregate) = 0)
+       { 9.4.divbug.24.b — also reject when the inner carries GROUP BY,
+         HAVING, or SF_HasAgg.  C asserts pSub->pGroupBy==0 at select.c:7797
+         under the assumption that SF_Aggregate is always set whenever
+         pGroupBy is present; Pas selectMarkAggregate is not guaranteed
+         to tag every aggregate subquery, so the explicit pGroupBy/
+         pHaving/SF_HasAgg check is required to keep flatten from
+         silently dropping GROUP BY (aggnested-3.2 / 3.3). }
+       and (pItem^.u4.pSubq^.pSelect^.pGroupBy = nil)
+       and (pItem^.u4.pSubq^.pSelect^.pHaving = nil)
+       and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_HasAgg) = 0)
     then
     begin
       if flattenSubquery(pParse, p, 0, 0) <> 0 then
@@ -29740,7 +32486,8 @@ begin
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
-          or (pDest^.eDest = SRT_Coroutine))
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_Exists))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -29759,8 +32506,14 @@ begin
          10.1.bug.113 — SRT_Coroutine (outer being coded as a coroutine
          producer, e.g. LEFT/RIGHT MERGE arm) admits FROM-subquery
          coroutine emission unconditionally, matching C select.c:8043
-         which has no eDest gate. }
+         which has no eDest gate.
+         divbug.89.004 — SRT_Mem (scalar subquery) and SRT_Exists
+         (EXISTS subquery from sqlite3CodeSubselect) also admit
+         FROM-subquery coroutine emission; without this the outer
+         scalar/EXISTS body emits OP_Rewind on a cursor that was never
+         opened (fuzz-1.5 / fuzz-1.11 AV at vdbe.c OP_Rewind). }
        and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
+            or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Exists)
             or ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0))
     then
     begin
@@ -29959,6 +32712,25 @@ begin
         if (bSort = 0) and (p^.iLimit <> 0) then
           sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
       end
+      else if pDest^.eDest = SRT_Mem then
+      begin
+        { divbug.89.004 — SRT_Mem (scalar subquery): the expression
+          loop above coded the result expressions directly into
+          pDest^.iSdst (== iSDParm from sqlite3CodeSubselect), so no
+          OP_Move/OP_ResultRow needed.  Apply LIMIT (sqlite3CodeSubselect
+          forces LIMIT 1 so we stop after the first qualifying row). }
+        if (bSort = 0) and (p^.iLimit <> 0) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
+      end
+      else if pDest^.eDest = SRT_Exists then
+      begin
+        { divbug.89.004 — SRT_Exists (EXISTS subquery): each qualifying
+          row sets iSDParm = 1; mirrors selectInnerLoop SRT_Exists arm
+          (codegen.pas:25254 / select.c:1287..1290). }
+        sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+        if (bSort = 0) and (p^.iLimit <> 0) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
+      end
       else
       begin
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
@@ -30001,6 +32773,16 @@ begin
           { 10.1.bug.113 — sort tail under SRT_Coroutine outer must
             yield each row to the consumer, not OP_ResultRow. }
           sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else if pDest^.eDest = SRT_Mem then
+        begin
+          { divbug.89.004 — sort tail under SRT_Mem outer: values are
+            already copied to pDest^.iSdst (==iSDParm) by the OP_Column
+            block above; no OP_ResultRow. }
+        end
+        else if pDest^.eDest = SRT_Exists then
+          { divbug.89.004 — sort tail under SRT_Exists outer: each row
+            sets iSDParm = 1. }
+          sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm)
         else
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
         if p^.iLimit <> 0 then
@@ -30379,12 +33161,13 @@ begin
     optimisations require passing WHERE_WANT_DISTINCT into
     sqlite3WhereBegin and are deferred. }
   iTabTnct := -1;
+  addrDistinctEph := -1;
   if (p^.selFlags and SF_Distinct) <> 0 then
   begin
     iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
     pDistKey := sqlite3KeyInfoFromExprList(pParse, pEList, 0, 0);
-    sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
-                      PAnsiChar(pDistKey), P4_KEYINFO);
+    addrDistinctEph := sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
+                                         PAnsiChar(pDistKey), P4_KEYINFO);
     sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
   end;
 
@@ -30406,6 +33189,17 @@ begin
   end
   else if (not isExists) and (p^.pLimit <> nil) then
   begin
+    { 9.4.divbug.72 — reject row-value LIMIT / OFFSET vectors here too;
+      this inline pre-WHERE arm bypasses computeLimitRegisters' guard.
+      C raises this via expr.c:5597 (sqlite3ExprCode TK_VECTOR arm). }
+    if (sqlite3ExprIsVector(p^.pLimit^.pLeft) <> 0)
+       or ((p^.pLimit^.pRight <> nil)
+           and (sqlite3ExprIsVector(p^.pLimit^.pRight) <> 0)) then
+    begin
+      sqlite3ErrorMsg(pParse, 'row value misused');
+      Result := 1;
+      Exit;
+    end;
     { Non-Exists constant-integer LIMIT — mirrors the
       sqlite3ExprIsInteger arm of computeLimitRegisters
       (select.c:2520..2530).  Emits OP_Integer N, iLimit before the
@@ -30531,11 +33325,43 @@ begin
   {$IFDEF SQLITE_DEBUG}
   TreeTraceLine($2, 'WhereBegin');  { select.c:8279 }
   {$ENDIF}
+  { Pass WHERE_WANT_DISTINCT when DISTINCT was requested so the WHERE
+    layer can elect a covering / ordered scan that obviates the dedup
+    ephemeral (select.c:8267).  Also forward SF_FixedLimit (== WHERE_USE_LIMIT)
+    so the planner can stop early on LIMIT plans. }
+  wctrlFlagsSel := 0;
+  if (p^.selFlags and SF_Distinct) <> 0 then
+    wctrlFlagsSel := wctrlFlagsSel or WHERE_WANT_DISTINCT;
+  if (p^.selFlags and SF_FixedLimit) <> 0 then
+    wctrlFlagsSel := wctrlFlagsSel or u16(SF_FixedLimit);
   pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
-                              pEList, p, 0, 0);
+                              pEList, p, wctrlFlagsSel, 0);
   if pWInfo = nil then
   begin
     Result := SQLITE_ERROR; Exit;
+  end;
+  { select.c:8292..8294 — if the WHERE layer can satisfy DISTINCT, capture
+    its mode.  WHERE_DISTINCT_UNIQUE means the scan emits each row once;
+    WHERE_DISTINCT_ORDERED means consecutive duplicates can be detected
+    with a single OP_Eq.  Either way we noop the dedup ephemeral and
+    suppress the "USE TEMP B-TREE FOR DISTINCT" EQP detail. }
+  eTnctTypeSel := WHERE_DISTINCT_NOOP;
+  if ((p^.selFlags and SF_Distinct) <> 0) and (iTabTnct >= 0) then
+  begin
+    eTnctTypeSel := sqlite3WhereIsDistinct(pWInfo);
+    if (eTnctTypeSel = WHERE_DISTINCT_UNIQUE)
+       or (eTnctTypeSel = WHERE_DISTINCT_ORDERED) then
+    begin
+      if addrDistinctEph >= 0 then
+        sqlite3VdbeChangeToNoop(v, addrDistinctEph);
+      { For UNIQUE the WHERE layer guarantees per-row uniqueness — drop
+        the dedup ephemeral entirely.  For ORDERED, the dedup site below
+        falls back to a regPrev / OP_Ne|OP_Eq compare (select.c
+        codeDistinct lines 946..970).  Clearing iTabTnct suppresses the
+        EQP "USE TEMP B-TREE FOR DISTINCT" detail in both cases
+        (divbug.55). }
+      iTabTnct := -1;
+    end;
   end;
   {$IFDEF SQLITE_DEBUG}
   TreeTraceLine($2, 'WhereBegin returns');  { select.c:8302 }
@@ -30644,9 +33470,13 @@ begin
           sqlite3ExprCode(pParse, pE, pDest^.iSdst + i);
       end;
 
-    { DISTINCT dedup — codeDistinct WHERE_DISTINCT_UNORDERED
-      (select.c:978..988).  Inserted before any disposal so the per-row
-      arms below see only first-occurrence rows. }
+    { DISTINCT dedup — codeDistinct (select.c:933..985).
+      Dispatch on eTnctTypeSel determined after sqlite3WhereBegin:
+        UNORDERED — full OP_Found / OP_IdxInsert against the ephemeral.
+        ORDERED   — OP_Ne/OP_Eq chain against a regPrev row, then OP_Copy
+                    over the previous-row buffer.  Ephemeral was noop'd
+                    above (divbug.55).
+        UNIQUE    — nothing to do; WHERE layer guarantees uniqueness. }
     if iTabTnct >= 0 then
     begin
       rDistTmp := sqlite3GetTempReg(pParse);
@@ -30658,6 +33488,31 @@ begin
                            pDest^.iSdst, nResultCol);
       sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
       sqlite3ReleaseTempReg(pParse, rDistTmp);
+    end
+    else if eTnctTypeSel = WHERE_DISTINCT_ORDERED then
+    begin
+      { Port of codeDistinct ORDERED arm (select.c:946..970).  Allocate
+        nResultCol regs starting at regPrev to hold the previous row;
+        for each column emit OP_Ne (jumps past the Copy when different)
+        or OP_Eq on last (jumps to iContinue when fully equal). }
+      regPrevTnct := pParse^.nMem + 1;
+      Inc(pParse^.nMem, nResultCol);
+      { Initialize regPrev[0] = NULL so first iteration's OP_Eq fails. }
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regPrevTnct);
+      iJumpTnct := sqlite3VdbeCurrentAddr(v) + nResultCol;
+      for jj := 0 to nResultCol - 1 do
+      begin
+        pCollTnct := sqlite3ExprCollSeq(pParse, ExprListItems(pEList)[jj].pExpr);
+        if jj < nResultCol - 1 then
+          sqlite3VdbeAddOp3(v, OP_Ne, pDest^.iSdst + jj, iJumpTnct,
+                            regPrevTnct + jj)
+        else
+          sqlite3VdbeAddOp3(v, OP_Eq, pDest^.iSdst + jj, pWInfo^.iContinue,
+                            regPrevTnct + jj);
+        sqlite3VdbeChangeP4(v, -1, PAnsiChar(pCollTnct), P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+      end;
+      sqlite3VdbeAddOp3(v, OP_Copy, pDest^.iSdst, regPrevTnct, nResultCol - 1);
     end;
 
     { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits
@@ -30666,12 +33521,19 @@ begin
       affinity string in P4. }
     if (bSort <> 0) and (pDest^.eDest = SRT_EphemTab) then
     begin
-      { pushOntoSorter for SRT_EphemTab — non-OMITREF, non-Top-N slice.
-        Mirrors the SRT_Output non-OMITREF arm below.  Sort tail drains
-        the sorter and re-emits MakeRecord+NewRowid+Insert into iSDParm
-        instead of OP_ResultRow. }
+      { pushOntoSorter for SRT_EphemTab — mirrors the SRT_Output non-OMITREF
+        arm below, including the bUseSorter=0 Top-N B-tree gate
+        (Sequence/Last/IdxLE/Delete + IdxInsert).  Sort tail (32316..) drains
+        the sorted store via OP_SorterSort/OP_Sort and re-emits
+        MakeRecord+NewRowid+Insert into iSDParm instead of OP_ResultRow.
+        9.4.divbug.82 — without the bUseSorter switch, SorterInsert into a
+        B-tree cursor opened with OpenEphemeral silently no-ops; the sort
+        tail then drains an empty store, so an outer GROUP BY over a
+        FROM-subquery with ORDER BY + LIMIT yields zero rows
+        (tkt-31338dca7e-3.1).  Port of select.c:1341..1352 routed through
+        pushOntoSorter (select.c:860..866). }
       regSortBase := pParse^.nMem + 1;
-      Inc(pParse^.nMem, sortNKey + nResultCol);
+      Inc(pParse^.nMem, sortNKey + bSeqExtra + nResultCol);
       for jj := 0 to sortNKey - 1 do
       begin
         r1 := sqlite3ExprCodeTarget(pParse,
@@ -30680,15 +33542,46 @@ begin
         if r1 <> regSortBase + jj then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
       end;
+      { bSeq=1 path (Top-N): emit OP_Sequence between keys and data so
+        duplicate sort-keys remain insertable into the B-tree. }
+      if bSeqExtra <> 0 then
+      begin
+        regSeq := regSortBase + sortNKey;
+        sqlite3VdbeAddOp2(v, OP_Sequence, iSorterCsr, regSeq);
+      end;
       for jj := 0 to nResultCol - 1 do
         sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
-                          regSortBase + sortNKey + jj);
+                          regSortBase + sortNKey + bSeqExtra + jj);
+      { Top-N gate (select.c pushOntoSorter:832..856).  When LIMIT is set
+        and we are in B-tree mode (bUseSorter=0), cap the B-tree at
+        LIMIT+OFFSET entries via the Last+IdxLE+Delete sequence. }
+      iSkipTopN := 0;
+      if (bUseSorter = 0) and (p^.iLimit <> 0) then
+      begin
+        if p^.iOffset <> 0 then iLimitTopN := p^.iOffset + 1
+                            else iLimitTopN := p^.iLimit;
+        sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
+                          sqlite3VdbeCurrentAddr(v) + 4);
+        sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+        iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
+                          iSorterCsr, 0,
+                          regSortBase,
+                          sortNKey);
+        sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
+      end;
       Inc(pParse^.nMem);
       regSortRec := pParse^.nMem;
       sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
-                        sortNKey + nResultCol, regSortRec);
-      sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
-                           regSortBase, nResultCol);
+                        sortNKey + bSeqExtra + nResultCol, regSortRec);
+      if bUseSorter <> 0 then
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol)
+      else
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iSorterCsr, regSortRec,
+                             regSortBase,
+                             sortNKey + bSeqExtra + nResultCol);
+      if iSkipTopN > 0 then
+        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
     end
     else if (pDest^.eDest = SRT_Output)
          or ((pDest^.eDest = SRT_Coroutine) and (bSort <> 0)) then
@@ -30755,10 +33648,23 @@ begin
             sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
                               sqlite3VdbeCurrentAddr(v) + 4);
             sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+            { 9.4.divbug.54 — C pushOntoSorter (select.c:852..853) uses
+              `regBase+nOBSat, nExpr-nOBSat` because the nOBSat>0 arm at
+              select.c:789..831 has already flushed the sorter at every
+              block boundary, leaving only entries that share the first
+              nOBSat key columns.  The Pas port of that block-flush arm
+              is deferred — so feeding `nOBSat>0, nExpr-nOBSat` here lets
+              the Top-N cap compare only the trailing (non-satisfied)
+              keys across block boundaries, which is wrong:  after the
+              first block exhausts the LIMIT+OFFSET budget the second
+              block's trailing-key comparison drops valid rows of the
+              new block (orderby6-1.12..1.14 with `b DESC,a`).  Until
+              the block-flush lands, compare the FULL sort key (which is
+              correct in all cases, only slightly less efficient). }
             iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
                               iSorterCsr, 0,
-                              regSortBase + pWInfo^.nOBSat,
-                              sortNKey - pWInfo^.nOBSat);
+                              regSortBase,
+                              sortNKey);
             sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
           end;
           Inc(pParse^.nMem);
@@ -30808,6 +33714,12 @@ begin
         treats SRT_Coroutine as a sibling of SRT_Output — same upstream
         register block, different downstream sink. }
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+      { divbug.87.033 — LIMIT decrement for SRT_Coroutine (select.c:1522..1524).
+        C emits DecrJumpZero p->iLimit, iBreak after the eDest dispatch when
+        no sorter is in play; without this, `INSERT INTO t(col) SELECT … FROM
+        src LIMIT N` yields every row of src instead of N. }
+      if (p^.iLimit <> 0) and (not isExists) then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
     end
     else if (pDest^.eDest = SRT_EphemTab)
          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo) then
@@ -30907,6 +33819,22 @@ begin
           pDest^.iSdst, nResultCol);
       sqlite3ReleaseTempReg(pParse, i);
     end;
+
+    { 9.4.divbug.46 — post-disposal LIMIT decrement (select.c:1522..1524):
+      `if (pSort==0 && p->iLimit) sqlite3VdbeAddOp2(v, OP_DecrJumpZero,
+      p->iLimit, iBreak)`.  The SRT_Output, SRT_Mem and SRT_Coroutine
+      disposal arms above already emit their own DecrJumpZero, so guard
+      against double-emit.  Without this, FROM-subqueries materialised
+      via SRT_EphemTab (e.g. `SELECT count(*) FROM (SELECT * FROM t LIMIT 2)`)
+      ingest ALL inner rows — the LIMIT register is allocated by
+      computeLimitRegisters but never consulted.  bSort=0 is implicit
+      here: the bSort=1 paths above pushed into the sorter, which caps
+      the cardinality via the Top-N gate / SorterInsert sort tail. }
+    if (p^.iLimit <> 0) and (not isExists) and (bSort = 0)
+       and (pDest^.eDest <> SRT_Output)
+       and (pDest^.eDest <> SRT_Mem)
+       and (pDest^.eDest <> SRT_Coroutine) then
+      sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
   end;
 
   { Close the loop — emits OP_Next and resolves the iBreak label. }
@@ -30956,11 +33884,35 @@ begin
       annotation that distinguishes a sorter-driven ORDER BY from one
       satisfied by an index. }
     i := sqlite3VdbeCurrentAddr(v);
-    sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
-                      sqlite3MPrintf(pParse^.db,
-                                     'USE TEMP B-TREE FOR %s',
-                                     ['ORDER BY']),
-                      P4_DYNAMIC);
+    { select.c:1702..1711 — when the planner already satisfies a leading
+      prefix of ORDER BY (pWInfo^.nOBSat>0), distinguish single-trailing-key
+      "LAST TERM OF ORDER BY" from multi-trailing-key "LAST N TERMS OF
+      ORDER BY".  Otherwise plain "ORDER BY". }
+    if (pWInfo^.nOBSat = 0)
+       or ((p^.pOrderBy <> nil)
+           and ((p^.pOrderBy^.nExpr - pWInfo^.nOBSat) = 1)) then
+    begin
+      if pWInfo^.nOBSat <> 0 then
+        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                          sqlite3MPrintf(pParse^.db,
+                                         'USE TEMP B-TREE FOR %s',
+                                         ['LAST TERM OF ORDER BY']),
+                          P4_DYNAMIC)
+      else
+        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                          sqlite3MPrintf(pParse^.db,
+                                         'USE TEMP B-TREE FOR %s',
+                                         ['ORDER BY']),
+                          P4_DYNAMIC);
+    end
+    else
+    begin
+      sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                        sqlite3MPrintf(pParse^.db,
+                                       'USE TEMP B-TREE FOR LAST %d TERMS OF ORDER BY',
+                                       [p^.pOrderBy^.nExpr - pWInfo^.nOBSat]),
+                        P4_DYNAMIC);
+    end;
     if addrSortBrk = 0 then
       addrSortBrk := sqlite3VdbeMakeLabel(pParse);
     if bUseSorter <> 0 then
@@ -33388,6 +36340,42 @@ end;
   productive.  Until then DROP TABLE issues a `DELETE FROM
   sqlite_master WHERE ...` (where-loop, not truncate), so the gating
   remains until step 11g.2.h. }
+{ exprHasSubquery — walks pE, returns True if any node is a sub-SELECT
+  (TK_SELECT, TK_EXISTS, or TK_IN with x.pSelect set).  Stand-in for the
+  NC_Subquery flag the C resolver (resolve.c:1389) sets when descending
+  into TK_SELECT/TK_EXISTS/TK_IN subselects — the Pas resolver doesn't
+  set that flag yet, so the delete-from one-pass gate (delete.c:497) had
+  no signal and stayed at ONEPASS_MULTIROW even when the WHERE clause
+  referenced the table under deletion through a subquery (delete-12.0,
+  the forumpost/e61252062c9d286d regression). }
+function exprHasSubquery(pE: PExpr): Boolean;
+var
+  i: i32;
+  pList: PExprList;
+begin
+  Result := False;
+  if pE = nil then Exit;
+  if ExprHasProperty(pE, EP_xIsSelect)
+     and ExprUseXSelect(pE) and (pE^.x.pSelect <> nil) then
+  begin
+    Result := True; Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if exprHasSubquery(pE^.pLeft) then begin Result := True; Exit; end;
+  if exprHasSubquery(pE^.pRight) then begin Result := True; Exit; end;
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList := pE^.x.pList;
+    if pList <> nil then
+      for i := 0 to pList^.nExpr - 1 do
+        if exprHasSubquery((PExprListItem(PByte(ExprListItems(pList))
+                              + PtrUInt(i) * SZ_EXPRLIST_ITEM))^.pExpr) then
+        begin
+          Result := True; Exit;
+        end;
+  end;
+end;
+
 procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
   pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr);
 label
@@ -33588,6 +36576,9 @@ begin
     { Where-loop / one-pass DELETE arm — port of delete.c:495..665. }
     wcf := WHERE_ONEPASS_DESIRED or WHERE_DUPLICATES_OK;
     if (sNC.ncFlags and NC_Subquery) <> 0 then bComplex := 1;
+    { Pas resolver doesn't set NC_Subquery yet; walk pWhere directly so
+      the bComplex/ONEPASS gate matches C (delete.c:497, delete-12.0). }
+    if (bComplex = 0) and exprHasSubquery(pWhere) then bComplex := 1;
     if bComplex = 0 then wcf := wcf or u16($0008); { WHERE_ONEPASS_MULTIROW }
     if HasRowid(pTab) then
     begin
@@ -33942,7 +36933,14 @@ begin
   iTabCol := pIdx^.aiColumn[iIdxCol];
   if iTabCol = XN_EXPR then
   begin
-    Assert(False, 'sqlite3ExprCodeLoadIndexColumn: XN_EXPR not yet supported');
+    { expr.c:4367..4372 — code the indexed expression with iSelfTab set
+      so column refs route through iTabCur (9.4.divbug.87.031). }
+    Assert(pIdx^.aColExpr <> nil);
+    Assert(pIdx^.aColExpr^.nExpr > iIdxCol);
+    pParse^.iSelfTab := iTabCur + 1;
+    sqlite3ExprCodeCopy(pParse,
+      ExprListItems(pIdx^.aColExpr)[iIdxCol].pExpr, regOut);
+    pParse^.iSelfTab := 0;
     Exit;
   end;
   sqlite3ExprCodeGetColumnOfTable(pParse^.pVdbe, pIdx^.pTable, iTabCur,
@@ -36138,6 +39136,10 @@ var
   regRec:         i32;
   regTempRowid:   i32;
   addrL:          i32;
+  iRegStore:      i32;
+  nHidden:        i32;
+  colFlg:         u32;
+  tmaskBefore:    Boolean;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -36311,6 +39313,49 @@ begin
   bIdListInOrder := u8(ord(
     (pTab^.tabFlags and (TF_OOOHidden or TF_HasStored)) = 0));
 
+  { IDLIST per-column resolution pre-pass — port of insert.c:1077..1108.
+    Must run BEFORE the SELECT coroutine is emitted so destCoro.iSdst is
+    initialised from the IDLIST-resolved bIdListInOrder (a column-reorder
+    IDLIST forces dest.iSdst=0 and we then SCopy into table-storage order).
+    The count-mismatch check (insert.c:1256..1259) still runs later once
+    nColumn is known.  divbug.87.033: without this, INSERT INTO t(a,c)
+    SELECT * FROM t routed the SELECT directly into regData in IDLIST order
+    and skipped the SCopy shuffle, swapping b<->c in storage. }
+  if pColumn <> nil then
+  begin
+    aTabColMap := Pi32(sqlite3DbMallocZero(db,
+      SizeOf(i32) * SizeInt(pTab^.nCol)));
+    if aTabColMap = nil then goto insert_cleanup;
+    pIdItems := IdListItems(pColumn);
+    for i := 0 to pColumn^.nId - 1 do
+    begin
+      j := sqlite3ColumnIndex(pTab, pIdItems[i].zName);
+      if j >= 0 then
+      begin
+        if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
+        if i <> j then bIdListInOrder := 0;
+        if j = i32(pTab^.iPKey) then
+        begin
+          ipkColumn := i;
+          { assert( withoutRowid = 0 ) }
+        end;
+      end
+      else if (sqlite3IsRowid(pIdItems[i].zName) <> 0) and (withoutRowid = 0) then
+      begin
+        ipkColumn := i;
+        bIdListInOrder := 0;
+      end
+      else
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+          'table %S has no column named %s',
+          [@SrcListItems(pTabList)[0], pIdItems[i].zName]));
+        pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
+        goto insert_cleanup;
+      end;
+    end;
+  end;
+
   { Compound-SELECT-of-constants chain detection (Phase 6.8.6 narrowed scope).
     Multi-row VALUES is now produced via sqlite3MultiValues' viaCoroutine
     arm (caught above by useCoroutine), so the SF_Values fallback chain
@@ -36466,15 +39511,43 @@ generic_coro_done:
     aTabColMap[i] = (1-based) index into pColumn for table column i, or 0
     if column i is not named in the IDLIST (default value path).  IPK alias
     and generated-column arms are deferred until the IPK INSERT path lands. }
-  { No-IDLIST count mismatch — port of insert.c:1244..1254.  Skip the
-    NOINSERT-flag tally (no TF_HasGenerated / TF_HasHidden support yet);
-    nHidden is therefore 0 and the check reduces to nColumn vs nCol. }
-  if (pColumn = nil) and (nColumn > 0) and (nColumn <> i32(pTab^.nCol)) then
+  { No-IDLIST count mismatch — port of insert.c:1222..1254.
+
+    Two arms run before the count check:
+      (a) insert.c:1224..1235 — if the table has an INTEGER PRIMARY KEY *and*
+          generated columns precede it, ipkColumn drops one slot for each so
+          that the positional VALUES list (which skips generated cols) still
+          aligns the rowid term to the right index.
+      (b) insert.c:1241..1248 — tally NOINSERT (= GENERATED | HIDDEN) columns
+          into nHidden so the expected count nCol-nHidden ignores cols the
+          user can't supply.  Without this gencol1-2.1.150
+          (INSERT INTO t1 VALUES(a,b,c) on a 3-real + 3-generated table)
+          spuriously errored "table t1 has 6 columns but 3 values were
+          supplied". }
+  if (pColumn = nil) and (nColumn > 0) then
   begin
-    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
-      'table %S has %d columns but %d values were supplied',
-      [@SrcListItems(pTabList)[0], i32(pTab^.nCol), nColumn]));
-    goto insert_cleanup;
+    { Port of insert.c:1241..1254 — tally NOINSERT (= GENERATED | HIDDEN)
+      columns into nHidden so the expected count nCol-nHidden ignores cols
+      the user cannot supply.  Without this, gencol1-2.1.150 (3-real +
+      3-generated table) spuriously errored "table t1 has 6 columns but
+      3 values were supplied".  ipkColumn is left untouched; the row-
+      emission loop below recomputes nHidden in storage order and downstream
+      ipkColumnPresent logic relies on ipkColumn = -1 for the no-IDLIST
+      path. }
+    nHidden := 0;
+    if (pTab^.tabFlags and (TF_HasGenerated or TF_HasHidden)) <> 0 then
+    begin
+      for i := 0 to i32(pTab^.nCol) - 1 do
+        if (pTab^.aCol[i].colFlags and COLFLAG_NOINSERT) <> 0 then
+          Inc(nHidden);
+    end;
+    if nColumn <> (i32(pTab^.nCol) - nHidden) then
+    begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'table %S has %d columns but %d values were supplied',
+        [@SrcListItems(pTabList)[0], i32(pTab^.nCol) - nHidden, nColumn]));
+      goto insert_cleanup;
+    end;
   end;
   if pColumn <> nil then
   begin
@@ -36485,40 +39558,8 @@ generic_coro_done:
         '%d values for %d columns', [nColumn, pColumn^.nId]));
       goto insert_cleanup;
     end;
-    aTabColMap := Pi32(sqlite3DbMallocZero(db,
-      SizeOf(i32) * SizeInt(pTab^.nCol)));
-    if aTabColMap = nil then goto insert_cleanup;
-    pIdItems := IdListItems(pColumn);
-    for i := 0 to pColumn^.nId - 1 do
-    begin
-      j := sqlite3ColumnIndex(pTab, pIdItems[i].zName);
-      if j >= 0 then
-      begin
-        if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
-        if i <> j then bIdListInOrder := 0;
-        if j = i32(pTab^.iPKey) then
-        begin
-          ipkColumn := i;
-          { assert( withoutRowid = 0 ) }
-        end;
-      end
-      else if (sqlite3IsRowid(pIdItems[i].zName) <> 0) and (withoutRowid = 0) then
-      begin
-        { Rowid alias named in IDLIST for a table with no declared
-          INTEGER PRIMARY KEY — C insert.c:1097..1099.  The IDLIST index
-          becomes ipkColumn; the term carries the user-supplied rowid. }
-        ipkColumn := i;
-        bIdListInOrder := 0;
-      end
-      else
-      begin
-        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
-          'table %S has no column named %s',
-          [@SrcListItems(pTabList)[0], pIdItems[i].zName]));
-        pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
-        goto insert_cleanup;
-      end;
-    end;
+    { aTabColMap + bIdListInOrder + ipkColumn already computed by the
+      pre-coroutine IDLIST resolution pass above (insert.c:1077..1108). }
   end;
 
   { viaCoroutine register-reuse override (insert.c:1134..1138).  When the
@@ -36628,18 +39669,29 @@ generic_coro_done:
   if useTempTable then
   begin
     { Template-4 main loop top — port of insert.c:1322..1333.
-      Rewind srcTab; loop body reads each row via OP_Column srcTab. }
+      Rewind srcTab; loop body reads each row via OP_Column srcTab.
+      Per C insert.c:1505..1509, the IPK pre-load only fires when
+      ipkColumn >= 0 (i.e. the IPK is positionally present in the
+      coroutine output / IDLIST), and it reads srcTab column ipkColumn
+      (the IDLIST index of the IPK term), NOT pTab^.iPKey.  divbug.87.034:
+      reading column iPKey unconditionally treated the IDLIST's first
+      value (e.g. b=987) as the rowid when IDLIST didn't name the IPK,
+      surfacing as "UNIQUE constraint failed". }
     nRows := 1;
     addrInsTop := sqlite3VdbeAddOp1(v, OP_Rewind, srcTab);
     addrCont   := sqlite3VdbeCurrentAddr(v);
     ipkInSelect := False;
-    if pTab^.iPKey >= 0 then
+    if (pColumn = nil) and (pTab^.iPKey >= 0) then
     begin
-      { insert.c:1508..1509 — IPK value comes from the srcTab column.
-        Pre-load regRowid here (equivalent to C's read in the rowid
-        section: regRowid is not clobbered by the column loop, which
-        only SoftNulls regData+iPKey). }
+      { No-IDLIST positional path — IPK appears at storage position iPKey
+        in srcTab.  C insert.c:1505..1509 reads it via the same OP_Column. }
       sqlite3VdbeAddOp3(v, OP_Column, srcTab, i32(pTab^.iPKey), regRowid);
+      ipkInSelect := True;
+    end
+    else if ipkColumn >= 0 then
+    begin
+      { IDLIST names the IPK (or rowid alias) at index ipkColumn. }
+      sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid);
       ipkInSelect := True;
     end;
   end
@@ -36700,73 +39752,94 @@ generic_coro_done:
     else
       pListItems := nil;
 
+    { Port of insert.c:1361..1437.  Walk pTab columns in storage order.
+      iRegStore tracks the destination register; VIRTUAL generated columns
+      do not participate in OP_MakeRecord, so iRegStore is held back when
+      one is skipped.  STORED generated columns get a SoftNull placeholder
+      iff BEFORE triggers fire (so the OP_Copy at insert.c:1471 reads
+      something defined); their final value is filled in later by
+      sqlite3ComputeGeneratedColumns.  Hidden columns not named in the
+      IDLIST take their default. }
+    nHidden   := 0;
+    iRegStore := regData;
+    tmaskBefore := (tmask and TRIGGER_BEFORE) <> 0;
     for i := 0 to i32(pTab^.nCol) - 1 do
     begin
+      colFlg := pTab^.aCol[i].colFlags;
+      if (colFlg and COLFLAG_NOINSERT) <> 0 then
+      begin
+        Inc(nHidden);
+        if (colFlg and COLFLAG_VIRTUAL) <> 0 then
+        begin
+          { Virtual generated columns do not occupy a record slot — do
+            not advance iRegStore.  insert.c:1377..1382. }
+          Continue;
+        end
+        else if (colFlg and COLFLAG_STORED) <> 0 then
+        begin
+          { Stored generated columns computed later; SoftNull only if
+            BEFORE triggers will copy the slot. }
+          if tmaskBefore then
+            sqlite3VdbeAddOp1(v, OP_SoftNull, iRegStore);
+          Inc(iRegStore);
+          Continue;
+        end
+        else if pColumn = nil then
+        begin
+          { Hidden col with no IDLIST → default value. }
+          sqlite3ExprCodeFactorable(pParse,
+            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore);
+          Inc(iRegStore);
+          Continue;
+        end;
+      end;
+
       if useTempTable then
       begin
-        { Template-4 column extraction — port of insert.c:1363..1424.
-          IPK column gets a SoftNull placeholder (real value already
-          loaded into regRowid at loop top); every other column is
-          read from the srcTab cursor.  A column not named in the
-          IDLIST falls back to its default value. }
-        if i = i32(pTab^.iPKey) then
-        begin
-          sqlite3VdbeAddOp1(v, OP_SoftNull, regData + i);
-          Continue;
-        end;
+        { Template-4 column extraction — port of insert.c:1363..1424. }
         if pColumn <> nil then
         begin
           k := (aTabColMap + i)^;
           if k = 0 then
             sqlite3ExprCodeFactorable(pParse,
-              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
           else
-            sqlite3VdbeAddOp3(v, OP_Column, srcTab, k - 1, regData + i);
+            sqlite3VdbeAddOp3(v, OP_Column, srcTab, k - 1, iRegStore);
         end
         else
-          sqlite3VdbeAddOp3(v, OP_Column, srcTab, i, regData + i);
-        Continue;
-      end;
-      if useCoroutine then
+          sqlite3VdbeAddOp3(v, OP_Column, srcTab, i - nHidden, iRegStore);
+      end
+      else if useCoroutine then
       begin
-        { Coroutine streams values into regFromSelect..; copy into regData+i
-          only when the layouts diverge (IDLIST out-of-order or partial).
-          IPK slot stays NULL (will be re-loaded into regRowid in rowid arm). }
-        if i = i32(pTab^.iPKey) then
-        begin
-          if regData <> regFromSelect then
-            sqlite3VdbeAddOp1(v, OP_SoftNull, regData + i);
-          Continue;
-        end;
-        if regData = regFromSelect then Continue;
         if pColumn <> nil then
         begin
           k := (aTabColMap + i)^;
           if k = 0 then
             sqlite3ExprCodeFactorable(pParse,
-              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
-          else
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
+          else if regData <> regFromSelect then
             sqlite3VdbeAddOp2(v, OP_SCopy,
-              regFromSelect + (k - 1), regData + i);
+              regFromSelect + (k - 1), iRegStore);
         end
-        else
-          sqlite3VdbeAddOp2(v, OP_SCopy, regFromSelect + i, regData + i);
-        Continue;
-      end;
-      if pColumn <> nil then
+        else if regData <> regFromSelect then
+          sqlite3VdbeAddOp2(v, OP_SCopy,
+            regFromSelect + (i - nHidden), iRegStore);
+      end
+      else if pColumn <> nil then
       begin
         j := (aTabColMap + i)^;
         if j = 0 then
           sqlite3ExprCodeFactorable(pParse,
-            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
         else
-          sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
+          sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, iRegStore);
       end
       else if pCurRow = nil then
         sqlite3ExprCodeFactorable(pParse,
-          sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+          sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), iRegStore)
       else
-        sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
+        sqlite3ExprCode(pParse, pListItems[i - nHidden].pExpr, iRegStore);
+      Inc(iRegStore);
     end;
 
     { Determine whether the user supplied a value for the IPK alias column
@@ -39122,6 +42195,290 @@ begin
   end;
 end;
 
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ PRowCntArr/TRowCntArr hoisted to interface for whereKeyStats signature. }
+
+{ Local tRowcnt array decoder — variant of decodeIntArray that writes
+  raw u64 counts (not LogEst) into a tRowcnt vector.  Mirrors the
+  STAT4 arm of analyze.c:decodeIntArray() (decodeIntArray with non-nil
+  aOut and nil pIndex). }
+procedure decodeStat4IntArray(z: PAnsiChar; nOut: i32; aOut: PRowCntArr);
+var
+  i: i32;
+  v: u64;
+  c: AnsiChar;
+begin
+  if (z = nil) or (aOut = nil) then Exit;
+  i := 0;
+  while (z^ <> #0) and (i < nOut) do
+  begin
+    v := 0;
+    while True do
+    begin
+      c := z^;
+      if (c < '0') or (c > '9') then Break;
+      v := v * 10 + u64(Ord(c) - Ord('0'));
+      Inc(z);
+    end;
+    aOut^[i] := v;
+    if z^ = ' ' then Inc(z);
+    Inc(i);
+  end;
+end;
+
+{ findIndexOrPrimaryKey — port of analyze.c:1742.
+  Look up an index by name; if none found and zName names a WITHOUT ROWID
+  table, return its synthesised PRIMARY KEY index. }
+function findIndexOrPrimaryKey(db: PTsqlite3; zName: PAnsiChar;
+                               zDb: PAnsiChar): PIndex2;
+var
+  pIxFind: PIndex2;
+  pTabFind: PTable2;
+begin
+  pIxFind := sqlite3FindIndex(db, zName, zDb);
+  if pIxFind = nil then
+  begin
+    pTabFind := sqlite3FindTable(db, zName, zDb);
+    if (pTabFind <> nil) and (not HasRowid(pTabFind)) then
+      pIxFind := sqlite3PrimaryKeyIndex(pTabFind);
+  end;
+  Result := pIxFind;
+end;
+
+{ initAvgEq — port of analyze.c:1683.
+  Populate pIdx^.aAvgEq[] from the per-sample anEq/anDLt vectors. }
+procedure initAvgEq(pIxAvg: PIndex2);
+var
+  aSampleArr: PIndexSample;
+  pFinal:     PIndexSample;
+  pSampI:     PIndexSample;
+  pSampIp1:   PIndexSample;
+  iCol:       i32;
+  nCol:       i32;
+  nSampleEx:  i32;
+  iLoop:      i32;
+  sumEq:      u64;
+  avgEq:      u64;
+  nRow:       u64;
+  nSum100:    i64;
+  nDist100:   i64;
+begin
+  if pIxAvg = nil then Exit;
+  aSampleArr := pIxAvg^.aSample;
+  if aSampleArr = nil then Exit;
+  pFinal := PIndexSample(PByte(aSampleArr) +
+              (pIxAvg^.nSample - 1) * SizeOf(TIndexSample));
+  nCol := 1;
+  if pIxAvg^.nSampleCol > 1 then
+  begin
+    { stat4 data: aAvgEq[nCol] for the last column is always 1. }
+    nCol := pIxAvg^.nSampleCol - 1;
+    pIxAvg^.aAvgEq[nCol] := 1;
+  end;
+  for iCol := 0 to nCol - 1 do
+  begin
+    nSampleEx := pIxAvg^.nSample;
+    sumEq := 0;
+    avgEq := 0;
+    if (pIxAvg^.aiRowEst = nil)
+       or (iCol >= pIxAvg^.nKeyCol)
+       or (pIxAvg^.aiRowEst[iCol + 1] = 0) then
+    begin
+      nRow := pFinal^.anLt[iCol];
+      nDist100 := i64(100) * i64(pFinal^.anDLt[iCol]);
+      Dec(nSampleEx);
+    end
+    else
+    begin
+      nRow := pIxAvg^.aiRowEst[0];
+      nDist100 := (i64(100) * i64(pIxAvg^.aiRowEst[0])) div
+                  i64(pIxAvg^.aiRowEst[iCol + 1]);
+    end;
+    pIxAvg^.nRowEst0 := nRow;
+
+    nSum100 := 0;
+    for iLoop := 0 to nSampleEx - 1 do
+    begin
+      pSampI := PIndexSample(PByte(aSampleArr) + iLoop * SizeOf(TIndexSample));
+      if iLoop = pIxAvg^.nSample - 1 then
+      begin
+        sumEq := sumEq + pSampI^.anEq[iCol];
+        nSum100 := nSum100 + 100;
+      end
+      else
+      begin
+        pSampIp1 := PIndexSample(PByte(aSampleArr) +
+                     (iLoop + 1) * SizeOf(TIndexSample));
+        if pSampI^.anDLt[iCol] <> pSampIp1^.anDLt[iCol] then
+        begin
+          sumEq := sumEq + pSampI^.anEq[iCol];
+          nSum100 := nSum100 + 100;
+        end;
+      end;
+    end;
+
+    if (nDist100 > nSum100) and (sumEq < nRow) then
+      avgEq := u64((i64(100) * i64(nRow - sumEq)) div (nDist100 - nSum100));
+    if avgEq = 0 then avgEq := 1;
+    pIxAvg^.aAvgEq[iCol] := avgEq;
+  end;
+end;
+
+{ loadStatTbl — port of analyze.c:1767.
+  Two-pass loader of sqlite_stat4: first pass counts samples per index and
+  allocates aSample[]+aAvgEq[] in one block; second pass decodes neq/nlt/
+  ndlt vectors and copies the sample blob. }
+function loadStatTbl(db: PTsqlite3; zSql1: PAnsiChar; zSql2: PAnsiChar;
+                     zDb: PAnsiChar): i32;
+var
+  rc:        i32;
+  pStmt:     PVdbe;
+  zSql:      PAnsiChar;
+  pPrevIdx:  PIndex2;
+  pSampSlot: PIndexSample;
+  zIndex:    PAnsiChar;
+  pIxL:      PIndex2;
+  nSamp:     i32;
+  nIdxCol:   i32;
+  nCol:      i32;
+  nByte:     u64;
+  iLoop:     u64;
+  pSpace:    ^u64;
+  pPtr:      PByte;
+  nBlob:     i32;
+  pBlobSrc:  Pointer;
+begin
+  pStmt := nil;
+  pPrevIdx := nil;
+
+  if not Assigned(passqlite3vdbe.gPrepareV2) then
+  begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
+  zSql := sqlite3MPrintf(db, zSql1, [Pointer(zDb)]);
+  if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  rc := passqlite3vdbe.gPrepareV2(db, zSql, -1, PPointer(@pStmt), nil);
+  sqlite3DbFree(db, zSql);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  while sqlite3_step(pStmt) = SQLITE_ROW do
+  begin
+    nIdxCol := 1;
+    zIndex := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zIndex = nil then Continue;
+    nSamp := sqlite3_column_int(pStmt, 1);
+    pIxL := findIndexOrPrimaryKey(db, zIndex, zDb);
+    if pIxL = nil then Continue;
+    if pIxL^.aSample <> nil then
+      Continue;  { same index named twice }
+    if (not HasRowid(pIxL^.pTable))
+       and ((pIxL^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY) then
+      nIdxCol := pIxL^.nKeyCol
+    else
+      nIdxCol := pIxL^.nColumn;
+    pIxL^.nSampleCol := nIdxCol;
+    pIxL^.mxSample   := nSamp;
+    { ROUND8(sizeof(IndexSample) * nSamp) + 3*nIdxCol*nSamp*tRowcnt
+      + nIdxCol*tRowcnt (for aAvgEq).  tRowcnt = u64. }
+    nByte := (u64(SizeOf(TIndexSample)) * u64(nSamp) + 7) and not u64(7);
+    nByte := nByte + u64(SizeOf(u64)) * u64(nIdxCol) * 3 * u64(nSamp);
+    nByte := nByte + u64(nIdxCol) * u64(SizeOf(u64));
+    pIxL^.aSample := PIndexSample(sqlite3DbMallocZero(db, nByte));
+    if pIxL^.aSample = nil then
+    begin
+      sqlite3_finalize(pStmt);
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    pPtr := PByte(pIxL^.aSample);
+    Inc(pPtr, (u64(SizeOf(TIndexSample)) * u64(nSamp) + 7) and not u64(7));
+    pSpace := Pointer(pPtr);
+    pIxL^.aAvgEq := pSpace;
+    Inc(pSpace, nIdxCol);
+    pIxL^.pTable^.tabFlags := pIxL^.pTable^.tabFlags or TF_HasStat4;
+    for iLoop := 0 to u64(nSamp) - 1 do
+    begin
+      pSampSlot := PIndexSample(PByte(pIxL^.aSample) +
+                     iLoop * SizeOf(TIndexSample));
+      pSampSlot^.anEq := pSpace;  Inc(pSpace, nIdxCol);
+      pSampSlot^.anLt := pSpace;  Inc(pSpace, nIdxCol);
+      pSampSlot^.anDLt := pSpace; Inc(pSpace, nIdxCol);
+    end;
+  end;
+  rc := sqlite3_finalize(pStmt);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  zSql := sqlite3MPrintf(db, zSql2, [Pointer(zDb)]);
+  if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  pStmt := nil;
+  rc := passqlite3vdbe.gPrepareV2(db, zSql, -1, PPointer(@pStmt), nil);
+  sqlite3DbFree(db, zSql);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  while sqlite3_step(pStmt) = SQLITE_ROW do
+  begin
+    zIndex := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zIndex = nil then Continue;
+    pIxL := findIndexOrPrimaryKey(db, zIndex, zDb);
+    if pIxL = nil then Continue;
+    if pIxL^.nSample >= pIxL^.mxSample then
+      Continue;  { duplicate-named index overflowed allocation }
+    nCol := pIxL^.nSampleCol;
+    if pIxL <> pPrevIdx then
+    begin
+      initAvgEq(pPrevIdx);
+      pPrevIdx := pIxL;
+    end;
+    pSampSlot := PIndexSample(PByte(pIxL^.aSample) +
+                   u64(pIxL^.nSample) * SizeOf(TIndexSample));
+    decodeStat4IntArray(PAnsiChar(sqlite3_column_text(pStmt, 1)),
+                        nCol, PRowCntArr(pSampSlot^.anEq));
+    decodeStat4IntArray(PAnsiChar(sqlite3_column_text(pStmt, 2)),
+                        nCol, PRowCntArr(pSampSlot^.anLt));
+    decodeStat4IntArray(PAnsiChar(sqlite3_column_text(pStmt, 3)),
+                        nCol, PRowCntArr(pSampSlot^.anDLt));
+
+    { Copy sample blob + 8 trailing zero bytes (per analyze.c:1876..1891). }
+    nBlob := sqlite3_column_bytes(pStmt, 4);
+    pSampSlot^.n := nBlob;
+    pSampSlot^.p := sqlite3DbMallocZero(db, u64(nBlob) + 8);
+    if pSampSlot^.p = nil then
+    begin
+      sqlite3_finalize(pStmt);
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    if nBlob > 0 then
+    begin
+      pBlobSrc := sqlite3_column_blob(pStmt, 4);
+      if pBlobSrc <> nil then
+        Move(pBlobSrc^, pSampSlot^.p^, nBlob);
+    end;
+    Inc(pIxL^.nSample);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  if rc = SQLITE_OK then initAvgEq(pPrevIdx);
+  Result := rc;
+end;
+
+{ loadStat4 — port of analyze.c:1903.
+  Drive loadStatTbl with the two stat4 SELECTs when sqlite_stat4 exists
+  and the SQLITE_Stat4 optimisation is enabled. }
+function loadStat4(db: PTsqlite3; zDb: PAnsiChar): i32;
+var
+  pStat4Tab: PTable2;
+begin
+  Result := SQLITE_OK;
+  if not OptimizationEnabled(db, SQLITE_Stat4) then Exit;
+  pStat4Tab := sqlite3FindTable(db, 'sqlite_stat4', zDb);
+  if pStat4Tab = nil then Exit;
+  if pStat4Tab^.eTabType <> TABTYP_NORM then Exit;
+  Result := loadStatTbl(db,
+    'SELECT idx,count(*) FROM %Q.sqlite_stat4 GROUP BY idx COLLATE nocase',
+    'SELECT idx,neq,nlt,ndlt,sample FROM %Q.sqlite_stat4',
+    zDb);
+end;
+{$ENDIF}
+
 { sqlite3AnalysisLoad — port of analyze.c:1942.
   Clear any prior stat1 flags on every Table/Index in pSchema, drive the
   sqlite_stat1 SELECT through gStat1Exec when the table exists, then
@@ -39153,13 +42510,20 @@ begin
     pElem := PHashElem(pElem^.next);
   end;
 
-  { Clear hasStat1 (bit 7 of idxFlags) on every index. }
+  { Clear hasStat1 (bit 7 of idxFlags) on every index.  Under STAT4 also
+    drop any cached sample arrays before reloading. }
   pElem := pSchema^.idxHash.first;
   while pElem <> nil do
   begin
     pIdx := PIndex2(pElem^.data);
     if pIdx <> nil then
+    begin
       pIdx^.idxFlags := pIdx^.idxFlags and (not u16(1 shl 7));
+      {$IFDEF SQLITE_ENABLE_STAT4}
+      sqlite3DeleteIndexSamples(db, pIdx);
+      pIdx^.aSample := nil;
+      {$ENDIF}
+    end;
     pElem := PHashElem(pElem^.next);
   end;
 
@@ -39193,6 +42557,32 @@ begin
       sqlite3DefaultRowEst(pIdx);
     pElem := PHashElem(pElem^.next);
   end;
+
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { Load STAT4 samples (analyze.c:1992..2003).  DisableLookaside is the
+    Inc(bDisable) macro pair in C; loadStatTbl asserts it.  After the
+    load, aiRowEst (the per-prefix non-log row-count vector used only by
+    initAvgEq) is released — it's owned by sqlite3_malloc, not lookaside. }
+  if Result = SQLITE_OK then
+  begin
+    Inc(db^.lookaside.bDisable);
+    Result := loadStat4(db, db^.aDb[iDb].zDbSName);
+    Dec(db^.lookaside.bDisable);
+  end;
+  pElem := pSchema^.idxHash.first;
+  while pElem <> nil do
+  begin
+    pIdx := PIndex2(pElem^.data);
+    if (pIdx <> nil) and (pIdx^.aiRowEst <> nil) then
+    begin
+      sqlite3_free(pIdx^.aiRowEst);
+      pIdx^.aiRowEst := nil;
+    end;
+    pElem := PHashElem(pElem^.next);
+  end;
+
+  if Result = SQLITE_NOMEM then sqlite3OomFault(db);
+  {$ENDIF}
 end;
 
 { build.c:599 — collapse the aDb[] array, dropping any detached entries
@@ -40014,8 +43404,9 @@ begin
     pCol := @p^.aCol[p^.nCol - 1];
     if sqlite3ExprIsConstantOrFunction(pExpr, isInit) = 0 then
     begin
-      sqlite3ErrorMsg(pParse,
-        PAnsiChar('default value of column is not constant'));
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'default value of column [%s] is not constant',
+        [pCol^.zCnName]));
     end
     else if (pCol^.colFlags and COLFLAG_GENERATED) <> 0 then
     begin
@@ -40545,6 +43936,21 @@ var
   zCollPk: PAnsiChar;
   pListPk: PExprList;
   ipkTokenPk: TToken;
+  pSelTab:    PTable2;
+  destAS:     TSelectDest;
+  iCsrAS:     i32;
+  regYieldAS: i32;
+  regRecAS:   i32;
+  regRowidAS: i32;
+  addrTopAS:  i32;
+  addrInsLoopAS: i32;
+  pIdxRD: PIndex2;
+  nPkRD, nNewRD, iRD, jRD, kRD: i32;
+  isDupRD: Boolean;
+  { 9.4.divbug.71 STRICT arm }
+  pCol_eTC:    PColumn;
+  eCTypeStr:   i32;
+  zStrictErrTC: PAnsiChar;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -40559,16 +43965,6 @@ begin
   end;
 
   db := pParse^.db;
-
-  { CREATE TABLE ... AS SELECT body codegen is deferred to Phase 7.x.
-    Without it we would write a CREATE-table schema row with no column
-    list, leaving sqlite_schema malformed.  Surface a clean parse error
-    instead and skip the entire emit path. }
-  if pSelect <> nil then begin
-    sqlite3ErrorMsg(pParse,
-      PAnsiChar('CREATE TABLE AS SELECT not yet supported in this build'));
-    Exit;
-  end;
 
   { Test-scaffold gate: the synthetic dbs used by TestParserSmoke /
     TestVtab leave eOpenState=1 and have no working aDb[].pSchema /
@@ -40632,6 +44028,42 @@ begin
       sqlite3ErrorMsg(pParse,
         PAnsiChar('must have at least one non-generated column'));
       Exit;
+    end;
+  end;
+
+  { STRICT-table arm — port of build.c:2686..2713 (9.4.divbug.71).
+    Without this, TF_Strict never reaches pTab^.tabFlags, so
+    sqlite3TableAffinity skips its OP_TypeCheck branch and INSERTs of
+    wrong-typed values into STRICT tables silently succeed. }
+  if (tabOpts and TF_Strict) <> 0 then begin
+    pTab^.tabFlags := pTab^.tabFlags or TF_Strict;
+    for ii := 0 to pTab^.nCol - 1 do begin
+      pCol_eTC := @pTab^.aCol[ii];
+      eCTypeStr := (pCol_eTC^.typeFlags shr 4) and $0F;
+      if eCTypeStr = COLTYPE_CUSTOM then begin
+        if (pCol_eTC^.colFlags and COLFLAG_HASTYPE) <> 0 then
+          zStrictErrTC := sqlite3MPrintf(db,
+            'unknown datatype for %s.%s: "%s"',
+            [pTab^.zName, pCol_eTC^.zCnName,
+             sqlite3ColumnType(pCol_eTC, PAnsiChar(''))])
+        else
+          zStrictErrTC := sqlite3MPrintf(db,
+            'missing datatype for %s.%s',
+            [pTab^.zName, pCol_eTC^.zCnName]);
+        sqlite3ErrorMsg(pParse, zStrictErrTC);
+        sqlite3DbFree(db, zStrictErrTC);
+        Exit;
+      end else if eCTypeStr = COLTYPE_ANY then begin
+        pCol_eTC^.affinity := AnsiChar(SQLITE_AFF_BLOB);
+      end;
+      if ((pCol_eTC^.colFlags and COLFLAG_PRIMKEY) <> 0)
+         and (pTab^.iPKey <> ii)
+         and ((pCol_eTC^.typeFlags and $0F) = OE_None) then
+      begin
+        pCol_eTC^.typeFlags :=
+          (pCol_eTC^.typeFlags and $F0) or u8(OE_Abort);
+        pTab^.tabFlags := pTab^.tabFlags or TF_HasNotNull;
+      end;
     end;
   end;
 
@@ -40717,6 +44149,74 @@ begin
       pPk2^.nColumn := pPk2^.nKeyCol;
     end;
 
+    { Update the in-memory representation of every UNIQUE / non-PK index
+      so the synthesised "rowid tail" column emitted by sqlite3CreateIndex
+      (the pPk=nil arm at codegen.pas:43307..43313) is replaced with the
+      WITHOUT-ROWID PK key columns (dedup-aware).  Port of
+      build.c:2451..2483.  Without this the secondary index's aiColumn
+      tail still contains XN_ROWID, and any planner path that opens that
+      index dereferences past the column array → segfault on tables like
+      `CREATE TABLE t0(c0 COLLATE RTRIM, c1 BLOB UNIQUE, PRIMARY KEY(c0,c1))
+      WITHOUT ROWID` (9.4.divbug.42). }
+    if pPk2 <> nil then begin
+      pIdxRD := pTab^.pIndex;
+      nPkRD := i32(pPk2^.nKeyCol);
+      while pIdxRD <> nil do begin
+        if (pIdxRD^.idxFlags and 3) <> SQLITE_IDXTYPE_PRIMARYKEY then begin
+          { Count non-duplicate PK columns. }
+          nNewRD := 0;
+          for iRD := 0 to nPkRD - 1 do begin
+            isDupRD := False;
+            jRD := i32(pIdxRD^.nKeyCol);
+            for kRD := 0 to jRD - 1 do begin
+              if ((pIdxRD^.aiColumn + kRD)^ = (pPk2^.aiColumn + iRD)^)
+                 and ((PPAnsiChar(pIdxRD^.azColl) + kRD)^ <> nil)
+                 and ((PPAnsiChar(pPk2^.azColl) + iRD)^ <> nil)
+                 and (sqlite3StrICmp((PPAnsiChar(pIdxRD^.azColl) + kRD)^,
+                                     (PPAnsiChar(pPk2^.azColl)  + iRD)^) = 0) then
+              begin
+                isDupRD := True; Break;
+              end;
+            end;
+            if not isDupRD then Inc(nNewRD);
+          end;
+          if nNewRD = 0 then begin
+            { Index is a superset of the PK — drop the rowid tail. }
+            pIdxRD^.nColumn := pIdxRD^.nKeyCol;
+          end else begin
+            if resizeIndexObject(pParse, pIdxRD,
+                                 i32(pIdxRD^.nKeyCol) + nNewRD) <> SQLITE_OK then
+              Exit;
+            jRD := i32(pIdxRD^.nKeyCol);
+            for iRD := 0 to nPkRD - 1 do begin
+              isDupRD := False;
+              for kRD := 0 to i32(pIdxRD^.nKeyCol) - 1 do begin
+                if ((pIdxRD^.aiColumn + kRD)^ = (pPk2^.aiColumn + iRD)^)
+                   and ((PPAnsiChar(pIdxRD^.azColl) + kRD)^ <> nil)
+                   and ((PPAnsiChar(pPk2^.azColl) + iRD)^ <> nil)
+                   and (sqlite3StrICmp((PPAnsiChar(pIdxRD^.azColl) + kRD)^,
+                                       (PPAnsiChar(pPk2^.azColl)  + iRD)^) = 0) then
+                begin
+                  isDupRD := True; Break;
+                end;
+              end;
+              if not isDupRD then begin
+                (pIdxRD^.aiColumn + jRD)^ := (pPk2^.aiColumn + iRD)^;
+                (PPAnsiChar(pIdxRD^.azColl) + jRD)^ :=
+                  (PPAnsiChar(pPk2^.azColl) + iRD)^;
+                if (pPk2^.aSortOrder + iRD)^ <> 0 then
+                  { Per build.c:2476 ticket bba7b69f9849b5bf — set
+                    bAscKeyBug (bit 9 of idxFlags). }
+                  pIdxRD^.idxFlags := pIdxRD^.idxFlags or u32(1 shl 9);
+                Inc(jRD);
+              end;
+            end;
+          end;
+        end;
+        pIdxRD := pIdxRD^.pNext;
+      end;
+    end;
+
     { Append all non-PK, non-VIRTUAL table columns to the PK index so the
       stored row record carries every value (build.c:2484..2510). }
     if (pPk2 <> nil) and (pTab^.aCol <> nil) then begin
@@ -40790,13 +44290,8 @@ begin
       Exit;
     end;
 
-    { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Parser owns
-      pSelect and frees it after EndTable returns; we only note whether
-      a SELECT was present so the createTableStmt branch below can fire. }
     bAsSelect := 0;
-    if pSelect <> nil then begin
-      bAsSelect := 1;
-    end;
+    if pSelect <> nil then bAsSelect := 1;
 
     { Determine zType / zType2 (build.c:2811..2820): regular table vs view. }
     if pTab^.eTabType = TABTYP_NORM then begin
@@ -40807,12 +44302,59 @@ begin
       zType2 := PAnsiChar('VIEW');
     end;
 
+    { Phase 6.10 step 2: emit OP_Close 0 (build.c:2806). }
+    sqlite3VdbeAddOp1(v, OP_Close, 0);
+
+    { CREATE TABLE ... AS SELECT body — port of build.c:2836..2884.
+      Open a write cursor on the new btree (root in regRoot, P5=P2ISREG),
+      run the SELECT into a coroutine, then loop OP_Yield → MakeRecord →
+      NewRowid → Insert until the coroutine signals EOF. }
+    if bAsSelect <> 0 then begin
+      { build.c:2846..2850 — refuse during DECLARE_VTAB / RENAME passes. }
+      if pParse^.eParseMode <> PARSE_MODE_NORMAL then begin
+        pParse^.rc := SQLITE_ERROR;
+        Inc(pParse^.nErr);
+        Exit;
+      end;
+      iCsrAS := pParse^.nTab; Inc(pParse^.nTab);
+      Inc(pParse^.nMem); regYieldAS := pParse^.nMem;
+      Inc(pParse^.nMem); regRecAS   := pParse^.nMem;
+      Inc(pParse^.nMem); regRowidAS := pParse^.nMem;
+      sqlite3MayAbort(pParse);
+      sqlite3VdbeAddOp3(v, OP_OpenWrite, iCsrAS, pParse^.u1.cr.regRoot, iDb);
+      sqlite3VdbeChangeP5(v, OPFLAG_P2ISREG);
+      addrTopAS := sqlite3VdbeCurrentAddr(v) + 1;
+      sqlite3VdbeAddOp3(v, OP_InitCoroutine, regYieldAS, 0, addrTopAS);
+      if pParse^.nErr <> 0 then Exit;
+      pSelTab := sqlite3ResultSetOfSelect(pParse, pSelect,
+                   AnsiChar(SQLITE_AFF_BLOB));
+      if pSelTab = nil then Exit;
+      AssertH(pTab^.aCol = nil, 'EndTable AS SELECT: aCol must be empty');
+      pTab^.nCol   := pSelTab^.nCol;
+      pTab^.nNVCol := pSelTab^.nCol;
+      pTab^.aCol   := pSelTab^.aCol;
+      pSelTab^.nCol := 0;
+      pSelTab^.aCol := nil;
+      sqlite3DeleteTable(db, pSelTab);
+      sqlite3SelectDestInit(@destAS, SRT_Coroutine, regYieldAS);
+      sqlite3Select(pParse, pSelect, @destAS);
+      if pParse^.nErr <> 0 then Exit;
+      sqlite3VdbeEndCoroutine(v, regYieldAS);
+      sqlite3VdbeJumpHere(v, addrTopAS - 1);
+      addrInsLoopAS := sqlite3VdbeAddOp1(v, OP_Yield, destAS.iSDParm);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, destAS.iSdst, destAS.nSdst, regRecAS);
+      sqlite3TableAffinity(v, pTab, 0);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iCsrAS, regRowidAS);
+      sqlite3VdbeAddOp3(v, OP_Insert, iCsrAS, regRecAS, regRowidAS);
+      sqlite3VdbeGoto(v, addrInsLoopAS);
+      sqlite3VdbeJumpHere(v, addrInsLoopAS);
+      sqlite3VdbeAddOp1(v, OP_Close, iCsrAS);
+    end;
+
     { Compute the complete text of the CREATE statement (build.c:2886..2896). }
     if (bAsSelect <> 0) and (gCreateTableStmt <> nil) then begin
       zStmt := gCreateTableStmt(db, pTab);
     end else if bAsSelect <> 0 then begin
-      { Hook not registered (codegen-only test programs).  Leave nil; the
-        schema-row sql column will be empty for the AS SELECT arm. }
       zStmt := nil;
     end else begin
       pEnd2 := pEnd;
@@ -40823,10 +44365,6 @@ begin
                               [zType2, n, pParse^.sNameToken.z]);
     end;
 
-    { Phase 6.10 step 2: emit OP_Close 0 (build.c:2806), then the
-      UPDATE-equivalent bytecode that overwrites the placeholder row
-      sqlite3StartTable inserted into sqlite_schema. }
-    sqlite3VdbeAddOp1(v, OP_Close, 0);
     emitSchemaRowUpdate(pParse, v, iDb, zType, pTab^.zName,
                         pTab^.zName, pParse^.u1.cr.regRoot, zStmt,
                         pParse^.u1.cr.regRowid);
@@ -40878,17 +44416,23 @@ begin
     pParse^.pNewTable := nil;
     db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
 
-    { sqlite_sequence pSeqTab pin (build.c:2952..2956).  During init.busy
-      reparse of the AUTOINCREMENT table, pin sqlite_sequence on the
-      schema so autoIncBegin can find it.  May resolve to nil if
-      sqlite_sequence has not yet been reparsed (depends on
-      ParseSchema callback order); autoIncBegin re-attempts the
-      lookup at insert-codegen time as a fallback. }
+    { sqlite_sequence pSeqTab pin (build.c:2963..2972).  When the table
+      being added under init.busy IS sqlite_sequence, pin pSeqTab on its
+      schema so subsequent AUTOINCREMENT CREATEs (and autoIncBegin) can
+      find it without re-CREATEing the shadow.  C cites strcmp(p->zName,
+      "sqlite_sequence")==0 → p->pSchema->pSeqTab = p; (build.c:2968..
+      2970). }
+    if sqlite3StrICmp(pTab^.zName, 'sqlite_sequence') = 0 then
+      passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab := pTab;
+    { Legacy fallback: also try to pin via FindTable when the table being
+      added is itself AUTOINCREMENT (covers reparse-order races where
+      sqlite_sequence may have been reparsed earlier). }
     if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
     begin
-      passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab :=
-        sqlite3FindTable(db, PAnsiChar('sqlite_sequence'),
-                         db^.aDb[iDb].zDbSName);
+      if passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab = nil then
+        passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab :=
+          sqlite3FindTable(db, PAnsiChar('sqlite_sequence'),
+                           db^.aDb[iDb].zDbSName);
     end;
   end;
 
@@ -41749,6 +45293,8 @@ var
   zCollName:   PAnsiChar;
   jj:          i32;
   isDup:       Boolean;
+  sortOrderMask: i32;
+  requestedSortOrder: i32;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -41919,6 +45465,14 @@ begin
   if InRenameObject(pParse) then begin
     pIndex^.aColExpr := pList;
   end;
+  { build.c:4190..4196 — honour DESC sort order on indexed columns only
+    when the schema file_format is >= 4.  Older databases must ignore the
+    DESC qualifier (sortOrderMask=0) so the on-disk b-tree direction stays
+    backwards-compatible. }
+  if pDb^.pSchema^.file_format >= 4 then
+    sortOrderMask := -1
+  else
+    sortOrderMask := 0;
   for i := 0 to i32(pList^.nExpr) - 1 do
   begin
     n := -1;
@@ -41927,14 +45481,19 @@ begin
     { build.c:4216..4219 — convert TK_STRING to TK_ID, then resolve
       column references.  Under IN_RENAME_OBJECT this rewrites simple
       column references from TK_ID to TK_COLUMN so renameColumnExprCb
-      (TK_COLUMN gate) can match the indexed-column span.  Restricted to
-      rename mode here because the legacy zToken-based aiColumn lookup
-      below still relies on the pre-resolve identifier text. }
-    if InRenameObject(pParse) then begin
-      sqlite3StringToId(pColExpr);
-      if sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil) <> 0 then
-        goto exit_create_index;
-    end;
+      (TK_COLUMN gate) can match the indexed-column span.  Outside
+      rename mode we also run the resolve so that a bogus column name
+      (e.g. CREATE INDEX i ON t(f4) where f4 is not in t) emits the
+      "no such column: f4" diagnostic up-front, matching C's
+      `if(pParse->nErr) goto exit_create_index;` (9.4.divbug.58).
+      9.4.divbug.87.072 — must run UNCONDITIONALLY (no init.busy gate), as
+      C build.c:4217..4219 does: when reloading the schema from sqlite_master
+      the resolved aColExpr is required by upsert target matching
+      (sqlite3UpsertAnalyzeTarget at upsert.c:181 expects TK_COLUMN nodes,
+      not raw TK_ID/TK_STRING tokens). }
+    sqlite3StringToId(pColExpr);
+    sqlite3ResolveSelfReference(pParse, pTab, NC_IdxExpr, pColExpr, nil);
+    if pParse^.nErr <> 0 then goto exit_create_index;
     { 10.1.bug.108: peel any TK_COLLATE wrapper to expose the underlying
       column expression, and capture the wrapper's zToken as the index
       column's collation name.  Mirrors build.c:4253..4276 (TK_COLLATE
@@ -41955,7 +45514,9 @@ begin
       a non-identifier expression u.zToken is NOT a valid pointer (e.g. an
       integer literal carries u.iValue under EP_IntValue) — dereferencing
       it segfaults (9.4.divbug.12).  Route such slots to XN_EXPR like C. }
-    if (pColExpr <> nil)
+    if (pColExpr <> nil) and (pColExpr^.op = TK_COLUMN) then
+      n := pColExpr^.iColumn
+    else if (pColExpr <> nil)
        and ((pColExpr^.op = TK_ID) or (pColExpr^.op = TK_STRING))
        and ((pColExpr^.flags and EP_IntValue) = 0) then
       n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken)
@@ -41984,6 +45545,14 @@ begin
     if (n >= 0) and ((PColumn(pTab^.aCol)[n].typeFlags and $0F) = OE_None) then
       pIndex^.idxFlags := pIndex^.idxFlags and not u32($08);
     (pIndex^.aiColumn + i)^ := i16(n);
+    { build.c:4251..4269 — when no explicit COLLATE wrapper is present and
+      the indexed term resolves to a real table column (n>=0), the index
+      column inherits the table column's declared collation; otherwise
+      fall back to BINARY.  Without the inheritance arm any index built
+      over a column declared "x TEXT COLLATE custom" carries BINARY in
+      azColl[], so wherePathSatisfiesOrderBy's azColl-vs-ExprNNCollSeq
+      compare rejects the index for ORDER BY x — planner falls back to a
+      TEMP B-TREE sorter, scrambling row order vs C (9.4.divbug.79). }
     if zCollName <> nil then
     begin
       pCollSeq := PTCollSeq(sqlite3LocateCollSeq(pParse, zCollName));
@@ -41991,9 +45560,22 @@ begin
         (PPAnsiChar(pIndex^.azColl) + i)^ := pCollSeq^.zName
       else
         (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
+    end else if n >= 0 then
+    begin
+      zCollName := sqlite3ColumnColl(@PColumn(pTab^.aCol)[n]);
+      if zCollName = nil then
+        (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY
+      else
+        (PPAnsiChar(pIndex^.azColl) + i)^ := zCollName;
     end else
       (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
-    (pIndex^.aSortOrder + i)^ := 0;
+    { build.c:4270..4271 — store the per-column ASC/DESC bit (masked by
+      sortOrderMask so legacy file_format<4 schemas ignore DESC). }
+    requestedSortOrder :=
+      i32(PExprListItem(PByte(ExprListItems(pList))
+                        + i * SizeOf(TExprListItem))^.fg.sortFlags)
+      and sortOrderMask;
+    (pIndex^.aSortOrder + i)^ := u8(requestedSortOrder);
   end;
   { Append rowid (or pPk key cols) as the implicit tail.  WITHOUT ROWID
     tables: copy each pPk key column (skipping duplicates already in
@@ -42070,6 +45652,57 @@ begin
     the exit_create_index cleanup does not double-free it. }
   if (pIndex^.aColExpr <> nil) and (pIndex^.aColExpr = pList) then
     pList := nil;
+
+  { Equivalent-constraint dedup — port of build.c:4315..4379.  Only fires
+    on the implicit-index path (CREATE TABLE … UNIQUE / PRIMARY KEY,
+    pTab==pParse->pNewTable).  If any prior auto-index on this table has
+    identical key columns AND collations, drop the new one rather than
+    publish a redundant index.  Required for index-16.{1..4} —
+    `CREATE TABLE t7(c UNIQUE PRIMARY KEY)` etc. should leave a single
+    sqlite_autoindex row, not two.  (divbug.87.025) }
+  if (pTab = pParse^.pNewTable) and (pIndex <> nil) then
+  begin
+    pLoop := pTab^.pIndex;
+    while pLoop <> nil do
+    begin
+      if u32(pLoop^.nKeyCol) = u32(pIndex^.nKeyCol) then
+      begin
+        jj := 0;
+        while jj < i32(pLoop^.nKeyCol) do
+        begin
+          if (pLoop^.aiColumn + jj)^ <> (pIndex^.aiColumn + jj)^ then Break;
+          if ((PPAnsiChar(pLoop^.azColl) + jj)^ <> nil)
+             and ((PPAnsiChar(pIndex^.azColl) + jj)^ <> nil)
+             and (sqlite3StrICmp((PPAnsiChar(pLoop^.azColl) + jj)^,
+                                  (PPAnsiChar(pIndex^.azColl) + jj)^) <> 0) then
+            Break;
+          Inc(jj);
+        end;
+        if jj = i32(pLoop^.nKeyCol) then
+        begin
+          if pLoop^.onError <> pIndex^.onError then
+          begin
+            if (pLoop^.onError <> OE_Default) and (pIndex^.onError <> OE_Default) then
+              sqlite3ErrorMsg(pParse,
+                PAnsiChar('conflicting ON CONFLICT clauses specified'));
+            if pLoop^.onError = OE_Default then
+              pLoop^.onError := pIndex^.onError;
+          end;
+          if idxType = SQLITE_IDXTYPE_PRIMARYKEY then
+            pLoop^.idxFlags := (pLoop^.idxFlags and not u32($03))
+                                or u32(SQLITE_IDXTYPE_PRIMARYKEY);
+          if InRenameObject(pParse) then
+          begin
+            pIndex^.pNext := pParse^.pNewIndex;
+            pParse^.pNewIndex := pIndex;
+            pIndex := nil;
+          end;
+          goto exit_create_index;
+        end;
+      end;
+      pLoop := pLoop^.pNext;
+    end;
+  end;
 
   { Codegen / hash-publish phase. }
   if not InRenameObject(pParse) then begin
@@ -42357,6 +45990,21 @@ var
   pItem: PSrcItem;
 begin
   db := pParse^.db;
+  { build.c:5079..5083 — `<src1> JOIN <src2> ON ...` with no <src1> (e.g.
+    a CTE/select where the first FROM-term has been folded away leaving the
+    JOIN with no LHS) must error rather than attach the ON/USING to the
+    first append.  Without this gate tkt3935.5/.7 silently parse. }
+  if (p = nil) and ((pOn <> nil) or (pUsing <> nil)) then begin
+    if pOn <> nil then
+      sqlite3ErrorMsg(pParse, 'a JOIN clause is required before ON')
+    else
+      sqlite3ErrorMsg(pParse, 'a JOIN clause is required before USING');
+    sqlite3ExprDelete(db, pOn);
+    sqlite3IdListDelete(db, pUsing);
+    if pSubquery <> nil then sqlite3SelectDelete(db, pSubquery);
+    Result := nil;
+    Exit;
+  end;
   p := sqlite3SrcListAppend(pParse, p, pTable, pDatabase);
   if p <> nil then begin
     pItem := PSrcItem(PByte(SrcListItems(p)) +
@@ -42521,7 +46169,16 @@ begin
   if pNew = nil then begin Result := nil; Exit; end;
   pItem := PIdListItem(PByte(IdListItems(pNew)) +
     pNew^.nId * SizeOf(TIdListItem));
+  { build.c:4726 — use sqlite3NameFromToken to dequote any STRING/"id"/[id]
+    tokens that flow into the idlist via `nm ::= STRING` (parse.y:340).
+    Without dequoting, `INSERT INTO t('a','b') VALUES(…)` (emitted by
+    echoUpdate %Q quoting in test8.c:642..654) registers a column name of
+    `'a'` (with the single quotes) and the resolver in sqlite3ColumnIndex
+    raises "no column named 'a'".  9.4.divbug.26.  Parser-unit
+    sqlite3NameFromToken is not visible here — inline the two-step
+    StrNDup+Dequote (cf. analyzeNameFromToken below). }
   pItem^.zName := sqlite3DbStrNDup(db, PChar(pToken^.z), pToken^.n);
+  if pItem^.zName <> nil then sqlite3Dequote(pItem^.zName);
   Inc(pNew^.nId);
   Result := pNew;
 end;
@@ -46843,6 +50500,22 @@ end;
 procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
                           iStatCur, iMem, iTab: i32); forward;
 
+{ STAT_GET_* function selectors (analyze.c:793..797).  Non-STAT4 build
+  only references STAT_GET_STAT1; the others are emitted by the STAT4
+  arms of analyzeOneTable to feed sqlite_stat4. }
+const
+  STAT_GET_STAT1 = 0;
+  STAT_GET_ROWID = 1;
+  STAT_GET_NEQ   = 2;
+  STAT_GET_NLT   = 3;
+  STAT_GET_NDLT  = 4;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  IsStat4              = 1;
+  SQLITE_STAT4_SAMPLES = 24;
+  {$ELSE}
+  IsStat4        = 0;  { non-STAT4 build }
+  {$ENDIF}
+
 { ============================================================
   StatAccum — non-STAT4 layout, port of analyze.c:265..302.
   Trailing tRowcnt[nCol] (anDLt) lives just past the record body,
@@ -46850,9 +50523,27 @@ procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
   ============================================================ }
 type
   PStatAccum = ^TStatAccum;
-  TStatSampleSlim = record
-    anDLt: ^u64;          { tRowcnt = u64 in this build }
+  PStatSample = ^TStatSample;
+  TStatSampleU = record
+    case Integer of
+      0: (iRowid: i64);
+      1: (aRowid: Pu8);
   end;
+  TStatSample = record
+    anDLt:     ^u64;          { tRowcnt = u64 in this build }
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    anEq:      ^u64;
+    anLt:      ^u64;
+    u:         TStatSampleU;  { 8 bytes — iRowid or aRowid pointer }
+    nRowid:    u32;           { Sizeof aRowid[] }
+    isPSample: u8;            { True if periodic sample }
+    _pad13:    array[0..2] of u8;
+    iCol:      i32;
+    iHash:     u32;           { Tiebreaker hash }
+    {$ENDIF}
+  end;
+  { Legacy slim alias — uses the same first field as the C non-STAT4 path. }
+  TStatSampleSlim = TStatSample;
   TStatAccum = record
     db:         Pointer;  { sqlite3* — Pointer keeps unit deps minimal }
     nEst:       u64;      { tRowcnt nEst (set from sqlite3_value_int64) }
@@ -46862,16 +50553,95 @@ type
     nKeyCol:    i32;
     nSkipAhead: u8;
     _pad0:      array[0..2] of Byte;  { align trailing pointer }
-    current:    TStatSampleSlim;
+    current:    TStatSample;
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    nPSample:   u64;
+    mxSample:   i32;
+    iPrn:       u32;
+    aBest:      PStatSample;
+    iMin:       i32;
+    nSample:    i32;
+    nMaxEqZero: i32;
+    iGet:       i32;
+    a:          PStatSample;
+    {$ENDIF}
   end;
 
-{ statAccumDestructor — analyze.c:366..377.  Non-STAT4 build: nothing
-  to free in StatSample, just the StatAccum block itself. }
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ sampleClear — analyze.c:307..313.  Free rowid blob (if any). }
+procedure sampleClear(db: PTsqlite3; p: PStatSample);
+begin
+  if p^.nRowid <> 0 then
+  begin
+    sqlite3DbFree(db, p^.u.aRowid);
+    p^.nRowid := 0;
+  end;
+end;
+
+{ sampleSetRowid — analyze.c:319..329.  Set BLOB rowid (WITHOUT ROWID PK). }
+procedure sampleSetRowid(db: PTsqlite3; p: PStatSample; n: i32; pData: Pu8);
+begin
+  if p^.nRowid <> 0 then sqlite3DbFree(db, p^.u.aRowid);
+  p^.u.aRowid := Pu8(sqlite3DbMallocRawNN(db, u64(n)));
+  if p^.u.aRowid <> nil then
+  begin
+    p^.nRowid := u32(n);
+    Move(pData^, p^.u.aRowid^, n);
+  end else
+    p^.nRowid := 0;
+end;
+
+{ sampleSetRowidInt64 — analyze.c:335..340. }
+procedure sampleSetRowidInt64(db: PTsqlite3; p: PStatSample; iRowid: i64);
+begin
+  if p^.nRowid <> 0 then sqlite3DbFree(db, p^.u.aRowid);
+  p^.nRowid   := 0;
+  p^.u.iRowid := iRowid;
+end;
+
+{ sampleCopy — analyze.c:348..360. }
+procedure sampleCopy(p: PStatAccum; pTo, pFrom: PStatSample);
+begin
+  pTo^.isPSample := pFrom^.isPSample;
+  pTo^.iCol      := pFrom^.iCol;
+  pTo^.iHash     := pFrom^.iHash;
+  Move(pFrom^.anEq^,  pTo^.anEq^,  SizeOf(u64) * p^.nCol);
+  Move(pFrom^.anLt^,  pTo^.anLt^,  SizeOf(u64) * p^.nCol);
+  Move(pFrom^.anDLt^, pTo^.anDLt^, SizeOf(u64) * p^.nCol);
+  if pFrom^.nRowid <> 0 then
+    sampleSetRowid(p^.db, pTo, i32(pFrom^.nRowid), pFrom^.u.aRowid)
+  else
+    sampleSetRowidInt64(p^.db, pTo, pFrom^.u.iRowid);
+end;
+{$ENDIF}
+
+{ statAccumDestructor — analyze.c:366..377. }
 procedure statAccumDestructor(p: Pointer); cdecl;
-var pAcc: PStatAccum;
+var
+  pAcc: PStatAccum;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  i: i32;
+  pS: PStatSample;
+  {$ENDIF}
 begin
   pAcc := PStatAccum(p);
   if pAcc = nil then Exit;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  if pAcc^.mxSample <> 0 then
+  begin
+    for i := 0 to pAcc^.nCol - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.aBest) + i * SizeOf(TStatSample));
+      sampleClear(pAcc^.db, pS);
+    end;
+    for i := 0 to pAcc^.mxSample - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.a) + i * SizeOf(TStatSample));
+      sampleClear(pAcc^.db, pS);
+    end;
+    sampleClear(pAcc^.db, @pAcc^.current);
+  end;
+  {$ENDIF}
   sqlite3DbFree(pAcc^.db, pAcc);
 end;
 
@@ -46887,9 +50657,22 @@ var
   nColUp:  i32;
   n:       u64;
   db:      Pointer;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  mxSample: i32;
+  pSpace:   Pu8;
+  i:        i32;
+  pS:       PStatSample;
+  nEstArg:  i64;
+  {$ENDIF}
 begin
   if argc < 4 then Exit;
   db   := sqlite3_context_db_handle(pCtx);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  if OptimizationEnabled(PTsqlite3(db), SQLITE_Stat4) then
+    mxSample := SQLITE_STAT4_SAMPLES
+  else
+    mxSample := 0;
+  {$ENDIF}
   nCol := sqlite3_value_int(Psqlite3_value(argv^));
   AssertH(nCol > 0, 'statInit: nCol>0');
   nColUp  := nCol;     { sizeof(tRowcnt)==8 here, so nColUp==nCol (analyze.c:421) }
@@ -46898,6 +50681,13 @@ begin
   AssertH(nKeyCol > 0,     'statInit: nKeyCol>0');
 
   n := u64(SizeOf(TStatAccum)) + u64(SizeOf(u64)) * u64(nColUp);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  n := n + u64(SizeOf(u64)) * u64(nColUp);   { current.anEq }
+  if mxSample <> 0 then
+    n := n + u64(SizeOf(u64)) * u64(nColUp)                                          { current.anLt }
+           + u64(SizeOf(TStatSample)) * u64(nCol + mxSample)                         { aBest[], a[] }
+           + u64(SizeOf(u64)) * 3 * u64(nColUp) * u64(nCol + mxSample);              { per-sample anEq/anLt/anDLt }
+  {$ENDIF}
   pAcc := PStatAccum(sqlite3DbMallocZero(db, n));
   if pAcc = nil then
   begin
@@ -46906,7 +50696,12 @@ begin
   end;
 
   pAcc^.db         := db;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  nEstArg          := sqlite3_value_int64(Psqlite3_value((argv + 2)^));
+  pAcc^.nEst       := u64(nEstArg);
+  {$ELSE}
   pAcc^.nEst       := u64(sqlite3_value_int64(Psqlite3_value((argv + 2)^)));
+  {$ENDIF}
   pAcc^.nRow       := 0;
   pAcc^.nLimit     := sqlite3_value_int(Psqlite3_value((argv + 3)^));
   pAcc^.nCol       := nCol;
@@ -46915,22 +50710,195 @@ begin
   { current.anDLt = (tRowcnt*)&p[1] — first byte after the record. }
   pAcc^.current.anDLt := Pointer(PByte(pAcc) + SizeOf(TStatAccum));
 
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  pAcc^.current.anEq := Pointer(PByte(pAcc^.current.anDLt) + SizeOf(u64) * nColUp);
+  if pAcc^.nLimit = 0 then pAcc^.mxSample := mxSample
+  else                     pAcc^.mxSample := 0;
+  if mxSample <> 0 then
+  begin
+    pAcc^.nPSample := u64(pAcc^.nEst div u64(mxSample div 3 + 1) + 1);
+    pAcc^.current.anLt := Pointer(PByte(pAcc^.current.anEq) + SizeOf(u64) * nColUp);
+    pAcc^.iPrn := u32($689e962d) * u32(nCol) xor u32($d0944565) * u32(nEstArg);
+    pAcc^.iGet := -1;
+
+    { Set up a[] and aBest[] arrays.  a[] of size mxSample, aBest[] of size nCol. }
+    pAcc^.a     := PStatSample(PByte(pAcc^.current.anLt) + SizeOf(u64) * nColUp);
+    pAcc^.aBest := PStatSample(PByte(pAcc^.a) + SizeOf(TStatSample) * mxSample);
+    pSpace      := Pu8(PByte(pAcc^.a) + SizeOf(TStatSample) * (mxSample + nCol));
+    for i := 0 to (mxSample + nCol) - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.a) + i * SizeOf(TStatSample));
+      pS^.anEq  := Pointer(pSpace); Inc(pSpace, SizeOf(u64) * nColUp);
+      pS^.anLt  := Pointer(pSpace); Inc(pSpace, SizeOf(u64) * nColUp);
+      pS^.anDLt := Pointer(pSpace); Inc(pSpace, SizeOf(u64) * nColUp);
+    end;
+    for i := 0 to nCol - 1 do
+    begin
+      pS := PStatSample(PByte(pAcc^.aBest) + i * SizeOf(TStatSample));
+      pS^.iCol := i;
+    end;
+  end;
+  {$ENDIF}
+
   { Return the StatAccum pointer as a BLOB.  Only the pointer (the 2nd
     parameter) matters; size is opaque to callers. }
   sqlite3_result_blob(pCtx, pAcc, i32(SizeOf(TStatAccum)),
                       @statAccumDestructor);
 end;
 
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ sampleIsBetterPost — analyze.c:511..525. }
+function sampleIsBetterPost(pAccum: PStatAccum; pNew, pOld: PStatSample): Boolean;
+var i: i32;
+begin
+  for i := pNew^.iCol + 1 to pAccum^.nCol - 1 do
+  begin
+    if pNew^.anEq[i] > pOld^.anEq[i] then Exit(True);
+    if pNew^.anEq[i] < pOld^.anEq[i] then Exit(False);
+  end;
+  Result := pNew^.iHash > pOld^.iHash;
+end;
+
+{ sampleIsBetter — analyze.c:535..552. }
+function sampleIsBetter(pAccum: PStatAccum; pNew, pOld: PStatSample): Boolean;
+var nEqNew, nEqOld: u64;
+begin
+  nEqNew := pNew^.anEq[pNew^.iCol];
+  nEqOld := pOld^.anEq[pOld^.iCol];
+  if nEqNew > nEqOld then Exit(True);
+  if nEqNew = nEqOld then
+  begin
+    if pNew^.iCol < pOld^.iCol then Exit(True);
+    Result := (pNew^.iCol = pOld^.iCol) and sampleIsBetterPost(pAccum, pNew, pOld);
+    Exit;
+  end;
+  Result := False;
+end;
+
+{ sampleAt — index into p->a[i]. }
+function sampleAt(p: PStatAccum; i: i32): PStatSample; inline;
+begin
+  Result := PStatSample(PByte(p^.a) + i * SizeOf(TStatSample));
+end;
+
+function bestAt(p: PStatAccum; i: i32): PStatSample; inline;
+begin
+  Result := PStatSample(PByte(p^.aBest) + i * SizeOf(TStatSample));
+end;
+
+{ sampleInsert — analyze.c:558..640. }
+procedure sampleInsert(p: PStatAccum; pNew: PStatSample; nEqZero: i32);
+label find_new_min;
+var
+  pSample, pOld, pUpgrade, pMin: PStatSample;
+  i, iMin: i32;
+  anEq, anLt, anDLt: ^u64;
+begin
+  pSample := nil;
+
+  if nEqZero > p^.nMaxEqZero then p^.nMaxEqZero := nEqZero;
+  if pNew^.isPSample = 0 then
+  begin
+    pUpgrade := nil;
+    for i := p^.nSample - 1 downto 0 do
+    begin
+      pOld := sampleAt(p, i);
+      if pOld^.anEq[pNew^.iCol] = 0 then
+      begin
+        if pOld^.isPSample <> 0 then Exit;
+        if (pUpgrade = nil) or sampleIsBetter(p, pOld, pUpgrade) then
+          pUpgrade := pOld;
+      end;
+    end;
+    if pUpgrade <> nil then
+    begin
+      pUpgrade^.iCol := pNew^.iCol;
+      pUpgrade^.anEq[pUpgrade^.iCol] := pNew^.anEq[pUpgrade^.iCol];
+      goto find_new_min;
+    end;
+  end;
+
+  { Make room. }
+  if p^.nSample >= p^.mxSample then
+  begin
+    pMin  := sampleAt(p, p^.iMin);
+    anEq  := pMin^.anEq;
+    anLt  := pMin^.anLt;
+    anDLt := pMin^.anDLt;
+    sampleClear(p^.db, pMin);
+    Move(PByte(pMin)[SizeOf(TStatSample)], pMin^,
+         SizeOf(TStatSample) * (p^.nSample - p^.iMin - 1));
+    pSample := sampleAt(p, p^.nSample - 1);
+    pSample^.nRowid := 0;
+    pSample^.anEq   := anEq;
+    pSample^.anDLt  := anDLt;
+    pSample^.anLt   := anLt;
+    p^.nSample := p^.mxSample - 1;
+  end;
+
+  pSample := sampleAt(p, p^.nSample);
+  sampleCopy(p, pSample, pNew);
+  Inc(p^.nSample);
+
+  if nEqZero > 0 then
+    FillChar(pSample^.anEq^, SizeOf(u64) * nEqZero, 0);
+
+find_new_min:
+  if p^.nSample >= p^.mxSample then
+  begin
+    iMin := -1;
+    for i := 0 to p^.mxSample - 1 do
+    begin
+      if sampleAt(p, i)^.isPSample <> 0 then Continue;
+      if (iMin < 0) or sampleIsBetter(p, sampleAt(p, iMin), sampleAt(p, i)) then
+        iMin := i;
+    end;
+    p^.iMin := iMin;
+  end;
+end;
+
+{ samplePushPrevious — analyze.c:650..680. }
+procedure samplePushPrevious(p: PStatAccum; iChng: i32);
+var
+  i, j:  i32;
+  pBest: PStatSample;
+begin
+  for i := p^.nCol - 2 downto iChng do
+  begin
+    pBest := bestAt(p, i);
+    pBest^.anEq[i] := p^.current.anEq[i];
+    if (p^.nSample < p^.mxSample)
+       or sampleIsBetter(p, pBest, sampleAt(p, p^.iMin)) then
+      sampleInsert(p, pBest, i);
+  end;
+  if iChng < p^.nMaxEqZero then
+  begin
+    for i := p^.nSample - 1 downto 0 do
+      for j := iChng to p^.nCol - 1 do
+        if sampleAt(p, i)^.anEq[j] = 0 then
+          sampleAt(p, i)^.anEq[j] := p^.current.anEq[j];
+    p^.nMaxEqZero := iChng;
+  end;
+end;
+{$ENDIF}
+
 { statPushImpl — analyze.c:702..779.  stat_push(P, iChng [,R]).
   Non-STAT4 build: third arg (rowid) is unused.  Updates anDLt[]
   for columns >= iChng on every row except the first, and emits a
-  signal value if the per-loop scan budget is exhausted. }
+  signal value if the per-loop scan budget is exhausted.
+  STAT4 build: also maintains anEq[]/anLt[], rowid blob, periodic
+  samples, and the aBest[] working set. }
 procedure statPushImpl(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pAcc:  PStatAccum;
   iChng: i32;
   i:     i32;
   anDLt: ^u64;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  pVal:  Psqlite3_value;
+  nLt:   u64;
+  pB:    PStatSample;
+  {$ENDIF}
 begin
   if argc < 2 then Exit;
   pAcc  := PStatAccum(sqlite3_value_blob(Psqlite3_value(argv^)));
@@ -46939,13 +50907,62 @@ begin
   AssertH(pAcc^.nCol > 0, 'statPush: nCol>0');
   AssertH(iChng < pAcc^.nCol, 'statPush: iChng<nCol');
 
-  if pAcc^.nRow <> 0 then
+  if pAcc^.nRow = 0 then
   begin
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    for i := 0 to pAcc^.nCol - 1 do
+      pAcc^.current.anEq[i] := 1;
+    {$ENDIF}
+  end else begin
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    if pAcc^.mxSample <> 0 then samplePushPrevious(pAcc, iChng);
+    for i := 0 to iChng - 1 do
+      Inc(pAcc^.current.anEq[i]);
+    {$ENDIF}
     anDLt := pAcc^.current.anDLt;
     for i := iChng to pAcc^.nCol - 1 do
+    begin
       Inc(anDLt[i]);
+      {$IFDEF SQLITE_ENABLE_STAT4}
+      if pAcc^.mxSample <> 0 then
+        pAcc^.current.anLt[i] := pAcc^.current.anLt[i] + pAcc^.current.anEq[i];
+      pAcc^.current.anEq[i] := 1;
+      {$ENDIF}
+    end;
   end;
   Inc(pAcc^.nRow);
+
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  if pAcc^.mxSample <> 0 then
+  begin
+    pVal := Psqlite3_value((argv + 2)^);
+    if sqlite3_value_type(pVal) = SQLITE_INTEGER then
+      sampleSetRowidInt64(pAcc^.db, @pAcc^.current, sqlite3_value_int64(pVal))
+    else
+      sampleSetRowid(pAcc^.db, @pAcc^.current, sqlite3_value_bytes(pVal),
+                     Pu8(sqlite3_value_blob(pVal)));
+    pAcc^.iPrn := pAcc^.iPrn * 1103515245 + 12345;
+    pAcc^.current.iHash := pAcc^.iPrn;
+
+    nLt := pAcc^.current.anLt[pAcc^.nCol - 1];
+    if (nLt div pAcc^.nPSample) <> ((nLt + 1) div pAcc^.nPSample) then
+    begin
+      pAcc^.current.isPSample := 1;
+      pAcc^.current.iCol      := 0;
+      sampleInsert(pAcc, @pAcc^.current, pAcc^.nCol - 1);
+      pAcc^.current.isPSample := 0;
+    end;
+
+    for i := 0 to pAcc^.nCol - 2 do
+    begin
+      pAcc^.current.iCol := i;
+      pB := bestAt(pAcc, i);
+      if (i >= iChng) or sampleIsBetterPost(pAcc, @pAcc^.current, pB) then
+        sampleCopy(pAcc, pB, @pAcc^.current);
+    end;
+    Exit;
+  end;
+  {$ENDIF}
 
   if (pAcc^.nLimit <> 0)
      and (pAcc^.nRow > u64(pAcc^.nLimit) * (u64(pAcc^.nSkipAhead) + 1)) then
@@ -46971,11 +50988,21 @@ var
   iVal:      u64;
   nDistinct: u64;
   nReport:   u64;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  eCall:     i32;
+  pS:        PStatSample;
+  aCnt:      ^u64;
+  {$ENDIF}
 begin
   if argc < 1 then Exit;
   pAcc := PStatAccum(sqlite3_value_blob(Psqlite3_value(argv^)));
   if pAcc = nil then Exit;
 
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  eCall := sqlite3_value_int(Psqlite3_value((argv + 1)^));
+  if eCall = STAT_GET_STAT1 then
+  begin
+  {$ENDIF}
   if pAcc^.nSkipAhead <> 0 then nReport := pAcc^.nEst
   else                          nReport := pAcc^.nRow;
   s := IntToStr(QWord(nReport));
@@ -46988,6 +51015,45 @@ begin
     s := s + ' ' + IntToStr(QWord(iVal));
   end;
   sqlite3_result_text(pCtx, PAnsiChar(s), i32(Length(s)), SQLITE_TRANSIENT);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  end
+  else if eCall = STAT_GET_ROWID then
+  begin
+    if pAcc^.iGet < 0 then
+    begin
+      samplePushPrevious(pAcc, 0);
+      pAcc^.iGet := 0;
+    end;
+    if pAcc^.iGet < pAcc^.nSample then
+    begin
+      pS := sampleAt(pAcc, pAcc^.iGet);
+      if pS^.nRowid = 0 then
+        sqlite3_result_int64(pCtx, pS^.u.iRowid)
+      else
+        sqlite3_result_blob(pCtx, pS^.u.aRowid, i32(pS^.nRowid),
+                            SQLITE_TRANSIENT);
+    end;
+  end
+  else
+  begin
+    aCnt := nil;
+    pS := sampleAt(pAcc, pAcc^.iGet);
+    case eCall of
+      STAT_GET_NEQ: aCnt := pS^.anEq;
+      STAT_GET_NLT: aCnt := pS^.anLt;
+    else
+      aCnt := pS^.anDLt;
+      Inc(pAcc^.iGet);
+    end;
+    s := '';
+    for i := 0 to pAcc^.nCol - 1 do
+    begin
+      if i > 0 then s := s + ' ';
+      s := s + IntToStr(QWord(aCnt[i]));
+    end;
+    sqlite3_result_text(pCtx, PAnsiChar(s), i32(Length(s)), SQLITE_TRANSIENT);
+  end;
+  {$ENDIF}
 end;
 
 var
@@ -47014,12 +51080,12 @@ begin
   aStatFuncs[0].xSFunc    := @statInitImpl;
   aStatFuncs[0].zName     := 'stat_init';
 
-  aStatFuncs[1].nArg      := 2;     { 2+IsStat4; non-STAT4 == 2 }
+  aStatFuncs[1].nArg      := 2 + IsStat4;     { 2+IsStat4; non-STAT4 == 2 }
   aStatFuncs[1].funcFlags := STAT_FUNC_FLAGS;
   aStatFuncs[1].xSFunc    := @statPushImpl;
   aStatFuncs[1].zName     := 'stat_push';
 
-  aStatFuncs[2].nArg      := 1;     { 1+IsStat4; non-STAT4 == 1 }
+  aStatFuncs[2].nArg      := 1 + IsStat4;     { 1+IsStat4; non-STAT4 == 1 }
   aStatFuncs[2].funcFlags := STAT_FUNC_FLAGS;
   aStatFuncs[2].xSFunc    := @statGetImpl;
   aStatFuncs[2].zName     := 'stat_get';
@@ -47041,8 +51107,14 @@ const
   cTabName: array[0..2] of PAnsiChar =
     ('sqlite_stat1', 'sqlite_stat4', 'sqlite_stat3');
   cTabCols: array[0..2] of PAnsiChar =
-    ('tbl,idx,stat', nil, nil);
-  cNToOpen = 1;  { non-STAT4 build }
+    ('tbl,idx,stat',
+     {$IFDEF SQLITE_ENABLE_STAT4} 'tbl,idx,neq,nlt,ndlt,sample', {$ELSE} nil, {$ENDIF}
+     nil);
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  cNToOpen = 2;
+  {$ELSE}
+  cNToOpen = 1;
+  {$ENDIF}
 var
   i:          i32;
   db:         PTsqlite3;
@@ -47116,16 +51188,14 @@ end;
   same xFunc resolution path as any other registered function). }
 procedure callStatGet(pParse: PParse; regStat, iParam, regOut: i32);
 begin
-  { Non-STAT4 path: iParam silenced, see analyze.c:941. }
   AssertH((regOut <> regStat) and (regOut <> regStat + 1),
           'callStatGet: regOut overlap');
-  { Look up stat_get by name (matches sqlite3VdbeAddFunctionCall's
-    eventual lookup against db->aFunc).  Until the StatAccum SQL funcs
-    are registered the resolver returns nil and this becomes a no-op
-    OP_Function with P4=nil — same shape as upstream's PRAGMA-only
-    path. }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  { STAT4: stat_get takes a second integer argument (the J selector). }
+  sqlite3VdbeAddOp2(sqlite3GetVdbe(pParse), OP_Integer, iParam, regStat + 1);
+  {$ENDIF}
   sqlite3AnalyzeFunctions;  { idempotent — guarantees the FuncDef is set up }
-  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1,
+  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1 + IsStat4,
                              @aStatFuncs[2], 0);  { statGetFuncdef }
 end;
 
@@ -47305,14 +51375,6 @@ end;
 
 { STAT_GET_* function selectors (analyze.c:793..797).  Non-STAT4 build
   only references STAT_GET_STAT1; the others land for shape-parity. }
-const
-  STAT_GET_STAT1 = 0;
-  STAT_GET_ROWID = 1;
-  STAT_GET_NEQ   = 2;
-  STAT_GET_NLT   = 3;
-  STAT_GET_NDLT  = 4;
-  IsStat4        = 0;  { non-STAT4 build }
-
 { analyzeOneTable — port of analyze.c:977..1378.  1:1 body (non-STAT4,
   non-PREUPDATE_HOOK build) — emits the per-index OP_OpenRead /
   stat_init / Rewind / next-row distinct-test / stat_push / Next /
@@ -47359,7 +51421,18 @@ var
   uniqNN:       u32;
   azCollPP:     PPAnsiChar;
   j1, j2, j3:   i32;
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  pPk:          PIndex2;
+  pX:           PIndex2;
+  regKey, j, k: i32;
+  regEq, regLt, regDLt, regSample, regCol, regSampleRowid: i32;
+  addrNext, addrIsNull, seekOp, mxCol, nColX: i32;
+  doOnce:       Boolean;
+  {$ENDIF}
 begin
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  doOnce := True;
+  {$ENDIF}
   iMemLocal := iMem;
   iTabLocal := iTab;
   jZeroRows := -1;
@@ -47492,6 +51565,27 @@ begin
       sqlite3DbFree(db, aGotoChng);
     end;
 
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    if OptimizationEnabled(db, SQLITE_Stat4) then
+    begin
+      AssertH(regRowid = regStat + 2, 'analyzeOneTable: regRowid layout (STAT4)');
+      if HasRowid(pTab) then
+        sqlite3VdbeAddOp2(v, OP_IdxRowid, iIdxCur, regRowid)
+      else
+      begin
+        pPk := sqlite3PrimaryKeyIndex(pIdx^.pTable);
+        regKey := sqlite3GetTempRange(pParse, pPk^.nKeyCol);
+        for j := 0 to pPk^.nKeyCol - 1 do
+        begin
+          k := sqlite3TableColumnToIndex(pIdx, Pi16(pPk^.aiColumn)[j]);
+          sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, k, regKey + j);
+          analyzeVdbeCommentIndexWithColumnName(v, pIdx, k);
+        end;
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regKey, pPk^.nKeyCol, regRowid);
+        sqlite3ReleaseTempRange(pParse, regKey, pPk^.nKeyCol);
+      end;
+    end;
+    {$ENDIF}
     {   stat_push(P, regChng, regRowid)
         Next csr ; if !eof goto next_row }
     AssertH(regChng = regStat + 1, 'analyzeOneTable: regChng layout');
@@ -47525,6 +51619,61 @@ begin
     sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
     sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
 
+    {$IFDEF SQLITE_ENABLE_STAT4}
+    { Add entries to the stat4 table (analyze.c:1284..1351). }
+    if OptimizationEnabled(db, SQLITE_Stat4) and (db^.nAnalysisLimit = 0) then
+    begin
+      regEq          := regStat1;
+      regLt          := regStat1 + 1;
+      regDLt         := regStat1 + 2;
+      regSample      := regStat1 + 3;
+      regCol         := regStat1 + 4;
+      regSampleRowid := regCol + nCol;
+      if HasRowid(pTab) then seekOp := OP_NotExists
+      else                   seekOp := OP_NotFound;
+
+      if addrGotoEnd = 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Cast, regStat1, SQLITE_AFF_INTEGER);
+        addrGotoEnd := sqlite3VdbeAddOp1(v, OP_IfNot, regStat1);
+      end;
+
+      if doOnce then
+      begin
+        mxCol := nCol;
+        pX := pTab^.pIndex;
+        while pX <> nil do
+        begin
+          if (not HasRowid(pTab)) and ((pX^.idxFlags and 3) = 2) then
+            nColX := pX^.nKeyCol
+          else
+            nColX := pX^.nColumn;
+          if nColX > mxCol then mxCol := nColX;
+          pX := pX^.pNext;
+        end;
+        sqlite3TouchRegister(pParse, regCol + mxCol);
+        doOnce := False;
+        sqlite3ClearTempRegCache(pParse);
+      end;
+
+      addrNext := sqlite3VdbeCurrentAddr(v);
+      callStatGet(pParse, regStat, STAT_GET_ROWID, regSampleRowid);
+      addrIsNull := sqlite3VdbeAddOp1(v, OP_IsNull, regSampleRowid);
+      callStatGet(pParse, regStat, STAT_GET_NEQ,  regEq);
+      callStatGet(pParse, regStat, STAT_GET_NLT,  regLt);
+      callStatGet(pParse, regStat, STAT_GET_NDLT, regDLt);
+      sqlite3VdbeAddOp4Int(v, seekOp, iTabCur, addrNext, regSampleRowid, 0);
+      for i := 0 to nCol - 1 do
+        sqlite3ExprCodeLoadIndexColumn(pParse, pIdx, iTabCur, i, regCol + i);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regCol, nCol, regSample);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regTabname, 6, regTemp);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur + 1, regNewRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, iStatCur + 1, regTemp, regNewRowid);
+      sqlite3VdbeAddOp2(v, OP_Goto, 1, addrNext);
+      sqlite3VdbeJumpHere(v, addrIsNull);
+    end;
+    {$ENDIF}
+
     { End of analysis }
     if addrGotoEnd <> 0 then sqlite3VdbeJumpHere(v, addrGotoEnd);
 
@@ -47548,10 +51697,31 @@ begin
 end;
 
 procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
+{$IFDEF SQLITE_ENABLE_STAT4}
+var
+  j: i32;
+  pS: PIndexSample;
+{$ENDIF}
 begin
-  { analyze.c:1656 — body is gated under SQLITE_ENABLE_STAT4, off in default
-    upstream build.  The non-STAT4 arm is a no-op (UNUSED_PARAMETER pair),
-    which matches the existing implementation. }
+  { analyze.c:1656..1676 — gated under SQLITE_ENABLE_STAT4. }
+  {$IFDEF SQLITE_ENABLE_STAT4}
+  AssertH(db <> nil, 'DeleteIndexSamples: db<>nil');
+  AssertH(pIdx <> nil, 'DeleteIndexSamples: pIdx<>nil');
+  if pIdx^.aSample <> nil then
+  begin
+    for j := 0 to pIdx^.nSample - 1 do
+    begin
+      pS := PIndexSample(PByte(pIdx^.aSample) + j * SizeOf(TIndexSample));
+      sqlite3DbFree(db, pS^.p);
+    end;
+    sqlite3DbFree(db, pIdx^.aSample);
+  end;
+  if db^.pnBytesFreed = nil then
+  begin
+    pIdx^.nSample := 0;
+    pIdx^.aSample := nil;
+  end;
+  {$ENDIF}
 end;
 
 function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
@@ -47677,7 +51847,7 @@ const
     activate_extensions (CEROD), data_store_directory (Win32),
     lock_proxy_file (LOCKING_STYLE), lock_status / parser_trace / sql_trace
     / stats / vdbe_* (DEBUG/TEST only). }
-  aPragmaName: array[0..65] of TPragmaName = (
+  aPragmaName: array[0..66] of TPragmaName = (
     (zName: 'analysis_limit';            ePragTyp: PragTyp_ANALYSIS_LIMIT;
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'application_id';            ePragTyp: PragTyp_HEADER_VALUE;
@@ -47755,6 +51925,10 @@ const
      mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq;                                  iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'legacy_alter_table';        ePragTyp: PragTyp_FLAG;
      mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_LegacyAlter),
+    { 9.4.divbug.87.048 — pragma.h:411..415 (gated SQLITE_DEBUG||SQLITE_TEST,
+      always-on in this port).  ColNames slot 53 = "database" (mirrors pragCName). }
+    (zName: 'lock_status';               ePragTyp: PragTyp_LOCK_STATUS;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName: 53; nPragCName: 2; iArg: 0),
     (zName: 'locking_mode';              ePragTyp: PragTyp_LOCKING_MODE;
      mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq;                                  iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'max_page_count';            ePragTyp: PragTyp_PAGE_COUNT;
@@ -47918,6 +52092,13 @@ var
   bShowInternal: i32;
   pPragmaId: PToken;
   newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
+  iValPragma: i64; { 9.4.divbug.87.067 — PRAGMA max_page_count=N parse }
+  { 9.4.divbug.36 — PragTyp_JOURNAL_MODE write arm locals
+    (pragma.c:734..771).  eModeJm = resolved PAGER_JOURNALMODE_*,
+    iJm = loop var, zModeJm = candidate name from azJournalModeName[]. }
+  eModeJm:   i32;
+  iJm:       i32;
+  zModeJm:   PAnsiChar;
   { 6.28.6.a — locals for PRAGMA integrity_check / quick_check.  Match
     C var names from pragma.c:1696 (i, j, addr, mxErr, x, pTbls, aRoot,
     cnt, pTab, pIdx, nIdx, isQuick).  Renamed to *Ic suffix where the
@@ -47929,6 +52110,7 @@ var
   iDbIc:      i32;
   nIdxIc:     i32;
   aRootIc:    PPgno;
+  pObjTabIc:  PTable2;
   pTblsIc:    passqlite3util.PHash;
   xIc:        passqlite3util.PHashElem;
   pTabIc:     PTable2;
@@ -47983,6 +52165,11 @@ var
   zModVIc:    PAnsiChar;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
+  { pragma.c:2744..2745 — LOCK_STATUS names (slots 0..4) plus
+    'unknown' (5) and 'closed' (6) for the Pas LOCK_STATUS arm. }
+  azLockName: array[0..6] of PAnsiChar = (
+    'unlocked', 'shared', 'reserved', 'pending', 'exclusive',
+    'unknown',  'closed');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
   { pragma.c:269 — actionName(): map ON DELETE/UPDATE action codes to text.
     Indexed by the FK action byte directly (OE_None=0, OE_Restrict=7,
@@ -48023,6 +52210,13 @@ begin
   end
   else
     iDb := 0;
+  { pragma.c:454..459 — if the temp database is explicitly named, open it
+    now so OP_ReadCookie/OP_Transaction emitted below see a non-nil pBt.
+    Without this `PRAGMA temp.data_version` (and any other temp.* pragma
+    that hits HEADER_VALUE/auto_vacuum/etc.) SIGSEGV in OP_ReadCookie
+    because db^.aDb[1].pBt is nil for :memory: connections that have
+    never had a temp table.  9.4.divbug.69. }
+  if (iDb = 1) and (sqlite3OpenTempDatabase(pParse) <> 0) then Exit;
   SetString(zName, pPragmaId^.z, pPragmaId^.n);
   if pValue <> nil then SetString(zRight, pValue^.z, pValue^.n) else zRight := '';
   { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466).
@@ -48048,6 +52242,18 @@ begin
     LOCKING_MODE / INTEGRITY_CHECK and the constant-default emitters).
     Closing the remaining DiagPragma divergences. }
   pName := pragmaLocate(PAnsiChar(zName));
+
+  { pragma.c:521..524 — make sure the database schema is loaded if the
+    pragma requires it (PragFlg_NeedSchema).  Without this gate the
+    first PRAGMA integrity_check (and any other NeedSchema pragma)
+    issued on a fresh connection runs against an empty pSchema → only
+    the freelist root is walked; subsequent prepares then fail
+    "database schema has changed" because the cookie mismatch is only
+    detected mid-step (corruptC-2.x, divbug.87.006). }
+  if (pName <> nil) and ((pName^.mPragFlg and PragFlg_NeedSchema) <> 0) then
+  begin
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
+  end;
 
   { Register the result column names for pragmas that return results
     (pragma.c:526..531 setPragmaResultColumnNames).  Without this every
@@ -48265,6 +52471,36 @@ begin
       Exit;
     end;
 
+    { pragma.c:2743..2764 — PRAGMA lock_status.  Report each attached db's
+      lock state via sqlite3_file_control(SQLITE_FCNTL_LOCKSTATE).
+      9.4.divbug.87.048 — lock7-1.2 expected "main unlocked temp closed"
+      but got [] because this case arm was missing. }
+    PragTyp_LOCK_STATUS: begin
+      pParse^.nMem := 2;
+      i := 0;
+      while i < db^.nDb do begin
+        if db^.aDb[i].zDbSName = nil then begin
+          Inc(i); continue;
+        end;
+        pBtArg := PBtree(db^.aDb[i].pBt);
+        zType := azLockName[5]; { 'unknown' }
+        if (pBtArg = nil) or (sqlite3BtreePager(pBtArg) = nil) then
+          zType := azLockName[6] { 'closed' }
+        else begin
+          j := 0;
+          sqlite3BtreeEnter(pBtArg);
+          if sqlite3OsFileControl(sqlite3PagerFile(sqlite3BtreePager(pBtArg)),
+              SQLITE_FCNTL_LOCKSTATE, @j) = SQLITE_OK then
+            if (j >= 0) and (j <= 4) then zType := azLockName[j];
+          sqlite3BtreeLeave(pBtArg);
+        end;
+        sqlite3VdbeMultiLoad(v, 1, 'ss',
+          [Pointer(db^.aDb[i].zDbSName), Pointer(zType)]);
+        Inc(i);
+      end;
+      Exit;
+    end;
+
     { pragma.c:1462 — PRAGMA function_list.  Walks both the global built-in
       hash and per-connection db^.aFunc. }
     PragTyp_FUNCTION_LIST: begin
@@ -48351,6 +52587,68 @@ begin
       sqlite3VdbeReusable(v);
       Exit;
     end;
+
+    { pragma.c:2517..2640 — PRAGMA optimize / PRAGMA optimize=MASK.  Minimal
+      port: the full version walks every schema table, consults sqlite_stat1
+      thresholds, and re-runs ANALYZE on tables that drifted by 10x.  This
+      reduced port only emits the read-lock attempt (OP_Transaction on every
+      non-temp attached DB) plus OP_Expire — enough to engage the busy
+      handler when another connection holds an EXCLUSIVE lock, which is the
+      behaviour exercised by busy.test 3.2/3.5/3.7 and the reason the
+      previous silent no-op was a soft divergence (9.4.divbug.21 residual).
+      The 0x02 mask bit in the C body is "perform analysis"; without zRight
+      we default to opMask=0xfffe matching pragma.c:2536. }
+    { pragma.c:624..643 — PRAGMA [schema.]secure_delete[=BOOL|FAST].
+      Read returns current BTS_FAST_SECURE >> BTS_SECURE_DELETE bit pair
+      (0=off, 1=on, 2=fast); write toggles BTS_SECURE_DELETE/BTS_OVERWRITE
+      via sqlite3BtreeSecureDelete.  When no schema prefix is given the
+      write propagates to every attached pBt (so PRAGMA secure_delete=ON
+      affects db2 too — securedel-1.3..1.6).  9.4.divbug.87.066. }
+    PragTyp_SECURE_DELETE: begin
+      iVal := -1;  { b in C oracle — sentinel "read only" }
+      if zRight <> '' then begin
+        if sqlite3_stricmp(PChar(zRight), 'fast') = 0 then
+          iVal := 2
+        else
+          iVal := sqlite3GetBoolean(PChar(zRight), 0);
+      end;
+      if ((pId2 = nil) or (pId2^.n = 0)) and (iVal >= 0) then begin
+        for i := 0 to db^.nDb - 1 do
+          sqlite3BtreeSecureDelete(PBtree(db^.aDb[i].pBt), iVal);
+      end;
+      iVal := sqlite3BtreeSecureDelete(PBtree(db^.aDb[iDb].pBt), iVal);
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+      sqlite3VdbeReusable(v);
+      Exit;
+    end;
+
+    PragTyp_OPTIMIZE: begin
+      if zRight <> '' then begin
+        iVal := sqlite3Atoi(PChar(zRight));
+        if (iVal and $02) = 0 then begin
+          Exit;
+        end;
+      end;
+      { Schema verification on every non-temp attached database forces a
+        shared read lock on each pBt (sqlite3CodeVerifySchema → OP_Transaction
+        P2=0).  We then upgrade with sqlite3BeginWriteOperation so that the
+        eventual ANALYZE re-run would have its write lock — engaging the
+        busy handler when another connection holds either an EXCLUSIVE lock
+        (busy-3.2) or merely a SHARED read lock that blocks the write
+        upgrade (busy-3.5/3.7).  The full C body (pragma.c:2549..2622) walks
+        sqlite_stat1 thresholds per table and emits OP_SqlExec("ANALYZE …")
+        — not yet ported; this reduced arm covers the busy-handler
+        engagement that the original silent no-op was missing
+        (9.4.divbug.21 residual). }
+      for i := 0 to db^.nDb - 1 do begin
+        if i = 1 then Continue;  { skip TEMP (no on-disk lock) }
+        sqlite3CodeVerifySchema(pParse, i);
+        sqlite3BeginWriteOperation(pParse, 0, i);
+      end;
+      sqlite3VdbeAddOp0(v, OP_Expire);
+      Exit;
+    end;
   end;
 
   { PragTyp_FLAG — pragma.c (generic boolean-flag arm).  Read emits
@@ -48387,16 +52685,22 @@ begin
     application_id is iCookie=BTREE_APPLICATION_ID, data_version is
     iCookie=BTREE_DATA_VERSION (virtual meta-value, ReadOnly). }
   if SameText(zName, 'user_version') or SameText(zName, 'application_id')
-     or SameText(zName, 'data_version') then
+     or SameText(zName, 'data_version') or SameText(zName, 'freelist_count')
+     or SameText(zName, 'schema_version') then
   begin
     if SameText(zName, 'user_version') then
       iCookie := BTREE_USER_VERSION
     else if SameText(zName, 'data_version') then
       iCookie := BTREE_DATA_VERSION
+    else if SameText(zName, 'freelist_count') then
+      iCookie := BTREE_FREE_PAGE_COUNT
+    else if SameText(zName, 'schema_version') then
+      iCookie := BTREE_SCHEMA_VERSION
     else
       iCookie := BTREE_APPLICATION_ID;
     sqlite3VdbeUsesBtree(v, iDb);
-    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION) then begin
+    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION)
+       and (iCookie <> BTREE_FREE_PAGE_COUNT) then begin
       { Write arm — Transaction(write) + SetCookie(P5=1).  data_version
         is ReadOnly per pragma.h flags so writes silently no-op. }
       SetString(zRight, pValue^.z, pValue^.n);
@@ -48405,8 +52709,14 @@ begin
                                   sqlite3Atoi(PChar(zRight)));
       sqlite3VdbeChangeP5(v, 1);
       if addrOp = 0 then ;
-    end else if pValue = nil then begin
-      { Read arm. }
+    end else begin
+      { Read arm.  C's pragma.c:2326..2362 gates the write arm on
+        `zRight && (mPragFlg & PragFlg_ReadOnly)==0` then falls through
+        to the read arm for the ReadOnly case (data_version, freelist_count)
+        even when a value was supplied (silent no-op write + return the
+        cookie).  Without falling through, `PRAGMA data_version=1234;
+        PRAGMA data_version;` returned `[1]` instead of `[1 1]` — pragma3-102
+        (9.4.divbug.69). }
       sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
       sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, iCookie);
       sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
@@ -48465,6 +52775,16 @@ begin
     Exit;
   end;
 
+  { PragTyp_CASE_SENSITIVE_LIKE (pragma.c:1654..1664).  Reinstall the
+    per-connection 'like' shim with the requested case-sensitivity.  No
+    result row is emitted (write-only pragma, like_match_blob etc.).
+    9.4.divbug.56 — like-1.5.2 expected only 'abc' but got both 'ABC abc'
+    because PRAGMA case_sensitive_like=on was a silent no-op. }
+  if SameText(zName, 'case_sensitive_like') and (pValue <> nil) then begin
+    sqlite3RegisterLikeFunctions(db, sqlite3GetBoolean(PChar(zRight), 0));
+    Exit;
+  end;
+
   { PragTyp_AUTO_VACUUM read arm (pragma.c:801).  Calls into the btree
     layer which reads pBt^.autoVacuum / pBt^.incrVacuum (populated from
     page-1 header meta[4]/meta[7] in lockBtree).  Returns 0=NONE,
@@ -48502,16 +52822,27 @@ begin
     Exit;
   end;
 
-  { PragTyp_PAGE_SIZE read arm (pragma.c:598).  Page size is fixed at
-    open time so capture at codegen via sqlite3BtreeGetPageSize. }
-  if SameText(zName, 'page_size') and (pValue = nil) then begin
+  { PragTyp_PAGE_SIZE (pragma.c:598).  Read arm: page size is fixed at
+    open time so capture at codegen via sqlite3BtreeGetPageSize.  Write
+    arm: stash in db^.nextPagesize and call sqlite3BtreeSetPageSize —
+    the btree honours the new size only if BTS_PAGESIZE_FIXED is unset
+    (i.e. before the first write materialises the header). }
+  if SameText(zName, 'page_size') then begin
     pBtArg := PBtree(db^.aDb[iDb].pBt);
-    if pBtArg <> nil then
-      iVal := sqlite3BtreeGetPageSize(pBtArg)
-    else
-      iVal := 0;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Assert(pBtArg <> nil);
+    if pValue = nil then begin
+      if pBtArg <> nil then
+        iVal := sqlite3BtreeGetPageSize(pBtArg)
+      else
+        iVal := 0;
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    end else begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      db^.nextPagesize := sqlite3Atoi(PChar(zRight));
+      if SQLITE_NOMEM = sqlite3BtreeSetPageSize(pBtArg, db^.nextPagesize, 0, 0) then
+        sqlite3OomFault(db);
+    end;
     Exit;
   end;
 
@@ -48566,6 +52897,70 @@ begin
     Exit;
   end;
 
+  { PragTyp_BUSY_TIMEOUT (pragma.c:2651..2657).  Write arm calls
+    sqlite3_busy_timeout(db, atoi(zRight)) at compile time, then both
+    arms emit OP_Integer db->busyTimeout / OP_ResultRow.  9.4.divbug.87.047
+    — lock-2.8b / lock-2.11b expected the sqlite3_busy_timeout() Tcl-API
+    setter (db^.busyTimeout) to be visible to PRAGMA busy_timeout. }
+  if SameText(zName, 'busy_timeout') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if Assigned(gBusyTimeout) then
+        gBusyTimeout(db, sqlite3Atoi(PChar(zRight)))
+      else
+        db^.busyTimeout := sqlite3Atoi(PChar(zRight));
+    end;
+    sqlite3VdbeAddOp2(v, OP_Integer,   db^.busyTimeout, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
+  { PragTyp_WAL_CHECKPOINT (pragma.c:2393..2411).  9.4.divbug.88.064.
+    Without this arm the pragma compiled to a no-op so OP_Checkpoint
+    was never emitted; resolveP2Values then left Vdbe.readOnly = 1 and
+    sqlite3_stmt_readonly("PRAGMA wal_checkpoint") returned 1 instead
+    of 0 (capi3d-2.7 / capi3d-2.7.explain / capi3d-2.7.eqp). }
+  if SameText(zName, 'wal_checkpoint') then begin
+    if (pId2 <> nil) and (pId2^.z <> nil) and (pId2^.n > 0) then
+      iVal := iDb
+    else
+      iVal := SQLITE_MAX_ATTACHED + 2; { SQLITE_MAX_DB_INTERNAL — inlined to avoid main uses cycle. }
+    eModeJm := 0; { SQLITE_CHECKPOINT_PASSIVE }
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if      sqlite3StrICmp(PAnsiChar(zRight), 'full')     = 0 then eModeJm := 1  { _FULL }
+      else if sqlite3StrICmp(PAnsiChar(zRight), 'restart')  = 0 then eModeJm := 2  { _RESTART }
+      else if sqlite3StrICmp(PAnsiChar(zRight), 'truncate') = 0 then eModeJm := 3  { _TRUNCATE }
+      else if sqlite3StrICmp(PAnsiChar(zRight), 'noop')     = 0 then eModeJm := -1; { _NOOP }
+    end;
+    pParse^.nMem := 3;
+    sqlite3VdbeAddOp3(v, OP_Checkpoint, iVal, eModeJm, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 3);
+    Exit;
+  end;
+
+  { PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429).  Write arm calls
+    sqlite3_wal_autocheckpoint(db, atoi(zRight)) at compile time, which
+    installs sqlite3WalDefaultHook (positive N) or clears the hook (N<=0).
+    Both arms emit returnSingleInt(v, db->xWalCallback==sqlite3WalDefaultHook
+    ? PTR_TO_INT(db->pWalArg) : 0).  9.4.divbug.37: prior fall-through into
+    the constant-default block ignored writes, so `PRAGMA wal_autocheckpoint
+    = N` failed to overwrite a user-installed wal_hook (e_walhook-6.1.2). }
+  if SameText(zName, 'wal_autocheckpoint') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if Assigned(gWalAutoCheckpoint) then
+        gWalAutoCheckpoint(db, sqlite3Atoi(PChar(zRight)));
+    end;
+    if (gWalDefaultHook <> nil) and (db^.xWalCallback = gWalDefaultHook) then
+      iVal := i32(PtrUInt(db^.pWalArg))
+    else
+      iVal := 0;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -48573,17 +52968,12 @@ begin
     not preserved), matching the pre-port behaviour. }
   if pValue = nil then begin
     iVal := MaxInt; { sentinel "not handled" }
-    if      SameText(zName, 'secure_delete')      then iVal := 0
-    else if SameText(zName, 'temp_store')         then iVal := 0
+    if      SameText(zName, 'temp_store')         then iVal := 0
     else if SameText(zName, 'threads')            then iVal := 0
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
-    else if SameText(zName, 'busy_timeout')       then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0
-    else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
     else if SameText(zName, 'journal_size_limit') then iVal := -1
-    else if SameText(zName, 'freelist_count')     then iVal := 0
-    else if SameText(zName, 'schema_version')     then iVal := 0
     { pragma.c:951..978 PragTyp_MMAP_SIZE — when SQLITE_MAX_MMAP_SIZE<=0
       sz=0 and returnSingleInt(v, 0).  The Pas port does not yet wire
       sqlite3_file_control(SQLITE_FCNTL_MMAP_SIZE) so default to 0,
@@ -48597,13 +52987,27 @@ begin
     end;
   end;
 
-  { max_page_count default — pragma.c:1042.  OP_MaxPgcnt with P3=0 reads
-    the current limit (default 4294967294 = 0xFFFFFFFE on a fresh memory
-    db).  Yields i64 in result Mem so column_int truncates to -2 and
-    column_text renders "4294967294" via %lld — matching the C oracle. }
-  if SameText(zName, 'max_page_count') and (pValue = nil) then begin
+  { max_page_count — pragma.c:663..681 (PragTyp_PAGE_COUNT, 'm' branch).
+    Read form (pValue=nil): OP_MaxPgcnt with P3=0 reads the current limit
+    (default 4294967294 = 0xFFFFFFFE on a fresh memory db); yields i64 in
+    result Mem so column_int truncates to -2 and column_text renders
+    "4294967294" via %lld — matching the C oracle.
+    Write form (9.4.divbug.87.067): clamp the requested N to [0..0xFFFFFFFE]
+    via sqlite3DecOrHexToI64 and pass as P3 to OP_MaxPgcnt — without this the
+    write was a silent no-op so `PRAGMA max_page_count=40` never installed the
+    pager mxPgno cap and disk-full enforcement (tkt2920) was disabled. }
+  if SameText(zName, 'max_page_count') then begin
     sqlite3CodeVerifySchema(pParse, iDb);
-    sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma) = 0 then begin
+        if iValPragma < 0 then iValPragma := 0
+        else if iValPragma > i64($FFFFFFFE) then iValPragma := i64($FFFFFFFE);
+      end else
+        iValPragma := 0;
+      sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, i32(iValPragma));
+    end else
+      sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
@@ -48627,20 +53031,50 @@ begin
     always end with `OP_ResultRow` carrying the (possibly updated) current
     mode (pragma.c:770 / pragma.c:725). }
   if SameText(zName, 'journal_mode') then begin
-    { pragma.c:734..771 — emit the *current* journal mode name from the
-      attached pager.  On an in-memory DB this is "memory"; on an on-disk
-      DB the default is "delete".  Previously the Pas port hard-coded
-      "memory" which diverged from the C oracle on file-backed corpora
-      (Phase 9.1.divbug.2).  We do not yet port the OP_JournalMode opcode
-      so the mode-switch arm of zRight is still a silent no-op; reads now
-      reflect reality, which is what TestSQLCorpus exercises. }
-    pBtArg := PBtree(db^.aDb[iDb].pBt);
-    if pBtArg <> nil then
-      sqlite3VdbeLoadString(v, 1,
-        PChar(AnsiString(sqlite3JournalModename(
-          sqlite3PagerGetJournalMode(sqlite3BtreePager(pBtArg))))))
-    else
-      sqlite3VdbeLoadString(v, 1, 'memory');
+    { pragma.c:734..771 PragTyp_JOURNAL_MODE — faithful port.  Resolves
+      the requested mode (or PAGER_JOURNALMODE_QUERY for read form), then
+      emits one OP_JournalMode per affected attached DB and a final
+      ResultRow carrying the resulting mode (reg 1).  9.4.divbug.36:
+      previously the write arm was a silent no-op so
+      `PRAGMA journal_mode=off` was ignored. }
+    if (pValue <> nil) and (Length(zRight) > 0) then begin
+      { Walk azJournalModeName[] looking for a case-insensitive prefix
+        match — pragma.c:744..747. }
+      eModeJm := PAGER_JOURNALMODE_QUERY;
+      iJm := 0;
+      while True do begin
+        zModeJm := sqlite3JournalModename(iJm);
+        if zModeJm = nil then Break;
+        if sqlite3_strnicmp(PChar(zRight), PChar(zModeJm),
+                            Length(zRight)) = 0 then begin
+          eModeJm := iJm;
+          Break;
+        end;
+        Inc(iJm);
+      end;
+      { pragma.c:753..757 — defensive mode rejects "off". }
+      if (eModeJm = PAGER_JOURNALMODE_OFF)
+         and ((db^.flags and u64($10000000)) <> 0) then { SQLITE_Defensive }
+        eModeJm := PAGER_JOURNALMODE_QUERY;
+    end else
+      eModeJm := PAGER_JOURNALMODE_QUERY;
+
+    { pragma.c:759..763 — bare "PRAGMA journal_mode" without schema
+      qualifier maps to main.journal_mode. }
+    if (eModeJm = PAGER_JOURNALMODE_QUERY)
+       and ((pId2 = nil) or (pId2^.n = 0)) then
+      iDb := 0;
+
+    { pragma.c:764..769 — emit OP_JournalMode for the selected DB(s).
+      When pId2 is empty, all attached DBs get touched (reverse order
+      so reg 1 ends up holding main's mode for the ResultRow). }
+    for iJm := db^.nDb - 1 downto 0 do begin
+      if (db^.aDb[iJm].pBt <> nil)
+         and ((iJm = iDb) or (pId2 = nil) or (pId2^.n = 0)) then begin
+        sqlite3VdbeUsesBtree(v, iJm);
+        sqlite3VdbeAddOp3(v, OP_JournalMode, iJm, 1, eModeJm);
+      end;
+    end;
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
@@ -48696,15 +53130,28 @@ begin
       table-name branch — tracked as a follow-up).  Default 100 from
       SQLITE_INTEGRITY_CHECK_ERROR_MAX. }
     mxErrIc := 100;
+    pObjTabIc := nil;
     if (pValue <> nil) and (Length(zRight) > 0) then
     begin
       if sqlite3GetInt32(PAnsiChar(zRight), @mxErrIc) <> 0 then
       begin
         if mxErrIc <= 0 then mxErrIc := 100;
+      end
+      else
+      begin
+        { pragma.c:1725..1728 — non-integer argument is a table name:
+          restrict the integrity_check to that single table.  Without
+          this, divbug.71.b: `PRAGMA quick_check('t1')` walked every
+          table; on writable_schema-remapped rootpages btree reported
+          "2nd reference to page" / "never used" diagnostics that
+          should have been suppressed.  Use iDb hint when explicit. }
+        if iDb >= 0 then
+          pObjTabIc := sqlite3LocateTable(pParse, 0,
+            PAnsiChar(zRight), db^.aDb[iDb].zDbSName)
+        else
+          pObjTabIc := sqlite3LocateTable(pParse, 0,
+            PAnsiChar(zRight), nil);
       end;
-      { else branch — pObjTab via sqlite3LocateTable — not yet ported.
-        Without a real pObjTab the walk simply covers every table, which
-        is a superset; on clean DBs this still emits "ok". }
     end;
 
     { pragma.c:1729 — reg[1] holds errors-left counter (mxErr-1 because
@@ -48734,7 +53181,8 @@ begin
         pTabIc := PTable2(xIc^.data);
         { tableSkipIntegrityCheck (pragma.c:402): with pObjTab=NULL the
           only skip predicate is TF_Imposter. }
-        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0) then
+        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0)
+           and ((pObjTabIc = nil) or (pTabIc = pObjTabIc)) then
         begin
           if HasRowid(pTabIc) then Inc(cntIc);
           pIdxIc := pTabIc^.pIndex;
@@ -48755,16 +53203,33 @@ begin
         10727), unlike C VDBE which passes &aRoot[1].  So we lay out
         the array as plain [root0..rootN-1] with no leading count
         sentinel — btree.pas then sees aRoot[0]=firstRoot (non-zero,
-        bPartial=0) which matches a full check.  Lifetime is owned by
-        the VDBE via P4_INTARRAY. }
-      aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc)));
+        bPartial=0) which matches a full check.
+
+        divbug.71.b: when pObjTab restricts the walk to one table, we
+        must signal a "partial" check so btree.pas does not flag the
+        unlisted rootpages as "never used".  C does this by prepending
+        an aRoot[0]==0 sentinel (pragma.c:1763, btree.c:11148..11151);
+        we do the same here — alloc cnt+1 cells, write 0 at index 0,
+        fill roots from index 1, and pass nRoot=cnt+1 to OP_IntegrityCk.
+        Lifetime is owned by the VDBE via P4_INTARRAY. }
+      if pObjTabIc <> nil then
+        aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc + 1)))
+      else
+        aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc)));
       if aRootIc = nil then Break;
-      cntIc := 0;
+      if pObjTabIc <> nil then
+      begin
+        aRootIc[0] := 0;
+        cntIc := 1;     { fill subsequent roots starting at index 1 }
+      end
+      else
+        cntIc := 0;
       xIc := pTblsIc^.first;
       while xIc <> nil do
       begin
         pTabIc := PTable2(xIc^.data);
-        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0) then
+        if (pTabIc <> nil) and ((pTabIc^.tabFlags and u32($00020000)) = 0)
+           and ((pObjTabIc = nil) or (pTabIc = pObjTabIc)) then
         begin
           if HasRowid(pTabIc) then
           begin
@@ -48837,7 +53302,8 @@ begin
       while xIc <> nil do
       begin
         pTabIc := PTable2(xIc^.data);
-        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0) then
+        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0)
+           or ((pObjTabIc <> nil) and (pTabIc <> pObjTabIc)) then
         begin xIc := xIc^.next; Continue; end;
         if HasRowid(pTabIc) then
         begin
@@ -48876,7 +53342,8 @@ begin
       while xIc <> nil do
       begin
         pTabIc := PTable2(xIc^.data);
-        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0) then
+        if (pTabIc = nil) or ((pTabIc^.tabFlags and u32($00020000)) <> 0)
+           or ((pObjTabIc <> nil) and (pTabIc <> pObjTabIc)) then
         begin xIc := xIc^.next; Continue; end;
         if pTabIc^.eTabType <> TABTYP_NORM then
         begin xIc := xIc^.next; Continue; end;
@@ -49227,6 +53694,8 @@ begin
         { tableSkipIntegrityCheck (pragma.c:402) with pObjTab=NULL —
           TF_Imposter ($00020000) is the only skip predicate here. }
         if (pTabIc^.tabFlags and u32($00020000)) <> 0 then
+        begin xIc := xIc^.next; Continue; end;
+        if (pObjTabIc <> nil) and (pTabIc <> pObjTabIc) then
         begin xIc := xIc^.next; Continue; end;
         if pTabIc^.eTabType = TABTYP_NORM then
         begin xIc := xIc^.next; Continue; end;          { IsOrdinaryTable }
@@ -49923,6 +54392,11 @@ begin
   if p = nil then begin
     zErr := 'no such collation sequence: ' + AnsiString(zName);
     sqlite3ErrorMsg(pParse, PAnsiChar(zErr));
+    { callback.c:231 — distinguish missing-collation errors from generic
+      SQLITE_ERROR so build.c:5674's KeyInfoOfIndex assertion holds and
+      so the extended-rc surfaces as SQLITE_ERROR_MISSING_COLLSEQ (257)
+      at the API boundary. }
+    pParse^.rc := SQLITE_ERROR_MISSING_COLLSEQ;
   end;
   Result := p;
 end;
@@ -49952,14 +54426,24 @@ end;
 
 function sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
 var
-  db:  PTsqlite3;
-  enc: u8;
-  p:   PTCollSeq;
+  db:       PTsqlite3;
+  enc:      u8;
+  initbusy: u8;
+  p:        PTCollSeq;
 begin
-  db  := pParse^.db;
-  enc := db^.enc;
-  p   := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 1));
-  if (p <> nil) and (p^.xCmp = nil) then
+  { Faithful port of callback.c:256..268.  During schema load (init.busy=1)
+    we MUST NOT report a missing collation as an error — the inner CREATE
+    TABLE re-parse would otherwise fail, sqlite3InitCallback routes the
+    failure through corruptSchema → SQLITE_CORRUPT → "database disk image
+    is malformed".  Instead, allocate a placeholder CollSeq via
+    sqlite3FindCollSeq(create=initbusy) and let the runtime path
+    (init.busy=0) report "no such collation sequence: …" via
+    sqlite3GetCollSeq when the table is actually used (9.4.divbug.31). }
+  db       := pParse^.db;
+  enc      := db^.enc;
+  initbusy := db^.init.busy;
+  p        := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, initbusy));
+  if (initbusy = 0) and ((p = nil) or (p^.xCmp = nil)) then
     p := PTCollSeq(sqlite3GetCollSeq(pParse, enc, p, zName));
   Result := p;
 end;
@@ -50118,57 +54602,107 @@ begin
     matches default-build behaviour exactly until then. }
 end;
 
-{ sqlite3CreateFunc — register a user-defined SQL function. }
+{ sqlite3CreateFunc — register a user-defined SQL function.  Faithful port
+  of main.c:1931..2057.  Honours SQLITE_ANY (registers three encodings),
+  the "delete non-existent function is a no-op" gate, and the active-VM
+  busy/expire arm. }
 function sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
   nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
   xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
   pDestructor: Pointer): i32;
 var
-  p: PTFuncDef;
-  encByte: u8;
-  pDest: PTFuncDestructor;
+  p:        PTFuncDef;
+  extraFlags: u32;
+  encMasked: i32;
+  rc:       i32;
+  pDest:    PTFuncDestructor;
+const
+  SQLITE_FUNC_UNSAFE_LOCAL = $00040000;  { SQLITE_FUNC_UNSAFE bit, see sqliteInt.h }
 begin
-  if (zFunctionName = nil) or (nArg < -1) or (nArg > SQLITE_MAX_FUNCTION_ARG) then begin
+  { main.c:1949..1957 — argument validation. }
+  if (zFunctionName = nil)
+     or ((xSFunc <> nil) and (xFinal <> nil))
+     or ((xFinal = nil) <> (xStep = nil))
+     or ((xValue = nil) <> (xInverse = nil))
+     or (nArg < -1) or (nArg > SQLITE_MAX_FUNCTION_ARG)
+     or (sqlite3Strlen30(zFunctionName) > 255) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  { Strip flags from enc; keep only encoding bits }
-  encByte := u8(enc and $03);
-  if encByte = 0 then encByte := SQLITE_UTF8;
-  p := sqlite3FindFunction(db, zFunctionName, nArg, encByte, 1);
-  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  { Clear old destructor if any }
-  if (p^.funcFlags and SQLITE_FUNC_EPHEM) = 0 then begin
-    pDest := PTFuncDestructor(p^.u);
-    if pDest <> nil then begin
-      Dec(pDest^.nRef);
-      if pDest^.nRef = 0 then begin
-        pDest^.xDestroy(pDest^.pUserData);
-        sqlite3DbFree(db, pDest);
-      end;
+
+  { main.c:1961..1964 — split extraFlags off encoding. }
+  extraFlags := u32(enc) and (SQLITE_DETERMINISTIC or SQLITE_DIRECTONLY or
+                              SQLITE_SUBTYPE or SQLITE_INNOCUOUS);
+  encMasked  := enc and (SQLITE_FUNC_ENCMASK or SQLITE_ANY);
+
+  { main.c:1969 — INNOCUOUS bit is inverted vs FUNC_UNSAFE. }
+  extraFlags := extraFlags xor SQLITE_FUNC_UNSAFE_LOCAL;
+
+  { main.c:1980..2007 — encoding normalisation; SQLITE_ANY expands into
+    three recursive registrations.  SQLITE_UTF16 maps to NATIVE. }
+  case encMasked of
+    SQLITE_UTF16: encMasked := SQLITE_UTF16NATIVE;
+    SQLITE_ANY: begin
+      rc := sqlite3CreateFunc(db, zFunctionName, nArg,
+              i32((u32(SQLITE_UTF8) or extraFlags) xor SQLITE_FUNC_UNSAFE_LOCAL),
+              pUserData, xSFunc, xStep, xFinal, xValue, xInverse, pDestructor);
+      if rc = SQLITE_OK then
+        rc := sqlite3CreateFunc(db, zFunctionName, nArg,
+                i32((u32(SQLITE_UTF16LE) or extraFlags) xor SQLITE_FUNC_UNSAFE_LOCAL),
+                pUserData, xSFunc, xStep, xFinal, xValue, xInverse, pDestructor);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      encMasked := SQLITE_UTF16BE;
     end;
-  end;
-  p^.funcFlags  := u32(enc and (SQLITE_DETERMINISTIC or
-                    SQLITE_DIRECTONLY or SQLITE_SUBTYPE or SQLITE_INNOCUOUS));
-  p^.funcFlags  := p^.funcFlags or encByte;
-  p^.pUserData  := pUserData;
-  { main.c:2050 — `p->xSFunc = xSFunc ? xSFunc : xStep;`.  The xStep
-    fallback is what makes aggregate-only registrations findable at
-    runtime: sqlite3FindFunction only returns a hit when xSFunc<>nil
-    (codegen.pas:42378). }
-  if xSFunc <> nil then
-    p^.xSFunc   := TxSFuncProc(xSFunc)
+    SQLITE_UTF8, SQLITE_UTF16LE, SQLITE_UTF16BE: ;
   else
-    p^.xSFunc   := TxSFuncProc(xStep);
-  p^.xFinalize  := TxFinalProc(xFinal);
-  p^.xValue     := TxValueProc(xValue);
-  p^.xInverse   := TxInverseProc(xInverse);
-  p^.nArg       := i16(nArg);
-  if pDestructor <> nil then begin
-    pDest := PTFuncDestructor(pDestructor);
-    Inc(pDest^.nRef);
-    p^.u := pDest;
-  end else
+    encMasked := SQLITE_UTF8;
+  end;
+
+  { main.c:2017..2031 — replace-or-delete gate. }
+  p := sqlite3FindFunction(db, zFunctionName, nArg, u8(encMasked), 0);
+  if (p <> nil)
+     and ((p^.funcFlags and SQLITE_FUNC_ENCMASK) = u32(encMasked))
+     and (p^.nArg = i16(nArg)) then begin
+    if db^.nVdbeActive <> 0 then begin
+      sqlite3ErrorWithMsg(db, SQLITE_BUSY,
+        'unable to delete/modify user-function due to active statements');
+      Result := SQLITE_BUSY; Exit;
+    end else begin
+      sqlite3ExpirePreparedStatements(db, 0);
+    end;
+  end else if (xSFunc = nil) and (xFinal = nil) then begin
+    { Trying to delete a function that does not exist.  main.c:2027..2030. }
+    Result := SQLITE_OK; Exit;
+  end;
+
+  p := sqlite3FindFunction(db, zFunctionName, nArg, u8(encMasked), 1);
+  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+  { main.c:2041 functionDestroy — fire prior destructor if its refcount
+    reaches zero.  Only applies when this slot was previously populated. }
+  pDest := PTFuncDestructor(p^.u);
+  if pDest <> nil then begin
+    Dec(pDest^.nRef);
+    if pDest^.nRef = 0 then begin
+      pDest^.xDestroy(pDest^.pUserData);
+      sqlite3DbFree(db, pDest);
+    end;
     p^.u := nil;
+  end;
+
+  if pDestructor <> nil then begin
+    Inc(PTFuncDestructor(pDestructor)^.nRef);
+  end;
+  p^.u := pDestructor;
+  p^.funcFlags := (p^.funcFlags and SQLITE_FUNC_ENCMASK) or extraFlags;
+  if xSFunc <> nil then
+    p^.xSFunc := TxSFuncProc(xSFunc)
+  else
+    p^.xSFunc := TxSFuncProc(xStep);
+  p^.xFinalize := TxFinalProc(xFinal);
+  p^.xValue    := TxValueProc(xValue);
+  p^.xInverse  := TxInverseProc(xInverse);
+  p^.pUserData := pUserData;
+  p^.nArg      := i16(nArg);
   Result := SQLITE_OK;
 end;
 
@@ -50633,6 +55167,17 @@ begin
   end;
 end;
 
+{ subtype(X) — func.c:100..111.  Returns the subtype byte of the argument
+  (0 if no subtype set).  Registered with SQLITE_FUNC_TYPEOF|SQLITE_SUBTYPE
+  so the planner does not optimise it out (FUNC_TYPEOF) and the resolver
+  propagates the source value's subtype across the call (SUBTYPE).
+  9.4.divbug.52. }
+procedure subtypeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  sqlite3_result_int(pCtx,
+    i32(sqlite3_value_subtype(Psqlite3_value(argv^))));
+end;
+
 procedure octetLengthFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pVal: PMem;
@@ -51058,54 +55603,111 @@ begin
 end;
 
 procedure trimFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+{ 1:1 port of func.c:1569..1648 (trimFunc).  Splits zCharSet into UTF-8
+  characters via SQLITE_SKIP_UTF8 (lead byte >= 0xc0 → skip continuation
+  bytes 0x80..0xBF) and then trims by multi-byte character match, not by
+  individual bytes.  Function side (left/right/both) is selected from the
+  registered pUserData (1=ltrim, 2=rtrim, 3=trim). }
 var
-  z, zChars: PAnsiChar;
-  n, nChars, i, j, start, stop: i32;
-  doLeft, doRight: Boolean;
-  matched: Boolean;
-  pFd: PTFuncDef;
+  zIn:      PAnsiChar;            { input string }
+  zCharSet: PAnsiChar;            { set of characters to trim }
+  nIn:      u32;
+  flags:    i32;
+  i:        i32;
+  aLen:     PUInt32;              { length of each char in zCharSet }
+  azChar:   PPAnsiChar;           { individual chars in zCharSet }
+  nChar:    i32;
+  z, zSav:  PAnsiChar;
+  len:      u32;
+  blockSz:  PtrInt;
+  pFd:      PTFuncDef;
+  staticLenOne: u32;
+  staticAzOne:  PAnsiChar;
 begin
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
-  z := sqlite3_value_text(Psqlite3_value(argv^));
-  n := sqlite3_value_bytes(Psqlite3_value(argv^));
-  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
-  if argc >= 2 then begin
-    zChars := sqlite3_value_text(Psqlite3_value((argv+1)^));
-    nChars := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
-    if zChars = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  aLen := nil;
+  azChar := nil;
+  zCharSet := nil;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  zIn := sqlite3_value_text(Psqlite3_value(argv^));
+  if zIn = nil then Exit;
+  nIn := u32(sqlite3_value_bytes(Psqlite3_value(argv^)));
+  if argc = 1 then begin
+    staticLenOne := 1;
+    staticAzOne  := PAnsiChar(' ');
+    nChar  := 1;
+    aLen   := @staticLenOne;
+    azChar := @staticAzOne;
+    zCharSet := nil;
   end else begin
-    zChars := ' ';
-    nChars := 1;
-  end;
-  { Determine which sides to trim based on function name }
-  pFd := PTFuncDef(Psqlite3_context(pCtx)^.pFunc);
-  doLeft  := True;
-  doRight := True;
-  if pFd <> nil then begin
-    if sqlite3StrICmp(pFd^.zName, 'ltrim') = 0 then doRight := False;
-    if sqlite3StrICmp(pFd^.zName, 'rtrim') = 0 then doLeft  := False;
-  end;
-  start := 0;
-  stop  := n;
-  if doLeft then begin
-    while start < stop do begin
-      matched := False;
-      for j := 0 to nChars - 1 do
-        if (z + start)^ = (zChars + j)^ then begin matched := True; Break; end;
-      if matched then Inc(start) else Break;
+    zCharSet := sqlite3_value_text(Psqlite3_value((argv+1)^));
+    if zCharSet = nil then Exit;
+    z := zCharSet; nChar := 0;
+    while z^ <> #0 do begin
+      if u8(z^) >= $C0 then begin
+        Inc(z);
+        while (u8(z^) and $C0) = $80 do Inc(z);
+      end else
+        Inc(z);
+      Inc(nChar);
+    end;
+    if nChar > 0 then begin
+      blockSz := PtrInt(nChar) * (SizeOf(Pointer) + SizeOf(u32));
+      azChar := sqlite3_malloc(blockSz);
+      if azChar = nil then begin
+        sqlite3_result_error_nomem(pCtx); Exit;
+      end;
+      aLen := PUInt32(PAnsiChar(azChar) + PtrInt(nChar) * SizeOf(Pointer));
+      z := zCharSet; nChar := 0;
+      while z^ <> #0 do begin
+        (azChar + nChar)^ := z;
+        zSav := z;
+        if u8(z^) >= $C0 then begin
+          Inc(z);
+          while (u8(z^) and $C0) = $80 do Inc(z);
+        end else
+          Inc(z);
+        (aLen + nChar)^ := u32(z - zSav);
+        Inc(nChar);
+      end;
     end;
   end;
-  if doRight then begin
-    while stop > start do begin
-      matched := False;
-      for j := 0 to nChars - 1 do
-        if (z + stop - 1)^ = (zChars + j)^ then begin matched := True; Break; end;
-      if matched then Dec(stop) else Break;
+  if nChar > 0 then begin
+    pFd := PTFuncDef(Psqlite3_context(pCtx)^.pFunc);
+    flags := 3;
+    if pFd <> nil then begin
+      if sqlite3StrICmp(pFd^.zName, 'ltrim') = 0 then flags := 1
+      else if sqlite3StrICmp(pFd^.zName, 'rtrim') = 0 then flags := 2;
     end;
+    if (flags and 1) <> 0 then begin
+      while nIn > 0 do begin
+        len := 0;
+        i := 0;
+        while i < nChar do begin
+          len := (aLen + i)^;
+          if (len <= nIn) and CompareMem(zIn, (azChar + i)^, len) then Break;
+          Inc(i);
+        end;
+        if i >= nChar then Break;
+        Inc(zIn, len);
+        Dec(nIn, len);
+      end;
+    end;
+    if (flags and 2) <> 0 then begin
+      while nIn > 0 do begin
+        len := 0;
+        i := 0;
+        while i < nChar do begin
+          len := (aLen + i)^;
+          if (len <= nIn) and CompareMem(zIn + (nIn - len), (azChar + i)^, len) then Break;
+          Inc(i);
+        end;
+        if i >= nChar then Break;
+        Dec(nIn, len);
+      end;
+    end;
+    if zCharSet <> nil then sqlite3_free(azChar);
   end;
-  sqlite3_result_text(pCtx, z + start, stop - start, SQLITE_TRANSIENT);
+  sqlite3_result_text(pCtx, zIn, i32(nIn), SQLITE_TRANSIENT);
 end;
 
 procedure replaceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -51220,49 +55822,31 @@ begin
                  nSep, zSep);
 end;
 
-procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
-var
-  zPat, zStr, zE: PAnsiChar;
-  esc: u32;
-  rc: i32;
-begin
-  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
-     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
-    sqlite3_result_null(pCtx); Exit;
+{ TCompareInfo / globInfo / likeInfoNorm / likeInfoAlt — hoisted from the
+  patternCompare block further down so likeFunc (next), globFunc and
+  aBuiltinFuncs[].pUserData (set in InitBuiltinFuncs) can reference them.
+  Carries the matchAll/matchOne/matchSet wildcards used by the LIKE/GLOB
+  optimisation in sqlite3IsLikeFunction (func.c:2407). }
+type
+  TCompareInfo = record
+    matchAll, matchOne, matchSet, noCase: u8;
   end;
-  zPat := sqlite3_value_text(Psqlite3_value(argv^));
-  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if (zPat = nil) or (zStr = nil) then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
-  esc := 0;
-  if argc = 3 then begin
-    zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
-    if zE = nil then Exit;
-    if sqlite3Utf8CharLen(zE, -1) <> 1 then begin
-      sqlite3_result_error(pCtx,
-        'ESCAPE expression must be a single character', -1);
-      Exit;
-    end;
-    if zE^ <> #0 then esc := Ord(zE^);
-  end;
-  rc := sqlite3_strlike(zPat, zStr, esc);
-  sqlite3_result_int(pCtx, i32(rc = 0));
-end;
+  PCompareInfo = ^TCompareInfo;
 
-procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
-var
-  zPat, zStr: PAnsiChar;
-begin
-  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
-     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
-  zPat := sqlite3_value_text(Psqlite3_value(argv^));
-  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if (zPat = nil) or (zStr = nil) then begin sqlite3_result_null(pCtx); Exit; end;
-  sqlite3_result_int(pCtx, i32(sqlite3_strglob(zPat, zStr) = 0));
-end;
+const
+  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
+  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
+  { func.c:681 likeInfoAlt — case-sensitive LIKE (PRAGMA case_sensitive_like=on
+    or SQLITE_CASE_SENSITIVE_LIKE build).  Bound by sqlite3RegisterLikeFunctions. }
+  likeInfoAlt:  TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 0);
+
+{ likeFunc + globFunc bodies were relocated by 12.2.candidate.5.a so they
+  sit *after* patternCompare's definition (eliminating the hand-written
+  pseudo-duplicate forward decl of patternCompare that used to live here).
+  aBuiltinFuncs (further down) still references them by address, so we
+  carry forward declarations only. }
+procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl; forward;
+procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl; forward;
 
 procedure coalesceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
@@ -51661,18 +56245,36 @@ end;
   `flags & MEM_Null` which never triggers (init leaves all bits 0): min
   worked only by accident (number<string fallback returned -1 so the <0
   branch happened to copy); max always missed because >0 was never true. }
+{ minmaxStep magnet — when the incoming arg does NOT supersede the
+  running best, raise the skip-accumulator-load flag so OP_AggStep1
+  signals the magnet register and the outer codegen's OP_If gate
+  bypasses bare-column reloads on this iteration.  Without this the
+  sticky-row property of `SELECT c, max(a) FROM t1` is lost and
+  bare columns hold the LAST scanned row, not the row that won
+  min/max (divbug.14 residual aggorderby-4.1). func.c:2103 / 2121. }
+procedure minmaxSkipLoad(pCtx: Psqlite3_context); inline;
+begin
+  pCtx^.isError  := -1;
+  pCtx^.skipFlag := 1;
+end;
+
 procedure minStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pAgg: PMem;
 begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
   if pAgg = nil then Exit;
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    if pAgg^.flags <> 0 then minmaxSkipLoad(pCtx);
+    Exit;
+  end;
   if pAgg^.flags = 0 then begin
     pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
   end else if sqlite3MemCompare(argv^, pAgg, nil) < 0 then
-    sqlite3VdbeMemCopy(pAgg, argv^);
+    sqlite3VdbeMemCopy(pAgg, argv^)
+  else
+    minmaxSkipLoad(pCtx);
 end;
 
 procedure maxStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -51681,12 +56283,17 @@ var
 begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
   if pAgg = nil then Exit;
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    if pAgg^.flags <> 0 then minmaxSkipLoad(pCtx);
+    Exit;
+  end;
   if pAgg^.flags = 0 then begin
     pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
   end else if sqlite3MemCompare(argv^, pAgg, nil) > 0 then
-    sqlite3VdbeMemCopy(pAgg, argv^);
+    sqlite3VdbeMemCopy(pAgg, argv^)
+  else
+    minmaxSkipLoad(pCtx);
 end;
 
 procedure minMaxFinal(pCtx: Psqlite3_context); cdecl;
@@ -52417,22 +57024,17 @@ end;
 const
   FUNC_ENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
+  { 9.4.divbug.45 — VFUNCTION (volatile/non-deterministic) and DFUNCTION
+    (slow-change) macros from sqliteInt.h:2134..2159.  VFUNCTION omits
+    SQLITE_FUNC_CONSTANT entirely; DFUNCTION substitutes SQLITE_FUNC_SLOCHNG
+    for SQLITE_FUNC_CONSTANT.  Both must be distinguishable from FUNCTION so
+    havingToWhere / sqlite3ExprIsConstantOrGroupBy reject random*(), changes(),
+    last_insert_rowid(), etc. as non-promotable HAVING terms (expr.c:2502..2510). }
+  FUNC_VENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
+  FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
-  aBuiltinFuncs: array[0..81] of TFuncDef;
-
-{ TCompareInfo / globInfo / likeInfoNorm — hoisted from the patternCompare
-  block further down so aBuiltinFuncs[].pUserData (set in InitBuiltinFuncs)
-  can reference them.  Carries the matchAll/matchOne/matchSet wildcards used
-  by the LIKE/GLOB optimisation in sqlite3IsLikeFunction (func.c:2407). }
-type
-  TCompareInfo = record
-    matchAll, matchOne, matchSet, noCase: u8;
-  end;
-
-const
-  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
-  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
+  aBuiltinFuncs: array[0..84] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -52466,18 +57068,23 @@ begin
     the C oracle bytecode exactly (func.c: FUNCTION(nullif, 2, 0, 1, nullifFunc)). }
   MakeFD(aBuiltinFuncs[15], 2, FUNC_ENC or SQLITE_FUNC_NEEDCOLL,
     @nullifFunc, nil, 'nullif');
-  MakeFD(aBuiltinFuncs[16], 0, FUNC_ENC,  @versionFunc,    nil, 'sqlite_version');
-  MakeFD(aBuiltinFuncs[17], 0, FUNC_ENC,  @sourceidFunc,   nil, 'sqlite_source_id');
-  MakeFD(aBuiltinFuncs[18], 0, FUNC_ENC,  @randomFunc,     nil, 'random');
-  MakeFD(aBuiltinFuncs[19], 1, FUNC_ENC,  @randomBlobFunc, nil, 'randomblob');
-  MakeFD(aBuiltinFuncs[20], 0, FUNC_ENC,  @lastInsertRowid,nil, 'last_insert_rowid');
-  MakeFD(aBuiltinFuncs[21], 0, FUNC_ENC,  @changesFunc,    nil, 'changes');
-  MakeFD(aBuiltinFuncs[22], 0, FUNC_ENC,  @totalChangesFunc,nil,'total_changes');
+  { 9.4.divbug.45 — sqlite_version/sqlite_source_id are DFUNCTION (SLOCHNG,
+    not CONSTANT); random/randomblob/last_insert_rowid/changes/total_changes
+    are VFUNCTION (volatile — neither CONSTANT nor SLOCHNG).  Distinguishing
+    these from regular FUNCTION lets exprNodeIsConstantFunction reject them
+    so havingToWhere does not hoist HAVING randomblob(...) into WHERE. }
+  MakeFD(aBuiltinFuncs[16], 0, FUNC_DENC, @versionFunc,    nil, 'sqlite_version');
+  MakeFD(aBuiltinFuncs[17], 0, FUNC_DENC, @sourceidFunc,   nil, 'sqlite_source_id');
+  MakeFD(aBuiltinFuncs[18], 0, FUNC_VENC, @randomFunc,     nil, 'random');
+  MakeFD(aBuiltinFuncs[19], 1, FUNC_VENC, @randomBlobFunc, nil, 'randomblob');
+  MakeFD(aBuiltinFuncs[20], 0, FUNC_VENC, @lastInsertRowid,nil, 'last_insert_rowid');
+  MakeFD(aBuiltinFuncs[21], 0, FUNC_VENC, @changesFunc,    nil, 'changes');
+  MakeFD(aBuiltinFuncs[22], 0, FUNC_VENC, @totalChangesFunc,nil,'total_changes');
   MakeFD(aBuiltinFuncs[23],-1, FUNC_ENC or SQLITE_FUNC_INLINE,  @coalesceFunc,   nil, 'coalesce');
   aBuiltinFuncs[23].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
   MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC or SQLITE_FUNC_INLINE,  @ifnullFunc,     nil, 'ifnull');
   aBuiltinFuncs[24].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
-  MakeFD(aBuiltinFuncs[25], 3, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'iif');
+  MakeFD(aBuiltinFuncs[25],-4, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'iif');
   aBuiltinFuncs[25].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
   MakeFD(aBuiltinFuncs[26], 1, FUNC_ENC,  @quoteFunc,      nil, 'quote');
   MakeFD(aBuiltinFuncs[27], 1, FUNC_ENC,  @unicodeFunc,    nil, 'unicode');
@@ -52632,6 +57239,26 @@ begin
     @compileoptionusedFunc, nil, 'sqlite_compileoption_used');
   MakeFD(aBuiltinFuncs[81], 1, FUNC_ENC or SQLITE_FUNC_SLOCHNG,
     @compileoptiongetFunc, nil, 'sqlite_compileoption_get');
+  { subtype(X) — func.c:3306: FUNCTION2(subtype, 1, 0, 0, subtypeFunc,
+    SQLITE_FUNC_TYPEOF|SQLITE_SUBTYPE).  Returns the subtype byte stored
+    on the argument's Mem (e.g. JSON_SUBTYPE = 74 for json()/json_extract
+    results).  9.4.divbug.52. }
+  MakeFD(aBuiltinFuncs[82], 1,
+    FUNC_ENC or SQLITE_FUNC_TYPEOF or SQLITE_SUBTYPE,
+    @subtypeFunc, nil, 'subtype');
+  { 9.4.divbug.66.a — `if(c,a,b)` is registered upstream as an alias for
+    `iif(c,a,b)` via INLINE_FUNC (func.c:3430).  Same inlined codegen
+    branch (INLINEFUNC_iif); only the name differs.  Resolves
+    "no such function: if" (qrf01-13.x). }
+  MakeFD(aBuiltinFuncs[83],-4, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'if');
+  aBuiltinFuncs[83].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
+  { 9.4.divbug.90 — unistr_quote(X): same impl as quote(X) but with
+    pUserData=1 so quoteFunc emits the unistr() escape variant for
+    non-ASCII bytes (func.c:3340 FUNCTION(unistr_quote,1,1,0,quoteFunc),
+    consumed by quoteFunc at func.c:1264 via SQLITE_PTR_TO_INT(user_data)).
+    Closes func9-210 "no such function: unistr_quote". }
+  MakeFD(aBuiltinFuncs[84], 1, FUNC_ENC, @quoteFunc, nil, 'unistr_quote');
+  aBuiltinFuncs[84].pUserData := Pointer(PtrInt(1));
 end;
 
 var
@@ -52846,9 +57473,40 @@ begin
 end;
 
 procedure sqlite3RegisterLikeFunctions(db: PTsqlite3; caseSensitive: i32);
+var
+  pDef: PTFuncDef;
+  pInfo: Pointer;
+  flags: u32;
+  nArg: i32;
 begin
-  { The like/glob functions are already in the built-in table.
-    Per-connection case-sensitivity can be changed via funcFlags later. }
+  { Port of func.c:2344..2365 sqlite3RegisterLikeFunctions.  Re-register the
+    built-in like(B,A) and like(B,A,esc) shims for this connection with the
+    requested case-sensitivity.  Called by PRAGMA case_sensitive_like and
+    once at open with the SQLITE_CaseSensitiveLike DBFLAG state.  Without
+    this port, PRAGMA case_sensitive_like=on was a silent no-op: the global
+    likeInfoNorm (noCase=1) stayed wired and 'ABC' LIKE 'abc' kept matching
+    (9.4.divbug.56 — like-1.5.2). }
+  if caseSensitive <> 0 then
+  begin
+    pInfo := @likeInfoAlt;
+    flags := SQLITE_FUNC_LIKE or SQLITE_FUNC_CASE;
+  end
+  else
+  begin
+    pInfo := @likeInfoNorm;
+    flags := SQLITE_FUNC_LIKE;
+  end;
+  for nArg := 2 to 3 do
+  begin
+    sqlite3CreateFunc(db, 'like', nArg, SQLITE_UTF8, pInfo,
+      @likeFunc, nil, nil, nil, nil, nil);
+    pDef := sqlite3FindFunction(db, 'like', nArg, SQLITE_UTF8, 0);
+    if pDef <> nil then
+    begin
+      pDef^.funcFlags := pDef^.funcFlags or flags;
+      pDef^.funcFlags := pDef^.funcFlags and (not u32(SQLITE_FUNC_UNSAFE));
+    end;
+  end;
 end;
 
 function sqlite3IsLikeFunction(db: PTsqlite3; pExpr: PExpr;
@@ -55619,6 +60277,78 @@ begin
   if Result = SQLITE_NOWILDCARDMATCH then Result := SQLITE_NOMATCH;
 end;
 
+{ likeFunc + globFunc — moved here by 12.2.candidate.5.a so they sit after
+  patternCompare's body and no longer need a hand-written forward
+  declaration further up. }
+procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zPat, zStr, zE: PAnsiChar;
+  zEU8: Pu8;
+  escape: u32;
+  nPat: i32;
+  db: PTsqlite3;
+  pInfo, pInfoOrig: PCompareInfo;
+  backupInfo: TCompareInfo;
+begin
+  { Port of func.c:907..971 likeFunc.  Reads its compareInfo from
+    sqlite3_user_data(pCtx) — which sqlite3RegisterLikeFunctions flips
+    between likeInfoNorm (noCase=1) and likeInfoAlt (noCase=0) when
+    PRAGMA case_sensitive_like fires.  Calls patternCompare directly:
+    sqlite3_strlike hardcodes likeInfoNorm so the per-connection
+    case-sensitivity would never reach the engine.  9.4.divbug.56. }
+  db := sqlite3_context_db_handle(pCtx);
+  pInfo := PCompareInfo(sqlite3_user_data(pCtx));
+  if pInfo = nil then pInfo := @likeInfoNorm;
+  pInfoOrig := pInfo;
+
+  { Pattern-length limit (func.c:931..940). }
+  nPat := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if (db <> nil) and (nPat > db^.aLimit[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]) then
+  begin
+    sqlite3_result_error(pCtx, 'LIKE or GLOB pattern too complex', -1);
+    Exit;
+  end;
+
+  if argc = 3 then begin
+    zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
+    if zE = nil then Exit;
+    if sqlite3Utf8CharLen(zE, -1) <> 1 then begin
+      sqlite3_result_error(pCtx,
+        'ESCAPE expression must be a single character', -1);
+      Exit;
+    end;
+    zEU8 := Pu8(zE);
+    escape := sqlite3Utf8Read(PPChar(@zEU8));
+    if (escape = pInfo^.matchAll) or (escape = pInfo^.matchOne) then begin
+      backupInfo := pInfoOrig^;
+      pInfo := @backupInfo;
+      if escape = pInfo^.matchAll then pInfo^.matchAll := 0;
+      if escape = pInfo^.matchOne then pInfo^.matchOne := 0;
+    end;
+  end else
+    escape := pInfo^.matchSet;
+
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat <> nil) and (zStr <> nil) then
+    sqlite3_result_int(pCtx,
+      i32(patternCompare(Pu8(zPat), Pu8(zStr), pInfo^, escape) = 0));
+end;
+
+procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zPat, zStr: PAnsiChar;
+begin
+  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
+     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat = nil) or (zStr = nil) then begin sqlite3_result_null(pCtx); Exit; end;
+  sqlite3_result_int(pCtx, i32(sqlite3_strglob(zPat, zStr) = 0));
+end;
+
 
 // ===========================================================================
 // Phase 6.7 — window.c port
@@ -56082,6 +60812,46 @@ end;
 // sqlite3ExprCompare — compare two expressions (expr.c:6544)
 // Returns 0 if identical, 1 if certainly different, 2 if indeterminate.
 // ---------------------------------------------------------------------------
+{ exprCompareVariable — port of expr.c:6487..6516.
+  Returns 0 if pVar (a TK_VARIABLE) is currently bound to the same value
+  as the simple SQL literal pExpr; returns 2 otherwise (or when QPSG
+  disables this trick).  Two TK_VARIABLE nodes with identical iColumn
+  compare equal trivially (same bound slot).  divbug.87.027..030. }
+function exprCompareVariable(pParse: PParse; pVar: PExpr; pExpr: PExpr): i32;
+var
+  iVar: i32;
+  pL, pR: Psqlite3_value;
+begin
+  Result := 2;
+  pR := nil;
+  if (pExpr^.op = TK_VARIABLE) and (pVar^.iColumn = pExpr^.iColumn) then
+  begin
+    Result := 0; Exit;
+  end;
+  if (pParse^.db^.flags and u64($00800000)) <> 0 then  { SQLITE_EnableQPSG }
+  begin
+    Result := 2; Exit;
+  end;
+  sqlite3ValueFromExpr(pParse^.db, pExpr, SQLITE_UTF8, SQLITE_AFF_BLOB, pR);
+  if pR <> nil then
+  begin
+    iVar := pVar^.iColumn;
+    sqlite3VdbeSetVarmask(pParse^.pVdbe, iVar);
+    pL := sqlite3VdbeGetBoundValue(pParse^.pReprepare, iVar, SQLITE_AFF_BLOB);
+    if pL <> nil then
+    begin
+      if sqlite3_value_type(pL) = SQLITE_TEXT then
+        sqlite3_value_text(pL);  { force UTF-8 encoding }
+      if sqlite3MemCompare(pL, pR, nil) <> 0 then
+        Result := 2
+      else
+        Result := 0;
+    end;
+    sqlite3ValueFree(pR);
+    sqlite3ValueFree(pL);
+  end;
+end;
+
 function sqlite3ExprCompare(pParse: PParse; pA: PExpr; pB: PExpr;
   iTab: i32): i32;
 var
@@ -56089,6 +60859,10 @@ var
 begin
   if (pA = nil) or (pB = nil) then begin
     if pA = pB then Result := 0 else Result := 2;
+    Exit;
+  end;
+  if (pParse <> nil) and (pA^.op = TK_VARIABLE) then begin
+    Result := exprCompareVariable(pParse, pA, pB);
     Exit;
   end;
   combinedFlags := pA^.flags or pB^.flags;
@@ -59269,12 +64043,20 @@ var
   addrBloom:   i32;
   regBloom:    i32;
   pOpRef:      PVdbeOp;
+  pCoroSrc:    PSrcItem;       { 9.4.divbug.78 }
+  addrCoroYield: i32;
+  rCoroBase, rCoroRec, iCoro: i32;
 begin
   v := pParse^.pVdbe;
   Assert(v <> nil);
   if v = nil then Exit;
 
   addrOnce := 0;
+  pCoroSrc := nil;
+  addrCoroYield := 0;
+  rCoroBase := 0;
+  rCoroRec := 0;
+  iCoro := 0;
 
   { Wrap in a Once-gated subroutine when neither EP_VarSelect nor a CHECK
     constraint context (iSelfTab) forces re-evaluation per row. }
@@ -59322,12 +64104,68 @@ begin
         addrBloom := sqlite3VdbeAddOp2(v, OP_Blob, 10000, regBloom);
         destSet.iSDParm2 := regBloom;
       end;
-      pCopy := sqlite3SelectDup(pParse^.db, pSel, 0);
-      if pParse^.db^.mallocFailed <> 0 then
-        rcSelect := 1
-      else
-        rcSelect := sqlite3Select(pParse, pCopy, @destSet);
-      sqlite3SelectDelete(pParse^.db, pCopy);
+      { 9.4.divbug.78 — multi-VALUES wrapper fast path.  When pSel is
+        the wrapper produced by sqlite3MultiValues (pSrc[0] carries
+        SRCITEM_FG_VIA_COROUTINE; the coroutine body was already emitted
+        during parse and addresses are stashed on pSubq), the recursive
+        sqlite3SelectDup+sqlite3Select would walk only the residual
+        single-row pLeft (the C parser stripped the rest off when
+        attaching the coroutine), yielding just one row into iTab.  C
+        select.c handles this by recognising viaCoroutine in WhereBegin
+        and emitting OP_InitCoroutine + per-row OP_Yield drain that
+        feeds SRT_Set.  Reproduce that shape directly here: re-prime the
+        existing coroutine and drain it into the eph cursor opened by
+        the OP_OpenEphemeral above, mirroring the C 3.53 layout
+        addrs 17..26 for `WHERE c IN (VALUES(x),(y),...)`. }
+      rcSelect := -1;
+      if (pSel^.pSrc <> nil) and (pSel^.pSrc^.nSrc = 1) then
+      begin
+        pCoroSrc := SrcListItems(pSel^.pSrc);
+        if ((pCoroSrc^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0)
+           and (pCoroSrc^.u4.pSubq <> nil)
+           and (pCoroSrc^.u4.pSubq^.regReturn <> 0)
+           and (pCoroSrc^.u4.pSubq^.regResult <> 0)
+           and (pCoroSrc^.u4.pSubq^.addrFillSub > 0) then
+        begin
+          { Emit "SCAN N-ROW VALUES CLAUSE" explain narrator at the
+            destination (mirrors select.c viaCoroutine handling). }
+          sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+            pCoroSrc^.u4.pSubq^.regReturn, 0,
+            pCoroSrc^.u4.pSubq^.addrFillSub);
+          addrCoroYield := sqlite3VdbeAddOp2(v, OP_Yield,
+            pCoroSrc^.u4.pSubq^.regReturn, 0);
+          { Copy the coroutine result block to a fresh contiguous block
+            so OP_MakeRecord can apply the per-column affinity safely
+            without mutating the coroutine's regResult slots. }
+          rCoroBase := pParse^.nMem + 1;
+          pParse^.nMem := pParse^.nMem + nVal;
+          for iCoro := 0 to nVal - 1 do
+            sqlite3VdbeAddOp2(v, OP_Copy,
+              pCoroSrc^.u4.pSubq^.regResult + iCoro,
+              rCoroBase + iCoro);
+          rCoroRec := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp4(v, OP_MakeRecord, rCoroBase, nVal, rCoroRec,
+            destSet.zAffSdst, nVal);
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iTab, rCoroRec,
+            rCoroBase, nVal);
+          if destSet.iSDParm2 <> 0 then
+            sqlite3VdbeAddOp4Int(v, OP_FilterAdd, destSet.iSDParm2, 0,
+              rCoroBase, nVal);
+          sqlite3ReleaseTempReg(pParse, rCoroRec);
+          sqlite3VdbeAddOp2(v, OP_Goto, 0, addrCoroYield);
+          sqlite3VdbeJumpHere(v, addrCoroYield);
+          rcSelect := 0;
+        end;
+      end;
+      if rcSelect = -1 then
+      begin
+        pCopy := sqlite3SelectDup(pParse^.db, pSel, 0);
+        if pParse^.db^.mallocFailed <> 0 then
+          rcSelect := 1
+        else
+          rcSelect := sqlite3Select(pParse, pCopy, @destSet);
+        sqlite3SelectDelete(pParse^.db, pCopy);
+      end;
       sqlite3DbFree(pParse^.db, destSet.zAffSdst);
       if addrBloom <> 0 then
       begin
@@ -59461,6 +64299,13 @@ begin
   v           := pParse^.pVdbe;
   if v = nil then Exit;
   pLeft   := pExpr^.pLeft;
+
+  { Port of expr.c:4055 — validate LHS vector size against the
+    RHS sub-select column count (or scalar LHS for value-list RHS)
+    before any further codegen.  Emits "sub-select returns N columns
+    - expected M" / "row value misused" via sqlite3SubselectError /
+    sqlite3VectorErrorMsg.  Fixes select7-5.1..5.4 (9.4.divbug.75). }
+  if sqlite3ExprCheckIN(pParse, pExpr) <> 0 then Exit;
 
   { Phase 6.9-bis 11g.2.f sub-progress 23 — subselect IN-RHS now
     routes through `sqlite3CodeRhsOfIN`'s Case-1 materialisation via
@@ -60281,6 +65126,282 @@ begin
   Result := rc;
 end;
 
+{$IFDEF SQLITE_ENABLE_STAT4}
+{ -----------------------------------------------------------------------
+  sqlite3Stat4ValueFromExpr — interface forward (declared near whereKeyStats);
+  full body at vdbemem.c:2127..2134 lives further below.  Listed here as a
+  marker for readers; no separate `forward` is needed since the interface
+  declaration is already visible.
+  ----------------------------------------------------------------------- }
+
+{ -----------------------------------------------------------------------
+  valueFromFunctionImpl — port of vdbemem.c:1701..1799.  STAT4 helper that
+  pre-evaluates a deterministic scalar function call at planner time so
+  its constant result can be used as a probe value into pIdx^.aSample[].
+
+  Called via passqlite3vdbe.valueFromFunction (which delegates through
+  gValueFromFunctionImpl when STAT4 is on).  Wired in initialization.
+
+  Faithful line-by-line port; the only deviation from C is using the
+  Pascal `apVal` dynamic helper array instead of pointer-cast malloc
+  (functionally equivalent — both are zero-init arrays of sqlite3_value*).
+  ----------------------------------------------------------------------- }
+function valueFromFunctionImpl(db: Psqlite3; pInExpr: Pointer;
+                               enc: u8; aff: u8;
+                               out ppVal: Psqlite3_value;
+                               pCtx: PValueNewStat4Ctx): i32;
+label
+  value_from_function_out;
+var
+  p:      PExpr;
+  ctx:    Tsqlite3_context;        { context object for function invocation }
+  apVal:  array of Psqlite3_value; { function arguments (zero-init by SetLength) }
+  nVal:   i32;                     { number of function arguments }
+  pFn:    PTFuncDef;               { function definition (FPC: avoid pFunc shadow) }
+  pVal:   Psqlite3_value;          { new value }
+  rc:     i32;                     { return code }
+  pList:  PExprList;               { function argument list }
+  pItem:  PExprListItem;           { iterator over pList items (flex-array access) }
+  i:      i32;                     { iterator }
+begin
+  ppVal := nil;
+  pVal  := nil;
+  nVal  := 0;
+  rc    := SQLITE_OK;
+  p     := PExpr(pInExpr);
+
+  Assert(pCtx <> nil);
+  Assert((p^.flags and EP_TokenOnly) = 0);
+  Assert(ExprUseXList(p));
+  pList := p^.x.pList;
+  if pList <> nil then nVal := pList^.nExpr;
+  Assert(not ExprHasProperty(p, EP_IntValue));
+  pFn := sqlite3FindFunction(PTsqlite3(db), p^.u.zToken, nVal, enc, 0);
+{$IFDEF SQLITE_ENABLE_UNKNOWN_SQL_FUNCTION}
+  if pFn = nil then begin Result := SQLITE_OK; Exit; end;
+{$ENDIF}
+  Assert(pFn <> nil);
+  if ((pFn^.funcFlags and (SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG)) = 0)
+     or ((pFn^.funcFlags and (SQLITE_FUNC_NEEDCOLL or SQLITE_FUNC_RUNONLY)) <> 0) then
+  begin
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  if pList <> nil then
+  begin
+    SetLength(apVal, nVal);  { zero-initialised; mirrors sqlite3DbMallocZero }
+    if (nVal > 0) and (apVal = nil) then
+    begin
+      rc := SQLITE_NOMEM;
+      goto value_from_function_out;
+    end;
+    pItem := ExprListItems(pList);
+    for i := 0 to nVal - 1 do
+    begin
+      rc := sqlite3Stat4ValueFromExpr(PParse(pCtx^.pParse), pItem[i].pExpr, aff,
+                                      PPointer(@apVal[i]));
+      if (apVal[i] = nil) or (rc <> SQLITE_OK) then goto value_from_function_out;
+    end;
+  end;
+
+  pVal := passqlite3vdbe.valueNew(db, pCtx);
+  if pVal = nil then
+  begin
+    rc := SQLITE_NOMEM;
+    goto value_from_function_out;
+  end;
+
+  FillChar(ctx, SizeOf(ctx), 0);
+  ctx.pOut  := PMem(pVal);
+  ctx.pFunc := PFuncDef(pFn);
+  ctx.enc   := PTsqlite3(db)^.enc;
+  if apVal <> nil then
+    pFn^.xSFunc(@ctx, nVal, PPMem(@apVal[0]))
+  else
+    pFn^.xSFunc(@ctx, nVal, nil);
+  if ctx.isError <> 0 then
+  begin
+    rc := ctx.isError;
+    sqlite3ErrorMsg(PParse(pCtx^.pParse), PAnsiChar(sqlite3_value_text(pVal)));
+  end else
+  begin
+    sqlite3ValueApplyAffinity(pVal, aff, SQLITE_UTF8);
+    Assert(rc = SQLITE_OK);
+    rc := sqlite3VdbeChangeEncoding(PMem(pVal), enc);
+    if (rc = SQLITE_OK) and (sqlite3VdbeMemTooBig(PMem(pVal)) <> 0) then
+    begin
+      rc := SQLITE_TOOBIG;
+      Inc(PParse(pCtx^.pParse)^.nErr);
+    end;
+  end;
+
+value_from_function_out:
+  if rc <> SQLITE_OK then
+  begin
+    pVal := nil;
+    PParse(pCtx^.pParse)^.rc := rc;
+  end;
+  if apVal <> nil then
+  begin
+    for i := 0 to nVal - 1 do
+      sqlite3ValueFree(apVal[i]);
+    SetLength(apVal, 0);
+  end;
+  ppVal  := pVal;
+  Result := rc;
+end;
+
+{ Forward decl — stat4ValueFromExpr below calls into the trampoline
+  defined further down in this same file. }
+function valueFromExprTrampoline(db: Psqlite3; pInExpr: Pointer;
+                                 enc: u8; affinity: u8;
+                                 out ppVal: passqlite3vdbe.Psqlite3_value;
+                                 pCtx: Pointer): i32; forward;
+
+{ -----------------------------------------------------------------------
+  stat4ValueFromExpr — port of vdbemem.c:2007..2046.  Internal helper used
+  by sqlite3Stat4ValueFromExpr (pAlloc=nil) and sqlite3Stat4ProbeSetValue
+  (pAlloc != nil; landing in prereq.c.4).  Skips TK_COLLATE wrappers, then
+  routes TK_VARIABLE through the reprepare bound-value path and any other
+  expression through valueFromExprTrampoline.
+  ----------------------------------------------------------------------- }
+function stat4ValueFromExpr(pParse: PParse; pExpr: PExpr; affinity: u8;
+                            pAlloc: PValueNewStat4Ctx;
+                            out ppVal: passqlite3vdbe.Psqlite3_value): i32;
+var
+  rc:       i32;
+  pVal:     passqlite3vdbe.Psqlite3_value;
+  db:       PTsqlite3;
+  v:        PVdbe;
+  iBindVar: i32;
+begin
+  rc   := SQLITE_OK;
+  pVal := nil;
+  db   := pParse^.db;
+
+  { Skip over any TK_COLLATE nodes. }
+  pExpr := sqlite3ExprSkipCollate(pExpr);
+
+  Assert((pExpr = nil) or (pExpr^.op <> TK_REGISTER) or (pExpr^.op2 <> TK_VARIABLE));
+
+  if pExpr = nil then begin
+    pVal := passqlite3vdbe.Psqlite3_value(
+              passqlite3vdbe.valueNew(Psqlite3(db), pAlloc));
+    if pVal <> nil then sqlite3VdbeMemSetNull(PMem(pVal));
+  end else if (pExpr^.op = TK_VARIABLE)
+              and ((db^.flags and u64($00800000)) = 0) then  { SQLITE_EnableQPSG }
+  begin
+    iBindVar := pExpr^.iColumn;
+    sqlite3VdbeSetVarmask(pParse^.pVdbe, iBindVar);
+    v := pParse^.pReprepare;
+    if v <> nil then begin
+      pVal := passqlite3vdbe.Psqlite3_value(
+                passqlite3vdbe.valueNew(Psqlite3(db), pAlloc));
+      if pVal <> nil then begin
+        rc := sqlite3VdbeMemCopy(PMem(pVal),
+                                 PMem(@PMem(v^.aVar)[iBindVar - 1]));
+        sqlite3ValueApplyAffinity(pVal, affinity, db^.enc);
+        PMem(pVal)^.db := Psqlite3(db);
+      end;
+    end;
+  end else begin
+    rc := valueFromExprTrampoline(Psqlite3(db), pExpr, db^.enc, affinity,
+                                  pVal, pAlloc);
+  end;
+
+  Assert((pVal = nil) or (PMem(pVal)^.db = Psqlite3(db)));
+  ppVal  := pVal;
+  Result := rc;
+end;
+
+{ sqlite3Stat4ValueFromExpr — vdbemem.c:2127..2134.  Public entry that
+  delegates to stat4ValueFromExpr with pAlloc=nil. }
+function sqlite3Stat4ValueFromExpr(pParse: PParse; pExpr: PExpr;
+                                   aff: u8;
+                                   apVal: PPointer): i32;
+var
+  pV: passqlite3vdbe.Psqlite3_value;
+begin
+  pV := nil;
+  Result := stat4ValueFromExpr(pParse, pExpr, aff, nil, pV);
+  if apVal <> nil then apVal^ := pV;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3Stat4ProbeSetValue — port of vdbemem.c:2082..2115.
+
+  Build an UnpackedRecord* incrementally for the STAT4 sample probe.
+  For each of the nElem subexpressions of pExpr (or pExpr itself when it
+  is scalar / nil), call stat4ValueFromExpr with a ValueNewStat4Ctx that
+  carries the caller's *ppRec slot.  valueNew() allocates the record on
+  first successful extract and fills aMem[iVal+i] in place.
+
+  ppRec is IN/OUT: nil on first call, non-nil thereafter.  *pnExtract
+  receives the count of successfully populated cells (may be < nElem).
+
+  The TK_SELECT short-circuit at the top mirrors the C: row-valued
+  subqueries are handled elsewhere and skipped here (nExtract stays 0).
+  ----------------------------------------------------------------------- }
+function sqlite3Stat4ProbeSetValue(pParse: PParse; pIdx: PIndex;
+                                   ppRec: PPointer; pExpr: PExpr;
+                                   nElem, iVal: i32;
+                                   pnExtract: Pi32): i32;
+var
+  rc:       i32;
+  nExtract: i32;
+  i:        i32;
+  pVal:     passqlite3vdbe.Psqlite3_value;
+  pElem:    PExpr;
+  aff:      u8;
+  zAff:     PAnsiChar;
+  pIx:      PIndex2;
+  alloc:    passqlite3vdbe.TValueNewStat4Ctx;
+begin
+  rc       := SQLITE_OK;
+  nExtract := 0;
+
+  if (pExpr = nil) or (pExpr^.op <> TK_SELECT) then
+  begin
+    pIx          := PIndex2(pIdx);
+    alloc.pParse := pParse;
+    alloc.pIdx   := Pointer(pIx);
+    alloc.ppRec  := Pointer(ppRec);
+    alloc.iVal   := 0;
+
+    { Materialize zColAff once so per-column lookups don't recompute.
+      Mirrors sqlite3IndexColumnAffinity inlined: zColAff[iCol]. }
+    zAff := nil;
+    if pIx <> nil then
+    begin
+      if pIx^.zColAff = nil then zAff := sqlite3IndexAffinityStr(pParse^.db, pIx)
+      else                       zAff := pIx^.zColAff;
+    end;
+
+    i := 0;
+    while i < nElem do
+    begin
+      pVal := nil;
+      if pExpr <> nil then pElem := sqlite3VectorFieldSubexpr(pExpr, i)
+      else                 pElem := nil;
+
+      if zAff <> nil then aff := u8(zAff[iVal + i])
+      else                aff := u8(SQLITE_AFF_BLOB);
+
+      alloc.iVal := iVal + i;
+      rc := stat4ValueFromExpr(pParse, pElem, aff,
+                               @alloc, pVal);
+      if pVal = nil then break;
+      Inc(nExtract);
+      Inc(i);
+    end;
+  end;
+
+  if pnExtract <> nil then pnExtract^ := nExtract;
+  Result := rc;
+end;
+{$ENDIF}
+
 { -----------------------------------------------------------------------
   valueFromExprTrampoline — port of vdbemem.c:1795 valueFromExpr() (with
   the public-API wrapper sqlite3ValueFromExpr at vdbemem.c:1978 inlined).
@@ -60291,7 +65412,8 @@ end;
   ----------------------------------------------------------------------- }
 function valueFromExprTrampoline(db: Psqlite3; pInExpr: Pointer;
                                  enc: u8; affinity: u8;
-                                 out ppVal: passqlite3vdbe.Psqlite3_value): i32;
+                                 out ppVal: passqlite3vdbe.Psqlite3_value;
+                                 pCtx: Pointer): i32;
 label
   no_mem;
 var
@@ -60307,6 +65429,17 @@ var
   aff:    u8;
   zTok:   PAnsiChar;
   nVal:   i32;
+
+  function NewValue: PMem; inline;
+  begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+    Result := PMem(passqlite3vdbe.valueNew(db, PValueNewStat4Ctx(pCtx)));
+{$ELSE}
+    Assert(pCtx = nil);
+    Result := PMem(sqlite3ValueNew(db));
+{$ENDIF}
+  end;
+
 begin
   ppVal := nil;
   pVal  := nil;
@@ -60325,12 +65458,22 @@ begin
   end;
   if op = TK_REGISTER then op := i32(e^.op2);
 
+  { Compressed (EP_TokenOnly) expressions only appear via DEFAULT-clause
+    parses, which never carry a STAT4 ctx.  vdbemem.c:1817..1818. }
+  Assert(((e^.flags and EP_TokenOnly) = 0) or (pCtx = nil));
+
   if op = TK_CAST then begin
     Assert(not ExprHasProperty(e, EP_IntValue));
     aff := u8(sqlite3AffinityType(e^.u.zToken, nil));
-    rc := valueFromExprTrampoline(db, e^.pLeft, enc, aff, ppVal);
+    rc := valueFromExprTrampoline(db, e^.pLeft, enc, aff, ppVal, pCtx);
     if ppVal <> nil then begin
+{$IFDEF SQLITE_ENABLE_STAT4}
+      rc := sqlite3VdbeMemExpandBlob(PMem(ppVal));
+{$ELSE}
+      { Zero-blobs only come from functions; functions are only processed
+        under STAT4. }
       Assert((PMem(ppVal)^.flags and MEM_Zero) = 0);
+{$ENDIF}
       sqlite3VdbeMemCast(PMem(ppVal), aff, enc);
       sqlite3ValueApplyAffinity(ppVal, affinity, enc);
     end;
@@ -60357,7 +65500,7 @@ begin
   end;
 
   if (op = TK_STRING) or (op = TK_FLOAT) or (op = TK_INTEGER) then begin
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal = nil then goto no_mem;
     if ExprHasProperty(e, EP_IntValue) then begin
       sqlite3VdbeMemSetInt64(pVal, i64(e^.u.iValue) * negInt);
@@ -60392,7 +65535,7 @@ begin
       rc := sqlite3VdbeChangeEncoding(pVal, enc);
   end else if op = TK_UMINUS then begin
     { Multiple negative signs: -(-5). }
-    if (valueFromExprTrampoline(db, e^.pLeft, enc, affinity, ppVal) = SQLITE_OK)
+    if (valueFromExprTrampoline(db, e^.pLeft, enc, affinity, ppVal, pCtx) = SQLITE_OK)
        and (ppVal <> nil) then begin
       pVal := PMem(ppVal);
       sqlite3VdbeMemNumerify(pVal);
@@ -60409,23 +65552,31 @@ begin
       Exit;  { ppVal already set by recursive call }
     end;
   end else if op = TK_NULL then begin
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal = nil then goto no_mem;
     sqlite3VdbeMemSetNull(pVal);
   end else if op = TK_BLOB then begin
     Assert(not ExprHasProperty(e, EP_IntValue));
     Assert((e^.u.zToken[0] = 'x') or (e^.u.zToken[0] = 'X'));
     Assert(e^.u.zToken[1] = '''');
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal = nil then goto no_mem;
     zTok := e^.u.zToken + 2;
     nVal := sqlite3Strlen30(zTok) - 1;
     Assert(zTok[nVal] = '''');
     sqlite3VdbeMemSetStr(pVal, PAnsiChar(sqlite3HexToBlob(db, zTok, nVal)),
                          nVal div 2, 0, SQLITE_DYNAMIC);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  end else if (op = TK_FUNCTION) and (pCtx <> nil) then begin
+    { STAT4-only: pre-evaluate deterministic scalar functions so their
+      constant results land in the sample probe.  vdbemem.c:1935..1939. }
+    rc := passqlite3vdbe.valueFromFunction(db, e, enc, affinity,
+                                           ppVal, PValueNewStat4Ctx(pCtx));
+    pVal := PMem(ppVal);
+{$ENDIF}
   end else if op = TK_TRUEFALSE then begin
     Assert(not ExprHasProperty(e, EP_IntValue));
-    pVal := PMem(sqlite3ValueNew(db));
+    pVal := NewValue;
     if pVal <> nil then begin
       pVal^.flags := MEM_Int;
       { TRUE.zToken = "TRUE" (len 4, [4]==NUL → 1); FALSE has [4]='E' → 0. }
@@ -60439,10 +65590,23 @@ begin
   Exit;
 
 no_mem:
+{$IFDEF SQLITE_ENABLE_STAT4}
+  if (pCtx = nil)
+     or (PParse(PValueNewStat4Ctx(pCtx)^.pParse)^.nErr = 0) then
+    sqlite3OomFault(db);
+{$ELSE}
   sqlite3OomFault(db);
+{$ENDIF}
   if zVal <> nil then sqlite3DbFree(db, zVal);
   Assert(ppVal = nil);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  { Under STAT4, when pCtx != 0 the pVal is owned by the UnpackedRecord
+    arena and must NOT be freed here.  vdbemem.c:1960..1963. }
+  if pCtx = nil then sqlite3ValueFree(Psqlite3_value(pVal));
+{$ELSE}
+  Assert(pCtx = nil);
   sqlite3ValueFree(Psqlite3_value(pVal));
+{$ENDIF}
   Result := SQLITE_NOMEM_BKPT;
 end;
 
@@ -61130,6 +66294,10 @@ initialization
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
   passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
+{$IFDEF SQLITE_ENABLE_STAT4}
+  passqlite3vdbe.gValueFromFunctionImpl  :=
+    passqlite3vdbe.TValueFromFunctionFn(@valueFromFunctionImpl);
+{$ENDIF}
 {$IFDEF SQLITE_ENABLE_PREUPDATE_HOOK}
   passqlite3vdbe.gVdbePreUpdateHook      :=
     passqlite3vdbe.TVdbePreUpdateHookFn(@sqlite3VdbePreUpdateHook);

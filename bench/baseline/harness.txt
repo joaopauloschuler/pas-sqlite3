@@ -1,0 +1,35 @@
+       Begin testset "main"
+ 100 - 500 INSERTs into table with no index........................  TIME
+ 110 - 500 ordered INSERTS with one index/PK.......................  TIME
+ 120 - 500 unordered INSERTS with one index/PK.....................  TIME
+ 130 - 25 SELECTS, numeric BETWEEN, unindexed......................  TIME
+ 140 - 10 SELECTS, LIKE, unindexed.................................  TIME
+ 142 - 10 SELECTS w/ORDER BY, unindexed............................  TIME
+ 145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................  TIME
+ 150 - CREATE INDEX five times.....................................  TIME
+ 160 - 100 SELECTS, numeric BETWEEN, indexed.......................  TIME
+ 161 - 100 SELECTS, numeric BETWEEN, PK............................  TIME
+ 170 - 100 SELECTS, text BETWEEN, indexed..........................  TIME
+ 180 - 500 INSERTS with three indexes..............................  TIME
+ 190 - DELETE and REFILL one table.................................  TIME
+ 200 - VACUUM......................................................  TIME
+ 210 - ALTER TABLE ADD COLUMN, and query...........................  TIME
+ 230 - 100 UPDATES, numeric BETWEEN, indexed.......................  TIME
+ 240 - 500 UPDATES of individual rows..............................  TIME
+ 250 - One big UPDATE of the whole 500-row table...................  TIME
+ 260 - Query added column after filling............................  TIME
+ 270 - 100 DELETEs, numeric BETWEEN, indexed.......................  TIME
+ 280 - 500 DELETEs of individual rows..............................  TIME
+ 290 - Refill two 500-row tables using REPLACE.....................  TIME
+ 300 - Refill a 500-row table using (b&1)==(a&1)...................  TIME
+ 310 - 100 four-ways joins.........................................  TIME
+ 320 - subquery in result set......................................  TIME
+ 400 - 700 REPLACE ops on an IPK...................................  TIME
+ 410 - 700 SELECTS on an IPK.......................................  TIME
+ 500 - 700 REPLACE on TEXT PK......................................  TIME
+ 510 - 700 SELECTS on a TEXT PK....................................  TIME
+ 520 - 700 SELECT DISTINCT.........................................  TIME
+ 980 - PRAGMA integrity_check......................................  TIME
+ 990 - ANALYZE.....................................................  TIME
+       TOTAL.......................................................  TIME
+rc=0

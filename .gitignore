@@ -20,3 +20,9 @@ backup
 # SQLite WAL/SHM sidecars
 *.db-shm
 *.db-wal
+# Phase 11.9 profiling artefacts
+bench/perf.data
+bench/perf.data.old
+bench/perf_report.txt
+bench/callgrind.out
+bench/profile_top.md

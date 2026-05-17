@@ -1,0 +1,6 @@
+       Begin testset "parsenumber"
+ 100 - parsing 10000 small integers................................  TIME
+ 110 - parsing 10000 large integers................................  TIME
+ 200 - parsing 10000 small reals...................................  TIME
+ 210 - parsing 10000 large reals...................................  TIME
+       TOTAL.......................................................  TIME

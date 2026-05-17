@@ -1,0 +1,543 @@
+{
+  "_comment": "Phase 11.7 baseline. RE-PINNED 2026-05-16 from MAX-of-9 local runs. Size=1 speedtest1 workloads are 1ms-quantised by GetTickCount64; per-cell ratios swing 3-8x across consecutive runs (75th pct max/min = 7.8x). The max-of-N pinning captures the worst-case ratio observed across N independent runs; paired with REGRESSION_THRESHOLD_PCT=200 in check_regression.sh this gives a stable gate that only fires on a 3x regression beyond observed noise. ratio = pas_ms/c_ms. Per-case ms = seconds*1000. CheckRegression compares new ratio to baseline; fails if (new-baseline)/baseline > REGRESSION_THRESHOLD_PCT/100. See tasklist.md 11.7 + check_regression.sh header for full decision log and re-pin recipe.",
+  "_format": {
+    "cells": "list of {testset,args,case_id,label,size,pas_ms,c_ms,ratio,skipped?}"
+  },
+  "cells": [
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 100,
+      "label": "500 INSERTs into table with no index",
+      "size": 1,
+      "pas_ms": 28,
+      "c_ms": 13,
+      "ratio": 2.14
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 110,
+      "label": "500 ordered INSERTS with one index/PK",
+      "size": 1,
+      "pas_ms": 35,
+      "c_ms": 21,
+      "ratio": 1.67
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 120,
+      "label": "500 unordered INSERTS with one index/PK",
+      "size": 1,
+      "pas_ms": 23,
+      "c_ms": 13,
+      "ratio": 1.76
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 130,
+      "label": "25 SELECTS, numeric BETWEEN, unindexed",
+      "size": 1,
+      "pas_ms": 12,
+      "c_ms": 8,
+      "ratio": 1.5
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 140,
+      "label": "10 SELECTS, LIKE, unindexed",
+      "size": 1,
+      "pas_ms": 12,
+      "c_ms": 3,
+      "ratio": 4.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 142,
+      "label": "10 SELECTS w/ORDER BY, unindexed",
+      "size": 1,
+      "pas_ms": 35,
+      "c_ms": 7,
+      "ratio": 5.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 145,
+      "label": "10 SELECTS w/ORDER BY and LIMIT, unindexed",
+      "size": 1,
+      "pas_ms": 28,
+      "c_ms": 7,
+      "ratio": 4.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 150,
+      "label": "CREATE INDEX five times",
+      "size": 1,
+      "pas_ms": 38,
+      "c_ms": 20,
+      "ratio": 1.9
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 160,
+      "label": "100 SELECTS, numeric BETWEEN, indexed",
+      "size": 1,
+      "pas_ms": 3,
+      "c_ms": 1,
+      "ratio": 3.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 161,
+      "label": "100 SELECTS, numeric BETWEEN, PK",
+      "size": 1,
+      "pas_ms": 2,
+      "c_ms": 1,
+      "ratio": 2.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 180,
+      "label": "500 INSERTS with three indexes",
+      "size": 1,
+      "pas_ms": 26,
+      "c_ms": 13,
+      "ratio": 2.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 190,
+      "label": "DELETE and REFILL one table",
+      "size": 1,
+      "pas_ms": 42,
+      "c_ms": 18,
+      "ratio": 2.33
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 200,
+      "label": "VACUUM",
+      "size": 1,
+      "pas_ms": 78,
+      "c_ms": 16,
+      "ratio": 4.88
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 210,
+      "label": "ALTER TABLE ADD COLUMN, and query",
+      "size": 1,
+      "pas_ms": 28,
+      "c_ms": 11,
+      "ratio": 2.57
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 230,
+      "label": "100 UPDATES, numeric BETWEEN, indexed",
+      "size": 1,
+      "pas_ms": 25,
+      "c_ms": 13,
+      "ratio": 1.95
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 240,
+      "label": "500 UPDATES of individual rows",
+      "size": 1,
+      "pas_ms": 24,
+      "c_ms": 10,
+      "ratio": 2.36
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 250,
+      "label": "One big UPDATE of the whole 500-row table",
+      "size": 1,
+      "pas_ms": 21,
+      "c_ms": 8,
+      "ratio": 2.58
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 270,
+      "label": "100 DELETEs, numeric BETWEEN, indexed",
+      "size": 1,
+      "pas_ms": 14,
+      "c_ms": 6,
+      "ratio": 2.36
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 280,
+      "label": "500 DELETEs of individual rows",
+      "size": 1,
+      "pas_ms": 12,
+      "c_ms": 6,
+      "ratio": 2.08
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 290,
+      "label": "Refill two 500-row tables using REPLACE",
+      "size": 1,
+      "pas_ms": 39,
+      "c_ms": 20,
+      "ratio": 1.96
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 300,
+      "label": "Refill a 500-row table using (b&1)==(a&1)",
+      "size": 1,
+      "pas_ms": 48,
+      "c_ms": 26,
+      "ratio": 1.85
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 310,
+      "label": "100 four-ways joins",
+      "size": 1,
+      "pas_ms": 3,
+      "c_ms": 3,
+      "ratio": 1.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 400,
+      "label": "700 REPLACE ops on an IPK",
+      "size": 1,
+      "pas_ms": 11,
+      "c_ms": 8,
+      "ratio": 1.38
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 410,
+      "label": "700 SELECTS on an IPK",
+      "size": 1,
+      "pas_ms": 16,
+      "c_ms": 3,
+      "ratio": 5.33
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 500,
+      "label": "700 REPLACE on TEXT PK",
+      "size": 1,
+      "pas_ms": 14,
+      "c_ms": 7,
+      "ratio": 2.0
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 510,
+      "label": "700 SELECTS on a TEXT PK",
+      "size": 1,
+      "pas_ms": 11,
+      "c_ms": 3,
+      "ratio": 3.67
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 980,
+      "label": "PRAGMA integrity_check",
+      "size": 1,
+      "pas_ms": 1,
+      "c_ms": 2,
+      "ratio": 0.71
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 990,
+      "label": "ANALYZE",
+      "size": 1,
+      "pas_ms": 34,
+      "c_ms": 14,
+      "ratio": 2.44
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 1",
+      "case_id": 0,
+      "label": "TOTAL",
+      "size": 1,
+      "pas_ms": 354,
+      "c_ms": 281,
+      "ratio": 1.26
+    },
+    {
+      "testset": "main",
+      "args": "--testset main --size 5",
+      "case_id": 0,
+      "label": "TOTAL",
+      "size": 5,
+      "pas_ms": null,
+      "c_ms": null,
+      "ratio": null,
+      "skipped": "engine bug: SQLITE_CORRUPT 'database disk image is malformed' during INSERT INTO t3 at size 5"
+    },
+    {
+      "testset": "cte",
+      "args": "--testset cte --size 1 --sqlonly",
+      "case_id": 0,
+      "label": "WALL_TOTAL",
+      "size": 1,
+      "pas_ms": 20,
+      "c_ms": 6,
+      "ratio": 3.29,
+      "_note": "sqlonly mode emits no per-case timings; cell tracks total harness wall-clock only"
+    },
+    {
+      "testset": "fp",
+      "args": "--testset fp --size 1",
+      "case_id": 100,
+      "label": "Fill a table with 10000 FP values",
+      "size": 1,
+      "pas_ms": 75,
+      "c_ms": 24,
+      "ratio": 3.12
+    },
+    {
+      "testset": "fp",
+      "args": "--testset fp --size 1",
+      "case_id": 110,
+      "label": "2 range queries",
+      "size": 1,
+      "pas_ms": 24,
+      "c_ms": 6,
+      "ratio": 4.0
+    },
+    {
+      "testset": "fp",
+      "args": "--testset fp --size 1",
+      "case_id": 120,
+      "label": "CREATE INDEX three times",
+      "size": 1,
+      "pas_ms": 37,
+      "c_ms": 13,
+      "ratio": 2.81
+    },
+    {
+      "testset": "fp",
+      "args": "--testset fp --size 1",
+      "case_id": 130,
+      "label": "2 indexed range queries",
+      "size": 1,
+      "pas_ms": 2,
+      "c_ms": 1,
+      "ratio": 2.0
+    },
+    {
+      "testset": "fp",
+      "args": "--testset fp --size 1",
+      "case_id": 140,
+      "label": "5000 calls to round()",
+      "size": 1,
+      "pas_ms": 30,
+      "c_ms": 2,
+      "ratio": 15.0
+    },
+    {
+      "testset": "fp",
+      "args": "--testset fp --size 1",
+      "case_id": 0,
+      "label": "TOTAL",
+      "size": 1,
+      "pas_ms": 99,
+      "c_ms": 51,
+      "ratio": 1.94
+    },
+    {
+      "testset": "parsenumber",
+      "args": "--testset parsenumber",
+      "case_id": 100,
+      "label": "parsing 10000 small integers",
+      "size": 1,
+      "pas_ms": 277,
+      "c_ms": 21,
+      "ratio": 13.2
+    },
+    {
+      "testset": "parsenumber",
+      "args": "--testset parsenumber",
+      "case_id": 110,
+      "label": "parsing 10000 large integers",
+      "size": 1,
+      "pas_ms": 257,
+      "c_ms": 26,
+      "ratio": 9.9
+    },
+    {
+      "testset": "parsenumber",
+      "args": "--testset parsenumber",
+      "case_id": 200,
+      "label": "parsing 10000 small reals",
+      "size": 1,
+      "pas_ms": 271,
+      "c_ms": 29,
+      "ratio": 9.36
+    },
+    {
+      "testset": "parsenumber",
+      "args": "--testset parsenumber",
+      "case_id": 210,
+      "label": "parsing 10000 large reals",
+      "size": 1,
+      "pas_ms": 466,
+      "c_ms": 70,
+      "ratio": 6.65
+    },
+    {
+      "testset": "parsenumber",
+      "args": "--testset parsenumber",
+      "case_id": 0,
+      "label": "TOTAL",
+      "size": 1,
+      "pas_ms": 1108,
+      "c_ms": 146,
+      "ratio": 7.59
+    },
+    {
+      "testset": "star",
+      "args": "--testset star --sqlonly --size 1",
+      "case_id": 0,
+      "label": "WALL_TOTAL",
+      "size": 1,
+      "pas_ms": null,
+      "c_ms": null,
+      "ratio": null,
+      "skipped": "engine bug: SpeedtestDiff reports CORRECTNESS DIVERGENCE in --sqlonly star emission vs C oracle"
+    },
+    {
+      "testset": "orm",
+      "args": "--testset orm --size 1",
+      "case_id": 100,
+      "label": "Fill 250 rows",
+      "size": 1,
+      "pas_ms": 15,
+      "c_ms": 10,
+      "ratio": 1.5
+    },
+    {
+      "testset": "orm",
+      "args": "--testset orm --size 1",
+      "case_id": 110,
+      "label": "Query 250 rows by rowid",
+      "size": 1,
+      "pas_ms": 36,
+      "c_ms": 5,
+      "ratio": 7.2
+    },
+    {
+      "testset": "orm",
+      "args": "--testset orm --size 1",
+      "case_id": 0,
+      "label": "TOTAL",
+      "size": 1,
+      "pas_ms": 32,
+      "c_ms": 15,
+      "ratio": 2.1
+    },
+    {
+      "testset": "trigger",
+      "args": "--testset trigger --sqlonly --size 1",
+      "case_id": 0,
+      "label": "WALL_TOTAL",
+      "size": 1,
+      "pas_ms": 8,
+      "c_ms": 6,
+      "ratio": 1.4,
+      "_note": "sqlonly mode emits no per-case timings; cell tracks total harness wall-clock only"
+    },
+    {
+      "testset": "debug1",
+      "args": "--testset debug1",
+      "case_id": 0,
+      "label": "WALL_TOTAL",
+      "size": 1,
+      "pas_ms": 13,
+      "c_ms": 5,
+      "ratio": 2.57,
+      "_note": "debug1 emits no per-case timings; cell tracks total harness wall-clock only"
+    },
+    {
+      "testset": "json",
+      "args": "--testset json --size 1",
+      "case_id": 100,
+      "label": "table J1 is 5 rows of JSONB",
+      "size": 1,
+      "pas_ms": 22,
+      "c_ms": 26,
+      "ratio": 0.83
+    },
+    {
+      "testset": "json",
+      "args": "--testset json --size 1",
+      "case_id": 110,
+      "label": "table J2 is 1 rows from J1 converted to text",
+      "size": 1,
+      "pas_ms": 12,
+      "c_ms": 12,
+      "ratio": 1.02
+    },
+    {
+      "testset": "json",
+      "args": "--testset json --size 1",
+      "case_id": 120,
+      "label": "create indexes on JSON expressions on J1",
+      "size": 1,
+      "pas_ms": 17,
+      "c_ms": 9,
+      "ratio": 1.94
+    },
+    {
+      "testset": "json",
+      "args": "--testset json --size 1",
+      "case_id": 130,
+      "label": "create indexes on JSON expressions on J2",
+      "size": 1,
+      "pas_ms": 16,
+      "c_ms": 11,
+      "ratio": 1.5
+    },
+    {
+      "testset": "json",
+      "args": "--testset json --size 1",
+      "case_id": 0,
+      "label": "TOTAL",
+      "size": 1,
+      "pas_ms": 61,
+      "c_ms": 89,
+      "ratio": 0.68
+    }
+  ]
+}

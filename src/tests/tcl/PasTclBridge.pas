@@ -159,6 +159,11 @@ procedure Tcl_GetVersion(major, minor, patchLevel, releaseType: pcint);
   Used by register_dbstat_vtab (test1.c:8601) to recover the SqliteDb*. }
 function Tcl_GetCommandInfo(interp: PTclInterp; cmdName: PChar;
   infoPtr: PTclCmdInfo): cint; cdecl; external 'tcl8.6';
+function Tcl_SetCommandInfo(interp: PTclInterp; cmdName: PChar;
+  infoPtr: PTclCmdInfo): cint; cdecl; external 'tcl8.6';
+{ tcl.h — Tcl_AppendElement appends a properly-list-quoted element. }
+procedure Tcl_AppendElement(interp: PTclInterp; element: PChar);
+  cdecl; external 'tcl8.6';
 
 { Command teardown.  tclsqlite.c:2744 (Tcl_DeleteCommand by name in
   the DB_CLOSE arm of DbObjCmd); token form is the modern API.  Both
@@ -242,6 +247,10 @@ procedure Tcl_BackgroundError(interp: PTclInterp); cdecl; external 'tcl8.6';
 
 { Tcl_Obj -> primitive accessors.  tclsqlite.c:874, :1138, :1146. }
 function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): cint; cdecl; external 'tcl8.6';
+{ String-arg accessors — used by the old-style argc/argv handlers in
+  test1.c (sqlite3_mprintf_int etc.). }
+function Tcl_GetInt(interp: PTclInterp; src: PAnsiChar; intPtr: pcint): cint; cdecl; external 'tcl8.6';
+function Tcl_GetDouble(interp: PTclInterp; src: PAnsiChar; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
 function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';
 function Tcl_GetDoubleFromObj(interp: PTclInterp; objPtr: PTclObj; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
 function Tcl_GetBooleanFromObj(interp: PTclInterp; objPtr: PTclObj; boolPtr: pcint): cint; cdecl; external 'tcl8.6';
@@ -288,6 +297,13 @@ function  Tcl_DStringAppend(dsPtr: PTclDString; bytes: PChar; length: cint): PCh
 function  Tcl_DStringAppendElement(dsPtr: PTclDString; element: PChar): PChar; cdecl; external 'tcl8.6';
 procedure Tcl_DStringFree(dsPtr: PTclDString); cdecl; external 'tcl8.6';
 function  Tcl_DStringValue(dsPtr: PTclDString): PChar; inline;
+{ Tcl_TranslateFileName — Tcl 8.6.  Expands ~user/ etc.; on success returns
+  a pointer into bufferPtr (which the caller must Tcl_DStringFree).  On
+  error returns nil and leaves a message in interp.  Mirrors C usage at
+  tclsqlite.c:4378. }
+function  Tcl_TranslateFileName(interp: PTclInterp; name: PChar;
+                                bufferPtr: PTclDString): PChar;
+                                cdecl; external 'tcl8.6';
 
 { ----------------------------------------------------------------------
   Tcl I/O channels — used by the DB_COPY arm of DbObjCmd

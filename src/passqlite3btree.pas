@@ -320,9 +320,9 @@ function  CORRUPT_PAGE(pPage: PMemPage): i32; inline;
 { Cell parsing }
 procedure btreeParseCellAdjustSizeForOverflow(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
 function  btreePayloadToLocal(pPage: PMemPage; nPayload: i64): i32;
-procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
-procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
-procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
+procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
+procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 procedure btreeParseCell(pPage: PMemPage; iCell: i32; pInfo: PCellInfo);
 
 { Cell size }
@@ -338,7 +338,7 @@ function  findCellPastPtr(pPage: PMemPage; i: i32): Pu8; inline;
 { Free-space and page management }
 function  pageFindSlot(pPg: PMemPage; nByte: i32; out pRc: i32): Pu8;
 function  allocateSpace(pPage: PMemPage; nByte: i32; out pIdx: i32): i32;
-function  freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32;
+function  freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32; inline;
 function  defragmentPage(pPage: PMemPage; nMaxFrag: i32): i32;
 function  decodeFlags(pPage: PMemPage; flagByte: i32): i32;
 function  btreeComputeFreeSpace(pPage: PMemPage): i32;
@@ -897,7 +897,7 @@ end;
   btreeParseCellPtrNoPayload  — table btree interior nodes
   btree.c lines 1242-1258
   =========================================================================== }
-procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+procedure btreeParseCellPtrNoPayload(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 var
   nBytes: i32;
   iKey  : u64;
@@ -915,7 +915,11 @@ end;
   btreeParseCellPtr  — table btree leaf nodes
   btree.c lines 1259-1346
   =========================================================================== }
-procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+{ NOTE: every hot call site dispatches through pPage^.xParseCell function
+  pointer; FPC cannot inline through indirect calls.  The `inline;` directive
+  is harmless (FPC emits an out-of-line body for the @-taken procvar at
+  setup time) and lets any future direct caller benefit. }
+procedure btreeParseCellPtr(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 var
   pIter   : Pu8;
   nPayload: u64;
@@ -993,7 +997,7 @@ end;
   btreeParseCellPtrIndex  — index btree nodes (interior and leaf)
   btree.c lines 1347-1385
   =========================================================================== }
-procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo);
+procedure btreeParseCellPtrIndex(pPage: PMemPage; pCell: Pu8; pInfo: PCellInfo); inline;
 var
   pIter   : Pu8;
   nPayload: u32;
@@ -1281,7 +1285,7 @@ end;
   freeSpace
   btree.c lines 1918-2013
   =========================================================================== }
-function freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32;
+function freeSpace(pPage: PMemPage; iStart: i32; iSize: i32): i32; inline;
 var
   iPtr    : i32;
   iFreeBlk: i32;
@@ -2919,6 +2923,13 @@ var
   pCell  : Pu8;
   nCellKey: i64;
   rawKey : u64;
+  { 12.2.candidate.4: cache hot pPage^ fields in locals so FPC does not
+    re-deref through pPage every loop iteration.  Refreshed each outer
+    iteration immediately after pPage := pCur^.pPage. }
+  aData   : Pu8;
+  aDataO  : Pu8;   { aDataOfst — used by findCellPastPtr inline }
+  aCellI  : Pu8;   { aCellIdx  — used by findCellPastPtr inline }
+  mskPage : u16;   { maskPage }
 label
   moveto_table_next_layer, moveto_table_finish;
 begin
@@ -2954,6 +2965,11 @@ begin
   c := 0;
   while True do begin
     pPage := pCur^.pPage;
+    { Refresh cached locals — pPage may have changed via moveToChild. }
+    aData   := pPage^.aData;
+    aDataO  := pPage^.aDataOfst;
+    aCellI  := pPage^.aCellIdx;
+    mskPage := pPage^.maskPage;
     lwr := 0;
     upr := pPage^.nCell - 1;
     if biasRight <> 0 then
@@ -2962,7 +2978,8 @@ begin
       idx := upr shr 1;
 
     while True do begin
-      pCell := findCellPastPtr(pPage, idx);
+      { Inlined findCellPastPtr(pPage, idx) using cached locals. }
+      pCell := aDataO + (mskPage and u16(get2byteAligned(aCellI + 2*idx)));
       if pPage^.intKeyLeaf <> 0 then begin
         { Skip the payload length varint }
         while (pCell[0] and $80 <> 0) do begin
@@ -3010,9 +3027,10 @@ begin
 
 moveto_table_next_layer:
     if lwr >= pPage^.nCell then
-      chldPg := get4byte(pPage^.aData + pPage^.hdrOffset + 8)
+      chldPg := get4byte(aData + pPage^.hdrOffset + 8)
     else
-      chldPg := get4byte(findCell(pPage, lwr));
+      { Inlined findCell(pPage, lwr) using cached locals. }
+      chldPg := get4byte(aData + (mskPage and u16(get2byteAligned(aCellI + 2*lwr))));
     pCur^.ix := u16(lwr);
     rc := moveToChild(pCur, chldPg);
     if rc <> SQLITE_OK then begin
@@ -3393,8 +3411,215 @@ begin
   Result := pIdxKey^.default_rc;
 end;
 
-function sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
+{ ---------------------------------------------------------------------------
+  vdbeRecordCompareInt — specialised comparator for single-leading-integer
+  keys.  Port of vdbeaux.c:4971..5058 (sqlite3VdbeRecordCompareInt).  Used
+  via sqlite3VdbeFindCompare when the first key field is an integer.
+  --------------------------------------------------------------------------- }
+function vdbeRecordCompareInt(nKey1: i32; pKey1: Pointer;
+                              pPKey2: PUnpackedRecord): i32;
+var
+  aKey:        Pu8;
+  serial_type: i32;
+  y:           u32;
+  x:           u64;
+  v, lhs:      i64;
+  pRhs:        PBtMemView;
 begin
+  aKey := Pu8(pKey1);
+  { *(const u8*)pKey1 & 0x3F  is the szHdr (header always single-byte here) }
+  aKey := Pu8(PByte(pKey1) + (aKey[0] and $3F));
+  serial_type := i32(Pu8(pKey1)[1]);
+  case serial_type of
+    1: { 1-byte signed int }
+      lhs := i64(i8(aKey[0]));
+    2: { 2-byte signed int }
+      lhs := i64(i16((u16(aKey[0]) shl 8) or u16(aKey[1])));
+    3: { 3-byte signed int }
+      begin
+        y := (u32(aKey[0]) shl 16) or (u32(aKey[1]) shl 8) or u32(aKey[2]);
+        if (y and $00800000) <> 0 then y := y or $FF000000;
+        lhs := i64(i32(y));
+      end;
+    4: { 4-byte signed int }
+      begin
+        y := (u32(aKey[0]) shl 24) or (u32(aKey[1]) shl 16)
+          or (u32(aKey[2]) shl 8)  or  u32(aKey[3]);
+        lhs := i64(i32(y));
+      end;
+    5: { 6-byte signed int }
+      begin
+        lhs := (i64((u32(aKey[2]) shl 24) or (u32(aKey[3]) shl 16)
+                  or (u32(aKey[4]) shl 8)  or  u32(aKey[5])) and i64($FFFFFFFF))
+             + (i64(i16((u16(aKey[0]) shl 8) or u16(aKey[1]))) shl 32);
+      end;
+    6: { 8-byte signed int }
+      begin
+        x := (u64(aKey[0]) shl 56) or (u64(aKey[1]) shl 48)
+          or (u64(aKey[2]) shl 40) or (u64(aKey[3]) shl 32)
+          or (u64(aKey[4]) shl 24) or (u64(aKey[5]) shl 16)
+          or (u64(aKey[6]) shl 8)  or  u64(aKey[7]);
+        lhs := i64(x);
+      end;
+    8: lhs := 0;
+    9: lhs := 1;
+  else
+    { Cases 0/7 and >9: fall back to generic comparator (handles NULL,
+      REAL, TEXT, BLOB at column 0). }
+    Result := sqlite3VdbeRecordCompare(nKey1, pKey1, pPKey2);
+    Exit;
+  end;
+
+  pRhs := PBtMemView(pPKey2^.aMem);
+  v := pRhs^.u_i;  { pPKey2->u.i == pPKey2->aMem[0].u.i (asserted in C) }
+  if v > lhs then
+    Result := pPKey2^.r1
+  else if v < lhs then
+    Result := pPKey2^.r2
+  else begin
+    { First fields equal — fall back to generic for trailing-field compare
+      (Pas merged WithSkip into the generic comparator; we lose only the
+      bSkip=1 micro-optimisation, correctness is preserved because the
+      first-int comparison will yield 0 again and the generic walks on). }
+    if pPKey2^.nField > 1 then
+      Result := sqlite3VdbeRecordCompare(nKey1, pKey1, pPKey2)
+    else begin
+      Result := pPKey2^.default_rc;
+      pPKey2^.eqSeen := 1;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  vdbeRecordCompareString — specialised comparator for single-leading-BINARY
+  string keys.  Port of vdbeaux.c:5066..5129 (sqlite3VdbeRecordCompareString).
+  --------------------------------------------------------------------------- }
+function vdbeRecordCompareString(nKey1: i32; pKey1: Pointer;
+                                 pPKey2: PUnpackedRecord): i32;
+var
+  aKey1:       Pu8;
+  serial_type: i32;
+  res:         i32;
+  nCmp, nStr: i32;
+  szHdr:       i32;
+  vTmp32:      u32;
+  c:           i32;
+begin
+  aKey1 := Pu8(pKey1);
+  serial_type := i32(i8(aKey1[1]));   { signed: negative => multibyte varint }
+
+  { Inlined vrcs_restart loop: re-fetch the serial_type as an unsigned
+    varint if the signed byte was negative; if the decoded type is still
+    < 12 here it's a number/NULL (CORRUPT_DB caveat per C). }
+  if (serial_type < 0) then begin
+    sqlite3GetVarint32(@aKey1[1], vTmp32);
+    serial_type := i32(vTmp32);
+  end;
+
+  if serial_type < 12 then begin
+    res := pPKey2^.r1;  { (pKey1) is a number or NULL — sorts before strings }
+  end
+  else if (serial_type and 1) = 0 then begin
+    res := pPKey2^.r2;  { (pKey1) is a blob — sorts after strings }
+  end
+  else begin
+    szHdr := i32(aKey1[0]);
+    nStr  := (serial_type - 12) div 2;
+    if (szHdr + nStr) > nKey1 then begin
+      pPKey2^.errCode := SQLITE_CORRUPT_BKPT;
+      Result := 0;
+      Exit;
+    end;
+    if pPKey2^.n < nStr then nCmp := pPKey2^.n else nCmp := nStr;
+    if nCmp > 0 then
+      c := CompareByte((@aKey1[szHdr])^, pPKey2^.u.z^, nCmp)
+    else
+      c := 0;
+    if c > 0 then
+      res := pPKey2^.r2
+    else if c < 0 then
+      res := pPKey2^.r1
+    else begin
+      res := nStr - pPKey2^.n;
+      if res = 0 then begin
+        if pPKey2^.nField > 1 then
+          { No WithSkip in Pas — generic re-compares col 0 (same string,
+            yields 0) then proceeds to trailing fields.  Correct, slightly
+            slower than C's bSkip=1 path. }
+          res := sqlite3VdbeRecordCompare(nKey1, pKey1, pPKey2)
+        else begin
+          res := pPKey2^.default_rc;
+          pPKey2^.eqSeen := 1;
+        end;
+      end
+      else if res > 0 then
+        res := pPKey2^.r2
+      else
+        res := pPKey2^.r1;
+    end;
+  end;
+  Result := res;
+end;
+
+function sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
+const
+  BT_KEYINFO_ORDER_DESC    = 1;
+  BT_KEYINFO_ORDER_BIGNULL = 2;
+var
+  pKI:        PByte;
+  nAllField:  u16;
+  pSortFlags: Pu8;
+  pAColl:     PPointer;
+  pMem0:      PBtMemView;
+  flags:      u16;
+  sortFlag0:  u8;
+begin
+  pKI := PByte(pIdxKey^.pKeyInfo);
+  if pKI = nil then begin
+    Result := @sqlite3VdbeRecordCompare;
+    Exit;
+  end;
+  { nAllField at offset 8 in TKeyInfo. }
+  nAllField := PWord(pKI + 8)^;
+  if nAllField <= 13 then begin
+    pMem0 := PBtMemView(pIdxKey^.aMem);
+    flags := pMem0^.flags;
+    { aSortFlags Pu8 at offset 24 in TKeyInfo. }
+    pSortFlags := Pu8(PPointer(pKI + 24)^);
+    sortFlag0 := 0;
+    if pSortFlags <> nil then sortFlag0 := pSortFlags[0];
+    if sortFlag0 <> 0 then begin
+      if (sortFlag0 and BT_KEYINFO_ORDER_BIGNULL) <> 0 then begin
+        Result := @sqlite3VdbeRecordCompare;
+        Exit;
+      end;
+      pIdxKey^.r1 :=  1;
+      pIdxKey^.r2 := -1;
+    end
+    else begin
+      pIdxKey^.r1 := -1;
+      pIdxKey^.r2 :=  1;
+    end;
+
+    if (flags and BT_MEM_Int) <> 0 then begin
+      pIdxKey^.u.i := pMem0^.u_i;
+      Result := @vdbeRecordCompareInt;
+      Exit;
+    end;
+
+    { aColl[0] lives at offset 32 (after TKeyInfo struct).  BINARY = nil. }
+    pAColl := PPointer(pKI + 32);
+    if ((flags and (BT_MEM_Real or BT_MEM_IntReal
+                    or BT_MEM_Null or BT_MEM_Blob)) = 0)
+       and (pAColl[0] = nil) then begin
+      { flags & MEM_Str asserted by elimination. }
+      pIdxKey^.u.z := pMem0^.z;
+      pIdxKey^.n   := pMem0^.n;
+      Result := @vdbeRecordCompareString;
+      Exit;
+    end;
+  end;
+
   Result := @sqlite3VdbeRecordCompare;
 end;
 
@@ -3463,6 +3688,12 @@ var
   pCellBody     : Pu8;
   nOverrun      : i32;
   bOvfl         : Boolean;
+  { 12.2.candidate.3: cache hot pPage^ fields in locals; refreshed each
+    outer iteration immediately after pPage := pCur^.pPage. }
+  aData   : Pu8;
+  aDataO  : Pu8;
+  aCellI  : Pu8;
+  mskPage : u16;
 label
   bypass_moveto_root, moveto_index_finish;
 begin
@@ -3530,12 +3761,18 @@ bypass_moveto_root:
   c := 0;
   while True do begin
     pPage := pCur^.pPage;
+    { Refresh cached locals — pPage may change when descending into a child. }
+    aData   := pPage^.aData;
+    aDataO  := pPage^.aDataOfst;
+    aCellI  := pPage^.aCellIdx;
+    mskPage := pPage^.maskPage;
     lwr := 0;
     upr := pPage^.nCell - 1;
     idx := upr shr 1;
 
     while True do begin
-      pCell := findCellPastPtr(pPage, idx);
+      { Inlined findCellPastPtr(pPage, idx) using cached locals. }
+      pCell := aDataO + (mskPage and u16(get2byteAligned(aCellI + 2*idx)));
       nCell := pCell[0];
       bOvfl := False;
       if nCell <= pPage^.max1bytePayload then begin
@@ -3597,9 +3834,10 @@ bypass_moveto_root:
     end;
 
     if lwr >= pPage^.nCell then
-      chldPg := get4byte(pPage^.aData + pPage^.hdrOffset + 8)
+      chldPg := get4byte(aData + pPage^.hdrOffset + 8)
     else
-      chldPg := get4byte(findCell(pPage, lwr));
+      { Inlined findCell(pPage, lwr) using cached locals. }
+      chldPg := get4byte(aData + (mskPage and u16(get2byteAligned(aCellI + 2*lwr))));
 
     pCur^.info.nSize := 0;
     pCur^.curFlags := pCur^.curFlags and (not (BTCF_ValidNKey or BTCF_ValidOvfl));
@@ -8323,13 +8561,19 @@ begin
     sqlite3PagerUnref(pOvflPage);
   end;
   if (nIn <> 0) and (nErrAtStart = pCheck^.nErr) then begin
+    { btree.c:10768 — C computes `expected-N` with both as u32, so over-
+      counting (N decremented past zero) wraps mod 2^32 and %u prints
+      the wrapped 32-bit value (e.g. expected=2, N=u32(-1) → diff=3).
+      FPC widens u32-u32 to 64 bits in array-of-const, so without an
+      explicit mask we print 18446744069414584323 instead of 3
+      (9.4.divbug.88.012 corrupt2-14.3/.5). }
     if isFreeList <> 0 then
       checkAppendMsg(pCheck, 'size is %u but should be %u',
-                     [expected - nIn, expected])
+                     [u32((expected - nIn) and $FFFFFFFF), expected])
     else
       checkAppendMsg(pCheck,
                      'overflow list length is %u but should be %u',
-                     [expected - nIn, expected]);
+                     [u32((expected - nIn) and $FFFFFFFF), expected]);
   end;
 end;
 

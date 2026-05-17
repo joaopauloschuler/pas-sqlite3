@@ -363,6 +363,13 @@ type
     pParse:     Pointer;                               { %extra_context — PParse }
     yystackEnd: PyyStackEntry;                         { last entry in stack }
     yystack:    PyyStackEntry;                         { the parser stack base }
+    { 9.4.divbug.80 — Track the most-recently-reduced DELETE/UPDATE arm
+      so yy_syntax_error can emit the SQLite "ORDER BY without LIMIT on
+      DELETE/UPDATE" message instead of a bare "near ORDER" when the
+      grammar (built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT) rejects
+      a trailing ORDER BY / LIMIT.  0 = none; 152 = DELETE arm,
+      159 = UPDATE arm.  Cleared on shift. }
+    lastDmlRule: u32;
     yystk0:     array[0..YYSTACKDEPTH-1] of yyStackEntry; { initial stack space }
   end;
   PyyParser = ^yyParser;
@@ -892,19 +899,32 @@ begin
         tokenType^ := TK_DOT;
         Result := 1; Exit;
       end;
-      { z[0]='.' followed by digits — a float like .5 }
+      { z[0]='.' followed by digits — a float like .5.
+        Port of tokenize.c:421..497 (CC_DOT fall-through into CC_DIGIT).
+        '_' between digits flips tokenType to TK_QNUMBER (SQLite 3.46+). }
       tokenType^ := TK_FLOAT;
       i := 1;
-      while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+      while True do begin
+        if sqlite3Isdigit(z[i]) = 0 then begin
+          if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+          else Break;
+        end;
+        Inc(i);
+      end;
       { optional exponent }
       if (z[i] = Ord('e')) or (z[i] = Ord('E')) then begin
-        if sqlite3Isdigit(z[i+1]) <> 0 then begin
-          Inc(i, 2);
-          while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
-        end else if ((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
-                    (sqlite3Isdigit(z[i+2]) <> 0) then begin
-          Inc(i, 3);
-          while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+        if (sqlite3Isdigit(z[i+1]) <> 0)
+           or (((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
+               (sqlite3Isdigit(z[i+2]) <> 0)) then begin
+          if sqlite3Isdigit(z[i+1]) <> 0 then Inc(i, 2)
+          else Inc(i, 3);
+          while True do begin
+            if sqlite3Isdigit(z[i]) = 0 then begin
+              if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+              else Break;
+            end;
+            Inc(i);
+          end;
         end;
       end;
       while sqlite3IsIdChar(z[i]) <> 0 do begin
@@ -915,33 +935,58 @@ begin
     end;
 
     CC_DIGIT: begin
+      { Port of tokenize.c:433..497.  '_' digit-separator (SQLite 3.46+)
+        between digits/xdigits flips tokenType to TK_QNUMBER.  The literal
+        is later dequoted via sqlite3DequoteNumber before AtoF/AtoI. }
       tokenType^ := TK_INTEGER;
       { Hex literal? }
       if (z[0] = Ord('0')) and
          ((z[1] = Ord('x')) or (z[1] = Ord('X'))) and
          (sqlite3Isxdigit(z[2]) <> 0) then begin
         i := 3;
-        while sqlite3Isxdigit(z[i]) <> 0 do Inc(i);
+        while True do begin
+          if sqlite3Isxdigit(z[i]) = 0 then begin
+            if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+            else Break;
+          end;
+          Inc(i);
+        end;
       end else begin
         i := 0;
-        while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+        while True do begin
+          if sqlite3Isdigit(z[i]) = 0 then begin
+            if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+            else Break;
+          end;
+          Inc(i);
+        end;
         { Decimal point? }
         if z[i] = Ord('.') then begin
-          tokenType^ := TK_FLOAT;
+          if tokenType^ = TK_INTEGER then tokenType^ := TK_FLOAT;
           Inc(i);
-          while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+          while True do begin
+            if sqlite3Isdigit(z[i]) = 0 then begin
+              if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+              else Break;
+            end;
+            Inc(i);
+          end;
         end;
         { Exponent? }
         if ((z[i] = Ord('e')) or (z[i] = Ord('E'))) then begin
-          if sqlite3Isdigit(z[i+1]) <> 0 then begin
+          if (sqlite3Isdigit(z[i+1]) <> 0)
+             or (((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
+                 (sqlite3Isdigit(z[i+2]) <> 0)) then begin
             if tokenType^ = TK_INTEGER then tokenType^ := TK_FLOAT;
-            Inc(i, 2);
-            while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
-          end else if ((z[i+1] = Ord('+')) or (z[i+1] = Ord('-'))) and
-                      (sqlite3Isdigit(z[i+2]) <> 0) then begin
-            if tokenType^ = TK_INTEGER then tokenType^ := TK_FLOAT;
-            Inc(i, 3);
-            while sqlite3Isdigit(z[i]) <> 0 do Inc(i);
+            if sqlite3Isdigit(z[i+1]) <> 0 then Inc(i, 2)
+            else Inc(i, 3);
+            while True do begin
+              if sqlite3Isdigit(z[i]) = 0 then begin
+                if z[i] = Ord('_') then tokenType^ := TK_QNUMBER
+                else Break;
+              end;
+              Inc(i);
+            end;
           end;
         end;
       end;
@@ -1183,8 +1228,17 @@ procedure runParser_free(p: Pointer); external 'c' name 'free';
   sqlite3ErrStr[] verbatim).  Local name avoids clashing with the
   vdbe-side symbol when both are in the same final binary. }
 function runParser_errStr(rc: i32): PAnsiChar;
+{ 9.4.divbug.71: handle extended SQLITE_ABORT_ROLLBACK before mask-and-lookup,
+  matching main.c:1648.  Previously the bare-value case statement neither
+  matched the extended code nor any primary code, so callers reported
+  "unknown error" for aborted-stmt rollbacks. }
 begin
   case rc of
+    SQLITE_ABORT_ROLLBACK: begin Result := 'abort due to ROLLBACK'; Exit; end;
+    SQLITE_ROW:            begin Result := 'another row available'; Exit; end;
+    SQLITE_DONE:           begin Result := 'no more rows available'; Exit; end;
+  end;
+  case (rc and $FF) of
     SQLITE_OK:        Result := 'not an error';
     SQLITE_ERROR:     Result := 'SQL logic error';
     SQLITE_INTERNAL:  Result := 'internal SQLite error';
@@ -1211,8 +1265,6 @@ begin
     SQLITE_NOTADB:    Result := 'file is not a database';
     SQLITE_NOTICE:    Result := 'notification message';
     SQLITE_WARNING:   Result := 'warning message';
-    SQLITE_ROW:       Result := 'another row available';
-    SQLITE_DONE:      Result := 'no more rows available';
   else                Result := 'unknown error';
   end;
 end;
@@ -1561,6 +1613,38 @@ begin
   pPse := PParse(yypParser^.pParse);
   if pPse = nil then Exit;
   db := pPse^.db;
+  { 9.4.divbug.80 — when the immediately-preceding reduction was the
+    DELETE arm (rule 152) or the UPDATE arm (rule 159) and the offending
+    lookahead is ORDER or LIMIT, replicate the message that delete.c:201
+    / update.c:212 emit when SQLITE_ENABLE_UPDATE_DELETE_LIMIT is built
+    (wherelimit-0.1 / 0.2 / 0.3 expect "ORDER BY without LIMIT on …").
+    Our Lemon tables are generated without that conditional arm, so the
+    only signal is at error time. }
+  if ((yymajor = TK_ORDER) or (yymajor = TK_LIMIT))
+     and (yypParser^.lastDmlRule <> 0) then begin
+    if yymajor = TK_ORDER then begin
+      if yypParser^.lastDmlRule = 152 then
+        zMsg := sqlite3MPrintf(db, 'ORDER BY without LIMIT on DELETE', [])
+      else
+        zMsg := sqlite3MPrintf(db, 'ORDER BY without LIMIT on UPDATE', []);
+    end else begin
+      if yypParser^.lastDmlRule = 152 then
+        zMsg := sqlite3MPrintf(db, 'LIMIT clause should come after %s not before',
+          [PAnsiChar('DELETE')])
+      else
+        zMsg := sqlite3MPrintf(db, 'LIMIT clause should come after %s not before',
+          [PAnsiChar('UPDATE')]);
+    end;
+    Inc(pPse^.nErr);
+    pPse^.rc := SQLITE_ERROR;
+    if zMsg <> nil then begin
+      if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+      pPse^.zErrMsg := zMsg;
+    end;
+    yypParser^.lastDmlRule := 0;
+    if yymajor = 0 then ;
+    Exit;
+  end;
   if (yyminor.z <> nil) and (yyminor.z^ <> #0) then begin
     { parse.c yy_syntax_error: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", &TOKEN);
       sqlite3ErrorMsg in this codebase has no varargs overload — inline
@@ -1688,15 +1772,36 @@ begin
     Result := nil;
 end;
 
-{ ---- parserSyntaxError (parse.y:85) ------------------------------------- }
-{ Tiny helper used by rule 186 when a "#N" register reference appears        }
-{ outside a nested parse.  C body: sqlite3ErrorMsg(pParse,                   }
-{ "near \"%T\": syntax error", p);  Our sqlite3ErrorMsg currently lacks the  }
-{ printf-style %T specifier (see chunk 7.2e.1 notes), so we emit a static    }
-{ message and accept reduced fidelity until Phase 8 wires up varargs.        }
+{ ---- parserSyntaxError (parse.y:122..126) ------------------------------- }
+{ C body: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", p);          }
+{ sqlite3ErrorMsg() in this codebase lacks a varargs overload, so we route  }
+{ through sqlite3MPrintf (which honours the %T token specifier) and stamp   }
+{ nErr/rc/zErrMsg by hand — same pattern as yy_syntax_error above.  Bug     }
+{ 9.4.divbug.53 (fuzz2-6.1 expects `near "#0": syntax error`).              }
 procedure parserSyntaxError(pPse: PParse; const p: PToken);
+var
+  db:   PTsqlite3;
+  zMsg: PAnsiChar;
 begin
-  sqlite3ErrorMsg(pPse, 'near token: syntax error');
+  if pPse = nil then Exit;
+  db := pPse^.db;
+  if (db <> nil) and (db^.suppressErr <> 0) then begin
+    Inc(pPse^.nErr);
+    pPse^.rc := SQLITE_ERROR;
+    Exit;
+  end;
+  zMsg := sqlite3MPrintf(db, 'near "%T": syntax error', [p]);
+  Inc(pPse^.nErr);
+  pPse^.rc := SQLITE_ERROR;
+  if zMsg <> nil then begin
+    if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+    pPse^.zErrMsg := zMsg;
+  end;
+  { Mirror %T's sqlite3RecordErrorByteOffset side-effect so the CLI caret   }
+  { marker (10.1.bug.80) anchors under the offending token.                 }
+  if (db <> nil) and (p <> nil) and (p^.z <> nil) and (pPse^.zTail <> nil)
+     and (PtrUInt(p^.z) >= PtrUInt(pPse^.zTail)) then
+    db^.errByteOffset := i32(PtrUInt(p^.z) - PtrUInt(pPse^.zTail));
 end;
 
 { ---- sqlite3ExprFunction (expr.c:1169) ----------------------------------- }
@@ -1986,7 +2091,13 @@ begin
   p := sqlite3ExprListAppend(pPse, pPrior, nil);
   if ((hasCollate <> 0) or (sortOrder <> SQLITE_SO_UNDEFINED))
      and (pPse^.db^.init.busy = 0) then
-    sqlite3ErrorMsg(pPse, 'syntax error after column name');
+    { parse.y:1671 — include the offending column name (quoted) so the
+      tokenize/parser1 diagnostic matches C.  sqlite3ErrorMsg() here is
+      non-varargs so we inline the format via Copy(). }
+    sqlite3ErrorMsg(pPse,
+      PAnsiChar('syntax error after column name "'
+                + Copy(AnsiString(PAnsiChar(pIdToken^.z)), 1, pIdToken^.n)
+                + '"'));
   sqlite3ExprListSetName(pPse, p, pIdToken, 1);
   Result := p;
 end;
@@ -2603,6 +2714,7 @@ var
   bHex:      Boolean;
   iValue:    i32;
   c, prev, next: AnsiChar;
+  zMsg:      PAnsiChar;
 begin
   Assert((pExpr <> nil) or (pPse^.db^.mallocFailed <> 0));
   if pExpr = nil then Exit;
@@ -2621,12 +2733,17 @@ begin
       { '_' must lie between two digits (or hex digits when bHex). }
       prev := (pIn - 1)^;
       next := (pIn + 1)^;
-      if (not bHex) and ((sqlite3Isdigit(u8(prev)) = 0)
-                         or (sqlite3Isdigit(u8(next)) = 0)) then
-        sqlite3ErrorMsg(pPse, 'unrecognized token')
-      else if bHex and ((sqlite3Isxdigit(u8(prev)) = 0)
-                         or (sqlite3Isxdigit(u8(next)) = 0)) then
-        sqlite3ErrorMsg(pPse, 'unrecognized token');
+      if ((not bHex) and ((sqlite3Isdigit(u8(prev)) = 0)
+                          or (sqlite3Isdigit(u8(next)) = 0)))
+         or (bHex and ((sqlite3Isxdigit(u8(prev)) = 0)
+                       or (sqlite3Isxdigit(u8(next)) = 0))) then begin
+        zMsg := sqlite3MPrintf(pPse^.db, 'unrecognized token: "%s"',
+                               [pExpr^.u.zToken]);
+        if zMsg <> nil then begin
+          sqlite3ErrorMsg(pPse, zMsg);
+          sqlite3DbFree(pPse^.db, zMsg);
+        end;
+      end;
     end;
     Inc(pIn);
   until c = #0;
@@ -2785,7 +2902,11 @@ begin
            yymsp[-1].minor.yy391 := TF_WithoutRowid or TF_NoVisibleRowid
          else begin
            yymsp[-1].minor.yy391 := 0;
-           sqlite3ErrorMsg(pPse, 'unknown table option');
+           { parse.y:240 — include the offending option token. }
+           sqlite3ErrorMsg(pPse,
+             PAnsiChar('unknown table option: '
+                       + Copy(AnsiString(PAnsiChar(yymsp[0].minor.yy0.z)),
+                              1, yymsp[0].minor.yy0.n)));
          end;
        end;
     24: { table_option ::= nm }
@@ -2795,7 +2916,11 @@ begin
            yylhsminor.yy391 := TF_Strict
          else begin
            yylhsminor.yy391 := 0;
-           sqlite3ErrorMsg(pPse, 'unknown table option');
+           { parse.y:248 — include the offending option token. }
+           sqlite3ErrorMsg(pPse,
+             PAnsiChar('unknown table option: '
+                       + Copy(AnsiString(PAnsiChar(yymsp[0].minor.yy0.z)),
+                              1, yymsp[0].minor.yy0.n)));
          end;
          yymsp[0].minor.yy391 := yylhsminor.yy391;
        end;
@@ -2839,7 +2964,11 @@ begin
        end;
     37: { ccons ::= DEFAULT scantok ID|INDEXED }
        begin
-         pTmp := sqlite3ExprAlloc(pPse^.db, TK_STRING, @yymsp[0].minor.yy0, 0);
+         { parse.y:400..407 — tokenExpr always dequotes; without dequote=1
+           the stored DEFAULT zToken keeps the surrounding "..." which
+           leaks into EXPLAIN P4_MEM rendering and into bound values
+           (misc3-6.11-utf8, divbug.87.053). }
+         pTmp := sqlite3ExprAlloc(pPse^.db, TK_STRING, @yymsp[0].minor.yy0, 1);
          if pTmp <> nil then
            sqlite3ExprIdToTrueFalse(pTmp);
          sqlite3AddDefaultValue(pPse, pTmp, yymsp[0].minor.yy0.z,
@@ -3347,6 +3476,8 @@ begin
            @yymsp[-1].minor.yy0);
          sqlite3DeleteFrom(pPse, PSrcList(yymsp[-2].minor.yy203),
            PExpr(yymsp[0].minor.yy454), nil, nil);
+         { 9.4.divbug.80 — flag DELETE arm for wherelimit-0.1 error path. }
+         yypParser^.lastDmlRule := 152;
        end;
     153, 155, 232, 233, 252, 268, 286:
        { where_opt ::=;  where_opt_ret ::=;  case_else ::=;
@@ -3389,6 +3520,8 @@ begin
          sqlite3Update(pPse, PSrcList(yymsp[-5].minor.yy203),
            PExprList(yymsp[-2].minor.yy14), PExpr(yymsp[0].minor.yy454),
            yymsp[-6].minor.yy144, nil, nil, nil);
+         { 9.4.divbug.80 — flag UPDATE arm for wherelimit-0.3 error path. }
+         yypParser^.lastDmlRule := 159;
        end;
     160: { setlist ::= setlist COMMA nm EQ expr }
        begin

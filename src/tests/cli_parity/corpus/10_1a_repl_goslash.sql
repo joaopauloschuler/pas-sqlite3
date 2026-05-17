@@ -1,0 +1,5 @@
+SELECT 11
+go
+SELECT 22
+/
+SELECT 33;

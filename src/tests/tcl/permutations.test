@@ -1,0 +1,42 @@
+# pas-sqlite3 permutations.test stub — 9.4.6.q.2.
+#
+# Upstream test/permutations.test (~1230 lines) defines the cross-build
+# permutation matrix (`test_suite`, `test_set`, `run_tests`, the
+# `::ALLTESTS` list, every individual permutation block — wal,
+# journaltest, memsubsys1, ...) and ends by invoking `run_test_suite`
+# variants.
+#
+# pas-sqlite3 runs only the baseline permutation (the matrix runner is
+# deferred — tasklist 9.4.7.e), so this stub provides the minimum that
+# `all.test` and any other .test file that `source $testdir/permutations.test`
+# needs to keep going:
+#
+#   * `test_suite`  / `test_set`  / `run_tests`  / `run_test_suite`
+#     are already defined by tester_min.tcl (9.4.2.g.8) as silent
+#     no-ops — they accept (and discard) any permutation definition.
+#   * `::ALLTESTS` is initialised to {} so glob-based selectors do not
+#     error.  (Real upstream populates this by `glob`'ing test/*.test;
+#     we baseline-only — no consumer reads it.)
+#
+# Net effect: sourcing this stub from .test files is a no-op except for
+# seeding `::ALLTESTS`.  `all.test` therefore loads cleanly and its
+# `run_test_suite full` / `run_test_suite wal` / ... calls all silently
+# return — exercising no further tests.  This matches the baseline
+# behaviour pre-9.4.6.q.2 except that `source` no longer ENOENT-aborts.
+#
+# C ref: test/permutations.test:1..1230.
+#
+# When the matrix runner lands (9.4.7.e), replace this stub with the
+# real proc bodies + per-permutation `test_suite` invocations.
+
+if {![info exists ::ALLTESTS]} {
+  set ::ALLTESTS [list]
+}
+
+# Baseline marker so consumer code that branches on
+# `[info exists ::trd::tcltest]` does not misclassify us.
+namespace eval ::trd { variable tcltest {} }
+
+# The upstream proc bodies are already provided by tester_min.tcl as
+# baseline-only no-op stubs (`test_suite`, `test_set`, `run_tests`,
+# `run_test_suite`).  Nothing to re-declare here.

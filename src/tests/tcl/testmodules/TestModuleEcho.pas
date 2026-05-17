@@ -1240,17 +1240,44 @@ begin
   sqlite3_free(p);
 end;
 
-{ getDbPointer — recover the sqlite3* behind a `db` Tcl command.  Mirrors
-  the local helper in TestModuleTclvar.pas. }
+{ getDbPointer — recover the sqlite3* behind a `db` Tcl command, or
+  decode a "%p" hex string into a sqlite3* pointer.  Mirrors test1.c
+  getDbPointer (test1.c:112..123): tkt3080.test passes the connection
+  via `register_echo_module [sqlite3_connection_pointer db]`, which
+  hands a hex string — without the hex fallback we silently failed
+  with no diagnostic, killing ifcapable-vtab tail (9.4.divbug.89.012). }
 function getDbPointer(interp: PTclInterp; zA: PAnsiChar;
   ppDb: PPTsqlite3): cint;
 var
   cmdInfo: TTclCmdInfo;
+  z      : PAnsiChar;
+  v      : QWord;
+  c      : cint;
 begin
   if Tcl_GetCommandInfo(interp, PChar(zA), @cmdInfo) <> 0 then
     ppDb^ := PPTsqlite3(cmdInfo.objClientData)^
   else
-    ppDb^ := nil;
+  begin
+    { test1.c:57..76 sqlite3TestTextToPtr — decode 0x-prefixed hex. }
+    z := zA;
+    if (z <> nil) and (z[0] = '0') and (z[1] = 'x') then
+      Inc(z, 2);
+    v := 0;
+    while (z <> nil) and (z^ <> #0) do
+    begin
+      c := Ord(z^);
+      if (c >= Ord('0')) and (c <= Ord('9')) then
+        v := (v shl 4) + QWord(c - Ord('0'))
+      else if (c >= Ord('a')) and (c <= Ord('f')) then
+        v := (v shl 4) + QWord(c - Ord('a') + 10)
+      else if (c >= Ord('A')) and (c <= Ord('F')) then
+        v := (v shl 4) + QWord(c - Ord('A') + 10)
+      else
+        Break;
+      Inc(z);
+    end;
+    ppDb^ := PTsqlite3(PtrUInt(v));
+  end;
   Result := TCL_OK;
 end;
 

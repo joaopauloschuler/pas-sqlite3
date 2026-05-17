@@ -1623,7 +1623,7 @@ begin
   jsonBadPathError(@ctx, PAnsiChar('$.x'),
                    i32(JSON_LOOKUP_NOTARRAY));
   CheckEqS('T367 badPathError NOTARRAY message',
-           MemString(pOut), 'not an array element: $.x');
+           MemString(pOut), 'not an array element: ''$.x''');
 
   SetupCtx(ctx, vm, pOut);
   jsonBadPathError(@ctx, PAnsiChar('$.x'),
@@ -1640,7 +1640,7 @@ begin
   SetupCtx(ctx, vm, pOut);
   jsonBadPathError(@ctx, PAnsiChar('$.x'), 0);
   CheckEqS('T370 badPathError default → "bad JSON path:"',
-           MemString(pOut), 'bad JSON path: $.x');
+           MemString(pOut), 'bad JSON path: ''$.x''');
 end;
 
 procedure TestFunctionArgToBlob;

@@ -1,0 +1,7 @@
+# Per-host AFL route decision written by build-afl.sh.  Not portable
+# across machines (depends on whether afl-as/afl-qemu-trace are
+# installed), so it must not be committed.
+.afl-route
+
+# AFL output directory.
+findings/

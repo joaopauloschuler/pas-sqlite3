@@ -2103,6 +2103,22 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ os_unix.c:1620..1635 — fileHasMoved.
+  Returns TRUE if pFile has been renamed or unlinked since open.
+  9.4.divbug.81: stat(zPath) failing OR a different inode now sitting at
+  zPath both signal the database file moved out from under us. }
+function fileHasMoved(pFile: PunixFile): Boolean;
+var
+  buf : Stat;
+begin
+  if (pFile^.pInode = nil) or (pFile^.zPath = nil) then begin
+    Result := False;
+    Exit;
+  end;
+  Result := (FpStat(pFile^.zPath, buf) <> 0)
+            or (u64(buf.st_ino) <> pFile^.pInode^.fileId.ino);
+end;
+
 { os_unix.c ~4050: unixFileControl_impl — handle FCNTL opcodes }
 function unixFileControl_impl(pFile: Psqlite3_file; op: cint;
                               pArg: Pointer): cint; cdecl;
@@ -2158,6 +2174,15 @@ begin
       PPointer(pArg)^ := pf^.pVfs;
       Result := SQLITE_OK;
     end;
+    SQLITE_FCNTL_HAS_MOVED: begin
+      { os_unix.c:4203..4206 — return 1 in *pArg iff the open file's
+        inode no longer matches what's at zPath on disk (renamed or
+        unlinked since open).  9.4.divbug.81 — required by pager
+        databaseIsUnmoved() to surface SQLITE_READONLY_DBMOVED for
+        pager4-1.3/.4/.9/.10/.11. }
+      PcInt(pArg)^ := Ord(fileHasMoved(pf));
+      Result := SQLITE_OK;
+    end;
     SQLITE_FCNTL_VFSNAME: begin
       { os_unix.c:4191 — return a sqlite3_malloc'd copy of the VFS name
         through *pArg.  The shell uses this for `.vfsname`. }
@@ -2178,10 +2203,26 @@ begin
   Result := 4096;
 end;
 
-{ os_unix.c ~4470: unixDeviceCharacteristics_impl }
+{ os_unix.c ~4470: unixDeviceCharacteristics_impl.
+
+  9.4.divbug.34 — was returning 0 unconditionally, so the pager always
+  saw a non-POWERSAFE_OVERWRITE device and clamped szPageDflt up to the
+  filesystem sectorSize (4096+ on Linux ext4 / 8192 on some kernels).
+  That made `SQLITE_DEFAULT_PAGE_SIZE` (and hence stock-test expectations
+  like format4-1.1 / pagesize-*) effectively unreachable.
+
+  Stock C (os_unix.c:4368) ORs SQLITE_IOCAP_POWERSAFE_OVERWRITE into the
+  returned bits whenever UNIXFILE_PSOW is set in ctrlFlags — and that bit
+  is on by default (os_unix.c:6105 `pNew->ctrlFlags |= UNIXFILE_PSOW`)
+  unless overridden by the `psow=0` URI parameter. }
 function unixDeviceCharacteristics_impl(pFile: Psqlite3_file): cint; cdecl;
+var
+  pFd: PunixFile;
 begin
+  pFd := PunixFile(pFile);
   Result := 0;
+  if (pFd^.ctrlFlags and UNIXFILE_PSOW) <> 0 then
+    Result := Result or SQLITE_IOCAP_POWERSAFE_OVERWRITE;
 end;
 
 { ============================================================
@@ -2264,8 +2305,18 @@ begin
   { Open the file (os_unix.c ~6678) }
   fd := FpOpen(zName, openFlags, SQLITE_DEFAULT_FILE_PERMISSIONS);
 
-  { Retry as read-only if read-write open failed (os_unix.c ~6693) }
+  { Retry as read-only if read-write open failed (os_unix.c ~6689..6696).
+    Faithful port: mutate the *caller-visible* `flags` to drop READWRITE|CREATE
+    and set READONLY, so that pOutFlags^ (line below) and the cached
+    pPreallocatedUnused^.flags reflect the actual open mode.  Without this,
+    pager.c's `readOnly := (fout and SQLITE_OPEN_READONLY) <> 0` reads 0 on a
+    chmod-444 file, BTS_READ_ONLY is never set in btreeOpen, and a later write
+    attempt trips SQLITE_IOERR_LOCK ($F0A=3850) at pagerLockDb instead of the
+    expected SQLITE_READONLY → "attempt to write a readonly database"
+    (9.4.divbug.32). }
   if (fd < 0) and isReadWrite and (fpgeterrno <> ESysEISDIR) then begin
+    flags     := (flags and not (SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE))
+                 or SQLITE_OPEN_READONLY;
     openFlags := (openFlags and not (O_RDWR or O_CREAT)) or O_RDONLY;
     fd := FpOpen(zName, openFlags, SQLITE_DEFAULT_FILE_PERMISSIONS);
     if fd >= 0 then
@@ -2296,6 +2347,12 @@ begin
     ctrlFlags := ctrlFlags or UNIXFILE_NOLOCK;
   if (flags and SQLITE_OPEN_URI) <> 0 then
     ctrlFlags := ctrlFlags or UNIXFILE_URI;
+  { 9.4.divbug.34 — POWERSAFE_OVERWRITE on by default (os_unix.c:6098..6106).
+    Honoured by setSectorSize → sectorSize=512, so szPageDflt stays at
+    SQLITE_DEFAULT_PAGE_SIZE rather than being clamped up to the FS
+    sector size.  Disabled via the `psow=0` URI param. }
+  if sqlite3_uri_boolean(zName, 'psow', 1) <> 0 then
+    ctrlFlags := ctrlFlags or UNIXFILE_PSOW;
 
   { Locate (or create) the process-wide shared inodeInfo keyed by
     (device, inode) so that multiple sqlite3* handles on the same file

@@ -1,0 +1,102 @@
+       Begin testset "debug1"
+    1    64     1 sixty four
+    2    32     2 thirty two
+    3    96     3 ninety six
+    4    16     4 sixteen
+    5    80     5 eighty
+    6    48     6 forty eight
+    7   112     7 one hundred twelve
+    8     8     8 eight
+    9    72     9 seventy two
+   10    40    10 forty
+   11   104    11 one hundred four
+   12    24    12 twenty four
+   13    88    13 eighty eight
+   14    56    14 fifty six
+   15   120    15 one hundred twenty
+   16     4    16 four
+   17    68    17 sixty eight
+   18    36    18 thirty six
+   19   100    19 one hundred
+   20    20    20 twenty
+   21    84    21 eighty four
+   22    52    22 fifty two
+   23   116    23 one hundred sixteen
+   24    12    24 twelve
+   25    76    25 seventy six
+   26    44    26 forty four
+   27   108    27 one hundred eight
+   28    28    28 twenty eight
+   29    92    29 ninety two
+   30    60    30 sixty
+   31   124    31 one hundred twenty four
+   32     2    32 two
+   33    66    33 sixty six
+   34    34    34 thirty four
+   35    98    35 ninety eight
+   36    18    36 eighteen
+   37    82    37 eighty two
+   38    50    38 fifty
+   39   114    39 one hundred fourteen
+   40    10    40 ten
+   41    74    41 seventy four
+   42    42    42 forty two
+   43   106    43 one hundred six
+   44    26    44 twenty six
+   45    90    45 ninety
+   46    58    46 fifty eight
+   47   122    47 one hundred twenty two
+   48     6    48 six
+   49    70    49 seventy
+   50    38    50 thirty eight
+   51   102    51 one hundred two
+   52    22    52 twenty two
+   53    86    53 eighty six
+   54    54    54 fifty four
+   55   118    55 one hundred eighteen
+   56    14    56 fourteen
+   57    78    57 seventy eight
+   58    46    58 forty six
+   59   110    59 one hundred ten
+   60    30    60 thirty
+   61    94    61 ninety four
+   62    62    62 sixty two
+   63   126    63 one hundred twenty six
+   64     1    64 one
+   65    65    65 sixty five
+   66    33    66 thirty three
+   67    97    67 ninety seven
+   68    17    68 seventeen
+   69    81    69 eighty one
+   70    49    70 forty nine
+   71   113    71 one hundred thirteen
+   72     9    72 nine
+   73    73    73 seventy three
+   74    41    74 forty one
+   75   105    75 one hundred five
+   76    25    76 twenty five
+   77    89    77 eighty nine
+   78    57    78 fifty seven
+   79   121    79 one hundred twenty one
+   80     5    80 five
+   81    69    81 sixty nine
+   82    37    82 thirty seven
+   83   101    83 one hundred one
+   84    21    84 twenty one
+   85    85    85 eighty five
+   86    53    86 fifty three
+   87   117    87 one hundred seventeen
+   88    13    88 thirteen
+   89    77    89 seventy seven
+   90    45    90 forty five
+   91   109    91 one hundred nine
+   92    29    92 twenty nine
+   93    93    93 ninety three
+   94    61    94 sixty one
+   95   125    95 one hundred twenty five
+   96     3    96 three
+   97    67    97 sixty seven
+   98    35    98 thirty five
+   99    99    99 ninety nine
+  100    19   100 nineteen
+       TOTAL.......................................................  TIME

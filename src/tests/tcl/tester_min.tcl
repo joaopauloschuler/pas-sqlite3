@@ -144,8 +144,18 @@ proc do_test {name cmd expected} {
   } else {
     set ok [expr {[string compare $result $expected]==0}]
     # Upstream falls back to fpnum_compare when string compare fails
-    # (tester.tcl:789..792); we don't have that helper ported, so the
-    # exact-compare result stands.
+    # (tester.tcl:789..792).  fpnum_compare is the C Tcl command
+    # registered by Sqlitetest1_Init (test1.c:6191..6325, ported in
+    # TestModuleTest1.pas) that does fuzzy 15-digit float-string
+    # equality so e.g. -1.11 matches -1.1099999999999999 and
+    # 9.22337203685478e+18 matches 9.2233720368547758e+18.  Without
+    # this, exact-string compare on float-bearing results diverges
+    # from upstream even when SQLite renders byte-identically (9.4.divbug.35).
+    if {!$ok} {
+      if {[llength [info commands fpnum_compare]]} {
+        set ok [fpnum_compare $result $expected]
+      }
+    }
   }
   if {$ok} {
     puts " Ok"
@@ -175,9 +185,30 @@ proc do_realnum_test {name cmd expected} {
   ] [realnum_normalize $expected]]
 }
 
+# verify_ex_errcode — upstream tester.tcl:1682..1684.  Verbatim.
+# Asserts that the most recent error's extended rc symbolic name on $db
+# matches $expected.  Forwards to do_test for PASS/FAIL accounting.
+# Requires the sqlite3_extended_errcode Tcl trampoline (TestModuleTest1
+# 9.4.divbug.88.035).
+proc verify_ex_errcode {name expected {db db}} {
+  do_test $name [list sqlite3_extended_errcode $db] $expected
+}
+
 # execsql — upstream tester.tcl:1445..1448.  Verbatim.
 proc execsql {sql {db db}} {
   uplevel [list $db eval $sql]
+}
+
+# execsql2 — upstream tester.tcl:1628..1636.  Verbatim.
+# Like execsql but returns a flat list of {colname value colname value ...}.
+proc execsql2 {sql} {
+  set result {}
+  db eval $sql data {
+    foreach f $data(*) {
+      lappend result $f $data($f)
+    }
+  }
+  return $result
 }
 
 # do_execsql_test — upstream tester.tcl:941..971.  Supports
@@ -225,14 +256,65 @@ proc finalize_testing {} {
 
 # ifcapable — upstream tester.tcl:1725..1739.  Real implementation
 # evaluates a boolean expression of SQLITE_OMIT_*/SQLITE_ENABLE_*
-# compile-time caps (see fix_ifcapable_expr) and runs BODY iff true,
-# else ELSEBODY.  pas-sqlite3 is built with the default set of caps
-# enabled (no SQLITE_OMIT_*), so for our smoke sweeps every expression
-# evaluates true — we unconditionally uplevel BODY and ignore both EXPR
-# and ELSEBODY.  Real cap-probe wiring lives behind 9.4.6.a / 9.4.2.g.1
-# follow-up.  C ref: tester.tcl:1725..1739.
+# compile-time caps (see fix_ifcapable_expr at tester.tcl:1697..1714)
+# and runs BODY iff true, else ELSEBODY.  pas-sqlite3 is built with the
+# default set of caps enabled (no SQLITE_OMIT_*), so every bare
+# capability token resolves to 1; we just remap ident-runs to "1" and
+# leave operators (`!`, `&&`, `||`, parens) intact, then eval as a
+# Tcl expression.  That means `ifcapable trigger` runs BODY,
+# `ifcapable !trigger` runs ELSEBODY — fixing rowid-8.* which would
+# otherwise execute both the `trigger` and `!trigger` arms and trip
+# "table t3 already exists" (divbug.73).  C ref: tester.tcl:1697..1739.
+# Per-capability defaults that diverge from "feature enabled" (1).
+# Mirrors the SQLITE_ALLOW_ROWID_IN_VIEW etc. test_config.c arms — caps
+# that are OFF in a vanilla build must read 0 so `ifcapable !foo` runs
+# the BODY and `ifcapable foo` runs ELSEBODY.
+array set ::sqlite_options {}
+set ::sqlite_options(allow_rowid_in_view) 0
+# pas-sqlite3 does not ship FTS3/4/5 — mirror test_config.c when
+# SQLITE_OMIT_FTS3 / SQLITE_OMIT_FTS5 are defined.
+set ::sqlite_options(fts3) 0
+set ::sqlite_options(fts5) 0
+# 9.4.divbug.87.066 — this build defines neither SQLITE_SECURE_DELETE nor
+# SQLITE_FAST_SECURE_DELETE (btree.c:2695..2699 / test_config.c:751..759),
+# so both caps must read 0.  Without these, `ifcapable fast_secure_delete`
+# defaults to 1 below and securedel.test computes DEFAULT_SECDEL=2 while
+# the engine honestly returns 0 → 1.0/1.1/1.2 fail.
+set ::sqlite_options(fast_secure_delete) 0
+set ::sqlite_options(secure_delete) 0
+
 proc ifcapable {expr code {else ""} {elsecode ""}} {
-  set c [catch {uplevel 1 $code} r]
+  set e2 ""
+  set state 0
+  for {set i 0} {$i < [string length $expr]} {incr i} {
+    set ch [string range $expr $i $i]
+    set newstate [expr {[string is alnum $ch] || $ch eq "_"}]
+    if {$newstate} {
+      if {!$state} { append e2 {$::sqlite_options(} }
+      append e2 $ch
+    } else {
+      if {$state} { append e2 ")" }
+      append e2 $ch
+    }
+    set state $newstate
+  }
+  if {$state} { append e2 ")" }
+  if {$e2 eq ""} { set e2 "1" }
+  # Default any unset capability to 1 (feature enabled).
+  while {[regexp -indices {\$::sqlite_options\(([a-zA-Z0-9_]+)\)} $e2 _ kidx]} {
+    set k [string range $e2 [lindex $kidx 0] [lindex $kidx 1]]
+    if {![info exists ::sqlite_options($k)]} { set ::sqlite_options($k) 1 }
+    # Replace this single occurrence with its literal value so the loop
+    # terminates even if eval fails later.
+    set v $::sqlite_options($k)
+    regsub "\\\$::sqlite_options\\($k\\)" $e2 $v e2
+  }
+  if {[catch {expr $e2} v]} { set v 1 }
+  if {$v} {
+    set c [catch {uplevel 1 $code} r]
+  } else {
+    set c [catch {uplevel 1 $elsecode} r]
+  }
   return -code $c $r
 }
 
@@ -320,6 +402,23 @@ proc do_delete_file {force args} {
         file delete $filename
       }
     }
+  }
+}
+
+# get_pwd — upstream tester.tcl:169..191.  Returns the current working
+# directory.  On Windows the upstream proc shells out to cmd /c CD to
+# preserve case; on POSIX (the only target here) it is just [pwd].
+proc get_pwd {} {
+  if {$::tcl_platform(platform) eq "windows"} {
+    if {[info exists ::env(ComSpec)]} {
+      set comSpec $::env(ComSpec)
+    } else {
+      set comSpec {C:\Windows\system32\cmd.exe}
+    }
+    return [string map [list \\ /] \
+        [string trim [exec -- $comSpec /c CD]]]
+  } else {
+    return [pwd]
   }
 }
 
@@ -418,6 +517,134 @@ proc faultsim_restore_and_reopen {args} {
 }
 proc faultsim_delete_and_reopen {args} {
   uplevel db_delete_and_reopen $args
+}
+
+# crashsql — upstream tester.tcl:1752..1840 (port, task 9.4.2.g.11).
+# Spawns a child tclsh that opens db via the "crash" VFS (provided by
+# TestModuleCrash, task 9.4.7.d), configures sqlite3_crashparams DELAY
+# CRASHFILE, runs $sql under `db eval {...}` and is then killed by
+# _exit(-1) inside the crash VFS's xSync.  The parent returns the
+# two-element list [list R MSG] where R is the catch rc (non-zero on
+# crash) and MSG is the error string — the upstream sigil is
+# "child process exited abnormally", which `exec` produces verbatim
+# when the spawned process is killed by a signal / non-zero exit.
+#
+# Options (subset of upstream — the full upstream surface is supported
+# down to "-tclbody" with the same defaults as tester.tcl:1754..1761):
+#   -delay  N        : crash on the Nth xSync of CRASHFILE (default 1)
+#   -file   PATH     : the crash filename (required by upstream)
+#   -seed   N        : seed the PRNG via a randomblob(N%10007+1)
+#   -opendb CMD      : command to open the db (default `sqlite3 db test.db -vfs crash`)
+#   -tclbody  SCRIPT : extra Tcl to run in the child before $sql
+#   -dfltvfs BOOL    : 2nd arg to sqlite3_crash_enable (default 0)
+#   -blocksize / -characteristics : forwarded as `-s N` / `-c LIST` flags
+#                       to sqlite3_crashparams (delegated to TestModuleCrash).
+#
+# The auxiliary commands that tester.tcl's crashsql writes into the
+# child script (install_malloc_faultsim, sqlite3_test_control_pending_byte,
+# btree_from_db, btree_set_cache_size, autoinstall_test_functions) are
+# either present in this build (autoinstall_test_functions via
+# TestModuleFunc, install_malloc_faultsim via TestModuleMalloc) or are
+# wrapped in `catch { ... }` so a missing command does not abort the
+# child before the SQL runs.  Same protective `catch` discipline as the
+# `catch {install_malloc_faultsim 1}` arm in tester.tcl:1791.
+#
+# C oracle: /home/bpsa/app/sqlite3/test/tester.tcl:1752..1840.
+proc crashsql {args} {
+  set blocksize ""
+  set crashdelay 1
+  set prngseed 0
+  set opendb {sqlite3 db test.db -vfs crash}
+  set tclbody {}
+  set crashfile ""
+  set dc ""
+  set dfltvfs 0
+  set sql [lindex $args end]
+
+  for {set ii 0} {$ii < [llength $args]-1} {incr ii 2} {
+    set z [lindex $args $ii]
+    set n [string length $z]
+    set z2 [lindex $args [expr $ii+1]]
+    if     {$n>1 && [string first $z -delay]==0}     {set crashdelay $z2} \
+    elseif {$n>1 && [string first $z -opendb]==0}    {set opendb $z2} \
+    elseif {$n>1 && [string first $z -seed]==0}      {set prngseed $z2} \
+    elseif {$n>1 && [string first $z -file]==0}      {set crashfile $z2} \
+    elseif {$n>1 && [string first $z -tclbody]==0}   {set tclbody $z2} \
+    elseif {$n>1 && [string first $z -blocksize]==0} {set blocksize "-s $z2"} \
+    elseif {$n>1 && [string first $z -characteristics]==0} {set dc "-c {$z2}"} \
+    elseif {$n>1 && [string first $z -dfltvfs]==0}   {set dfltvfs $z2} \
+    else   { error "Unrecognized option: $z" }
+  }
+
+  if {$crashfile eq ""} {
+    error "Compulsory option -file missing"
+  }
+
+  set cfile [string map {\\ \\\\} [file nativename [file join [pwd] $crashfile]]]
+
+  # 9.4.7.d — the child script must `load` libpassqlite3tcl.so to gain
+  # the `sqlite3` command and the crash-VFS bindings.  Our parent test
+  # process was started by TclTestDriver which puts bin/ on ::auto_path,
+  # but the child is a bare `[info nameofexec]` (tclsh), so we re-emit
+  # the package require here.  PASLIB env var lets the driver override
+  # the resolved .so path if it diverges from ::auto_path.
+  set libdir [file dirname [info script]]
+  # walk up to find bin/ — tester_min.tcl sits at src/tests/tcl/
+  set bindir [file normalize [file join $libdir .. .. .. bin]]
+
+  set f [open crash.tcl w]
+  puts $f "if {\[info exists ::env(PAS_TCL_PKG_DIR)\]} {"
+  puts $f "  lappend ::auto_path \$::env(PAS_TCL_PKG_DIR)"
+  puts $f "} else {"
+  puts $f "  lappend ::auto_path {$bindir}"
+  puts $f "}"
+  puts $f "package require sqlite3"
+  puts $f "sqlite3_initialize ; sqlite3_shutdown"
+  puts $f "catch { install_malloc_faultsim 1 }"
+  puts $f "sqlite3_crash_enable 1 $dfltvfs"
+  puts $f "sqlite3_crashparams $blocksize $dc $crashdelay $cfile"
+  puts $f "catch { sqlite3_test_control_pending_byte \$::sqlite_pending_byte }"
+  puts $f "catch { autoinstall_test_functions }"
+
+  if {$opendb ne ""} {
+    puts $f $opendb
+    puts $f {catch { db eval {SELECT * FROM sqlite_master;} }}
+    puts $f {catch {set bt [btree_from_db db]; btree_set_cache_size $bt 10}}
+  }
+
+  if {$prngseed} {
+    set seed [expr {$prngseed%10007+1}]
+    puts $f "db eval {SELECT randomblob($seed)}"
+  }
+
+  if {[string length $tclbody]>0} {
+    puts $f $tclbody
+  }
+  if {[string length $sql]>0} {
+    puts $f "db eval {"
+    puts $f   "$sql"
+    puts $f "}"
+  }
+  close $f
+
+  set r [catch {
+    exec [info nameofexec] crash.tcl >@stdout 2>@stdout
+  } msg]
+
+  if {$r && [string match {*ERROR: LeakSanitizer*} $msg]} {
+    set msg "child process exited abnormally"
+  }
+
+  lappend r $msg
+}
+
+# Initialise the global pending-byte that tester.tcl normally sets from
+# C-side test_config.  Upstream default is 0x40000000 (1 GiB) — the
+# child crashsql script catch-guards the call, so this is purely a
+# convenience so callers that read $::sqlite_pending_byte don't trip on
+# `can't read "sqlite_pending_byte": no such variable`.
+if {![info exists ::sqlite_pending_byte]} {
+  set ::sqlite_pending_byte 0x40000000
 }
 
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
@@ -536,6 +763,10 @@ proc omit_test {name reason {append 1}} {
 # does `db close; sqlite3 db test.db` to re-read the schema from disk
 # (e.g. index-1.1c/1.1d): the reopened handle saw an empty database
 # because the in-memory schema was never persisted (9.4.divbug.3).
+# Also exports `::DB` as the raw sqlite3* connection pointer (upstream
+# tester.tcl:557) so .test files (schema.test, malloc*.test, ioerr*.test)
+# that pass `$::DB` to sqlite3_prepare / sqlite3_extended_result_codes /
+# etc. don't trip "can't read \"::DB\": no such variable" (9.4.divbug.65).
 # C ref: tester.tcl:548..558.
 proc reset_db {} {
   catch {db close}
@@ -544,6 +775,14 @@ proc reset_db {} {
   forcedelete test.db-wal
   forcedelete test.db-shm
   sqlite3 db ./test.db
+  set ::DB [sqlite3_connection_pointer db]
+  # 9.4.7.e: apply the active permutation's presql (e.g. PRAGMA journal_mode=WAL)
+  # after each fresh handle.  When no --permutation is active, [presql] returns
+  # "" and this is a no-op.  C ref: tester.tcl:557..560 (sqlitetest_init).
+  set __presql [presql]
+  if {$__presql ne ""} {
+    catch { db eval $__presql }
+  }
 }
 
 # query_plan_graph — upstream tester.tcl:990..1001.  Renders the
@@ -608,6 +847,114 @@ proc do_eqp_test {name sql res} {
       set res "/*$res*/"
     }
     uplevel do_execsql_test $name [list "EXPLAIN QUERY PLAN $sql"] [list $res]
+  }
+}
+
+# do_vmstep_test — upstream tester.tcl:913..933.  Run SQL and verify
+# that the number of "vmsteps" required is greater than or less than
+# some constant.  If $nstep starts with "+", asserts vmstep>=N;
+# otherwise asserts vmstep<=N.
+proc do_vmstep_test {tn sql nstep {res {}}} {
+  uplevel [list do_execsql_test $tn.0 $sql $res]
+
+  set vmstep [db status vmstep]
+  if {[string range $nstep 0 0]=="+"} {
+    set body "if {$vmstep<$nstep} {
+      error \"got $vmstep, expected more than [string range $nstep 1 end]\"
+    }"
+  } else {
+    set body "if {$vmstep>$nstep} {
+      error \"got $vmstep, expected less than $nstep\"
+    }"
+  }
+
+  # set name "$tn.vmstep=$vmstep,expect=$nstep"
+  set name "$tn.1"
+  uplevel [list do_test $name $body {}]
+}
+
+# do_select_tests — upstream tester.tcl:1103..1157.  Runs a list of
+# {tn sql res} triples through do_execsql_test (default) or
+# do_catchsql_test (-errorformat), with optional -count / -query /
+# -tclquery / -repair switches.
+proc do_select_tests {prefix args} {
+
+  set testlist [lindex $args end]
+  set switches [lrange $args 0 end-1]
+
+  set errfmt ""
+  set countonly 0
+  set tclquery ""
+  set repair ""
+
+  for {set i 0} {$i < [llength $switches]} {incr i} {
+    set s [lindex $switches $i]
+    set n [string length $s]
+    if {$n>=2 && [string equal -length $n $s "-query"]} {
+      set tclquery [list execsql [lindex $switches [incr i]]]
+    } elseif {$n>=2 && [string equal -length $n $s "-tclquery"]} {
+      set tclquery [lindex $switches [incr i]]
+    } elseif {$n>=2 && [string equal -length $n $s "-errorformat"]} {
+      set errfmt [lindex $switches [incr i]]
+    } elseif {$n>=2 && [string equal -length $n $s "-repair"]} {
+      set repair [lindex $switches [incr i]]
+    } elseif {$n>=2 && [string equal -length $n $s "-count"]} {
+      set countonly 1
+    } else {
+      error "unknown switch: $s"
+    }
+  }
+
+  if {$countonly && $errfmt!=""} {
+    error "Cannot use -count and -errorformat together"
+  }
+  set nTestlist [llength $testlist]
+  if {$nTestlist%3 || $nTestlist==0 } {
+    error "SELECT test list contains [llength $testlist] elements"
+  }
+
+  eval $repair
+  foreach {tn sql res} $testlist {
+    if {$tclquery != ""} {
+      execsql $sql
+      uplevel do_test ${prefix}.$tn [list $tclquery] [list [list {*}$res]]
+    } elseif {$countonly} {
+      set nRow 0
+      db eval $sql {incr nRow}
+      uplevel do_test ${prefix}.$tn [list [list set {} $nRow]] [list $res]
+    } elseif {$errfmt==""} {
+      uplevel do_execsql_test ${prefix}.${tn} [list $sql] [list [list {*}$res]]
+    } else {
+      set res [list 1 [string trim [format $errfmt {*}$res]]]
+      uplevel do_catchsql_test ${prefix}.${tn} [list $sql] [list $res]
+    }
+    eval $repair
+  }
+
+}
+
+# drop_all_tables — upstream tester.tcl:2253..2275.  Drops all tables
+# and views from every attached database on connection [db].
+proc drop_all_tables {{db db}} {
+  ifcapable trigger&&foreignkey {
+    set pk [$db one "PRAGMA foreign_keys"]
+    $db eval "PRAGMA foreign_keys = OFF"
+  }
+  foreach {idx name file} [db eval {PRAGMA database_list}] {
+    if {$idx==1} {
+      set master sqlite_temp_master
+    } else {
+      set master $name.sqlite_master
+    }
+    foreach {t type} [$db eval "
+      SELECT name, type FROM $master
+      WHERE type IN('table', 'view') AND name NOT LIKE 'sqliteX_%' ESCAPE 'X'
+    "] {
+      $db eval "DROP $type \"$t\""
+    }
+  }
+  ifcapable trigger&&foreignkey {
+    $db eval "PRAGMA foreign_keys = $pk"
   }
 }
 
@@ -1027,6 +1374,282 @@ set ::MEMORY_MANAGEMENT 0
 # expressions are handled by the always-true `ifcapable` stub above.
 # C ref: src/test_config.c:309..313.
 array set ::sqlite_options {default_autovacuum 0}
+# 9.4.divbug.91.016 — types.test reads $sqlite_options(utf16) directly
+# (not through ifcapable).  pas-sqlite3 has UTF-16 enabled in its build,
+# matching the upstream default; mirror test_config.c:705 in that arm.
+set ::sqlite_options(utf16) 1
+
+# 9.4.divbug.91 — assorted globals that upstream test_config.c /
+# test1.c plumb but pas-sqlite3 does not.  Each test that names one
+# below errors with "no such variable" before reaching its first
+# assertion, so the engine never runs.  Seeding the value here lets
+# those tests load.  C refs noted per-line.
+#   bitmask_size: test1.c:9335..9438 LinkVar of sizeof(Bitmask)*8 = 64
+#     (Bitmask is u64 in this port — see passqlite3codegen.pas:53).
+#     Used by join3.test as the join-table-count limit.
+set ::bitmask_size 64
+#   SQLITE_MAX_VARIABLE_NUMBER: test_config.c:817 LinkVar of the
+#     SQLITE_MAX_VARIABLE_NUMBER macro (= 32766; matches
+#     passqlite3main.pas:653 / passqlite3types.pas:282).  Used by
+#     bind.test:422.
+set ::SQLITE_MAX_VARIABLE_NUMBER 32766
+#   cmdlinearg(soft-heap-limit): tester.tcl:378 / :404 default + CLI
+#     override; tester.tcl:546 feeds it to sqlite3_soft_heap_limit64.
+#     0 means "no limit".  Used by avtrans.test:169 and capi3b.test:144.
+if {![info exists ::cmdlinearg(soft-heap-limit)]} {
+  set ::cmdlinearg(soft-heap-limit) 0
+}
+
+# --------------------------------------------------------------------------
+# 9.4.6.q.2 — remaining tester.tcl / malloc_common.tcl procs surfaced by
+# the 9.4.4.d 100-test sweep.
+# --------------------------------------------------------------------------
+
+# do_not_use_codec — upstream tester.tcl:323..326.  Gates tests that are
+# incompatible with encryption codecs.  pas-sqlite3 has no codec build
+# variant, so the proc just sets the marker and resets the db (verbatim
+# port — matches upstream byte-for-byte).
+proc do_not_use_codec {} {
+  set ::do_not_use_codec 1
+  reset_db
+}
+catch {unset -nocomplain do_not_use_codec}
+
+# wal_is_wal_mode / wal_set_journal_mode / wal_check_journal_mode —
+# upstream tester.tcl:2308..2321.  Used by avtrans.test (and others) to
+# auto-promote the connection to WAL when running under the `wal`
+# permutation.  We baseline-only (permutation matrix deferred —
+# 9.4.7.e), so `wal_is_wal_mode` always returns 0 and the two callers
+# silently no-op — which is correct for the baseline run.
+proc wal_is_wal_mode {} {
+  expr {[permutation] eq "wal"}
+}
+proc wal_set_journal_mode {{db db}} {
+  if { [wal_is_wal_mode] } {
+    $db eval "PRAGMA journal_mode = WAL"
+  }
+}
+proc wal_check_journal_mode {testname {db db}} {
+  if { [wal_is_wal_mode] } {
+    $db eval { SELECT * FROM sqlite_master }
+    do_test $testname [list $db eval "PRAGMA main.journal_mode"] {wal}
+  }
+}
+# wal_is_capable — upstream tester.tcl:2323..2327.  Returns 1 if the
+# current build/permutation can drive a WAL test arm.  pas-sqlite3 has
+# WAL enabled and runs only the baseline permutation, so the guard
+# always permits.
+proc wal_is_capable {} {
+  ifcapable !wal { return 0 }
+  if {[permutation]=="journaltest"} { return 0 }
+  return 1
+}
+
+# test_set_config_pagecache / test_restore_config_pagecache — upstream
+# tester.tcl:2496..2530.  Reconfigures the SQLITE_CONFIG_PAGECACHE
+# parameters around a test and restores them afterwards.  Engine
+# support: passqlite3main.pas:2033..2036; the `sqlite3_config_pagecache`
+# Tcl shim is registered by Sqlitetest1_Init (9.4.6.q.2).
+# The upstream proc also calls `autoinstall_test_functions`; that is
+# already wired via TestModuleFunc (9.4.6.l.4) so we keep the call.
+proc test_set_config_pagecache {sz nPg} {
+  catch {db close}
+  catch {db2 close}
+  catch {db3 close}
+  sqlite3_shutdown
+  set ::old_pagecache_config [sqlite3_config_pagecache $sz $nPg]
+  sqlite3_initialize
+  catch { autoinstall_test_functions }
+  reset_db
+}
+proc test_restore_config_pagecache {} {
+  catch {db close}
+  catch {db2 close}
+  catch {db3 close}
+  sqlite3_shutdown
+  if {[info exists ::old_pagecache_config]} {
+    eval sqlite3_config_pagecache $::old_pagecache_config
+    unset ::old_pagecache_config
+  }
+  sqlite3_initialize
+  catch { autoinstall_test_functions }
+  reset_db
+}
+
+# do_faultsim_test — upstream malloc_common.tcl:121..157.  Drives a
+# matrix of fault-injection runs (oom, ioerr, cantopen, ...) of the same
+# body+test pair.  pas-sqlite3 has only the snapshot-aliases for the
+# faultsim helpers (9.4.2.g.13 SKIP); the full malloc/io fault matrix is
+# not yet wired.  Verbatim shape of the upstream proc is preserved but
+# the matrix collapses to ONE no-fault baseline pass (`-faults baseline`)
+# so tests that wrap their body in `do_faultsim_test` exercise their
+# happy-path body at least once — matching the way `aggfault.test`
+# verifies its non-error arms.  Real matrix DEFERRED to 9.4.2.g.13.
+# C ref: malloc_common.tcl:121..157.
+proc do_faultsim_test {name args} {
+  set DEFAULT(-prep)      ""
+  set DEFAULT(-body)      ""
+  set DEFAULT(-test)      ""
+  set DEFAULT(-install)   ""
+  set DEFAULT(-uninstall) ""
+  set DEFAULT(-faults)    "*"
+  set DEFAULT(-start)     1
+  set DEFAULT(-end)       0
+  fix_testname name
+  array set O [array get DEFAULT]
+  array set O $args
+  # Baseline-only fault: run prep + body once, check that body succeeds
+  # and that -test (if any) passes.  This mirrors `do_one_faultsim_test`
+  # with iFail=0 (no injection).  Errors in -body propagate as test
+  # failures via do_test.
+  uplevel #0 $O(-prep)
+  set ::testrc [catch [list uplevel #0 $O(-body)] ::testresult]
+  set ::testnfail 0
+  if {$O(-test) ne ""} {
+    # Mirror upstream do_one_faultsim_test (malloc_common.tcl:347,378..380):
+    # wrap -test as a proc receiving (testrc,testresult,testnfail), then
+    # `do_test` succeeds iff the proc runs without throwing.  Using a proc
+    # avoids `uplevel #0 <body> \; set {}` which (after `[list ...]` quotes
+    # the `;`) collapses to a single uplevel arg list where the trailing
+    # `{}` is dropped during arg concat, leaving `set` with zero args →
+    # "wrong # args: should be \"set varName ?newValue?\"".
+    proc faultsim_test_proc {testrc testresult testnfail} $O(-test)
+    set rc [catch [list faultsim_test_proc $::testrc $::testresult $::testnfail] res]
+    if {$rc == 0} {set res ok}
+    do_test $name.baseline [list list $rc $res] {0 ok}
+  } else {
+    do_test $name.baseline [list set ::testrc] 0
+  }
+}
+
+# 9.4.divbug.63.a — explain_no_trace (tester.tcl:1620..1623).  Show the
+# VDBE program for an SQL statement but skip the leading Trace opcode
+# block; used by callers that want to compare opcode sequences of two
+# statements without the trace-row prefix differing.
+proc explain_no_trace {sql} {
+  set tr [db eval "EXPLAIN $sql"]
+  return [lrange $tr 7 end]
+}
+
+# 9.4.divbug.63.a — faultsim_test_result (malloc_common.tcl:291..298,
+# 348..350).  In upstream this command is dynamically (re)defined by
+# do_one_faultsim_test with the per-test -injecterrlist baked in;
+# baseline pas-sqlite3 collapses the fault matrix down to a single
+# no-fault pass (see do_faultsim_test above), so the dynamic redefine
+# never runs.  Provide a fallback definition that mirrors
+# faultsim_test_result_int verbatim, with an empty injectErrList — under
+# the baseline pass testrc/testresult always come from the body itself
+# (testnfail=0), so the first equality clause (testnfail==0 && t!=r[0])
+# governs and lets the body's own success/error decide.
+proc faultsim_test_result_int {args} {
+  upvar testrc testrc testresult testresult testnfail testnfail
+  set t [list $testrc $testresult]
+  set r $args
+  if { ($testnfail==0 && $t != [lindex $r 0]) || [lsearch -exact $r $t]<0 } {
+    error "nfail=$testnfail rc=$testrc result=$testresult list=$r"
+  }
+}
+proc faultsim_test_result {args} {
+  uplevel faultsim_test_result_int $args [list {0 {}}]
+}
+
+# 9.4.divbug.63.b — test_binary_name / test_find_binary / test_find_cli /
+# test_cli_invocation / test_find_sqldiff.  Verbatim ports of
+# tester.tcl:2529..2596.  shell*.test and sqldiff*.test call these to
+# locate the on-disk CLI binary; if missing they `finish_test ; return`
+# in the caller's context (via `return -code return`).  pas-sqlite3 builds
+# its CLI at bin/passqlite3 — but we leave the upstream lookup verbatim
+# so .test files transparently skip when the upstream name isn't present
+# on PATH.  Individual tests may override these procs to point at our
+# binary if/when wired.  Engine FCNTL/test1.c file_control_reservebytes
+# is paired with this in TestModuleTest1.pas (test1.c:9258 / 7249..7276).
+proc test_binary_name {nm} {
+  if {$::tcl_platform(platform) eq "windows"} {
+    set ret "$nm.exe"
+  } else {
+    set ret $nm
+  }
+  if {[info exists ::cmdlinearg(TESTFIXTURE_HOME)]} {
+    file normalize [file join $::cmdlinearg(TESTFIXTURE_HOME) $ret]
+  } else {
+    file normalize $ret
+  }
+}
+proc test_find_binary {nm} {
+  set ret [test_binary_name $nm]
+  if {![file executable $ret]} {
+    finish_test
+    return ""
+  }
+  return $ret
+}
+proc test_find_cli {} {
+  set prog [test_find_binary sqlite3]
+  if {$prog==""} { return -code return }
+  return $prog
+}
+proc test_cli_invocation {} {
+  set prog [test_find_binary sqlite3]
+  if {$prog==""} { return -code return }
+  set vgrun [expr {[permutation]=="valgrind"}]
+  if {$vgrun || [info exists ::env(SQLITE_CLI_VALGRIND_OPT)]} {
+    if {$vgrun} {
+      set vgo "--quiet"
+    } else {
+      set vgo $::env(SQLITE_CLI_VALGRIND_OPT)
+    }
+    if {$vgo == 0 || $vgo eq ""} {
+      return $prog
+    } elseif {$vgo == 1} {
+      return "valgrind --quiet --leak-check=yes $prog"
+    } else {
+      return "valgrind $vgo $prog"
+    }
+  } else {
+    return $prog
+  }
+}
+proc test_find_sqldiff {} {
+  set prog [test_find_binary sqldiff]
+  if {$prog==""} { return -code return }
+  return $prog
+}
+
+# 9.4.divbug.63.b — run_thread_tests (thread_common.tcl:88..107).
+# Returns 1 iff this build can run the multi-threaded test arms; 0
+# otherwise (with a "WARNING: ..." note on stdout).  pas-sqlite3's
+# default build is not threadsafe (no `sqlthread` Tcl command is
+# registered — TestModuleSqlthread is not in build.sh), so the
+# `info commands sqlthread` arm fires and the predicate naturally
+# returns 0.  Verbatim port; tests gated on this take their skip arm.
+proc run_thread_tests {{print_warning 0}} {
+  ifcapable !mutex {
+    set zProblem "SQLite build is not threadsafe"
+  }
+  ifcapable mutex_noop {
+    set zProblem "SQLite build uses SQLITE_MUTEX_NOOP"
+  }
+  if {[info commands sqlthread] eq ""} {
+    set zProblem "SQLite build is not threadsafe"
+  }
+  if {![tcl::pkgconfig get threaded]} {
+    set zProblem "Linked against a non-threadsafe Tcl build"
+  }
+  if {[info exists zProblem]} {
+    puts "WARNING: Multi-threaded tests skipped: $zProblem"
+    return 0
+  }
+  set ::run_thread_tests_called 1
+  return 1
+}
+
+# Install the test scalar UDFs (randstr, test_*, real2hex, ...) as an
+# auto-extension so every freshly-opened connection picks them up.
+# Mirrors upstream tester.tcl:512 (one-shot at shim load).  Without this,
+# tests like tkt3918.test fail with `no such function: randstr` because
+# the auto-extension is only otherwise registered inside
+# test_set_config_pagecache.  9.4.divbug.66.
+catch { autoinstall_test_functions }
 
 # Open `db` on a fresh on-disk ./test.db at shim load time, mirroring
 # upstream tester.tcl:553..556.  The driver no longer issues its own

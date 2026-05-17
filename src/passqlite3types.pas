@@ -281,7 +281,16 @@ const
   SQLITE_MAX_ATTACHED            = 10;
   SQLITE_MAX_VARIABLE_NUMBER     = 32766;
   SQLITE_MAX_PAGE_SIZE           = 65536;
+  { 9.4.divbug.34 — match stock testfixture default (main.mk:1781
+    TESTFIXTURE_FLAGS += -DSQLITE_DEFAULT_PAGE_SIZE=1024) when built
+    with -dSQLITE_TEST so format4 / pagesize / createtab tests see the
+    same baseline page size the upstream test suite was authored
+    against.  Production builds keep the SQLite 3 default of 4096. }
+{$IFDEF SQLITE_TEST}
+  SQLITE_DEFAULT_PAGE_SIZE       = 1024;
+{$ELSE}
   SQLITE_DEFAULT_PAGE_SIZE       = 4096;
+{$ENDIF}
   SQLITE_MAX_DEFAULT_PAGE_SIZE   = 8192;
   SQLITE_MAX_PAGE_COUNT          = $fffffffe; { 4294967294 }
   SQLITE_MAX_LIKE_PATTERN_LENGTH = 50000;
