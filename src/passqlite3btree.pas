@@ -6965,9 +6965,18 @@ begin
 
     if rc = SQLITE_OK then begin
       if wrflag <> 0 then begin
-        rc := sqlite3PagerBegin(pPgr, ord(wrflag > 1), 0);
-        if rc = SQLITE_OK then
-          rc := newDatabase(pBt);
+        { btree.c:3709..3723 — second BTS_READ_ONLY gate AFTER lockBtree.
+          lockBtree may have just set BTS_READ_ONLY after re-reading
+          page 1 following a change-counter mismatch (test rdonly-1.6);
+          without this post-lock check, sqlite3PagerBegin runs and the
+          write succeeds against a now-readonly db (9.4.divbug.81). }
+        if (pBt^.btsFlags and BTS_READ_ONLY) <> 0 then
+          rc := SQLITE_READONLY
+        else begin
+          rc := sqlite3PagerBegin(pPgr, ord(wrflag > 1), 0);
+          if rc = SQLITE_OK then
+            rc := newDatabase(pBt);
+        end;
       end;
     end;
 
