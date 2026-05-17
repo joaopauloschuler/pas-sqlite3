@@ -106,6 +106,13 @@ src/tests/run_regression.sh    # run every bin/Test* and aggregate results
 Each test runs in its own temporary working directory under a per-test
 timeout (default 60s, override with `REGRESSION_TIMEOUT=<seconds>`).
 
+> **Do not run `Test*` binaries (or `TclTestDriver` shards) in parallel.**
+> Concurrent runs exhaust RAM on a typical workstation — page caches,
+> per-driver `libpassqlite3tcl.so` instances, and tclsh interpreters
+> stack up and one of the runs gets OOM-killed silently, leaving you
+> with a partial log that looks clean.  `run_regression.sh` is already
+> sequential by design; keep manual invocations the same way.
+
 Per-test logs are retained under a temporary directory only when at least
 one binary fails; an all-green run cleans them up.  The script exits
 non-zero if any binary fails, so it can be wired into CI directly.
@@ -138,6 +145,49 @@ artefacts:
 
 The harness exits rc=0 even when divergences exist (catalogue-only by
 design); promotion to a hard CI gate is tracked under `9.1.5`.
+
+### Upstream Tcl test suite (`bin/TclTestDriver`) — timing & timeouts
+
+`TclTestDriver` walks `src/tests/tcl/MANIFEST.txt` (~959 entries) and runs
+each `.test` file under a **20 s per-test watchdog**.  Read this before
+launching a run — picking the wrong invocation costs 25+ minutes.
+
+- **Never run unsharded.**  The single-process invocation
+  `bin/TclTestDriver --gate strict` is ~25 minutes on a quiet box and
+  hits the 20-min outer wall-clock used by most CI runners and agent
+  harnesses — you will get a truncated log, not a verdict.
+- **Always shard, but run the shards sequentially — never in parallel.**
+  Running shards (or multiple `Test*` binaries) concurrently exhausts
+  RAM on a typical workstation: each driver loads its own `libpassqlite3tcl.so`
+  + tclsh and many tests allocate multi-MB page caches.  Run one shard
+  at a time:
+
+  ```bash
+  for s in 0 1 2 3; do
+    timeout 1500 bin/TclTestDriver --gate strict \
+        --shard $s/4 --fail-log-dir bin/tcl-failure-logs \
+        > bin/shard-$s.log 2> bin/shard-$s.err
+  done
+  cat bin/shard-*.log | src/tests/tcl/check_status_regression.sh /dev/stdin
+  ```
+
+  Sequential 4-shard cost is ~25–60 min wall-clock — slower than
+  parallel, but the only way that finishes without OOM-killing one of
+  the shards mid-run (silent partial results).
+
+- **Three test files currently exceed the watchdog** and consume the
+  whole shard budget if left in (`pragma4.test`, `printf.test`,
+  `securedel.test` — tracked as `9.4.divbug.86`; sibling `.84` already
+  covers `select4.test` / `writecrash.test` / `securedel2.test`).  Until
+  those are fixed or moved to `src/tests/tcl/SKIP.md`, **shard 2 will
+  not finish under 25 min** — either accept the partial result or
+  temporarily skip them.
+- **Strict-gate FAIL is the only signal that matters.**  The shard log
+  reports `PASS`/`FAIL` per test, but most `FAIL`s are `pas-soft`
+  entries already cited in `src/tests/tcl/STATUS.txt`.  Only
+  `pas-strict` regressions break the build — those surface as
+  `REGRESSION (pas-strict FAIL): <path>` in the shard's stderr and via
+  `check_status_regression.sh`.
 
 ---
 
