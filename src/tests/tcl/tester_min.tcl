@@ -190,6 +190,18 @@ proc execsql {sql {db db}} {
   uplevel [list $db eval $sql]
 }
 
+# execsql2 — upstream tester.tcl:1628..1636.  Verbatim.
+# Like execsql but returns a flat list of {colname value colname value ...}.
+proc execsql2 {sql} {
+  set result {}
+  db eval $sql data {
+    foreach f $data(*) {
+      lappend result $f $data($f)
+    }
+  }
+  return $result
+}
+
 # do_execsql_test — upstream tester.tcl:941..971.  Supports
 #   do_execsql_test  TESTNAME SQL ?RESULT?
 #   do_execsql_test -db DB TESTNAME SQL ?RESULT?
