@@ -6564,6 +6564,40 @@ begin
         sqlite3ErrorMsg(pParse, 'row value misused');
         done := True;
       end;
+    TK_RAISE:
+      begin
+        { Port of expr.c:5727..5752 — RAISE(action, msg) inside a trigger
+          program.  Emits OP_Halt that the VDBE turns into the requested
+          conflict action (ROLLBACK/ABORT/FAIL/IGNORE).  Outside a trigger
+          (and not a nested parse) it is a hard error. }
+        if (pParse^.pTriggerTab = nil) and (pParse^.nested = 0) then
+        begin
+          sqlite3ErrorMsg(pParse,
+            'RAISE() may only be used within a trigger-program');
+          Result := 0;
+          done := True;
+        end
+        else
+        begin
+          if pExpr^.affExpr = AnsiChar(OE_Abort) then
+            sqlite3MayAbort(pParse);
+          if pExpr^.affExpr = AnsiChar(OE_Ignore) then
+          begin
+            sqlite3VdbeAddOp2(v, OP_Halt, SQLITE_OK, OE_Ignore);
+          end
+          else
+          begin
+            r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+            if pParse^.pTriggerTab <> nil then
+              sqlite3VdbeAddOp3(v, OP_Halt, SQLITE_CONSTRAINT_TRIGGER,
+                                i32(Ord(pExpr^.affExpr)), r1)
+            else
+              sqlite3VdbeAddOp3(v, OP_Halt, SQLITE_ERROR,
+                                i32(Ord(pExpr^.affExpr)), r1);
+          end;
+          done := True;
+        end;
+      end;
     else
       { C default arm semantics: assert (op==TK_NULL || op==TK_ERROR ||
         mallocFailed) then emit OP_Null.  TK_NULL is its own arm above;
@@ -29669,6 +29703,7 @@ begin
      and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo)
      and (pDest^.eDest <> SRT_Queue) and (pDest^.eDest <> SRT_DistQueue)
      and (pDest^.eDest <> SRT_Upfrom)
+     and (pDest^.eDest <> SRT_Discard)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   { Mirror select.c:7682..7684 — emit OP_ResultRow column names early, so
@@ -29838,7 +29873,7 @@ begin
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
           or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue)
           or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set)
-          or (pDest^.eDest = SRT_Mem))
+          or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Discard))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
@@ -29939,6 +29974,14 @@ begin
         in sqlite3CodeSubselect's destination init), so no further dispatch
         is needed.  Mirrors selectInnerLoop SRT_Mem arm (select.c:1325) which
         is a no-op when regResult == dest->iSDParm. }
+    end
+    else if pDest^.eDest = SRT_Discard then
+    begin
+      { SRT_Discard — `SELECT <expr-list>;` in a trigger body (codeTriggerProgram
+        @ TK_SELECT step).  Result columns were just evaluated above (the
+        evaluation matters for side-effects: RAISE() emits OP_Halt inside
+        ExprCode), but no per-row output is needed.  Mirrors selectInnerLoop's
+        SRT_Discard arm (select.c:1377..1380). }
     end
     else if (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue) then
     begin

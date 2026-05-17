@@ -11121,8 +11121,14 @@ begin
         op_program_run:
         pFrame := nil; { suppress unused label warning }
         if (pRtMem^.flags and MEM_Blob) = 0 then begin
+          { Port of vdbe.c:7521..7523 — bump nMem by 1 whenever the trigger
+            sub-program uses no cursors so apCsr (placed at &aMem[nMem]) does
+            not overlap the last register slot.  Previously gated only on
+            nProgMem=0, which silently corrupted apCsr for any trigger body
+            that allocated registers but no cursors (e.g. SELECT 1, RAISE())
+            — bug 9.4.divbug.87.052. }
           nProgMem := pProgSub^.nMem + pProgSub^.nCsr;
-          if nProgMem = 0 then nProgMem := 1;
+          if pProgSub^.nCsr = 0 then Inc(nProgMem);
           nByteProg := i64(ROUND8(SizeOf(TVdbeFrame)))
                      + i64(nProgMem) * i64(SizeOf(TMem))
                      + i64(pProgSub^.nCsr) * i64(SizeOf(PVdbeCursor))
