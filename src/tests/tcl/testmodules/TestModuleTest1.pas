@@ -3866,6 +3866,45 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.037 — test1.c:6795..6827 file_control_test.
+  Usage: file_control_test DB.  Exercises sqlite3_file_control plumbing:
+  4 calls — bad opcode 0, bad schema name, "main" opcode -1, "temp"
+  opcode -1.  C uses assert() on the rc; release builds (and Pas) just
+  drop them — empty result == TCL_OK matches filectrl-1.1. }
+function file_control_test_tcl(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:   PTsqlite3;
+  iArg: cint;
+  rc:   cint;
+begin
+  db := nil;
+  iArg := 0;
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  rc := sqlite3_file_control(db, nil, 0, @iArg);
+  { expect SQLITE_NOTFOUND }
+  rc := sqlite3_file_control(db, PAnsiChar('notadatabase'),
+          SQLITE_FCNTL_LOCKSTATE, @iArg);
+  { expect SQLITE_ERROR }
+  rc := sqlite3_file_control(db, PAnsiChar('main'), -1, @iArg);
+  { expect SQLITE_NOTFOUND }
+  rc := sqlite3_file_control(db, PAnsiChar('temp'), -1, @iArg);
+  { expect SQLITE_NOTFOUND or SQLITE_ERROR }
+  Result := TCL_OK;
+  if clientData = nil then ;
+  if rc = 0 then ;
+end;
+
 { 9.4.divbug.87.005 — test1.c:1740..1791 test_table_column_metadata.
   Usage: sqlite3_table_column_metadata DB dbname tblname ?colname?
   Returns a 5-element list: datatype collseq notnull primarykey autoinc.
@@ -4984,6 +5023,9 @@ begin
   { 9.4.divbug.88.024 — file_control_data_version (test1.c:9249 / 6873..6903). }
   Tcl_CreateObjCommand(interp, PChar('file_control_data_version'),
     @file_control_data_version, nil, nil);
+  { 9.4.divbug.88.037 — file_control_test (test1.c:9244 / 6795..6827). }
+  Tcl_CreateObjCommand(interp, PChar('file_control_test'),
+    @file_control_test_tcl, nil, nil);
   { 9.4.divbug.62.e — sqlite3_create_function_v2 / _create_window_function /
     _load_extension / _simulate_device / _user_version
     (test1.c:9262 + 9183 + test_window.c:337). }
