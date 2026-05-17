@@ -35137,6 +35137,42 @@ end;
   productive.  Until then DROP TABLE issues a `DELETE FROM
   sqlite_master WHERE ...` (where-loop, not truncate), so the gating
   remains until step 11g.2.h. }
+{ exprHasSubquery — walks pE, returns True if any node is a sub-SELECT
+  (TK_SELECT, TK_EXISTS, or TK_IN with x.pSelect set).  Stand-in for the
+  NC_Subquery flag the C resolver (resolve.c:1389) sets when descending
+  into TK_SELECT/TK_EXISTS/TK_IN subselects — the Pas resolver doesn't
+  set that flag yet, so the delete-from one-pass gate (delete.c:497) had
+  no signal and stayed at ONEPASS_MULTIROW even when the WHERE clause
+  referenced the table under deletion through a subquery (delete-12.0,
+  the forumpost/e61252062c9d286d regression). }
+function exprHasSubquery(pE: PExpr): Boolean;
+var
+  i: i32;
+  pList: PExprList;
+begin
+  Result := False;
+  if pE = nil then Exit;
+  if ExprHasProperty(pE, EP_xIsSelect)
+     and ExprUseXSelect(pE) and (pE^.x.pSelect <> nil) then
+  begin
+    Result := True; Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if exprHasSubquery(pE^.pLeft) then begin Result := True; Exit; end;
+  if exprHasSubquery(pE^.pRight) then begin Result := True; Exit; end;
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList := pE^.x.pList;
+    if pList <> nil then
+      for i := 0 to pList^.nExpr - 1 do
+        if exprHasSubquery((PExprListItem(PByte(ExprListItems(pList))
+                              + PtrUInt(i) * SZ_EXPRLIST_ITEM))^.pExpr) then
+        begin
+          Result := True; Exit;
+        end;
+  end;
+end;
+
 procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
   pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr);
 label
@@ -35337,6 +35373,9 @@ begin
     { Where-loop / one-pass DELETE arm — port of delete.c:495..665. }
     wcf := WHERE_ONEPASS_DESIRED or WHERE_DUPLICATES_OK;
     if (sNC.ncFlags and NC_Subquery) <> 0 then bComplex := 1;
+    { Pas resolver doesn't set NC_Subquery yet; walk pWhere directly so
+      the bComplex/ONEPASS gate matches C (delete.c:497, delete-12.0). }
+    if (bComplex = 0) and exprHasSubquery(pWhere) then bComplex := 1;
     if bComplex = 0 then wcf := wcf or u16($0008); { WHERE_ONEPASS_MULTIROW }
     if HasRowid(pTab) then
     begin

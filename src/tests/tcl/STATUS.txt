@@ -156,7 +156,7 @@ pas-strict	../sqlite3/test/carray02.test	-
 pas-strict	../sqlite3/test/carrayfault.test	-
 pas-strict	../sqlite3/test/cast.test	-
 pas-skip	../sqlite3/test/cffault.test	unswept
-pas-soft	../sqlite3/test/changes.test	9.4.divbug.36
+pas-strict	../sqlite3/test/changes.test	-
 pas-soft	../sqlite3/test/changes2.test	9.4.4.g-unbucketed
 pas-strict	../sqlite3/test/check.test	-
 pas-skip	../sqlite3/test/checkfault.test	unswept
@@ -239,7 +239,7 @@ pas-skip	../sqlite3/test/dbstatus.test	unswept
 pas-skip	../sqlite3/test/dbstatus2.test	unswept
 pas-strict	../sqlite3/test/decimal.test	-
 pas-strict	../sqlite3/test/default.test	-
-pas-soft	../sqlite3/test/delete.test	9.4.divbug.32
+pas-soft	../sqlite3/test/delete.test	9.4.4.g-unbucketed
 pas-soft	../sqlite3/test/delete2.test	9.4.divbug.41-residual
 pas-strict	../sqlite3/test/delete3.test	-
 pas-soft	../sqlite3/test/delete4.test	9.4.4.g-unbucketed
