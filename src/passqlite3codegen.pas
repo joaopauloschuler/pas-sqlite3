@@ -10280,6 +10280,22 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           Exit;
         end;
       end;
+      { 9.4.divbug.87.068 — port resolve.c:719..746.  Before erroring on an
+        unresolved bare TK_ID, if it carries EP_DblQuoted *and* DQS-DML is
+        enabled (sqlite3_db_config SQLITE_DBCONFIG_DQS_DML 1, default off in
+        modern builds), demote the identifier to TK_STRING so it lexes as a
+        legacy double-quoted string literal.  SELECTs are DML, hence the
+        DqsDML bit (areDoubleQuotedStringsEnabled, resolve.c:161..172). }
+      if (pE^.flags and EP_DblQuoted) <> 0 then
+      begin
+        if (pParse^.db^.init.busy <> 0)
+           or ((pParse^.db^.flags and u64($40000000)) <> 0) then
+        begin
+          pE^.op := TK_STRING;
+          FillChar(pE^.y, SizeOf(pE^.y), 0);
+          Exit;
+        end;
+      end;
       { Unresolved bare identifier — try TK_ID → TK_TRUEFALSE rewrite
         (resolve.c:747).  If that also fails, emit "no such column: X"
         per resolve.c:784..795 (lookupName). }
@@ -10311,6 +10327,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       emit "no such column: X" (resolve.c:784..795). }
     if pE^.op = TK_ID then
     begin
+      { 9.4.divbug.87.068 — same DQS demotion arm for the no-FROM path. }
+      if (pE^.flags and EP_DblQuoted) <> 0 then
+      begin
+        if (pParse^.db^.init.busy <> 0)
+           or ((pParse^.db^.flags and u64($40000000)) <> 0) then
+        begin
+          pE^.op := TK_STRING;
+          FillChar(pE^.y, SizeOf(pE^.y), 0);
+          Exit;
+        end;
+      end;
       if sqlite3ExprIdToTrueFalse(pE) = 0 then
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
