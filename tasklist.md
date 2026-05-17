@@ -1144,17 +1144,17 @@ acceptance gate for this section.
   - [ ] **9.4.divbug.88.009** `collate7` — ! collate7-1.1 error: invalid command name "sqlite3_create_collation_v2"
   - [ ] **9.4.divbug.88.010** `colname` — ! colname-2.1 error: invalid command name "execsql2"
   - [ ] **9.4.divbug.88.011** `corrupt` — ! corrupt-2.1.8 error: invalid command name "btree_from_db"
-  - [ ] **9.4.divbug.88.012** `corrupt2` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.013** `corrupt3` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.014** `corrupt4` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.015** `corrupt6` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.016** `corrupt7` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.017** `corruptE` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.018** `corruptG` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.019** `corruptH` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.020** `corruptI` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.021** `corruptJ` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
-  - [ ] **9.4.divbug.88.022** `corruptK` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
+  - [ ] **9.4.divbug.88.012** `corrupt2` — nonzero_reserved_bytes Tcl cmd ported (PasTclSqlite.pas:NonzeroReservedBytes; mirrors tester.tcl:331 `return [sqlite3 -has-codec]`=0 for no-codec build). Port advanced past prologue; corrupt2 now exercises 393 subtests (12 PASS / 381 FAIL — deeper port bugs around corrupt-DB handling). Verified via `LD_LIBRARY_PATH=src/ bin/TclTestDriver --filter corrupt2`.
+  - [ ] **9.4.divbug.88.013** `corrupt3` — nonzero_reserved_bytes Tcl cmd ported (see .012). corrupt3 now 0/13 (FAIL but no SOURCE-ERROR).
+  - [ ] **9.4.divbug.88.014** `corrupt4` — nonzero_reserved_bytes Tcl cmd ported (see .012). corrupt4 now 0/15.
+  - [ ] **9.4.divbug.88.015** `corrupt6` — nonzero_reserved_bytes Tcl cmd ported (see .012). corrupt6 now 0/12.
+  - [ ] **9.4.divbug.88.016** `corrupt7` — nonzero_reserved_bytes Tcl cmd ported (see .012). corrupt7 now 0/13.
+  - [ ] **9.4.divbug.88.017** `corruptE` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptE now 0/16.
+  - [ ] **9.4.divbug.88.018** `corruptG` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptG now 0/20.
+  - [ ] **9.4.divbug.88.019** `corruptH` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptH now 0/12.
+  - [ ] **9.4.divbug.88.020** `corruptI` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptI now 0/17.
+  - [ ] **9.4.divbug.88.021** `corruptJ` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptJ now 0/13.
+  - [ ] **9.4.divbug.88.022** `corruptK` — nonzero_reserved_bytes Tcl cmd ported (see .012). corruptK now 0/47.
   - [ ] **9.4.divbug.88.023** `corruptN` — ! corruptN-1.0 error: invalid command name "decode_hexdb"
   - [ ] **9.4.divbug.88.024** `dataversion1` — SOURCE-ERROR: invalid command name "file_control_data_version"
   - [ ] **9.4.divbug.88.025** `delete_db` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"

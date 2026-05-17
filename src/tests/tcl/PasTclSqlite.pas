@@ -4826,6 +4826,25 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.012..020 — `nonzero_reserved_bytes` is defined in
+  upstream tester.tcl:331 as `return [sqlite3 -has-codec]`.  We don't
+  ship a codec, so the answer is always 0 — but the corrupt*.test
+  prologue calls this command and bails with `invalid command name`
+  if it's unregistered.  Provide a trivial C-side stub that mirrors
+  the no-codec result, matching what the upstream Tcl proc returns
+  against a no-codec build. }
+function NonzeroReservedBytes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc <> 1 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(0));
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -4836,6 +4855,9 @@ begin
     @DbMain, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('register_dbstat_vtab'),
     @TestRegisterDbstatVtab, nil, nil);
+  { 9.4.divbug.88.012..020 — corrupt*.test prologue requires this. }
+  Tcl_CreateObjCommand(interp, PChar('nonzero_reserved_bytes'),
+    @NonzeroReservedBytes, nil, nil);
   { 9.4.8.d — opcode coverage probes (see PasOpcodeCoverage{Enable,Dump}). }
   Tcl_CreateObjCommand(interp, PChar('pas_opcode_coverage_enable'),
     @PasOpcodeCoverageEnable, nil, nil);
