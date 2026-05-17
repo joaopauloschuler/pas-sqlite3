@@ -2257,6 +2257,22 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:272..291 — clang_sanitize_address.  Returns 1 when the C test
+  binary was compiled with -fsanitize=address, else 0.  Also returns 1
+  when env OMIT_MISUSE is set.  FPC port has no asan, so we honour only
+  the OMIT_MISUSE env hook. }
+function tcl_test_clang_sanitize_address(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  res: cint;
+begin
+  res := 0;
+  if GetEnvironmentVariable('OMIT_MISUSE') <> '' then res := 1;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(res));
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
 { 9.4.divbug.88.007 — sqlite3_register_cksumvfs.  test1.c:8795..8814.
   STUB: full cksumvfs port (cksumvfs.c, ~820 lines, page-checksum shim VFS)
   is out of scope here; we register the Tcl command and return SQLITE_OK so
@@ -5393,6 +5409,9 @@ begin
   { 9.4.divbug.88.058 — sqlite3_normalize SQL (test1.c:5550..5572). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_normalize'),
     @tcl_test_normalize, nil, nil);
+  { 9.4.divbug.88.053 — clang_sanitize_address (test1.c:272..291). }
+  Tcl_CreateObjCommand(interp, PChar('clang_sanitize_address'),
+    @tcl_test_clang_sanitize_address, nil, nil);
   { 9.4.divbug.88.007 — sqlite3_register_cksumvfs / _unregister_cksumvfs
     STUBS (test1.c:9328..9329).  Full cksumvfs.c port deferred. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_register_cksumvfs'),

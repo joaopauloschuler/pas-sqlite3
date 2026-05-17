@@ -1185,7 +1185,7 @@ acceptance gate for this section.
   - [x] **9.4.divbug.88.050** `memsubsys1` — SOURCE-ERROR: invalid command name "sqlite3_config_lookaside"
   - [x] **9.4.divbug.88.051** `memsubsys2` — SOURCE-ERROR: invalid command name "sqlite3_config_memstatus"
   - [ ] **9.4.divbug.88.052** `misc6` — ! misc6-1.1 error: invalid command name "sqlite_bind"
-  - [ ] **9.4.divbug.88.053** `misuse` — SOURCE-ERROR: invalid command name "clang_sanitize_address"
+  - [X] **9.4.divbug.88.053** `misuse` — ported `clang_sanitize_address` stub (always 0, honours OMIT_MISUSE env), TestModuleTest1.pas:2261; cite test1.c:272..291. SOURCE-ERROR cleared (22 pass / 35 fail vs 19 / 37 before).
   - [ ] **9.4.divbug.88.054** `mjournal` — SOURCE-ERROR: invalid command name "testvfs"
   - [ ] **9.4.divbug.88.055** `multiplex4` — SOURCE-ERROR: invalid command name "sqlite3_multiplex_initialize"
   - [ ] **9.4.divbug.88.056** `nan` — SOURCE-ERROR: invalid command name "nonzero_reserved_bytes"
