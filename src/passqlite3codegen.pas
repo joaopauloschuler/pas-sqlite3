@@ -3024,10 +3024,14 @@ type
     Allows codegen to drive on-disk schema reload without a circular
     use clause back into passqlite3main. }
   TSqlite3InitFn = function(db: PTsqlite3; pzErrMsg: PPAnsiChar): i32;
+  { 9.4.divbug.87.047 — wire sqlite3_busy_timeout (passqlite3main) into
+    PragTyp_BUSY_TIMEOUT write arm without circular uses. }
+  TBusyTimeoutFn = function(db: PTsqlite3; ms: i32): i32;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
   gSqlite3Init:      TSqlite3InitFn;
+  gBusyTimeout:      TBusyTimeoutFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -52346,6 +52350,24 @@ begin
     Exit;
   end;
 
+  { PragTyp_BUSY_TIMEOUT (pragma.c:2651..2657).  Write arm calls
+    sqlite3_busy_timeout(db, atoi(zRight)) at compile time, then both
+    arms emit OP_Integer db->busyTimeout / OP_ResultRow.  9.4.divbug.87.047
+    — lock-2.8b / lock-2.11b expected the sqlite3_busy_timeout() Tcl-API
+    setter (db^.busyTimeout) to be visible to PRAGMA busy_timeout. }
+  if SameText(zName, 'busy_timeout') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if Assigned(gBusyTimeout) then
+        gBusyTimeout(db, sqlite3Atoi(PChar(zRight)))
+      else
+        db^.busyTimeout := sqlite3Atoi(PChar(zRight));
+    end;
+    sqlite3VdbeAddOp2(v, OP_Integer,   db^.busyTimeout, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -52358,7 +52380,6 @@ begin
     else if SameText(zName, 'threads')            then iVal := 0
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
-    else if SameText(zName, 'busy_timeout')       then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0
     else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
     else if SameText(zName, 'journal_size_limit') then iVal := -1

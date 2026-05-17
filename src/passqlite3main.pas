@@ -6228,6 +6228,10 @@ initialization
   vdbeRunVacuum := @runVacuumImpl;
   passqlite3codegen.gSqlite3Init :=
     passqlite3codegen.TSqlite3InitFn(@sqlite3Init);
+  { 9.4.divbug.87.047 — wire sqlite3_busy_timeout for PragTyp_BUSY_TIMEOUT
+    write arm (codegen.pas can't `uses passqlite3main`). }
+  passqlite3codegen.gBusyTimeout :=
+    passqlite3codegen.TBusyTimeoutFn(@sqlite3_busy_timeout);
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)
