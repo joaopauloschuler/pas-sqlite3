@@ -52517,16 +52517,22 @@ begin
     application_id is iCookie=BTREE_APPLICATION_ID, data_version is
     iCookie=BTREE_DATA_VERSION (virtual meta-value, ReadOnly). }
   if SameText(zName, 'user_version') or SameText(zName, 'application_id')
-     or SameText(zName, 'data_version') then
+     or SameText(zName, 'data_version') or SameText(zName, 'freelist_count')
+     or SameText(zName, 'schema_version') then
   begin
     if SameText(zName, 'user_version') then
       iCookie := BTREE_USER_VERSION
     else if SameText(zName, 'data_version') then
       iCookie := BTREE_DATA_VERSION
+    else if SameText(zName, 'freelist_count') then
+      iCookie := BTREE_FREE_PAGE_COUNT
+    else if SameText(zName, 'schema_version') then
+      iCookie := BTREE_SCHEMA_VERSION
     else
       iCookie := BTREE_APPLICATION_ID;
     sqlite3VdbeUsesBtree(v, iDb);
-    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION) then begin
+    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION)
+       and (iCookie <> BTREE_FREE_PAGE_COUNT) then begin
       { Write arm — Transaction(write) + SetCookie(P5=1).  data_version
         is ReadOnly per pragma.h flags so writes silently no-op. }
       SetString(zRight, pValue^.z, pValue^.n);
@@ -52800,8 +52806,6 @@ begin
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0
     else if SameText(zName, 'journal_size_limit') then iVal := -1
-    else if SameText(zName, 'freelist_count')     then iVal := 0
-    else if SameText(zName, 'schema_version')     then iVal := 0
     { pragma.c:951..978 PragTyp_MMAP_SIZE — when SQLITE_MAX_MMAP_SIZE<=0
       sz=0 and returnSingleInt(v, 0).  The Pas port does not yet wire
       sqlite3_file_control(SQLITE_FCNTL_MMAP_SIZE) so default to 0,
