@@ -256,14 +256,58 @@ proc finalize_testing {} {
 
 # ifcapable — upstream tester.tcl:1725..1739.  Real implementation
 # evaluates a boolean expression of SQLITE_OMIT_*/SQLITE_ENABLE_*
-# compile-time caps (see fix_ifcapable_expr) and runs BODY iff true,
-# else ELSEBODY.  pas-sqlite3 is built with the default set of caps
-# enabled (no SQLITE_OMIT_*), so for our smoke sweeps every expression
-# evaluates true — we unconditionally uplevel BODY and ignore both EXPR
-# and ELSEBODY.  Real cap-probe wiring lives behind 9.4.6.a / 9.4.2.g.1
-# follow-up.  C ref: tester.tcl:1725..1739.
+# compile-time caps (see fix_ifcapable_expr at tester.tcl:1697..1714)
+# and runs BODY iff true, else ELSEBODY.  pas-sqlite3 is built with the
+# default set of caps enabled (no SQLITE_OMIT_*), so every bare
+# capability token resolves to 1; we just remap ident-runs to "1" and
+# leave operators (`!`, `&&`, `||`, parens) intact, then eval as a
+# Tcl expression.  That means `ifcapable trigger` runs BODY,
+# `ifcapable !trigger` runs ELSEBODY — fixing rowid-8.* which would
+# otherwise execute both the `trigger` and `!trigger` arms and trip
+# "table t3 already exists" (divbug.73).  C ref: tester.tcl:1697..1739.
+# Per-capability defaults that diverge from "feature enabled" (1).
+# Mirrors the SQLITE_ALLOW_ROWID_IN_VIEW etc. test_config.c arms — caps
+# that are OFF in a vanilla build must read 0 so `ifcapable !foo` runs
+# the BODY and `ifcapable foo` runs ELSEBODY.
+array set ::sqlite_options {}
+set ::sqlite_options(allow_rowid_in_view) 0
+# pas-sqlite3 does not ship FTS3/4/5 — mirror test_config.c when
+# SQLITE_OMIT_FTS3 / SQLITE_OMIT_FTS5 are defined.
+set ::sqlite_options(fts3) 0
+set ::sqlite_options(fts5) 0
+
 proc ifcapable {expr code {else ""} {elsecode ""}} {
-  set c [catch {uplevel 1 $code} r]
+  set e2 ""
+  set state 0
+  for {set i 0} {$i < [string length $expr]} {incr i} {
+    set ch [string range $expr $i $i]
+    set newstate [expr {[string is alnum $ch] || $ch eq "_"}]
+    if {$newstate} {
+      if {!$state} { append e2 {$::sqlite_options(} }
+      append e2 $ch
+    } else {
+      if {$state} { append e2 ")" }
+      append e2 $ch
+    }
+    set state $newstate
+  }
+  if {$state} { append e2 ")" }
+  if {$e2 eq ""} { set e2 "1" }
+  # Default any unset capability to 1 (feature enabled).
+  while {[regexp -indices {\$::sqlite_options\(([a-zA-Z0-9_]+)\)} $e2 _ kidx]} {
+    set k [string range $e2 [lindex $kidx 0] [lindex $kidx 1]]
+    if {![info exists ::sqlite_options($k)]} { set ::sqlite_options($k) 1 }
+    # Replace this single occurrence with its literal value so the loop
+    # terminates even if eval fails later.
+    set v $::sqlite_options($k)
+    regsub "\\\$::sqlite_options\\($k\\)" $e2 $v e2
+  }
+  if {[catch {expr $e2} v]} { set v 1 }
+  if {$v} {
+    set c [catch {uplevel 1 $code} r]
+  } else {
+    set c [catch {uplevel 1 $elsecode} r]
+  }
   return -code $c $r
 }
 
