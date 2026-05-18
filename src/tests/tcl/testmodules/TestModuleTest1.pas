@@ -5548,6 +5548,34 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.88.012.f — test1.c:4884..4902 test_errcode.
+  Usage: sqlite3_errcode DB.  Returns the symbolic name of the most
+  recent error (e.g. "SQLITE_CORRUPT"), via t1ErrName/sqlite3ErrName.
+  corrupt2-10.2 catches sqlite3_errcode and asserts {SQLITE_CORRUPT};
+  without this trampoline tester_min.tcl's fallback returned the numeric
+  rc (11). Registered at test1.c:9134. }
+function test_errcode(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_errcode(db);
+  Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.003 — test1.c:6383..6411 test_db_cacheflush.
   Usage: sqlite3_db_cacheflush DB.  Attempt to flush any dirty pages to
   disk.  Engine entry: passqlite3main.pas:4391 (main.c:921). }
@@ -5680,6 +5708,12 @@ begin
     notnull.test).  C ref test1.c registered at 9133. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_extended_errcode'),
     @test_extended_errcode, nil, nil);
+  { 9.4.divbug.88.012.f — sqlite3_errcode DB returns symbolic rc
+    name (test1.c:4884..4902, registered :9134). Without this the
+    tester_min.tcl fallback `[$db errorcode]` returns numeric 11 and
+    corrupt2-10.2 diverges from {SQLITE_CORRUPT}. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_errcode'),
+    @test_errcode, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
   { 9.4.divbug.88.047 — sqlite3_exec_printf DB FORMAT STRING.
