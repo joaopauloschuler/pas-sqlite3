@@ -52982,6 +52982,12 @@ begin
     if pValue <> nil then begin
       SetString(zRight, pValue^.z, pValue^.n);
       bSet := sqlite3GetBoolean(PChar(zRight), 0);
+      { pragma.c:1158..1162 — foreign-key support may not be enabled or
+        disabled while not in auto-commit mode.  Strip the bit from the
+        write mask so the in-transaction PRAGMA is a silent no-op.
+        (9.4.divbug.38.b — e_fkey-6.1..6.3.) }
+      if (db^.autoCommit = 0) and (flagMask = SQLITE_ForeignKeys) then
+        flagMask := 0;
       if bSet <> 0 then
         db^.flags := db^.flags or flagMask
       else
