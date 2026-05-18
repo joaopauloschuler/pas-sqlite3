@@ -53117,6 +53117,50 @@ begin
     Exit;
   end;
 
+  { PragTyp_AUTO_VACUUM write arm (pragma.c:807..843).  Parse 'none'/
+    'full'/'incremental' or 0/1/2, set db^.nextAutovac (so freshly-
+    materialised DB files inherit the mode in sqlite3BtreeOpen) and
+    call sqlite3BtreeSetAutoVacuum.  If the new mode is FULL or
+    INCREMENTAL, emit a small VDBE snippet that, inside an exclusive
+    transaction, refuses the change unless meta[4] (largest root page)
+    is non-zero (i.e. the DB already has at least one btree root from
+    which the ptrmap pages can be inferred), then writes meta[7]
+    (BTREE_INCR_VACUUM = eAuto-1) so subsequent connections see the
+    correct mode.  9.4.divbug.88.036. }
+  if SameText(zName, 'auto_vacuum') and (pValue <> nil) then begin
+    pBtArg := PBtree(db^.aDb[iDb].pBt);
+    if pBtArg = nil then Exit;
+    SetString(zRight, pValue^.z, pValue^.n);
+    if sqlite3StrICmp(PChar(zRight), 'none') = 0 then
+      iVal := BTREE_AUTOVACUUM_NONE
+    else if sqlite3StrICmp(PChar(zRight), 'full') = 0 then
+      iVal := BTREE_AUTOVACUUM_FULL
+    else if sqlite3StrICmp(PChar(zRight), 'incremental') = 0 then
+      iVal := BTREE_AUTOVACUUM_INCR
+    else begin
+      iVal := sqlite3Atoi(PChar(zRight));
+      if (iVal < 0) or (iVal > 2) then iVal := 0;
+    end;
+    db^.nextAutovac := Int8(iVal);
+    if sqlite3BtreeSetAutoVacuum(pBtArg, iVal) = SQLITE_OK then begin
+      if (iVal = BTREE_AUTOVACUUM_FULL) or (iVal = BTREE_AUTOVACUUM_INCR) then
+      begin
+        { setMeta6: open write txn, read meta[4] (largest root page)
+          into reg1; if it is non-zero, write meta[7] = eAuto-1.
+          Otherwise OP_Halt with SQLITE_OK / OE_Abort — silently
+          refuses to switch an unwritten DB. }
+        sqlite3VdbeAddOp2(v, OP_Transaction, iDb, 1);
+        sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, 1, BTREE_LARGEST_ROOT_PAGE);
+        iIncrVacAddr := sqlite3VdbeAddOp1(v, OP_If, 1);
+        sqlite3VdbeAddOp4Int(v, OP_Halt, SQLITE_OK, OE_Abort, 0, 0);
+        sqlite3VdbeJumpHere(v, iIncrVacAddr);
+        sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_INCR_VACUUM, iVal - 1);
+        sqlite3VdbeUsesBtree(v, iDb);
+      end;
+    end;
+    Exit;
+  end;
+
   { PragTyp_INCREMENTAL_VACUUM (pragma.c:854).  Faithful port: loop
     OP_IncrVacuum up to iLimit steps, returning one result row per step. }
   if SameText(zName, 'incremental_vacuum') then begin
