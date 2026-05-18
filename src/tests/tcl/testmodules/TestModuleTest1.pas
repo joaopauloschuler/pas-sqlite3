@@ -48,6 +48,7 @@ uses
   passqlite3totype,
   passqlite3explain,
   passqlite3wholenumber,
+  passqlite3decimal,
   passqlite3printf,
   passqlite3normalize,
   passqlite3cksumvfs,
@@ -553,12 +554,22 @@ begin
   Result := sqlite3WholenumberInit(db);
 end;
 
+{ decimal — ported passqlite3decimal unit (ext/misc/decimal.c).
+  Needed by nan.test (load_static_extension db decimal) which uses
+  decimal_exp() to render the exact decimal expansion of subnormal
+  doubles. 9.4.divbug.88.056. }
+function decimal_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3DecimalInit(db);
+end;
+
 function tclLoadStaticExtensionCmd(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
 const
   SQLITE_OK_LOAD_PERMANENTLY = 256;  { sqlite3.h — SQLITE_OK | (8<<8) }
 var
-  aExtension: array[0..8] of TStaticExt;
+  aExtension: array[0..9] of TStaticExt;
   db:         PTsqlite3;
   zName:      PAnsiChar;
   i, j, rc:   cint;
@@ -573,6 +584,7 @@ begin
   aExtension[6].zExtName := 'totype';      aExtension[6].pInit := @totype_ext_init;
   aExtension[7].zExtName := 'explain';     aExtension[7].pInit := @explain_ext_init;
   aExtension[8].zExtName := 'wholenumber'; aExtension[8].pInit := @wholenumber_ext_init;
+  aExtension[9].zExtName := 'decimal';     aExtension[9].pInit := @decimal_ext_init;
   zErrMsg := nil;
   if objc < 3 then
   begin
