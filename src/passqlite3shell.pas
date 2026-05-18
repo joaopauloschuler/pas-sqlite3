@@ -1331,21 +1331,36 @@ end;
 function localGetLine(var inF: Text; out atEof: Boolean): AnsiString;
 var
   ch: Char;
+  used, cap: PtrInt;
 begin
-  Result := '';
-  atEof  := False;
+  { Build the line in a SetLength-managed buffer with capacity-doubling
+    growth.  The naive `Result := Result + ch` form goes through
+    fpc_ansistr_concat -> DefaultAnsi2UnicodeMove on each char, which is
+    quadratic *and* round-trips the growing buffer through UTF-16; on
+    long input (e.g. tests with 65k single-row INSERT lines) this
+    dominates wall-clock.  See feedback note (9.4.divbug.89.005). }
+  atEof := False;
   if EOF(inF) then begin
-    atEof := True;
+    Result := '';
+    atEof  := True;
     Exit;
   end;
+  used := 0;
+  cap  := 128;
+  SetLength(Result, cap);
   while not EOF(inF) do begin
     Read(inF, ch);
     if ch = #10 then Break;
-    Result := Result + ch;
+    if used >= cap then begin
+      cap := cap * 2;
+      SetLength(Result, cap);
+    end;
+    Inc(used);
+    Result[used] := ch;  { 1-based }
   end;
   { Strip trailing '\r' if the input had CRLF terminators. }
-  if (Length(Result) > 0) and (Result[Length(Result)] = #13) then
-    SetLength(Result, Length(Result)-1);
+  if (used > 0) and (Result[used] = #13) then Dec(used);
+  SetLength(Result, used);
 end;
 
 { 10.1.4 sister: oneInputLine — shell.c.in:1042..1072.  In the C
