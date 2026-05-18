@@ -10273,8 +10273,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             {rowid, oid, _rowid_} and pTab has a VisibleRowid, bind to
             iColumn=-1 against this source.  WITHOUT-ROWID tables fall
             through to the "no such column" error, matching C. }
+          { 9.4.divbug.90.008 — must mirror C VisibleRowid (sqliteInt.h:2545)
+            here, not HasRowid.  Subquery synthetic tables and views carry
+            TF_NoVisibleRowid; resolving `subq.rowid` against them would
+            bind iColumn=-1 to a cursor whose pEList has no such slot,
+            crashing substExpr during pushdown (misc8-3.0). }
           if (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
-             and HasRowid(pItem^.pSTab) then
+             and ((pItem^.pSTab^.tabFlags and TF_NoVisibleRowid) = 0) then
           begin
             pE^.op      := TK_COLUMN;
             pE^.iTable  := pItem^.iCursor;
@@ -10487,7 +10492,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
-          if not HasRowid(pItem^.pSTab) then Continue;
+          { 9.4.divbug.90.008 — C uses VisibleRowid (sqliteInt.h:2545) here,
+            not HasRowid: subquery synthetic tables and views carry
+            TF_NoVisibleRowid and must NOT match a bare `rowid` reference,
+            otherwise iColumn=-1 is bound to a cursor whose pEList has no
+            such column and substExpr SIGSEGVs during WHERE pushdown
+            (misc8-3.0). }
+          if (pItem^.pSTab^.tabFlags and TF_NoVisibleRowid) <> 0 then Continue;
           pE^.op      := TK_COLUMN;
           pE^.iTable  := pItem^.iCursor;
           pE^.iColumn := i16(-1);
