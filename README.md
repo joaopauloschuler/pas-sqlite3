@@ -164,32 +164,15 @@ launching a run — picking the wrong invocation costs 25+ minutes.
   + tclsh and many tests allocate multi-MB page caches.  Run one shard
   at a time:
 
-  ```bash
-  for s in 0 1 2 3; do
-    timeout 1500 bin/TclTestDriver --gate strict \
-        --shard $s/4 --fail-log-dir bin/tcl-failure-logs \
-        > bin/shard-$s.log 2> bin/shard-$s.err
-  done
-  cat bin/shard-*.log | src/tests/tcl/check_status_regression.sh /dev/stdin
-  ```
-
-  Sequential 4-shard cost is ~25–60 min wall-clock — slower than
-  parallel, but the only way that finishes without OOM-killing one of
-  the shards mid-run (silent partial results).
-
-- **Three test files currently exceed the watchdog** and consume the
-  whole shard budget if left in (`pragma4.test`, `printf.test`,
-  `securedel.test` — tracked as `9.4.divbug.86`; sibling `.84` already
-  covers `select4.test` / `writecrash.test` / `securedel2.test`).  Until
-  those are fixed or moved to `src/tests/tcl/SKIP.md`, **shard 2 will
-  not finish under 25 min** — either accept the partial result or
-  temporarily skip them.
-- **Strict-gate FAIL is the only signal that matters.**  The shard log
-  reports `PASS`/`FAIL` per test, but most `FAIL`s are `pas-soft`
-  entries already cited in `src/tests/tcl/STATUS.txt`.  Only
-  `pas-strict` regressions break the build — those surface as
-  `REGRESSION (pas-strict FAIL): <path>` in the shard's stderr and via
-  `check_status_regression.sh`.
+```bash
+echo "=== shard $s/10 ==="
+for s in 0 1 2 3 4 5 6 7 8 9; do
+  timeout 3600 bin/TclTestDriver --gate strict \
+    --shard $s/10 --fail-log-dir bin/tcl-failure-logs \
+    > bin/shard-$s.log 2> bin/shard-$s.err
+done
+cat bin/shard-*.log | src/tests/tcl/check_status_regression.sh /dev/stdin
+```
 
 ---
 
