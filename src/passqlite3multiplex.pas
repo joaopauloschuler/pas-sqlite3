@@ -3,6 +3,12 @@
 
   9.4.divbug.88.069 — Faithful port of ../sqlite3/src/test_multiplex.c
   (1369 C lines).
+  9.4.divbug.88.069.a — Port the SQLITE_ENABLE_8_3_NAMES arms in
+  multiplexFilename (extension truncation, journal/wal offset rename)
+  and multiplexSubOpen (chunk-overflow → SQLITE_FULL).  Gated behind a
+  unit-local compile-time {$DEFINE SQLITE_ENABLE_8_3_NAMES} so the
+  default-on multiplex shim matches the test harness expectations of
+  multiplex4.test and delete_db.test 2.x.
 
   Multiplex VFS shim — splits a large database file across multiple smaller
   chunk files on disk (foo.db, foo.db001, foo.db002, ...).  All I/O is
@@ -32,6 +38,10 @@
       sqlite3_auto_extension, same convention as cksumvfs.
 }
 {$I passqlite3.inc}
+{ Enable SQLITE_ENABLE_8_3_NAMES arms in multiplexFilename / multiplexSubOpen
+  (test_multiplex.c gates these on the public SQLITE_ENABLE_8_3_NAMES symbol;
+  multiplex4.test and delete_db.test 2.x exercise the 8_3 rename path). }
+{$DEFINE SQLITE_ENABLE_8_3_NAMES}
 unit passqlite3multiplex;
 
 interface
@@ -205,15 +215,31 @@ procedure multiplexFilename(zBase: PAnsiChar; nBase, flags, iChunk: cint;
                             zOut: PAnsiChar);
 var
   n: cint;
+{$IFDEF SQLITE_ENABLE_8_3_NAMES}
+  i, iChk: cint;
+{$ENDIF}
 begin
   n := nBase;
   Move(zBase^, zOut^, n + 1);
   if (iChunk <> 0) and (iChunk <= MX_CHUNK_NUMBER) then begin
-    { SQLITE_ENABLE_8_3_NAMES branch omitted — not defined upstream.  When
-      that gate is enabled it folds journal/wal offsets into iChunk and
-      truncates after the last '.' within the final 4 chars. }
+{$IFDEF SQLITE_ENABLE_8_3_NAMES}
+    { test_multiplex.c:229..245 — fold the chunk index into a 3-digit
+      extension; if zOut already has a '.' within the trailing 4 chars,
+      truncate at it so the result fits in 8.3.  Journal/WAL chunks get a
+      400/700 offset so their extensions can't collide with main-db chunks. }
+    i := n - 1;
+    while (i > 0) and (i >= n - 4) and (zOut[i] <> '.') do Dec(i);
+    if i >= n - 4 then n := i + 1;
+    iChk := iChunk;
+    if (flags and SQLITE_OPEN_MAIN_JOURNAL) <> 0 then
+      iChk := iChk + SQLITE_MULTIPLEX_JOURNAL_8_3_OFFSET
+    else if (flags and SQLITE_OPEN_WAL) <> 0 then
+      iChk := iChk + SQLITE_MULTIPLEX_WAL_8_3_OFFSET;
+    multiplexAppend03d(zOut + n, iChk);
+{$ELSE}
     if flags = flags then ;  { silence unused-param warning }
     multiplexAppend03d(zOut + n, iChunk);
+{$ENDIF}
     n := n + 3;
   end;
   Assert(zOut[n] = #0);
@@ -268,8 +294,15 @@ begin
   pSubOpen := nil;
   pOrigVfs := gMultiplex_pOrigVfs;
 
-  { SQLITE_ENABLE_8_3_NAMES branch (iChunk >= JOURNAL_8_3_OFFSET → SQLITE_FULL)
-    omitted — gate not defined upstream. }
+{$IFDEF SQLITE_ENABLE_8_3_NAMES}
+  { test_multiplex.c:299..309 — with JOURNAL_8_3_OFFSET=400, any overflow file
+    that is part of a database journal is named db.401, db.402, … so a database
+    may not grow past 400 chunks.  Refusing chunk 400+ surfaces SQLITE_FULL. }
+  if iChunk >= SQLITE_MULTIPLEX_JOURNAL_8_3_OFFSET then begin
+    rc^ := SQLITE_FULL;
+    Exit(nil);
+  end;
+{$ENDIF}
 
   rc^ := multiplexSubFilename(pGroup, iChunk);
   if rc^ = SQLITE_OK then begin
