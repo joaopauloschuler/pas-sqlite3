@@ -50,6 +50,7 @@ uses
   passqlite3wholenumber,
   passqlite3printf,
   passqlite3normalize,
+  passqlite3cksumvfs,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -2320,33 +2321,34 @@ begin
   if (clientData = nil) and (objc = 0) and (objv = nil) then ;
 end;
 
-{ 9.4.divbug.88.007 — sqlite3_register_cksumvfs.  test1.c:8795..8814.
-  STUB: full cksumvfs port (cksumvfs.c, ~820 lines, page-checksum shim VFS)
-  is out of scope here; we register the Tcl command and return SQLITE_OK so
-  the test prologue (cksumvfs.test:27) advances.  Downstream subtests that
-  rely on actual checksum behaviour will fail with a clearer error than
-  the original "invalid command name". }
+{ 9.4.divbug.88.068 — sqlite3_register_cksumvfs.  test1.c:8795..8814.
+  Wraps the full Pascal port in passqlite3cksumvfs.pas. }
 function tcl_test_register_cksumvfs(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: i32;
 begin
   if objc <> 1 then begin
     Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
     Result := TCL_ERROR; Exit;
   end;
-  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  rc := sqlite3_register_cksumvfs(nil);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
   Result := TCL_OK;
 end;
 
-{ 9.4.divbug.88.007 — sqlite3_unregister_cksumvfs.  test1.c:8816..8835.
-  STUB: paired with the register stub above; returns SQLITE_OK. }
+{ 9.4.divbug.88.068 — sqlite3_unregister_cksumvfs.  test1.c:8816..8835. }
 function tcl_test_unregister_cksumvfs(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: i32;
 begin
   if objc <> 1 then begin
     Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
     Result := TCL_ERROR; Exit;
   end;
-  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  rc := sqlite3_unregister_cksumvfs;
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
   Result := TCL_OK;
 end;
 
