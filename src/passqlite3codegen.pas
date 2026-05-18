@@ -14351,21 +14351,78 @@ begin
               iTab);
 end;
 
-function sqlite3IndexAffinityOk(pX: PExpr; idxaff: AnsiChar): i32;
+{ comparisonAffinity (expr.c:364..379) — return the affinity that should be
+  applied to both operands of a comparison.  Mirrors the C body 1:1. }
+function comparisonAffinity(const pExpr: PExpr): AnsiChar;
+var
+  aff: AnsiChar;
 begin
-  { Real impl in expr.c — checks that the expression's affinity is
-    compatible with the index column affinity.  For rowid-EQ scans
-    pIdx is nil, so zCollName is nil and the caller never reaches here. }
-  Result := 1;
+  Assert((pExpr^.op = TK_EQ) or (pExpr^.op = TK_IN) or (pExpr^.op = TK_LT)
+      or (pExpr^.op = TK_GT_TK) or (pExpr^.op = TK_GE) or (pExpr^.op = TK_LE)
+      or (pExpr^.op = TK_NE) or (pExpr^.op = TK_IS) or (pExpr^.op = TK_ISNOT));
+  Assert(pExpr^.pLeft <> nil);
+  aff := sqlite3ExprAffinity(pExpr^.pLeft);
+  if pExpr^.pRight <> nil then
+    aff := sqlite3CompareAffinity(pExpr^.pRight, aff)
+  else if ExprUseXSelect(pExpr) then
+    aff := sqlite3CompareAffinity(
+             PExprListItem(ExprListItems(pExpr^.x.pSelect^.pEList))^.pExpr, aff)
+  else if Byte(aff) = 0 then
+    aff := AnsiChar(SQLITE_AFF_BLOB);
+  Result := aff;
 end;
 
+{ sqlite3IndexAffinityOk (expr.c:387..396) — true if an index column with
+  affinity idx_affinity can serve pExpr's comparison. }
+function sqlite3IndexAffinityOk(pX: PExpr; idxaff: AnsiChar): i32;
+var
+  aff: AnsiChar;
+begin
+  aff := comparisonAffinity(pX);
+  if Byte(aff) < SQLITE_AFF_TEXT then Exit(1);
+  if Byte(aff) = SQLITE_AFF_TEXT then
+  begin
+    if Byte(idxaff) = SQLITE_AFF_TEXT then Exit(1) else Exit(0);
+  end;
+  if Byte(idxaff) >= SQLITE_AFF_NUMERIC then Result := 1 else Result := 0;
+end;
+
+{ indexInAffinityOk (where.c:319..344) — for a WO_IN term, check that the
+  comparison affinity is compatible with the index column affinity.  Returns
+  the collation name to demand from the index, or nil if incompatible.
+  Vector IN ("(x,y) IN (SELECT...)") synthesises a fake TK_EQ Expr for the
+  iField'th pair. }
 function indexInAffinityOk(pParse: PParse; pTerm: PWhereTerm;
   idxaff: AnsiChar): PAnsiChar;
+var
+  pX:      PExpr;
+  inexpr:  TExpr;
+  pRet:    PTCollSeq;
+  iField:  i32;
 begin
-  { Real impl checks each LHS of an "x IN (...)" RHS against the index
-    column affinity, returning the collation name or nil.  WO_IN is not
-    produced by the current minimal sqlite3WhereSplit body. }
-  Result := nil;
+  pX := pTerm^.pExpr;
+  Assert((pTerm^.eOperator and WO_IN) <> 0);
+
+  if sqlite3ExprIsVector(pX^.pLeft) <> 0 then
+  begin
+    iField := pTerm^.u.iField - 1;
+    FillChar(inexpr, SizeOf(inexpr), 0);
+    inexpr.op    := TK_EQ;
+    inexpr.pLeft := PExprListItem(PByte(ExprListItems(pX^.pLeft^.x.pList))
+                      + iField * SZ_EXPRLIST_ITEM)^.pExpr;
+    Assert(ExprUseXSelect(pX));
+    inexpr.pRight := PExprListItem(PByte(ExprListItems(pX^.x.pSelect^.pEList))
+                       + iField * SZ_EXPRLIST_ITEM)^.pExpr;
+    pX := @inexpr;
+  end;
+
+  if sqlite3IndexAffinityOk(pX, idxaff) <> 0 then
+  begin
+    pRet := PTCollSeq(sqlite3ExprCompareCollSeq(pParse, pX));
+    if pRet <> nil then Result := pRet^.zName else Result := WhereStrBINARY;
+  end
+  else
+    Result := nil;
 end;
 
 { ===========================================================================
