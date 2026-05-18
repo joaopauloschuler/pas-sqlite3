@@ -1664,7 +1664,7 @@ ports: bare table-valued or MATCH-style invocations are blocked by bug 6.13
   - [ ] **10.1a.1.7** `.imposter INDEX IMPOSTER` / `.imposter off` — emits `CREATE TABLE` from `PRAGMA index_xinfo` + `SQLITE_TESTCTRL_IMPOSTER` wrap.  Cite: shell.c.in:9781..9962 (~180 lines).  Depends on `sqlite3_test_control(IMPOSTER, …)` arm being live; verify before porting.
   - [ ] **10.1a.1.8** `.progress N` — `sqlite3_progress_handler` plus `--quiet/--reset/--once/--timeout/--limit` flag parser.  Cite: shell.c.in:10380..10435 (~56 lines).  Needs `flgProgress` / `mxProgress` / `tmProgress` / `nProgress` ShellState fields (check whether already present) and a `progress_handler` callback trampoline.
   - [X] **10.1a.1.9** `.load FILE ?ENTRY?` — `cmdLoad` landed; safe-mode gate + arg parse + `sqlite3_load_extension` forward; surfaces engine OMIT "extension loading is disabled" on stderr.
-  - [ ] **10.1a.1.10** `.auth ON|OFF` — `sqlite3_set_authorizer(shellAuth | safeModeAuth | nil)`.  Cite: shell.c.in:9007..9022 (~16 lines).  Needs `shellAuth` callback + `safeModeAuth` callback ported from shell.c.in:8901..8973 (~80 lines additional).  Total ~100 LOC.
+  - [X] **10.1a.1.10** `.auth ON|OFF` — `sqlite3_set_authorizer(shellAuth | safeModeAuth | nil)`.  Cite: shell.c.in:9007..9022 (~16 lines).  Needs `shellAuth` callback + `safeModeAuth` callback ported from shell.c.in:8901..8973 (~80 lines additional).  Total ~100 LOC.
   - [X] **10.1a.1.11** `.intck ?STEPS_PER_UNLOCK?` — `cmdIntck` landed; wraps `sqlite3_intck_open/_step/_message/_unlock/_error/_close`; emits `<N> steps, <M> errors` trailer per C.
 
 ### 10.1.bug.* — fixed bug ledger (kept as ticked stubs only)
