@@ -49,10 +49,11 @@ for bin in "${binaries[@]}"; do
   fi
 
   # Count per-assertion PASS/FAIL markers emitted by the test (lines
-  # whose first non-whitespace token is the literal word PASS or FAIL).
+  # whose first non-whitespace token is the literal word PASS or FAIL,
+  # optionally followed by a colon — Tcl smoke tests use "PASS: ..." form).
   # Avoids matching summary lines like "Results: 1026 pass" or "ALL PASS".
-  ap=$(grep -cE '^[[:space:]]*PASS([[:space:]]|$)' "$log" 2>/dev/null); ap=${ap:-0}
-  af=$(grep -cE '^[[:space:]]*FAIL([[:space:]]|$)' "$log" 2>/dev/null); af=${af:-0}
+  ap=$(grep -cE '^[[:space:]]*PASS([[:space:]:]|$)' "$log" 2>/dev/null); ap=${ap:-0}
+  af=$(grep -cE '^[[:space:]]*FAIL([[:space:]:]|$)' "$log" 2>/dev/null); af=${af:-0}
   assert_pass=$((assert_pass + ap))
   assert_fail=$((assert_fail + af))
 

@@ -92,7 +92,7 @@ begin
   sqlite3_close(db);
 
   if fails = 0 then begin
-    WriteLn('TestPublicApi: PASS');
+    WriteLn('PASS: TestPublicApi');
     Halt(0);
   end else begin
     WriteLn('TestPublicApi: ', fails, ' failure(s)');

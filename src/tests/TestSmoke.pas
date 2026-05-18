@@ -73,41 +73,41 @@ begin
   rc := csq_open_v2(':memory:', db,
         SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, nil);
   Check(rc, 'csq_open_v2');
-  WriteLn('csq_open_v2     : OK');
+  WriteLn('PASS: csq_open_v2');
 
   { 3. Prepare "SELECT 1;" }
   rc := csq_prepare_v2(db, 'SELECT 1;', -1, stmt, tail);
   Check(rc, 'csq_prepare_v2');
-  WriteLn('csq_prepare_v2  : OK');
+  WriteLn('PASS: csq_prepare_v2');
 
   { 4. Step — expect SQLITE_ROW }
   rc := csq_step(stmt);
   if rc <> SQLITE_ROW then
     Fail('csq_step expected SQLITE_ROW (' + IntToStr(SQLITE_ROW) +
          '), got ' + IntToStr(rc));
-  WriteLn('csq_step        : SQLITE_ROW');
+  WriteLn('PASS: csq_step (SQLITE_ROW)');
 
   { 5. Read column 0 — expect integer 1 }
   val := csq_column_int(stmt, 0);
   if val <> 1 then
     Fail('csq_column_int expected 1, got ' + IntToStr(val));
-  WriteLn('column value    : ', val);
+  WriteLn('PASS: csq_column_int (value=', val, ')');
 
   { 6. Step again — expect SQLITE_DONE }
   rc := csq_step(stmt);
   if rc <> SQLITE_DONE then
     Fail('second csq_step expected SQLITE_DONE (' + IntToStr(SQLITE_DONE) +
          '), got ' + IntToStr(rc));
-  WriteLn('csq_step (done) : SQLITE_DONE');
+  WriteLn('PASS: csq_step (SQLITE_DONE)');
 
   { 7. Finalize }
   Check(csq_finalize(stmt), 'csq_finalize');
-  WriteLn('csq_finalize    : OK');
+  WriteLn('PASS: csq_finalize');
 
   { 8. Close }
   Check(csq_close(db), 'csq_close');
-  WriteLn('csq_close       : OK');
+  WriteLn('PASS: csq_close');
 
   WriteLn;
-  WriteLn('TestSmoke PASSED.');
+  WriteLn('PASS: TestSmoke (all steps)');
 end.
