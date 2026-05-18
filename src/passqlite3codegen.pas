@@ -5453,9 +5453,11 @@ var
   r1, r2:    i32;
   constMask: u32;
   pArg:      PExpr;
+  pColl:     Pointer;
 begin
   v := pParse^.pVdbe;
   db := pParse^.db;
+  pColl := nil;
   if v = nil then begin Result := False; Exit; end;
   z := pExpr^.u.zToken;
   if z = nil then begin Result := False; Exit; end;
@@ -5595,9 +5597,16 @@ begin
     i := 0;
     while i < n do
     begin
-      if (i < 32) and (sqlite3ExprIsConstant(pParse,
-            PExprListItem(PByte(items) + i * SZ_EXPRLIST_ITEM)^.pExpr) <> 0) then
+      pArg := PExprListItem(PByte(items) + i * SZ_EXPRLIST_ITEM)^.pExpr;
+      if (i < 32) and (sqlite3ExprIsConstant(pParse, pArg) <> 0) then
         constMask := constMask or (u32(1) shl i);
+      { Port of expr.c:5380..5382 — when SQLITE_FUNC_NEEDCOLL is set,
+        the OP_CollSeq P4 is the collation of the FIRST argument that
+        carries an explicit COLLATE clause (sqlite3ExprCollSeq returns
+        NULL for args without one).  Drives scalar min/max collation
+        propagation (collate4-4.10/4.13/4.14). }
+      if ((pDef^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0) and (pColl = nil) then
+        pColl := sqlite3ExprCollSeq(pParse, pArg);
       Inc(i);
     end;
     if constMask <> 0 then
@@ -5633,8 +5642,11 @@ begin
     collation sequences through expression trees; a BINARY collation is
     exactly what the C oracle uses for nullif(a,0) with no explicit COLLATE. }
   if (pDef^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0 then
+  begin
+    if pColl = nil then pColl := db^.pDfltColl;
     sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0,
-      PAnsiChar(db^.pDfltColl), P4_COLLSEQ);
+      PAnsiChar(pColl), P4_COLLSEQ);
+  end;
   sqlite3VdbeAddFunctionCall(pParse, i32(constMask), r1, target, n,
     pDef, i32(pExpr^.op2));
   if n > 0 then
@@ -56642,10 +56654,22 @@ var
   i:     i32;
   iBest: i32;
   msk:   i32;
+  pColl: Pointer;
+  pOp:   PVdbeOp;
 begin
   Assert(argc > 1);
   { msk=0 → min; msk=-1 (all bits) → max (mirrors C: mask = pUserData==0 ? 0 : -1) }
   if sqlite3_user_data(pCtx) = nil then msk := 0 else msk := -1;
+  { Recover collation from the OP_CollSeq emitted immediately before
+    OP_Function — port of func.c:27..34 sqlite3GetFuncCollSeq.  Drives
+    collate4-4.10/4.13/4.14 (scalar max(b,a) collation propagation). }
+  pColl := nil;
+  if (pCtx^.pVdbe <> nil) and (pCtx^.iOp >= 1) then
+  begin
+    pOp := @pCtx^.pVdbe^.aOp[pCtx^.iOp - 1];
+    if (pOp^.opcode = OP_CollSeq) and (pOp^.p4type = P4_COLLSEQ) then
+      pColl := pOp^.p4.pColl;
+  end;
   if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
   iBest := 0;
   i := 1;
@@ -56653,7 +56677,7 @@ begin
   begin
     if sqlite3_value_type(Psqlite3_value((argv+i)^)) = SQLITE_NULL then Exit;
     { (compare ^ msk) >= 0: for min keeps i when best>=i; for max keeps i when best<i }
-    if (sqlite3MemCompare((argv+iBest)^, (argv+i)^, nil) xor msk) >= 0 then
+    if (sqlite3MemCompare((argv+iBest)^, (argv+i)^, pColl) xor msk) >= 0 then
       iBest := i;
     Inc(i);
   end;
