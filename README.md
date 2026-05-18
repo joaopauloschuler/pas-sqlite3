@@ -148,7 +148,7 @@ artefacts:
 The harness exits rc=0 even when divergences exist (catalogue-only by
 design); promotion to a hard CI gate is tracked under `9.1.5`.
 
-### Upstream Tcl test suite (`bin/TclTestDriver`) — timing & timeouts
+### Upstream Tcl test suite (`bin/TclTestDriver`)
 
 `TclTestDriver` walks `src/tests/tcl/MANIFEST.txt` (~959 entries) and runs
 each `.test` file under a **20 s per-test watchdog**.  Read this before
@@ -175,6 +175,28 @@ for s in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 done
 cat bin/shard-*.log | src/tests/tcl/check_status_regression.sh /dev/stdin
 ```
+
+#### Running a single `.test` file
+
+To iterate on one test, pass `--filter SUBSTR` — only manifest entries
+whose path contains `SUBSTR` are run.  Combine with `--limit 1` if the
+substring still matches more than one entry:
+
+```bash
+bin/TclTestDriver --filter select1            # every entry matching "select1"
+bin/TclTestDriver --filter select1 --limit 1  # just the first match
+```
+
+Other flags accepted by the driver (see `src/tests/TclTestDriver.pas`):
+
+- `--manifest PATH` — point at an alternate manifest
+- `--shard I/N` — slice the (post-filter) entry list; `I` is 0-based
+- `--fail-log-dir DIR` — write a per-test log on FAIL
+- `--build PROFILE` — load an alternate engine `.so`
+  (e.g. `threadsafe`, `memdebug`)
+- `--permutation NAME` — apply a named runtime permutation
+- `--gate strict` — diff results against the committed `STATUS.txt`
+- `--coverage` — opt-in opcode-coverage mode
 
 ---
 
