@@ -33371,7 +33371,7 @@ begin
   addrSortBrk := 0;  { 0 = unallocated; valid labels are < 0 }
   if (p^.pOrderBy <> nil)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
-          or (pDest^.eDest = SRT_Coroutine))
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Mem))
      and (not isExists) then
   begin
     bSort := 1;
@@ -33682,6 +33682,64 @@ begin
       { Top-N gate (select.c pushOntoSorter:832..856).  When LIMIT is set
         and we are in B-tree mode (bUseSorter=0), cap the B-tree at
         LIMIT+OFFSET entries via the Last+IdxLE+Delete sequence. }
+      iSkipTopN := 0;
+      if (bUseSorter = 0) and (p^.iLimit <> 0) then
+      begin
+        if p^.iOffset <> 0 then iLimitTopN := p^.iOffset + 1
+                            else iLimitTopN := p^.iLimit;
+        sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
+                          sqlite3VdbeCurrentAddr(v) + 4);
+        sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+        iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
+                          iSorterCsr, 0,
+                          regSortBase,
+                          sortNKey);
+        sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
+      end;
+      Inc(pParse^.nMem);
+      regSortRec := pParse^.nMem;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                        sortNKey + bSeqExtra + nResultCol, regSortRec);
+      if bUseSorter <> 0 then
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol)
+      else
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iSorterCsr, regSortRec,
+                             regSortBase,
+                             sortNKey + bSeqExtra + nResultCol);
+      if iSkipTopN > 0 then
+        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+    end
+    else if (bSort <> 0) and (pDest^.eDest = SRT_Mem) then
+    begin
+      { 9.4.divbug.90.007 — pushOntoSorter for SRT_Mem scalar subquery
+        with ORDER BY.  Mirrors the SRT_EphemTab arm above; sort tail
+        below (extended to admit SRT_Mem) re-emits OP_Column from the
+        sorter into pDest^.iSdst on the first sorted row, then the
+        post-tail OP_DecrJumpZero on p^.iLimit short-circuits out of
+        the sort drain after row 1.  Without this, scalar subqueries
+        like `(SELECT x FROM t ORDER BY random() LIMIT 1)` silently
+        dropped the ORDER BY and returned the natural-scan-first row.
+        Port of selectInnerLoop SRT_Mem + sSort arm via pushOntoSorter
+        (select.c:1422..1438 dispatch through select.c:730..870). }
+      regSortBase := pParse^.nMem + 1;
+      Inc(pParse^.nMem, sortNKey + bSeqExtra + nResultCol);
+      for jj := 0 to sortNKey - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse,
+                ExprListItems(p^.pOrderBy)[jj].pExpr,
+                regSortBase + jj);
+        if r1 <> regSortBase + jj then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+      end;
+      if bSeqExtra <> 0 then
+      begin
+        regSeq := regSortBase + sortNKey;
+        sqlite3VdbeAddOp2(v, OP_Sequence, iSorterCsr, regSeq);
+      end;
+      for jj := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                          regSortBase + sortNKey + bSeqExtra + jj);
       iSkipTopN := 0;
       if (bUseSorter = 0) and (p^.iLimit <> 0) then
       begin
@@ -34101,6 +34159,15 @@ begin
     end
     else if pDest^.eDest = SRT_Coroutine then
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+    else if pDest^.eDest = SRT_Mem then
+    begin
+      { 9.4.divbug.90.007 — SRT_Mem sort tail.  Result registers were
+        already populated into pDest^.iSdst by the Column-emit loop
+        immediately above; no further opcode is required to land the
+        first sorted row.  The post-tail OP_DecrJumpZero (always emitted
+        for SRT_Mem inner-loop since p^.iLimit is forced to 1 by
+        sqlite3CodeSubselect) breaks the SorterNext loop after row 1. }
+    end
     else
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
     { LIMIT decrement after each emitted row (post-sort).  Sorter mode
