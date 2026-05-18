@@ -83,6 +83,14 @@ else
   echo "libsqlite3.so already present, skipping C build."
 fi
 
+# ---- Step 1b: Scrub stale Pascal artefacts before compiling ----
+# Without this, a previous aborted/partial run leaves .ppu/.o files behind
+# and FPC's cross-unit decisions diverge from a clean build — manifesting
+# as "first run has N failures, second run has fewer" flakiness.
+find "$SRC_DIR"    -maxdepth 3 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete 2>/dev/null || true
+find "$BIN_DIR"    -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete 2>/dev/null || true
+find "$SCRIPT_DIR" -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete 2>/dev/null || true
+
 # ---- Step 2: Compile Pascal test binaries ----
 # 10.1.42.d — opt-in SQLITE_DEBUG gate.  Default builds leave it
 # undefined so {$IFDEF SQLITE_DEBUG} consumer arms (TREETRACE /
