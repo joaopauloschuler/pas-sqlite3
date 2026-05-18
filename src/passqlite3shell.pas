@@ -121,6 +121,7 @@ uses
   passqlite3pcachetrace,
   passqlite3recover,
   passqlite3expert,
+  passqlite3lineedit,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -1495,15 +1496,19 @@ end;
 
 function oneInputLine(p: PShellState; isContinuation: Boolean;
                       out atEof: Boolean): AnsiString;
+var prompt: AnsiString;
 begin
   if curInputText <> nil then begin
     Result := localGetLine(curInputText^, atEof);
     Exit;
   end;
   if (p^.inFile = nil) and (stdin_is_interactive <> 0) then begin
-    if isContinuation then Write(dynamicContinuePromptStr)
-    else Write(mainPromptStr);
-    Flush(Output);
+    if isContinuation then prompt := dynamicContinuePromptStr
+    else prompt := mainPromptStr;
+    Result := LineEditReadLine(prompt, atEof);
+    if (not atEof) and (Length(Result) > 0) then
+      LineEditAddHistory(Result);
+    Exit;
   end;
   Result := localGetLine(Input, atEof);
 end;

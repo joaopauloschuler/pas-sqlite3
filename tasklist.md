@@ -1725,6 +1725,25 @@ ports: bare table-valued or MATCH-style invocations are blocked by bug 6.13
   code; any divergence is a hard failure.
   Landed: src/tests/TestCliParity.pas → bin/TestCliParity 20 PASS / 1 SOFT / 0 FAIL (21 total).
 
+### Phase 10.3 — Interactive line-editor follow-ups
+
+Baseline raw-mode editor with arrow-key history landed in
+`src/passqlite3lineedit.pas` (Left/Right/Home/End/Up/Down,
+Backspace/Delete, Ctrl-A/E/B/F/N/P/U/K/W/L/C/D, in-memory history
+capped at 1000).  Optional enhancements on top of that baseline:
+
+- [ ] **10.3.a** On-disk history persistence at `~/.passqlite3_history`
+  (load on startup, append/save on exit; mode 0600).
+- [ ] **10.3.b** Tab completion for `.dot` commands and for table /
+  column names visible in the currently-open database (query
+  `sqlite_schema` + `PRAGMA table_info`).
+- [ ] **10.3.c** Multi-line wrap-aware rendering — current refresh
+  assumes the line fits on one terminal row; long lines smear.  Needs
+  column-count probe (`TIOCGWINSZ`) and a multi-row redraw that
+  positions the cursor with `ESC[<n>A` / `ESC[<n>B`.
+- [ ] **10.3.d** Reverse-incremental search (Ctrl-R) over the in-memory
+  history, matching readline's `(reverse-i-search)`'pat': hit` UX.
+
 ---
 
 ## Phase 11 — Benchmarks (Pascal-on-Pascal speedtest1 port)
