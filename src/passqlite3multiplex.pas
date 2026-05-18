@@ -63,10 +63,17 @@ function sqlite3_multiplex_initialize(zOrigVfsName: PAnsiChar;
   sqlite3_multiplex_shutdown() in test_multiplex.c:1211..1218. }
 function sqlite3_multiplex_shutdown(eForce: cint): cint;
 
+{ 9.4.divbug.88.069.b — Delete an SQLite database and all of its associated
+  files (journal, wal, shm, 8.3 variants and multiplex chunks).  Mirrors
+  sqlite3_delete_database() in test_delete.c:95..156.  zFile must be a real
+  filename, not an SQLite URI. }
+function sqlite3_delete_database(zFile: PAnsiChar): cint; cdecl;
+
 implementation
 
 uses
-  passqlite3printf;  { sqlite3PfMprintf }
+  passqlite3printf,  { sqlite3PfMprintf }
+  BaseUnix;          { FpAccess / FpUnlink / fpgeterrno / F_OK / ESysENOENT }
 
 { ----------------------------------------------------------------------
   Constants — test_multiplex.c:67..101 and test_multiplex.h:46..48.
@@ -1193,6 +1200,129 @@ begin
   FillChar(gMultiplex_sIoMethodsV2, SizeOf(gMultiplex_sIoMethodsV2), 0);
   gMultiplex_pOrigVfs := nil;
   Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  sqlite3_delete_database — test_delete.c:95..156.
+  Used by delete_db.test (9.4.divbug.88.069.b).  POSIX-only path: we
+  call FpAccess(F_OK) then FpUnlink directly, matching the upstream
+  non-_WIN32 branch.  pVfs is always NULL.
+  ---------------------------------------------------------------------- }
+
+{ test_delete.c:46..51 — sqlite3FileSuffix3-equivalent 8.3 truncation:
+  scan backwards for '/' or '.' within the basename; if a '.' is found
+  and the suffix already has at least 4 trailing chars, copy the final
+  3 bytes to fit immediately after the dot. }
+procedure sqlite3Delete83Name(z: PAnsiChar);
+var
+  i, sz: cint;
+begin
+  sz := 0;
+  while z[sz] <> #0 do Inc(sz);
+  i := sz - 1;
+  while (i > 0) and (z[i] <> '/') and (z[i] <> '.') do Dec(i);
+  if (z[i] = '.') and (sz > i + 4) then
+    Move(z[sz - 3], z[i + 1], 4); { incl trailing NUL }
+end;
+
+{ test_delete.c:60..89 — POSIX arm only.  pbExists may be NULL. }
+function sqlite3DeleteUnlinkIfExists(zFile: PAnsiChar;
+                                     pbExists: PcInt): cint;
+var
+  rc : cint;
+begin
+  rc := FpAccess(zFile, F_OK);
+  if rc <> 0 then begin
+    if fpgeterrno = ESysENOENT then begin
+      if pbExists <> nil then pbExists^ := 0;
+      rc := SQLITE_OK;
+    end;
+  end else begin
+    if pbExists <> nil then pbExists^ := 1;
+    rc := FpUnlink(zFile);
+  end;
+  Result := rc;
+end;
+
+{ Append a NUL-terminated suffix at zBuf[off..]; returns new length. }
+function appendSuffix(zBuf: PAnsiChar; off: cint; zSuffix: PAnsiChar): cint;
+var
+  k : cint;
+begin
+  k := 0;
+  while zSuffix[k] <> #0 do begin
+    zBuf[off + k] := zSuffix[k];
+    Inc(k);
+  end;
+  zBuf[off + k] := #0;
+  Result := off + k;
+end;
+
+function sqlite3_delete_database(zFile: PAnsiChar): cint; cdecl;
+const
+  azSuffix : array[0..3] of PAnsiChar = ('', '-journal', '-wal', '-shm');
+  aMSuffix : array[0..5] of PAnsiChar =
+    ('', '-journal', '-wal', '', '-journal', '-wal');
+  aMOffset : array[0..5] of cint =
+    (0, 0, 0,
+     0, SQLITE_MULTIPLEX_JOURNAL_8_3_OFFSET, SQLITE_MULTIPLEX_WAL_8_3_OFFSET);
+  aMb83    : array[0..5] of cint = (0, 0, 0, 1, 1, 1);
+var
+  zBuf    : PAnsiChar;
+  nBuf    : cint;
+  rc      : cint;
+  i       : cint;
+  iChunk  : cint;
+  bExists : cint;
+  nFile   : cint;
+  baseLen : cint;
+  iChk    : cint;
+begin
+  rc := 0;
+  nFile := 0;
+  while zFile[nFile] <> #0 do Inc(nFile);
+  nBuf := nFile + 100;
+  zBuf := PAnsiChar(sqlite3_malloc64(u64(nBuf)));
+  if zBuf = nil then Exit(SQLITE_NOMEM);
+
+  { Delete regular + 8.3 versions of db / journal / wal / shm. }
+  i := 0;
+  while (rc = 0) and (i < Length(azSuffix)) do begin
+    Move(zFile^, zBuf^, nFile);
+    baseLen := appendSuffix(zBuf, nFile, azSuffix[i]);
+    if baseLen = baseLen then ;  { silence unused }
+    rc := sqlite3DeleteUnlinkIfExists(zBuf, nil);
+    if (rc = 0) and (i <> 0) then begin
+      sqlite3Delete83Name(zBuf);
+      rc := sqlite3DeleteUnlinkIfExists(zBuf, nil);
+    end;
+    Inc(i);
+  end;
+
+  { Delete any multiplex chunk files. }
+  i := 0;
+  while (rc = 0) and (i < Length(aMSuffix)) do begin
+    iChunk := 1;
+    while iChunk <= MX_CHUNK_NUMBER do begin
+      bExists := 0;
+      Move(zFile^, zBuf^, nFile);
+      baseLen := appendSuffix(zBuf, nFile, aMSuffix[i]);
+      iChk := iChunk + aMOffset[i];
+      { 3-digit zero-padded chunk index. }
+      zBuf[baseLen]     := AnsiChar(Ord('0') + ((iChk div 100) mod 10));
+      zBuf[baseLen + 1] := AnsiChar(Ord('0') + ((iChk div 10) mod 10));
+      zBuf[baseLen + 2] := AnsiChar(Ord('0') + (iChk mod 10));
+      zBuf[baseLen + 3] := #0;
+      if aMb83[i] <> 0 then sqlite3Delete83Name(zBuf);
+      rc := sqlite3DeleteUnlinkIfExists(zBuf, @bExists);
+      if (bExists = 0) or (rc <> 0) then Break;
+      Inc(iChunk);
+    end;
+    Inc(i);
+  end;
+
+  sqlite3_free(zBuf);
+  if rc <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
 end;
 
 end.

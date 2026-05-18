@@ -2353,6 +2353,25 @@ begin
   Result := TCL_OK;
 end;
 
+{ 9.4.divbug.88.069.b — sqlite3_delete_database FILENAME.
+  test1.c:2852..2873; entry point in passqlite3multiplex.pas. }
+function tcl_test_delete_database(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zFile : PAnsiChar;
+  rc    : cint;
+begin
+  if clientData = clientData then ;
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FILE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zFile := Tcl_GetString(objv[1]);
+  rc := sqlite3_delete_database(zFile);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
+  Result := TCL_OK;
+end;
+
 { 9.4.divbug.88.069 — sqlite3_multiplex_initialize.
   test_multiplex.c:1229..1255.  Full Pascal port in passqlite3multiplex.pas. }
 function tcl_test_multiplex_initialize(clientData: TClientData; interp: PTclInterp;
@@ -5785,6 +5804,10 @@ begin
     @tcl_test_register_cksumvfs, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_unregister_cksumvfs'),
     @tcl_test_unregister_cksumvfs, nil, nil);
+  { 9.4.divbug.88.069.b — sqlite3_delete_database (test1.c:9321). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_delete_database'),
+    @tcl_test_delete_database, nil, nil);
+
   { 9.4.divbug.88.069 — sqlite3_multiplex_* (test_multiplex.c:1352..1367).
     Full multiplex shim VFS in passqlite3multiplex.pas. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_multiplex_initialize'),
