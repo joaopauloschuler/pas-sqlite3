@@ -22446,30 +22446,38 @@ begin
       Exit(nil);
     end;
 
-    { where.c:7218..7237 — for DELETE/UPDATE plans (WHERE_ONEPASS_DESIRED)
-      that target a rowid table, clear WHERE_IDX_ONLY on the driving
-      WhereLoop so the per-level cursor-open arm below opens the table
-      cursor (the delete/update proper needs it live).  Gated 1:1 with
-      C: only fires when bOnerow OR (WHERE_ONEPASS_MULTIROW && !vtab &&
-      !MULTI_OR && SQLITE_OnePass enabled).  Earlier divbug.55 omitted
-      the gate, which mislabelled UPDATE/DELETE EQP for COVERING-INDEX
-      plans where chngKey suppresses MULTIROW (indexedby-8.1/8.3/11.10).
-      divbug.87.027..030 restores the gate. }
+    { where.c:7218..7237 — ONEPASS_SINGLE / ONEPASS_MULTI detection for
+      DELETE/UPDATE plans (WHERE_ONEPASS_DESIRED).  Faithful port of the
+      C block: bOnerow ⇒ ONEPASS_SINGLE, otherwise ONEPASS_MULTI when the
+      caller granted WHERE_ONEPASS_MULTIROW, the table is not virtual,
+      the scan is not MULTI-OR (or the caller granted DUPLICATES_OK), and
+      the OnePass optimisation is enabled.  Then, on rowid tables that
+      went WHERE_IDX_ONLY, clear that flag so the cursor-open arm below
+      opens the table cursor (the delete/update proper needs it live).
+      9.4.divbug.90.005.a — previously only the second half (clearing
+      WHERE_IDX_ONLY) lived here; the eOnePass assignment was duplicated
+      only in the inline single-table fast path (line 22756), so any
+      UPDATE that went through the full-planner block (e.g. table with
+      indexes + no WHERE) saw eOnePass=ONEPASS_OFF and update.c's
+      sqlite3OpenTableAndIndices emitted a second OP_OpenRead alongside
+      the planner's OP_OpenWrite (indexexpr2-4.200/4.210/4.220). }
     if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
     begin
       pLoop := whereInfoLevels(pWInfo)[0].pWLoop;
       pTab  := SrcListItems(pTabList)[0].pSTab;
-      if HasRowid(pTab)
-         and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0)
-         and (pTab^.eTabType <> TABTYP_VTAB)
-         and (   ((pLoop^.wsFlags and WHERE_ONEROW) <> 0)
-              or (    ((wctrlFlags and WHERE_ONEPASS_MULTIROW) <> 0)
-                  and (((pLoop^.wsFlags and WHERE_MULTI_OR) = 0)
-                       or ((wctrlFlags and WHERE_DUPLICATES_OK) <> 0))
-                  and OptimizationEnabled(db, SQLITE_OnePass)) )
-      then
+      if ((pLoop^.wsFlags and WHERE_ONEROW) <> 0)
+         or (    ((wctrlFlags and WHERE_ONEPASS_MULTIROW) <> 0)
+             and (pTab^.eTabType <> TABTYP_VTAB)
+             and (((pLoop^.wsFlags and WHERE_MULTI_OR) = 0)
+                  or ((wctrlFlags and WHERE_DUPLICATES_OK) <> 0))
+             and OptimizationEnabled(db, SQLITE_OnePass)) then
       begin
-        pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
+        if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
+          pWInfo^.eOnePass := ONEPASS_SINGLE
+        else
+          pWInfo^.eOnePass := ONEPASS_MULTI;
+        if HasRowid(pTab) and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0) then
+          pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
       end;
     end;
 
@@ -22527,7 +22535,17 @@ begin
               and ((wctrlFlags and WHERE_OR_SUBCLAUSE) = 0))
            or ((pTabItem^.fg.jointype and (JT_LTORJ or JT_RIGHT)) <> 0) then
         begin
-          sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
+          { where.c:7275..7280 — ONEPASS DELETE/UPDATE opens its driving
+            cursor as OP_OpenWrite and records aiCurOnePass[0] so the
+            caller (sqlite3DeleteFrom / sqlite3Update) skips re-opening
+            via sqlite3OpenTableAndIndices.  9.4.divbug.90.005.a. }
+          if pWInfo^.eOnePass <> ONEPASS_OFF then
+          begin
+            sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenWrite);
+            pWInfo^.aiCurOnePass[0] := pTabItem^.iCursor;
+          end
+          else
+            sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
           { 7.4b.2 — reduce OP_OpenRead p4 (column count) to the highest
             bit set in pTabItem^.colUsed when only a prefix is referenced.
             Mirrors where.c:7284..7297. }
