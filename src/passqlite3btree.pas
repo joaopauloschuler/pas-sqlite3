@@ -3262,6 +3262,9 @@ begin
   end;
   d1 := szHdr1;
   if d1 > u32(nKey1) then begin
+    { Corruption — match C vdbeaux.c:4770 errCode assignment so caller
+      IndexMoveto can promote rc to SQLITE_CORRUPT_BKPT (divbug.88.018). }
+    pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
     Result := 0;
     Exit;
   end;
@@ -3313,7 +3316,10 @@ begin
       else begin
         nStr := i32((serial_type - 12) shr 1);
         if (d1 + u32(nStr)) > u32(nKey1) then begin
-          { Corruption — match C return-0-without-eqSeen }
+          { Corruption — match C return-0-without-eqSeen.  Also set
+            errCode so IndexMoveto can promote to SQLITE_CORRUPT
+            (vdbeaux.c:4854, divbug.88.018). }
+          pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
           Result := 0;
           Exit;
         end;
@@ -3379,6 +3385,9 @@ begin
       else begin
         nStr := i32((serial_type - 12) shr 1);
         if (d1 + u32(nStr)) > u32(nKey1) then begin
+          { Corruption — vdbeaux.c:4885; flag errCode for caller
+            (divbug.88.018). }
+          pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
           Result := 0;
           Exit;
         end;
@@ -3443,6 +3452,9 @@ begin
       Inc(idx1, vTmp32);
     end;
     if idx1 >= szHdr1 then begin
+      { Corrupt index — vdbeaux.c:4944 errCode propagation
+        (divbug.88.018). }
+      pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
       Result := 0;
       Exit;
     end;
@@ -3755,6 +3767,10 @@ begin
     Exit;
   end;
 
+  { Initialise errCode so corruption arms in the comparator have a clean
+    slate (btree.c:6042; divbug.88.018). }
+  pIdxKey^.errCode := 0;
+
   { Skip-to-root optimization — mirrors btree.c:6049..6083.
     Two cases:
       (1) cursor is at the *last cell* of the table and pIdxKey >= that
@@ -3861,6 +3877,10 @@ bypass_moveto_root:
         pRes^ := 0;
         rc := SQLITE_OK;
         pCur^.ix := u16(idx);
+        { btree.c:6197 — comparator may have stashed CORRUPT/NOMEM in
+          errCode even when reporting equality; propagate so caller
+          sees the malformed-disk-image error (divbug.88.018). }
+        if pIdxKey^.errCode <> 0 then rc := SQLITE_CORRUPT_BKPT;
         goto moveto_index_finish;
       end;
       if lwr > upr then break;
