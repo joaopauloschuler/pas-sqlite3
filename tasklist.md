@@ -1225,6 +1225,70 @@ acceptance gate for this section.
   - [X] **9.4.divbug.89.012** `tkt3080` — SOURCE-ERROR was the local `getDbPointer` in TestModuleEcho.pas missing the `sqlite3TestTextToPtr` hex-string fallback (only handled the `db` Tcl-command-name form via `Tcl_GetCommandInfo`).  tkt3080.test line 53 calls `register_echo_module [sqlite3_connection_pointer db]` which passes a "0x..." hex pointer — our local helper returned `nil` (Tcl_GetCommandInfo lookup fails for hex strings) then `register_echo_module` short-circuited with `TCL_ERROR` + empty result, surfacing as empty `SOURCE-ERROR:` in stderr.  Fixed at src/tests/tcl/testmodules/TestModuleEcho.pas:1244..1280 by porting the test1.c:57..76 hex decoder inline (matches test1.c:112..123 `getDbPointer`).  Driver now reports `PASS ../sqlite3/test/tkt3080.test 6 300`.
   - [X] **9.4.divbug.89.013** `joinA` — **PASS 42/42** after porting `extendFJMatch` (resolve.c:208..223) + the FULL-JOIN coalesce-arm of `lookupName` (resolve.c:458..461 + 761..782) into ResolveExpr at passqlite3codegen.pas:10241..10394.  Root cause: when a bare TK_ID matched USING-shared columns across a FULL JOIN (both JT_LEFT and JT_RIGHT set), the existing port had no extendFJMatch and fell through to `Inc(cnt)` so any second match raised "ambiguous column name".  Fix: track pFJMatch ExprList; on FULL-JOIN USING match append a synthesised TK_COLUMN (iCursor of prior pMatch, IPK-aliased matchEffCol, EP_CanBeNull); track matchEffCol per match (IPK→-1 alias applied per resolve.c:466); after the loop if `cnt>1 and pFJMatch^.nExpr=cnt-1`, append one more arg from the right-most match and rewrite pE in place as `TK_FUNCTION 'coalesce'` with x.pList=pFJMatch (resolve.c:773..776).  Also clear pFJMatch on the non-USING-ambig and pure-RIGHT arms (resolve.c:446, 456).  --filter join: joinA 0→42 PASS; joinB/C/D/E/F/H/I unchanged (8 PASS / 9 FAIL → 9 PASS / 8 FAIL); no regressions.
   - [~] **9.4.divbug.89.014** `joinB` residual (carved from .009 close 2026-05-17, partial close 2026-05-17) — joinB residual errors **368→32 / 512** (480 subtests now PASS, was 144).  Root cause: Pas port of `sqlite3ProcessJoin` (passqlite3codegen.pas:27412..27488, mirrors select.c:516..668) was missing the JT_LTORJ coalesce arm at select.c:596..633.  When the FROM clause contains *any* RIGHT/FULL JOIN, the USING-emitted left side `pE1` must be `coalesce(t1.col, t2.col, ..., tN.col)` over EVERY prior FROM term that has the column (gated by `pSrc->a[0].fg.jointype & JT_LTORJ`).  Without it, the RIGHT JOIN's unmatched-right scan emits a row where the first matched left-table's column is NULL, and the subsequent USING-eq `t1.a = t5.a` drops what should be a match (e.g. joinB-17: t4.a=19 unmatched-right + `INNER JOIN t5 USING(a)` lost the t5.a=19 row entirely).  Fix: port the `while tableAndColumnIndex(... iLeft+1, i-1 ...) != 0` loop that accumulates non-ambiguous matches into pFuncArgs, then wraps as a TK_FUNCTION 'coalesce' with affExpr=SQLITE_AFF_DEFER.  Also raise "ambiguous reference to X in USING()" when an interior match is NOT also USING-masked (mirrors select.c:619).  No regressions: joinA 42/42, joinC unchanged (152 err), joinD/E/F PASS, in-tree regression 100/101 (baseline).  Residual 32 errors in joinB form a different shape (e.g. joinB-84: expected `11 31 - 31 31 -` got `11 - - - 31 -`) — a separate downstream issue with column-2 (`t1.a`) projection on RIGHT-JOIN unmatched-right rows; tracked as 89.014-tail.
+
+      89.014-tail triage 2026-05-18 (no code landed — architectural):
+      All 32 residuals are subtests whose FROM clause contains a parens-
+      wrapped sub-join like `(t2 RIGHT JOIN t3 USING(a))` or `(t2 FULL JOIN
+      t3 USING(a))` (joinB-68/76/84/92/100/108/.../508).  EXPLAIN diff for
+      joinB-84 shows the divergence is in the INNER subroutine that
+      materialises the parens-wrapped sub-FROM into an ephemeral table:
+      C emits `Column 3 0` (read `a` from cursor t3) for the column-0
+      projection, Pas emits `Column 2 0` (read `a` from cursor t2).
+      C's inner subroutine also has 8 projection slots vs Pas's 6.
+
+      Root cause: Pas's `expandStar` (passqlite3codegen.pas:26821..27026)
+      directly emits resolved `TK_COLUMN(iCursor, iColumn)` while C's
+      `selectExpander` star arm (select.c:6160..6313) emits `TK_ID` /
+      `TK_DOT(TK_ID,TK_ID)` and relies on the *resolver* (`lookupName`,
+      resolve.c:370..461) to apply the JT_LTORJ + USING-shared
+      column-rewrite rule: when later FROM items USING-share the column
+      and are plain RIGHT JOIN (JT_RIGHT and not JT_LEFT), re-target
+      pMatch to the right-most table (rules at resolve.c:386..394 and
+      449..457); for FULL JOIN, synthesise a coalesce() via
+      `extendFJMatch` (already ported as 89.013 for the resolver, but
+      89.013 only covers bare TK_ID, not the expandStar/NestedFrom path).
+      In addition, the C SF_NestedFrom path at select.c:6184..6202
+      synthesises a leading `..colname` TK_ID with `bUsingTerm=1` for
+      each USING column before emitting that table's regular columns,
+      and (with VisibleRowid) appends a `rowid` alias per table at
+      select.c:6207..6208 — accounting for the extra 2 slots in C's
+      inner pEList.
+
+      Two attempted patches today: (1) port the resolver rescan loop
+      into expandStar with `pTgtItem`/`jTgt` redirect + FULL-JOIN
+      coalesce wrap, gated `SF_NestedFrom==0` — joinB-84 unchanged
+      (the divergence is *inside* the NestedFrom sub-expand, so the
+      gate excluded it).  (2) Same patch without the SF_NestedFrom
+      gate — joinB-84 fixed but joinB went from 32 fails to 211 fails
+      (regression on cases that rely on the existing 1-to-1 pEList /
+      pTab->nCol invariant, see assert at select.c:6174).  Reverted
+      both, repo back to clean baseline (32 fails / 480 pass).
+
+      Path forward (architectural — STOP per task guidance): port the
+      full SF_NestedFrom branch of `selectExpander` star arm
+      (select.c:6160..6313) including the `..colname` USING-prefix
+      synthesis, the `rowid` alias append, the qualified
+      TK_DOT-wrap policy, AND the resolver rescan-loop redirect for
+      plain RIGHT JOIN.  Or alternatively, switch Pas expandStar to
+      emit `TK_ID`/`TK_DOT` and ensure `sqlite3ResolveSelectNames`
+      re-runs over the expanded pEList so the existing lookupName
+      port (which already has the JT_RIGHT / extendFJMatch arms from
+      89.013) handles the redirect.  Either is a >1h port that
+      touches resolver invariants for every `SELECT *`, so deferred.
+      Reproducer:
+        CREATE TABLE t1(a INT,b INT,c INT);
+        CREATE TABLE t2(a INT,b INT,d INT);
+        CREATE TABLE t3(a INT,b INT,e INT);
+        CREATE TABLE t4(a INT,b INT,f INT);
+        CREATE TABLE t5(a INT,b INT,g INT);
+        INSERT INTO t1 VALUES(11,21,31);
+        INSERT INTO t3 VALUES(11,21,31);
+        INSERT INTO t4 VALUES(11,21,31);
+        SELECT a, c, d, e, f, g FROM t1
+          INNER JOIN (t2 RIGHT JOIN t3 USING(a)) USING(a)
+          RIGHT JOIN (t4 LEFT JOIN t5 USING(a)) USING(a);
+        -- expected: 11|31||31|31|
+        -- pas got:  11||||31|
   - [X] **9.4.divbug.89.015** `joinD` residual (carved from .010 close 2026-05-17, closed 2026-05-17) — Re-measured after just-landed siblings 89.013 (joinA FULL-JOIN USING extendFJMatch, commit 219aab1) and 89.014 (joinB JT_LTORJ coalesce, commit b1b851b): joinD now fully PASS (1170 subtests, 0 fail, ~1433 ms).  The SIGSEGV that previously hit between joinD-extra-1000 and joinD-extra-1010 was a downstream symptom of the same JT_LTORJ / extendFJMatch coalesce gaps fixed by 89.013+89.014 — once the USING-coalesce wrapped the missing FROM terms, the AV-triggering NULL-column projection path no longer fired.  No code change required for this ticket.  Sibling join tests: joinA/D/E/F/I all PASS; joinB/C/H still fail (pre-existing separate buckets — 89.014-tail, etc.).
   - [X] **9.4.divbug.89.016** `fuzz` residual — closed 2026-05-17.  Root cause: `LIMIT (SELECT ... ORDER BY 1)` (and OFFSET subqueries) tripped `AssertH multiSelectByMerge: iOrderByCol<=0` because pas's per-Select name resolver never resolved `p^.pLimit` at all.  Outer `sqlite3SelectAddTypeInfo` then walked the expression tree and blanket-set `SF_HasTypeInfo` on the inner LIMIT subquery's compound — so the later `sqlite3SelectPrep` call from `sqlite3CodeSubselect` early-returned before `sqlite3ResolveSelectNames` (and therefore `ResolveCompoundOrderBy`) ever ran on the inner.  The integer `ORDER BY 1` term reached `multiSelectByMerge` with `iOrderByCol=0` and tripped the assert.  C ref `resolve.c:1888` resolves LIMIT/OFFSET via `sqlite3ResolveExprNames(&sNC, p->pLimit)` with the walker descending into TK_SELECT children → inner gains `SF_Resolved` BEFORE `SF_HasTypeInfo` is set.  Fix: call `ResolveExpr(p^.pLimit)` in the per-Select loop in `sqlite3ResolveSelectNames` (passqlite3codegen.pas:11647).  Reusing the existing internal `ResolveExpr` (which already recurses into `pE^.x.pSelect` for TK_SELECT/TK_EXISTS) cleanly fixes the descent without adding a new walker.  Before: fuzz.test FAILs at fuzz-1.18 (0 / 414 ms).  After: fuzz.test advances past fuzz-1.18..fuzz-1.20 and ~365 fuzz-2.NN subtests before its next divergence (now fuzz-2.365, SIGSEGV — new bucket).  joinA 42/42 preserved; full TestWhere* / TestExpr / TestSelect Pas suites still 5199 assertions PASS.  Minimal repro: `SELECT -1 LIMIT (SELECT 0 EXCEPT SELECT DISTINCT 'experiments' ORDER BY 1 ASC);`.
 - [ ] **9.4.divbug.90** Extension / SQL function / VFS registration residue (sibling of `9.4.divbug.66`, carved from `9.4.4.g-unbucketed` 2026-05-16) — **8 pas-soft tests**: 6 `no such extension` (`btree02`, `extension01`, `func4`, `indexexpr2`, …), 1 `no such function` (`func9`), 1 `no such vfs: devsym` (`io`).  Each pin in the C build is a known extension/function/VFS shim; port or auto-register at db-open following the `.66` template.  Progress 2026-05-17: 7/8 registration shims landed (5 aExtension[] rows in TestModuleTest1.pas — eval/fileio/totype/explain/wholenumber, all Pas ports already existed; unistr_quote builtin in passqlite3codegen.pas via quoteFunc + pUserData=1, mirrors func.c:3340).  3/8 now PASS via driver (`extension01`, `func4`, `func9`); 4/8 reach the engine post-shim and re-bucket as non-registration engine bugs (`btree02`, `indexexpr2`, `memdb`, `misc8`); 1/8 (`io`) still wants the full `test_devsym.c` VFS port — out of scope for the registration drain.
