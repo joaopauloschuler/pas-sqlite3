@@ -165,8 +165,8 @@ launching a run — picking the wrong invocation costs 25+ minutes.
   at a time:
 
 ```bash
-echo "=== shard $s/10 ==="
 for s in 0 1 2 3 4 5 6 7 8 9; do
+  echo "=== shard $s/10 ==="
   timeout 3600 bin/TclTestDriver --gate strict \
     --shard $s/10 --fail-log-dir bin/tcl-failure-logs \
     > bin/shard-$s.log 2> bin/shard-$s.err
