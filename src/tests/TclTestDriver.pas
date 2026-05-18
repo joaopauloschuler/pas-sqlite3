@@ -126,13 +126,20 @@ type
     Ms       : LongInt;
   end;
 const
-  PER_TEST_TIMEOUT_OVERRIDES: array[0..3] of TPerTestTimeout = (
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..5] of TPerTestTimeout = (
     (BaseName: 'securedel2.test'; Ms: 900000),
     (BaseName: 'select4.test';    Ms: 900000),
     (BaseName: 'writecrash.test'; Ms: 900000),
     { 9.4.divbug.62.a — printf.test runs ~1200 mprintf assertions and
       easily blows past the 30s default once the cluster actually runs. }
-    (BaseName: 'printf.test';     Ms: 300000)
+    (BaseName: 'printf.test';     Ms: 300000),
+    { 9.4.divbug.91.002/.003 — backup.test runs 40 backup-3.* permutations
+      that each populate a ~100-page source DB via row-by-row INSERTs (no
+      sqlite3_create_function "randstr" → row-at-a-time in Tcl), then
+      backup_ioerr.test loops ~850 IO-error injections.  Both legitimately
+      blow past 30s once we stop infinite-looping on $::sqlite_pending_byte. }
+    (BaseName: 'backup.test';       Ms: 300000),
+    (BaseName: 'backup_ioerr.test'; Ms: 600000)
   );
 
 function TimeoutForTest(const testAbsPath: string): LongInt;

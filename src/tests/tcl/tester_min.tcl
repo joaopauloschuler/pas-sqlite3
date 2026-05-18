@@ -639,12 +639,20 @@ proc crashsql {args} {
 }
 
 # Initialise the global pending-byte that tester.tcl normally sets from
-# C-side test_config.  Upstream default is 0x40000000 (1 GiB) — the
-# child crashsql script catch-guards the call, so this is purely a
-# convenience so callers that read $::sqlite_pending_byte don't trip on
-# `can't read "sqlite_pending_byte": no such variable`.
+# C-side test_config.  Upstream tester.tcl:102 calls
+#   sqlite3_test_control_pending_byte 0x0010000
+# unconditionally at load time so the locking-page is reachable in tests
+# without creating multi-GiB database files.  Our pas-sqlite3 build does
+# not yet expose sqlite3_test_control_pending_byte as a Tcl command (the
+# engine PENDING_BYTE is a compile-time constant at 0x40000000) so we
+# cannot move the actual lock byte, but we MUST still mirror the Tcl-side
+# variable to 0x10000.  Otherwise upstream tests such as backup.test and
+# backup_ioerr.test do
+#   while {[file size test.db] <= $::sqlite_pending_byte} { ... }
+# which, against a 1 GiB threshold, never terminates and looks to the
+# test driver like an engine-level deadlock (9.4.divbug.91.002 / .003).
 if {![info exists ::sqlite_pending_byte]} {
-  set ::sqlite_pending_byte 0x40000000
+  set ::sqlite_pending_byte 0x0010000
 }
 
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
