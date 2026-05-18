@@ -3259,13 +3259,9 @@ function DbOneColumnExistsArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj; bExists: Boolean): cint; cdecl;
 var
   pDb:      PSqliteDb;
-  zSql:     PAnsiChar;
-  pStmt:    Pointer;
-  rc:       i32;
-  rcStep:   i32;
   pResult:  PTclObj;
-  zNullStr: PAnsiChar;
-  emptyNull: array[0..0] of AnsiChar;
+  sEval:    TDbEvalContext;
+  rc:       cint;
 begin
   if objc <> 3 then
   begin
@@ -3274,60 +3270,36 @@ begin
     Exit;
   end;
 
-  pDb  := PSqliteDb(clientData);
-  zSql := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
-  pStmt := nil;
-  rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, nil);
-  if rc <> SQLITE_OK then
-  begin
-    if pStmt <> nil then sqlite3_finalize(pStmt);
-    Tcl_SetObjResult(interp,
-      Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
-    Result := TCL_ERROR;
-    Exit;
-  end;
-  if pStmt = nil then
-  begin
-    { No statement compiled (empty / comment-only SQL) — behaves like
-      "no rows". }
-    if bExists then
-      Tcl_SetObjResult(interp, Tcl_NewBooleanObj(0));
-    Result := TCL_OK;
-    Exit;
-  end;
-
-  rcStep := sqlite3_step(pStmt);
+  pDb     := PSqliteDb(clientData);
   pResult := nil;
+
+  { Faithful port of tclsqlite.c:3259..3286 (DB_EXISTS / DB_ONECOLUMN):
+    iterate dbEvalStep so multi-statement scripts like
+      "COMMIT; SELECT count(*) FROM t1"
+    skip statements that produce no rows and return the first row of
+    the first row-producing statement (or "" / 0 if none).  The previous
+    single-prepare path only ever compiled the FIRST statement (pzTail
+    discarded), so a leading COMMIT swallowed the trailing SELECT and
+    `db one` returned empty — surfaces as btree02-110 expected 10 got [].
+    (9.4.divbug.90.001.) }
+  DbEvalInit(@sEval, pDb, ObjvAt(objv, 2), nil, 0);
+  rc := DbEvalStep(@sEval);
   if not bExists then
   begin
-    { onecolumn: return column 0 of the first row, or "" if no rows. }
-    if rcStep = SQLITE_ROW then
-    begin
-      emptyNull[0] := #0;
-      if pDb^.zNull <> nil then zNullStr := pDb^.zNull
-      else zNullStr := @emptyNull[0];
-      pResult := DbEvalColumnValue(pStmt, 0, zNullStr);
-    end;
+    if rc = TCL_OK then
+      pResult := DbEvalColumnValueCtx(@sEval, 0)
+    else if rc = TCL_BREAK then
+      Tcl_ResetResult(interp);
   end
-  else
-  begin
-    { exists: 1 if the query produced a row, else 0. }
-    if (rcStep = SQLITE_ROW) or (rcStep = SQLITE_DONE) then
-      pResult := Tcl_NewBooleanObj(Ord(rcStep = SQLITE_ROW));
-  end;
+  else if (rc = TCL_BREAK) or (rc = TCL_OK) then
+    pResult := Tcl_NewBooleanObj(Ord(rc = TCL_OK));
 
-  rc := sqlite3_finalize(pStmt);
-  if (rc <> SQLITE_OK) and (rcStep <> SQLITE_ROW) then
-  begin
-    Tcl_SetObjResult(interp,
-      Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
-    Result := TCL_ERROR;
-    Exit;
-  end;
-
+  DbEvalFinalize(@sEval);
   if pResult <> nil then
     Tcl_SetObjResult(interp, pResult);
-  Result := TCL_OK;
+
+  if rc = TCL_BREAK then rc := TCL_OK;
+  Result := rc;
 end;
 
 { DbCacheArm — port of the DB_CACHE arm of DbObjCmd (tclsqlite.c:2678..
