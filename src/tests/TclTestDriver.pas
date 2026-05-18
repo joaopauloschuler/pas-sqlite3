@@ -64,6 +64,11 @@
                           Output is buffered per-test and emitted in
                           MANIFEST order so PASS/FAIL counts and the
                           strict gate remain deterministic.
+      --timeout MS        override per-test timeout in milliseconds
+                          (default 30000).  When set, also clamps every
+                          entry in PER_TEST_TIMEOUT_OVERRIDES — intended
+                          as a fast smoke-sweep knob (e.g. --timeout 1000
+                          to surface only tests that finish within 1 s).
       --coverage          (9.4.8.d) opt-in opcode-coverage mode.
                           Injects pas_opcode_coverage_enable into the
                           child tclsh script, dumps per-test hit
@@ -142,11 +147,17 @@ const
     (BaseName: 'backup_ioerr.test'; Ms: 600000)
   );
 
+var
+  gTimeoutMs : LongInt = -1;   { --timeout override in ms; -1 = unset }
+
 function TimeoutForTest(const testAbsPath: string): LongInt;
 var
   i  : Integer;
   bn : string;
 begin
+  { --timeout MS clamps everything, overrides included — intent is
+    "show me only the fast tests", not "honour the slow-test allowlist". }
+  if gTimeoutMs > 0 then Exit(gTimeoutMs);
   bn := LowerCase(ExtractFileName(testAbsPath));
   for i := Low(PER_TEST_TIMEOUT_OVERRIDES) to High(PER_TEST_TIMEOUT_OVERRIDES) do
     if PER_TEST_TIMEOUT_OVERRIDES[i].BaseName = bn then
@@ -332,6 +343,13 @@ begin
       end;
     end else if a = '--coverage' then begin
       gCoverage := True;
+    end else if a = '--timeout' then begin
+      Inc(i);
+      gTimeoutMs := StrToIntDef(ParamStr(i), -1);
+      if gTimeoutMs <= 0 then begin
+        Writeln(StdErr, 'TclTestDriver: --timeout expects positive milliseconds, got: ', ParamStr(i));
+        Halt(2);
+      end;
     end else if a = '--jobs' then begin
       Inc(i); gJobs := StrToIntDef(ParamStr(i), 1);
       if gJobs < 1 then begin
