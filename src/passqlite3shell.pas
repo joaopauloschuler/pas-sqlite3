@@ -465,6 +465,10 @@ var
   Argv0:                AnsiString = '';
   mainPromptStr:        AnsiString = MAIN_PROMPT_DEFAULT;
   continuePromptStr:    AnsiString = CONTINUATION_PROMPT;
+  { 10.3.a — resolved on-disk history path for the interactive REPL.
+    Empty string disables load/save (non-TTY, pipe, no HOME).  Set on
+    REPL entry, consulted on REPL exit; see shell.c.in:13571..13609. }
+  gHistoryFile:         AnsiString = '';
   { 10.1.25 — `.output` / `.once` redirect state.  See cmdOutput. }
   gSavedStdoutFd:       cint    = -1;
   gOutRedirected:       Boolean = False;
@@ -11866,7 +11870,30 @@ begin
   { ---------------- REPL or bail ---------------- }
   if readStdin then begin
     state.zInFile := zStdinName;
+    { 10.3.a — on-disk history persistence at ~/.passqlite3_history
+      (linenoise-style load-on-start / save-on-exit; gated on
+      stdin_is_interactive like shell.c.in:13569..13609).  Honours
+      $PASSQLITE_HISTORY override; otherwise defaults to
+      $HOME/.passqlite3_history.  Skipped under non-TTY/pipe stdin
+      to avoid clobbering the user's file from test harnesses. }
+    if (stdin_is_interactive <> 0) and LineEditIsTTY then begin
+      gHistoryFile := GetEnvironmentVariable('PASSQLITE_HISTORY');
+      if gHistoryFile = '' then begin
+        gHistoryFile := GetEnvironmentVariable('HOME');
+        if gHistoryFile <> '' then
+          gHistoryFile := gHistoryFile + '/.passqlite3_history'
+        else
+          gHistoryFile := '';
+      end;
+      if gHistoryFile <> '' then LineEditLoadHistory(gHistoryFile);
+    end else
+      gHistoryFile := '';
     Result := processInput(@state);
+    if gHistoryFile <> '' then begin
+      LineEditStifleHistory(HistoryMaxEntries);
+      LineEditSaveHistory(gHistoryFile);
+      gHistoryFile := '';
+    end;
   end else
     Result := 0;
 

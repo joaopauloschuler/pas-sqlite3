@@ -1737,8 +1737,8 @@ Baseline raw-mode editor with arrow-key history landed in
 Backspace/Delete, Ctrl-A/E/B/F/N/P/U/K/W/L/C/D, in-memory history
 capped at 1000).  Optional enhancements on top of that baseline:
 
-- [ ] **10.3.a** On-disk history persistence at `~/.passqlite3_history`
-  (load on startup, append/save on exit; mode 0600).
+- [X] **10.3.a** On-disk history persistence at `~/.passqlite3_history`
+  (load on startup, append/save on exit; mode 0600).  Mirrors shell.c.in:13571..13609 (linenoise-style load/stifle/save).  Added `LineEditLoadHistory` / `LineEditSaveHistory` / `LineEditStifleHistory` to passqlite3lineedit.pas; wired into shellMain's REPL gate (passqlite3shell.pas) under `stdin_is_interactive` + `LineEditIsTTY`.  `$PASSQLITE_HISTORY` overrides the default `$HOME/.passqlite3_history`; capped at `HistoryMaxEntries` (1000) at save time.  Smoke (pty): two SELECTs + `.quit` persisted; relaunch + Up-arrow recalls last entry.  Regression: 100/101 (unchanged TestFuzzDiff baseline).
 - [ ] **10.3.b** Tab completion for `.dot` commands and for table /
   column names visible in the currently-open database (query
   `sqlite_schema` + `PRAGMA table_info`).
