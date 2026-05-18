@@ -541,6 +541,27 @@ type
 var
   btreeMovetoIndexHook: TBtreeMovetoIndexFn;
 
+{ ---------------------------------------------------------------------------
+  btreeRecordCmpEncChgHook — vdbe.pas registers a callback here at unit
+  init that runs the encoding-change arm of vdbeCompareMemString
+  (vdbeaux.c:4450) on the LHS key bytes (wrapped via the Mem-prefix
+  inputs) and the RHS Mem.  Pulled out of sqlite3VdbeRecordCompare to
+  avoid a uses-cycle (vdbe.pas already uses btree.pas).  Parameters:
+    pLhsBytes/nLhs    — raw key cell bytes (LHS), encoded in kiEnc
+    kiEnc, db         — KeyInfo encoding + db handle for the LHS Mem
+    pRhs              — already-formed Mem (RHS)
+    pColl             — collation (pColl^.enc differs from one or both)
+    prcErr            — OOM out param (Pu8); NIL if caller doesn't care
+  --------------------------------------------------------------------------- }
+type
+  TBtreeRecCmpEncChgFn = function(pLhsBytes: Pointer; nLhs: i32;
+                                  kiEnc: u8; db: Pointer;
+                                  pRhs: Pointer;
+                                  pColl: Pointer;
+                                  prcErr: Pu8): i32;
+var
+  btreeRecordCmpEncChgHook: TBtreeRecCmpEncChgFn;
+
 { ===========================================================================
   Phase 4.3 — Insert path public API
   =========================================================================== }
@@ -3299,29 +3320,49 @@ begin
         { Collation-aware compare — vdbeaux.c:4839.  pKeyInfo->aColl[i]
           carries the collation pointer (NULL = BINARY).  TKeyInfo
           layout: aColl[FLEXARRAY] starts at offset 32 (SizeOf(TKeyInfo)),
-          aColl[i] = PPointer(pKeyInfo + 32 + i*8).  Same-encoding fast
-          path only; encoding-mismatch falls back to BINARY compare
-          (vdbeCompareMemString transcoding arm not ported — default
-          UTF-8 build never reaches it). }
+          aColl[i] = PPointer(pKeyInfo + 32 + i*8).  When pColl^.enc
+          matches both kiEnc and pRhs^.enc we use the same-encoding fast
+          path.  Otherwise we delegate to the encoding-change arm via
+          btreeRecordCmpEncChgHook (vdbeaux.c:4450 port,
+          vdbeCompareMemStringWithEncodingChange — done in vdbe.pas to
+          avoid the uses-cycle into Mem helpers). }
         pColl := nil;
+        kiEnc := 0;
         if pIdxKey^.pKeyInfo <> nil then
         begin
           pColl := PBtCollView(PPointer(PByte(pIdxKey^.pKeyInfo)
                                         + 32 + i * 8)^);
-          if pColl <> nil then
-          begin
-            kiEnc   := PByte(pIdxKey^.pKeyInfo)[4];  { TKeyInfo.enc @4 }
-            collEnc := pColl^.enc;
-            if (collEnc <> kiEnc) or (kiEnc <> pRhs^.enc)
-               or (not Assigned(pColl^.xCmp)) then
-              pColl := nil;
-          end;
+          kiEnc := PByte(pIdxKey^.pKeyInfo)[4];  { TKeyInfo.enc @4 }
+          if (pColl <> nil) and (not Assigned(pColl^.xCmp)) then
+            pColl := nil;
         end;
         if pColl <> nil then
         begin
-          rc := pColl^.xCmp(pColl^.pUser,
-                            nStr,    @aKey1[d1],
-                            pRhs^.n, pRhs^.z);
+          collEnc := pColl^.enc;
+          if (collEnc = kiEnc) and (kiEnc = pRhs^.enc) then
+          begin
+            rc := pColl^.xCmp(pColl^.pUser,
+                              nStr,    @aKey1[d1],
+                              pRhs^.n, pRhs^.z);
+          end else if btreeRecordCmpEncChgHook <> nil then
+          begin
+            { vdbeaux.c:4450 transcoding arm.  Wrap LHS bytes as a
+              Mem(kiEnc) and call into the vdbe-side helper.  db comes
+              from KeyInfo.db @16. }
+            rc := btreeRecordCmpEncChgHook(@aKey1[d1], nStr, kiEnc,
+                                           PPointer(PByte(pIdxKey^.pKeyInfo)
+                                                    + 16)^,
+                                           pRhs, pColl, nil);
+          end else
+          begin
+            { Hook not yet wired (boot order) — fall back to BINARY. }
+            if nStr < pRhs^.n then nCmp := nStr else nCmp := pRhs^.n;
+            if nCmp > 0 then
+              rc := i32(CompareByte((@aKey1[d1])^, pRhs^.z^, nCmp))
+            else
+              rc := 0;
+            if rc = 0 then rc := nStr - pRhs^.n;
+          end;
         end else
         begin
           if nStr < pRhs^.n then nCmp := nStr else nCmp := pRhs^.n;

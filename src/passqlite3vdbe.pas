@@ -1533,6 +1533,9 @@ function  sqlite3VdbeMemFromBtreeZeroOffset(pCur: PBtCursor;
 function  sqlite3VdbeMemFinalize(pMem: PMem; pFunc: PFuncDef): i32;
 function  sqlite3VdbeMemAggValue(pAccum: PMem; pOut: PMem; pFunc: PFuncDef): i32;
 function  sqlite3MemCompare(pMem1, pMem2: PMem; pColl: Pointer): i32;
+function  sqlite3VdbeCompareMemStringEncChg(pMem1, pMem2: PMem;
+                                            pColl: PTCollSeq;
+                                            prcErr: Pu8): i32;
 function  sqlite3AddInt64(pA: Pi64; iB: i64): i32;
 function  sqlite3VdbeMemSetRowSet(pMem: PMem): i32;
 function  sqlite3VdbeMemIsRowSet(pMem: PMem): i32;
@@ -7524,6 +7527,35 @@ begin
   Result := n1 - n2;
 end;
 
+{ sqlite3VdbeCompareMemStringEncChg — port of vdbeaux.c:4450
+  vdbeCompareMemStringWithEncodingChange.  Both input Mems carry
+  string data in encodings that differ from pColl->enc; shallow-copy
+  each into a local Mem, transcode via sqlite3ValueText(v,pColl->enc),
+  call pColl->xCmp, then release.  On OOM (ValueText returns NULL)
+  sets prcErr (if non-NULL) to SQLITE_NOMEM and returns 0. }
+function sqlite3VdbeCompareMemStringEncChg(pMem1, pMem2: PMem;
+                                           pColl: PTCollSeq;
+                                           prcErr: Pu8): i32;
+var
+  c1, c2: TMem;
+  v1, v2: Pointer;
+begin
+  sqlite3VdbeMemInit(@c1, pMem1^.db, MEM_Null);
+  sqlite3VdbeMemInit(@c2, pMem1^.db, MEM_Null);
+  sqlite3VdbeMemShallowCopy(@c1, pMem1, MEM_Ephem);
+  sqlite3VdbeMemShallowCopy(@c2, pMem2, MEM_Ephem);
+  v1 := sqlite3ValueText(Psqlite3_value(@c1), pColl^.enc);
+  v2 := sqlite3ValueText(Psqlite3_value(@c2), pColl^.enc);
+  if (v1 = nil) or (v2 = nil) then begin
+    if prcErr <> nil then prcErr^ := SQLITE_NOMEM;
+    Result := 0;
+  end else begin
+    Result := pColl^.xCmp(pColl^.pUser, c1.n, v1, c2.n, v2);
+  end;
+  sqlite3VdbeMemReleaseMalloc(@c1);
+  sqlite3VdbeMemReleaseMalloc(@c2);
+end;
+
 { sqlite3MemCompare — full typed comparison of two Mem values.
   Port of vdbeaux.c:4579. pColl=nil → memcmp for strings. }
 function sqlite3MemCompare(pMem1, pMem2: PMem; pColl: Pointer): i32;
@@ -7587,8 +7619,12 @@ begin
                                           pMem2^.n, pMem2^.z);
         Exit;
       end;
-      { Encoding-change arm (vdbeaux.c:4450) — UTF-8/UTF-16 transcoding
-        not yet ported.  Default UTF-8 build never reaches this branch. }
+      { Encoding-change arm — port of vdbeaux.c:4450
+        vdbeCompareMemStringWithEncodingChange.  Shallow-copy both Mems,
+        transcode via sqlite3ValueText(v, pColl->enc), then xCmp + release. }
+      Result := sqlite3VdbeCompareMemStringEncChg(pMem1, pMem2,
+                                                   PTCollSeq(pColl), nil);
+      Exit;
     end;
     { no collation: fall through to blob compare (memcmp) }
   end;
@@ -14252,10 +14288,35 @@ begin
   Result := rc;
 end;
 
+{ btreeRecordCmpEncChgImpl — wired into btree.pas's
+  btreeRecordCmpEncChgHook at init.  The btree comparator calls this
+  when pColl^.enc differs from the LHS kiEnc or RHS pRhs^.enc — see
+  passqlite3btree.pas:3303 region.  We synthesise a Mem(kiEnc) over the
+  LHS raw bytes and delegate to sqlite3VdbeCompareMemStringEncChg
+  (vdbeaux.c:4450 port). }
+function btreeRecordCmpEncChgImpl(pLhsBytes: Pointer; nLhs: i32;
+                                  kiEnc: u8; db: Pointer;
+                                  pRhs: Pointer;
+                                  pColl: Pointer;
+                                  prcErr: Pu8): i32;
+var
+  mLhs: TMem;
+begin
+  sqlite3VdbeMemInit(@mLhs, Psqlite3(db), 0);
+  mLhs.flags := MEM_Str or MEM_Ephem;
+  mLhs.enc   := kiEnc;
+  mLhs.z     := PAnsiChar(pLhsBytes);
+  mLhs.n     := nLhs;
+  Result := sqlite3VdbeCompareMemStringEncChg(@mLhs, PMem(pRhs),
+                                              PTCollSeq(pColl), prcErr);
+  sqlite3VdbeMemReleaseMalloc(@mLhs);
+end;
+
 initialization
   FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
   SQLITE_DYNAMIC   := @sqlite3FreeXDel;
   SQLITE_TRANSIENT := TxDelProc(Pointer(-1));
-  btreeMovetoIndexHook := @btreeMovetoIndexImpl;
+  btreeMovetoIndexHook   := @btreeMovetoIndexImpl;
+  btreeRecordCmpEncChgHook := @btreeRecordCmpEncChgImpl;
 
 end.
