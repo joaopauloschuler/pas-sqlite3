@@ -3031,6 +3031,11 @@ type
     sqlite3WalDefaultHook pointer into PragTyp_WAL_AUTOCHECKPOINT without
     circular uses.  Both must be installed by passqlite3main at unit init. }
   TWalAutoCheckpointFn = function(db: PTsqlite3; nFrame: i32): i32;
+  { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
+    dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA (port of
+    pragma.c:475..511).  Installed by passqlite3main at unit init. }
+  TFileControlFn = function(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
+                            pArg: Pointer): i32; cdecl;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
@@ -3038,6 +3043,7 @@ var
   gBusyTimeout:      TBusyTimeoutFn;
   gWalAutoCheckpoint: TWalAutoCheckpointFn;
   gWalDefaultHook:   Pointer;
+  gFileControl:      TFileControlFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -52287,6 +52293,13 @@ var
   pPragmaId: PToken;
   newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
   iValPragma: i64; { 9.4.divbug.87.067 — PRAGMA max_page_count=N parse }
+  { 9.4.divbug.88.068.a — locals for SQLITE_FCNTL_PRAGMA fallback
+    (pragma.c:475..511).  aFcntlPragma is the four-slot char** argument
+    handed to the VFS xFileControl. }
+  aFcntlPragma: array[0..3] of PAnsiChar;
+  zDbFc:        PAnsiChar;
+  zRightFc:     PAnsiChar;
+  rcFc:         i32;
   { 9.4.divbug.36 — PragTyp_JOURNAL_MODE write arm locals
     (pragma.c:734..771).  eModeJm = resolved PAGER_JOURNALMODE_*,
     iJm = loop var, zModeJm = candidate name from azJournalModeName[]. }
@@ -52435,6 +52448,60 @@ begin
     ENCODING / PAGE_SIZE / CACHE_SIZE / SYNCHRONOUS / JOURNAL_MODE /
     LOCKING_MODE / INTEGRITY_CHECK and the constant-default emitters).
     Closing the remaining DiagPragma divergences. }
+  { 9.4.divbug.88.068.a — pragma.c:475..511.  Send an SQLITE_FCNTL_PRAGMA
+    file-control to the underlying VFS *before* the pragmaLocate lookup.
+    Lets cksumvfs / vfsstat / multiplex etc. intercept their pragmas even
+    when the name isn't in aPragmaName.  Layout of aFcntlPragma:
+      [0] = nil (VFS may set to a returned text result, owned by sqlite3_malloc)
+      [1] = zLeft (pragma name, UTF-8)
+      [2] = zRight (pragma argument or nil)
+      [3] = nil
+    On SQLITE_OK: emit a single-column result with aFcntl[0] then exit.
+    On any non-NOTFOUND rc: surface aFcntl[0] as the error message, bump
+    pParse->nErr/rc, and exit.  On SQLITE_NOTFOUND: fall through to the
+    legacy pragmaLocate dispatcher. }
+  if Assigned(gFileControl) then
+  begin
+    if (pId2 <> nil) and (pId2^.n > 0) then
+      zDbFc := db^.aDb[iDb].zDbSName
+    else
+      zDbFc := nil;
+    if pValue <> nil then
+      zRightFc := PAnsiChar(zRight)
+    else
+      zRightFc := nil;
+    aFcntlPragma[0] := nil;
+    aFcntlPragma[1] := PAnsiChar(zName);
+    aFcntlPragma[2] := zRightFc;
+    aFcntlPragma[3] := nil;
+    db^.busyHandler.nBusy := 0;
+    rcFc := gFileControl(db, zDbFc, SQLITE_FCNTL_PRAGMA, @aFcntlPragma);
+    if rcFc = SQLITE_OK then
+    begin
+      sqlite3VdbeSetNumCols(v, 1);
+      sqlite3VdbeSetColName(v, 0, COLNAME_NAME, aFcntlPragma[0],
+        SQLITE_TRANSIENT);
+      if aFcntlPragma[0] <> nil then
+      begin
+        sqlite3VdbeLoadString(v, 1, aFcntlPragma[0]);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+      end;
+      sqlite3_free(aFcntlPragma[0]);
+      Exit;
+    end;
+    if rcFc <> SQLITE_NOTFOUND then
+    begin
+      if aFcntlPragma[0] <> nil then
+      begin
+        sqlite3ErrorMsg(pParse, aFcntlPragma[0]);
+        sqlite3_free(aFcntlPragma[0]);
+      end;
+      Inc(pParse^.nErr);
+      pParse^.rc := rcFc;
+      Exit;
+    end;
+  end;
+
   pName := pragmaLocate(PAnsiChar(zName));
 
   { pragma.c:521..524 — make sure the database schema is loaded if the
