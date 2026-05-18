@@ -46238,9 +46238,16 @@ begin
   if p <> nil then begin
     pItem := PSrcItem(PByte(SrcListItems(p)) +
       (p^.nSrc - 1) * SizeOf(TSrcItem));
-    if (pAlias <> nil) and (pAlias^.n > 0) then
+    if (pAlias <> nil) and (pAlias^.n > 0) then begin
+      { 9.4.divbug.88.010.1 — must dequote the alias (build.c:5099 uses
+        sqlite3NameFromToken, not raw DbStrNDup).  Without dequote a
+        `... AS "y"` alias is stored as `"y"` and qualified refs `y.x` /
+        `"y"."x"` (which dequote on the lookupName side) fail to match. }
       pItem^.zAlias :=
         sqlite3DbStrNDup(db, PChar(pAlias^.z), pAlias^.n);
+      if pItem^.zAlias <> nil then
+        sqlite3Dequote(pItem^.zAlias);
+    end;
     if pSubquery <> nil then begin
       if sqlite3SrcItemAttachSubquery(pParse, pItem, pSubquery, 0) <> 0 then begin
         if (pSubquery^.selFlags and SF_NestedFrom) <> 0 then
