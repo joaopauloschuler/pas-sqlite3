@@ -1423,6 +1423,25 @@ proc do_not_use_codec {} {
 }
 catch {unset -nocomplain do_not_use_codec}
 
+# sql36231 — upstream tester.tcl:2446..2456.  Opens a second connection
+# on test.db, runs the supplied SQL, closes, then restores the 4-byte
+# field at offset 28 (db size in pages) and the 8 bytes at offset 92
+# (change-counter / version-valid-for).  Simulates a write by a
+# pre-3.7.0 client that never learnt to maintain those header fields,
+# so the next 3.7+ open must derive page count from file size again.
+# Used by filefmt-2.*, 3.2 and 4.2.  Verbatim port of the upstream proc.
+proc sql36231 {sql} {
+  set B [hexio_read test.db 92 8]
+  set A [hexio_read test.db 28 4]
+  sqlite3 db36231 test.db
+  catch { db36231 func a_string a_string }
+  execsql $sql db36231
+  db36231 close
+  hexio_write test.db 28 $A
+  hexio_write test.db 92 $B
+  return ""
+}
+
 # wal_is_wal_mode / wal_set_journal_mode / wal_check_journal_mode —
 # upstream tester.tcl:2308..2321.  Used by avtrans.test (and others) to
 # auto-promote the connection to WAL when running under the `wal`
