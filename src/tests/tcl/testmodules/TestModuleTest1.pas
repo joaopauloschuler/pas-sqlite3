@@ -51,6 +51,7 @@ uses
   passqlite3printf,
   passqlite3normalize,
   passqlite3cksumvfs,
+  passqlite3multiplex,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -2352,44 +2353,98 @@ begin
   Result := TCL_OK;
 end;
 
-{ 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_initialize.
-  test_multiplex.c:1227..1256 (registered :1357,1364).
-  STUB: full multiplex VFS port (test_multiplex.c, ~1400 lines, chunk-file
-  shim VFS) is out of scope; register the Tcl command and return SQLITE_OK
-  so delete_db.test / multiplex4.test prologues advance.  Subtests that
-  exercise actual chunking will FAIL deeper (tracked as 88.069). }
+{ 9.4.divbug.88.069 — sqlite3_multiplex_initialize.
+  test_multiplex.c:1229..1255.  Full Pascal port in passqlite3multiplex.pas. }
 function tcl_test_multiplex_initialize(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zName       : PAnsiChar;
+  makeDefault : cint;
+  rc          : cint;
 begin
+  if clientData = clientData then ;
   if objc <> 3 then begin
     Tcl_WrongNumArgs(interp, 1, objv, PChar('NAME MAKEDEFAULT'));
     Result := TCL_ERROR; Exit;
   end;
-  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  zName := Tcl_GetString(objv[1]);
+  if Tcl_GetBooleanFromObj(interp, objv[2], @makeDefault) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if zName[0] = #0 then zName := nil;
+  rc := sqlite3_multiplex_initialize(zName, makeDefault);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
   Result := TCL_OK;
 end;
 
-{ 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_shutdown.
-  test_multiplex.c:1258..1284 (registered :1358,1364).  STUB. }
+{ 9.4.divbug.88.069 — sqlite3_multiplex_shutdown.
+  test_multiplex.c:1260..1283. }
 function tcl_test_multiplex_shutdown(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc : cint;
 begin
+  if clientData = clientData then ;
+  if (objc = 2) and (StrComp(Tcl_GetString(objv[1]), '-force') <> 0) then
+    objc := 3;
   if (objc <> 1) and (objc <> 2) then begin
     Tcl_WrongNumArgs(interp, 1, objv, PChar('?-force?'));
     Result := TCL_ERROR; Exit;
   end;
-  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
+  rc := sqlite3_multiplex_shutdown(Ord(objc = 2));
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
   Result := TCL_OK;
 end;
 
-{ 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_control.
-  test_multiplex.c:1286..1354 (registered :1359,1364).  STUB. }
+{ 9.4.divbug.88.069 — sqlite3_multiplex_control HANDLE DBNAME SUB-COMMAND INT-VALUE.
+  test_multiplex.c:1288..1345. }
+const
+  aMxSubName : array[0..3] of PAnsiChar =
+    ('enable', 'chunk_size', 'max_chunks', nil);
+  aMxSubOp : array[0..2] of cint =
+    (214014 {MULTIPLEX_CTRL_ENABLE},
+     214015 {MULTIPLEX_CTRL_SET_CHUNK_SIZE},
+     214016 {MULTIPLEX_CTRL_SET_MAX_CHUNKS});
+
 function tcl_test_multiplex_control(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc      : cint;
+  idx     : cint;
+  cmdInfo : TTclCmdInfo;
+  db      : PTsqlite3;
+  iValue  : cint;
+  pArg    : Pointer;
 begin
-  Tcl_SetResult(interp, t1ErrName(SQLITE_OK), TCL_VOLATILE);
-  Result := TCL_OK;
-  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+  if clientData = clientData then ;
+  iValue := 0;
+  pArg := nil;
+  if objc <> 5 then begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('HANDLE DBNAME SUB-COMMAND INT-VALUE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  FillChar(cmdInfo, SizeOf(cmdInfo), 0);
+  if Tcl_GetCommandInfo(interp, Tcl_GetString(objv[1]),
+                        @cmdInfo) = 0 then begin
+    Tcl_AppendResult(interp, PChar('expected database handle, got "'),
+      Tcl_GetString(objv[1]), PChar('"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := PTestSqliteDb(cmdInfo.objClientData)^.db;
+  rc := Tcl_GetIndexFromObj(interp, objv[3],
+                            @aMxSubName[0], PChar('sub-command'), 0, @idx);
+  if rc <> TCL_OK then begin Result := rc; Exit; end;
+  if Tcl_GetIntFromObj(interp, objv[4], @iValue) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  pArg := @iValue;
+  rc := sqlite3_file_control(db, Tcl_GetString(objv[2]),
+                             aMxSubOp[idx], pArg);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
+  if rc = SQLITE_OK then Result := TCL_OK else Result := TCL_ERROR;
 end;
 
 { 9.4.divbug.88.034 — sqlite3_enable_shared_cache (test1.c:1665..1699).
@@ -5730,8 +5785,8 @@ begin
     @tcl_test_register_cksumvfs, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_unregister_cksumvfs'),
     @tcl_test_unregister_cksumvfs, nil, nil);
-  { 9.4.divbug.88.025 / 88.055 — sqlite3_multiplex_* STUBS
-    (test_multiplex.c:1357..1364).  Full multiplex shim VFS port deferred. }
+  { 9.4.divbug.88.069 — sqlite3_multiplex_* (test_multiplex.c:1352..1367).
+    Full multiplex shim VFS in passqlite3multiplex.pas. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_multiplex_initialize'),
     @tcl_test_multiplex_initialize, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_multiplex_shutdown'),
