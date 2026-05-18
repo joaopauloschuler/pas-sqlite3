@@ -26850,6 +26850,10 @@ var
   isStar:    Boolean;
   tableSeen: Boolean;
   zMsg:      PAnsiChar;
+  longNames: Boolean;
+  zColName:  PAnsiChar;
+  zTabName:  PAnsiChar;
+  pNewItem:  PExprListItem;
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
@@ -26870,6 +26874,9 @@ begin
   if not hasStar then Exit;
 
   db := pParse^.db;
+  { select.c:6118 — longNames triggers `tab.col` zEName synthesis. }
+  longNames := ((db^.flags and SQLITE_FullColNames) <> 0) and
+               ((db^.flags and SQLITE_ShortColNames) = 0);
   pNew := nil;
   for k := 0 to pEList^.nExpr - 1 do
   begin
@@ -26974,6 +26981,28 @@ begin
         else
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
         pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
+        { select.c:6307..6313 — synthesise zEName so generateColumnNames /
+          sqlite3ColumnsFromExprList can emit the inherited column name
+          (or "tab.col" under longNames) instead of falling through to
+          the generic `columnN` placeholder (9.4.divbug.88.010). }
+        if pNew <> nil then
+        begin
+          zColName := pCol^.zCnName;
+          pNewItem := PExprListItem(PByte(ExprListItems(pNew)) +
+                        (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+          if longNames then
+          begin
+            if pItem^.zAlias <> nil then
+              zTabName := pItem^.zAlias
+            else
+              zTabName := pTab^.zName;
+            pNewItem^.zEName := sqlite3MPrintf(db, '%s.%s',
+                                  [zTabName, zColName]);
+          end else
+            pNewItem^.zEName := sqlite3DbStrDup(db, zColName);
+          pNewItem^.fg.eBits :=
+            (pNewItem^.fg.eBits and not u8($03)) or u8(ENAME_NAME);
+        end;
       end;
     end;
     if not tableSeen then
