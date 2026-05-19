@@ -34400,7 +34400,20 @@ begin
     pNext := pIndex^.pNext;
     if (pTab^.eTabType <> TABTYP_VTAB) and (pIndex^.zName <> nil) then begin
       pIdxSchema := passqlite3util.PSchema(pIndex^.pSchema);
-      if pIdxSchema <> nil then
+      { Only unlink when the live idxHash entry actually points to *this*
+        pIndex.  Mirrors the spirit of build.c:828
+        `assert( pOld==pIndex || pOld==0 )` — in the C reference the
+        unlink is unconditional and the assert merely catches the
+        same-name-different-pointer case in debug builds.  The Pas port
+        runs into that case routinely on ALTER paths that build transient
+        Parse.pNewTable trees alongside the live schema (rename-mode
+        parse + init.busy re-parse both attach an autoindex pointer to
+        their pTab^.pIndex chain), so the unconditional remove rips the
+        live autoindex out of idxHash on transient cleanup and produces
+        "orphan index" on the next schema reload (alterdropcol-4.x.4+). }
+      if (pIdxSchema <> nil)
+         and (sqlite3HashFind(@pIdxSchema^.idxHash, PChar(pIndex^.zName))
+              = Pointer(pIndex)) then
         sqlite3HashInsert(@pIdxSchema^.idxHash, PChar(pIndex^.zName), nil);
     end;
     sqlite3FreeIndex(db, pIndex);
@@ -55161,16 +55174,50 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ Faithful port of callback.c:495 sqlite3SchemaClear.
+
+  Key invariant: idxHash is cleared *before* iterating tblHash so that
+  sqlite3DeleteTable's per-table index unlinking (build.c:817..831 →
+  `sqlite3HashInsert(&pIndex->pSchema->idxHash, zName, 0)`) is a no-op
+  on an already-empty hash.  The previous shortcut here merely zeroed
+  all four hashes without freeing their Table/Trigger payloads —
+  leaving dangling Table objects whose later free() ripped the *new*
+  autoindex (same name) out of idxHash, producing
+  "malformed database schema (sqlite_autoindex_<tab>_1) - orphan index"
+  on the first schema reload after ALTER TABLE DROP COLUMN on a table
+  with an autoindex (alterdropcol-4.x.4..9). }
 procedure sqlite3SchemaClear(p: Pointer);
 var
   pSchema: passqlite3util.PSchema;
+  temp1, temp2: passqlite3util.THash;
+  pElem: passqlite3util.PHashElem;
+  xdb: TSqlite3;
 begin
   pSchema := passqlite3util.PSchema(p);
   if pSchema = nil then Exit;
-  sqlite3HashClear(@pSchema^.tblHash);
+
+  FillChar(xdb, SizeOf(xdb), 0);
+  temp1 := pSchema^.tblHash;
+  temp2 := pSchema^.trigHash;
+  sqlite3HashInit(@pSchema^.trigHash);
   sqlite3HashClear(@pSchema^.idxHash);
-  sqlite3HashClear(@pSchema^.trigHash);
+
+  pElem := temp2.first;
+  while pElem <> nil do begin
+    sqlite3DeleteTrigger(@xdb, PTrigger(pElem^.data));
+    pElem := passqlite3util.PHashElem(pElem^.next);
+  end;
+  sqlite3HashClear(@temp2);
+
+  sqlite3HashInit(@pSchema^.tblHash);
+  pElem := temp1.first;
+  while pElem <> nil do begin
+    sqlite3DeleteTable(@xdb, PTable2(pElem^.data));
+    pElem := passqlite3util.PHashElem(pElem^.next);
+  end;
+  sqlite3HashClear(@temp1);
   sqlite3HashClear(@pSchema^.fkeyHash);
+
   pSchema^.pSeqTab := nil;
   if (pSchema^.schemaFlags and DB_SchemaLoaded) <> 0 then
     Inc(pSchema^.iGeneration);
