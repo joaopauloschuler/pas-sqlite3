@@ -9057,17 +9057,16 @@ begin
   if bPartial = 0 then begin
     i := 1;
     while (i <= sCheck.nCkPage) and (sCheck.mxErr <> 0) do begin
-      if pBt^.autoVacuum = 0 then begin
-        if getPageReferenced(@sCheck, i) = 0 then
-          checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
-      end else begin
-        { Auto-vacuum: pointer-map pages must be referenced exactly
-          when PTRMAP_PAGENO(pBt, i) == i.  The Pascal port treats
-          PTRMAP_PAGENO as approximate (per btree.pas:7340) so we
-          fall back to the !autoVacuum check, which is conservative. }
-        if getPageReferenced(@sCheck, i) = 0 then
-          checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
-      end;
+      { Auto-vacuum: pointer-map pages (PTRMAP_PAGENO(pBt,i)=i) are never
+        directly referenced from a btree, so they must be excluded from the
+        "never used" check; conversely a referenced ptrmap page is itself an
+        error.  btree.c:11242..11253. }
+      if (getPageReferenced(@sCheck, i) = 0)
+         and ((ptrmapPageno(pBt, i) <> i) or (pBt^.autoVacuum = 0)) then
+        checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
+      if (getPageReferenced(@sCheck, i) <> 0)
+         and ((ptrmapPageno(pBt, i) = i) and (pBt^.autoVacuum <> 0)) then
+        checkAppendMsg(@sCheck, 'Page %u: pointer map referenced', [i]);
       Inc(i);
     end;
   end;
