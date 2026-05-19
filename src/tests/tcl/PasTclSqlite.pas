@@ -1474,12 +1474,18 @@ begin
       DbBindOneParam(pDb, pStmt, iParam, zParamName, nil, nil);
     end;
 
-    nCol := sqlite3_column_count(pStmt);
+    { Defer sqlite3_column_count until AFTER the first sqlite3_step.  An
+      automatic SQLITE_SCHEMA reprepare inside step (VdbeSwap) can change
+      the column count, and capturing it before stepping would freeze the
+      stale value (alter2-1.3/2.2/3.3/7.2: SELECT * after a writable_schema
+      ALTER returned only the pre-ALTER columns per row). }
+    nCol := 0;
 
     repeat
       rcStep := sqlite3_step(pStmt);
       if rcStep = SQLITE_ROW then
       begin
+        if nCol = 0 then nCol := sqlite3_column_count(pStmt);
         if pScript = nil then
         begin
           { objc==3: accumulate typed column values onto the flat list. }
