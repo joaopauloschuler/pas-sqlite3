@@ -50649,6 +50649,11 @@ begin
         []);
       rc := SQLITE_ERROR;
     end;
+    { attach.c:205..207 — newly attached pager inherits db->dfltLockMode so
+      that `PRAGMA locking_mode=exclusive; ATTACH 'x' AS aux` leaves aux in
+      exclusive mode (exclusive-1.7..1.10). }
+    sqlite3PagerLockingMode(sqlite3BtreePager(PBtree(pSlot^.pBt)),
+                            i32(db^.dfltLockMode));
     sqlite3BtreeSecureDelete(PBtree(pSlot^.pBt),
       sqlite3BtreeSecureDelete(PBtree(db^.aDb[0].pBt), -1));
   end;
