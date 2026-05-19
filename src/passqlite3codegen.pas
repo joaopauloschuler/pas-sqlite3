@@ -5048,7 +5048,13 @@ begin
     pNew^.iOffset  := 0;
     pNew^.selFlags := p^.selFlags;
     pNew^.nSelectRow := p^.nSelectRow;
-    pNew^.pWith    := nil;  { Phase 6.5 }
+    { expr.c:1983 — duplicate the WITH clause so stored view bodies retain
+      their CTE definitions across selectDup.  Without this, a view defined
+      with `CREATE VIEW v AS WITH t AS (...) SELECT … FROM t` lost its
+      pWith on dup, so re-prep of the stored body could not find `t` as a
+      CTE and fell through to LocateTable → "no such table: main.t"
+      (errofst1-1.2). }
+    pNew^.pWith    := sqlite3WithDup(db, p^.pWith);
     pNew^.pWin     := nil;
     pNew^.pWinDefn := sqlite3WindowListDup(db, p^.pWinDefn);
     pNew^.selId    := p^.selId;
