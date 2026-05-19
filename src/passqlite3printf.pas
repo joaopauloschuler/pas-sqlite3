@@ -1306,10 +1306,16 @@ begin
         end;
       'q':
         begin
+          { printf.c:871..877 — for %q/%Q/%w the precision counts INPUT
+            bytes from escarg, not output bytes (extra quote-doubling and
+            wrapping is added on top).  Truncate the source first, then
+            escape, and pass prec=-1 to emitField so width-padding does
+            not re-truncate. }
           NextArgStr(s, wasNil);
           if wasNil then s := '';
+          if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
           body := escQ(s);
-          emitField(a, body, '', width, prec, leftAlign, False, True);
+          emitField(a, body, '', width, -1, leftAlign, False, True);
           Inc(p);
         end;
       'Q':
@@ -1317,10 +1323,11 @@ begin
           NextArgStr(s, wasNil);
           if wasNil then begin
             { %Q with nil → "NULL" without quotes }
-            emitField(a, 'NULL', '', width, prec, leftAlign, False, True);
+            emitField(a, 'NULL', '', width, -1, leftAlign, False, True);
           end else begin
+            if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
             body := '''' + escQ(s) + '''';
-            emitField(a, body, '', width, prec, leftAlign, False, True);
+            emitField(a, body, '', width, -1, leftAlign, False, True);
           end;
           Inc(p);
         end;
@@ -1328,8 +1335,9 @@ begin
         begin
           NextArgStr(s, wasNil);
           if wasNil then s := '';
+          if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
           body := escW(s);
-          emitField(a, body, '', width, prec, leftAlign, False, True);
+          emitField(a, body, '', width, -1, leftAlign, False, True);
           Inc(p);
         end;
       'T':
