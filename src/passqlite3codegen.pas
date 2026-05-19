@@ -30852,11 +30852,18 @@ begin
     end
     else
     begin
-      { 6.13.B.10 — multi-source GROUP BY.  No subquery / VIEW /
-        TF_Ephemeral source supported here (those need the coroutine /
-        eph-materialise plumbing from the single-source path).  Vtab
-        sources are OK: WhereBegin / whereLoopAddVirtual already drive
-        them as outer or inner loops with lateral-arg pushdown. }
+      { 6.13.B.10 — multi-source GROUP BY.  Vtab sources are OK:
+        WhereBegin / whereLoopAddVirtual already drive them as outer or
+        inner loops with lateral-arg pushdown.  Subquery / VIEW sources
+        (SRCITEM_FG_IS_SUBQUERY after sqlite3SrcItemAttachSubquery —
+        view-expand attaches a subquery) are admitted and pre-materialised
+        into an ephemeral cursor below (mirrors the no-aggregate path at
+        codegen.pas:33391..33413).  TF_Ephemeral sources that are NOT
+        attached subqueries (raw recursive-CTE pseudo-cursors etc.) are
+        still bailed — those need the deferred plumbing.
+        Required for distinct2-5050/5060/5070: outer GROUP BY 1 over
+        `FROM t3 LEFT JOIN v4` where v4 was view-expanded into a
+        subquery source. }
       isGBSubquery := False;
       for iSrcCheck := 0 to p^.pSrc^.nSrc - 1 do
       begin
@@ -30864,7 +30871,7 @@ begin
         if pItemCheck^.pSTab = nil then
           begin Result := SQLITE_OK; Exit; end;
         if (pItemCheck^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0 then
-          begin Result := SQLITE_OK; Exit; end;
+          Continue;  { admitted — pre-materialised below }
         if pItemCheck^.pSTab^.eTabType = TABTYP_VIEW then
           begin Result := SQLITE_OK; Exit; end;
         if (pItemCheck^.pSTab^.tabFlags and TF_Ephemeral) <> 0 then
@@ -31131,6 +31138,35 @@ begin
       end
       else
       begin
+        { Pre-materialise FROM-subquery sources (view-expanded items
+          carry SRCITEM_FG_IS_SUBQUERY) into an ephemeral cursor before
+          calling sqlite3WhereBegin.  Mirrors the no-aggregate path at
+          codegen.pas:33391..33413.  Required for multi-source GROUP BY
+          over a VIEW / subquery FROM (distinct2-5050/5060/5070). }
+        for iSrcCheck := 0 to p^.pSrc^.nSrc - 1 do
+        begin
+          pItemCheck := @SrcListItems(p^.pSrc)[iSrcCheck];
+          if ((pItemCheck^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+             and ((pItemCheck^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0)
+             and (pItemCheck^.u4.pSubq <> nil)
+             and (pItemCheck^.u4.pSubq^.pSelect <> nil)
+             and (pItemCheck^.pSTab <> nil) then
+          begin
+            if pItemCheck^.iCursor < 0 then
+            begin
+              pItemCheck^.iCursor := pParse^.nTab;
+              Inc(pParse^.nTab);
+            end;
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItemCheck^.iCursor,
+                              pItemCheck^.pSTab^.nCol);
+            sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItemCheck^.iCursor);
+            if sqlite3Select(pParse, pItemCheck^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+            begin
+              sqlite3ExprListDelete(pParse^.db, pAggDistinct);
+              Result := SQLITE_ERROR; Exit;
+            end;
+          end;
+        end;
         {$IFDEF SQLITE_DEBUG}
         TreeTraceLine($2, 'WhereBegin');  { select.c:8518 }
         {$ENDIF}
