@@ -46327,6 +46327,19 @@ begin
   if p <> nil then begin
     pItem := PSrcItem(PByte(SrcListItems(p)) +
       (p^.nSrc - 1) * SizeOf(TSrcItem));
+    { build.c:5093..5096 — under PARSE_MODE_RENAME map the SrcItem.zName
+      pointer to the original table-name token (or qualified DB token if
+      "db.tbl" form was used).  Without this, renameTableFunc's per-step
+      renameTokenFind() on pStep^.pSrc->a[i].zName finds no entry, the
+      reference to the renamed table is never rewritten in the trigger /
+      view body text, and renameTestSchema fails with "no such table:
+      main.<old>" after ALTER TABLE ... RENAME. }
+    if InRenameObject(pParse) and (pItem^.zName <> nil) then begin
+      if (pDatabase <> nil) and (pDatabase^.z <> nil) then
+        sqlite3RenameTokenMap(pParse, pItem^.zName, pDatabase)
+      else
+        sqlite3RenameTokenMap(pParse, pItem^.zName, pTable);
+    end;
     if (pAlias <> nil) and (pAlias^.n > 0) then begin
       { 9.4.divbug.88.010.1 — must dequote the alias (build.c:5099 uses
         sqlite3NameFromToken, not raw DbStrNDup).  Without dequote a
