@@ -1397,6 +1397,11 @@ set ::SQLITE_DEFAULT_SYNCHRONOUS 2
 set ::SQLITE_DEFAULT_WAL_SYNCHRONOUS 2
 set ::SQLITE_DEFAULT_FILE_FORMAT 4
 set ::MEMORY_MANAGEMENT 0
+# SQLITE_DEFAULT_CACHE_SIZE — sqliteLimit.h:161 default -2000.  Negative
+# means kibibytes; exclusive2.test:139/223 compares numerically against
+# nPage (db-file size in pages), so a very negative value reliably means
+# "the cache is already big enough" and skips the PRAGMA cache_size bump.
+set ::SQLITE_DEFAULT_CACHE_SIZE -2000
 
 # Minimal sqlite_options() array — upstream test_config.c populates this
 # from compile-time SQLITE_OMIT_*/SQLITE_ENABLE_* macros.  pas-sqlite3 is

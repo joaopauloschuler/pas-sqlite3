@@ -18222,7 +18222,18 @@ begin
       { ---- IPK / full-table scan ---- }
       pNew^.wsFlags := WHERE_IPK;
       if b <> 0 then pNew^.iSortIdx := u8(iSortIdx) else pNew^.iSortIdx := 0;
-      pNew^.rRun := i16(rSize + 16);  { non-STAT4 build: no -2 discount }
+      {$IFDEF SQLITE_ENABLE_STAT4}
+      { TUNING (where.c:4166): with STAT4 data, reduce 3.0*N penalty to 2.75*N
+        (i.e. rSize+16 - 2 if TF_HasStat4 set).  Lets a high-selectivity
+        constraint prefer full SCAN over an index lookup that would visit
+        most rows. }
+      if (pTab^.tabFlags and TF_HasStat4) <> 0 then
+        pNew^.rRun := i16(rSize + 16 - 2)
+      else
+        pNew^.rRun := i16(rSize + 16);
+      {$ELSE}
+      pNew^.rRun := i16(rSize + 16);
+      {$ENDIF}
       whereLoopOutputAdjust(pWC, pNew, rSize);
       if (fgBits and u8($04)) <> 0 then  { isSubquery }
       begin
@@ -53379,12 +53390,24 @@ begin
     Exit;
   end;
 
-  { PragTyp_CACHE_SIZE read arm (pragma.c:882).  Default is
+  { PragTyp_CACHE_SIZE (pragma.c:882..894).  Default is
     SQLITE_DEFAULT_CACHE_SIZE (-2000); C populates Schema.cache_size in
     sqlite3InitOne (prepare.c:323) which is not yet ported, so a 0 here
     means "uninitialised" and we substitute the default — matching the
-    fallback at prepare.c:326. }
-  if SameText(zName, 'cache_size') and (pValue = nil) then begin
+    fallback at prepare.c:326.  Write arm: parse N, store on
+    pSchema->cache_size, propagate via sqlite3BtreeSetCacheSize so the
+    pcache gets resized (without this, exclusive2-1.2.1/2.2.1 fail
+    because `PRAGMA cache_size = N` is a silent no-op). }
+  if SameText(zName, 'cache_size') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      iVal := sqlite3Atoi(PAnsiChar(zRight));
+      if db^.aDb[iDb].pSchema <> nil then
+        db^.aDb[iDb].pSchema^.cache_size := iVal;
+      pBtArg := PBtree(db^.aDb[iDb].pBt);
+      if pBtArg <> nil then
+        sqlite3BtreeSetCacheSize(pBtArg, iVal);
+    end;
     if (db^.aDb[iDb].pSchema <> nil)
        and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
       iVal := db^.aDb[iDb].pSchema^.cache_size
@@ -53612,14 +53635,48 @@ begin
     sqlite3VdbeReusable(v);
     Exit;
   end;
+  { PragTyp_LOCKING_MODE — pragma.c:687..727.  Resolve requested mode
+    (or QUERY if no value), then call sqlite3PagerLockingMode on the
+    target Btree's pager.  When pId2 is empty (bare PRAGMA), the mode
+    must be applied to ALL attached pagers AND stored on
+    db^.dfltLockMode so future ATTACH'd dbs inherit it.  Without this
+    wiring, `PRAGMA locking_mode=exclusive` was a no-op so subsequent
+    commits still went through pagerUnlockDb (NO_LOCK→SHARED) which
+    resets changeCountDone, causing the change-counter to be bumped on
+    every write rather than only on the first write in exclusive mode
+    (exclusive2-3.4..3.6). }
   if SameText(zName, 'locking_mode') then begin
+    eModeJm := PAGER_LOCKINGMODE_QUERY;
     if pValue <> nil then begin
       SetString(zRight, pValue^.z, pValue^.n);
-      if SameText(zRight, 'exclusive') then
-        sqlite3VdbeLoadString(v, 1, 'exclusive')
+      if      SameText(zRight, 'exclusive') then eModeJm := PAGER_LOCKINGMODE_EXCLUSIVE
+      else if SameText(zRight, 'normal')    then eModeJm := PAGER_LOCKINGMODE_NORMAL;
+    end;
+
+    if ((pId2 = nil) or (pId2^.n = 0)) and (eModeJm = PAGER_LOCKINGMODE_QUERY) then begin
+      { Bare "PRAGMA locking_mode;" — return db-wide default. }
+      eModeJm := i32(db^.dfltLockMode);
+    end else begin
+      if (pId2 = nil) or (pId2^.n = 0) then begin
+        { Setter without schema qualifier: apply to all attached pagers
+          and update db->dfltLockMode (pragma.c:708..714). }
+        for iJm := 2 to db^.nDb - 1 do begin
+          pBtArg := PBtree(db^.aDb[iJm].pBt);
+          if pBtArg <> nil then
+            sqlite3PagerLockingMode(sqlite3BtreePager(pBtArg), eModeJm);
+        end;
+        db^.dfltLockMode := u8(eModeJm);
+      end;
+      pBtArg := PBtree(db^.aDb[iDb].pBt);
+      if pBtArg <> nil then
+        eModeJm := sqlite3PagerLockingMode(sqlite3BtreePager(pBtArg), eModeJm)
       else
-        sqlite3VdbeLoadString(v, 1, 'normal');
-    end else
+        eModeJm := PAGER_LOCKINGMODE_NORMAL;
+    end;
+
+    if eModeJm = PAGER_LOCKINGMODE_EXCLUSIVE then
+      sqlite3VdbeLoadString(v, 1, 'exclusive')
+    else
       sqlite3VdbeLoadString(v, 1, 'normal');
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
