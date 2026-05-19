@@ -54242,8 +54242,13 @@ begin
             sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 3);
             jmp5Ic := sqlite3VdbeLoadString(v, 4, pIdxIc^.zName);
             sqlite3VdbeAddOp3(v, OP_Concat, 4, 3, 3);
-            jmp4Ic := sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
-            sqlite3VdbeAddOp3(v, OP_IfPos, 1, sqlite3VdbeCurrentAddr(v) + 2, 1);
+            { integrityCheckResultRow inline (pragma.c:385) — return value
+              is the address of the OP_IfPos guard, not the OP_ResultRow,
+              so subsequent VdbeJumpHere(jmp4Ic) lands AFTER the Halt
+              fall-through (pragma.c:2090). }
+            sqlite3VdbeAddOp2(v, OP_ResultRow, 3, 1);
+            jmp4Ic := sqlite3VdbeAddOp3(v, OP_IfPos, 1,
+                                        sqlite3VdbeCurrentAddr(v) + 2, 1);
             sqlite3VdbeAddOp0(v, OP_Halt);
             sqlite3VdbeResolveLabel(v, ckUniqIc);
 
