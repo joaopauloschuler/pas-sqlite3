@@ -8651,10 +8651,22 @@ begin
     if iTable >= 0 then
     begin
       iCol := sqlite3ColumnIndex(pTab, zCol);
-      if (iCol < 0) and (sqlite3IsRowid(zCol) <> 0) then
-        iCol := -1
-      else if iCol = pTab^.iPKey then
-        iCol := -1;
+      { resolve.c:561..569 — branch on whether the column was found.  When
+        not found, only the rowid alias is acceptable; otherwise force
+        iCol := nCol so the iCol<nCol gate below rejects the reference
+        (else the iPKey==-1 line below would silently rebind any missing
+        new.<col>/old.<col> to the rowid alias — alterdropcol2-2.8.1). }
+      if iCol >= 0 then
+      begin
+        if pTab^.iPKey = iCol then iCol := -1;
+      end
+      else
+      begin
+        if sqlite3IsRowid(zCol) <> 0 then
+          iCol := -1
+        else
+          iCol := pTab^.nCol;
+      end;
       if (iCol >= -1) and (iCol < pTab^.nCol) then
       begin
         pE^.op      := TK_TRIGGER;
@@ -8677,6 +8689,19 @@ begin
           else
             pParse^.newmask := $FFFFFFFF;
         end;
+      end
+      else
+      begin
+        { resolve.c:lookupName cnt==0 tail — the qualifier IS new/old (so the
+          trigger pseudo-table is the only candidate) but no column resolves.
+          Without this, a values-only Select (e.g. trigger
+          `INSERT INTO log VALUES(new.<dropped>)`) leaves the TK_DOT intact and
+          downstream renameTestSchema never sees an error after DROP COLUMN
+          deletes the referenced column — alterdropcol2-2.8.1. }
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('no such column: '
+                    + AnsiString(zTab) + '.' + AnsiString(zCol)));
+        sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
       end;
       Exit;
     end;
