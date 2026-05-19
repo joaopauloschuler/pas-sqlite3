@@ -4394,12 +4394,154 @@ end;
 procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64); forward;
 procedure sqlite3SystemError(db: Pointer; rc: i32); forward;
 
+{ vdbeaux.c:3029..3171 — multi-file commit via super-journal.
+  Called by vdbeCommit when nTrans>1 and zMain is a real file.  Atomically
+  commits write-transactions across every attached database by writing a
+  super-journal file naming each per-db journal, fsyncing it, fsyncing each
+  db's own commit-phase-one (which embeds the super-journal pathname), then
+  deleting the super-journal — the deletion is the commit point.  Phase-two
+  cleanup runs under benign-malloc; failure there is non-fatal. }
+function vdbeSuperJournalCommit(db: PTsqlite3; zMainFile: PAnsiChar): i32;
+const
+  SQLITE_IOCAP_SEQUENTIAL = $00000400;
+  SQLITE_SYNC_NORMAL      = $00002;
+  SQLITE_ACCESS_EXISTS    = 0;
+var
+  pVfs:        Psqlite3_vfs;
+  pSuperJrnl:  Psqlite3_file;
+  zBuf:        PAnsiChar;       { raw allocation: 4 leading nulls + main + 16 nulls }
+  zSuper:      PAnsiChar;       { = zBuf + 4, the writable super-journal pathname }
+  nMainFile:   i32;
+  offset:      i64;
+  res:         cint;
+  retryCount:  i32;
+  iRandom:     u32;
+  rc:          i32;
+  i:           i32;
+  pBt:         PBtree;
+  zFile:       PAnsiChar;
+  nFile:       i32;
+begin
+  pVfs       := Psqlite3_vfs(db^.pVfs);
+  pSuperJrnl := nil;
+  offset     := 0;
+  retryCount := 0;
+  zBuf       := nil;
+  zSuper     := nil;
+
+  nMainFile := sqlite3Strlen30(zMainFile);
+  { 4 leading + nMainFile + 16 trailing nulls (= room for "-mj%06X9%02X" + NUL). }
+  zBuf := PAnsiChar(sqlite3DbMallocZero(db, u64(nMainFile) + 4 + 16));
+  if zBuf = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  zSuper := zBuf + 4;
+  Move(zMainFile^, zSuper^, nMainFile);
+
+  repeat
+    if retryCount > 0 then begin
+      if retryCount > 100 then begin
+        { sqlite3_log(SQLITE_FULL, zSuper) — diagnostic only, omit }
+        sqlite3OsDelete(pVfs, zSuper, 0);
+        Break;
+      end else if retryCount = 1 then
+        { sqlite3_log(SQLITE_FULL, zSuper) — diagnostic only, omit }
+    end;
+    Inc(retryCount);
+    sqlite3_randomness(SizeOf(iRandom), @iRandom);
+    zFile := sqlite3MPrintf(db, '-mj%06x9%02x',
+                            [(iRandom shr 8) and $ffffff, iRandom and $ff]);
+    if zFile = nil then begin
+      sqlite3DbFree(db, zBuf);
+      Result := SQLITE_NOMEM_BKPT; Exit;
+    end;
+    Move(zFile^, zSuper[nMainFile], 13);
+    sqlite3DbFree(db, zFile);
+    sqlite3FileSuffix3(zMainFile, zSuper);
+    rc := sqlite3OsAccess(pVfs, zSuper, SQLITE_ACCESS_EXISTS, @res);
+  until not ((rc = SQLITE_OK) and (res <> 0));
+
+  if rc = SQLITE_OK then begin
+    pSuperJrnl := Psqlite3_file(sqlite3MallocZero(csize_t(pVfs^.szOsFile)));
+    if pSuperJrnl = nil then rc := SQLITE_NOMEM_BKPT
+    else
+      rc := sqlite3OsOpen(pVfs, zSuper, pSuperJrnl,
+              SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or
+              SQLITE_OPEN_EXCLUSIVE or SQLITE_OPEN_SUPER_JOURNAL, nil);
+    if rc <> SQLITE_OK then begin
+      if pSuperJrnl <> nil then sqlite3_free(pSuperJrnl);
+      pSuperJrnl := nil;
+    end;
+  end;
+  if rc <> SQLITE_OK then begin
+    sqlite3DbFree(db, zBuf);
+    Result := rc; Exit;
+  end;
+
+  { Write each per-db journal name into the super-journal. }
+  for i := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE) then begin
+      zFile := sqlite3BtreeGetJournalname(pBt);
+      if (zFile = nil) or (zFile^ = #0) then Continue;
+      nFile := sqlite3Strlen30(zFile) + 1;
+      rc := sqlite3OsWrite(pSuperJrnl, zFile, nFile, offset);
+      offset := offset + nFile;
+      if rc <> SQLITE_OK then begin
+        sqlite3OsClose(pSuperJrnl);
+        sqlite3_free(pSuperJrnl);
+        sqlite3OsDelete(pVfs, zSuper, 0);
+        sqlite3DbFree(db, zBuf);
+        Result := rc; Exit;
+      end;
+    end;
+  end;
+
+  { Sync the super-journal unless the device says IOCAP_SEQUENTIAL. }
+  if (sqlite3OsDeviceCharacteristics(pSuperJrnl) and SQLITE_IOCAP_SEQUENTIAL) = 0 then begin
+    rc := sqlite3OsSync(pSuperJrnl, SQLITE_SYNC_NORMAL);
+    if rc <> SQLITE_OK then begin
+      sqlite3OsClose(pSuperJrnl);
+      sqlite3_free(pSuperJrnl);
+      sqlite3OsDelete(pVfs, zSuper, 0);
+      sqlite3DbFree(db, zBuf);
+      Result := rc; Exit;
+    end;
+  end;
+
+  { Phase-one each db: sync its journal embedding the super-journal name. }
+  i := 0;
+  while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt <> nil then
+      rc := sqlite3BtreeCommitPhaseOne(pBt, zSuper);
+    Inc(i);
+  end;
+  sqlite3OsClose(pSuperJrnl);
+  sqlite3_free(pSuperJrnl);
+  if rc <> SQLITE_OK then begin
+    sqlite3DbFree(db, zBuf);
+    Result := rc; Exit;
+  end;
+
+  { Delete the super-journal: this is the atomic commit point. }
+  rc := sqlite3OsDelete(pVfs, zSuper, 1);
+  sqlite3DbFree(db, zBuf);
+  zBuf := nil;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { Phase-two: cleanup per-db journals.  Failures here cannot un-commit. }
+  for i := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt <> nil then
+      sqlite3BtreeCommitPhaseTwo(pBt, 1);
+  end;
+  sqlite3VtabCommit(db);
+  Result := SQLITE_OK;
+end;
+
 { vdbeaux.c:2919 — vdbeCommit.  Single-database simple-case is ported in
   full (covers the entire default test corpus, which does not ATTACH writable
-  files).  The multi-file super-journal arm is intentionally deferred: with
-  no productive ATTACH-with-write workload it is unreachable today.  If a
-  future caller pushes nTrans>1 with a named main-file we early-return
-  SQLITE_ERROR rather than silently committing partially. }
+  files).  The multi-file super-journal arm forwards to
+  vdbeSuperJournalCommit above. }
 function vdbeCommit(db: PTsqlite3; p: PVdbe): i32;
 var
   i:           i32;
@@ -4480,8 +4622,11 @@ begin
     end;
     if rc = SQLITE_OK then sqlite3VtabCommit(db);
   end else begin
-    { Multi-file commit needs a super-journal; not productive in this port. }
-    Result := SQLITE_ERROR; Exit;
+    { Multi-file commit: open a super-journal so the transaction commits
+      atomically across all attached databases.  Faithful port of
+      vdbeaux.c:3029..3171. }
+    Result := vdbeSuperJournalCommit(db, zMain);
+    Exit;
   end;
   Result := rc;
 end;

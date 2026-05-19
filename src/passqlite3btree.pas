@@ -487,6 +487,7 @@ function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
 function  sqlite3BtreeIsReadonly(p: PBtree): i32;
 function  sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
+function  sqlite3BtreeGetJournalname(p: PBtree): PAnsiChar;
 function  sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
                                  pnLog, pnCkpt: PcInt): i32;
 
@@ -6928,6 +6929,14 @@ function sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
 begin
   Assert(p^.pBt^.pPager <> nil);
   Result := PAnsiChar(sqlite3PagerFilename(p^.pBt^.pPager, 1));
+end;
+
+{ btree.c:11297 — sqlite3BtreeGetJournalname.
+  Return the full pathname of the underlying journal file. }
+function sqlite3BtreeGetJournalname(p: PBtree): PAnsiChar;
+begin
+  Assert(p^.pBt^.pPager <> nil);
+  Result := PAnsiChar(sqlite3PagerJournalname(p^.pBt^.pPager));
 end;
 
 { ===========================================================================
