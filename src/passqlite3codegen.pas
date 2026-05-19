@@ -26613,7 +26613,7 @@ var
   pColExpr: PExpr;
   pTab:   PTable2;
   iCol:   i32;
-  pCollide: PColumn;
+  pCollide: PExprListItem;
 begin
   db := pParse^.db;
   sqlite3HashInit(@ht);
@@ -26676,9 +26676,12 @@ begin
     cnt := 0;
     while zName <> nil do
     begin
-      pCollide := PColumn(sqlite3HashFind(@ht, zName));
+      pCollide := PExprListItem(sqlite3HashFind(@ht, zName));
       if pCollide = nil then break;
-      if (pCollide^.colFlags and COLFLAG_NOEXPAND) <> 0 then
+      { select.c:2298 — pCollide is an ExprList_item*; check its bUsingTerm
+        (eBits bit 7).  Set COLFLAG_NOEXPAND on the current pCol so the
+        outer SELECT-* expansion will skip this duplicate name. }
+      if (pCollide^.fg.eBits and $80) <> 0 then
         pCol^.colFlags := pCol^.colFlags or COLFLAG_NOEXPAND;
       nName := sqlite3Strlen30(zName);
       j := nName - 1;
@@ -26692,7 +26695,9 @@ begin
     end;
     pCol^.zCnName := zName;
     pCol^.hName   := sqlite3StrIHash(zName);
-    if (pX^.fg.eBits and $80) <> 0 then { bNoExpand = bit 7 of eBits2? or eBits? }
+    { select.c:2314 — propagate per-item bNoExpand (eBits2 bit 0) to the
+      Column.colFlags so the parent SELECT-* expansion suppresses it. }
+    if (pX^.fg.eBits2 and $01) <> 0 then
       pCol^.colFlags := pCol^.colFlags or COLFLAG_NOEXPAND;
     sqlite3ColumnPropertiesFromName(nil, pCol);
     if zName <> nil then
@@ -26983,6 +26988,15 @@ var
   zColName:  PAnsiChar;
   zTabName:  PAnsiChar;
   pNewItem:  PExprListItem;
+  pNextItem: PSrcItem;
+  pUsingNext: PIdList;
+  iiU:       i32;
+  zUName:    PAnsiChar;
+  pIdExpr:   PExpr;
+  pEmitted:  PExprListItem;
+  zEName:    PAnsiChar;
+  bMarkNoExpand: Boolean;
+  pNxt:      PSrcItem;
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
@@ -27070,6 +27084,48 @@ begin
            (sqlite3StrICmp(zTName, zItemName) <> 0) then Continue;
       end;
       tableSeen := True;
+
+      { select.c:6184..6205 — under SF_NestedFrom, if the NEXT FROM item
+        carries a USING clause, emit one synthetic TK_ID per USING column
+        BEFORE this item's regular columns.  Each leading entry is tagged
+        bUsingTerm (eBits bit 7) with zEName="..name" / eEName=ENAME_TAB
+        so that sqlite3ColumnsFromExprList can later mark the colliding
+        non-USING duplicates COLFLAG_NOEXPAND, and the parent SELECT's
+        expandStar will then skip those duplicates.  Without this arm, a
+        nested-from wrapper like `(t2 NATURAL JOIN t1)` produces 4 visible
+        columns (a, b, a:1, b:1) instead of the dedup'd 2 (a, b)
+        (e_select-2.1.x.28d). }
+      if ((p^.selFlags and SF_NestedFrom) <> 0)
+         and (zTName = nil)
+         and (i + 1 < pSrc^.nSrc) then
+      begin
+        pNextItem := PSrcItem(PByte(base) + (i + 1) * SizeOf(TSrcItem));
+        if ((pNextItem^.fg.fgBits2 and $08) <> 0)
+           and (pNextItem^.u3.pUsing <> nil) then
+        begin
+          pUsingNext := pNextItem^.u3.pUsing;
+          for iiU := 0 to pUsingNext^.nId - 1 do
+          begin
+            zUName := IdListItems(pUsingNext)[iiU].zName;
+            if zUName = nil then Continue;
+            pIdExpr := sqlite3Expr(db, TK_ID, zUName);
+            if pIdExpr = nil then Continue;
+            pNew := sqlite3ExprListAppend(pParse, pNew, pIdExpr);
+            if pNew <> nil then
+            begin
+              pEmitted := PExprListItem(PByte(ExprListItems(pNew)) +
+                            (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+              zEName := sqlite3MPrintf(db, '..%s', [zUName]);
+              pEmitted^.zEName := zEName;
+              pEmitted^.fg.eBits :=
+                (pEmitted^.fg.eBits and not u8($03)) or u8(ENAME_TAB);
+              { bUsingTerm — eBits bit 7. }
+              pEmitted^.fg.eBits := pEmitted^.fg.eBits or u8($80);
+            end;
+          end;
+        end;
+      end;
+
       for j := 0 to pTab^.nCol - 1 do
       begin
         pCol := PColumn(PByte(pTab^.aCol) + j * SizeOf(TColumn));
@@ -27131,6 +27187,34 @@ begin
             pNewItem^.zEName := sqlite3DbStrDup(db, zColName);
           pNewItem^.fg.eBits :=
             (pNewItem^.fg.eBits and not u8($03)) or u8(ENAME_NAME);
+          { select.c:6300..6306 — under SF_NestedFrom, tag bNoExpand
+            (eBits2 bit 0) on USING-matching columns and on those whose
+            pTab col already carries COLFLAG_NOEXPAND.  These are what
+            the parent SELECT-* expansion uses to suppress duplicates
+            (e_select-2.1.x.28d). }
+          if (p^.selFlags and SF_NestedFrom) <> 0 then
+          begin
+            bMarkNoExpand := False;
+            if ((pItem^.fg.fgBits2 and $08) <> 0)
+               and (pItem^.u3.pUsing <> nil)
+               and (sqlite3IdListIndex(pItem^.u3.pUsing,
+                                       pCol^.zCnName) >= 0) then
+              bMarkNoExpand := True;
+            if (not bMarkNoExpand) and (i + 1 < pSrc^.nSrc) then
+            begin
+              pNxt := PSrcItem(PByte(base) + (i + 1) * SizeOf(TSrcItem));
+              if ((pNxt^.fg.fgBits2 and $08) <> 0)
+                 and (pNxt^.u3.pUsing <> nil)
+                 and (sqlite3IdListIndex(pNxt^.u3.pUsing,
+                                         pCol^.zCnName) >= 0) then
+                bMarkNoExpand := True;
+            end;
+            if (not bMarkNoExpand)
+               and ((pCol^.colFlags and COLFLAG_NOEXPAND) <> 0) then
+              bMarkNoExpand := True;
+            if bMarkNoExpand then
+              pNewItem^.fg.eBits2 := pNewItem^.fg.eBits2 or u8($01);
+          end;
         end;
       end;
     end;
