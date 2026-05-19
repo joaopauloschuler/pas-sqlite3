@@ -29662,6 +29662,7 @@ var
   pItem:       PSrcItem;
   pTab:        PTable2;
   pE:          PExpr;
+  pBaseExpr:   PExpr;
   items:       PExprListItem;
   nResultCol:  i32;
   i:           i32;
@@ -31252,7 +31253,39 @@ begin
       sqlite3VdbeAddOp3(v, OP_SorterData, pAggI2^.sortingIdx,
                         sortOut, sortPTab);
       for jj := 0 to nGroupBy - 1 do
+      begin
         sqlite3VdbeAddOp3(v, OP_Column, sortPTab, jj, iBMem + jj);
+        { call-function-once optimisation — select.c:8651..8664.  When the
+          GROUP BY term j+1 was resolved by ResolveOrderGroupBy as an alias
+          for result-list column iOrderByCol, rewrite that result-list
+          expression node to a TK_REGISTER reference into iAMem+j.  Then
+          the post-finalize result-row codegen reads the cached group key
+          instead of re-evaluating the (possibly non-deterministic, e.g.
+          random()) expression.  Without this the result column for tests
+          like `SELECT abs(random())%5 AS r FROM cnt GROUP BY 1 ORDER BY 1`
+          re-rolls the random each output row, producing duplicates and
+          unsorted output (distinct2-5020/5030; 5050..5070 also rely on
+          this for NULL groups). }
+        if (pGroupByLoc <> nil)
+           and (ExprListItems(pGroupByLoc)[jj].u.x.iOrderByCol > 0)
+           and (p^.pEList <> nil)
+           and (i32(ExprListItems(pGroupByLoc)[jj].u.x.iOrderByCol) <= p^.pEList^.nExpr) then
+        begin
+          pE := ExprListItems(p^.pEList)
+                  [ExprListItems(pGroupByLoc)[jj].u.x.iOrderByCol - 1].pExpr;
+          { Walk through TK_IF_NULL_ROW wrappers, matching C's loop. }
+          pBaseExpr := sqlite3ExprSkipCollateAndLikely(pE);
+          while (pBaseExpr <> nil) and (pBaseExpr^.op = TK_IF_NULL_ROW) do
+          begin
+            pE := pBaseExpr^.pLeft;
+            pBaseExpr := sqlite3ExprSkipCollateAndLikely(pE);
+          end;
+          if (pBaseExpr <> nil)
+             and (pBaseExpr^.op <> TK_AGG_COLUMN)
+             and (pBaseExpr^.op <> TK_REGISTER) then
+            sqlite3ExprToRegister(pE, iAMem + jj);
+        end;
+      end;
       sqlite3VdbeAddOp4(v, OP_Compare, iAMem, iBMem, nGroupBy,
                         PAnsiChar(sqlite3KeyInfoRef(pKeyInfoGB)), P4_KEYINFO);
       addr1 := sqlite3VdbeCurrentAddr(v);
