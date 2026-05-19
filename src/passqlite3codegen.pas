@@ -43546,7 +43546,8 @@ begin
 
   { Reject duplicate column name (case-insensitive). }
   if (p^.nCol > 0) and (sqlite3ColumnIndex(p, z) >= 0) then begin
-    sqlite3ErrorMsg(pParse, 'duplicate column name');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'duplicate column name: %s', [z]));
     sqlite3DbFree(db, z);
     Exit;
   end;
