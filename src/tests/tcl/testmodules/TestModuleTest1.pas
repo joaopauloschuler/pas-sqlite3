@@ -5632,6 +5632,34 @@ begin
   if clientData = nil then ;
 end;
 
+{ attach.test — test1.c:6434..6455 test_db_filename.
+  Usage: sqlite3_db_filename DB DBNAME.  Returns the on-disk filename
+  associated with DBNAME on DB ("" for :memory:/temp/unknown).  Engine
+  entry: passqlite3main.pas:4390 (main.c:4985). }
+function test_db_filename(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:      PTsqlite3;
+  zDbName: PAnsiChar;
+  zRes:    PAnsiChar;
+begin
+  db := nil;
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB DBNAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zDbName := Tcl_GetString(objv[2]);
+  zRes := sqlite3_db_filename(db, zDbName);
+  Tcl_AppendResult(interp, zRes, Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.042 + 9.4.divbug.88.060 — test1.c:6075..6098 get_autocommit.
   Usage: sqlite3_get_autocommit DB.  Returns 1 if DB is in auto-commit mode,
   0 otherwise.  Required by ioerr.test and trans3.test (trans3-1.3.1). }
@@ -5678,6 +5706,9 @@ begin
   { 9.4.divbug.81 — test1.c:9176 sqlite3_db_readonly. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_readonly'),
     @test_db_readonly, nil, nil);
+  { attach.test — test1.c:9175 sqlite3_db_filename. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_db_filename'),
+    @test_db_filename, nil, nil);
   { 9.4.divbug.35 — fpnum_compare for fuzzy float-string equality
     fallback used by tester.tcl do_test (tester.tcl:789..792). }
   Tcl_CreateObjCommand(interp, PChar('fpnum_compare'),
