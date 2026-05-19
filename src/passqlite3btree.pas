@@ -7485,17 +7485,27 @@ begin
   Result := sqlite3BtreeClearTable(pCur^.pBtree, i32(pCur^.pgnoRoot), nil);
 end;
 
-{ btree.c lines 10325-10397: btreeDropTable (simplified: SQLITE_OMIT_AUTOVACUUM) }
+{ btree.c lines 10313-10397: btreeDropTable.  Full port — includes the
+  !SQLITE_OMIT_AUTOVACUUM arm that relocates the highest root-page into the
+  freed slot and updates meta[4] (BTREE_LARGEST_ROOT_PAGE).  Without this,
+  the on-disk "largest root page" header byte (offset 52) stays stale after
+  DROP TABLE under auto_vacuum, and integrity_check reports
+  "max rootpage (N) disagrees with header (M)" (filefmt-3.3). }
 function btreeDropTable(p: PBtree; iTable: Pgno; piMoved: Pi32): i32;
 var
-  pPage: PMemPage;
-  pBt  : PBtShared;
-  rc   : i32;
+  pPage       : PMemPage;
+  pBt         : PBtShared;
+  rc          : i32;
+  maxRootPgno : Pgno;
+  pMove       : PMemPage;
 begin
   pPage := nil;
   pBt   := p^.pBt;
   rc    := SQLITE_OK;
 
+  Assert(sqlite3BtreeHoldsMutex(p) <> 0);
+  Assert(p^.inTrans = TRANS_WRITE);
+  Assert(iTable >= 2);
   if iTable > btreePagecount(pBt) then begin
     Result := SQLITE_CORRUPT_BKPT; Exit;
   end;
@@ -7503,12 +7513,55 @@ begin
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
 
   rc := btreeGetPage(pBt, iTable, pPage, 0);
-  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  if rc <> SQLITE_OK then begin
+    releasePage(pPage);
+    Result := rc; Exit;
+  end;
 
   piMoved^ := 0;
-  { No autovacuum: just free the page }
-  freePage(pPage, @rc);
-  releasePage(pPage);
+
+  if pBt^.autoVacuum <> 0 then begin
+    { btree.c:10339..10390 — autovacuum branch. }
+    sqlite3BtreeGetMeta(p, BTREE_LARGEST_ROOT_PAGE, @maxRootPgno);
+
+    if iTable = maxRootPgno then begin
+      { iTable is the largest root-page; just free it. }
+      freePage(pPage, @rc);
+      releasePage(pPage);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end else begin
+      { Move the page at maxRootPgno into the slot left by iTable. }
+      pMove := nil;
+      releasePage(pPage);
+      rc := btreeGetPage(pBt, maxRootPgno, pMove, 0);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      rc := relocatePage(pBt, pMove, PTRMAP_ROOTPAGE, 0, iTable, 0);
+      releasePage(pMove);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      pMove := nil;
+      rc := btreeGetPage(pBt, maxRootPgno, pMove, 0);
+      freePage(pMove, @rc);
+      releasePage(pMove);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      piMoved^ := i32(maxRootPgno);
+    end;
+
+    { btree.c:10378..10390 — Set the new 'max-root-page' value in the database
+      header. This is the old value less one, less one more if that happens to
+      be a root-page number, less one again if that is PENDING_BYTE_PAGE. }
+    Dec(maxRootPgno);
+    { Inline of PTRMAP_ISPAGE (defined later in this unit): the page is a
+      ptrmap page iff ptrmapPageno(pBt, pg) = pg.  See btreeInt.h:628. }
+    while (maxRootPgno = PENDING_BYTE_PAGE(pBt)) or
+          (ptrmapPageno(pBt, maxRootPgno) = maxRootPgno) do
+      Dec(maxRootPgno);
+    Assert(maxRootPgno <> PENDING_BYTE_PAGE(pBt));
+
+    rc := sqlite3BtreeUpdateMeta(p, 4, maxRootPgno);
+  end else begin
+    freePage(pPage, @rc);
+    releasePage(pPage);
+  end;
   Result := rc;
 end;
 
