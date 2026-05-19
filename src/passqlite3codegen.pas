@@ -33637,14 +33637,20 @@ begin
     if (eTnctTypeSel = WHERE_DISTINCT_UNIQUE)
        or (eTnctTypeSel = WHERE_DISTINCT_ORDERED) then
     begin
-      if addrDistinctEph >= 0 then
-        sqlite3VdbeChangeToNoop(v, addrDistinctEph);
       { For UNIQUE the WHERE layer guarantees per-row uniqueness — drop
         the dedup ephemeral entirely.  For ORDERED, the dedup site below
         falls back to a regPrev / OP_Ne|OP_Eq compare (select.c
-        codeDistinct lines 946..970).  Clearing iTabTnct suppresses the
-        EQP "USE TEMP B-TREE FOR DISTINCT" detail in both cases
-        (divbug.55). }
+        codeDistinct lines 946..970); fixDistinctOpenEph (called after
+        regPrevTnct is allocated) rewrites the OpenEphemeral into an
+        OP_Null with p1=1 (Cleared sentinel) so the first iteration's
+        OP_Eq fails — must NOT pre-noop the slot here for ORDERED.
+        Clearing iTabTnct suppresses the EQP "USE TEMP B-TREE FOR
+        DISTINCT" detail in both cases (divbug.55). }
+      if eTnctTypeSel = WHERE_DISTINCT_UNIQUE then
+      begin
+        if addrDistinctEph >= 0 then
+          sqlite3VdbeChangeToNoop(v, addrDistinctEph);
+      end;
       iTabTnct := -1;
     end;
   end;
@@ -33779,11 +33785,15 @@ begin
       { Port of codeDistinct ORDERED arm (select.c:946..970).  Allocate
         nResultCol regs starting at regPrev to hold the previous row;
         for each column emit OP_Ne (jumps past the Copy when different)
-        or OP_Eq on last (jumps to iContinue when fully equal). }
+        or OP_Eq on last (jumps to iContinue when fully equal).
+
+        regPrev[0] is initialised to a Cleared-NULL by fixDistinctOpenEph,
+        which rewrites the pre-loop OpenEphemeral slot into
+        "OP_Null p1=1, p2=regPrev" (select.c:1011..1036).  Emitting an
+        OP_Null inline here would reset regPrev each iteration and
+        defeat the dedup compare (distinct.test 2.1.1 / 2.5.1 / 2.7.1). }
       regPrevTnct := pParse^.nMem + 1;
       Inc(pParse^.nMem, nResultCol);
-      { Initialize regPrev[0] = NULL so first iteration's OP_Eq fails. }
-      sqlite3VdbeAddOp2(v, OP_Null, 0, regPrevTnct);
       iJumpTnct := sqlite3VdbeCurrentAddr(v) + nResultCol;
       for jj := 0 to nResultCol - 1 do
       begin
@@ -33798,6 +33808,14 @@ begin
         sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
       end;
       sqlite3VdbeAddOp3(v, OP_Copy, pDest^.iSdst, regPrevTnct, nResultCol - 1);
+      { fixDistinctOpenEph — rewrite the OpenEphemeral slot emitted at
+        the top of selectInnerLoop into "OP_Null p1=1, p2=regPrev" so
+        regPrev[0] starts as a Cleared-NULL (compares != any value, even
+        another NULL under SQLITE_NULLEQ).  Mirrors select.c:1297 +
+        fixDistinctOpenEph (select.c:1017..1037). }
+      if addrDistinctEph >= 0 then
+        fixDistinctOpenEph(pParse, WHERE_DISTINCT_ORDERED,
+                           regPrevTnct, addrDistinctEph);
     end;
 
     { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits
