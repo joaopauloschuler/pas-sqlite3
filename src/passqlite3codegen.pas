@@ -45193,7 +45193,8 @@ begin
 {$ENDIF}
 
   if tableMayNotBeDropped(db, pTab) <> 0 then begin
-    sqlite3ErrorMsg(pParse, 'table may not be dropped');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'table %s may not be dropped', [pTab^.zName]));
     goto exit_drop_table;
   end;
 
