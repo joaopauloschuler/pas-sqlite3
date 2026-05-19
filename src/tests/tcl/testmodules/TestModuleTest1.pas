@@ -5692,6 +5692,101 @@ begin
   if clientData = nil then ;
 end;
 
+{ autovacuum2.test — test1.c:8915..9000 test_autovacuum_pages.
+  Usage: sqlite3_autovacuum_pages DB ?SCRIPT?.  Registers a Tcl script as
+  the autovacuum-pages callback on DB; with no SCRIPT (or empty), clears
+  it.  Engine entry: passqlite3main.pas:3554 (main.c:2439). }
+type
+  PAutovacPageData = ^TAutovacPageData;
+  TAutovacPageData = record
+    interp:  PTclInterp;
+    zScript: PAnsiChar;  { points just past the record into the same alloc }
+  end;
+
+function test_autovacuum_pages_callback(pClientData: Pointer;
+  zSchema: PAnsiChar; nFilePages: u32; nFreePages: u32;
+  nBytePerPage: u32): u32; cdecl;
+var
+  pData: PAutovacPageData;
+  str:   TTclDString;
+  x:     cint;
+  zBuf:  array[0..63] of AnsiChar;
+  sBuf:  ShortString;
+begin
+  pData := PAutovacPageData(pClientData);
+  Tcl_DStringInit(@str);
+  Tcl_DStringAppend(@str, pData^.zScript, -1);
+  Tcl_DStringAppendElement(@str, zSchema);
+  sBuf := IntToStr(QWord(nFilePages));
+  Move(sBuf[1], zBuf[0], Length(sBuf)); zBuf[Length(sBuf)] := #0;
+  Tcl_DStringAppendElement(@str, PChar(@zBuf[0]));
+  sBuf := IntToStr(QWord(nFreePages));
+  Move(sBuf[1], zBuf[0], Length(sBuf)); zBuf[Length(sBuf)] := #0;
+  Tcl_DStringAppendElement(@str, PChar(@zBuf[0]));
+  sBuf := IntToStr(QWord(nBytePerPage));
+  Move(sBuf[1], zBuf[0], Length(sBuf)); zBuf[Length(sBuf)] := #0;
+  Tcl_DStringAppendElement(@str, PChar(@zBuf[0]));
+  Tcl_ResetResult(pData^.interp);
+  Tcl_Eval(pData^.interp, Tcl_DStringValue(@str));
+  Tcl_DStringFree(@str);
+  x := cint(nFreePages);
+  Tcl_GetIntFromObj(nil, Tcl_GetObjResult(pData^.interp), @x);
+  Result := u32(x);
+end;
+
+function test_autovacuum_pages(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pData:   PAutovacPageData;
+  db:      PTsqlite3;
+  rc:      cint;
+  zScript: PAnsiChar;
+  nScript: PtrUInt;
+  pAlloc:  PByte;
+  zBuf:    array[0..127] of AnsiChar;
+  sBuf:    ShortString;
+begin
+  db := nil;
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB ?SCRIPT?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 3 then zScript := Tcl_GetString(objv[2]) else zScript := nil;
+  if zScript <> nil then
+  begin
+    nScript := StrLen(zScript);
+    pAlloc := PByte(sqlite3_malloc64(u64(SizeOf(TAutovacPageData) + nScript + 1)));
+    if pAlloc = nil then
+    begin
+      Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    pData := PAutovacPageData(pAlloc);
+    pData^.interp := interp;
+    pData^.zScript := PAnsiChar(pAlloc + SizeOf(TAutovacPageData));
+    Move(zScript^, pData^.zScript^, nScript + 1);
+    rc := sqlite3_autovacuum_pages(db,
+      TAutovacuumPagesFn(@test_autovacuum_pages_callback),
+      pData, TAutovacuumDestrFn(@sqlite3_free));
+  end else
+    rc := sqlite3_autovacuum_pages(db, nil, nil, nil);
+  if rc <> 0 then
+  begin
+    sBuf := IntToStr(rc);
+    Move(sBuf[1], zBuf[0], Length(sBuf)); zBuf[Length(sBuf)] := #0;
+    Tcl_AppendResult(interp, PChar('sqlite3_autovacuum_pages() returns '),
+      PChar(@zBuf[0]), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -5709,6 +5804,9 @@ begin
   { attach.test — test1.c:9175 sqlite3_db_filename. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_filename'),
     @test_db_filename, nil, nil);
+  { autovacuum2.test — test1.c:9325 sqlite3_autovacuum_pages. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_autovacuum_pages'),
+    @test_autovacuum_pages, nil, nil);
   { 9.4.divbug.35 — fpnum_compare for fuzzy float-string equality
     fallback used by tester.tcl do_test (tester.tcl:789..792). }
   Tcl_CreateObjCommand(interp, PChar('fpnum_compare'),
