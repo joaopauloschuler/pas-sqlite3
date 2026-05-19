@@ -4122,8 +4122,11 @@ begin
   end;
 
   { authorizer — tclsqlite.c:2503 (DB_AUTHORIZER).  sqlite3_set_authorizer
-    shim. }
-  if (zSub <> nil) and (StrComp(zSub, 'authorizer') = 0) then
+    shim.  The `auth` short form is accepted as a unique prefix (C's
+    Tcl_GetIndexFromObj does prefix matching; tests in alterauth*.test
+    invoke `db auth xAuth`). }
+  if (zSub <> nil) and ((StrComp(zSub, 'authorizer') = 0)
+                    or  (StrComp(zSub, 'auth') = 0)) then
   begin
     Result := DbAuthorizerArm(clientData, interp, objc, objv);
     Exit;
