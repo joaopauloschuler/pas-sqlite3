@@ -8097,19 +8097,37 @@ function sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
 var
   pBt    : PBtShared;
   rc     : i32;
-  pPage1 : PDbPage;
-  zData  : Pu8;
+  aData  : Pu8;
 begin
   pBt := p^.pBt;
-  rc  := sqlite3PagerGet(pBt^.pPager, 1, @pPage1, 0);
-  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
-  rc := sqlite3PagerWrite(pPage1);
+  Assert((iVersion = 1) or (iVersion = 2));
+
+  { If setting the version fields to 1, do not automatically open the
+    WAL connection, even if the version fields are currently set to 2.
+    The BTS_NO_WAL flag suppresses the WAL-open arm in lockBtree (page1
+    init).  Without going through sqlite3BtreeBeginTrans here the WAL is
+    never created on the `PRAGMA journal_mode=WAL` transition — the old
+    raw page-1 write skipped the begin-trans entirely (btree.c:4290). }
+  pBt^.btsFlags := pBt^.btsFlags and (not BTS_NO_WAL);
+  if iVersion = 1 then
+    pBt^.btsFlags := pBt^.btsFlags or BTS_NO_WAL;
+
+  rc := sqlite3BtreeBeginTrans(p, 0, nil);
   if rc = SQLITE_OK then begin
-    zData := Pu8(sqlite3PagerGetData(pPage1));
-    zData[18] := u8(iVersion);
-    zData[19] := u8(iVersion);
+    aData := pBt^.pPage1^.aData;
+    if (aData[18] <> u8(iVersion)) or (aData[19] <> u8(iVersion)) then begin
+      rc := sqlite3BtreeBeginTrans(p, 2, nil);
+      if rc = SQLITE_OK then begin
+        rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+        if rc = SQLITE_OK then begin
+          aData[18] := u8(iVersion);
+          aData[19] := u8(iVersion);
+        end;
+      end;
+    end;
   end;
-  sqlite3PagerUnref(pPage1);
+
+  pBt^.btsFlags := pBt^.btsFlags and (not BTS_NO_WAL);
   Result := rc;
 end;
 
