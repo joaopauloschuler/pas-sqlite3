@@ -3993,7 +3993,7 @@ begin
 
   if (pPager^.exclusiveMode = 0)
   and ((pagerUseWal(pPager) = 0)
-       or (sqlite3WalExclusiveMode(pPager^.pWal, 0) = 0)) then
+       or (sqlite3WalExclusiveMode(pPager^.pWal, 0) <> 0)) then
     rc2 := pagerUnlockDb(pPager, SHARED_LOCK);
 
   pPager^.eState  := PAGER_READER;
