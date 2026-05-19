@@ -2645,6 +2645,7 @@ begin
     { Try "| OFF: hh hh hh hh hh hh hh hh hh hh hh hh hh hh hh hh". }
     i := iSave;
     ok := hexdb_match_lit(zIn, i, '| ');
+    if ok then hexdb_skip_ws(zIn, i);
     if ok then ok := hexdb_parse_uint(zIn, i, j);
     if ok then ok := hexdb_match_lit(zIn, i, ':');
     if ok then begin
