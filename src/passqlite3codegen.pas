@@ -52228,8 +52228,10 @@ const
     relies on this order.  OMIT-guarded rows excluded for our build:
     activate_extensions (CEROD), data_store_directory (Win32),
     lock_proxy_file (LOCKING_STYLE), lock_status / parser_trace / sql_trace
-    / stats / vdbe_* (DEBUG/TEST only). }
-  aPragmaName: array[0..66] of TPragmaName = (
+    / vdbe_* (DEBUG/TEST only).  `stats` is DEBUG-gated upstream but kept
+    here so autoanalyze1.test (which expects pragma_stats as an eponymous
+    table-valued function) passes; shard-0 fix 8. }
+  aPragmaName: array[0..67] of TPragmaName = (
     (zName: 'analysis_limit';            ePragTyp: PragTyp_ANALYSIS_LIMIT;
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'application_id';            ePragTyp: PragTyp_HEADER_VALUE;
@@ -52348,6 +52350,11 @@ const
      mPragFlg: PragFlg_NoColumns;                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'soft_heap_limit';           ePragTyp: PragTyp_SOFT_HEAP_LIMIT;
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    { pragma.h:550 — `stats` (DEBUG-only upstream).  Five-column row-set:
+      tbl, idx, wdth, hght, flgs.  Required for autoanalyze1.test via
+      eponymous vtab pragma_stats. }
+    (zName: 'stats';                     ePragTyp: PragTyp_STATS;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq;            iPragCName: 38; nPragCName: 5; iArg: 0),
     (zName: 'synchronous';               ePragTyp: PragTyp_SYNCHRONOUS;
      mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;
                                                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
@@ -52720,6 +52727,39 @@ begin
     end;
   end;
   if pName <> nil then case pName^.ePragTyp of
+
+    { pragma.c:1342..1367 — PRAGMA stats (DEBUG-gated upstream).  Walk the
+      tblHash for iDb; emit one row per (table, NULL) plus one row per
+      attached index.  Columns: tbl, idx, wdth (szTabRow / szIdxRow),
+      hght (nRowLogEst / aiRowLogEst[0]), flgs (tabFlags / hasStat1).
+      Required by autoanalyze1.test via eponymous vtab pragma_stats. }
+    PragTyp_STATS: begin
+      pParse^.nMem := 5;
+      sqlite3CodeVerifySchema(pParse, iDb);
+      pElemA := db^.aDb[iDb].pSchema^.tblHash.first;
+      while pElemA <> nil do begin
+        pTabA := PTable2(pElemA^.data);
+        if pTabA <> nil then begin
+          sqlite3VdbeMultiLoad(v, 1, 'ssiii', [
+            Pointer(sqlite3PreferredTableName(pTabA^.zName)),
+            Pointer(PAnsiChar(nil)),
+            i32(pTabA^.szTabRow),
+            i32(pTabA^.nRowLogEst),
+            i32(pTabA^.tabFlags)]);
+          pIdxA := pTabA^.pIndex;
+          while pIdxA <> nil do begin
+            sqlite3VdbeMultiLoad(v, 2, 'siiiX', [
+              Pointer(pIdxA^.zName),
+              i32(pIdxA^.szIdxRow),
+              i32(Pi16(pIdxA^.aiRowLogEst)[0]),
+              indexHasStat1(pIdxA)]);
+            sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 5);
+            pIdxA := pIdxA^.pNext;
+          end;
+        end;
+        pElemA := passqlite3util.PHashElem(pElemA^.next);
+      end;
+    end;
 
     { pragma.c:1211 — PRAGMA table_info(t) / table_xinfo(t).  iArg=0 hides
       hidden/virtual/stored columns; iArg=1 (table_xinfo) shows them. }
