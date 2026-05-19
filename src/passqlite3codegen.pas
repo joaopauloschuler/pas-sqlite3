@@ -32147,7 +32147,8 @@ begin
      and (p^.pWin     = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_Coroutine))
   then
   begin
     canUseAgg := True;
@@ -32641,7 +32642,14 @@ begin
             sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
         end;
         if pDest^.eDest = SRT_Output then
-          sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
+        else if pDest^.eDest = SRT_Coroutine then
+          { filter1-1.8 — when this aggregate-no-GROUP-BY arm is invoked
+            recursively from the FROM-subquery coroutine arm above, the
+            inner produces a single aggregate row that the outer scans
+            via OP_Yield.  Match select.c's selectInnerLoop SRT_Coroutine
+            branch (select.c:1438..1442). }
+          sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
         if addrSkip <> 0 then
           sqlite3VdbeResolveLabel(v, addrSkip);
         if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
@@ -32887,6 +32895,21 @@ begin
   then
   begin
     pItem := SrcListItems(p^.pSrc);
+    if (pItem^.pSTab <> nil)
+       and SrcItemIsSubquery(pItem^.fg)
+       and (pItem^.u4.pSubq <> nil)
+       and (pItem^.u4.pSubq^.pSelect <> nil) then
+    begin
+      { filter1-1.8 / aggsub-subq SIGSEGV — C sets SF_Aggregate in
+        resolveSelectStep (resolve.c:1961..1964) on every nested SELECT.
+        Pas selectMarkAggregate runs only on the outer SELECT inside
+        sqlite3Select, so an aggregate-bearing inner subquery enters
+        flattenSubquery with selFlags clean and gets absorbed — its
+        sum()/avg()/etc. lose aggregate codegen and emit OP_Function,
+        whose sumStep then sees a pCtx with no pMem and segfaults.
+        Mark the inner explicitly here, just like C's resolver would. }
+      selectMarkAggregate(pParse, pItem^.u4.pSubq^.pSelect);
+    end;
     if (pItem^.pSTab <> nil)
        and SrcItemIsSubquery(pItem^.fg)
        and (pItem^.u4.pSubq <> nil)
