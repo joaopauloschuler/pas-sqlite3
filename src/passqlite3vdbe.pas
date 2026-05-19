@@ -6012,11 +6012,14 @@ begin
     if pStmt^.rc <> SQLITE_OK then rc := SQLITE_ERROR;
   end;
   if db <> nil then begin
-    { vdbeapi.c:884 — transfer p^.zErrMsg into db^.pErr so sqlite3_errmsg
-      returns the real cause.  C gates on SQLITE_PREPARE_SAVESQL to also
-      override rc on SCHEMA-retry; we always transfer (no auto-reprepare
-      yet) since the message-routing is the load-bearing effect here. }
-    if rc <> SQLITE_DONE then
+    { vdbeapi.c:884..890 — only transfer p^.zErrMsg into db^.pErr when the
+      stmt was prepared with SAVESQL (i.e. sqlite3_prepare_v2/v3).  For
+      legacy sqlite3_prepare the real error stays attached to the stmt
+      (surfaced via sqlite3_finalize/_reset) and sqlite3_errmsg(db) must
+      return the generic "SQL logic error" string from db^.errCode alone
+      (errmsg-1.1 / 2.2 / 3.1.2). }
+    if (rc <> SQLITE_DONE)
+       and ((pStmt^.prepFlags and SQLITE_PREPARE_SAVESQL) <> 0) then
       rc := sqlite3VdbeTransferError(pStmt);
     db^.errCode := rc;
     Dec(db^.nVdbeActive);
