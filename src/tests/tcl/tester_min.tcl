@@ -282,6 +282,12 @@ set ::sqlite_options(fts5) 0
 # the engine honestly returns 0 → 1.0/1.1/1.2 fail.
 set ::sqlite_options(fast_secure_delete) 0
 set ::sqlite_options(secure_delete) 0
+# descidx1-6.1 — pas-sqlite3 builds without -DSQLITE_DEFAULT_FILE_FORMAT=1,
+# so SQLITE_DEFAULT_FILE_FORMAT defaults to 4 (sqliteInt.h:694) and main.c's
+# `#if SQLITE_DEFAULT_FILE_FORMAT<4` arm is skipped — SQLITE_LegacyFileFmt
+# is NOT in the default db->flags (passqlite3main.pas:873..883).  Mirror
+# test_config.c:491..495 which writes 0 when DEFAULT_FILE_FORMAT != 1.
+set ::sqlite_options(legacyformat) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
