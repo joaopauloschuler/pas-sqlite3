@@ -1424,6 +1424,26 @@ set ::SQLITE_MAX_VARIABLE_NUMBER 32766
 if {![info exists ::cmdlinearg(soft-heap-limit)]} {
   set ::cmdlinearg(soft-heap-limit) 0
 }
+#   cmdlinearg(TESTFIXTURE_HOME): tester.tcl:497 sets this to
+#     [file dirname [info nameofexec]] so test_find_binary /
+#     test_find_db / friends (tester.tcl:2530..2536) can locate
+#     auxiliary binaries and data files relative to the testfixture
+#     executable.  Honour $env(TESTFIXTURE_HOME) when set (matches the
+#     upstream convention used by Makefile-driven runs), else fall back
+#     to the directory containing the running interpreter / [pwd].
+#     Surfaced by analyzer1.test via the read at tester_min.tcl:1616.
+if {![info exists ::cmdlinearg(TESTFIXTURE_HOME)]} {
+  if {[info exists ::env(TESTFIXTURE_HOME)]} {
+    set ::cmdlinearg(TESTFIXTURE_HOME) $::env(TESTFIXTURE_HOME)
+  } else {
+    set _tfh [file dirname [info nameofexec]]
+    if {$_tfh eq "" || $_tfh eq "."} {
+      set _tfh [pwd]
+    }
+    set ::cmdlinearg(TESTFIXTURE_HOME) $_tfh
+    unset _tfh
+  }
+}
 
 # --------------------------------------------------------------------------
 # 9.4.6.q.2 — remaining tester.tcl / malloc_common.tcl procs surfaced by
