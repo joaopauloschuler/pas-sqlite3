@@ -45404,6 +45404,12 @@ begin
 
   z := PAnsiChar(pFKey + FKEY_ACOL_OFFSET + SizeInt(nCol) * COLMAP_SIZE);
   PPointer(pFKey + FKEY_ZTO_OFFSET)^ := z;
+  { build.c:3669..3671 — under PARSE_MODE_RENAME map the FK target-table
+    name buffer to the original pTo token so renameTableFunc can later
+    rewrite REFERENCES targets in the child table's sqlite_master text
+    (altertab2-2.1/2.2/2.3). }
+  if InRenameObject(pParse) then
+    sqlite3RenameTokenMap(pParse, Pointer(z), pTo);
   Move(pTo^.z^, z^, pTo^.n);
   z[pTo^.n] := #0;
   sqlite3Dequote(z);
