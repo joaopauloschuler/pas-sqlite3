@@ -1133,14 +1133,22 @@ end;
   =========================================================================== }
 function cellSizePtrNoPayload(pPage: PMemPage; pCell: Pu8): u16;
 var
-  pIter: Pu8;
-  pEnd : Pu8;
+  pIter   : Pu8;
+  pEnd    : Pu8;
+  hadHigh : Boolean;
 begin
   pIter := pCell + 4;
   pEnd  := pIter + 9;
-  while (pIter[0] and $80 <> 0) and (pIter < pEnd) do
+  { btree.c:1509  while( (*pIter++)&0x80 && pIter<pEnd );
+    The byte is read and pIter advanced together (post-increment), THEN both
+    conditions are tested.  A naive `while (hi) and (pIter<pEnd) do Inc` plus a
+    trailing Inc over-counts by one when the rowid needs the full 9-byte varint
+    (every one of the first 8 bytes has its high bit set), making an interior
+    cell appear 1 byte too long and corrupting integrity_check / balance. }
+  repeat
+    hadHigh := (pIter[0] and $80) <> 0;
     Inc(pIter);
-  Inc(pIter);
+  until (not hadHigh) or (pIter >= pEnd);
   Result := u16(pIter - pCell);
 end;
 
@@ -5255,7 +5263,11 @@ begin
         Exit;
       end;
       pCell := pTmp + (pCell - aData);
-    end else if SQLITE_OVERFLOW_CHK(pEnd, pCell, pCell + sz) then begin
+    end else if SQLITE_OVERFLOW_CHK(pSrcEnd, pCell, pCell + sz) then begin
+      { btree.c:7666 — the boundary is the *source sibling* data end
+        (pSrcEnd = pCArray->apEnd[k]), NOT the destination page end pEnd.
+        Using pEnd weakens the cross-sibling overlap check and lets a
+        straddling cell through, corrupting the rebuilt page. }
       Result := SQLITE_CORRUPT_BKPT;
       Exit;
     end;
@@ -6075,7 +6087,12 @@ begin
     freePage(apOld[i], @rc);
 
 balance_cleanup:
-  sqlite3StackFree(nil, pMem);
+  { btree.c:9003 frees b.apCell — which the entry-time FillChar(b,...) zeroed,
+    so the early-exit `goto balance_cleanup` paths (before the scratch alloc)
+    free a NULL pointer (a safe no-op).  The local pMem is NOT zero-initialised
+    on those paths and would carry a stale (already-freed) pointer from a prior
+    balance_nonroot stack frame, causing a double free.  Mirror C exactly. }
+  sqlite3StackFree(nil, b.apCell);
   for i := 0 to nOld - 1 do releasePage(apOld[i]);
   for i := 0 to nNew - 1 do releasePage(apNew[i]);
   Result := rc;
