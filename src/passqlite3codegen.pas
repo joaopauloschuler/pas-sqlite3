@@ -37030,11 +37030,16 @@ begin
   else
     bComplex := 0;
 
-  { TODO(Phase 6.x): wire sqlite3LimitWhere call (delete.c:374) —
-    DELETE/UPDATE LIMIT support.  The helper itself is fully ported (see
-    codegen.pas:31123); only the caller-side wiring inside this driver
-    is still pending.  Productive path today doesn't touch LIMIT for
-    schema-row DELETEs from sqlite3NestedParse. }
+  { SQLITE_ENABLE_UPDATE_DELETE_LIMIT (delete.c:372..380) — rewrite the
+    WHERE clause into "rowid IN (SELECT rowid ... ORDER BY ... LIMIT ...)"
+    for non-view targets, then clear pOrderBy/pLimit so the rest of the
+    driver runs the ordinary path. }
+  if isView = 0 then begin
+    pWhere := sqlite3LimitWhere(pParse, pTabList, pWhere, pOrderBy, pLimit,
+                PAnsiChar('DELETE'));
+    pOrderBy := nil;
+    pLimit := nil;
+  end;
 
   if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto delete_from_cleanup;
 
@@ -38155,9 +38160,15 @@ begin
     nChangeFrom := 0;
   AssertH((nChangeFrom = 0) or (pUpsert = nil), 'Update FROM with UPSERT');
 
-  { TODO(Phase 6.x): wire sqlite3LimitWhere call (update.c:398..406) —
-    helper is real (codegen.pas:31123); only the caller-side wiring in
-    this driver is pending.  Productive path has no LIMIT today. }
+  { SQLITE_ENABLE_UPDATE_DELETE_LIMIT (update.c:398..406) — rewrite the
+    WHERE clause into a "PK IN (SELECT ... ORDER BY ... LIMIT ...)" subquery
+    for non-view, non-UPDATE-FROM targets, then clear pOrderBy/pLimit. }
+  if (isView = 0) and (nChangeFrom = 0) then begin
+    pWhere := sqlite3LimitWhere(pParse, pTabList, pWhere, pOrderBy, pLimit,
+                PAnsiChar('UPDATE'));
+    pOrderBy := nil;
+    pLimit := nil;
+  end;
 
   if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto update_cleanup;
   if sqlite3IsReadOnly(pParse, pTab, pTrg) <> 0 then goto update_cleanup;
