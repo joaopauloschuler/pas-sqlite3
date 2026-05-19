@@ -2161,25 +2161,6 @@ and can be added later via a small C entry stub.
 
 ---
 
-## Out of scope until core is green (carry-over from history.md)
-
-These remain explicitly deferred and are **not** part of finishing
-the port unless a user requests them after Phases 0–9 are green:
-
-- `../sqlite3/ext/` — every extension directory (fts3/fts5, rtree,
-  icu, session, rbu, intck, recover, qrf, jni, wasm, expert, misc).
-- Test-harness C files inside `src/` (`src/test*.c`,
-  `src/tclsqlite.{c,h}`).  Phase 9.4 calls the Tcl suite via the
-  C-built `libsqlite3.so`, never via a Pascal port of these files.
-- `src/os_kv.c` — optional key-value VFS.
-- `src/os_win.c`, `src/mutex_w32.c`, `src/os_win.h` — Windows
-  backend (Linux first; Windows is a Phase 11+ stretch).
-- Forensic / one-off tools: `tool/showwal.c`, `dbhash`, `enlargedb`,
-  `fast_vacuum`, `max-limits`, etc.  (`tool/lemon.c`,
-  `tool/lempar.c` are in scope as Phase 7 inputs.)
-
----
-
 ## Per-function porting checklist (apply to every new function)
 
 - [ ] Signature matches the C source (same argument order, same
