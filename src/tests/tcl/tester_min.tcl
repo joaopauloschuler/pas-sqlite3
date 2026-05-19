@@ -1024,6 +1024,23 @@ if {[llength [info commands cksum]]==0} {
     return $cksum
   }
 }
+# dbcksum — verbatim port of tester.tcl:2176..2188.
+# Computes an md5 of $dbname's sqlite_master plus every table's contents.
+if {[llength [info commands dbcksum]]==0} {
+  proc dbcksum {db dbname} {
+    if {$dbname=="temp"} {
+      set master sqlite_temp_master
+    } else {
+      set master $dbname.sqlite_master
+    }
+    set alltab [$db eval "SELECT name FROM $master WHERE type='table'"]
+    set txt [$db eval "SELECT * FROM $master"]\n
+    foreach tab $alltab {
+      append txt [$db eval "SELECT * FROM $dbname.$tab"]\n
+    }
+    return [md5 $txt]
+  }
+}
 # output2 — verbatim port of tester.tcl: writes to stdout.
 if {[llength [info commands output2]]==0} {
   proc output2 {args} { uplevel puts $args }
