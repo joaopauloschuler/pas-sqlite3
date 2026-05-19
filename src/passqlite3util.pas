@@ -795,6 +795,7 @@ function  sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
 function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
 function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
+procedure sqlite3FileSuffix3(zBaseFilename, z: PChar);
 function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
 function sqlite3_uri_key(zFilename: PChar; N: i32): PChar;
 function sqlite3_filename_database(zFilename: PChar): PChar;
@@ -3165,6 +3166,29 @@ begin
   if bDflt <> 0 then df := 1 else df := 0;
   if z <> nil then Result := sqlite3GetBoolean(z, df)
   else Result := df;
+end;
+
+{ util.c:2056..2067 — sqlite3FileSuffix3.
+
+  If SQLITE_ENABLE_8_3_NAMES is set at compile-time and zBaseFilename's URI
+  has 8_3_names=1 (or build-level 2), shorten z[]'s suffix to its last 3
+  chars so journal/wal/shm pathnames fit 8.3 form:
+    test.db-journal => test.nal
+    test.db-wal     => test.wal
+    test.db-shm     => test.shm
+
+  In pas-sqlite3 we always compile this in and gate purely on the URI flag,
+  so the same binary behaves correctly with or without 8_3_names=1. }
+procedure sqlite3FileSuffix3(zBaseFilename, z: PChar);
+var
+  i, sz: i32;
+begin
+  if sqlite3_uri_boolean(zBaseFilename, '8_3_names', 0) = 0 then Exit;
+  sz := sqlite3Strlen30(z);
+  i := sz - 1;
+  while (i > 0) and (z[i] <> '/') and (z[i] <> '.') do Dec(i);
+  if (z[i] = '.') and (sz > i + 4) then
+    Move(z[sz - 3], z[i + 1], 4);  { copies 3 chars + trailing NUL }
 end;
 
 { main.c ~4907: sqlite3_uri_int64 }

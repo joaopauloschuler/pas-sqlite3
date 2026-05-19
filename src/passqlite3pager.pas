@@ -2550,6 +2550,9 @@ begin
     pPgr^.zJournal := PChar(pPtr);
     Move(zPathname^, pPtr^, nPathname);  Inc(pPtr, nPathname);
     Move('-journal'[1], pPtr^, 8);       Inc(pPtr, 8 + 1);
+    { pager.c:4916..4919 — rewrite to 8.3 form when URI requests it }
+    sqlite3FileSuffix3(zFilename, pPgr^.zJournal);
+    pPtr := Pu8(pPgr^.zJournal) + sqlite3Strlen30(pPgr^.zJournal) + 1;
   end else
     pPgr^.zJournal := nil;
 
@@ -2559,6 +2562,9 @@ begin
     pPgr^.zWal := PChar(pPtr);
     Move(zPathname^, pPtr^, nPathname);  Inc(pPtr, nPathname);
     Move('-wal'[1], pPtr^, 4);           Inc(pPtr, 4 + 1);
+    { pager.c:4930..4933 — rewrite to 8.3 form when URI requests it }
+    sqlite3FileSuffix3(zFilename, pPgr^.zWal);
+    pPtr := Pu8(pPgr^.zWal) + sqlite3Strlen30(pPgr^.zWal) + 1;
   end else
     pPgr^.zWal := nil;
 
