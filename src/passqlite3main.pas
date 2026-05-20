@@ -6282,6 +6282,10 @@ initialization
     circular codegen->vtab uses. }
   passqlite3codegen.gVtabOverloadFunction :=
     passqlite3codegen.TVtabOverloadFunctionFn(@passqlite3vtab.sqlite3VtabOverloadFunction);
+  { Wire sqlite3VtabFindFunctionOp so isAuxiliaryVtabOperator (codegen.pas,
+    whereexpr.c:449) can query a vtab module's xFindFunction overload. }
+  passqlite3codegen.gVtabFindFunctionOp :=
+    passqlite3codegen.TVtabFindFunctionOpFn(@passqlite3vtab.sqlite3VtabFindFunctionOp);
   { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
     dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA. }
   passqlite3codegen.gFileControl :=

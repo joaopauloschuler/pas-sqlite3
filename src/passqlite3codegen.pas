@@ -2041,6 +2041,12 @@ function  whereLoopAddBtreeIndex(pBuilder: PWhereLoopBuilder;
 function  whereLoopAddBtree(pBuilder: PWhereLoopBuilder;
   mPrereq: Bitmask): i32;
 
+{ where.c:1659 — termFromWhereClause(pWC, iTerm) — walks the
+  pWC -> pWC.pOuter chain to recover the iTerm'th WhereTerm.  Exported so
+  the public sqlite3_vtab_* API helpers (in passqlite3vtab) can resolve a
+  constraint's source term via aConstraint[].iTermOffset. }
+function  termFromWhereClause(pWC: PWhereClause; iTerm: i32): PWhereTerm;
+
 { Phase 6.13.B.7 — virtual-table planner driver.  Forward decl; full
   body at the four-pass driver below (mirrors where.c:4681..4803).
   Callees whereLoopAddVirtualOne / allocateIndexInfo / freeIndexInfo /
@@ -3048,6 +3054,13 @@ type
     xFindFunction override.  Wired from passqlite3vtab initialisation. }
   TVtabOverloadFunctionFn = function(db: PTsqlite3; pDef: PTFuncDef;
                                      nArg: i32; pExpr: PExpr): PTFuncDef;
+  { Trampoline for the xFindFunction-overload arm of isAuxiliaryVtabOperator
+    (whereexpr.c:449..468).  Given a vtab column expression and a function
+    name + nArg, calls the module's xFindFunction and returns the eOp value
+    it reports (>=SQLITE_INDEX_CONSTRAINT_FUNCTION) or 0.  Lives in
+    passqlite3vtab (circular uses); wired from passqlite3main at startup. }
+  TVtabFindFunctionOpFn = function(db: PTsqlite3; pTab: Pointer;
+                                   zName: PAnsiChar; nArg: i32): i32;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
@@ -3058,6 +3071,7 @@ var
   gFileControl:      TFileControlFn;
   gOverloadFunction: TOverloadFunctionFn;
   gVtabOverloadFunction: TVtabOverloadFunctionFn;
+  gVtabFindFunctionOp: TVtabFindFunctionOpFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -15528,6 +15542,102 @@ begin
   Result := 0;
 end;
 
+{ whereexpr.c:402..498 — isAuxiliaryVtabOperator.  Detect "column OP expr"
+  forms (MATCH/GLOB/LIKE/REGEXP, !=, IS NOT, IS NOT NULL, or an overloaded
+  vtab function) that must be passed to a virtual table's xBestIndex as a
+  WO_AUX constraint.  On a match, set peOp2 to the SQLITE_INDEX_CONSTRAINT_*
+  operator and ppLeft/ppRight to the column/expr operands; return 1 (or 2 if
+  the RHS is also a vtab column for forms 5/7).  Otherwise return 0.
+  ExprIsVtab(X) := X.op=TK_COLUMN and X.y.pTab.eTabType=TABTYP_VTAB. }
+function isAuxiliaryVtabOperator(db: PTsqlite3; pExpr: PExpr;
+  peOp2: Pu8; ppLeft: PPExpr; ppRight: PPExpr): i32;
+const
+  SQLITE_INDEX_CONSTRAINT_NE        = 68;
+  SQLITE_INDEX_CONSTRAINT_ISNOT     = 69;
+  SQLITE_INDEX_CONSTRAINT_ISNOTNULL = 70;
+  SQLITE_INDEX_CONSTRAINT_FUNCTION  = 150;
+  function ExprIsVtabCol(pX: PExpr): Boolean; inline;
+  begin
+    Result := (pX <> nil) and (pX^.op = TK_COLUMN)
+      and (pX^.y.pTab <> nil)
+      and (PTable2(pX^.y.pTab)^.eTabType = TABTYP_VTAB);
+  end;
+var
+  pList:        PExprList;
+  items:        PExprListItem;
+  pCol:         PExpr;
+  iOp:          i32;
+  pLeft, pRight: PExpr;
+  res:          i32;
+  tmp:          PExpr;
+begin
+  if pExpr^.op = TK_FUNCTION then
+  begin
+    Assert(ExprUseXList(pExpr));
+    pList := pExpr^.x.pList;
+    if (pList = nil) or (pList^.nExpr <> 2) then begin Result := 0; Exit; end;
+    items := ExprListItems(pList);
+
+    { Builtin MATCH/GLOB/LIKE/REGEXP — vtab column is the 2nd argument. }
+    pCol := items[1].pExpr;
+    if ExprIsVtabCol(pCol) then
+    begin
+      iOp := sqlite3ExprIsLikeOperator(pExpr);
+      if iOp <> 0 then
+      begin
+        peOp2^   := u8(iOp);
+        ppRight^ := items[0].pExpr;
+        ppLeft^  := pCol;
+        Result := 1;
+        Exit;
+      end;
+    end;
+
+    { Overloaded vtab function — 1st argument is the vtab column. }
+    pCol := items[0].pExpr;
+    if ExprIsVtabCol(pCol) and (gVtabFindFunctionOp <> nil) then
+    begin
+      Assert(not ExprHasProperty(pExpr, EP_IntValue));
+      iOp := gVtabFindFunctionOp(db, pCol^.y.pTab, pExpr^.u.zToken, 2);
+      if iOp >= SQLITE_INDEX_CONSTRAINT_FUNCTION then
+      begin
+        peOp2^   := u8(iOp);
+        ppRight^ := items[1].pExpr;
+        ppLeft^  := pCol;
+        Result := 1;
+        Exit;
+      end;
+    end;
+  end
+  else if pExpr^.op >= TK_EQ then
+  begin
+    { Comparison operators terminate early (TK_NE/TK_ISNOT/TK_NOTNULL<TK_EQ). }
+    Result := 0;
+    Exit;
+  end
+  else if (pExpr^.op = TK_NE) or (pExpr^.op = TK_ISNOT)
+       or (pExpr^.op = TK_NOTNULL) then
+  begin
+    res := 0;
+    pLeft  := pExpr^.pLeft;
+    pRight := pExpr^.pRight;
+    if ExprIsVtabCol(pLeft) then Inc(res);
+    if (pRight <> nil) and ExprIsVtabCol(pRight) then
+    begin
+      Inc(res);
+      tmp := pLeft; pLeft := pRight; pRight := tmp;
+    end;
+    ppLeft^  := pLeft;
+    ppRight^ := pRight;
+    if pExpr^.op = TK_NE      then peOp2^ := u8(SQLITE_INDEX_CONSTRAINT_NE);
+    if pExpr^.op = TK_ISNOT   then peOp2^ := u8(SQLITE_INDEX_CONSTRAINT_ISNOT);
+    if pExpr^.op = TK_NOTNULL then peOp2^ := u8(SQLITE_INDEX_CONSTRAINT_ISNOTNULL);
+    Result := res;
+    Exit;
+  end;
+  Result := 0;
+end;
+
 procedure exprAnalyze(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
 var
   pWInfo:     PWhereInfo;
@@ -15571,6 +15681,15 @@ var
   nLeft:        i32;
   iVec:         i32;
   pVecLeft, pVecRight: PExpr;
+  { isAuxiliaryVtabOperator / WO_AUX locals (whereexpr.c:1521..1563). }
+  eOp2:         u8;
+  pAuxLeft, pAuxRight: PExpr;
+  resAux:       i32;
+  prereqColumn, prereqExpr: Bitmask;
+  pNewExprAux:  PExpr;
+  idxNewAux:    i32;
+  pNewTermAux:  PWhereTerm;
+  tmpAux:       PExpr;
 begin
   { whereexpr.c:1122.. — trimmed body; see banner above for what is and is
     not covered.  Comments cite C source line numbers. }
@@ -15931,8 +16050,47 @@ begin
     end;
   end;
 
-  { isAuxiliaryVtabOperator / WO_AUX vtab path (whereexpr.c:1531..1567)
-    deferred — vtab corpus is not exercised today. }
+  { whereexpr.c:1521..1563 — add a WO_AUX auxiliary term for "column OP expr"
+    forms (MATCH/LIKE/GLOB/REGEXP, !=, IS, IS NOT, NOT NULL, or an overloaded
+    vtab function) that get passed into a virtual table's xBestIndex but are
+    not otherwise optimised.  isAuxiliaryVtabOperator may return 2 (forms 5/7
+    where both operands are vtab columns), so the synthesis loops. }
+  if pWC^.op = TK_AND then
+  begin
+    pAuxLeft  := nil;
+    pAuxRight := nil;
+    eOp2      := 0;
+    resAux := isAuxiliaryVtabOperator(db, pX, @eOp2, @pAuxLeft, @pAuxRight);
+    while resAux > 0 do
+    begin
+      Dec(resAux);
+      prereqExpr   := sqlite3WhereExprUsage(pMaskSet, pAuxRight);
+      prereqColumn := sqlite3WhereExprUsage(pMaskSet, pAuxLeft);
+      if (prereqExpr and prereqColumn) = 0 then
+      begin
+        pNewExprAux := sqlite3PExpr(pPrs, TK_MATCH,
+                         nil, sqlite3ExprDup(db, pAuxRight, 0));
+        if ExprHasProperty(pX, EP_OuterON) and (pNewExprAux <> nil) then
+        begin
+          ExprSetProperty(pNewExprAux, EP_OuterON);
+          pNewExprAux^.w.iJoin := pX^.w.iJoin;
+        end;
+        idxNewAux := whereClauseInsert(pWC, pNewExprAux,
+                       TERM_VIRTUAL or TERM_DYNAMIC);
+        pNewTermAux := @pWC^.a[idxNewAux];
+        pNewTermAux^.prereqRight   := prereqExpr or extraRight;
+        pNewTermAux^.leftCursor    := pAuxLeft^.iTable;
+        pNewTermAux^.u.leftColumn  := pAuxLeft^.iColumn;
+        pNewTermAux^.eOperator     := u16(WO_AUX);
+        pNewTermAux^.eMatchOp      := eOp2;
+        markTermAsChild(pWC, idxNewAux, idxTerm);
+        pTerm := @pWC^.a[idxTerm];
+        pTerm^.wtFlags := pTerm^.wtFlags or TERM_COPIED;
+        pNewTermAux^.prereqAll := pTerm^.prereqAll;
+      end;
+      tmpAux := pAuxLeft; pAuxLeft := pAuxRight; pAuxRight := tmpAux;
+    end;
+  end;
 
   { whereexpr.c:1566..1570 — prevent ON-clause terms of a LEFT JOIN from
     being used to drive an index for tables to the left of the join.
