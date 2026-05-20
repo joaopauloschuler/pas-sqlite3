@@ -9119,12 +9119,47 @@ begin
   end;
 end;
 
+{ bareColInSrcList — return True (and the matching SrcItem + column index)
+  if zCol resolves to a real column of any table in pSrc.  Top-level twin of
+  sqlite3ResolveSelectNames.ColumnInSrcList, used by the UPDATE-lean
+  correlated-subquery pre-pass below to bind bare (unqualified) outer column
+  references. }
+function bareColInSrcList(pSrc: PSrcList; zCol: PAnsiChar;
+  out pMatch: PSrcItem; out iColOut: i32): Boolean;
+var
+  base_: PSrcItem;
+  pIt:   PSrcItem;
+  j_, ic: i32;
+begin
+  Result := False;
+  pMatch := nil; iColOut := -1;
+  if (pSrc = nil) or (zCol = nil) then Exit;
+  base_ := SrcListItems(pSrc);
+  for j_ := 0 to pSrc^.nSrc - 1 do
+  begin
+    pIt := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+    if pIt^.pSTab = nil then Continue;
+    ic := sqlite3ColumnIndex(pIt^.pSTab, zCol);
+    if ic >= 0 then
+    begin
+      pMatch := pIt; iColOut := ic; Result := True; Exit;
+    end;
+  end;
+end;
+
 { resolveOuterDotInExpr — single-expression walker that converts any
   TK_DOT whose table-part matches pOuterSrc (by alias or zName) and is
   NOT found in pInnerSrc into a TK_COLUMN bound to the matching outer
   cursor.  Used by sqlite3ResolveExprNames to handle subqueries inside
   e.g. UPDATE SET expressions, where the outer NameContext is not on a
-  chain that the inner sqlite3SelectPrep walker can reach. }
+  chain that the inner sqlite3SelectPrep walker can reach.
+
+  Bare (unqualified) TK_ID references are handled too: a bare column that
+  matches no inner-FROM column but matches an outer-FROM column is bound to
+  the outer cursor — mirroring sqlite3ResolveSelectNames.ResolveOuterIDs
+  (resolve.c lookupName pNC->pNext climb).  Without this, a correlated
+  UPDATE SET subquery such as `UPDATE t1 SET (c,d)=(SELECT y,z FROM t2 WHERE
+  (w,x)=(a,b))` fails with "no such column: a" (rowvalue7-1.2/1.3). }
 procedure resolveOuterDotInExpr(pW: PExpr; pOuterSrc: PSrcList;
   pInnerSrc: PSrcList); forward;
 
@@ -9145,8 +9180,29 @@ var
   j, iCol: i32;
   zTab, zCol: PAnsiChar;
   foundInner: Boolean;
+  pOutItem, pInItemBare: PSrcItem;
+  iOutColBare, iInColBare: i32;
 begin
   if pW = nil then Exit;
+  { Bare (unqualified) TK_ID: bind to the outer FROM when it matches no inner
+    column.  Mirror sqlite3ResolveSelectNames.ResolveOuterIDs. }
+  if pW^.op = TK_ID then
+  begin
+    if (pW^.u.zToken <> nil) and (pOuterSrc <> nil)
+       and (not bareColInSrcList(pInnerSrc, pW^.u.zToken, pInItemBare, iInColBare))
+       and bareColInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutColBare) then
+    begin
+      pW^.op      := TK_COLUMN;
+      pW^.iTable  := pOutItem^.iCursor;
+      pW^.iColumn := i16(iOutColBare);
+      pW^.y.pTab  := pOutItem^.pSTab;
+      if iOutColBare < BMS - 1 then
+        pOutItem^.colUsed := pOutItem^.colUsed or (Bitmask(1) shl iOutColBare)
+      else
+        pOutItem^.colUsed := pOutItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+    end;
+    Exit;
+  end;
   if pW^.op = TK_DOT then
   begin
     if (pW^.pLeft <> nil) and (pW^.pLeft^.op = TK_ID)
@@ -9238,9 +9294,21 @@ var
   j: i32;
   zTab: PAnsiChar;
   foundInner: Boolean;
+  pOutItem, pInItemBare: PSrcItem;
+  iOutColBare, iInColBare: i32;
 begin
   Result := False;
   if pE = nil then Exit;
+  { Bare TK_ID matching an outer-FROM column (but not an inner one) makes the
+    subquery correlated — twin of the TK_DOT check below. }
+  if pE^.op = TK_ID then
+  begin
+    if (pE^.u.zToken <> nil) and (pOuterSrc <> nil)
+       and (not bareColInSrcList(pInnerSrc, pE^.u.zToken, pInItemBare, iInColBare))
+       and bareColInSrcList(pOuterSrc, pE^.u.zToken, pOutItem, iOutColBare) then
+      Result := True;
+    Exit;
+  end;
   if pE^.op = TK_DOT then
   begin
     if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID) then
