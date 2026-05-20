@@ -5082,6 +5082,8 @@ var
   pPayload   : Pu8;
   pBt        : PBtShared;
   pgnoOvfl   : Pgno;
+  pgnoPtrmap : Pgno;
+  eType      : u8;
   nHeader    : i32;
   pOvfl      : PMemPage;
 begin
@@ -5142,7 +5144,31 @@ begin
     Dec(spaceLeft, n);
     if spaceLeft = 0 then begin
       pOvfl  := nil;
+      { btree.c:7187..7195 — for auto-vacuum, advance the allocation hint
+        past any ptrmap / pending-byte page and snapshot the previous overflow
+        page number (0 for the first overflow page). }
+      pgnoPtrmap := pgnoOvfl;
+      if pBt^.autoVacuum <> 0 then begin
+        { Inline PTRMAP_ISPAGE: page is a ptrmap page iff
+          ptrmapPageno(pBt,pg)=pg (btreeInt.h:628). }
+        repeat
+          Inc(pgnoOvfl);
+        until not ((ptrmapPageno(pBt, pgnoOvfl) = pgnoOvfl)
+                   or (pgnoOvfl = PENDING_BYTE_PAGE(pBt)));
+      end;
       rc := allocateBtreePage(pBt, pOvfl, pgnoOvfl, pgnoOvfl, 0);
+      { btree.c:7198..7216 — write the pointer-map entry for this overflow
+        page.  The first overflow page (pgnoPtrmap=0) gets a PTRMAP_OVERFLOW1
+        partial entry; subsequent pages get PTRMAP_OVERFLOW2 pointing at the
+        previous overflow page.  Even the first entry must be written so
+        clearCell()'s optimistic chain walk does not misread stale bytes. }
+      if (pBt^.autoVacuum <> 0) and (rc = SQLITE_OK) then begin
+        if pgnoPtrmap <> 0 then eType := PTRMAP_OVERFLOW2
+        else eType := PTRMAP_OVERFLOW1;
+        ptrmapPut(pBt, pgnoOvfl, eType, pgnoPtrmap, @rc);
+        if rc <> SQLITE_OK then
+          releasePage(pOvfl);
+      end;
       if rc <> SQLITE_OK then begin
         releasePage(pToRelease);
         Result := rc;
@@ -6009,7 +6035,52 @@ begin
     Move(pOld^.aData[8], apNew[nNew-1]^.aData[8], 4);
   end;
 
-  { Auto-vacuum pointer-map updates (no-op in this port) }
+  { Make any required updates to pointer map entries associated with cells
+    stored on sibling pages following the balance operation.  Divider-cell
+    ptrmap entries are set by insertCell().  btree.c:8756..8812. }
+  if ISAUTOVACUUM(pBt) then begin
+    pNew := apNew[0];
+    pOld := pNew;
+    cntOldNext := i32(pNew^.nCell) + i32(pNew^.nOverflow);
+    iNew := 0;
+    iOldIdx := 0;
+
+    i := 0;
+    while i < b.nCell do begin
+      pCell := (b.apCell + i)^;
+      while i = cntOldNext do begin
+        Inc(iOldIdx);
+        if iOldIdx < nNew then pOld := apNew[iOldIdx]
+        else pOld := apOld[iOldIdx];
+        cntOldNext := cntOldNext + i32(pOld^.nCell) + i32(pOld^.nOverflow)
+                      + (1 - leafData);
+      end;
+      if i = cntNew[iNew] then begin
+        Inc(iNew);
+        pNew := apNew[iNew];
+        if leafData = 0 then begin
+          Inc(i);
+          continue;
+        end;
+      end;
+
+      { Cell pCell is destined for new sibling page pNew.  If the source
+        sibling page iOld had the same page number as pNew, and pCell really
+        was part of sibling page iOld (not a divider or overflow cell), the
+        ptrmap entries can be left unchanged. }
+      if (iOldIdx >= nNew)
+         or (pNew^.pgno <> aPgno[iOldIdx])
+         or (not SQLITE_WITHIN(pCell, pOld^.aData, pOld^.aDataEnd)) then
+      begin
+        if leafCorrection = 0 then
+          ptrmapPut(pBt, sqlite3Get4byte(pCell), PTRMAP_BTREE, pNew^.pgno, @rc);
+        if cachedCellSize(@b, i) > pNew^.minLocal then
+          ptrmapPutOvflPtr(pNew, pOld, pCell, @rc);
+        if rc <> SQLITE_OK then goto balance_cleanup;
+      end;
+      Inc(i);
+    end;
+  end;
 
   { Insert divider cells into pParent }
   iOvflSpace := 0;
