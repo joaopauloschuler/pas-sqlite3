@@ -37211,8 +37211,18 @@ begin
     sqlite3NestedParse fall through to the no-op tail — same observable
     behavior as the prior skeleton. }
 
-  { TODO(Phase 6.5): sqlite3MaterializeView (delete.c:428).  isView=0 in the
-    productive corpus today (sqlite_master is a real table). }
+  { If deleting from a view, realise the view into an ephemeral table at
+    iTabCur (delete.c:427..436).  The INSTEAD OF DELETE trigger then fires
+    once per materialised row.  Without this, the WHERE loop emits OP_Rewind
+    on iTabCur which was never opened → nil-cursor crash (auth-4.5). }
+  if isView <> 0 then
+  begin
+    sqlite3MaterializeView(pParse, pTab, pWhere, pOrderBy, pLimit, iTabCur);
+    iDataCur := iTabCur;
+    iIdxCur  := iTabCur;
+    pOrderBy := nil;
+    pLimit   := nil;
+  end;
 
   { Resolve column names in WHERE clause (delete.c:438..445). }
   sNC.pParse := pParse;
