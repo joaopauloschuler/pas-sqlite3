@@ -4802,6 +4802,62 @@ begin
   if clientData = nil then ;
 end;
 
+{ ----------------------------------------------------------------------
+  test1.c:3494..3526 — add_alignment_test_collations.
+
+  Two collations, "utf16_unaligned" (SQLITE_UTF16) and "utf16_aligned"
+  (SQLITE_UTF16_ALIGNED), share the alignmentCollFunc xCompare.  That
+  function does a BINARY-style memcmp but bumps unaligned_string_counter
+  whenever a key begins on an odd byte boundary.  The point of the test
+  is that the ALIGNED collation never receives an odd-boundary key, so
+  its contribution to the counter stays 0.  The counter is exposed to
+  Tcl via Tcl_LinkVar so the test can read it back.
+  ---------------------------------------------------------------------- }
+
+{ test1.c:3495 — file-scope static int unaligned_string_counter = 0. }
+var
+  unaligned_string_counter: cint = 0;
+
+{ test1.c:3496..3510 — alignmentCollFunc. }
+function alignmentCollFunc(NotUsed: Pointer; nKey1: cint; pKey1: Pointer;
+  nKey2: cint; pKey2: Pointer): cint; cdecl;
+var
+  rc, n: cint;
+begin
+  if nKey1 < nKey2 then n := nKey1 else n := nKey2;
+  if (nKey1 > 0) and (1 = (1 and cint(PtrInt(pKey1)))) then
+    Inc(unaligned_string_counter);
+  if (nKey2 > 0) and (1 = (1 and cint(PtrInt(pKey2)))) then
+    Inc(unaligned_string_counter);
+  rc := CompareByte(pKey1^, pKey2^, n);
+  if rc = 0 then
+    rc := nKey1 - nKey2;
+  Result := rc;
+  if NotUsed = nil then ;
+end;
+
+{ test1.c:3511..3526 — add_alignment_test_collations DB. }
+function add_alignment_test_collations(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc >= 2 then
+  begin
+    if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    sqlite3_create_collation(db, PChar('utf16_unaligned'), SQLITE_UTF16,
+      nil, @alignmentCollFunc);
+    sqlite3_create_collation(db, PChar('utf16_aligned'), SQLITE_UTF16_ALIGNED,
+      nil, @alignmentCollFunc);
+  end;
+  Result := SQLITE_OK;
+  if clientData = nil then ;
+end;
+
 { test5.c:29..44 — binarize: return the argument string as a byte array,
   including its trailing NUL (len+1 bytes). }
 function binarize(clientData: TClientData; interp: PTclInterp;
@@ -7456,6 +7512,9 @@ begin
     @test_collate, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('add_test_collate_needed'),
     @test_collate_needed, nil, nil);
+  { test1.c:9226 — add_alignment_test_collations. }
+  Tcl_CreateObjCommand(interp, PChar('add_alignment_test_collations'),
+    @add_alignment_test_collations, nil, nil);
   { test5.c:206..209 — binarize / test_translate / translate_selftest
     (upstream Sqlitetest5_Init). }
   Tcl_CreateObjCommand(interp, PChar('binarize'),
@@ -7483,6 +7542,10 @@ begin
     verify the optimizer correctly elides ORDER BY sorts. }
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
     @sqlite3_sort_count, TCL_LINK_INT);
+  { test1.c:9395 — expose the alignment-collation counter so utf16align.test
+    can read/reset it. }
+  Tcl_LinkVar(interp, PChar('unaligned_string_counter'),
+    @unaligned_string_counter, TCL_LINK_INT);
   { 9.4.divbug.62.d — sqlite3_config_uri / _config_pmasz
     (test_malloc.c:1163..1241, registered at test_malloc.c:1497, 1499)
     and sqlite3_reset_auto_extension (test_autoext.c:189..219). }
