@@ -33385,6 +33385,23 @@ begin
         { Refresh pTabList — the subquery's source replaced the outer's
           single FROM item.  Subsequent code paths read p^.pSrc directly. }
         pTabList := p^.pSrc;
+        { Compound-subquery flatten: when the inner was a UNION ALL,
+          flattenSubquery rewrites the OUTER query into an equivalent
+          compound (p^.pPrior now chains one peer per prior inner arm —
+          select.c:4490..4527).  In C the flattener runs during the
+          analysis phase, BEFORE the multiSelect compound dispatch, so the
+          rewritten compound is then coded by multiSelect and every arm
+          emits.  This Pas port runs flatten LATE (in the per-FROM-item
+          codegen path, well past the compound dispatch at
+          codegen.pas:30938), so a fall-through here would code only the
+          rightmost arm (p itself) and silently drop every peer.  Re-enter
+          sqlite3Select on the now-compound p so the compound dispatch
+          fires and all arms are coded. }
+        if p^.pPrior <> nil then
+        begin
+          Result := sqlite3Select(pParse, p, pDest);
+          Exit;
+        end;
       end;
     end;
   end;
