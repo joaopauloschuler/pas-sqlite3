@@ -465,6 +465,47 @@ proc get_pwd {} {
   }
 }
 
+# test_pwd — upstream tester.tcl:248..264.  Returns the current working
+# directory with $suffix1 appended when the `curdir` capability is present
+# (always true in this build, since the ifcapable stub above runs the BODY),
+# otherwise returns $suffix2.  Used by e_uri.test to build file:// URIs that
+# map to absolute local paths, e.g. [test_pwd /]test.db and [test_pwd / {}].
+proc test_pwd { args } {
+  if {[llength $args] > 0} {
+    set suffix1 [lindex $args 0]
+    if {[llength $args] > 1} {
+      set suffix2 [lindex $args 1]
+    } else {
+      set suffix2 $suffix1
+    }
+  } else {
+    set suffix1 ""; set suffix2 ""
+  }
+  ifcapable curdir {
+    return "[get_pwd]$suffix1"
+  } else {
+    return $suffix2
+  }
+}
+
+# filepath_normalize / do_filepath_test — upstream tester.tcl:873..886.
+# Test cases assume unix-style paths; on the only target here (unix) the
+# path is returned unchanged.  do_filepath_test wraps do_test, normalising
+# both the command result and the expected value.  Used by e_uri.test.
+proc filepath_normalize {p} {
+  if {$::tcl_platform(platform) ne "unix"} {
+    string map [list \\ / \{/ / .db\} .db] \
+        [regsub -nocase -all {[a-z]:[/\\]+} $p {/}]
+  } {
+    set p
+  }
+}
+proc do_filepath_test {name cmd expected} {
+  uplevel [list do_test $name [
+    subst -nocommands { filepath_normalize [ $cmd ] }
+  ] [filepath_normalize $expected]]
+}
+
 # copy_file / forcecopy / do_copy_file — upstream tester.tcl:197..235.
 # Mirror of delete_file/forcedelete/do_delete_file above: `copy_file`
 # errors on a copy failure, `forcecopy` uses `file copy -force`.  Both

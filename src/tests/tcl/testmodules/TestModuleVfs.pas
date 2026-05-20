@@ -500,6 +500,8 @@ var
   pParent  : Psqlite3_vfs;
   rc       : cint;
   pMethods : Psqlite3_io_methods;
+  pArg     : PTclObj;
+  z        : PChar;
 begin
   pTestfile := PTestvfsFile(pFile);
   p := PTestvfs(pVfs^.pAppData);
@@ -516,12 +518,23 @@ begin
 
   Tcl_ResetResult(p^.interp);
   if (p^.pScript <> nil) and ((p^.mask and TESTVFS_OPEN_MASK) <> 0) then begin
-    { An empty list as the key-value-args arg.  We skip the MAIN_DB URI
-      key-value walk that C does — none of the target tests examine the
-      argument, and the parameter walk needs a tail-of-buffer scan that
-      depends on the URI encoding the unix VFS uses. }
+    { test_vfs.c:636..648 — build the key-value-args list.  For a MAIN_DB
+      open, walk the NUL-separated URI parameter pairs stored immediately
+      past the filename's terminating NUL and append each as a list element. }
+    pArg := Tcl_NewObj;
+    Tcl_IncrRefCount(pArg);
+    if (flags and SQLITE_OPEN_MAIN_DB) <> 0 then begin
+      z := PChar(zName) + strlen(PChar(zName)) + 1;
+      while z^ <> #0 do begin
+        Tcl_ListObjAppendElement(nil, pArg, Tcl_NewStringObj(z, -1));
+        z := z + strlen(z) + 1;
+        Tcl_ListObjAppendElement(nil, pArg, Tcl_NewStringObj(z, -1));
+        z := z + strlen(z) + 1;
+      end;
+    end;
     tvfsExecTcl(p, 'xOpen', Tcl_NewStringObj(pFd^.zFilename, -1),
-      Tcl_NewStringObj('', 0), nil, nil);
+      pArg, nil, nil);
+    Tcl_DecrRefCount(pArg);
     if tvfsResultCode(p, rc) <> 0 then begin
       if rc <> SQLITE_OK then begin
         ckfree(pFd);
