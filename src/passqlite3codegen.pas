@@ -51000,6 +51000,7 @@ var
   regArgs:  i32;
   db:       PTsqlite3;
   rcResolv: i32;
+  zAuthArg: PAnsiChar;
   label attach_end;
 begin
   db := pParse^.db;
@@ -51014,6 +51015,23 @@ begin
   if rcResolv = SQLITE_OK then rcResolv := resolveAttachExpr(@sName, pDbname);
   if rcResolv = SQLITE_OK then rcResolv := resolveAttachExpr(@sName, pKey);
   if rcResolv <> SQLITE_OK then goto attach_end;
+
+{$IFNDEF SQLITE_OMIT_AUTHORIZATION}
+  { attach.c:375..389 — SQLITE_ATTACH / SQLITE_DETACH authorizer.  zAuthArg
+    is the filename string only when pAuthArg is a literal TK_STRING (e.g.
+    ATTACH ':memory:'); for a bound parameter or a concatenation expression
+    it is NULL.  A non-OK return (DENY / IGNORE) aborts the attach/detach
+    before any bytecode is emitted (auth-1.252..262). }
+  if pAuthArg <> nil then
+  begin
+    if pAuthArg^.op = TK_STRING then
+      zAuthArg := pAuthArg^.u.zToken
+    else
+      zAuthArg := nil;
+    if sqlite3AuthCheck(pParse, opType, zAuthArg, nil, nil) <> SQLITE_OK then
+      goto attach_end;
+  end;
+{$ENDIF}
 
   v := sqlite3GetVdbe(pParse);
   Assert((v <> nil) or (db^.mallocFailed <> 0));
@@ -51032,8 +51050,6 @@ begin
     else
       sqlite3VdbeAddOp1(v, OP_Expire, 0);
   end;
-
-  if pAuthArg <> nil then ; { used by SQLITE_OMIT_AUTHORIZATION arm — no-op. }
 
 attach_end:
   sqlite3ExprDelete(db, pFilename);
