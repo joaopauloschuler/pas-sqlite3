@@ -6602,6 +6602,21 @@ carray_bind_done:
   Result := TCL_OK;
 end;
 
+{ test1.c:5527..5550 — sqlite3_complete16 <utf-16 sql>.  Returns 1 if the
+  supplied UTF-16 argument is a complete SQL statement, 0 otherwise. }
+function test_complete16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var zBuf: Pointer;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('<utf-16 sql>'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zBuf := Tcl_GetByteArrayFromObj(objv[1], nil);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_complete16(zBuf)));
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -6639,6 +6654,9 @@ begin
     @test_open_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_open16'),
     @test_open16, nil, nil);
+  { test1.c:9143 — sqlite3_complete16 <utf-16 sql>. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_complete16'),
+    @test_complete16, nil, nil);
   { 9.4.divbug.88.031 — test1.c:9079..9080 sqlite3_close / _v2. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_close'),
     @test_close, nil, nil);
