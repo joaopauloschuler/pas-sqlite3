@@ -55625,7 +55625,12 @@ var
   rc: i32;
 begin
   db := pParse^.db;
-  if (db^.xAuth = nil) or (db^.init.busy <> 0) then begin
+  { Don't do any authorization checks if the database is initializing or if
+    the parser is being invoked from within sqlite3_declare_vtab (or any
+    other special parse mode).  Port of auth.c:207 — adds IN_SPECIAL_PARSE
+    (pParse->eParseMode != PARSE_MODE_NORMAL). }
+  if (db^.xAuth = nil) or (db^.init.busy <> 0)
+     or (pParse^.eParseMode <> PARSE_MODE_NORMAL) then begin
     Result := SQLITE_OK; Exit;
   end;
   rc := TxAuthCallback(db^.xAuth)(db^.pAuthArg, code,
