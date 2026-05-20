@@ -336,7 +336,7 @@ begin
         if not found then begin
           { vtab.c:283 — pVtab^.zErrMsg uses sqlite3_mprintf; we mirror
             with a libc-allocated buffer so sqlite3_free clears it. }
-          cur^.pVtab^.zErrMsg := sqlite3VtabFmtMsg1Libc('unknown datatype: %s',
+          cur^.pVtab^.zErrMsg := sqlite3VtabFmtMsg1Libc('unknown datatype: %Q',
             AnsiString(zType));
           Result := SQLITE_ERROR; Exit;
         end;

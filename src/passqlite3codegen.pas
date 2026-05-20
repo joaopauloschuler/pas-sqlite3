@@ -3344,6 +3344,7 @@ uses
   passqlite3printf,
   passqlite3json,
   passqlite3jsoneach,
+  passqlite3carray,
   passqlite3vtab,
   passqlite3parser;
 
@@ -43038,6 +43039,8 @@ begin
         pMod := passqlite3vtab.PVtabModule(sqlite3PragmaVtabRegister(db, zName));
       if (pMod = nil) and (sqlite3_strnicmp(zName, 'json', 4) = 0) then
         pMod := passqlite3jsoneach.sqlite3JsonVtabRegister(db, zName);
+      if (pMod = nil) and (sqlite3_stricmp(zName, 'carray') = 0) then
+        pMod := passqlite3vtab.PVtabModule(passqlite3carray.sqlite3CarrayRegister(db));
       if (pMod <> nil) and
          (passqlite3vtab.sqlite3VtabEponymousTableInit(pParse, pMod) <> 0) then
       begin
