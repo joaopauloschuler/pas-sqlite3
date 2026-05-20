@@ -288,6 +288,11 @@ set ::sqlite_options(secure_delete) 0
 # is NOT in the default db->flags (passqlite3main.pas:873..883).  Mirror
 # test_config.c:491..495 which writes 0 when DEFAULT_FILE_FORMAT != 1.
 set ::sqlite_options(legacyformat) 0
+# autoinc-6.2 — pas-sqlite3 builds without SQLITE_32BIT_ROWID, so the default
+# build uses 64-bit rowids.  Mirror test_config.c:52..56 which writes 0 unless
+# SQLITE_32BIT_ROWID is defined.  Without this, `ifcapable {!rowid32}` blocks
+# (which insert INT64_MAX) are skipped and only the rowid32 32-bit arm runs.
+set ::sqlite_options(rowid32) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
