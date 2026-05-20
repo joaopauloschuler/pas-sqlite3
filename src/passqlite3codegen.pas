@@ -27203,24 +27203,43 @@ end;
   (divbug.16 residual). }
 procedure sqlite3SubqueryColumnTypes(pParse: PParse; pTab: PTable2;
   pSelect: PSelect; aff: AnsiChar);
+const
+  { Mirror of global.c:394 sqlite3StdType[] / global.c:386
+    sqlite3StdTypeAffinity[].  Indices 1..SQLITE_N_STDTYPE (6). }
+  StdType: array[1..6] of PAnsiChar = (
+    'ANY', 'BLOB', 'INT', 'INTEGER', 'REAL', 'TEXT');
+  StdTypeAffinity: array[1..6] of AnsiChar = (
+    AnsiChar(SQLITE_AFF_NUMERIC),
+    AnsiChar(SQLITE_AFF_BLOB),
+    AnsiChar(SQLITE_AFF_INTEGER),
+    AnsiChar(SQLITE_AFF_INTEGER),
+    AnsiChar(SQLITE_AFF_REAL),
+    AnsiChar(SQLITE_AFF_TEXT));
 var
   db:    PTsqlite3;
   pSel:  PSelect;
   pS2:   PSelect;
   pCol:  PColumn;
-  i:     i32;
+  i, j:  i32;
   m:     i32;
   pE:    PExpr;
   items: PExprListItem;
   s2items: PExprListItem;
   affC:  AnsiChar;
   pColl: PTCollSeq;
+  sNC:   TNameContext;
+  zType: PAnsiChar;
+  n, k:  i64;
+  zNew:  PAnsiChar;
 begin
   db := pParse^.db;
   if (db^.mallocFailed <> 0) or InRenameObject(pParse) then Exit;
   pSel := pSelect;
   while pSel^.pPrior <> nil do pSel := pSel^.pPrior;
   if pTab^.nCol = 0 then Exit;
+  { select.c:2367..2368 — NameContext used by columnType() below. }
+  FillChar(sNC, SizeOf(sNC), 0);
+  sNC.pSrcList := pSel^.pSrc;
   items := PExprListItem(PByte(pSel^.pEList) + SizeOf(TExprList));
   pCol := pTab^.aCol;
   for i := 0 to pTab^.nCol - 1 do
@@ -27229,6 +27248,8 @@ begin
     if pE = nil then begin Inc(pCol); continue; end;
     m := 0;
     pS2 := pSel;
+    { select.c:2374 — propagate COLFLAG_NOINSERT to the table. }
+    pTab^.tabFlags := pTab^.tabFlags or u32(pCol^.colFlags and COLFLAG_NOINSERT);
     affC := sqlite3ExprAffinity(pE);
     { Walk forward through pNext while the affinity is still NONE — first
       non-NONE arm wins (select.c:2378..2382). }
@@ -27241,7 +27262,8 @@ begin
       affC := sqlite3ExprAffinity(s2items[i].pExpr);
     end;
     if affC <= AnsiChar(SQLITE_AFF_NONE) then affC := aff;
-    { BLOB downgrade for compound mixed types (select.c:2386..2398). }
+    { BLOB downgrade for compound mixed types + FLEXNUM CAST promotion
+      (select.c:2386..2398). }
     if (affC >= AnsiChar(SQLITE_AFF_TEXT))
        and ((pS2^.pNext <> nil) or (pS2 <> pSel)) then
     begin
@@ -27256,8 +27278,47 @@ begin
         affC := AnsiChar(SQLITE_AFF_BLOB)
       else if (affC >= AnsiChar(SQLITE_AFF_NUMERIC)) and ((m and $02) <> 0) then
         affC := AnsiChar(SQLITE_AFF_BLOB);
+      if (affC >= AnsiChar(SQLITE_AFF_NUMERIC)) and (pE^.op = TK_CAST) then
+        affC := AnsiChar(SQLITE_AFF_FLEXNUM);
     end;
     pCol^.affinity := affC;
+    { select.c:2400..2425 — record the column's declared type string.
+      Use columnType() if it agrees with the chosen affinity; otherwise
+      synthesise "NUM" for NUMERIC/FLEXNUM affinity or look up the matching
+      sqlite3StdType[] name.  Store the type after the name's NUL in
+      zCnName and set COLFLAG_HASTYPE. }
+    zType := columnTypeImpl(@sNC, pE);
+    if (zType = nil)
+       or (affC <> sqlite3AffinityType(zType, nil)) then
+    begin
+      if (affC = AnsiChar(SQLITE_AFF_NUMERIC))
+         or (affC = AnsiChar(SQLITE_AFF_FLEXNUM)) then
+        zType := PAnsiChar('NUM')
+      else begin
+        zType := nil;
+        for j := 1 to 6 do  { SQLITE_N_STDTYPE }
+          if StdTypeAffinity[j] = affC then
+          begin
+            zType := StdType[j];
+            Break;
+          end;
+      end;
+    end;
+    if zType <> nil then
+    begin
+      k := i64(sqlite3Strlen30(zType));
+      n := i64(sqlite3Strlen30(pCol^.zCnName));
+      zNew := PAnsiChar(sqlite3DbReallocOrFree(db, pCol^.zCnName,
+                                               u64(n + k + 2)));
+      pCol^.zCnName := zNew;
+      pCol^.colFlags := pCol^.colFlags and
+                        not (COLFLAG_HASTYPE or COLFLAG_HASCOLL);
+      if pCol^.zCnName <> nil then
+      begin
+        Move(zType^, (pCol^.zCnName + n + 1)^, k + 1);
+        pCol^.colFlags := pCol^.colFlags or COLFLAG_HASTYPE;
+      end;
+    end;
     { select.c:2426..2430 — resolve and record the column's collating
       sequence.  This is the path that reports "no such collation sequence"
       for an UNDEFINED COLLATE name used in a view body / subquery result
