@@ -2988,6 +2988,33 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:5904..5945 (test_stmt_utf16) — sqlite3_column_text16 STMT column.
+  Returns the column text as a UTF-16 byte array including the 0x00 0x00
+  terminator (n+2 bytes), where n is found by scanning 2 bytes at a time
+  until a 0x00 0x00 pair. }
+function tcl_column_text16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var pStm: PVdbe; col: cint; zName16: PByte; n: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT column'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStm := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @col) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zName16 := PByte(sqlite3_column_text16(pStm, col));
+  if zName16 <> nil then begin
+    n := 0;
+    while (zName16[n] <> 0) or (zName16[n + 1] <> 0) do
+      Inc(n, 2);
+    Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(zName16, n + 2));
+  end;
+  Result := TCL_OK;
+end;
+
 { ----------------------------------------------------------------------
   9.4.divbug.62.b — sqlite3_bind_* family + hexio_* helpers.
 
@@ -6854,6 +6881,8 @@ begin
     @tcl_test_stmt_isexplain, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_column_bytes16'),
     @tcl_column_bytes16, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_column_text16'),
+    @tcl_column_text16, nil, nil);
   { 9.4.divbug.62.b — sqlite3_bind_* family + hexio_* helpers
     (test1.c:9114..9132, test_hexio.c:461..465). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_bind_int'),
