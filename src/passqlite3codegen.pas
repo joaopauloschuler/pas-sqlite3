@@ -34694,7 +34694,8 @@ begin
   addrSortBrk := 0;  { 0 = unallocated; valid labels are < 0 }
   if (p^.pOrderBy <> nil)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
-          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Mem))
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_Set))
      and (not isExists) then
   begin
     bSort := 1;
@@ -35108,6 +35109,75 @@ begin
                              sortNKey + bSeqExtra + nResultCol);
       if iSkipTopN > 0 then
         sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      { selectInnerLoop SRT_Mem + sort (select.c:1427) — `pDest->iSDParm =
+        regResult`.  The result columns were coded into pDest^.iSdst (==
+        regResult here) and re-read into the same registers by the sort
+        tail; point iSDParm at them so the caller (sqlite3CodeSubselect /
+        the outer BeginSubrtn Copy) reads the sorted value rather than the
+        stale NULL it pre-allocated.  Without this, a scalar subquery with
+        both DISTINCT and OFFSET (which forces iSdst<>iSDParm) returned
+        empty — subquery2-7.4. }
+      pDest^.iSDParm := pDest^.iSdst;
+    end
+    else if (bSort <> 0) and (pDest^.eDest = SRT_Set) then
+    begin
+      { pushOntoSorter for SRT_Set (IN (...) RHS) with ORDER BY.  Mirrors
+        the SRT_Mem / SRT_EphemTab arms above.  C selectInnerLoop:1384..1407
+        notes that even though set membership ignores row order, a LIMIT on
+        the subquery makes the ORDER BY significant — so the rows must be
+        sorted and the Top-N cap applied before the surviving rows are
+        IdxInserted into the set cursor by the sort tail below.  Setting
+        pDest^.iSDParm2 := 0 signals that any companion Bloom filter is left
+        unpopulated on this path (select.c:1392).  Without this arm the
+        ORDER BY bail emitted an empty loop body, leaving the IN-set empty
+        so `x IN (SELECT ... ORDER BY ... LIMIT n)` matched nothing
+        (subselect-3.10/4.2/4.3). }
+      regSortBase := pParse^.nMem + 1;
+      Inc(pParse^.nMem, sortNKey + bSeqExtra + nResultCol);
+      for jj := 0 to sortNKey - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse,
+                ExprListItems(p^.pOrderBy)[jj].pExpr,
+                regSortBase + jj);
+        if r1 <> regSortBase + jj then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+      end;
+      if bSeqExtra <> 0 then
+      begin
+        regSeq := regSortBase + sortNKey;
+        sqlite3VdbeAddOp2(v, OP_Sequence, iSorterCsr, regSeq);
+      end;
+      for jj := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                          regSortBase + sortNKey + bSeqExtra + jj);
+      iSkipTopN := 0;
+      if (bUseSorter = 0) and (p^.iLimit <> 0) then
+      begin
+        if p^.iOffset <> 0 then iLimitTopN := p^.iOffset + 1
+                            else iLimitTopN := p^.iLimit;
+        sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
+                          sqlite3VdbeCurrentAddr(v) + 4);
+        sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+        iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
+                          iSorterCsr, 0,
+                          regSortBase,
+                          sortNKey);
+        sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
+      end;
+      Inc(pParse^.nMem);
+      regSortRec := pParse^.nMem;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                        sortNKey + bSeqExtra + nResultCol, regSortRec);
+      if bUseSorter <> 0 then
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol)
+      else
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iSorterCsr, regSortRec,
+                             regSortBase,
+                             sortNKey + bSeqExtra + nResultCol);
+      if iSkipTopN > 0 then
+        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      pDest^.iSDParm2 := 0;
     end
     else if (pDest^.eDest = SRT_Output)
          or ((pDest^.eDest = SRT_Coroutine) and (bSort <> 0)) then
@@ -35441,6 +35511,16 @@ begin
     end;
     if addrSortBrk = 0 then
       addrSortBrk := sqlite3VdbeMakeLabel(pParse);
+    { generateSortTail (select.c:1734..1737) — for a scalar subquery
+      (SRT_Mem) with an OFFSET, re-initialise the destination register to
+      NULL before draining the sorter.  The inner-loop pushOntoSorter arm
+      already coded the candidate value into pDest^.iSdst while scanning, so
+      without this NULL reset an OFFSET that skips every sorted row would
+      still leave that stale scan value in the result register (the IfPos
+      below jumps over the Column readback).  subquery2-6.5: OFFSET 5 over a
+      one-row table must yield empty, not the row's value. }
+    if (pDest^.eDest = SRT_Mem) and (p^.iOffset <> 0) then
+      sqlite3VdbeAddOp2(v, OP_Null, 0, pDest^.iSdst);
     if bUseSorter <> 0 then
     begin
       Inc(pParse^.nMem); regSortOut := pParse^.nMem;
@@ -35467,6 +35547,14 @@ begin
     begin
       addrSortContinue := sqlite3VdbeMakeLabel(pParse);
       sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrSortContinue, 1);
+      { generateSortTail (select.c:1768..1770) — in Top-N B-tree mode the
+        sorter was capped at LIMIT+OFFSET entries during insert, so the
+        OFFSET skip above leaves exactly the LIMIT rows; decrement the LIMIT
+        counter once per surviving OFFSET boundary so it stays consistent
+        with the cap.  Emitted only in the non-sorter (OP_Sort) path, after
+        codeOffset, exactly as C does. }
+      if bUseSorter = 0 then
+        sqlite3VdbeAddOp2(v, OP_AddImm, p^.iLimit, -1);
     end
     else
       addrSortContinue := 0;
@@ -35500,6 +35588,19 @@ begin
     end
     else if pDest^.eDest = SRT_Coroutine then
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+    else if pDest^.eDest = SRT_Set then
+    begin
+      { generateSortTail SRT_Set (select.c:1837..1842) — read-back columns
+        are now in pDest^.iSdst; build a record with the per-column affinity
+        string and IdxInsert it into the set cursor (iSDParm).  This is the
+        sorted/Top-N counterpart of the non-sort SRT_Set disposal arm. }
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1,
+                        pDest^.zAffSdst, nResultCol);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                           pDest^.iSdst, nResultCol);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end
     else if pDest^.eDest = SRT_Mem then
     begin
       { 9.4.divbug.90.007 — SRT_Mem sort tail.  Result registers were
