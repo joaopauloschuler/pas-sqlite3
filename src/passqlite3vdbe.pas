@@ -13832,25 +13832,11 @@ procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
 var
   p: PMem;
 begin
+  { Port of vdbe.c:453 — simply delegate to the runtime applyAffinity,
+    which only demotes Real->Int when LOSSLESS. }
   p := PMem(pVal);
   if p = nil then Exit;
-  case aff of
-    SQLITE_AFF_INTEGER:
-      sqlite3VdbeMemIntegerify(p);
-    SQLITE_AFF_REAL:
-      sqlite3VdbeMemRealify(p);
-    SQLITE_AFF_NUMERIC:
-      sqlite3VdbeMemNumerify(p);
-    SQLITE_AFF_TEXT:
-      if (p^.flags and MEM_Null) = 0 then begin
-        if (p^.flags and (MEM_Str or MEM_Blob)) = 0 then
-          sqlite3VdbeMemStringify(p, enc, 0);
-        p^.flags := p^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal);
-      end;
-    else { SQLITE_AFF_BLOB: no coercion }
-      if (p^.flags and (MEM_Str or MEM_Int or MEM_Real or MEM_IntReal or MEM_Blob or MEM_Null)) = 0 then
-        sqlite3VdbeMemStringify(p, enc, 0);
-  end;
+  applyAffinity(p, AnsiChar(aff), enc);
 end;
 
 { -----------------------------------------------------------------------
