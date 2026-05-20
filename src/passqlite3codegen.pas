@@ -31535,6 +31535,7 @@ begin
      and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo)
      and (pDest^.eDest <> SRT_Queue) and (pDest^.eDest <> SRT_DistQueue)
      and (pDest^.eDest <> SRT_Upfrom)
+     and (pDest^.eDest <> SRT_Table)
      and (pDest^.eDest <> SRT_Discard)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
@@ -35548,7 +35549,7 @@ begin
       if (p^.iLimit <> 0) and (not isExists) then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
     end
-    else if (pDest^.eDest = SRT_EphemTab)
+    else if (pDest^.eDest = SRT_Table) or (pDest^.eDest = SRT_EphemTab)
          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo) then
     begin
       { 6.13(b) piece 1 — selectInnerLoop:1349..1370 SRT_Table /
@@ -35556,6 +35557,11 @@ begin
         iSDParm; append each result row via NewRowid+MakeRecord+Insert
         with OPFLAG_APPEND.  The two temp regs (record / rowid) are
         released to the pool immediately.
+
+        SRT_Table is the destination used by UPDATE...FROM when the target
+        is a virtual table or view (eDest = SRT_Table, iSDParm2 set): C
+        treats it identically to SRT_EphemTab here (select.c:1309 shared
+        case), differing only in the SQLITE_DEBUG OPFLAG_NOCHNG_MAGIC tag.
 
         SRT_Fifo (recursive-CTE Queue) reuses the same shape; SRT_DistFifo
         also pre-emits OP_IdxInsert into the iSDParm+1 dedup cursor
@@ -39094,6 +39100,12 @@ begin
                                                aXRef, chngRowid);
 end;
 
+{ Forward declaration: updateVirtualTable's multi-source arm (update.c:1265)
+  calls updateFromSelect, which is defined further below. }
+procedure updateFromSelect(pParse: PParse; iEph: i32; pPk: PIndex2;
+  pChanges: PExprList; pTabList: PSrcList; pWhere: PExpr;
+  pOrderBy: PExprList; pLimit: PExpr); forward;
+
 { exprRowColumn — port of update.c:143.  Build a TK_ROW expression with
   iColumn=iCol+1, used by updateVirtualTable to read the un-updated value
   of column iCol from the current row of the vtab cursor (SQLite's "row"
@@ -39151,10 +39163,12 @@ var
   pWInfo:      PWhereInfo;
   aDummy:      array[0..1] of i32;
   eOnePass:    i32;
+  pRow:        PExpr;
+  pRowExpr:    PExpr;
+  pList:       PExprList;
 begin
   v := pParse^.pVdbe;
   if v = nil then Exit;
-  if pSrc^.nSrc <> 1 then Exit;  { multi-source FROM — updateFromSelect TODO }
 
   db    := pParse^.db;
   pVTab := PAnsiChar(passqlite3vtab.sqlite3GetVTable(db, Pointer(pTab)));
@@ -39172,75 +39186,128 @@ begin
 
   pItem := SrcListItems(pSrc);
   iCsr := pItem^.iCursor;
-  AssertH(iCsr >= 0, 'updateVirtualTable: vtab cursor not allocated');
 
   pChItems := nil;
   if pChanges <> nil then pChItems := ExprListItems(pChanges);
 
-  { Start scanning the virtual table (update.c:1271..1274).  This drives
-    xBestIndex and emits a properly-populated OP_VFilter. }
-  pWInfo := sqlite3WhereBegin(pParse, pSrc, pWhere, nil, nil, nil,
-                              WHERE_ONEPASS_DESIRED, 0);
-  if pWInfo = nil then Exit;
-
-  { Populate argv[2..nArg-1] with new column values (update.c:1277..1287). }
-  for i := 0 to i32(pTab^.nCol) - 1 do
+  if pSrc^.nSrc > 1 then
   begin
-    if (aXRef + i)^ >= 0 then
-      sqlite3ExprCode(pParse, pChItems[(aXRef + i)^].pExpr, regArg + 2 + i)
+    { Multi-source UPDATE...FROM with a vtab target (update.c:1229..1267).
+      Build the (oldRowid/oldPK, col0..colN-1) projection as TK_ROW
+      pseudo-columns / SET expressions and run updateFromSelect, which
+      drives the join and buffers the result rows into the ephemeral
+      table.  pPk is nil for rowid vtabs (SRT_Table dest in updateFromSelect). }
+    pPk := nil;
+    if HasRowid(pTab) then
+    begin
+      if pRowid <> nil then
+        pRow := sqlite3ExprDup(db, pRowid, 0)
+      else
+        pRow := sqlite3PExpr(pParse, TK_ROW, nil, nil);
+    end
     else
     begin
-      sqlite3VdbeAddOp3(v, OP_VColumn, iCsr, i, regArg + 2 + i);
-      sqlite3VdbeChangeP5(v, OPFLAG_NOCHNG); { for sqlite3_vtab_nochange() }
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      AssertH(pPk <> nil, 'updateVirtualTable: WITHOUT ROWID vtab without PK');
+      AssertH(pPk^.nKeyCol = 1, 'updateVirtualTable: composite PK on vtab');
+      iPk := pPk^.aiColumn[0];
+      if (aXRef + iPk)^ >= 0 then
+        pRow := sqlite3ExprDup(db, pChItems[(aXRef + iPk)^].pExpr, 0)
+      else
+        pRow := exprRowColumn(pParse, iPk);
     end;
-  end;
+    pList := sqlite3ExprListAppend(pParse, nil, pRow);
 
-  { Populate argv[0] (oldRowid / oldPK) and argv[1] (newRowid / newPK)
-    — update.c:1288..1304. }
-  if HasRowid(pTab) then
+    for i := 0 to i32(pTab^.nCol) - 1 do
+    begin
+      if (aXRef + i)^ >= 0 then
+        pList := sqlite3ExprListAppend(pParse, pList,
+          sqlite3ExprDup(db, pChItems[(aXRef + i)^].pExpr, 0))
+      else
+      begin
+        pRowExpr := exprRowColumn(pParse, i);
+        if pRowExpr <> nil then pRowExpr^.op2 := u8(OPFLAG_NOCHNG);
+        pList := sqlite3ExprListAppend(pParse, pList, pRowExpr);
+      end;
+    end;
+
+    updateFromSelect(pParse, ephemTab, pPk, pList, pSrc, pWhere, nil, nil);
+    sqlite3ExprListDelete(db, pList);
+    eOnePass := ONEPASS_OFF;
+  end
+  else
   begin
-    sqlite3VdbeAddOp2(v, OP_Rowid, iCsr, regArg);
-    if pRowid <> nil then
-      sqlite3ExprCode(pParse, pRowid, regArg + 1)
+    AssertH(iCsr >= 0, 'updateVirtualTable: vtab cursor not allocated');
+
+    { Start scanning the virtual table (update.c:1271..1274).  This drives
+      xBestIndex and emits a properly-populated OP_VFilter. }
+    pWInfo := sqlite3WhereBegin(pParse, pSrc, pWhere, nil, nil, nil,
+                                WHERE_ONEPASS_DESIRED, 0);
+    if pWInfo = nil then Exit;
+
+    { Populate argv[2..nArg-1] with new column values (update.c:1277..1287). }
+    for i := 0 to i32(pTab^.nCol) - 1 do
+    begin
+      if (aXRef + i)^ >= 0 then
+        sqlite3ExprCode(pParse, pChItems[(aXRef + i)^].pExpr, regArg + 2 + i)
+      else
+      begin
+        sqlite3VdbeAddOp3(v, OP_VColumn, iCsr, i, regArg + 2 + i);
+        sqlite3VdbeChangeP5(v, OPFLAG_NOCHNG); { for sqlite3_vtab_nochange() }
+      end;
+    end;
+
+    { Populate argv[0] (oldRowid / oldPK) and argv[1] (newRowid / newPK)
+      — update.c:1288..1304. }
+    if HasRowid(pTab) then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Rowid, iCsr, regArg);
+      if pRowid <> nil then
+        sqlite3ExprCode(pParse, pRowid, regArg + 1)
+      else
+        sqlite3VdbeAddOp2(v, OP_Rowid, iCsr, regArg + 1);
+    end
     else
-      sqlite3VdbeAddOp2(v, OP_Rowid, iCsr, regArg + 1);
-  end
-  else
-  begin
-    pPk := sqlite3PrimaryKeyIndex(pTab);
-    AssertH(pPk <> nil, 'updateVirtualTable: WITHOUT ROWID vtab without PK');
-    AssertH(pPk^.nKeyCol = 1, 'updateVirtualTable: composite PK on vtab');
-    iPk := pPk^.aiColumn[0];
-    sqlite3VdbeAddOp3(v, OP_VColumn, iCsr, iPk, regArg);
-    sqlite3VdbeAddOp2(v, OP_SCopy, regArg + 2 + iPk, regArg + 1);
-  end;
+    begin
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      AssertH(pPk <> nil, 'updateVirtualTable: WITHOUT ROWID vtab without PK');
+      AssertH(pPk^.nKeyCol = 1, 'updateVirtualTable: composite PK on vtab');
+      iPk := pPk^.aiColumn[0];
+      sqlite3VdbeAddOp3(v, OP_VColumn, iCsr, iPk, regArg);
+      sqlite3VdbeAddOp2(v, OP_SCopy, regArg + 2 + iPk, regArg + 1);
+    end;
 
-  eOnePass := sqlite3WhereOkOnePass(pWInfo, @aDummy[0]);
-  AssertH((eOnePass = ONEPASS_OFF) or (eOnePass = ONEPASS_SINGLE),
-          'updateVirtualTable: no ONEPASS_MULTI on vtab');
+    eOnePass := sqlite3WhereOkOnePass(pWInfo, @aDummy[0]);
+    AssertH((eOnePass = ONEPASS_OFF) or (eOnePass = ONEPASS_SINGLE),
+            'updateVirtualTable: no ONEPASS_MULTI on vtab');
 
-  if eOnePass <> ONEPASS_OFF then
-  begin
-    { update.c:1308..1311 — no-op out the OP_OpenEphemeral and close the
-      scan cursor; the single OP_VUpdate runs inside the where loop. }
-    sqlite3VdbeChangeToNoop(v, addr);
-    sqlite3VdbeAddOp1(v, OP_Close, iCsr);
-  end
-  else
-  begin
-    { update.c:1314..1325 — buffer this row into the ephemeral table. }
-    sqlite3MultiWrite(pParse);
-    sqlite3VdbeAddOp3(v, OP_MakeRecord, regArg, nArg, regRec);
-    sqlite3VdbeAddOp2(v, OP_NewRowid, ephemTab, regRowid);
-    sqlite3VdbeAddOp3(v, OP_Insert, ephemTab, regRec, regRowid);
+    if eOnePass <> ONEPASS_OFF then
+    begin
+      { update.c:1308..1311 — no-op out the OP_OpenEphemeral and close the
+        scan cursor; the single OP_VUpdate runs inside the where loop. }
+      sqlite3VdbeChangeToNoop(v, addr);
+      sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+    end
+    else
+    begin
+      { update.c:1314..1325 — buffer this row into the ephemeral table. }
+      sqlite3MultiWrite(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regArg, nArg, regRec);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, ephemTab, regRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, ephemTab, regRec, regRowid);
+    end;
   end;
 
   if eOnePass = ONEPASS_OFF then
   begin
-    { End the virtual-table scan, then rewind the ephemeral table and
-      extract the buffered argv for the per-row OP_VUpdate. }
-    sqlite3WhereEnd(pWInfo);
-    pWInfo := nil;
+    { End the virtual-table scan (single-source only — update.c:1334),
+      then rewind the ephemeral table and extract the buffered argv for
+      the per-row OP_VUpdate. }
+    if pSrc^.nSrc = 1 then
+    begin
+      sqlite3WhereEnd(pWInfo);
+      pWInfo := nil;
+    end;
     addr := sqlite3VdbeAddOp1(v, OP_Rewind, ephemTab);
     for i := 0 to nArg - 1 do
       sqlite3VdbeAddOp3(v, OP_Column, ephemTab, i, regArg + i);
