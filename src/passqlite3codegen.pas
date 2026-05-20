@@ -8514,7 +8514,7 @@ end;
   UPDATE WHERE-clause path to drive sqlite3WhereBegin with a properly tagged
   TK_COLUMN tree (so prereqAll picks up the cursor mask and the False-
   WHERE-Term-Bypass does not spuriously fire on `rowid=N`). }
-procedure resolveExprAgainstSrcList(pSrc: PSrcList; pE: PExpr);
+procedure resolveExprAgainstSrcList(pParse: PParse; pSrc: PSrcList; pE: PExpr);
 var
   i:      i32;
   iCol:   i32;
@@ -8541,6 +8541,17 @@ begin
      and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
      and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
   begin
+    { resolve.c:1101..1105 — re-key the tokenExpr-recorded source tokens onto
+      the post-lookupName parse-tree elements under IN_RENAME_OBJECT, before
+      the loop clears pLeft/pRight.  Mirrors the same remap added to the
+      ResolveExpr TK_DOT arm; this lighter path resolves qualified refs that
+      reach sqlite3ResolveExprNames via sNC.pSrcList (e.g. trigger UPDATE SET
+      value exprs — altertab2/altertrig Case B). }
+    if (pParse <> nil) and InRenameObject(pParse) then
+    begin
+      sqlite3RenameTokenRemap(pParse, pE, pE^.pRight);
+      sqlite3RenameTokenRemap(pParse, @pE^.y.pTab, pE^.pLeft);
+    end;
     base := SrcListItems(pSrc);
     for i := 0 to pSrc^.nSrc - 1 do
     begin
@@ -8609,14 +8620,14 @@ begin
   end;
   if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
   begin
-    resolveExprAgainstSrcList(pSrc, pE^.pLeft);
-    resolveExprAgainstSrcList(pSrc, pE^.pRight);
+    resolveExprAgainstSrcList(pParse, pSrc, pE^.pLeft);
+    resolveExprAgainstSrcList(pParse, pSrc, pE^.pRight);
     if (pE^.flags and EP_xIsSelect) = 0 then
     begin
       if pE^.x.pList <> nil then
       begin
         for i := 0 to pE^.x.pList^.nExpr - 1 do
-          resolveExprAgainstSrcList(pSrc, ExprListItems(pE^.x.pList)[i].pExpr);
+          resolveExprAgainstSrcList(pParse, pSrc, ExprListItems(pE^.x.pList)[i].pExpr);
       end;
     end;
   end;
@@ -8675,6 +8686,18 @@ begin
       end;
       if (iCol >= -1) and (iCol < pTab^.nCol) then
       begin
+        { resolve.c:1102..1104 — under IN_RENAME_OBJECT, before lookupName
+          clears pLeft/pRight, the source tokens recorded by tokenExpr (keyed
+          on the inner TK_ID Expr pointers pE^.pLeft / pE^.pRight) must be
+          re-keyed: the column token onto pE itself (renameColumnExprCb finds
+          the TK_TRIGGER node by pointer) and the table token onto
+          &pE^.y.pTab.  Without this, new/old column refs in trigger WHEN
+          clauses and bodies are never remapped by sqlite_rename_column. }
+        if InRenameObject(pParse) then
+        begin
+          sqlite3RenameTokenRemap(pParse, pE, pE^.pRight);
+          sqlite3RenameTokenRemap(pParse, @pE^.y.pTab, pE^.pLeft);
+        end;
         pE^.op      := TK_TRIGGER;
         pE^.iTable  := iTable;
         pE^.iColumn := i16(iCol);
@@ -9405,7 +9428,7 @@ begin
       resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
     if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
       resolveUpsertExcludedRefs(pNC, pExpr);
-    resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
+    resolveExprAgainstSrcList(pNC^.pParse, pNC^.pSrcList, pExpr);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
       resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr)
     else if pNC^.pParse <> nil then
@@ -10333,6 +10356,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
          and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
       then begin
+        { resolve.c:1101..1105 — under IN_RENAME_OBJECT, re-key the source
+          tokens (recorded by tokenExpr on the inner TK_ID pointers) onto the
+          parse-tree elements lookupName will leave behind: the column token
+          onto pE itself (renameColumnExprCb finds the TK_COLUMN node by
+          pointer) and the table token onto &pE^.y.pTab.  Done once per
+          qualified ref, before the loop clears pLeft/pRight, so qualified
+          `tbl.col` refs in trigger bodies are remapped by
+          sqlite_rename_column (altertab2/altertrig Case B). }
+        if InRenameObject(pParse) then
+        begin
+          sqlite3RenameTokenRemap(pParse, pE, pE^.pRight);
+          sqlite3RenameTokenRemap(pParse, @pE^.y.pTab, pE^.pLeft);
+        end;
         pSrc := p^.pSrc;
         base := SrcListItems(pSrc);
         for i := 0 to pSrc^.nSrc - 1 do

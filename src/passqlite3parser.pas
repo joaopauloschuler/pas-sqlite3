@@ -2774,9 +2774,14 @@ var
   tok_180_full: TToken;
   tok_181_z0:  PAnsiChar;
   tok_181_z1:  PAnsiChar;
+  tok_181_t0:  TToken;
+  tok_181_t1:  TToken;
   tok_182_z0:  PAnsiChar;
   tok_182_z1:  PAnsiChar;
   tok_182_z2:  PAnsiChar;
+  tok_182_t0:  TToken;
+  tok_182_t1:  TToken;
+  tok_182_t2:  TToken;
   { Phase 7.2e.5 locals (rules 200..249). }
   pList_206:   PExprList;
   bNot_206:    i32;
@@ -3586,41 +3591,64 @@ begin
        end;
     181: { expr ::= nm DOT nm }
        begin
-         tok_181_z0 := yymsp[-2].minor.yy0.z;
-         tok_181_z1 := yymsp[0].minor.yy0.z;
+         { parse.y:1178 — C builds each TK_ID through tokenExpr (parse.y:1140),
+           which under IN_RENAME_OBJECT records the Expr pointer with its
+           source token via sqlite3RenameTokenMap.  The earlier port skipped
+           that map, so qualified `tbl.col` refs inside trigger bodies were
+           never remapped by sqlite_rename_column (altertab2/altertrig). }
+         tok_181_t0 := yymsp[-2].minor.yy0;
+         tok_181_t1 := yymsp[0].minor.yy0;
+         tok_181_z0 := tok_181_t0.z;
+         tok_181_z1 := tok_181_t1.z;
          temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[-2].minor.yy0, 1);
+           @tok_181_t0, 1);
          if temp1_181 <> nil then
            temp1_181^.w.iOfst :=
              i32(PtrUInt(tok_181_z0) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp1_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp1_181), @tok_181_t0);
          temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[0].minor.yy0, 1);
+           @tok_181_t1, 1);
          if temp2_181 <> nil then
            temp2_181^.w.iOfst :=
              i32(PtrUInt(tok_181_z1) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp2_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp2_181), @tok_181_t1);
          yylhsminor.yy454 := sqlite3PExpr(pPse, TK_DOT, temp1_181, temp2_181);
          yymsp[-2].minor.yy454 := yylhsminor.yy454;
        end;
     182: { expr ::= nm DOT nm DOT nm }
        begin
-         tok_182_z0 := yymsp[-4].minor.yy0.z;
-         tok_182_z1 := yymsp[-2].minor.yy0.z;
-         tok_182_z2 := yymsp[0].minor.yy0.z;
+         { parse.y:1183 — like rule 181, each TK_ID is built through tokenExpr
+           and so gets a rename-token map under IN_RENAME_OBJECT; the db-name
+           node is then remapped to 0 (dropped) right before assembly. }
+         tok_182_t0 := yymsp[-4].minor.yy0;
+         tok_182_t1 := yymsp[-2].minor.yy0;
+         tok_182_t2 := yymsp[0].minor.yy0;
+         tok_182_z0 := tok_182_t0.z;
+         tok_182_z1 := tok_182_t1.z;
+         tok_182_z2 := tok_182_t2.z;
          temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[-4].minor.yy0, 1);
+           @tok_182_t0, 1);
          if temp1_181 <> nil then
            temp1_181^.w.iOfst :=
              i32(PtrUInt(tok_182_z0) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp1_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp1_181), @tok_182_t0);
          temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[-2].minor.yy0, 1);
+           @tok_182_t1, 1);
          if temp2_181 <> nil then
            temp2_181^.w.iOfst :=
              i32(PtrUInt(tok_182_z1) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp2_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp2_181), @tok_182_t1);
          temp3_182 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[0].minor.yy0, 1);
+           @tok_182_t2, 1);
          if temp3_182 <> nil then
            temp3_182^.w.iOfst :=
              i32(PtrUInt(tok_182_z2) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp3_182 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp3_182), @tok_182_t2);
          temp4_182 := sqlite3PExpr(pPse, TK_DOT, temp2_181, temp3_182);
          if InRenameObject(pPse) then
            sqlite3RenameTokenRemap(pPse, nil, temp1_181);
