@@ -44528,8 +44528,40 @@ var
   zTblDup:   PAnsiChar;
   zExplain:  PAnsiChar;
   zDbName:   PAnsiChar;
+  zAuthTbl:  PAnsiChar;
+  iAuthCol:  i32;
+const
+  { sqlite_master columns, in the SET order of the nested UPDATE the C
+    oracle runs (build.c:2903 "SET type,name,tbl_name,rootpage,sql"). }
+  aSchemaCol: array[0..4] of PAnsiChar =
+    ('type', 'name', 'tbl_name', 'rootpage', 'sql');
 begin
   db := pParse^.db;
+
+  { The C reference reaches this schema-row write via
+    sqlite3NestedParse("UPDATE %Q.sqlite_master SET type=...,name=...,
+    tbl_name=...,rootpage=...,sql=... WHERE rowid=#%d"), which runs through
+    sqlite3Update.  That path fires one SQLITE_UPDATE authorizer callback per
+    SET column (update.c:505..517) and, when resolving the WHERE rowid=?
+    expression, a SQLITE_READ on the ROWID column (auth.c:178..182 via
+    sqlite3AuthRead).  We hand-emit the bytecode below, so emit the same
+    authorizer sequence here.  Both sqlite3AuthCheck and sqlite3AuthReadCol
+    early-out when xAuth=nil or db.init.busy<>0, so these are no-ops outside
+    an active authorizer / outside the top-level (non-nested-init) parse. }
+  { Only fire when an authorizer is registered and we are not parsing the
+    schema (db.init.busy).  sqlite3AuthReadCol does NOT guard xAuth=nil on its
+    own — in C it is only ever reached via sqlite3AuthRead, which checks
+    xAuth first (auth.c:168) — so gate the whole block here. }
+  if (db^.xAuth <> nil) and (db^.init.busy = 0) then begin
+    if iDb = 1 then
+      zAuthTbl := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE)
+    else
+      zAuthTbl := PAnsiChar(LEGACY_SCHEMA_TABLE);
+    for iAuthCol := 0 to 4 do
+      sqlite3AuthCheck(pParse, SQLITE_UPDATE_AUTH, zAuthTbl,
+                       aSchemaCol[iAuthCol], db^.aDb[iDb].zDbSName);
+    sqlite3AuthReadCol(pParse, zAuthTbl, PAnsiChar('ROWID'), iDb);
+  end;
 
   cur := pParse^.nTab; Inc(pParse^.nTab);
 
