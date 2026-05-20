@@ -909,6 +909,61 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:6024..6048 — delete_function (old-style argc/argv handler).
+  Usage: sqlite_delete_function DB function-name.  Re-registers the named
+  user function with NULL callbacks (any number of args, UTF8) which is
+  how SQLite deletes a function.  Needed by schema.test 11.2/11.6 +
+  schema2.test. }
+function delete_function(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: i32;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB function-name'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_function(db, av[2], -1, SQLITE_UTF8, nil, nil, nil, nil);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
+{ test1.c:6050..6075 — delete_collation (old-style argc/argv handler).
+  Usage: sqlite_delete_collation DB collation-name.  Re-registers the named
+  collation (UTF8) with a NULL comparator, which deletes it.  Needed by
+  schema.test + schema2.test. }
+function delete_collation(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: i32;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB function-name'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_collation(db, av[2], SQLITE_UTF8, nil, nil);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
 { test1.c:4910..4929 — test_errmsg.
   Usage: sqlite3_errmsg DB. }
 function test_errmsg(clientData: TClientData; interp: PTclInterp;
@@ -6826,6 +6881,12 @@ begin
     @tcl_test_key_v2, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_create_function'),
     @test_create_function, nil, nil);
+  { test1.c:9092..9093 — sqlite_delete_function / sqlite_delete_collation
+    (old-style argc/argv).  Needed by schema.test 11.2/11.6 + schema2.test. }
+  Tcl_CreateCommand(interp, PChar('sqlite_delete_function'),
+    @delete_function, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite_delete_collation'),
+    @delete_collation, nil, nil);
   { 9.4.divbug.88.042 + 9.4.divbug.88.060 — test1.c:9094 sqlite3_get_autocommit. }
   Tcl_CreateCommand(interp, PChar('sqlite3_get_autocommit'),
     @get_autocommit, nil, nil);
