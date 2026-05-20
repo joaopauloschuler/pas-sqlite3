@@ -10661,6 +10661,45 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         Exit;
       end;
     end;
+    { resolve.c:1163..1176 — SQLITE_FUNCTION authorizer.  C's resolveExprStep
+      is the preorder xExprCallback (walker.c:69 runs it BEFORE descending into
+      children), so the auth check for the parent function fires before its
+      arguments.  Mirror that ordering here by running the check ahead of the
+      child-recursion below — otherwise coalesce(min(...)) would report
+      {min coalesce} instead of C's {coalesce min} (auth2-1.6).  Guarded by
+      0==IN_RENAME_OBJECT; sqlite3AuthCheck additionally no-ops while
+      db^.init.busy (schema parse), matching C.  Arg1=NULL, Arg2=pDef^.zName
+      (the canonical function name), Arg3=NULL — see resolve.c:1165. }
+    if (pE^.op = TK_FUNCTION) and (pParse^.db^.xAuth <> nil)
+       and (not InRenameObject(pParse)) and (pE^.u.zToken <> nil)
+       and ExprUseXList(pE) then
+    begin
+      if pE^.x.pList <> nil then nArg_ := pE^.x.pList^.nExpr else nArg_ := 0;
+      pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg_,
+                                   pParse^.db^.enc, 0);
+      if pDef_ = nil then
+        pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                     pParse^.db^.enc, 0);
+      if pDef_ <> nil then
+      begin
+        i := sqlite3AuthCheck(pParse, SQLITE_FUNCTION_AUTH, nil,
+                              pDef_^.zName, nil);
+        if i <> SQLITE_OK then
+        begin
+          if i = SQLITE_DENY then
+          begin
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              'not authorized to use function: %s', [pDef_^.zName]));
+            { resolve.c:1170 pNC->nNcErr++ — mark resolution error. }
+            sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          end;
+          { resolve.c:1172 — SQLITE_IGNORE (or DENY) rewrites the call to a
+            NULL literal and prunes the walk (no descent into args). }
+          pE^.op := TK_NULL;
+          Exit;
+        end;
+      end;
+    end;
     { walker.c:71 — only descend into pLeft / pRight when the Expr is a full
       allocation.  Reduced (EP_TokenOnly) or leaf (EP_Leaf) nodes do not
       have pLeft / pRight fields physically present; reading them walks past
