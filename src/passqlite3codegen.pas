@@ -41390,16 +41390,17 @@ begin
 
   regAutoinc := autoIncBegin(pParse, iDb, pTab);
 
-  { regRowCount (insert.c:1245..1257).  SQLITE_CountRows = u64($100000000)
+  { regRowCount (insert.c:1263..1270).  SQLITE_CountRows = u64($100000000)
     (sqliteInt.h:1863).  Allocate the running counter when the connection
     has CountRows turned on, this is a top-level INSERT (not a trigger or
-    nested parse), and there is no RETURNING / UPSERT clause overriding
-    the change-count emission. }
+    nested parse), and there is no RETURNING clause.  Note: C does NOT gate
+    on pUpsert — UPSERT honours count_changes too; the DO UPDATE branch
+    jumps to endOfLoop (ignoreDest) past the OP_AddImm so only real INSERTs
+    increment the counter (upsert1-400 expects {1}). }
   if ((db^.flags and u64($100000000)) <> 0)
      and (pParse^.pTriggerTab = nil)
      and (pParse^.nested = 0)
-     and ((pParse^.parseFlags and PARSEFLAG_BReturning) = 0)
-     and (pUpsert = nil) then
+     and ((pParse^.parseFlags and PARSEFLAG_BReturning) = 0) then
   begin
     Inc(pParse^.nMem);
     regRowCount := pParse^.nMem;
