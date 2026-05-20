@@ -27214,6 +27214,7 @@ var
   items: PExprListItem;
   s2items: PExprListItem;
   affC:  AnsiChar;
+  pColl: PTCollSeq;
 begin
   db := pParse^.db;
   if (db^.mallocFailed <> 0) or InRenameObject(pParse) then Exit;
@@ -27257,6 +27258,17 @@ begin
         affC := AnsiChar(SQLITE_AFF_BLOB);
     end;
     pCol^.affinity := affC;
+    { select.c:2426..2430 — resolve and record the column's collating
+      sequence.  This is the path that reports "no such collation sequence"
+      for an UNDEFINED COLLATE name used in a view body / subquery result
+      column (collate1-10.0); sqlite3ExprCollSeq -> sqlite3GetCollSeq sets
+      pParse->rc / nErr when the named collation does not exist. }
+    pColl := PTCollSeq(sqlite3ExprCollSeq(pParse, pE));
+    if pColl <> nil then
+    begin
+      AssertH(pTab^.pIndex = nil, 'sqlite3SubqueryColumnTypes: pIndex');
+      sqlite3ColumnSetColl(db, pCol, pColl^.zName);
+    end;
     Inc(pCol);
   end;
   pTab^.szTabRow := 1;
