@@ -8244,6 +8244,12 @@ begin
      and (((iPageSize - 1) and iPageSize) = 0) then
   begin
     uPgsz := u32(iPageSize);
+    { btree.c:3092..3093 — adopt the new page size and discard the temp
+      scratch buffer so it gets reallocated at the new (larger) page size.
+      Without freeTempSpace the stale default-sized pTmpSpace is reused and
+      sqlite3BtreeInsert's FillChar overruns it once page_size grows. }
+    pBt^.pageSize := uPgsz;
+    freeTempSpace(pBt);
     rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
     pBt^.pageSize   := uPgsz;
     pBt^.usableSize := uPgsz - u32(nReserve);
