@@ -53276,6 +53276,24 @@ begin
       zRight := Copy(zRight, 2, Length(zRight) - 2);
   end;
 
+  { pragma.c:469..473 — SQLITE_PRAGMA authorizer check.  zDb is the schema
+    name only when an explicit `db.` prefix was supplied (pId2->n>0),
+    otherwise NULL.  zRight is NULL when the pragma has no argument.  A
+    non-OK return (DENY or IGNORE, both <>0) aborts before the pragma takes
+    effect.  Must run before the FCNTL dispatch and the pragmaLocate body
+    (auth-1.229..238). }
+  if (pId2 <> nil) and (pId2^.n > 0) then
+    zDbFc := db^.aDb[iDb].zDbSName
+  else
+    zDbFc := nil;
+  if pValue <> nil then
+    zRightFc := PAnsiChar(zRight)
+  else
+    zRightFc := nil;
+  if sqlite3AuthCheck(pParse, SQLITE_PRAGMA_AUTH,
+       PAnsiChar(zName), zRightFc, zDbFc) <> 0 then
+    Exit;
+
   { Phase 6.12 — table-valued / introspection pragma dispatcher.  Looks the
     pragma up in aPragmaName (Phase 6.8.0) and emits the C body verbatim
     when ePragTyp is one of the table-valued types.  Falls through to the
