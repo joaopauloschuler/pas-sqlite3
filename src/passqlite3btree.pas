@@ -6816,6 +6816,14 @@ begin
   Result := rc;
 end;
 
+{ main.c:2690 — sqlite3TempInMemory.  The build uses SQLITE_TEMP_STORE==1
+  (see tester_min.tcl), so temporary databases live in memory only when
+  PRAGMA temp_store has been raised to MEMORY (db^.temp_store == 2). }
+function sqlite3TempInMemory(db: Psqlite3): i32;
+begin
+  if PTsqlite3(db)^.temp_store = 2 then Result := 1 else Result := 0;
+end;
+
 { ===========================================================================
   sqlite3BtreeOpen — open or create a B-tree database
   btree.c lines 2528-2917 (simplified: no shared-cache, single connection)
@@ -6831,11 +6839,35 @@ var
   zDbHdr    : array[0..99] of u8;
   nReserve  : i32;
   iPageSize : u32;
+  isTempDb  : i32;
+  isMemdb   : i32;
   label btree_open_out;
 begin
   pBt := nil;
   rc  := SQLITE_OK;
   nReserve := -1;
+
+  { btree.c:2544..2569 — classify ephemeral/in-memory before opening the
+    pager.  isMemdb must be carried into flags via BTREE_MEMORY so that a
+    URI such as 'file:...?mode=memory' (which sets SQLITE_OPEN_MEMORY in
+    vfsFlags) reaches PAGER_MEMORY and skips the on-disk path-length check
+    (otherwise a long memory-db filename fails CANTOPEN). }
+  if (zFilename = nil) or (zFilename[0] = #0) then
+    isTempDb := 1
+  else
+    isTempDb := 0;
+  isMemdb := 0;
+  if (zFilename <> nil) and (StrComp(zFilename, ':memory:') = 0) then
+    isMemdb := 1
+  else if (isTempDb <> 0) and (sqlite3TempInMemory(db) <> 0) then
+    isMemdb := 1
+  else if (vfsFlags and SQLITE_OPEN_MEMORY) <> 0 then
+    isMemdb := 1;
+  if isMemdb <> 0 then
+    flags := flags or BTREE_MEMORY;
+  if ((vfsFlags and SQLITE_OPEN_MAIN_DB) <> 0)
+     and ((isMemdb <> 0) or (isTempDb <> 0)) then
+    vfsFlags := (vfsFlags and (not SQLITE_OPEN_MAIN_DB)) or SQLITE_OPEN_TEMP_DB;
 
   p := PBtree(sqlite3MallocZero(SizeOf(TBtree)));
   if p = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
