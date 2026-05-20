@@ -20423,18 +20423,16 @@ begin
         if (isMatch <> 0)
            and ((obItems[i].fg.sortFlags and KEYINFO_ORDER_BIGNULL) <> 0) then
         begin
-          { 9.4.divbug.43: the C planner accepts BIGNULL ordering and the
-            wherecode emitter (wherecode.c:1933..1953 + 2030..2086 +
-            2134..2164 + where.c:7616..7620) generates a two-pass
-            NULL-then-non-NULL (or vice-versa) scan around regBignull/
-            addrBignull/OP_DecrJumpZero.  That two-pass codegen is not yet
-            ported (the assertion at codegen.pas:22592 explicitly defers
-            it).  Until it lands, refuse the index-satisfies-ORDER-BY
-            match whenever NULL ordering would diverge from the index's
-            natural NULL placement so the planner falls back to the
-            external sorter, which already honours sortFlags via
-            VdbeRecordCompare (btree.pas:3361). }
-          isMatch := 0;
+          { where.c:5425..5431 — BIGNULL ordering (ASC NULLS LAST / DESC
+            NULLS FIRST).  Accept the match only when the BIGNULL column is
+            the first non-equality index column (j == nEq); the wherecode
+            emitter then generates the two-pass NULL-then-non-NULL scan
+            around regBignull/addrBignull/OP_DecrJumpZero (wherecode.c:
+            1933..1953 + 2030..2086 + 2134..2164 + where.c:7616..7620). }
+          if j = i32(pLoop^.u.btree.nEq) then
+            pLoop^.wsFlags := pLoop^.wsFlags or WHERE_BIGNULL_SORT
+          else
+            isMatch := 0;
         end;
         if isMatch <> 0 then
         begin
@@ -23184,7 +23182,8 @@ begin
             if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
                and ((pLoop^.wsFlags
                      and (WHERE_COLUMN_RANGE or WHERE_SKIPSCAN
-                          or WHERE_BIGNULL_SORT)) = 0)
+                          or WHERE_BIGNULL_SORT or WHERE_IN_SEEKSCAN)) = 0)
+               and ((pWInfo^.wctrlFlags and WHERE_ORDERBY_MIN) = 0)
                and (pWInfo^.eDistinct <> WHERE_DISTINCT_ORDERED) then
               sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
           end
@@ -23208,7 +23207,8 @@ begin
               if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
                  and ((pLoop^.wsFlags
                        and (WHERE_COLUMN_RANGE or WHERE_SKIPSCAN
-                            or WHERE_BIGNULL_SORT)) = 0)
+                            or WHERE_BIGNULL_SORT or WHERE_IN_SEEKSCAN)) = 0)
+                 and ((pWInfo^.wctrlFlags and WHERE_ORDERBY_MIN) = 0)
                  and (pWInfo^.eDistinct <> WHERE_DISTINCT_ORDERED) then
                 sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
             end;
@@ -23980,6 +23980,18 @@ begin
       begin
         sqlite3VdbeAddOp3(v, pLevel^.op, pLevel^.p1, pLevel^.p2, pLevel^.p3);
         sqlite3VdbeChangeP5(v, pLevel^.p5);
+        { where.c:7616..7620 — BIGNULL two-pass scan tail.  Resolve the
+          addrBignull label (jumped to when the first pass runs off the end
+          of the non-NULL range) and emit OP_DecrJumpZero: the first time it
+          flips regBignull 1->0 and falls through to re-seek for the NULL
+          pass; the second time (regBignull already 0) it jumps past the
+          re-seek to terminate. }
+        if pLevel^.regBignull <> 0 then
+        begin
+          sqlite3VdbeResolveLabel(v, pLevel^.addrBignull);
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, pLevel^.regBignull,
+                            pLevel^.p2 - 1);
+        end;
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 20 — IN-loop tail.
 
@@ -24302,6 +24314,7 @@ var
   jSwapTerm:       PWhereTerm;
   j4:              i32;
   addrSeekScan:    i32;
+  regBignull:      i32;
   { ---- Per-loop body code (push-down + transitive constraint) locals ---- }
   pWCBody:         PWhereClause;
   pTermBody:       PWhereTerm;
@@ -24695,9 +24708,6 @@ begin
     nTop4   := pLoop^.u.btree.nTop;
     Assert(nEq4 >= pLoop^.nSkip);
 
-    { Defer regBignull NULL-pad two-pass scan to its own batch — no
-      fixture exercises BIGNULL_SORT today. }
-    Assert((pLoop^.wsFlags and WHERE_BIGNULL_SORT) = 0);
     addrSeekScan := 0;
 
     pRangeStart := nil;
@@ -24731,6 +24741,30 @@ begin
       bSeekPastNull := 0;
     bStopAtNull := 0;
 
+    regBignull := 0;
+    { wherecode.c:1933..1953 — WHERE_BIGNULL_SORT two-pass setup.  Index
+      column nEq uses a non-default "big-null" sort (ASC NULLS LAST or DESC
+      NULLS FIRST).  Separate ordered scans are made of the NULL index
+      entries and the non-NULL ones; for ASC the non-NULL entries are
+      scanned first, for DESC the NULLs first.  Allocate the pass-counter
+      register and the addrBignull label, and force bSeekPastNull so the
+      first pass skips past the NULLs. }
+    if ((pLoop^.wsFlags and (WHERE_TOP_LIMIT or WHERE_BTM_LIMIT)) = 0)
+       and ((pLoop^.wsFlags and WHERE_BIGNULL_SORT) <> 0) then
+    begin
+      Assert((bSeekPastNull = 0) and (nExtraReg = 0)
+             and (nBtm4 = 0) and (nTop4 = 0));
+      Assert((pRangeEnd = nil) and (pRangeStart = nil));
+      nExtraReg     := 1;
+      bSeekPastNull := 1;
+      Inc(pParse^.nMem);
+      regBignull         := pParse^.nMem;
+      pLevel^.regBignull := regBignull;
+      if pLevel^.iLeftJoin <> 0 then
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, regBignull);
+      pLevel^.addrBignull := sqlite3VdbeMakeLabel(pParse);
+    end;
+
     { Reverse-order / ASC swap (wherecode.c:1907..1911).  When scanning
       in the opposite direction of the index sort order, swap pRangeStart
       and pRangeEnd so the same start-/end-bound emit logic produces the
@@ -24759,7 +24793,12 @@ begin
       zEndAff := sqlite3DbStrDup(pParse^.db, zStartAff + nEq4)
     else
       zEndAff := nil;
-    addrNxt := pLevel^.addrNxt;
+    { wherecode.c:1981 — during a BIGNULL two-pass scan, an off-the-end
+      probe must jump to addrBignull (the pass-2 setup) rather than addrNxt. }
+    if regBignull <> 0 then
+      addrNxt := pLevel^.addrBignull
+    else
+      addrNxt := pLevel^.addrNxt;
 
     if pRangeStart <> nil then
       startEq := i32((pRangeStart^.eOperator and (WO_LE or WO_GE)) <> 0)
@@ -24800,6 +24839,14 @@ begin
       sqlite3VdbeAddOp2(v, OP_Null, 0, regBase4 + nEq4);
       start_constraints := 1;
       Inc(nConstraint);
+    end
+    else if regBignull <> 0 then
+    begin
+      { wherecode.c:2019..2023 — DESC BIGNULL first pass scans the NULL
+        entries; seed regBase[nEq] with NULL as the equality value. }
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regBase4 + nEq4);
+      start_constraints := 1;
+      Inc(nConstraint);
     end;
     codeApplyAffinity(pParse, regBase4, nConstraint - i32(bSeekPastNull),
                       zStartAff);
@@ -24810,6 +24857,13 @@ begin
     end
     else
     begin
+      { wherecode.c:2030..2033 — initialise the BIGNULL pass counter to 1
+        (the non-NULL first pass).  OP_DecrJumpZero at the loop bottom then
+        flips it to 0 to drive the NULL second pass exactly once. }
+      if regBignull <> 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Integer, 1, regBignull);
+      end;
       if pLevel^.regFilter <> 0 then
       begin
         sqlite3VdbeAddOp4Int(v, OP_Filter, pLevel^.regFilter, addrNxt,
@@ -24839,6 +24893,24 @@ begin
         end;
       end;
       sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4, nConstraint);
+
+      { wherecode.c:2071..2086 — BIGNULL second seek.  The first seek above
+        positions for the non-NULL (ASC) / NULL (DESC) pass; emit a
+        skip-over OP_Goto and a Rewind/Last/SeekGE/SeekLE that the second
+        pass falls into after OP_DecrJumpZero. }
+      Assert((bSeekPastNull = 0) or (bStopAtNull = 0));
+      if regBignull <> 0 then
+      begin
+        Assert((bSeekPastNull = 1) or (bStopAtNull = 1));
+        Assert(i32(bSeekPastNull) = i32(1 - bStopAtNull));
+        Assert(i32(bStopAtNull) = startEq);
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, sqlite3VdbeCurrentAddr(v) + 2);
+        op4 := i32(aStartOp[i32(nConstraint > 1) * 4 + 2 + bRev]);
+        sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4,
+                             nConstraint - startEq);
+        Assert((op4 = OP_Rewind) or (op4 = OP_Last)
+               or (op4 = OP_SeekGE) or (op4 = OP_SeekLE));
+      end;
     end;
 
     { End-bound emit (wherecode.c:2068..2105). }
@@ -24867,8 +24939,14 @@ begin
     end
     else if bStopAtNull <> 0 then
     begin
-      sqlite3VdbeAddOp2(v, OP_Null, 0, regBase4 + nEq4);
-      endEq := 0;
+      { wherecode.c:2119..2125 — during a BIGNULL scan the NULL end-stop is
+        applied through the regBignull two-pass machinery below, so only
+        emit the plain NULL end-bound when regBignull is unused. }
+      if regBignull = 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regBase4 + nEq4);
+        endEq := 0;
+      end;
       Inc(nConstraint);
     end;
     if zStartAff <> nil then sqlite3DbFree(pParse^.db, zStartAff);
@@ -24880,12 +24958,29 @@ begin
     { Check if the index cursor is past the end of the range. }
     if nConstraint <> 0 then
     begin
+      { wherecode.c:2134..2139 — skip the end-of-range check while doing
+        the BIGNULL NULL-scan (regBignull = 0 on the 2nd pass). }
+      if regBignull <> 0 then
+        sqlite3VdbeAddOp2(v, OP_IfNot, regBignull,
+                          sqlite3VdbeCurrentAddr(v) + 3);
       op4 := i32(aEndOp[bRev * 2 + endEq]);
       sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4, nConstraint);
       { OP_SeekScan back-patch (wherecode.c:2146).  When OP_SeekScan was
         emitted without a range bound, ChangeP2 above was skipped so the
         scan budget jumps over the start-bound seek to land here. }
       if addrSeekScan <> 0 then sqlite3VdbeJumpHere(v, addrSeekScan);
+    end;
+    { wherecode.c:2148..2164 — during a NULL-scan, detect when the run of
+      NULL entries has ended and stop. }
+    if regBignull <> 0 then
+    begin
+      Assert(i32(bSeekPastNull) = i32(1 - bStopAtNull));
+      Assert(i32(bSeekPastNull) + i32(bStopAtNull) = 1);
+      Assert(nConstraint + i32(bSeekPastNull) > 0);
+      sqlite3VdbeAddOp2(v, OP_If, regBignull, sqlite3VdbeCurrentAddr(v) + 2);
+      op4 := i32(aEndOp[bRev * 2 + i32(bSeekPastNull)]);
+      sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4,
+                           nConstraint + i32(bSeekPastNull));
     end;
 
     if (pLoop^.wsFlags and WHERE_IN_EARLYOUT) <> 0 then
@@ -32840,6 +32935,19 @@ begin
       if pHavingLoc <> nil then
         sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc);
       pAggI2^.nAccumulator := pAggI2^.nColumn;
+      { MIN/MAX optimisation probe — select.c:8433..8437.  This MUST run
+        before analyzeAggFuncArgs, because that pass rewrites the aggregate
+        argument column from TK_COLUMN to TK_AGG_COLUMN, after which
+        sqlite3ExprCanBeNull (inside minMaxQuery) would no longer see the
+        column's NOT NULL constraint and would wrongly request a BIGNULL
+        ordering for non-nullable columns. }
+      pMinMaxOrderBy := nil;
+      if (p^.pGroupBy = nil) and (pHavingLoc = nil)
+         and (pAggI2^.nFunc = 1) then
+        minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
+                                  @pMinMaxOrderBy)
+      else
+        minMaxFlag := WHERE_ORDERBY_NORMAL;
       analyzeAggFuncArgs(pAggI2, @sNCAgg);
 
       { Bail when any aggregate carries DISTINCT, ORDER BY in the arg
@@ -33163,17 +33271,12 @@ begin
         end
         else
         begin
-          { MIN/MAX optimisation gate — select.c:8433.  When there is
-            exactly one aggregate, no GROUP BY, no HAVING, probe whether
-            it is min(x)/max(x) and if so synthesise a single-element
-            ORDER BY so sqlite3WhereBegin can ride an index in the
-            correct direction and trigger the early-out emitted by
-            sqlite3WhereMinMaxOptEarlyOut. }
-          pMinMaxOrderBy := nil;
-          minMaxFlag := WHERE_ORDERBY_NORMAL;
-          if pAggI2^.nFunc = 1 then
-            minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
-                                      @pMinMaxOrderBy);
+          { MIN/MAX optimisation gate — select.c:8433.  minMaxFlag /
+            pMinMaxOrderBy were computed earlier (before analyzeAggFuncArgs,
+            so sqlite3ExprCanBeNull still sees the TK_COLUMN arg) and carry
+            the synthesised single-element ORDER BY here so
+            sqlite3WhereBegin can ride an index in the correct direction and
+            trigger the early-out emitted by sqlite3WhereMinMaxOptEarlyOut. }
 
           { 9.4.divbug.33 — DISTINCT-aggregate index ride.  Mirrors
             select.c:8849..8853: when there are no bare accumulator
