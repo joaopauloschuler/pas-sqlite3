@@ -27722,6 +27722,7 @@ var
   pFuncArgs: PExprList;
   pFunc:     PExpr;
   iLtoR_LT, iLtoR_LC: i32;
+  zSavedAuthCtx: PAnsiChar;  { resolve.c:1921 — saved pParse->zAuthContext }
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -27784,7 +27785,17 @@ begin
         pSubSel := pItem^.u4.pSubq^.pSelect;
         if pSubSel <> nil then
         begin
+          { resolve.c:1921..1925 — authorize the FROM-subquery body under
+            the subquery/view name so SQLITE_READ callbacks fired during the
+            body's resolution carry pItem->zName as their 6th-arg context
+            (auth2-2.3).  The Pas resolver does not descend into FROM
+            subqueries; the body is fully prepared here in selectExpander,
+            so the save/set/restore wraps this prep call. }
+          zSavedAuthCtx := pParse^.zAuthContext;
+          if pItem^.zName <> nil then
+            pParse^.zAuthContext := pItem^.zName;
           sqlite3SelectPrep(pParse, pSubSel, nil);
+          pParse^.zAuthContext := zSavedAuthCtx;
           if pParse^.nErr <> 0 then Exit;
         end;
         if pItem^.pSTab = nil then
@@ -27871,8 +27882,17 @@ begin
             so inner TK_ID nodes bind against the view's FROM cursors.  An
             earlier sqlite3SelectExpand-only call left TK_COLUMN with stale
             iTable/iColumn from the EXPRDUP_REDUCE'd source, producing
-            OP_Null instead of OP_Column at codegen for `SELECT a FROM v`. }
+            OP_Null instead of OP_Column at codegen for `SELECT a FROM v`.
+
+            resolve.c:1921..1925 — authorize the view body under the view
+            name so SQLITE_READ callbacks fired while resolving the body
+            carry the view name (e.g. v2) as their 6th-arg context
+            (auth2-2.3). }
+          zSavedAuthCtx := pParse^.zAuthContext;
+          if pItem^.zName <> nil then
+            pParse^.zAuthContext := pItem^.zName;
           sqlite3SelectPrep(pParse, pItem^.u4.pSubq^.pSelect, nil);
+          pParse^.zAuthContext := zSavedAuthCtx;
         end;
       end;
 
@@ -30112,6 +30132,17 @@ var
   pKeyInfoCnt:  PKeyInfo2;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
+  { select.c:7608 — top-of-sqlite3Select authorizer check.  Fires
+    SQLITE_SELECT with an empty 6th-arg context for the outer query (and,
+    via the recursive sqlite3Select calls, with the FROM-item name for
+    each nested subquery/view body).  Must run BEFORE sqlite3SelectPrep so
+    the leading `SQLITE_SELECT {} {} {} {}` precedes the per-column
+    SQLITE_READ callbacks (auth2-2.3). }
+  if sqlite3AuthCheck(pParse, SQLITE_SELECT_AUTH, nil, nil, nil) <> 0 then
+  begin
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
   { 10.1.42.a.6.5 — Pre-zero the local AggInfo handle so the select_end tail
     (below) can guard on `pAggI2<>nil` even when the aggregate-codegen
     branches at 26187/26353/27369 never fired. C uses C-scope semantics +
@@ -45306,6 +45337,7 @@ var
   db:      PTsqlite3;
   nTab:    i32;
   nSelect: i32;
+  savedXAuth: Pointer;  { build.c:3096 — saved db->xAuth }
 begin
   nErr := 0;
   db := pParse^.db;
@@ -45325,7 +45357,15 @@ begin
     nSelect := pParse^.nSelect;
     sqlite3SrcListAssignCursors(pParse, pSel^.pSrc);
     pTable^.nCol := -1;
+    { build.c:3155..3159 — disable the authorizer while computing the view's
+      result-set column names.  Resolving the duplicate view body would
+      otherwise fire SQLITE_READ callbacks for the underlying table columns;
+      the real (authorized) view-body resolution happens later during the
+      outer SELECT's selectExpander/SelectPrep pass (auth2-2.3). }
+    savedXAuth := db^.xAuth;
+    db^.xAuth := nil;
     pSelTab := sqlite3ResultSetOfSelect(pParse, pSel, AnsiChar(SQLITE_AFF_NONE));
+    db^.xAuth := savedXAuth;
     pParse^.nTab    := nTab;
     pParse^.nSelect := nSelect;
     if pSelTab = nil then begin
