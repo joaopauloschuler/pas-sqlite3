@@ -430,6 +430,12 @@ procedure sqlite3VtabArgExtend(pPse: PParse; p: PToken);
   can append the three module-arg slots without duplicating the helper. }
 procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
 
+{ Extract a single field (column iField of nField) from a vector expression
+  pVector (expr.c:574).  Exposed so where-clause analysis in passqlite3codegen
+  can decompose vector ==/IS predicates into per-component terms. }
+function sqlite3ExprForVectorField(pPse: PParse; pVector: PExpr;
+                                   iField, nField: i32): PExpr;
+
 { =========================================================================== }
 
 implementation

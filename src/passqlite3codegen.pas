@@ -15366,6 +15366,10 @@ var
   iLk:          i32;
   zCollSeqName: PAnsiChar;
   wtLikeFlags:  u16;
+  { Vector ==/IS and IN decomposition locals (whereexpr.c:1467..1518). }
+  nLeft:        i32;
+  iVec:         i32;
+  pVecLeft, pVecRight: PExpr;
 begin
   { whereexpr.c:1122.. — trimmed body; see banner above for what is and is
     not covered.  Comments cite C source line numbers. }
@@ -15658,9 +15662,60 @@ begin
     end;
   end;
 
-  { Vector == / IS expansion (whereexpr.c:1467..1489) and vector IN expansion
-    (whereexpr.c:1500..1518) deferred — vector predicates are out of scope
-    for the rowid-EQ corpus exercised today. }
+  { If there is a vector == or IS term - e.g. "(a, b) == (?, ?)" - create
+    new terms for each component comparison - "a = ?" and "b = ?".  The new
+    terms completely replace the original vector comparison, which is no
+    longer used.  Only required if at least one side is not a sub-select.
+    (whereexpr.c:1467..1489, tag-20220128a). }
+  pTerm := @pWC^.a[idxTerm];   { array may have moved during the analysis above }
+  nLeft := 0;
+  if ((pX^.op = TK_EQ) or (pX^.op = TK_IS)) then
+    nLeft := sqlite3ExprVectorSize(pX^.pLeft);
+  if ((pX^.op = TK_EQ) or (pX^.op = TK_IS))
+     and (nLeft > 1)
+     and (sqlite3ExprVectorSize(pX^.pRight) = nLeft)
+     and (((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+          or ((pX^.pRight^.flags and EP_xIsSelect) = 0))
+     and (pWC^.op = TK_AND) then
+  begin
+    for iVec := 0 to nLeft - 1 do
+    begin
+      pVecLeft  := sqlite3ExprForVectorField(pPrs, pX^.pLeft,  iVec, nLeft);
+      pVecRight := sqlite3ExprForVectorField(pPrs, pX^.pRight, iVec, nLeft);
+      pNewExpr  := sqlite3PExpr(pPrs, pX^.op, pVecLeft, pVecRight);
+      transferJoinMarkings(pNewExpr, pX);
+      idxNew := whereClauseInsert(pWC, pNewExpr, TERM_DYNAMIC or TERM_SLICE);
+      exprAnalyze(pSrc, pWC, idxNew);
+    end;
+    pTerm := @pWC^.a[idxTerm];
+    pTerm^.wtFlags  := pTerm^.wtFlags or TERM_CODED or TERM_VIRTUAL; { Disable the original }
+    pTerm^.eOperator := u16(WO_ROWVAL);
+  end
+
+  { If there is a vector IN term - e.g. "(a, b) IN (SELECT ...)" - create a
+    virtual term for each vector component.  The expression object used by
+    each such virtual term is pX (the full vector IN(...) expression).  The
+    WhereTerm.u.iField variable identifies the index within the vector on the
+    LHS that the virtual term represents.  Only works if the RHS is a simple
+    SELECT (not a compound) that does not use window functions.
+    (whereexpr.c:1500..1518). }
+  else if (pX^.op = TK_IN)
+     and (pTerm^.u.iField = 0)
+     and (pX^.pLeft^.op = TK_VECTOR)
+     and ExprUseXSelect(pX)
+     and ((pX^.x.pSelect^.pPrior = nil)
+          or ((pX^.x.pSelect^.selFlags and SF_Values) <> 0))
+     and (pX^.x.pSelect^.pWin = nil)
+     and (pWC^.op = TK_AND) then
+  begin
+    for iVec := 0 to sqlite3ExprVectorSize(pX^.pLeft) - 1 do
+    begin
+      idxNew := whereClauseInsert(pWC, pX, TERM_VIRTUAL or TERM_SLICE);
+      pWC^.a[idxNew].u.iField := iVec + 1;
+      exprAnalyze(pSrc, pWC, idxNew);
+      markTermAsChild(pWC, idxNew, idxTerm);
+    end;
+  end;
 
   { isAuxiliaryVtabOperator / WO_AUX vtab path (whereexpr.c:1531..1567)
     deferred — vtab corpus is not exercised today. }
