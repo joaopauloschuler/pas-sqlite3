@@ -11815,6 +11815,7 @@ var
   deferOB:    Boolean;
   i_:         i32;          { 9.4.divbug.30 — ORDER BY alias walk index }
   items_:     PExprListItem; { 9.4.divbug.30 — ORDER BY alias walk items }
+  pWinDef:    PWindow;       { altertab3-1.x — IN_RENAME_OBJECT window-def resolve }
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
@@ -11840,6 +11841,26 @@ begin
     function call that contains a nested aggregate in its argument list. }
   if pParse^.nErr = 0 then
     CheckNestedAggInList(p^.pEList);
+  { resolve.c:2001..2012 — under IN_RENAME_OBJECT only, resolve the
+    ORDER BY and PARTITION BY expression lists of every WINDOW definition
+    on this SELECT (Select->pWinDefn).  Normal code generation resolves
+    these later via sqlite3WindowRewrite, but the ALTER TABLE rename
+    helper never runs codegen, so without this the bare TK_ID column refs
+    inside `WINDOW w AS (ORDER BY a)` stay unresolved and renameColumnExprCb
+    (which only matches TK_COLUMN) never sees them — so a renamed column is
+    not rewritten in the trigger body (altertab3-1.2/1.3). }
+  if (pParse^.nErr = 0) and InRenameObject(pParse) then
+  begin
+    pWinDef := p^.pWinDefn;
+    while pWinDef <> nil do
+    begin
+      ResolveExprList(pWinDef^.pOrderBy);
+      if pParse^.nErr > 0 then Break;
+      ResolveExprList(pWinDef^.pPartition);
+      if pParse^.nErr > 0 then Break;
+      pWinDef := pWinDef^.pNextWin;
+    end;
+  end;
   { Phase 6.13.B.8 — resolve TABFUNC argument lists in pSrc so
     fitTabFuncArgs (called later inside sqlite3WhereBegin) sees fully
     bound TK_COLUMN references rather than raw TK_DOT/TK_ID.  C does
