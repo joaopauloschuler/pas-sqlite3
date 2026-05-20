@@ -4440,6 +4440,158 @@ begin
   if argc = 0 then ;
 end;
 
+{ ----------------------------------------------------------------------
+  test1.c:3554..3664 — add_test_function and its three encoding-specific
+  SQL-function callbacks.  Register one SQL function named "test_function"
+  up to three times on DB (UTF-8 / UTF-16LE / UTF-16BE), one per requested
+  encoding.  Each callback re-dispatches into the Tcl proc "test_function"
+  with the encoding tag and the argument, then returns the proc result in
+  a deliberately distinct encoding so the test can verify which handler ran.
+  ---------------------------------------------------------------------- }
+
+{ test1.c:3555..3578 — test_function_utf8. }
+procedure test_function_utf8(pCtx: Psqlite3_context; nArg: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  interp: PTclInterp;
+  pX:     PTclObj;
+  pVal:   Psqlite3_value;
+  pa:     PValueArr;
+begin
+  pa := PValueArr(argv);
+  interp := PTclInterp(sqlite3_user_data(pCtx));
+  pX := Tcl_NewStringObj(PChar('test_function'), -1);
+  Tcl_IncrRefCount(pX);
+  Tcl_ListObjAppendElement(interp, pX, Tcl_NewStringObj(PChar('UTF-8'), -1));
+  Tcl_ListObjAppendElement(interp, pX,
+    Tcl_NewStringObj(PChar(sqlite3_value_text(pa^[0])), -1));
+  Tcl_EvalObjEx(interp, pX, 0);
+  Tcl_DecrRefCount(pX);
+  sqlite3_result_text(pCtx, Tcl_GetStringResult(interp), -1, SQLITE_TRANSIENT);
+  pVal := sqlite3ValueNew(nil);
+  sqlite3ValueSetStr(pVal, -1, Tcl_GetStringResult(interp),
+    SQLITE_UTF8, SQLITE_STATIC);
+  sqlite3_result_text16be(pCtx, sqlite3_value_text16be(pVal),
+    -1, SQLITE_TRANSIENT);
+  sqlite3ValueFree(pVal);
+  if nArg = 0 then ;
+end;
+
+{ test1.c:3579..3600 — test_function_utf16le. }
+procedure test_function_utf16le(pCtx: Psqlite3_context; nArg: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  interp: PTclInterp;
+  pX:     PTclObj;
+  pVal:   Psqlite3_value;
+  pa:     PValueArr;
+begin
+  pa := PValueArr(argv);
+  interp := PTclInterp(sqlite3_user_data(pCtx));
+  pX := Tcl_NewStringObj(PChar('test_function'), -1);
+  Tcl_IncrRefCount(pX);
+  Tcl_ListObjAppendElement(interp, pX, Tcl_NewStringObj(PChar('UTF-16LE'), -1));
+  Tcl_ListObjAppendElement(interp, pX,
+    Tcl_NewStringObj(PChar(sqlite3_value_text(pa^[0])), -1));
+  Tcl_EvalObjEx(interp, pX, 0);
+  Tcl_DecrRefCount(pX);
+  pVal := sqlite3ValueNew(nil);
+  sqlite3ValueSetStr(pVal, -1, Tcl_GetStringResult(interp),
+    SQLITE_UTF8, SQLITE_STATIC);
+  sqlite3_result_text(pCtx, PChar(sqlite3_value_text(pVal)), -1,
+    SQLITE_TRANSIENT);
+  sqlite3ValueFree(pVal);
+  if nArg = 0 then ;
+end;
+
+{ test1.c:3601..3627 — test_function_utf16be. }
+procedure test_function_utf16be(pCtx: Psqlite3_context; nArg: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..15] of Psqlite3_value;
+var
+  interp: PTclInterp;
+  pX:     PTclObj;
+  pVal:   Psqlite3_value;
+  pa:     PValueArr;
+begin
+  pa := PValueArr(argv);
+  interp := PTclInterp(sqlite3_user_data(pCtx));
+  pX := Tcl_NewStringObj(PChar('test_function'), -1);
+  Tcl_IncrRefCount(pX);
+  Tcl_ListObjAppendElement(interp, pX, Tcl_NewStringObj(PChar('UTF-16BE'), -1));
+  Tcl_ListObjAppendElement(interp, pX,
+    Tcl_NewStringObj(PChar(sqlite3_value_text(pa^[0])), -1));
+  Tcl_EvalObjEx(interp, pX, 0);
+  Tcl_DecrRefCount(pX);
+  pVal := sqlite3ValueNew(nil);
+  sqlite3ValueSetStr(pVal, -1, Tcl_GetStringResult(interp),
+    SQLITE_UTF8, SQLITE_STATIC);
+  sqlite3_result_text16(pCtx, sqlite3_value_text16le(pVal),
+    -1, SQLITE_TRANSIENT);
+  sqlite3_result_text16be(pCtx, sqlite3_value_text16le(pVal),
+    -1, SQLITE_TRANSIENT);
+  sqlite3_result_text16le(pCtx, sqlite3_value_text16le(pVal),
+    -1, SQLITE_TRANSIENT);
+  sqlite3ValueFree(pVal);
+  if nArg = 0 then ;
+end;
+
+{ test1.c:3629..3664 — add_test_function DB <utf8> <utf16le> <utf16be>. }
+function test_function(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:  PTsqlite3;
+  val: cint;
+begin
+  if objc <> 5 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetStringFromObj(objv[0], nil),
+      PChar(' <DB> <utf8> <utf16le> <utf16be>'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[2], @val) <> TCL_OK then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if val <> 0 then
+    sqlite3_create_function(db, PChar('test_function'), 1, SQLITE_UTF8,
+      interp, @test_function_utf8, nil, nil);
+  if Tcl_GetBooleanFromObj(interp, objv[3], @val) <> TCL_OK then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if val <> 0 then
+    sqlite3_create_function(db, PChar('test_function'), 1, SQLITE_UTF16LE,
+      interp, @test_function_utf16le, nil, nil);
+  if Tcl_GetBooleanFromObj(interp, objv[4], @val) <> TCL_OK then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if val <> 0 then
+    sqlite3_create_function(db, PChar('test_function'), 1, SQLITE_UTF16BE,
+      interp, @test_function_utf16be, nil, nil);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:1088..1226 — test_create_function: register the UDFs above
   on DB.  Returns the rc enum-name.  Skips the UTF-16 hex16 / x_sqlite_exec
   arms (SQLITE_OMIT_UTF16-equivalent gate). }
@@ -6953,6 +7105,9 @@ begin
     @tcl_test_key_v2, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_create_function'),
     @test_create_function, nil, nil);
+  { test1.c:9268 — add_test_function (objc/objv-style). }
+  Tcl_CreateObjCommand(interp, PChar('add_test_function'),
+    @test_function, nil, nil);
   { test1.c:9092..9093 — sqlite_delete_function / sqlite_delete_collation
     (old-style argc/argv).  Needed by schema.test 11.2/11.6 + schema2.test. }
   Tcl_CreateCommand(interp, PChar('sqlite_delete_function'),
