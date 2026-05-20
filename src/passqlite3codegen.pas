@@ -22488,7 +22488,8 @@ begin
   if fSingleTabCoroutine
      or (nTabList <> 1)
      or (whereShortCut(@sWLB) = 0)
-     or ((sWLB.pNew^.wsFlags and WHERE_INDEXED) <> 0) then
+     or ((sWLB.pNew^.wsFlags and WHERE_INDEXED) <> 0)
+     or ((sWLB.pNew^.wsFlags and WHERE_COLUMN_IN) <> 0) then
   begin
     { Full planner path — where.c:7079..7473.
       Covers multi-table FROM (nTabList>1), single-table viaCoroutine
