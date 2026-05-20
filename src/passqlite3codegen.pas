@@ -46290,6 +46290,7 @@ var
   isDup:       Boolean;
   sortOrderMask: i32;
   requestedSortOrder: i32;
+  zSchemaTab:  PAnsiChar;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -46399,8 +46400,15 @@ begin
   { Authorisation. }
 {$IFNDEF SQLITE_OMIT_AUTHORIZATION}
   if not InRenameObject(pParse) then begin
+    { SCHEMA_TABLE(iDb): a TEMP index (iDb==1) writes sqlite_temp_master
+      (build.c:4119).  Hardcoding sqlite_master made an authorizer gating
+      INSERT on sqlite_temp_master miss the write (auth-1.193..199). }
+    if (OMIT_TEMPDB = 0) and (iDb = 1) then
+      zSchemaTab := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE)
+    else
+      zSchemaTab := PAnsiChar(LEGACY_SCHEMA_TABLE);
     if sqlite3AuthCheck(pParse, SQLITE_INSERT_AUTH,
-         PAnsiChar(LEGACY_SCHEMA_TABLE), nil, pDb^.zDbSName) <> 0 then
+         zSchemaTab, nil, pDb^.zDbSName) <> 0 then
       goto exit_create_index;
     i := SQLITE_CREATE_INDEX;
     if (OMIT_TEMPDB = 0) and (iDb = 1) then i := SQLITE_CREATE_TEMP_INDEX;
