@@ -56829,20 +56829,42 @@ end;
 
 procedure substrFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  z, zOut, zEnd: PAnsiChar;
+  z, zOut, zEnd, z2: PAnsiChar;
   p0, p1, p2: PMem;
-  p1i, p2i, n, nByte, i: i64;
+  p0type: i32;
+  p1i, p2i, n, i: i64;
 begin
   p0 := (argv + 0)^;
   p1 := (argv + 1)^;
   if sqlite3_value_type(Psqlite3_value(p0)) = SQLITE_NULL then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  z := sqlite3_value_text(Psqlite3_value(p0));
-  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
-  nByte := sqlite3_value_bytes(Psqlite3_value(p0));
-  n     := sqlite3Utf8CharLen(z, i32(nByte));
-  p1i   := sqlite3_value_int64(Psqlite3_value(p1));
+  { Faithful port of func.c substrFunc (func.c:347..436).  substr() detects
+    whether argv[0] is a BLOB vs TEXT and, for blobs, operates on BYTES
+    (sqlite3_value_bytes/sqlite3_value_blob) preserving embedded NULs; for
+    text it counts UTF-8 characters. }
+  p0type := sqlite3_value_type(Psqlite3_value(p0));
+  p1i := sqlite3_value_int64(Psqlite3_value(p1));
+  if p0type = SQLITE_BLOB then begin
+    n := sqlite3_value_bytes(Psqlite3_value(p0));
+    z := PAnsiChar(sqlite3_value_blob(Psqlite3_value(p0)));
+    if z = nil then Exit;
+  end else begin
+    z := sqlite3_value_text(Psqlite3_value(p0));
+    if z = nil then Exit;
+    n := 0;
+    if p1i < 0 then begin
+      z2 := z;
+      while z2^ <> #0 do begin
+        if u8(z2^) >= $C0 then begin
+          Inc(z2);
+          while (u8(z2^) and $C0) = $80 do Inc(z2);
+        end else
+          Inc(z2);
+        Inc(n);
+      end;
+    end;
+  end;
   if argc = 3 then begin
     p2  := (argv + 2)^;
     p2i := sqlite3_value_int64(Psqlite3_value(p2));
@@ -56874,30 +56896,41 @@ begin
     else p2i := -p2i;
     p1i := p1i - p2i;
   end;
-  { Now p1i (0-based start) and p2i (char count) are both >= 0.
-    Mirrors SQLITE_SKIP_UTF8 (sqliteInt.h): step past the lead byte first,
-    then skip any continuation bytes ($80..$BF). }
-  i := 0;
-  while (i < p1i) and (z^ <> #0) do begin
-    if u8(z^) >= $C0 then begin
-      Inc(z);
-      while (u8(z^) and $C0) = $80 do Inc(z);
-    end else
-      Inc(z);
-    Inc(i);
+  { Now p1i (0-based start) and p2i (char/byte count) are both >= 0. }
+  if p0type <> SQLITE_BLOB then begin
+    { Text: count UTF-8 characters.  Mirrors SQLITE_SKIP_UTF8 (sqliteInt.h):
+      step past the lead byte first, then skip any continuation bytes
+      ($80..$BF). func.c:417..426. }
+    i := 0;
+    while (i < p1i) and (z^ <> #0) do begin
+      if u8(z^) >= $C0 then begin
+        Inc(z);
+        while (u8(z^) and $C0) = $80 do Inc(z);
+      end else
+        Inc(z);
+      Inc(i);
+    end;
+    zOut := z;
+    i := 0;
+    while (i < p2i) and (z^ <> #0) do begin
+      if u8(z^) >= $C0 then begin
+        Inc(z);
+        while (u8(z^) and $C0) = $80 do Inc(z);
+      end else
+        Inc(z);
+      Inc(i);
+    end;
+    zEnd := z;
+    sqlite3_result_text(pCtx, zOut, zEnd - zOut, SQLITE_TRANSIENT);
+  end else begin
+    { Blob: byte-based slice; preserves all bytes including embedded NULs.
+      func.c:427..434. }
+    if p1i >= n then begin
+      p1i := 0; p2i := 0;
+    end else if p2i > n - p1i then
+      p2i := n - p1i;
+    sqlite3_result_blob(pCtx, z + p1i, i32(p2i), SQLITE_TRANSIENT);
   end;
-  zOut := z;
-  i := 0;
-  while (i < p2i) and (z^ <> #0) do begin
-    if u8(z^) >= $C0 then begin
-      Inc(z);
-      while (u8(z^) and $C0) = $80 do Inc(z);
-    end else
-      Inc(z);
-    Inc(i);
-  end;
-  zEnd := z;
-  sqlite3_result_text(pCtx, zOut, zEnd - zOut, SQLITE_TRANSIENT);
 end;
 
 procedure upperFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
