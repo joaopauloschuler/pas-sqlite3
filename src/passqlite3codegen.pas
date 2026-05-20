@@ -10564,6 +10564,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         the schema name; if known, rewrite pE in place to the 2-part shape
         and remember the schema so the per-SrcItem loop can require it. }
       pDbSchema := nil;
+      zDb := nil;
       if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_DOT)
          and (pE^.pRight^.pLeft <> nil) and (pE^.pRight^.pLeft^.op = TK_ID)
@@ -10723,10 +10724,21 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
          and (pE^.pLeft^.u.zToken <> nil)
          and (pE^.pRight^.u.zToken <> nil) then
       begin
-        sqlite3ErrorMsg(pParse,
-          PAnsiChar('no such column: '
-                    + AnsiString(pE^.pLeft^.u.zToken) + '.'
-                    + AnsiString(pE^.pRight^.u.zToken)));
+        { resolve.c:785..788 — a database qualifier (zDb, captured from the
+          3-part `db.tab.col` form before the tree was collapsed to 2-part)
+          must be reflected in the message: `db.tab.col` not just `tab.col`
+          (select5-2.1.2).  zDb is nil for a plain 2-part `tab.col`. }
+        if zDb <> nil then
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: '
+                      + AnsiString(zDb) + '.'
+                      + AnsiString(pE^.pLeft^.u.zToken) + '.'
+                      + AnsiString(pE^.pRight^.u.zToken)))
+        else
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: '
+                      + AnsiString(pE^.pLeft^.u.zToken) + '.'
+                      + AnsiString(pE^.pRight^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
       end;
       Exit;
