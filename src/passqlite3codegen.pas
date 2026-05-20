@@ -30875,6 +30875,36 @@ begin
   walkList(pSel^.pOrderBy);
 end;
 
+{ sameSrcAlias — port of select.c:7206..7227.  If any term of pSrc, or any
+  SF_NestedFrom sub-query, is not the same as p0 but has the same pSTab and
+  alias as p0, then return non-zero.  Otherwise return zero. }
+function sameSrcAlias(p0: PSrcItem; pSrc: PSrcList): i32;
+var
+  a:  PSrcItem;
+  p1: PSrcItem;
+  i:  i32;
+begin
+  a := SrcListItems(pSrc);
+  for i := 0 to pSrc^.nSrc - 1 do begin
+    p1 := @a[i];
+    if p1 = p0 then Continue;
+    if (p0^.pSTab = p1^.pSTab)
+       and (sqlite3_stricmp(p0^.zAlias, p1^.zAlias) = 0) then
+    begin
+      Result := 1;
+      Exit;
+    end;
+    if SrcItemIsSubquery(p1^.fg)
+       and ((p1^.u4.pSubq^.pSelect^.selFlags and SF_NestedFrom) <> 0)
+       and (sameSrcAlias(p0, p1^.u4.pSubq^.pSelect^.pSrc) <> 0) then
+    begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  Result := 0;
+end;
+
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 var
@@ -30882,6 +30912,8 @@ var
   pTabList:    PSrcList;
   pEList:      PExprList;
   pItem:       PSrcItem;
+  p0:          PSrcItem;   { UPDATE...FROM target (SF_UFSrcCheck) }
+  zUFMsg:      PAnsiChar;  { SF_UFSrcCheck error message }
   pTab:        PTable2;
   pE:          PExpr;
   pBaseExpr:   PExpr;
@@ -31598,6 +31630,35 @@ begin
      and (pDest^.eDest <> SRT_Discard)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
+  { select.c:7656..7680 — If SF_UFSrcCheck is set, this SELECT is populating
+    the temp table for an UPDATE...FROM statement.  It is an error if the
+    target object (pSrc->a[0]) name or alias is duplicated within the FROM
+    clause (pSrc->a[1..n]).  Postgres disallows this too; following PG's lead
+    avoids the divergent behaviour of other systems. }
+  if (p^.selFlags and SF_UFSrcCheck) <> 0 then begin
+    p0 := @SrcListItems(p^.pSrc)[0];
+    if sameSrcAlias(p0, p^.pSrc) <> 0 then begin
+      if p0^.zAlias <> nil then
+        zUFMsg := sqlite3MPrintf(pParse^.db,
+          'target object/alias may not appear in FROM clause: %s',
+          [p0^.zAlias])
+      else
+        zUFMsg := sqlite3MPrintf(pParse^.db,
+          'target object/alias may not appear in FROM clause: %s',
+          [p0^.pSTab^.zName]);
+      if zUFMsg <> nil then begin
+        sqlite3ErrorMsg(pParse, zUFMsg);
+        sqlite3DbFree(pParse^.db, zUFMsg);
+      end;
+      Result := SQLITE_ERROR;
+      Exit;
+    end;
+    { Clear the SF_UFSrcCheck flag.  The check has already been performed,
+      and leaving it set can cause errors if a compound sub-query in p->pSrc
+      is flattened into this query and this function is called again as part
+      of compound SELECT processing. }
+    p^.selFlags := p^.selFlags and (not u32(SF_UFSrcCheck));
+  end;
   { Mirror select.c:7682..7684 — emit OP_ResultRow column names early, so
     compound + multiSelectByMerge dispatch (and any path that recurses into
     sqlite3Select with SRT_Coroutine destinations) still publishes nResColumn
