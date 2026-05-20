@@ -9353,6 +9353,48 @@ begin
   end;
 end;
 
+{ resolveExprSubqueries — descend pE and run a full sqlite3SelectPrep on any
+  un-prepped subquery (TK_IN / TK_EXISTS / scalar TK_SELECT operand).  This
+  mirrors C's resolveExprStep TK_IN/TK_SELECT/TK_EXISTS arm (resolve.c:1365..
+  1391) which calls sqlite3WalkSelect on pExpr->x.pSelect regardless of
+  whether the enclosing NameContext has a FROM clause.  The Pascal resolver
+  only preps subqueries through resolveSubqueryOuterRefs, which is gated on a
+  non-nil outer pSrcList; lean entry points with no FROM (e.g. the DETACH /
+  ATTACH argument resolved via resolveAttachExpr) therefore never prepped the
+  inner SELECT, so a missing-table reference inside it was not reported here
+  and a later codegen-time error surfaced instead (attach-7.1: the IN-subquery
+  `SELECT "AAAAAA".*` left the bad table unresolved, and RAISE() in the DETACH
+  expression then wrongly raised "RAISE() may only be used within a
+  trigger-program" during sqlite3ExprCode).  Running prep here surfaces the
+  "no such table" first, matching the C ordering.  sqlite3SelectPrep is a
+  no-op on a select that already has SF_HasTypeInfo, so this is safe for
+  subqueries already prepped by the SELECT walker. }
+procedure resolveExprSubqueries(pParse: PParse; pE: PExpr);
+var i: i32;
+begin
+  if pE = nil then Exit;
+  if pParse = nil then Exit;
+  if pParse^.nErr <> 0 then Exit;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if (pE^.flags and EP_xIsSelect) <> 0 then
+  begin
+    if pE^.x.pSelect <> nil then
+    begin
+      sqlite3SelectPrep(pParse, pE^.x.pSelect, nil);
+      if pParse^.nErr <> 0 then Exit;
+    end;
+  end
+  else if pE^.x.pList <> nil then
+    for i := 0 to pE^.x.pList^.nExpr - 1 do
+    begin
+      resolveExprSubqueries(pParse, ExprListItems(pE^.x.pList)[i].pExpr);
+      if pParse^.nErr <> 0 then Exit;
+    end;
+  resolveExprSubqueries(pParse, pE^.pLeft);
+  if pParse^.nErr <> 0 then Exit;
+  resolveExprSubqueries(pParse, pE^.pRight);
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -9365,7 +9407,18 @@ begin
       resolveUpsertExcludedRefs(pNC, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
-      resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr);
+      resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr)
+    else if pNC^.pParse <> nil then
+    begin
+      { No outer FROM clause: resolveSubqueryOuterRefs (and the SELECT-prep
+        walker) never reach the inner subquery, so prep it here to surface
+        missing-table / bad-column errors in C's order (attach-7.1). }
+      resolveExprSubqueries(pNC^.pParse, pExpr);
+      if pNC^.pParse^.nErr > 0 then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+    end;
     { Unconditional TK_ID→TK_TRUEFALSE and TK_IS+TK_TRUEFALSE→TK_TRUTH
       rewrite — port of resolve.c:1402..1415 and resolve.c lookupName tail.
       Runs regardless of pSrcList so INSERT VALUES, CHECK, DEFAULT and any
