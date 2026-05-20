@@ -32746,8 +32746,15 @@ begin
       sqlite3ErrorMsg(pParse, 'row value misused');
       Result := SQLITE_ERROR; Exit;
     end;
-    if (p^.pLimit^.pLeft = nil)
-       or (sqlite3ExprIsInteger(p^.pLimit^.pLeft, nil, pParse) = 0) then
+    { subquery2-2.2 — non-constant LIMIT (e.g. `LIMIT 1+2`, `LIMIT abs(3)`,
+      `LIMIT (SELECT a FROM t5)`) is now handled by the else arm of the inline
+      LIMIT setup below (computeLimitRegisters' non-integer arm,
+      select.c:2538..2542), which codes the expression + OP_MustBeInt +
+      OP_IfNot.  The previous unconditional `Result := SQLITE_OK; Exit`
+      stub here bailed before any codegen, so the whole query body was
+      omitted and every non-constant LIMIT returned no rows.  Only pLeft=nil
+      (a parser-impossible shape) is still bailed defensively. }
+    if p^.pLimit^.pLeft = nil then
     begin Result := SQLITE_OK; Exit; end;
   end;
   { Phase 6.26 — window-function arm.  Mirrors select.c:7686 (Rewrite) and
@@ -34799,25 +34806,51 @@ begin
       Result := 1;
       Exit;
     end;
-    { Non-Exists constant-integer LIMIT — mirrors the
-      sqlite3ExprIsInteger arm of computeLimitRegisters
-      (select.c:2520..2530).  Emits OP_Integer N, iLimit before the
-      WHERE loop opens; DecrJumpZero is emitted in the inner loop
-      after OP_ResultRow.  When pRight (OFFSET) is present, allocate
-      iOffset + helper, code OFFSET expr, MustBeInt, OffsetLimit;
-      mirrors computeLimitRegisters lines 2544..2552. }
+    { Non-Exists LIMIT — mirrors computeLimitRegisters (select.c:2523..2543).
+      The constant-integer case emits OP_Integer N, iLimit and (for N=0) a
+      short-circuit Goto over the WHERE loop; DecrJumpZero is emitted in the
+      inner loop after OP_ResultRow.  Any non-integer-literal LIMIT (a
+      function call such as abs(3), an arithmetic expr such as 1+2, or a
+      scalar subquery such as (SELECT a FROM t5)) MUST take the else arm
+      that codes the expr, coerces it with OP_MustBeInt and gates the loop
+      with OP_IfNot iLimit, iBreak.  The previous code only handled the
+      integer arm: it left i=0 for every non-integer LIMIT, emitting
+      OP_Integer 0 plus the LIMIT-0 Goto, so the whole query body was
+      skipped and `... LIMIT (SELECT …)` / `... LIMIT 1+2` returned no rows
+      (subquery2-2.2). }
     i := 0;
-    sqlite3ExprIsInteger(p^.pLimit^.pLeft, @i, pParse);
-    Inc(pParse^.nMem);
-    iLimitReg := pParse^.nMem;
-    p^.iLimit  := iLimitReg;
-    sqlite3VdbeAddOp2(v, OP_Integer, i, iLimitReg);
-    { LIMIT 0 short-circuit — select.c:2532..2533.  Constant-integer
-      LIMIT of 0 means "return no rows"; emit an unconditional Goto
-      over the WHERE loop (target = pWInfo^.iBreak, patched after
-      sqlite3WhereBegin establishes the label). }
-    if i = 0 then
-      iLimit0Goto := sqlite3VdbeAddOp2(v, OP_Goto, 0, 0);
+    if sqlite3ExprIsInteger(p^.pLimit^.pLeft, @i, pParse) <> 0 then
+    begin
+      Inc(pParse^.nMem);
+      iLimitReg := pParse^.nMem;
+      p^.iLimit  := iLimitReg;
+      sqlite3VdbeAddOp2(v, OP_Integer, i, iLimitReg);
+      { LIMIT 0 short-circuit — select.c:2532..2533.  Constant-integer
+        LIMIT of 0 means "return no rows"; emit an unconditional Goto
+        over the WHERE loop (target = pWInfo^.iBreak, patched after
+        sqlite3WhereBegin establishes the label). }
+      if i = 0 then
+        iLimit0Goto := sqlite3VdbeAddOp2(v, OP_Goto, 0, 0)
+      else if (i >= 0) and (p^.nSelectRow > sqlite3LogEst(u64(i))) then
+      begin
+        p^.nSelectRow := i16(sqlite3LogEst(u64(i)));
+        p^.selFlags   := p^.selFlags or SF_FixedLimit;
+      end;
+    end
+    else
+    begin
+      { select.c:2538..2542 — non-constant LIMIT.  Code the expression into
+        iLimit, coerce to integer, and jump over the WHERE loop when it
+        evaluates to 0 (OP_IfNot).  The IfNot target is the same break label
+        the LIMIT-0 Goto would use; reuse the iLimit0Goto patch slot so the
+        target gets resolved to pWInfo^.iBreak (or addrSortBrk) below. }
+      Inc(pParse^.nMem);
+      iLimitReg := pParse^.nMem;
+      p^.iLimit  := iLimitReg;
+      sqlite3ExprCode(pParse, p^.pLimit^.pLeft, iLimitReg);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, iLimitReg);
+      iLimit0Goto := sqlite3VdbeAddOp2(v, OP_IfNot, iLimitReg, 0);
+    end;
     if p^.pLimit^.pRight <> nil then
     begin
       Inc(pParse^.nMem);
