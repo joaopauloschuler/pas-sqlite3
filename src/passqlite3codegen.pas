@@ -36230,8 +36230,16 @@ begin
   if pTable <> nil then begin
     code := SQLITE_DROP_TRIGGER;
     zDb := db^.aDb[iDb].zDbSName;
-    zTab := PAnsiChar(LEGACY_SCHEMA_TABLE);
-    if iDb = 1 then code := SQLITE_DROP_TEMP_TRIGGER;
+    { SCHEMA_TABLE(iDb): the TEMP schema (iDb==1) is "sqlite_temp_master"
+      (trigger.c:723).  Using the bare "sqlite_master" name made the
+      SQLITE_DELETE auth check for DROP TRIGGER on a temp trigger pass the
+      wrong table name, so a callback gating on sqlite_temp_master never
+      saw it (auth-1.164..176). }
+    if iDb = 1 then begin
+      code := SQLITE_DROP_TEMP_TRIGGER;
+      zTab := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE);
+    end else
+      zTab := PAnsiChar(LEGACY_SCHEMA_TABLE);
     if (sqlite3AuthCheck(pParse, code, pTrg^.zName, pTable^.zName, zDb) <> 0)
        or (sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, zTab, nil, zDb) <> 0) then
       Exit;
