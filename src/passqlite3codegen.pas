@@ -38260,6 +38260,7 @@ var
   nEphCol:              i32;
   pKeyInfoTmp:          PKeyInfo2;
   nOff:                 i32;
+  rcauth:               i32;
 begin
   pTab := nil; v := nil; pTrg := nil; isView := 0; tmask := 0;
   nChangeFrom := 0; iBaseCur := 0; iDataCur := 0; iIdxCur := 0;
@@ -38355,8 +38356,7 @@ begin
   if v = nil then goto update_cleanup;
 
   { Resolve column names in pChanges and detect chngRowid / chngPk
-    (update.c:466..518).  Authorization arm omitted — OMIT_AUTHORIZATION
-    in the default build. }
+    (update.c:466..518). }
   pELItems := ExprListItems(pChanges);
   for i := 0 to pChanges^.nExpr - 1 do
   begin
@@ -38399,6 +38399,19 @@ begin
         goto update_cleanup;
       end;
     end;
+    { update.c:505..517 — per-column SQLITE_UPDATE authorizer check. }
+    if j < 0 then
+      rcauth := sqlite3AuthCheck(pParse, SQLITE_UPDATE_AUTH, pTab^.zName,
+                                 PAnsiChar('ROWID'),
+                                 db^.aDb[iDb].zDbSName)
+    else
+      rcauth := sqlite3AuthCheck(pParse, SQLITE_UPDATE_AUTH, pTab^.zName,
+                                 pTab^.aCol[j].zCnName,
+                                 db^.aDb[iDb].zDbSName);
+    if rcauth = SQLITE_DENY then
+      goto update_cleanup
+    else if rcauth = SQLITE_IGNORE then
+      (aXRef + j)^ := -1;
   end;
   AssertH((chngRowid and chngPk) = 0, 'Update both chngRowid and chngPk');
   AssertH((chngRowid = 0) or (chngRowid = 1), 'Update chngRowid 0 or 1');
