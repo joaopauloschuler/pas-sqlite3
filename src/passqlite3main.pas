@@ -3561,7 +3561,7 @@ begin
   sqlite3_mutex_enter(db^.mutex);
   if Assigned(db^.xAutovacDestr) then
     db^.xAutovacDestr(db^.pAutovacPagesArg);
-  db^.xAutovacPages    := Pointer(@xCallback);
+  db^.xAutovacPages    := Pointer(xCallback);
   db^.pAutovacPagesArg := pArg;
   db^.xAutovacDestr    := xDestructor;
   sqlite3_mutex_leave(db^.mutex);
