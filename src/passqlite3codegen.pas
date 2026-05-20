@@ -39338,8 +39338,10 @@ begin
   db   := pParse^.db;
   iDb  := sqlite3SchemaToIndex(db, pIndex^.pSchema);
 
-  { Authorisation: SQLITE_OMIT_AUTHORIZATION default — sqlite3AuthCheck
-    is a no-op stub in this port (returns 0).  Skip the early-return. }
+  { Authorisation — port of build.c:3787..3792. }
+  if sqlite3AuthCheck(pParse, SQLITE_REINDEX_AUTH, pIndex^.zName, nil,
+       db^.aDb[iDb].zDbSName) <> 0 then
+    Exit;
 
   { sqlite3TableLock: shared-cache disabled — no-op in this port. }
 
