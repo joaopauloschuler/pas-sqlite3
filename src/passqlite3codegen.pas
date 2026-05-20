@@ -46785,6 +46785,7 @@ var
   code:  i32;
   zTab:  PAnsiChar;
   zDb:   PAnsiChar;
+  zArg2: PAnsiChar;
 {$ENDIF}
 begin
   db := pParse^.db;
@@ -46822,6 +46823,7 @@ begin
   if (OMIT_TEMPDB = 0) and (iDb = 1) then
     zTab := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE);
   zDb := db^.aDb[iDb].zDbSName;
+  zArg2 := nil;
   if sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, zTab, nil, zDb) <> 0 then
     goto exit_drop_table;
   if isView <> 0 then begin
@@ -46831,13 +46833,16 @@ begin
       code := SQLITE_DROP_VIEW;
   end else if pTab^.eTabType = TABTYP_VTAB then begin
     code := SQLITE_DROP_VTABLE;
+    { build.c:3548 — arg2 is the v-table's module name. }
+    zArg2 := passqlite3vtab.PVtabModule(
+               passqlite3vtab.sqlite3GetVTable(db, Pointer(pTab))^.pMod)^.zName;
   end else begin
     if (OMIT_TEMPDB = 0) and (iDb = 1) then
       code := SQLITE_DROP_TEMP_TABLE
     else
       code := SQLITE_DROP_TABLE;
   end;
-  if sqlite3AuthCheck(pParse, code, pTab^.zName, nil, zDb) <> 0 then
+  if sqlite3AuthCheck(pParse, code, pTab^.zName, zArg2, zDb) <> 0 then
     goto exit_drop_table;
   if sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, pTab^.zName, nil, zDb) <> 0 then
     goto exit_drop_table;

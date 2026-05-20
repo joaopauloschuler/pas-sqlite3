@@ -2514,9 +2514,12 @@ end;
 
 procedure sqlite3VtabBeginParse(pPse: PParse; pName1: PToken; pName2: PToken;
                                 pModuleName: PToken; ifNotExists: i32);
+const
+  SQLITE_CREATE_VTABLE = 29;  { sqlite3.h:97 (passqlite3vdbe.pas:571) }
 var
   pTable: PTable2;
   db:     PTsqlite3;
+  iDb:    i32;
 begin
   sqlite3StartTable(pPse, pName1, pName2, 0, 0, 1, ifNotExists);
   pTable := pPse^.pNewTable;
@@ -2537,12 +2540,18 @@ begin
     PtrUInt(pModuleName^.z) + PtrUInt(pModuleName^.n)
     - PtrUInt(pPse^.sNameToken.z));
 
-  { SQLITE_OMIT_AUTHORIZATION: the second sqlite3AuthCheck call             }
-  { (SQLITE_CREATE_VTABLE) is gated out at build time in upstream when the }
-  { authorizer is omitted.  Our port currently includes the authorizer      }
-  { surface, but sqlite3AuthCheck on a v-table is a defensible follow-up    }
-  { (needs the iDb lookup); left as a TODO so the gate test stays focused   }
-  { on the azArg contract.                                                  }
+  { vtab.c:414..426 — second authorization callback.  The first invocation
+    (SQLITE_INSERT into sqlite_schema) already fired inside sqlite3StartTable;
+    this call obtains permission to create the v-table itself.
+    pTable^.u.vtab.azArg[0] is the module name.
+    SQLITE_CREATE_VTABLE = 29 — value duplicated locally because the parser
+    unit intentionally does not import passqlite3vdbe (sqlite3.h:97). }
+  if pTable^.u.vtab.azArg <> nil then begin
+    iDb := sqlite3SchemaToIndex(db, passqlite3util.PSchema(pTable^.pSchema));
+    Assert(iDb >= 0, 'sqlite3VtabBeginParse: iDb < 0');
+    sqlite3AuthCheck(pPse, SQLITE_CREATE_VTABLE, pTable^.zName,
+            PPAnsiChar(pTable^.u.vtab.azArg)[0], pPse^.db^.aDb[iDb].zDbSName);
+  end;
 end;
 
 procedure sqlite3VtabFinishParse(pPse: PParse; pEnd: PToken);
