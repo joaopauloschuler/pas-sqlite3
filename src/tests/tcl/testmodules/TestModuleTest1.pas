@@ -54,6 +54,7 @@ uses
   passqlite3cksumvfs,
   passqlite3multiplex,
   passqlite3carray,
+  passqlite3internal,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -4801,6 +4802,139 @@ begin
   if clientData = nil then ;
 end;
 
+{ test5.c:29..44 — binarize: return the argument string as a byte array,
+  including its trailing NUL (len+1 bytes). }
+function binarize(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  bytes: PChar;
+  len:   cint;
+begin
+  AssertH(objc = 2, 'binarize: objc=2');
+  bytes := Tcl_GetStringFromObj(objv[1], @len);
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(bytes, len + 1));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test5.c:90..115 — name_to_enc: map an encoding-name Tcl object to the
+  SQLITE_UTF* constant.  UTF16 folds to SQLITE_UTF16NATIVE; unknown names
+  append an error to interp and return 0. }
+function name_to_enc(interp: PTclInterp; pObj: PTclObj): u8;
+type
+  TEncName = record zName: PChar; enc: u8; end;
+const
+  encnames: array[0..3] of TEncName = (
+    (zName: 'UTF8';    enc: SQLITE_UTF8),
+    (zName: 'UTF16LE'; enc: SQLITE_UTF16LE),
+    (zName: 'UTF16BE'; enc: SQLITE_UTF16BE),
+    (zName: 'UTF16';   enc: SQLITE_UTF16));
+var
+  z:    PChar;
+  i:    cint;
+  enc:  u8;
+begin
+  z := Tcl_GetString(pObj);
+  i := 0;
+  enc := 0;
+  while i <= High(encnames) do
+  begin
+    if sqlite3StrICmp(z, encnames[i].zName) = 0 then
+    begin
+      enc := encnames[i].enc;
+      Break;
+    end;
+    Inc(i);
+  end;
+  if enc = 0 then
+    Tcl_AppendResult(interp, PChar('No such encoding: '), z, Pointer(nil));
+  if enc = SQLITE_UTF16 then
+    Result := SQLITE_UTF16NATIVE
+  else
+    Result := enc;
+end;
+
+{ test5.c:121..176 — test_translate <string/blob> <from> <to> ?<transient>?.
+  Translates a value between encodings via the engine sqlite3Value* API and
+  returns the result as a Tcl byte array (incl. NUL/BOM terminator). }
+function test_translate(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  enc_from, enc_to: u8;
+  pVal:    Psqlite3_value;
+  z, zTmp: PChar;
+  len:     cint;
+  xDel:    TxDelProc;
+begin
+  xDel := SQLITE_STATIC;
+  if (objc <> 4) and (objc <> 5) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetStringFromObj(objv[0], nil),
+      PChar(' <string/blob> <from enc> <to enc>'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if objc = 5 then
+    xDel := @sqlite3_free;
+
+  enc_from := name_to_enc(interp, objv[2]);
+  if enc_from = 0 then begin Result := TCL_ERROR; Exit; end;
+  enc_to := name_to_enc(interp, objv[3]);
+  if enc_to = 0 then begin Result := TCL_ERROR; Exit; end;
+
+  pVal := sqlite3ValueNew(nil);
+
+  if enc_from = SQLITE_UTF8 then
+  begin
+    z := Tcl_GetString(objv[1]);
+    if objc = 5 then
+    begin
+      { test5.c: z = sqlite3_mprintf("%s", z) — a freshly sqlite3_malloc'd,
+        NUL-terminated copy the value owns and frees via xDel.  The Pascal
+        sqlite3_mprintf is single-arg (no varargs), so copy by hand. }
+      len := StrLen(z) + 1;
+      zTmp := z;
+      z := sqlite3_malloc64(len);
+      Move(zTmp^, z^, len);
+    end;
+    sqlite3ValueSetStr(pVal, -1, z, enc_from, xDel);
+  end
+  else
+  begin
+    z := Tcl_GetByteArrayFromObj(objv[1], @len);
+    if objc = 5 then
+    begin
+      zTmp := z;
+      z := sqlite3_malloc64(len);
+      Move(zTmp^, z^, len);
+    end;
+    sqlite3ValueSetStr(pVal, -1, z, enc_from, xDel);
+  end;
+
+  z := PChar(sqlite3ValueText(pVal, enc_to));
+  if enc_to = SQLITE_UTF8 then
+    len := sqlite3ValueBytes(pVal, enc_to) + 1
+  else
+    len := sqlite3ValueBytes(pVal, enc_to) + 2;
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(z, len));
+
+  sqlite3ValueFree(pVal);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test5.c:185..195 — translate_selftest.  Runs sqlite3UtfSelfTest, which
+  round-trips every codepoint through the UTF serialise/deserialise
+  primitives and asserts they are inverses.  Takes no arguments. }
+function test_translate_selftest(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3UtfSelfTest;
+  Result := TCL_OK;
+  if (clientData = nil) and (interp = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
 { test1.c:1088..1226 — test_create_function: register the UDFs above
   on DB.  Returns the rc enum-name.  Skips the UTF-16 hex16 / x_sqlite_exec
   arms (SQLITE_OMIT_UTF16-equivalent gate). }
@@ -7322,6 +7456,14 @@ begin
     @test_collate, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('add_test_collate_needed'),
     @test_collate_needed, nil, nil);
+  { test5.c:206..209 — binarize / test_translate / translate_selftest
+    (upstream Sqlitetest5_Init). }
+  Tcl_CreateObjCommand(interp, PChar('binarize'),
+    @binarize, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('test_translate'),
+    @test_translate, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('translate_selftest'),
+    @test_translate_selftest, nil, nil);
   { test1.c:9399..9400 — ::sqlite_last_needed_collation, read-only string
     backed by pzNeededCollation (which points at the zNeededCollation buffer
     the collation-needed callback writes). }

@@ -787,6 +787,7 @@ function sqlite3Utf8Read(pIn: PPChar): u32;
 function sqlite3Utf8ReadLimited(z: Pu8; n: i32; out piOut: u32): i32;
 function sqlite3Utf8CharLen(z: PChar; nByte: i32): i32;
 function sqlite3AppendOneUtf8Character(zOut: PChar; v: u32): i32;
+procedure sqlite3UtfSelfTest;
 
 { Config (main.c §sqlite3_config — minimal Phase 3 stub) }
 function  sqlite3_config(op: i32; pArg: Pointer): i32; overload;
@@ -3022,7 +3023,9 @@ begin
       c := (c shl 6) or u32(p^ and $3f);
       Inc(p);
     end;
-    if c < $80 then c := $fffd;
+    if (c < $80)
+        or ((c and $FFFFF800) = $D800)
+        or ((c and $FFFFFFFE) = $FFFE) then c := $fffd;
   end;
   pIn^ := PChar(p);
   Result := c;
@@ -3088,6 +3091,56 @@ begin
   zOut[2] := Char($80 or u8((v shr 6) and $3f));
   zOut[3] := Char($80 or u8(v and $3f));
   Result := 4;
+end;
+
+{ utf.c ~574: sqlite3UtfSelfTest -- called from TCL "translate_selftest".
+  Verifies that the serialise/deserialise primitives for each encoding are
+  inverses of each other.  WRITE_UTF8 is expanded inline (it advances z). }
+procedure sqlite3UtfSelfTest;
+var
+  i, t, c: u32;
+  zBuf: array[0..19] of u8;
+  z: Pu8;
+  zp: PChar;
+  n: i32;
+begin
+  i := 0;
+  while i < $00110000 do
+  begin
+    z := @zBuf[0];
+    { WRITE_UTF8(z, i) }
+    c := i;
+    if c < $00080 then begin
+      z^ := u8(c and $FF); Inc(z);
+    end
+    else if c < $00800 then begin
+      z^ := $C0 + u8((c shr 6) and $1F); Inc(z);
+      z^ := $80 + u8(c and $3F); Inc(z);
+    end
+    else if c < $10000 then begin
+      z^ := $E0 + u8((c shr 12) and $0F); Inc(z);
+      z^ := $80 + u8((c shr 6) and $3F); Inc(z);
+      z^ := $80 + u8(c and $3F); Inc(z);
+    end else begin
+      z^ := $F0 + u8((c shr 18) and $07); Inc(z);
+      z^ := $80 + u8((c shr 12) and $3F); Inc(z);
+      z^ := $80 + u8((c shr 6) and $3F); Inc(z);
+      z^ := $80 + u8(c and $3F); Inc(z);
+    end;
+    n := i32(PtrUInt(z) - PtrUInt(@zBuf[0]));
+    AssertH((n > 0) and (n <= 4), 'sqlite3UtfSelfTest: WRITE_UTF8 length');
+    z^ := 0;
+    z := @zBuf[0];
+    zp := PChar(z);
+    c := sqlite3Utf8Read(@zp);
+    t := i;
+    if (i >= $D800) and (i <= $DFFF) then t := $FFFD;
+    if (i and $FFFFFFFE) = $FFFE then t := $FFFD;
+    AssertH(c = t, 'sqlite3UtfSelfTest: round-trip codepoint mismatch');
+    AssertH((PtrUInt(zp) - PtrUInt(@zBuf[0])) = PtrUInt(n),
+            'sqlite3UtfSelfTest: read length mismatch');
+    Inc(i);
+  end;
 end;
 
 { ============================================================
