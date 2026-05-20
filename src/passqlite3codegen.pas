@@ -10169,6 +10169,91 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc);
   end;
 
+  { resolver01-7.1/7.2 — NC_UEList outer result-alias fallback.
+    Mirrors the lookupName NameContext-chain walk (resolve.c:658..698):
+    after the inner SrcList scan fails (cnt==0) the loop advances
+    pNC=pNC->pNext, incrementing nSubquery, and for any outer NameContext
+    carrying NC_UEList it scans pNC->uNC.pEList for an ENAME_NAME alias
+    matching the bare column and calls resolveAlias(pParse,pEList,j,pExpr,
+    nSubquery).  The outer NameContext established for the outer query's
+    WHERE/HAVING/etc carries NC_UEList = the outer p->pEList (resolve.c:
+    1978..1988), and the inner result-set list is resolved with that NC as
+    sNC.pNext (resolve.c:1950..1953) — so a correlated subquery's bare
+    result expression can bind to the outer query's result-set alias.
+
+      SELECT 2 AS x WHERE (SELECT x AS y WHERE 3>y);
+
+    The inner `x` matches no inner FROM column (none) and no outer FROM
+    column (none) but matches the outer pEList alias `x`, so it is swapped
+    for a copy of the outer `2` with nSubquery=1.  The inner `WHERE 3>y`
+    binds `y` against the inner select's own pEList via ResolveAliasInWhere.
+
+    This pre-resolution runs against the OUTER p^.pEList before the inner
+    per-Select resolver; it only fires for bare TK_IDs that bind neither in
+    the inner FROM nor the outer FROM, so it cannot mask a real column. }
+  procedure ResolveOuterAliasIDs(pW: PExpr; pOuterSrc, pInnerSrc: PSrcList;
+                                 pOuterEList: PExprList); forward;
+
+  procedure ResolveOuterAliasIDsInList(pList: PExprList;
+             pOuterSrc, pInnerSrc: PSrcList; pOuterEList: PExprList);
+  var k_: i32;
+  begin
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      ResolveOuterAliasIDs(ExprListItems(pList)[k_].pExpr,
+                           pOuterSrc, pInnerSrc, pOuterEList);
+  end;
+
+  procedure ResolveOuterAliasIDs(pW: PExpr; pOuterSrc, pInnerSrc: PSrcList;
+                                 pOuterEList: PExprList);
+  var
+    pInItem, pOutItem: PSrcItem;
+    iInCol, iOutCol:   i32;
+    j_:                i32;
+    itemsE:            PExprListItem;
+    pOrig:             PExpr;
+    zAs:               PAnsiChar;
+  begin
+    if pW = nil then Exit;
+    if pW^.op = TK_ID then
+    begin
+      if (pW^.u.zToken = nil) or (pOuterEList = nil) then Exit;
+      if (pW^.flags and EP_IntValue) <> 0 then Exit;
+      { Inner scope wins; an outer FROM column is handled by ResolveOuterIDs. }
+      if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
+      if ColumnInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutCol) then Exit;
+      { resolve.c:664..698 — scan outer NC_UEList pEList for an ENAME_NAME
+        alias match. }
+      itemsE := ExprListItems(pOuterEList);
+      for j_ := 0 to pOuterEList^.nExpr - 1 do
+      begin
+        zAs := itemsE[j_].zEName;
+        if (zAs <> nil)
+           and ((itemsE[j_].fg.eBits and $03) = ENAME_NAME)
+           and (sqlite3StrICmp(zAs, pW^.u.zToken) = 0) then
+        begin
+          pOrig := itemsE[j_].pExpr;
+          { resolve.c:684..687 — row value misused guard. }
+          if sqlite3ExprVectorSize(pOrig) <> 1 then
+          begin
+            sqlite3ErrorMsg(pParse, 'row value misused');
+            Exit;
+          end;
+          { nSubquery=1: the alias is one subquery level out from pW. }
+          resolveAlias(pParse, pOuterEList, j_, pW, 1);
+          Exit;
+        end;
+      end;
+      Exit;
+    end;
+    if pW^.op = TK_DOT then Exit;
+    if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
+    ResolveOuterAliasIDs(pW^.pLeft,  pOuterSrc, pInnerSrc, pOuterEList);
+    ResolveOuterAliasIDs(pW^.pRight, pOuterSrc, pInnerSrc, pOuterEList);
+    if (pW^.flags and EP_xIsSelect) = 0 then
+      ResolveOuterAliasIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc, pOuterEList);
+  end;
+
   { 9.4.divbug.87.019 — recursive deep walk of FROM-subquery interiors.
     For each level of nested FROM-subquery, run ResolveOuterRefs /
     ResolveOuterIDs against the OUTERmost pSrc so deeply-nested TK_DOT
@@ -11218,6 +11303,36 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           while pCompArm <> nil do
           begin
             WalkDeepFromSubqueries(pCompArm, p^.pSrc);
+            pCompArm := pCompArm^.pPrior;
+          end;
+        end;
+        { resolver01-7.1/7.2 — NC_UEList outer result-alias fallback.
+          Mirror resolve.c:1950..1953 + 658..698: the inner subquery's
+          result-set list (and its other clauses) are resolved with the
+          OUTER select's NameContext as sNC.pNext, and that outer NC carries
+          NC_UEList = the outer p^.pEList.  Pre-resolve any inner bare TK_ID
+          that binds neither in the inner FROM nor the outer FROM but matches
+          an outer result-set ENAME_NAME alias, swapping it for a copy of the
+          aliased expr (resolveAlias, nSubquery=1) BEFORE the inner per-Select
+          resolver runs (which lacks the NC chain).  Gated only on the outer
+          pEList existing; runs across every compound arm and clause that can
+          contain a bare alias reference. }
+        if ((pInner^.selFlags and SF_HasTypeInfo) = 0)
+           and (p^.pEList <> nil) then
+        begin
+          pCompArm := pInner;
+          while (pCompArm <> nil) and (pParse^.nErr = 0) do
+          begin
+            ResolveOuterAliasIDsInList(pCompArm^.pEList,
+                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDs(pCompArm^.pWhere,
+                                 p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDs(pCompArm^.pHaving,
+                                 p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDsInList(pCompArm^.pGroupBy,
+                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDsInList(pCompArm^.pOrderBy,
+                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
             pCompArm := pCompArm^.pPrior;
           end;
         end;
