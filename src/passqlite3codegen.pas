@@ -8950,6 +8950,25 @@ begin
     bare table token (9.4.divbug.14). }
   if pE^.op = TK_DOT then
   begin
+    { resolve.c:785..786 — a 3-part `db.tab.col` reference (parser rule 182
+      builds TK_DOT(TK_ID(db), TK_DOT(TK_ID(tab), TK_ID(col)))) reports the
+      fully-qualified `zDb.zTab.zCol` (vacuum-into-340 `main.t1.nosuchcol`). }
+    if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+       and (pE^.pLeft^.u.zToken <> nil)
+       and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_DOT)
+       and (pE^.pRight^.pLeft <> nil) and (pE^.pRight^.pLeft^.op = TK_ID)
+       and (pE^.pRight^.pLeft^.u.zToken <> nil)
+       and (pE^.pRight^.pRight <> nil) and (pE^.pRight^.pRight^.op = TK_ID)
+       and (pE^.pRight^.pRight^.u.zToken <> nil) then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('no such column: '
+                  + AnsiString(pE^.pLeft^.u.zToken) + '.'
+                  + AnsiString(pE^.pRight^.pLeft^.u.zToken) + '.'
+                  + AnsiString(pE^.pRight^.pRight^.u.zToken)));
+      sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+      Exit;
+    end;
     if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
        and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
        and (pE^.pLeft^.u.zToken <> nil)
@@ -9740,8 +9759,17 @@ begin
       here; the outer resolver (codegen.pas:10145..10162) will run
       ResolveOuterRefs against the outer pSrc, and any genuinely unbound
       reference is reported by the outer level's flagUnresolvedTKID. }
+    { resolve.c lookupName (resolve.c:341..706) walks pNC->pNext before
+      raising "no such column": a leftover reference is only genuinely
+      unresolved when there is no enclosing NameContext to bind it.  So
+      run the leftover-sweep when this NameContext has a populated FROM
+      clause, OR when it is self-contained (no outer pNext) — the latter
+      covers sqlite3ResolveSelfReference's empty SrcList (nSrc=0) used by
+      VACUUM INTO <expr>, CHECK constraints, etc. (vacuum-into-320/330/
+      340/420: bad column/qualified-column/function must error at prepare
+      time, not code to NULL and trip the runtime "non-text filename"). }
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil)
-       and (pNC^.pSrcList^.nSrc > 0) then
+       and ((pNC^.pSrcList^.nSrc > 0) or (pNC^.pNext = nil)) then
     begin
       flagUnresolvedTKID(pNC^.pParse, pExpr,
         (pNC^.ncFlags and NC_IsDDL) <> 0);
