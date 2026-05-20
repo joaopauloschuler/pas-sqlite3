@@ -4707,6 +4707,8 @@ var
   iNewTrunk: Pgno;
   pNewTrunk: PMemPage;
   pPg      : PMemPage;
+  searchList: u8;
+  eType    : u8;
 label
   end_allocate_page;
 begin
@@ -4724,8 +4726,26 @@ begin
 
   rc := SQLITE_OK;
   if n > 0 then begin
-    { Reuse a page from the freelist }
+    { There are pages on the freelist.  Reuse one of those pages. }
     nSearch := 0;
+    searchList := 0;
+
+    { btree.c:6535..6550 — if eMode=BTALLOC_EXACT and the pointer-map shows
+      that page `nearby` is on the free-list, search the whole list for it;
+      for BTALLOC_LE always search. }
+    if eMode = BTALLOC_EXACT then begin
+      if nearby <= mxPage then begin
+        rc := ptrmapGet(pBt, nearby, eType, iPage);
+        if rc <> SQLITE_OK then begin
+          Result := rc;
+          Exit;
+        end;
+        if eType = PTRMAP_FREEPAGE then
+          searchList := 1;
+      end;
+    end else if eMode = BTALLOC_LE then
+      searchList := 1;
+
     rc := sqlite3PagerWrite(pPage1^.pDbPage);
     if rc <> SQLITE_OK then begin
       Result := rc;
@@ -4733,6 +4753,8 @@ begin
     end;
     sqlite3Put4byte(@pPage1^.aData[36], n - 1);
 
+    { The loop runs once if searchList is false; otherwise once per trunk
+      page until the target page is located (btree.c:6564..6739). }
     repeat
       pPrevTrunk := pTrunk;
       if pPrevTrunk <> nil then
@@ -4752,8 +4774,9 @@ begin
       end;
 
       k := sqlite3Get4byte(@pTrunk^.aData[4]);
-      if k = 0 then begin
-        { Trunk has no leaves — use trunk page itself }
+      if (k = 0) and (searchList = 0) then begin
+        { Trunk has no leaves and the list is not being searched — use the
+          trunk page itself as the newly allocated page. }
         rc := sqlite3PagerWrite(pTrunk^.pDbPage);
         if rc <> SQLITE_OK then
           goto end_allocate_page;
@@ -4764,7 +4787,56 @@ begin
       end else if k > (pBt^.usableSize div 4 - 2) then begin
         rc := SQLITE_CORRUPT_BKPT;
         goto end_allocate_page;
-      end else begin
+      end else if (searchList <> 0)
+               and ((nearby = iTrunk)
+                    or ((iTrunk < nearby) and (eMode = BTALLOC_LE))) then begin
+        { btree.c:6611..6671 — the trunk page itself is the page to allocate. }
+        pPgno := iTrunk;
+        ppPage := pTrunk;
+        searchList := 0;
+        rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+        if rc <> SQLITE_OK then
+          goto end_allocate_page;
+        if k = 0 then begin
+          if pPrevTrunk = nil then
+            Move(pTrunk^.aData[0], pPage1^.aData[32], 4)
+          else begin
+            rc := sqlite3PagerWrite(pPrevTrunk^.pDbPage);
+            if rc <> SQLITE_OK then
+              goto end_allocate_page;
+            Move(pTrunk^.aData[0], pPrevTrunk^.aData[0], 4);
+          end;
+        end else begin
+          { Trunk required by caller but has leaf pointers; the first leaf
+            becomes a trunk page. }
+          iNewTrunk := sqlite3Get4byte(@pTrunk^.aData[8]);
+          if iNewTrunk > mxPage then begin
+            rc := SQLITE_CORRUPT_BKPT;
+            goto end_allocate_page;
+          end;
+          rc := btreeGetUnusedPage(pBt, iNewTrunk, pNewTrunk, 0);
+          if rc <> SQLITE_OK then
+            goto end_allocate_page;
+          rc := sqlite3PagerWrite(pNewTrunk^.pDbPage);
+          if rc <> SQLITE_OK then begin
+            releasePage(pNewTrunk);
+            goto end_allocate_page;
+          end;
+          Move(pTrunk^.aData[0], pNewTrunk^.aData[0], 4);
+          sqlite3Put4byte(@pNewTrunk^.aData[4], k - 1);
+          Move(pTrunk^.aData[12], pNewTrunk^.aData[8], (k - 1) * 4);
+          releasePage(pNewTrunk);
+          if pPrevTrunk = nil then
+            sqlite3Put4byte(@pPage1^.aData[32], iNewTrunk)
+          else begin
+            rc := sqlite3PagerWrite(pPrevTrunk^.pDbPage);
+            if rc <> SQLITE_OK then
+              goto end_allocate_page;
+            sqlite3Put4byte(@pPrevTrunk^.aData[0], iNewTrunk);
+          end;
+        end;
+        pTrunk := nil;
+      end else if k > 0 then begin
         { Extract a leaf from trunk }
         aData := pTrunk^.aData;
         if nearby > 0 then begin
@@ -4799,29 +4871,34 @@ begin
           rc := SQLITE_CORRUPT_BKPT;
           goto end_allocate_page;
         end;
-        pPgno := iPage;
-        rc := sqlite3PagerWrite(pTrunk^.pDbPage);
-        if rc <> SQLITE_OK then
-          goto end_allocate_page;
-        if closest < k - 1 then
-          Move(aData[4 + k * 4], aData[8 + closest * 4], 4);
-        sqlite3Put4byte(@aData[4], k - 1);
-        if btreeGetHasContent(pBt, pPgno) then
-          noContent := 0
-        else
-          noContent := PAGER_GET_NOCONTENT;
-        rc := btreeGetUnusedPage(pBt, pPgno, ppPage, noContent);
-        if rc = SQLITE_OK then begin
-          rc := sqlite3PagerWrite(ppPage^.pDbPage);
-          if rc <> SQLITE_OK then begin
-            releasePage(ppPage);
-            ppPage := nil;
+        if (searchList = 0)
+           or (iPage = nearby)
+           or ((iPage < nearby) and (eMode = BTALLOC_LE)) then begin
+          pPgno := iPage;
+          rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+          if rc <> SQLITE_OK then
+            goto end_allocate_page;
+          if closest < k - 1 then
+            Move(aData[4 + k * 4], aData[8 + closest * 4], 4);
+          sqlite3Put4byte(@aData[4], k - 1);
+          if btreeGetHasContent(pBt, pPgno) then
+            noContent := 0
+          else
+            noContent := PAGER_GET_NOCONTENT;
+          rc := btreeGetUnusedPage(pBt, pPgno, ppPage, noContent);
+          if rc = SQLITE_OK then begin
+            rc := sqlite3PagerWrite(ppPage^.pDbPage);
+            if rc <> SQLITE_OK then begin
+              releasePage(ppPage);
+              ppPage := nil;
+            end;
           end;
+          searchList := 0;
         end;
       end;
       releasePage(pPrevTrunk);
       pPrevTrunk := nil;
-    until True; { loop runs once when not searching; no searchList needed without autovacuum }
+    until searchList = 0;
   end else begin
     { No free pages — extend the database }
     if pBt^.bDoTruncate <> 0 then
