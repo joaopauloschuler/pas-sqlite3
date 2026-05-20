@@ -66,6 +66,7 @@ uses
   passqlite3pager,
   passqlite3btree,
   passqlite3vdbe,
+  passqlite3printf,
   passqlite3codegen;
 
 type
@@ -129,13 +130,35 @@ end;
   --------------------------------------------------------------------------- }
 function findBtree(pErrorDb, pDb: PTsqlite3; zDb: PAnsiChar): PBtree;
 var
-  i : i32;
+  i      : i32;
+  zMsg   : PAnsiChar;
+  sParse : TParse;
+  rc     : i32;
 begin
   i := sqlite3FindDbName(pDb, zDb);
-  { The "temp" branch (i=1) of the C source needs OpenTempDatabase; our
-    openDatabase already does this eagerly so we can simply trust aDb[1]. }
+
+  { The "temp" database (i=1) may not yet have its b-tree opened; open it on
+    demand exactly as backup.c does, surfacing any error onto pErrorDb. }
+  if i = 1 then begin
+    FillChar(sParse, SizeOf(sParse), 0);
+    rc := 0;
+    sqlite3ParseObjectInit(@sParse, pDb);
+    if sqlite3OpenTempDatabase(@sParse) <> 0 then begin
+      sqlite3ErrorWithMsg(pErrorDb, sParse.rc, sParse.zErrMsg);
+      rc := SQLITE_ERROR;
+    end;
+    sqlite3DbFree(pErrorDb, sParse.zErrMsg);
+    sqlite3ParseObjectReset(@sParse);
+    if rc <> 0 then begin
+      Result := nil;
+      Exit;
+    end;
+  end;
+
   if i < 0 then begin
-    sqlite3ErrorWithMsg(pErrorDb, SQLITE_ERROR, 'unknown database');
+    zMsg := sqlite3MPrintf(pErrorDb, 'unknown database %s', [zDb]);
+    sqlite3ErrorWithMsg(pErrorDb, SQLITE_ERROR, zMsg);
+    sqlite3DbFree(pErrorDb, zMsg);
     Result := nil;
     Exit;
   end;
