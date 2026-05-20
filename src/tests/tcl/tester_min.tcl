@@ -293,6 +293,13 @@ set ::sqlite_options(legacyformat) 0
 # SQLITE_32BIT_ROWID is defined.  Without this, `ifcapable {!rowid32}` blocks
 # (which insert INT64_MAX) are skipped and only the rowid32 32-bit arm runs.
 set ::sqlite_options(rowid32) 0
+# analyzeE/F/G, analyze3/5/8/D — this build defines neither SQLITE_ENABLE_STAT4
+# nor SQLITE_ENABLE_STAT3, so test_config.c:608..612 writes stat4=0.  Without
+# this, `ifcapable !stat4 {finish_test; return}` guards default to FALSE (cap
+# reads 1 below) and the stat4-only analyze tests run on a non-stat4 engine →
+# strict failures / timeouts.  (No test uses `ifcapable stat3`, and
+# test_config.c sets no stat3 cap, so none is added here.)
+set ::sqlite_options(stat4) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
