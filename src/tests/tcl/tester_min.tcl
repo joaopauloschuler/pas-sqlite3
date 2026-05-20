@@ -325,6 +325,13 @@ set ::sqlite_options(rowid32) 0
 # strict failures / timeouts.  (No test uses `ifcapable stat3`, and
 # test_config.c sets no stat3 cap, so none is added here.)
 set ::sqlite_options(stat4) 0
+# uri2.test is gated by `ifcapable !uri_00_error`.  A vanilla build does NOT
+# define SQLITE_ENABLE_URI_00_ERROR, so test_config.c writes no uri_00_error
+# cap and the oracle SKIPS this test (the !SQLITE_ENABLE_URI_00_ERROR arm in
+# sqlite3ParseUri simply ignores the rest of the path on %00).  Without this,
+# the cap defaults to 1 below → the test wrongly RUNS and expects the
+# "unexpected %00 in uri" error this build never raises.
+set ::sqlite_options(uri_00_error) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
