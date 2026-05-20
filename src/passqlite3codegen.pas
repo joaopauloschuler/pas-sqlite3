@@ -9911,6 +9911,48 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { autoindex5-2.2 — rowid outer-scope climb (resolve.c:471..503 + 619..638).
+    A bare `rowid`/`oid`/`_rowid_` that matches no real column in the inner
+    scope and whose inner scope has no VisibleRowid source must resolve
+    against the nearest outer source that has a VisibleRowid — exactly as
+    lookupName's cntTab tracking climbs pNC->pNext.  These helpers locate
+    such a source and test for its presence. }
+  function SrcListHasVisibleRowid(pSrc: PSrcList): Boolean;
+  var
+    base_: PSrcItem;
+    pIt:   PSrcItem;
+    j_:    i32;
+  begin
+    Result := False;
+    if pSrc = nil then Exit;
+    base_ := SrcListItems(pSrc);
+    for j_ := 0 to pSrc^.nSrc - 1 do
+    begin
+      pIt := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+      if pIt^.pSTab = nil then Continue;
+      if (pIt^.pSTab^.tabFlags and TF_NoVisibleRowid) = 0 then
+      begin Result := True; Exit; end;
+    end;
+  end;
+
+  function FirstVisibleRowidItem(pSrc: PSrcList): PSrcItem;
+  var
+    base_: PSrcItem;
+    pIt:   PSrcItem;
+    j_:    i32;
+  begin
+    Result := nil;
+    if pSrc = nil then Exit;
+    base_ := SrcListItems(pSrc);
+    for j_ := 0 to pSrc^.nSrc - 1 do
+    begin
+      pIt := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+      if pIt^.pSTab = nil then Continue;
+      if (pIt^.pSTab^.tabFlags and TF_NoVisibleRowid) = 0 then
+      begin Result := pIt; Exit; end;
+    end;
+  end;
+
   function ExprRefsOuterID(pW: PExpr; pOuterSrc: PSrcList;
                            pInnerSrc: PSrcList): Boolean; forward;
 
@@ -9939,6 +9981,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if (pW^.u.zToken = nil) or (pOuterSrc = nil) then Exit;
       if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
       if ColumnInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutCol) then
+      begin Result := True; Exit; end;
+      { autoindex5-2.2 — bare rowid climbing to an outer VisibleRowid source
+        (resolve.c:471..503 cntTab climb).  Only when the inner scope has no
+        VisibleRowid source of its own (otherwise the inner resolver binds it). }
+      if (sqlite3IsRowid(pW^.u.zToken) <> 0)
+         and (not SrcListHasVisibleRowid(pInnerSrc))
+         and SrcListHasVisibleRowid(pOuterSrc) then
       begin Result := True; Exit; end;
       Exit;
     end;
@@ -9986,6 +10035,22 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pOutItem^.colUsed := pOutItem^.colUsed or (Bitmask(1) shl iOutCol)
         else
           pOutItem^.colUsed := pOutItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        Exit;
+      end;
+      { autoindex5-2.2 — rowid climbs to the nearest outer VisibleRowid source
+        when the inner scope has none (resolve.c:471..503 + 619..638). }
+      if (sqlite3IsRowid(pW^.u.zToken) <> 0)
+         and (not SrcListHasVisibleRowid(pInnerSrc)) then
+      begin
+        pOutItem := FirstVisibleRowidItem(pOuterSrc);
+        if pOutItem <> nil then
+        begin
+          pW^.op      := TK_COLUMN;
+          pW^.iTable  := pOutItem^.iCursor;
+          pW^.iColumn := i16(-1);
+          pW^.y.pTab  := pOutItem^.pSTab;
+          pW^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        end;
       end;
       Exit;
     end;
