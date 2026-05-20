@@ -4868,6 +4868,10 @@ begin
     else
       db^.errCode := p^.rc;
   end;
+  { vdbeaux.c:3628 — clear the current-result-row pointer so that
+    sqlite3_data_count()/sqlite3_column_*() report no live row after a
+    reset (capi2-1.9/1.10). }
+  p^.pResultRow := nil;
   p^.eVdbeState := VDBE_READY_STATE;
   if db <> nil then
     Result := p^.rc and db^.errMask
