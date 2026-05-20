@@ -30374,6 +30374,7 @@ var
   pBestCnt:     PIndex2;
   iRootCnt:     i32;
   pKeyInfoCnt:  PKeyInfo2;
+  zAuthDb:      PAnsiChar;   { tag-select-0410 — zDb for unreferenced-table READ auth }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   { select.c:7608 — top-of-sqlite3Select authorizer check.  Fires
@@ -30736,6 +30737,34 @@ begin
     if pParse^.db^.mallocFailed <> 0 then
       begin Result := SQLITE_NOMEM; Exit; end;
     pTabList := p^.pSrc;
+  end;
+
+  { Loop over all terms in the FROM clause and authorize unreferenced
+    tables — port of select.c:7939..7978 (tag-select-0400 / tag-select-0410).
+
+    Issue SQLITE_READ authorizations with a fake (empty-string) column name
+    for any table that is referenced but from which no values are extracted
+    (e.g. SELECT count(*) FROM t1 -> SQLITE_READ t1.""). }
+  if pTabList <> nil then
+  begin
+    for i := 0 to pTabList^.nSrc - 1 do
+    begin
+      pItem := @SrcListItems(pTabList)[i];
+      if (pItem^.colUsed = 0) and (pItem^.zName <> nil) then
+      begin
+        if (pItem^.fg.fgBits3 and u8($01)) <> 0 then  { fixedSchema }
+        begin
+          iDb := sqlite3SchemaToIndex(pParse^.db, pItem^.u4.pSchema);
+          zAuthDb := pParse^.db^.aDb[iDb].zDbSName;
+        end
+        else if SrcItemIsSubquery(pItem^.fg) then
+          zAuthDb := nil
+        else
+          zAuthDb := pItem^.u4.zDatabase;
+        sqlite3AuthCheck(pParse, SQLITE_READ_AUTH, pItem^.zName,
+                         PAnsiChar(''), zAuthDb);
+      end;
+    end;
   end;
 
   {$IFDEF SQLITE_DEBUG}
