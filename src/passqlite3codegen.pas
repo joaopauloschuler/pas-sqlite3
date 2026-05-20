@@ -56487,6 +56487,14 @@ const
   COL_AFFIN: array[0..4] of u8 = (
     SQLITE_AFF_TEXT, SQLITE_AFF_TEXT, SQLITE_AFF_TEXT,
     SQLITE_AFF_INTEGER, SQLITE_AFF_TEXT);
+  { Standard declared-type encoding (eCType, high nibble of typeFlags) for
+    'CREATE TABLE x(type text,name text,tbl_name text,rootpage int,sql text)'.
+    Lets sqlite3ColumnType() return the declared type (TEXT/INT) so
+    sqlite3_column_decltype reports it, mirroring sqlite3AddColumn's
+    standard-typename detection (build.c:1526..1542). }
+  COL_ECTYPE: array[0..4] of u8 = (
+    COLTYPE_TEXT, COLTYPE_TEXT, COLTYPE_TEXT,
+    COLTYPE_INT, COLTYPE_TEXT);
 var
   pSchema: passqlite3util.PSchema;
   pTab:    PTable2;
@@ -56522,10 +56530,11 @@ begin
   end;
 
   for i := 0 to 4 do begin
-    pCol[i].zCnName  := sqlite3DbStrDup(db, COL_NAMES[i]);
-    pCol[i].hName    := sqlite3StrIHash(pCol[i].zCnName);
-    pCol[i].affinity := AnsiChar(COL_AFFIN[i]);
-    pCol[i].szEst    := 1;
+    pCol[i].zCnName   := sqlite3DbStrDup(db, COL_NAMES[i]);
+    pCol[i].hName     := sqlite3StrIHash(pCol[i].zCnName);
+    pCol[i].affinity  := AnsiChar(COL_AFFIN[i]);
+    pCol[i].typeFlags := (pCol[i].typeFlags and $0F) or u8(COL_ECTYPE[i] shl 4);
+    pCol[i].szEst     := 1;
   end;
 
   pTab^.zName      := zName;
