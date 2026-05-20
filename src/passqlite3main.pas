@@ -3561,7 +3561,7 @@ begin
   sqlite3_mutex_enter(db^.mutex);
   if Assigned(db^.xAutovacDestr) then
     db^.xAutovacDestr(db^.pAutovacPagesArg);
-  db^.xAutovacPages    := Pointer(@xCallback);
+  db^.xAutovacPages    := Pointer(xCallback);
   db^.pAutovacPagesArg := pArg;
   db^.xAutovacDestr    := xDestructor;
   sqlite3_mutex_leave(db^.mutex);
@@ -6271,6 +6271,10 @@ initialization
   passqlite3codegen.gWalAutoCheckpoint :=
     passqlite3codegen.TWalAutoCheckpointFn(@sqlite3_wal_autocheckpoint);
   passqlite3codegen.gWalDefaultHook := @sqlite3WalDefaultHook;
+  { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
+    dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA. }
+  passqlite3codegen.gFileControl :=
+    passqlite3codegen.TFileControlFn(@sqlite3_file_control);
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)

@@ -1344,6 +1344,8 @@ begin
   e.pRight:= @eR;
   eL.op   := TK_COLUMN;
   eL.iColumn := 1;
+  eL.y.pTab  := @tab;     { 9.4.divbug.30 — sqlite3IndexAffinityOk now real;
+                            comparisonAffinity needs a resolvable column. }
   eR.op   := TK_INTEGER;
 
   t.pExpr        := @e;

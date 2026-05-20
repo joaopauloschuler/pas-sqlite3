@@ -646,17 +646,18 @@ end;
   Auto-extension hook + public entries.  cksumvfs.c:767..817.
   ---------------------------------------------------------------------- }
 
-procedure cksmAutoExtension; cdecl;
-{ Called automatically by SQLite for every newly opened db connection
-  once sqlite3_register_cksumvfs has been invoked.  The C signature is
-  `int (*)(sqlite3*, char**, const sqlite3_api_routines*)`; the variadic
-  args go unread here because we always register as deterministic /
-  innocuous with the constant function name. }
+{ cksmRegisterFunc — cksumvfs.c:767..783.
+  Auto-extension callback: registers verify_checksum() on every new db.
+  Signature matches Tsqlite3_loadext_entry expected by the engine
+  (passqlite3main.pas:2973): int(*)(sqlite3*, char**, const void*). }
+function cksmRegisterFunc(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+                          pApi: Pointer): i32; cdecl;
 begin
-  { Auto-extension trampoline — the connection pointer is on the stack
-    in the C signature but discarded under the Pascal cdecl one-arg
-    boundary used by sqlite3_auto_extension (mirrors the way other
-    auto-extension wrappers in this tree are wired). }
+  if (pzErrMsg = pzErrMsg) and (pApi = pApi) then ; { silence unused }
+  if db = nil then Exit(SQLITE_OK);
+  Result := sqlite3_create_function(db, 'verify_checksum', 1,
+              SQLITE_UTF8 or SQLITE_INNOCUOUS or SQLITE_DETERMINISTIC,
+              nil, @cksmVerifyFunc, nil, nil);
 end;
 
 procedure cksmInitMethodsTables;
@@ -728,6 +729,9 @@ var
 begin
   if zArg = zArg then ; { silence unused-arg }
   cksmInitMethodsTables;
+  { Make sure the SQLite library is initialised so sqlite3_vfs_find
+    returns the bootstrap default VFS. }
+  sqlite3_initialize;
   pOrig := sqlite3_vfs_find(nil);
   if pOrig = nil then Exit(SQLITE_ERROR);
   cksm_vfs.iVersion := pOrig^.iVersion;
@@ -735,7 +739,7 @@ begin
   cksm_vfs.szOsFile := pOrig^.szOsFile + SizeOf(TCksmFile);
   rc := sqlite3_vfs_register(@cksm_vfs, 1);
   if rc = SQLITE_OK then
-    rc := sqlite3_auto_extension(@cksmAutoExtension);
+    rc := sqlite3_auto_extension(Tsqlite3_loadext_fn(Pointer(@cksmRegisterFunc)));
   Result := rc;
 end;
 
@@ -743,7 +747,7 @@ function sqlite3_unregister_cksumvfs: i32;
 begin
   if sqlite3_vfs_find('cksmvfs') <> nil then begin
     sqlite3_vfs_unregister(@cksm_vfs);
-    sqlite3_cancel_auto_extension(@cksmAutoExtension);
+    sqlite3_cancel_auto_extension(Tsqlite3_loadext_fn(Pointer(@cksmRegisterFunc)));
   end;
   Result := SQLITE_OK;
 end;

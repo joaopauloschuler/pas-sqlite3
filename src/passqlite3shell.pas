@@ -465,6 +465,10 @@ var
   Argv0:                AnsiString = '';
   mainPromptStr:        AnsiString = MAIN_PROMPT_DEFAULT;
   continuePromptStr:    AnsiString = CONTINUATION_PROMPT;
+  { 10.3.a — resolved on-disk history path for the interactive REPL.
+    Empty string disables load/save (non-TTY, pipe, no HOME).  Set on
+    REPL entry, consulted on REPL exit; see shell.c.in:13571..13609. }
+  gHistoryFile:         AnsiString = '';
   { 10.1.25 — `.output` / `.once` redirect state.  See cmdOutput. }
   gSavedStdoutFd:       cint    = -1;
   gOutRedirected:       Boolean = False;
@@ -1331,21 +1335,36 @@ end;
 function localGetLine(var inF: Text; out atEof: Boolean): AnsiString;
 var
   ch: Char;
+  used, cap: PtrInt;
 begin
-  Result := '';
-  atEof  := False;
+  { Build the line in a SetLength-managed buffer with capacity-doubling
+    growth.  The naive `Result := Result + ch` form goes through
+    fpc_ansistr_concat -> DefaultAnsi2UnicodeMove on each char, which is
+    quadratic *and* round-trips the growing buffer through UTF-16; on
+    long input (e.g. tests with 65k single-row INSERT lines) this
+    dominates wall-clock.  See feedback note (9.4.divbug.89.005). }
+  atEof := False;
   if EOF(inF) then begin
-    atEof := True;
+    Result := '';
+    atEof  := True;
     Exit;
   end;
+  used := 0;
+  cap  := 128;
+  SetLength(Result, cap);
   while not EOF(inF) do begin
     Read(inF, ch);
     if ch = #10 then Break;
-    Result := Result + ch;
+    if used >= cap then begin
+      cap := cap * 2;
+      SetLength(Result, cap);
+    end;
+    Inc(used);
+    Result[used] := ch;  { 1-based }
   end;
   { Strip trailing '\r' if the input had CRLF terminators. }
-  if (Length(Result) > 0) and (Result[Length(Result)] = #13) then
-    SetLength(Result, Length(Result)-1);
+  if (used > 0) and (Result[used] = #13) then Dec(used);
+  SetLength(Result, used);
 end;
 
 { 10.1.4 sister: oneInputLine — shell.c.in:1042..1072.  In the C
@@ -11851,7 +11870,30 @@ begin
   { ---------------- REPL or bail ---------------- }
   if readStdin then begin
     state.zInFile := zStdinName;
+    { 10.3.a — on-disk history persistence at ~/.passqlite3_history
+      (linenoise-style load-on-start / save-on-exit; gated on
+      stdin_is_interactive like shell.c.in:13569..13609).  Honours
+      $PASSQLITE_HISTORY override; otherwise defaults to
+      $HOME/.passqlite3_history.  Skipped under non-TTY/pipe stdin
+      to avoid clobbering the user's file from test harnesses. }
+    if (stdin_is_interactive <> 0) and LineEditIsTTY then begin
+      gHistoryFile := GetEnvironmentVariable('PASSQLITE_HISTORY');
+      if gHistoryFile = '' then begin
+        gHistoryFile := GetEnvironmentVariable('HOME');
+        if gHistoryFile <> '' then
+          gHistoryFile := gHistoryFile + '/.passqlite3_history'
+        else
+          gHistoryFile := '';
+      end;
+      if gHistoryFile <> '' then LineEditLoadHistory(gHistoryFile);
+    end else
+      gHistoryFile := '';
     Result := processInput(@state);
+    if gHistoryFile <> '' then begin
+      LineEditStifleHistory(HistoryMaxEntries);
+      LineEditSaveHistory(gHistoryFile);
+      gHistoryFile := '';
+    end;
   end else
     Result := 0;
 

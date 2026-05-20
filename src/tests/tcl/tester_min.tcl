@@ -199,6 +199,31 @@ proc execsql {sql {db db}} {
   uplevel [list $db eval $sql]
 }
 
+# stepsql — upstream tester.tcl:1649..1672.  Verbatim.
+# Use the non-callback API to execute multiple SQL statements.
+proc stepsql {dbptr sql} {
+  set sql [string trim $sql]
+  set r 0
+  while {[string length $sql]>0} {
+    if {[catch {sqlite3_prepare $dbptr $sql -1 sqltail} vm]} {
+      return [list 1 $vm]
+    }
+    set sql [string trim $sqltail]
+#    while {[sqlite_step $vm N VAL COL]=="SQLITE_ROW"} {
+#      foreach v $VAL {lappend r $v}
+#    }
+    while {[sqlite3_step $vm]=="SQLITE_ROW"} {
+      for {set i 0} {$i<[sqlite3_data_count $vm]} {incr i} {
+        lappend r [sqlite3_column_text $vm $i]
+      }
+    }
+    if {[catch {sqlite3_finalize $vm} errmsg]} {
+      return [list 1 $errmsg]
+    }
+  }
+  return $r
+}
+
 # execsql2 — upstream tester.tcl:1628..1636.  Verbatim.
 # Like execsql but returns a flat list of {colname value colname value ...}.
 proc execsql2 {sql} {
@@ -282,6 +307,24 @@ set ::sqlite_options(fts5) 0
 # the engine honestly returns 0 → 1.0/1.1/1.2 fail.
 set ::sqlite_options(fast_secure_delete) 0
 set ::sqlite_options(secure_delete) 0
+# descidx1-6.1 — pas-sqlite3 builds without -DSQLITE_DEFAULT_FILE_FORMAT=1,
+# so SQLITE_DEFAULT_FILE_FORMAT defaults to 4 (sqliteInt.h:694) and main.c's
+# `#if SQLITE_DEFAULT_FILE_FORMAT<4` arm is skipped — SQLITE_LegacyFileFmt
+# is NOT in the default db->flags (passqlite3main.pas:873..883).  Mirror
+# test_config.c:491..495 which writes 0 when DEFAULT_FILE_FORMAT != 1.
+set ::sqlite_options(legacyformat) 0
+# autoinc-6.2 — pas-sqlite3 builds without SQLITE_32BIT_ROWID, so the default
+# build uses 64-bit rowids.  Mirror test_config.c:52..56 which writes 0 unless
+# SQLITE_32BIT_ROWID is defined.  Without this, `ifcapable {!rowid32}` blocks
+# (which insert INT64_MAX) are skipped and only the rowid32 32-bit arm runs.
+set ::sqlite_options(rowid32) 0
+# analyzeE/F/G, analyze3/5/8/D — this build defines neither SQLITE_ENABLE_STAT4
+# nor SQLITE_ENABLE_STAT3, so test_config.c:608..612 writes stat4=0.  Without
+# this, `ifcapable !stat4 {finish_test; return}` guards default to FALSE (cap
+# reads 1 below) and the stat4-only analyze tests run on a non-stat4 engine →
+# strict failures / timeouts.  (No test uses `ifcapable stat3`, and
+# test_config.c sets no stat3 cap, so none is added here.)
+set ::sqlite_options(stat4) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
@@ -639,12 +682,20 @@ proc crashsql {args} {
 }
 
 # Initialise the global pending-byte that tester.tcl normally sets from
-# C-side test_config.  Upstream default is 0x40000000 (1 GiB) — the
-# child crashsql script catch-guards the call, so this is purely a
-# convenience so callers that read $::sqlite_pending_byte don't trip on
-# `can't read "sqlite_pending_byte": no such variable`.
+# C-side test_config.  Upstream tester.tcl:102 calls
+#   sqlite3_test_control_pending_byte 0x0010000
+# unconditionally at load time so the locking-page is reachable in tests
+# without creating multi-GiB database files.  Our pas-sqlite3 build does
+# not yet expose sqlite3_test_control_pending_byte as a Tcl command (the
+# engine PENDING_BYTE is a compile-time constant at 0x40000000) so we
+# cannot move the actual lock byte, but we MUST still mirror the Tcl-side
+# variable to 0x10000.  Otherwise upstream tests such as backup.test and
+# backup_ioerr.test do
+#   while {[file size test.db] <= $::sqlite_pending_byte} { ... }
+# which, against a 1 GiB threshold, never terminates and looks to the
+# test driver like an engine-level deadlock (9.4.divbug.91.002 / .003).
 if {![info exists ::sqlite_pending_byte]} {
-  set ::sqlite_pending_byte 0x40000000
+  set ::sqlite_pending_byte 0x0010000
 }
 
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
@@ -1016,6 +1067,23 @@ if {[llength [info commands cksum]]==0} {
     return $cksum
   }
 }
+# dbcksum — verbatim port of tester.tcl:2176..2188.
+# Computes an md5 of $dbname's sqlite_master plus every table's contents.
+if {[llength [info commands dbcksum]]==0} {
+  proc dbcksum {db dbname} {
+    if {$dbname=="temp"} {
+      set master sqlite_temp_master
+    } else {
+      set master $dbname.sqlite_master
+    }
+    set alltab [$db eval "SELECT name FROM $master WHERE type='table'"]
+    set txt [$db eval "SELECT * FROM $master"]\n
+    foreach tab $alltab {
+      append txt [$db eval "SELECT * FROM $dbname.$tab"]\n
+    }
+    return [md5 $txt]
+  }
+}
 # output2 — verbatim port of tester.tcl: writes to stdout.
 if {[llength [info commands output2]]==0} {
   proc output2 {args} { uplevel puts $args }
@@ -1366,6 +1434,11 @@ set ::SQLITE_DEFAULT_SYNCHRONOUS 2
 set ::SQLITE_DEFAULT_WAL_SYNCHRONOUS 2
 set ::SQLITE_DEFAULT_FILE_FORMAT 4
 set ::MEMORY_MANAGEMENT 0
+# SQLITE_DEFAULT_CACHE_SIZE — sqliteLimit.h:161 default -2000.  Negative
+# means kibibytes; exclusive2.test:139/223 compares numerically against
+# nPage (db-file size in pages), so a very negative value reliably means
+# "the cache is already big enough" and skips the PRAGMA cache_size bump.
+set ::SQLITE_DEFAULT_CACHE_SIZE -2000
 
 # Minimal sqlite_options() array — upstream test_config.c populates this
 # from compile-time SQLITE_OMIT_*/SQLITE_ENABLE_* macros.  pas-sqlite3 is
@@ -1399,6 +1472,26 @@ set ::SQLITE_MAX_VARIABLE_NUMBER 32766
 if {![info exists ::cmdlinearg(soft-heap-limit)]} {
   set ::cmdlinearg(soft-heap-limit) 0
 }
+#   cmdlinearg(TESTFIXTURE_HOME): tester.tcl:497 sets this to
+#     [file dirname [info nameofexec]] so test_find_binary /
+#     test_find_db / friends (tester.tcl:2530..2536) can locate
+#     auxiliary binaries and data files relative to the testfixture
+#     executable.  Honour $env(TESTFIXTURE_HOME) when set (matches the
+#     upstream convention used by Makefile-driven runs), else fall back
+#     to the directory containing the running interpreter / [pwd].
+#     Surfaced by analyzer1.test via the read at tester_min.tcl:1616.
+if {![info exists ::cmdlinearg(TESTFIXTURE_HOME)]} {
+  if {[info exists ::env(TESTFIXTURE_HOME)]} {
+    set ::cmdlinearg(TESTFIXTURE_HOME) $::env(TESTFIXTURE_HOME)
+  } else {
+    set _tfh [file dirname [info nameofexec]]
+    if {$_tfh eq "" || $_tfh eq "."} {
+      set _tfh [pwd]
+    }
+    set ::cmdlinearg(TESTFIXTURE_HOME) $_tfh
+    unset _tfh
+  }
+}
 
 # --------------------------------------------------------------------------
 # 9.4.6.q.2 — remaining tester.tcl / malloc_common.tcl procs surfaced by
@@ -1414,6 +1507,25 @@ proc do_not_use_codec {} {
   reset_db
 }
 catch {unset -nocomplain do_not_use_codec}
+
+# sql36231 — upstream tester.tcl:2446..2456.  Opens a second connection
+# on test.db, runs the supplied SQL, closes, then restores the 4-byte
+# field at offset 28 (db size in pages) and the 8 bytes at offset 92
+# (change-counter / version-valid-for).  Simulates a write by a
+# pre-3.7.0 client that never learnt to maintain those header fields,
+# so the next 3.7+ open must derive page count from file size again.
+# Used by filefmt-2.*, 3.2 and 4.2.  Verbatim port of the upstream proc.
+proc sql36231 {sql} {
+  set B [hexio_read test.db 92 8]
+  set A [hexio_read test.db 28 4]
+  sqlite3 db36231 test.db
+  catch { db36231 func a_string a_string }
+  execsql $sql db36231
+  db36231 close
+  hexio_write test.db 28 $A
+  hexio_write test.db 92 $B
+  return ""
+}
 
 # wal_is_wal_mode / wal_set_journal_mode / wal_check_journal_mode —
 # upstream tester.tcl:2308..2321.  Used by avtrans.test (and others) to

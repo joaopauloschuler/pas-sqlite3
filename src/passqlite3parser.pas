@@ -255,19 +255,19 @@ const
   YYWILDCARD           = 102;        { TK_ANY — wildcard token }
 
   YYSTACKDEPTH         = 50;         { initial parser stack depth }
-  YYNSTATE             = 600;
+  YYNSTATE             = 604;
   YYNRULE              = 412;
   YYNRULE_WITH_ACTION  = 348;
   YYNTOKEN             = 187;
 
-  YY_MAX_SHIFT         = 599;
-  YY_MIN_SHIFTREDUCE   = 867;
-  YY_MAX_SHIFTREDUCE   = 1278;
-  YY_ERROR_ACTION      = 1279;
-  YY_ACCEPT_ACTION     = 1280;
-  YY_NO_ACTION         = 1281;
-  YY_MIN_REDUCE        = 1282;
-  YY_MAX_REDUCE        = 1693;
+  YY_MAX_SHIFT         = 603;
+  YY_MIN_SHIFTREDUCE   = 871;
+  YY_MAX_SHIFTREDUCE   = 1282;
+  YY_ERROR_ACTION      = 1283;
+  YY_ACCEPT_ACTION     = 1284;
+  YY_NO_ACTION         = 1285;
+  YY_MIN_REDUCE        = 1286;
+  YY_MAX_REDUCE        = 1697;
 
   YY_MIN_DSTRCTR       = 206;
   YY_MAX_DSTRCTR       = 319;
@@ -363,13 +363,6 @@ type
     pParse:     Pointer;                               { %extra_context — PParse }
     yystackEnd: PyyStackEntry;                         { last entry in stack }
     yystack:    PyyStackEntry;                         { the parser stack base }
-    { 9.4.divbug.80 — Track the most-recently-reduced DELETE/UPDATE arm
-      so yy_syntax_error can emit the SQLite "ORDER BY without LIMIT on
-      DELETE/UPDATE" message instead of a bare "near ORDER" when the
-      grammar (built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT) rejects
-      a trailing ORDER BY / LIMIT.  0 = none; 152 = DELETE arm,
-      159 = UPDATE arm.  Cleared on shift. }
-    lastDmlRule: u32;
     yystk0:     array[0..YYSTACKDEPTH-1] of yyStackEntry; { initial stack space }
   end;
   PyyParser = ^yyParser;
@@ -1613,38 +1606,11 @@ begin
   pPse := PParse(yypParser^.pParse);
   if pPse = nil then Exit;
   db := pPse^.db;
-  { 9.4.divbug.80 — when the immediately-preceding reduction was the
-    DELETE arm (rule 152) or the UPDATE arm (rule 159) and the offending
-    lookahead is ORDER or LIMIT, replicate the message that delete.c:201
-    / update.c:212 emit when SQLITE_ENABLE_UPDATE_DELETE_LIMIT is built
-    (wherelimit-0.1 / 0.2 / 0.3 expect "ORDER BY without LIMIT on …").
-    Our Lemon tables are generated without that conditional arm, so the
-    only signal is at error time. }
-  if ((yymajor = TK_ORDER) or (yymajor = TK_LIMIT))
-     and (yypParser^.lastDmlRule <> 0) then begin
-    if yymajor = TK_ORDER then begin
-      if yypParser^.lastDmlRule = 152 then
-        zMsg := sqlite3MPrintf(db, 'ORDER BY without LIMIT on DELETE', [])
-      else
-        zMsg := sqlite3MPrintf(db, 'ORDER BY without LIMIT on UPDATE', []);
-    end else begin
-      if yypParser^.lastDmlRule = 152 then
-        zMsg := sqlite3MPrintf(db, 'LIMIT clause should come after %s not before',
-          [PAnsiChar('DELETE')])
-      else
-        zMsg := sqlite3MPrintf(db, 'LIMIT clause should come after %s not before',
-          [PAnsiChar('UPDATE')]);
-    end;
-    Inc(pPse^.nErr);
-    pPse^.rc := SQLITE_ERROR;
-    if zMsg <> nil then begin
-      if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
-      pPse^.zErrMsg := zMsg;
-    end;
-    yypParser^.lastDmlRule := 0;
-    if yymajor = 0 then ;
-    Exit;
-  end;
+  { SQLITE_ENABLE_UPDATE_DELETE_LIMIT is now built (UDL-capable parser),
+    so trailing ORDER BY / LIMIT on DELETE/UPDATE is accepted by the
+    grammar and the "ORDER BY without LIMIT on …" diagnostic is raised by
+    sqlite3LimitWhere (codegen) rather than at parse-error time.  The old
+    lastDmlRule workaround is therefore retired. }
   if (yyminor.z <> nil) and (yyminor.z^ <> #0) then begin
     { parse.c yy_syntax_error: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", &TOKEN);
       sqlite3ErrorMsg in this codebase has no varargs overload — inline
@@ -1884,6 +1850,7 @@ var
   ok:    i32;
   i:     i64;
   doAdd: i32;
+  zVarMsg: PAnsiChar;
 begin
   if pExpr = nil then Exit;
   db := pPse^.db;
@@ -1903,7 +1870,14 @@ begin
       end;
       if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
       begin
-        sqlite3ErrorMsg(pPse, 'variable number out of range');
+        { expr.c:1350 — "variable number must be between ?1 and ?%d".
+          sqlite3ErrorMsg has no varargs overload here, so format the
+          SQLITE_LIMIT_VARIABLE_NUMBER bound via sqlite3MPrintf first. }
+        zVarMsg := sqlite3MPrintf(db,
+          'variable number must be between ?1 and ?%d',
+          [db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]]);
+        sqlite3ErrorMsg(pPse, zVarMsg);
+        sqlite3DbFree(db, zVarMsg);
         sqlite3RecordErrorOffsetOfExpr(db, pExpr);
         Exit;
       end;
@@ -2808,9 +2782,14 @@ var
   tok_180_full: TToken;
   tok_181_z0:  PAnsiChar;
   tok_181_z1:  PAnsiChar;
+  tok_181_t0:  TToken;
+  tok_181_t1:  TToken;
   tok_182_z0:  PAnsiChar;
   tok_182_z1:  PAnsiChar;
   tok_182_z2:  PAnsiChar;
+  tok_182_t0:  TToken;
+  tok_182_t1:  TToken;
+  tok_182_t2:  TToken;
   { Phase 7.2e.5 locals (rules 200..249). }
   pList_206:   PExprList;
   bNot_206:    i32;
@@ -3470,14 +3449,17 @@ begin
     151: { limit_opt ::= LIMIT expr COMMA expr }
        yymsp[-3].minor.yy454 := sqlite3PExpr(pPse, TK_LIMIT,
          PExpr(yymsp[0].minor.yy454), PExpr(yymsp[-2].minor.yy454));
-    152: { cmd ::= with DELETE FROM xfullname indexed_opt where_opt_ret }
+    152: { cmd ::= with DELETE FROM xfullname indexed_opt where_opt_ret orderby_opt limit_opt }
        begin
-         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-2].minor.yy203),
-           @yymsp[-1].minor.yy0);
-         sqlite3DeleteFrom(pPse, PSrcList(yymsp[-2].minor.yy203),
-           PExpr(yymsp[0].minor.yy454), nil, nil);
-         { 9.4.divbug.80 — flag DELETE arm for wherelimit-0.1 error path. }
-         yypParser^.lastDmlRule := 152;
+         { SQLITE_ENABLE_UPDATE_DELETE_LIMIT — UDL-capable parser; the
+           orderby_opt/limit_opt RHS slots are real (parse.y:977..995) and
+           passed straight through to sqlite3DeleteFrom, which wires
+           sqlite3LimitWhere (delete.c:372..380). }
+         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-4].minor.yy203),
+           @yymsp[-3].minor.yy0);
+         sqlite3DeleteFrom(pPse, PSrcList(yymsp[-4].minor.yy203),
+           PExpr(yymsp[-2].minor.yy454), PExprList(yymsp[-1].minor.yy14),
+           PExpr(yymsp[0].minor.yy454));
        end;
     153, 155, 232, 233, 252, 268, 286:
        { where_opt ::=;  where_opt_ret ::=;  case_else ::=;
@@ -3498,13 +3480,15 @@ begin
          sqlite3AddReturning(pPse, PExprList(yymsp[0].minor.yy14));
          yymsp[-3].minor.yy454 := yymsp[-2].minor.yy454;
        end;
-    159: { cmd ::= with UPDATE orconf xfullname indexed_opt SET setlist from where_opt_ret }
+    159: { cmd ::= with UPDATE orconf xfullname indexed_opt SET setlist from where_opt_ret orderby_opt limit_opt }
        begin
-         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-5].minor.yy203),
-           @yymsp[-4].minor.yy0);
-         sqlite3ExprListCheckLength(pPse, PExprList(yymsp[-2].minor.yy14),
-           'set list');
-         pFromCl_159 := PSrcList(yymsp[-1].minor.yy203);
+         { SQLITE_ENABLE_UPDATE_DELETE_LIMIT — UDL-capable parser; the
+           orderby_opt/limit_opt RHS slots are real (parse.y:1013..1038) and
+           passed straight through to sqlite3Update, which wires
+           sqlite3LimitWhere (update.c:398..406). }
+         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-7].minor.yy203),
+           @yymsp[-6].minor.yy0);
+         pFromCl_159 := PSrcList(yymsp[-3].minor.yy203);
          if pFromCl_159 <> nil then begin
            if pFromCl_159^.nSrc > 1 then begin
              pSubq_159 := sqlite3SelectNew(pPse, nil, pFromCl_159, nil, nil,
@@ -3514,14 +3498,15 @@ begin
              pFromCl_159 := sqlite3SrcListAppendFromTerm(pPse, nil, nil, nil,
                @as_159, pSubq_159, nil, nil);
            end;
-           yymsp[-5].minor.yy203 := sqlite3SrcListAppendList(pPse,
-             PSrcList(yymsp[-5].minor.yy203), pFromCl_159);
+           yymsp[-7].minor.yy203 := sqlite3SrcListAppendList(pPse,
+             PSrcList(yymsp[-7].minor.yy203), pFromCl_159);
          end;
-         sqlite3Update(pPse, PSrcList(yymsp[-5].minor.yy203),
-           PExprList(yymsp[-2].minor.yy14), PExpr(yymsp[0].minor.yy454),
-           yymsp[-6].minor.yy144, nil, nil, nil);
-         { 9.4.divbug.80 — flag UPDATE arm for wherelimit-0.3 error path. }
-         yypParser^.lastDmlRule := 159;
+         sqlite3ExprListCheckLength(pPse, PExprList(yymsp[-4].minor.yy14),
+           'set list');
+         sqlite3Update(pPse, PSrcList(yymsp[-7].minor.yy203),
+           PExprList(yymsp[-4].minor.yy14), PExpr(yymsp[-2].minor.yy454),
+           yymsp[-8].minor.yy144, PExprList(yymsp[-1].minor.yy14),
+           PExpr(yymsp[0].minor.yy454), nil);
        end;
     160: { setlist ::= setlist COMMA nm EQ expr }
        begin
@@ -3614,41 +3599,64 @@ begin
        end;
     181: { expr ::= nm DOT nm }
        begin
-         tok_181_z0 := yymsp[-2].minor.yy0.z;
-         tok_181_z1 := yymsp[0].minor.yy0.z;
+         { parse.y:1178 — C builds each TK_ID through tokenExpr (parse.y:1140),
+           which under IN_RENAME_OBJECT records the Expr pointer with its
+           source token via sqlite3RenameTokenMap.  The earlier port skipped
+           that map, so qualified `tbl.col` refs inside trigger bodies were
+           never remapped by sqlite_rename_column (altertab2/altertrig). }
+         tok_181_t0 := yymsp[-2].minor.yy0;
+         tok_181_t1 := yymsp[0].minor.yy0;
+         tok_181_z0 := tok_181_t0.z;
+         tok_181_z1 := tok_181_t1.z;
          temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[-2].minor.yy0, 1);
+           @tok_181_t0, 1);
          if temp1_181 <> nil then
            temp1_181^.w.iOfst :=
              i32(PtrUInt(tok_181_z0) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp1_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp1_181), @tok_181_t0);
          temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[0].minor.yy0, 1);
+           @tok_181_t1, 1);
          if temp2_181 <> nil then
            temp2_181^.w.iOfst :=
              i32(PtrUInt(tok_181_z1) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp2_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp2_181), @tok_181_t1);
          yylhsminor.yy454 := sqlite3PExpr(pPse, TK_DOT, temp1_181, temp2_181);
          yymsp[-2].minor.yy454 := yylhsminor.yy454;
        end;
     182: { expr ::= nm DOT nm DOT nm }
        begin
-         tok_182_z0 := yymsp[-4].minor.yy0.z;
-         tok_182_z1 := yymsp[-2].minor.yy0.z;
-         tok_182_z2 := yymsp[0].minor.yy0.z;
+         { parse.y:1183 — like rule 181, each TK_ID is built through tokenExpr
+           and so gets a rename-token map under IN_RENAME_OBJECT; the db-name
+           node is then remapped to 0 (dropped) right before assembly. }
+         tok_182_t0 := yymsp[-4].minor.yy0;
+         tok_182_t1 := yymsp[-2].minor.yy0;
+         tok_182_t2 := yymsp[0].minor.yy0;
+         tok_182_z0 := tok_182_t0.z;
+         tok_182_z1 := tok_182_t1.z;
+         tok_182_z2 := tok_182_t2.z;
          temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[-4].minor.yy0, 1);
+           @tok_182_t0, 1);
          if temp1_181 <> nil then
            temp1_181^.w.iOfst :=
              i32(PtrUInt(tok_182_z0) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp1_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp1_181), @tok_182_t0);
          temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[-2].minor.yy0, 1);
+           @tok_182_t1, 1);
          if temp2_181 <> nil then
            temp2_181^.w.iOfst :=
              i32(PtrUInt(tok_182_z1) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp2_181 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp2_181), @tok_182_t1);
          temp3_182 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
-           @yymsp[0].minor.yy0, 1);
+           @tok_182_t2, 1);
          if temp3_182 <> nil then
            temp3_182^.w.iOfst :=
              i32(PtrUInt(tok_182_z2) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (temp3_182 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(temp3_182), @tok_182_t2);
          temp4_182 := sqlite3PExpr(pPse, TK_DOT, temp2_181, temp3_182);
          if InRenameObject(pPse) then
            sqlite3RenameTokenRemap(pPse, nil, temp1_181);

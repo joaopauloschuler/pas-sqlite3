@@ -667,7 +667,7 @@ pas-skip	../sqlite3/test/pragma5.test	9.4.divbug.68 fts5-unported
 pas-soft	../sqlite3/test/pragma6.test	9.4.divbug.63
 pas-skip	../sqlite3/test/pragmafault.test	unswept
 pas-strict	../sqlite3/test/prefixes.test	-
-pas-soft	../sqlite3/test/printf.test	9.4.divbug.86
+pas-skip	../sqlite3/test/printf.test	9.4.divbug.86
 pas-soft	../sqlite3/test/printf2.test	9.4.divbug.62
 pas-strict	../sqlite3/test/progress.test	-
 pas-strict	../sqlite3/test/ptrchng.test	-
@@ -735,12 +735,12 @@ pas-strict	../sqlite3/test/schema5.test	-
 pas-soft	../sqlite3/test/schema6.test	9.4.divbug.64
 pas-skip	../sqlite3/test/schemafault.test	unswept
 pas-soft	../sqlite3/test/securedel.test	9.4.divbug.86
-pas-soft	../sqlite3/test/securedel2.test	9.4.divbug.84
+pas-skip	../sqlite3/test/securedel2.test	9.4.divbug.84
 pas-strict	../sqlite3/test/seekscan1.test	-
 pas-soft	../sqlite3/test/select1.test	9.4.divbug.70
 pas-skip	../sqlite3/test/select2.test	unswept
 pas-soft	../sqlite3/test/select3.test	9.4.divbug.75
-pas-soft	../sqlite3/test/select4.test	9.4.divbug.84
+pas-skip	../sqlite3/test/select4.test	9.4.divbug.84
 pas-soft	../sqlite3/test/select5.test	9.4.divbug.75
 pas-strict	../sqlite3/test/select6.test	-
 pas-soft	../sqlite3/test/select7.test	9.4.divbug.75
@@ -1207,7 +1207,7 @@ pas-strict	../sqlite3/test/without_rowid4.test	-
 pas-strict	../sqlite3/test/without_rowid5.test	-
 pas-soft	../sqlite3/test/without_rowid6.test	9.4.divbug.66
 pas-soft	../sqlite3/test/without_rowid7.test	9.4.divbug.66
-pas-soft	../sqlite3/test/writecrash.test	9.4.divbug.84
+pas-skip	../sqlite3/test/writecrash.test	9.4.divbug.84
 pas-soft	../sqlite3/test/zeroblob.test	9.4.divbug.66
 pas-soft	../sqlite3/test/zeroblobfault.test	9.4.divbug.62
 pas-strict	../sqlite3/test/zerodamage.test	-

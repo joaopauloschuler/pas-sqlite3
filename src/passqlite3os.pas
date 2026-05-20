@@ -3149,6 +3149,8 @@ begin
     pShmNode^.zFilename := zShm;
     StrCopy(zShm, pDbFd^.zPath);
     StrCat(zShm, '-shm');
+    { os_unix.c:5006 — rewrite to 8.3 form when URI requests it }
+    sqlite3FileSuffix3(pDbFd^.zPath, zShm);
 
     pShmNode^.hShm := -1;
     pShmNode^.pInode := pDbFd^.pInode;

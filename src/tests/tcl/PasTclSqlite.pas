@@ -34,7 +34,8 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3parser,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
      passqlite3percentile, passqlite3regexp,
-     TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
+     TestModuleMd5, TestModuleTclvar, TestModuleBestindex,
+     TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
      TestModuleVfs;
 
@@ -59,6 +60,11 @@ type
   TTclObjTypePeek = record
     name: PAnsiChar;
   end;
+
+var
+  { Backing storage for the Tcl_LinkVar-exposed $SQLITE_MAX_ATTACHED.
+    Initialised inside Sqlite3_Init; READ_ONLY on the Tcl side. }
+  cv_max_attached: cint;
 
 function TclObjTypeName(p: PTclObj): PAnsiChar;
 var
@@ -1474,12 +1480,18 @@ begin
       DbBindOneParam(pDb, pStmt, iParam, zParamName, nil, nil);
     end;
 
-    nCol := sqlite3_column_count(pStmt);
+    { Defer sqlite3_column_count until AFTER the first sqlite3_step.  An
+      automatic SQLITE_SCHEMA reprepare inside step (VdbeSwap) can change
+      the column count, and capturing it before stepping would freeze the
+      stale value (alter2-1.3/2.2/3.3/7.2: SELECT * after a writable_schema
+      ALTER returned only the pre-ALTER columns per row). }
+    nCol := 0;
 
     repeat
       rcStep := sqlite3_step(pStmt);
       if rcStep = SQLITE_ROW then
       begin
+        if nCol = 0 then nCol := sqlite3_column_count(pStmt);
         if pScript = nil then
         begin
           { objc==3: accumulate typed column values onto the flat list. }
@@ -3259,13 +3271,9 @@ function DbOneColumnExistsArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj; bExists: Boolean): cint; cdecl;
 var
   pDb:      PSqliteDb;
-  zSql:     PAnsiChar;
-  pStmt:    Pointer;
-  rc:       i32;
-  rcStep:   i32;
   pResult:  PTclObj;
-  zNullStr: PAnsiChar;
-  emptyNull: array[0..0] of AnsiChar;
+  sEval:    TDbEvalContext;
+  rc:       cint;
 begin
   if objc <> 3 then
   begin
@@ -3274,60 +3282,36 @@ begin
     Exit;
   end;
 
-  pDb  := PSqliteDb(clientData);
-  zSql := Tcl_GetStringFromObj(ObjvAt(objv, 2), nil);
-  pStmt := nil;
-  rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, nil);
-  if rc <> SQLITE_OK then
-  begin
-    if pStmt <> nil then sqlite3_finalize(pStmt);
-    Tcl_SetObjResult(interp,
-      Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
-    Result := TCL_ERROR;
-    Exit;
-  end;
-  if pStmt = nil then
-  begin
-    { No statement compiled (empty / comment-only SQL) — behaves like
-      "no rows". }
-    if bExists then
-      Tcl_SetObjResult(interp, Tcl_NewBooleanObj(0));
-    Result := TCL_OK;
-    Exit;
-  end;
-
-  rcStep := sqlite3_step(pStmt);
+  pDb     := PSqliteDb(clientData);
   pResult := nil;
+
+  { Faithful port of tclsqlite.c:3259..3286 (DB_EXISTS / DB_ONECOLUMN):
+    iterate dbEvalStep so multi-statement scripts like
+      "COMMIT; SELECT count(*) FROM t1"
+    skip statements that produce no rows and return the first row of
+    the first row-producing statement (or "" / 0 if none).  The previous
+    single-prepare path only ever compiled the FIRST statement (pzTail
+    discarded), so a leading COMMIT swallowed the trailing SELECT and
+    `db one` returned empty — surfaces as btree02-110 expected 10 got [].
+    (9.4.divbug.90.001.) }
+  DbEvalInit(@sEval, pDb, ObjvAt(objv, 2), nil, 0);
+  rc := DbEvalStep(@sEval);
   if not bExists then
   begin
-    { onecolumn: return column 0 of the first row, or "" if no rows. }
-    if rcStep = SQLITE_ROW then
-    begin
-      emptyNull[0] := #0;
-      if pDb^.zNull <> nil then zNullStr := pDb^.zNull
-      else zNullStr := @emptyNull[0];
-      pResult := DbEvalColumnValue(pStmt, 0, zNullStr);
-    end;
+    if rc = TCL_OK then
+      pResult := DbEvalColumnValueCtx(@sEval, 0)
+    else if rc = TCL_BREAK then
+      Tcl_ResetResult(interp);
   end
-  else
-  begin
-    { exists: 1 if the query produced a row, else 0. }
-    if (rcStep = SQLITE_ROW) or (rcStep = SQLITE_DONE) then
-      pResult := Tcl_NewBooleanObj(Ord(rcStep = SQLITE_ROW));
-  end;
+  else if (rc = TCL_BREAK) or (rc = TCL_OK) then
+    pResult := Tcl_NewBooleanObj(Ord(rc = TCL_OK));
 
-  rc := sqlite3_finalize(pStmt);
-  if (rc <> SQLITE_OK) and (rcStep <> SQLITE_ROW) then
-  begin
-    Tcl_SetObjResult(interp,
-      Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
-    Result := TCL_ERROR;
-    Exit;
-  end;
-
+  DbEvalFinalize(@sEval);
   if pResult <> nil then
     Tcl_SetObjResult(interp, pResult);
-  Result := TCL_OK;
+
+  if rc = TCL_BREAK then rc := TCL_OK;
+  Result := rc;
 end;
 
 { DbCacheArm — port of the DB_CACHE arm of DbObjCmd (tclsqlite.c:2678..
@@ -4144,8 +4128,11 @@ begin
   end;
 
   { authorizer — tclsqlite.c:2503 (DB_AUTHORIZER).  sqlite3_set_authorizer
-    shim. }
-  if (zSub <> nil) and (StrComp(zSub, 'authorizer') = 0) then
+    shim.  The `auth` short form is accepted as a unique prefix (C's
+    Tcl_GetIndexFromObj does prefix matching; tests in alterauth*.test
+    invoke `db auth xAuth`). }
+  if (zSub <> nil) and ((StrComp(zSub, 'authorizer') = 0)
+                    or  (StrComp(zSub, 'auth') = 0)) then
   begin
     Result := DbAuthorizerArm(clientData, interp, objc, objv);
     Exit;
@@ -4912,6 +4899,8 @@ begin
   Md5_Init(interp);
   { 9.4.6.l.2 — test_tclvar.c: register the `register_tclvar_module` cmd. }
   Sqlitetesttclvar_Init(interp);
+  { test_bestindex.c: register the `register_tcl_module` cmd. }
+  Sqlitetesttcl_Init(interp);
   { 9.4.6.l.1 — test8.c: register_echo_module / sqlite3_declare_vtab. }
   Sqlitetest8_Init(interp);
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
@@ -4943,6 +4932,13 @@ begin
               @sqlite3_search_count, TCL_LINK_INT);
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
               @sqlite3_sort_count, TCL_LINK_INT);
+  { Shard 0 fix 2 — attach4.test / attach.test / sqllimits1.test / wal.test
+    read $SQLITE_MAX_ATTACHED.  Mirror the C test_config.c:827 LINKVAR
+    so the Tcl side sees the same compiled-in limit.  TCL_LINK_READ_ONLY
+    matches the C macro semantics. }
+  cv_max_attached := SQLITE_MAX_ATTACHED;
+  Tcl_LinkVar(interp, PChar('SQLITE_MAX_ATTACHED'),
+              @cv_max_attached, TCL_LINK_INT or TCL_LINK_READ_ONLY);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;

@@ -795,6 +795,7 @@ function  sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
 function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
 function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
+procedure sqlite3FileSuffix3(zBaseFilename, z: PChar);
 function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
 function sqlite3_uri_key(zFilename: PChar; N: i32): PChar;
 function sqlite3_filename_database(zFilename: PChar): PChar;
@@ -2157,32 +2158,46 @@ begin
   end;
   Inc(i); { restore 1-based }
   h := BITVEC_HASH(i - 1);
+  { 9.4.divbug.89.005/006 — fix dropped rehash branch.  C bitvec.c:189..206
+    falls *through* from the collision-probe loop into bitvec_set_rehash
+    (which then conditionally rehashes when nSet>=BITVEC_MXHASH).  The
+    original Pas port jumped to bitvec_set_end instead, so the hash table
+    would fill past BITVEC_NINT-1 without ever sub-dividing — and the next
+    Set() with all slots non-zero loops forever in the collision while.
+    Manifested as DROP INDEX hanging once the freelist bitvec crossed
+    ~3968 pages (>BITVEC_NBIT). }
   if p^.u.aHash[h] = 0 then begin
     if p^.nSet < u32(BITVEC_NINT - 1) then
       goto bitvec_set_end
     else
       goto bitvec_set_rehash;
   end;
-  { collision check }
-  while p^.u.aHash[h] <> 0 do begin
+  { collision: probe until empty slot or duplicate match }
+  repeat
     if p^.u.aHash[h] = i then Exit(SQLITE_OK);
-    h := (h + 1) mod u32(BITVEC_NINT);
-  end;
-  goto bitvec_set_end;
+    h := h + 1;
+    if h >= u32(BITVEC_NINT) then h := 0;
+  until p^.u.aHash[h] = 0;
+  { fall through to rehash gate (C bitvec.c:207..210) }
 
 bitvec_set_rehash:
-  p^.iDivisor := (p^.iSize + u32(BITVEC_NPTR) - 1) div u32(BITVEC_NPTR);
-  pNew := sqlite3BitvecCreate(p^.iSize);
-  if pNew = nil then Exit(SQLITE_NOMEM_BKPT);
-  for j := 0 to u32(BITVEC_NINT) - 1 do begin
-    if p^.u.aHash[j] <> 0 then begin
-      rc := sqlite3BitvecSet(pNew, p^.u.aHash[j]);
-      if rc <> SQLITE_OK then begin sqlite3BitvecDestroy(pNew); Exit(rc); end;
+  if p^.nSet >= u32(BITVEC_MXHASH) then begin
+    p^.iDivisor := p^.iSize div u32(BITVEC_NPTR);
+    if (p^.iSize mod u32(BITVEC_NPTR)) <> 0 then Inc(p^.iDivisor);
+    if p^.iDivisor < u32(BITVEC_NBIT) then p^.iDivisor := u32(BITVEC_NBIT);
+    pNew := PBitvec(sqlite3MallocZero(SizeOf(TBitvec)));
+    if pNew = nil then Exit(SQLITE_NOMEM_BKPT);
+    libc_memcpy(@pNew^.u.aHash[0], @p^.u.aHash[0], SizeOf(p^.u.aHash));
+    FillChar(p^.u.apSub, SizeOf(p^.u.apSub), 0);
+    p^.nSet := 0;
+    rc := sqlite3BitvecSet(p, i);
+    for j := 0 to u32(BITVEC_NINT) - 1 do begin
+      if pNew^.u.aHash[j] <> 0 then
+        rc := rc or sqlite3BitvecSet(p, pNew^.u.aHash[j]);
     end;
+    sqlite3_free(pNew);
+    Exit(rc);
   end;
-  libc_memcpy(p, pNew, SizeOf(TBitvec));
-  sqlite3_free(pNew);
-  Exit(sqlite3BitvecSet(p, i));
 
 bitvec_set_end:
   Inc(p^.nSet);
@@ -3151,6 +3166,29 @@ begin
   if bDflt <> 0 then df := 1 else df := 0;
   if z <> nil then Result := sqlite3GetBoolean(z, df)
   else Result := df;
+end;
+
+{ util.c:2056..2067 — sqlite3FileSuffix3.
+
+  If SQLITE_ENABLE_8_3_NAMES is set at compile-time and zBaseFilename's URI
+  has 8_3_names=1 (or build-level 2), shorten z[]'s suffix to its last 3
+  chars so journal/wal/shm pathnames fit 8.3 form:
+    test.db-journal => test.nal
+    test.db-wal     => test.wal
+    test.db-shm     => test.shm
+
+  In pas-sqlite3 we always compile this in and gate purely on the URI flag,
+  so the same binary behaves correctly with or without 8_3_names=1. }
+procedure sqlite3FileSuffix3(zBaseFilename, z: PChar);
+var
+  i, sz: i32;
+begin
+  if sqlite3_uri_boolean(zBaseFilename, '8_3_names', 0) = 0 then Exit;
+  sz := sqlite3Strlen30(z);
+  i := sz - 1;
+  while (i > 0) and (z[i] <> '/') and (z[i] <> '.') do Dec(i);
+  if (z[i] = '.') and (sz > i + 4) then
+    Move(z[sz - 3], z[i + 1], 4);  { copies 3 chars + trailing NUL }
 end;
 
 { main.c ~4907: sqlite3_uri_int64 }

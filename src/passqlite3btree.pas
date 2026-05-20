@@ -487,6 +487,7 @@ function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
 function  sqlite3BtreeIsReadonly(p: PBtree): i32;
 function  sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
+function  sqlite3BtreeGetJournalname(p: PBtree): PAnsiChar;
 function  sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
                                  pnLog, pnCkpt: PcInt): i32;
 
@@ -1132,14 +1133,22 @@ end;
   =========================================================================== }
 function cellSizePtrNoPayload(pPage: PMemPage; pCell: Pu8): u16;
 var
-  pIter: Pu8;
-  pEnd : Pu8;
+  pIter   : Pu8;
+  pEnd    : Pu8;
+  hadHigh : Boolean;
 begin
   pIter := pCell + 4;
   pEnd  := pIter + 9;
-  while (pIter[0] and $80 <> 0) and (pIter < pEnd) do
+  { btree.c:1509  while( (*pIter++)&0x80 && pIter<pEnd );
+    The byte is read and pIter advanced together (post-increment), THEN both
+    conditions are tested.  A naive `while (hi) and (pIter<pEnd) do Inc` plus a
+    trailing Inc over-counts by one when the rowid needs the full 9-byte varint
+    (every one of the first 8 bytes has its high bit set), making an interior
+    cell appear 1 byte too long and corrupting integrity_check / balance. }
+  repeat
+    hadHigh := (pIter[0] and $80) <> 0;
     Inc(pIter);
-  Inc(pIter);
+  until (not hadHigh) or (pIter >= pEnd);
   Result := u16(pIter - pCell);
 end;
 
@@ -3262,6 +3271,9 @@ begin
   end;
   d1 := szHdr1;
   if d1 > u32(nKey1) then begin
+    { Corruption — match C vdbeaux.c:4770 errCode assignment so caller
+      IndexMoveto can promote rc to SQLITE_CORRUPT_BKPT (divbug.88.018). }
+    pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
     Result := 0;
     Exit;
   end;
@@ -3313,7 +3325,10 @@ begin
       else begin
         nStr := i32((serial_type - 12) shr 1);
         if (d1 + u32(nStr)) > u32(nKey1) then begin
-          { Corruption — match C return-0-without-eqSeen }
+          { Corruption — match C return-0-without-eqSeen.  Also set
+            errCode so IndexMoveto can promote to SQLITE_CORRUPT
+            (vdbeaux.c:4854, divbug.88.018). }
+          pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
           Result := 0;
           Exit;
         end;
@@ -3379,6 +3394,9 @@ begin
       else begin
         nStr := i32((serial_type - 12) shr 1);
         if (d1 + u32(nStr)) > u32(nKey1) then begin
+          { Corruption — vdbeaux.c:4885; flag errCode for caller
+            (divbug.88.018). }
+          pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
           Result := 0;
           Exit;
         end;
@@ -3443,6 +3461,9 @@ begin
       Inc(idx1, vTmp32);
     end;
     if idx1 >= szHdr1 then begin
+      { Corrupt index — vdbeaux.c:4944 errCode propagation
+        (divbug.88.018). }
+      pIdxKey^.errCode := SQLITE_CORRUPT_BKPT;
       Result := 0;
       Exit;
     end;
@@ -3755,6 +3776,10 @@ begin
     Exit;
   end;
 
+  { Initialise errCode so corruption arms in the comparator have a clean
+    slate (btree.c:6042; divbug.88.018). }
+  pIdxKey^.errCode := 0;
+
   { Skip-to-root optimization — mirrors btree.c:6049..6083.
     Two cases:
       (1) cursor is at the *last cell* of the table and pIdxKey >= that
@@ -3861,6 +3886,10 @@ bypass_moveto_root:
         pRes^ := 0;
         rc := SQLITE_OK;
         pCur^.ix := u16(idx);
+        { btree.c:6197 — comparator may have stashed CORRUPT/NOMEM in
+          errCode even when reporting equality; propagate so caller
+          sees the malformed-disk-image error (divbug.88.018). }
+        if pIdxKey^.errCode <> 0 then rc := SQLITE_CORRUPT_BKPT;
         goto moveto_index_finish;
       end;
       if lwr > upr then break;
@@ -4678,6 +4707,8 @@ var
   iNewTrunk: Pgno;
   pNewTrunk: PMemPage;
   pPg      : PMemPage;
+  searchList: u8;
+  eType    : u8;
 label
   end_allocate_page;
 begin
@@ -4695,8 +4726,26 @@ begin
 
   rc := SQLITE_OK;
   if n > 0 then begin
-    { Reuse a page from the freelist }
+    { There are pages on the freelist.  Reuse one of those pages. }
     nSearch := 0;
+    searchList := 0;
+
+    { btree.c:6535..6550 — if eMode=BTALLOC_EXACT and the pointer-map shows
+      that page `nearby` is on the free-list, search the whole list for it;
+      for BTALLOC_LE always search. }
+    if eMode = BTALLOC_EXACT then begin
+      if nearby <= mxPage then begin
+        rc := ptrmapGet(pBt, nearby, eType, iPage);
+        if rc <> SQLITE_OK then begin
+          Result := rc;
+          Exit;
+        end;
+        if eType = PTRMAP_FREEPAGE then
+          searchList := 1;
+      end;
+    end else if eMode = BTALLOC_LE then
+      searchList := 1;
+
     rc := sqlite3PagerWrite(pPage1^.pDbPage);
     if rc <> SQLITE_OK then begin
       Result := rc;
@@ -4704,6 +4753,8 @@ begin
     end;
     sqlite3Put4byte(@pPage1^.aData[36], n - 1);
 
+    { The loop runs once if searchList is false; otherwise once per trunk
+      page until the target page is located (btree.c:6564..6739). }
     repeat
       pPrevTrunk := pTrunk;
       if pPrevTrunk <> nil then
@@ -4723,8 +4774,9 @@ begin
       end;
 
       k := sqlite3Get4byte(@pTrunk^.aData[4]);
-      if k = 0 then begin
-        { Trunk has no leaves — use trunk page itself }
+      if (k = 0) and (searchList = 0) then begin
+        { Trunk has no leaves and the list is not being searched — use the
+          trunk page itself as the newly allocated page. }
         rc := sqlite3PagerWrite(pTrunk^.pDbPage);
         if rc <> SQLITE_OK then
           goto end_allocate_page;
@@ -4735,7 +4787,56 @@ begin
       end else if k > (pBt^.usableSize div 4 - 2) then begin
         rc := SQLITE_CORRUPT_BKPT;
         goto end_allocate_page;
-      end else begin
+      end else if (searchList <> 0)
+               and ((nearby = iTrunk)
+                    or ((iTrunk < nearby) and (eMode = BTALLOC_LE))) then begin
+        { btree.c:6611..6671 — the trunk page itself is the page to allocate. }
+        pPgno := iTrunk;
+        ppPage := pTrunk;
+        searchList := 0;
+        rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+        if rc <> SQLITE_OK then
+          goto end_allocate_page;
+        if k = 0 then begin
+          if pPrevTrunk = nil then
+            Move(pTrunk^.aData[0], pPage1^.aData[32], 4)
+          else begin
+            rc := sqlite3PagerWrite(pPrevTrunk^.pDbPage);
+            if rc <> SQLITE_OK then
+              goto end_allocate_page;
+            Move(pTrunk^.aData[0], pPrevTrunk^.aData[0], 4);
+          end;
+        end else begin
+          { Trunk required by caller but has leaf pointers; the first leaf
+            becomes a trunk page. }
+          iNewTrunk := sqlite3Get4byte(@pTrunk^.aData[8]);
+          if iNewTrunk > mxPage then begin
+            rc := SQLITE_CORRUPT_BKPT;
+            goto end_allocate_page;
+          end;
+          rc := btreeGetUnusedPage(pBt, iNewTrunk, pNewTrunk, 0);
+          if rc <> SQLITE_OK then
+            goto end_allocate_page;
+          rc := sqlite3PagerWrite(pNewTrunk^.pDbPage);
+          if rc <> SQLITE_OK then begin
+            releasePage(pNewTrunk);
+            goto end_allocate_page;
+          end;
+          Move(pTrunk^.aData[0], pNewTrunk^.aData[0], 4);
+          sqlite3Put4byte(@pNewTrunk^.aData[4], k - 1);
+          Move(pTrunk^.aData[12], pNewTrunk^.aData[8], (k - 1) * 4);
+          releasePage(pNewTrunk);
+          if pPrevTrunk = nil then
+            sqlite3Put4byte(@pPage1^.aData[32], iNewTrunk)
+          else begin
+            rc := sqlite3PagerWrite(pPrevTrunk^.pDbPage);
+            if rc <> SQLITE_OK then
+              goto end_allocate_page;
+            sqlite3Put4byte(@pPrevTrunk^.aData[0], iNewTrunk);
+          end;
+        end;
+        pTrunk := nil;
+      end else if k > 0 then begin
         { Extract a leaf from trunk }
         aData := pTrunk^.aData;
         if nearby > 0 then begin
@@ -4770,29 +4871,34 @@ begin
           rc := SQLITE_CORRUPT_BKPT;
           goto end_allocate_page;
         end;
-        pPgno := iPage;
-        rc := sqlite3PagerWrite(pTrunk^.pDbPage);
-        if rc <> SQLITE_OK then
-          goto end_allocate_page;
-        if closest < k - 1 then
-          Move(aData[4 + k * 4], aData[8 + closest * 4], 4);
-        sqlite3Put4byte(@aData[4], k - 1);
-        if btreeGetHasContent(pBt, pPgno) then
-          noContent := 0
-        else
-          noContent := PAGER_GET_NOCONTENT;
-        rc := btreeGetUnusedPage(pBt, pPgno, ppPage, noContent);
-        if rc = SQLITE_OK then begin
-          rc := sqlite3PagerWrite(ppPage^.pDbPage);
-          if rc <> SQLITE_OK then begin
-            releasePage(ppPage);
-            ppPage := nil;
+        if (searchList = 0)
+           or (iPage = nearby)
+           or ((iPage < nearby) and (eMode = BTALLOC_LE)) then begin
+          pPgno := iPage;
+          rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+          if rc <> SQLITE_OK then
+            goto end_allocate_page;
+          if closest < k - 1 then
+            Move(aData[4 + k * 4], aData[8 + closest * 4], 4);
+          sqlite3Put4byte(@aData[4], k - 1);
+          if btreeGetHasContent(pBt, pPgno) then
+            noContent := 0
+          else
+            noContent := PAGER_GET_NOCONTENT;
+          rc := btreeGetUnusedPage(pBt, pPgno, ppPage, noContent);
+          if rc = SQLITE_OK then begin
+            rc := sqlite3PagerWrite(ppPage^.pDbPage);
+            if rc <> SQLITE_OK then begin
+              releasePage(ppPage);
+              ppPage := nil;
+            end;
           end;
+          searchList := 0;
         end;
       end;
       releasePage(pPrevTrunk);
       pPrevTrunk := nil;
-    until True; { loop runs once when not searching; no searchList needed without autovacuum }
+    until searchList = 0;
   end else begin
     { No free pages — extend the database }
     if pBt^.bDoTruncate <> 0 then
@@ -5053,6 +5159,8 @@ var
   pPayload   : Pu8;
   pBt        : PBtShared;
   pgnoOvfl   : Pgno;
+  pgnoPtrmap : Pgno;
+  eType      : u8;
   nHeader    : i32;
   pOvfl      : PMemPage;
 begin
@@ -5113,7 +5221,31 @@ begin
     Dec(spaceLeft, n);
     if spaceLeft = 0 then begin
       pOvfl  := nil;
+      { btree.c:7187..7195 — for auto-vacuum, advance the allocation hint
+        past any ptrmap / pending-byte page and snapshot the previous overflow
+        page number (0 for the first overflow page). }
+      pgnoPtrmap := pgnoOvfl;
+      if pBt^.autoVacuum <> 0 then begin
+        { Inline PTRMAP_ISPAGE: page is a ptrmap page iff
+          ptrmapPageno(pBt,pg)=pg (btreeInt.h:628). }
+        repeat
+          Inc(pgnoOvfl);
+        until not ((ptrmapPageno(pBt, pgnoOvfl) = pgnoOvfl)
+                   or (pgnoOvfl = PENDING_BYTE_PAGE(pBt)));
+      end;
       rc := allocateBtreePage(pBt, pOvfl, pgnoOvfl, pgnoOvfl, 0);
+      { btree.c:7198..7216 — write the pointer-map entry for this overflow
+        page.  The first overflow page (pgnoPtrmap=0) gets a PTRMAP_OVERFLOW1
+        partial entry; subsequent pages get PTRMAP_OVERFLOW2 pointing at the
+        previous overflow page.  Even the first entry must be written so
+        clearCell()'s optimistic chain walk does not misread stale bytes. }
+      if (pBt^.autoVacuum <> 0) and (rc = SQLITE_OK) then begin
+        if pgnoPtrmap <> 0 then eType := PTRMAP_OVERFLOW2
+        else eType := PTRMAP_OVERFLOW1;
+        ptrmapPut(pBt, pgnoOvfl, eType, pgnoPtrmap, @rc);
+        if rc <> SQLITE_OK then
+          releasePage(pOvfl);
+      end;
       if rc <> SQLITE_OK then begin
         releasePage(pToRelease);
         Result := rc;
@@ -5234,7 +5366,11 @@ begin
         Exit;
       end;
       pCell := pTmp + (pCell - aData);
-    end else if SQLITE_OVERFLOW_CHK(pEnd, pCell, pCell + sz) then begin
+    end else if SQLITE_OVERFLOW_CHK(pSrcEnd, pCell, pCell + sz) then begin
+      { btree.c:7666 — the boundary is the *source sibling* data end
+        (pSrcEnd = pCArray->apEnd[k]), NOT the destination page end pEnd.
+        Using pEnd weakens the cross-sibling overlap check and lets a
+        straddling cell through, corrupting the rebuilt page. }
       Result := SQLITE_CORRUPT_BKPT;
       Exit;
     end;
@@ -5976,7 +6112,52 @@ begin
     Move(pOld^.aData[8], apNew[nNew-1]^.aData[8], 4);
   end;
 
-  { Auto-vacuum pointer-map updates (no-op in this port) }
+  { Make any required updates to pointer map entries associated with cells
+    stored on sibling pages following the balance operation.  Divider-cell
+    ptrmap entries are set by insertCell().  btree.c:8756..8812. }
+  if ISAUTOVACUUM(pBt) then begin
+    pNew := apNew[0];
+    pOld := pNew;
+    cntOldNext := i32(pNew^.nCell) + i32(pNew^.nOverflow);
+    iNew := 0;
+    iOldIdx := 0;
+
+    i := 0;
+    while i < b.nCell do begin
+      pCell := (b.apCell + i)^;
+      while i = cntOldNext do begin
+        Inc(iOldIdx);
+        if iOldIdx < nNew then pOld := apNew[iOldIdx]
+        else pOld := apOld[iOldIdx];
+        cntOldNext := cntOldNext + i32(pOld^.nCell) + i32(pOld^.nOverflow)
+                      + (1 - leafData);
+      end;
+      if i = cntNew[iNew] then begin
+        Inc(iNew);
+        pNew := apNew[iNew];
+        if leafData = 0 then begin
+          Inc(i);
+          continue;
+        end;
+      end;
+
+      { Cell pCell is destined for new sibling page pNew.  If the source
+        sibling page iOld had the same page number as pNew, and pCell really
+        was part of sibling page iOld (not a divider or overflow cell), the
+        ptrmap entries can be left unchanged. }
+      if (iOldIdx >= nNew)
+         or (pNew^.pgno <> aPgno[iOldIdx])
+         or (not SQLITE_WITHIN(pCell, pOld^.aData, pOld^.aDataEnd)) then
+      begin
+        if leafCorrection = 0 then
+          ptrmapPut(pBt, sqlite3Get4byte(pCell), PTRMAP_BTREE, pNew^.pgno, @rc);
+        if cachedCellSize(@b, i) > pNew^.minLocal then
+          ptrmapPutOvflPtr(pNew, pOld, pCell, @rc);
+        if rc <> SQLITE_OK then goto balance_cleanup;
+      end;
+      Inc(i);
+    end;
+  end;
 
   { Insert divider cells into pParent }
   iOvflSpace := 0;
@@ -6054,7 +6235,12 @@ begin
     freePage(apOld[i], @rc);
 
 balance_cleanup:
-  sqlite3StackFree(nil, pMem);
+  { btree.c:9003 frees b.apCell — which the entry-time FillChar(b,...) zeroed,
+    so the early-exit `goto balance_cleanup` paths (before the scratch alloc)
+    free a NULL pointer (a safe no-op).  The local pMem is NOT zero-initialised
+    on those paths and would carry a stale (already-freed) pointer from a prior
+    balance_nonroot stack frame, causing a double free.  Mirror C exactly. }
+  sqlite3StackFree(nil, b.apCell);
   for i := 0 to nOld - 1 do releasePage(apOld[i]);
   for i := 0 to nNew - 1 do releasePage(apNew[i]);
   Result := rc;
@@ -6778,6 +6964,14 @@ begin
   Result := rc;
 end;
 
+{ main.c:2690 — sqlite3TempInMemory.  The build uses SQLITE_TEMP_STORE==1
+  (see tester_min.tcl), so temporary databases live in memory only when
+  PRAGMA temp_store has been raised to MEMORY (db^.temp_store == 2). }
+function sqlite3TempInMemory(db: Psqlite3): i32;
+begin
+  if PTsqlite3(db)^.temp_store = 2 then Result := 1 else Result := 0;
+end;
+
 { ===========================================================================
   sqlite3BtreeOpen — open or create a B-tree database
   btree.c lines 2528-2917 (simplified: no shared-cache, single connection)
@@ -6793,11 +6987,35 @@ var
   zDbHdr    : array[0..99] of u8;
   nReserve  : i32;
   iPageSize : u32;
+  isTempDb  : i32;
+  isMemdb   : i32;
   label btree_open_out;
 begin
   pBt := nil;
   rc  := SQLITE_OK;
   nReserve := -1;
+
+  { btree.c:2544..2569 — classify ephemeral/in-memory before opening the
+    pager.  isMemdb must be carried into flags via BTREE_MEMORY so that a
+    URI such as 'file:...?mode=memory' (which sets SQLITE_OPEN_MEMORY in
+    vfsFlags) reaches PAGER_MEMORY and skips the on-disk path-length check
+    (otherwise a long memory-db filename fails CANTOPEN). }
+  if (zFilename = nil) or (zFilename[0] = #0) then
+    isTempDb := 1
+  else
+    isTempDb := 0;
+  isMemdb := 0;
+  if (zFilename <> nil) and (StrComp(zFilename, ':memory:') = 0) then
+    isMemdb := 1
+  else if (isTempDb <> 0) and (sqlite3TempInMemory(db) <> 0) then
+    isMemdb := 1
+  else if (vfsFlags and SQLITE_OPEN_MEMORY) <> 0 then
+    isMemdb := 1;
+  if isMemdb <> 0 then
+    flags := flags or BTREE_MEMORY;
+  if ((vfsFlags and SQLITE_OPEN_MAIN_DB) <> 0)
+     and ((isMemdb <> 0) or (isTempDb <> 0)) then
+    vfsFlags := (vfsFlags and (not SQLITE_OPEN_MAIN_DB)) or SQLITE_OPEN_TEMP_DB;
 
   p := PBtree(sqlite3MallocZero(SizeOf(TBtree)));
   if p = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
@@ -6908,6 +7126,14 @@ function sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
 begin
   Assert(p^.pBt^.pPager <> nil);
   Result := PAnsiChar(sqlite3PagerFilename(p^.pBt^.pPager, 1));
+end;
+
+{ btree.c:11297 — sqlite3BtreeGetJournalname.
+  Return the full pathname of the underlying journal file. }
+function sqlite3BtreeGetJournalname(p: PBtree): PAnsiChar;
+begin
+  Assert(p^.pBt^.pPager <> nil);
+  Result := PAnsiChar(sqlite3PagerJournalname(p^.pBt^.pPager));
 end;
 
 { ===========================================================================
@@ -7465,17 +7691,27 @@ begin
   Result := sqlite3BtreeClearTable(pCur^.pBtree, i32(pCur^.pgnoRoot), nil);
 end;
 
-{ btree.c lines 10325-10397: btreeDropTable (simplified: SQLITE_OMIT_AUTOVACUUM) }
+{ btree.c lines 10313-10397: btreeDropTable.  Full port — includes the
+  !SQLITE_OMIT_AUTOVACUUM arm that relocates the highest root-page into the
+  freed slot and updates meta[4] (BTREE_LARGEST_ROOT_PAGE).  Without this,
+  the on-disk "largest root page" header byte (offset 52) stays stale after
+  DROP TABLE under auto_vacuum, and integrity_check reports
+  "max rootpage (N) disagrees with header (M)" (filefmt-3.3). }
 function btreeDropTable(p: PBtree; iTable: Pgno; piMoved: Pi32): i32;
 var
-  pPage: PMemPage;
-  pBt  : PBtShared;
-  rc   : i32;
+  pPage       : PMemPage;
+  pBt         : PBtShared;
+  rc          : i32;
+  maxRootPgno : Pgno;
+  pMove       : PMemPage;
 begin
   pPage := nil;
   pBt   := p^.pBt;
   rc    := SQLITE_OK;
 
+  Assert(sqlite3BtreeHoldsMutex(p) <> 0);
+  Assert(p^.inTrans = TRANS_WRITE);
+  Assert(iTable >= 2);
   if iTable > btreePagecount(pBt) then begin
     Result := SQLITE_CORRUPT_BKPT; Exit;
   end;
@@ -7483,12 +7719,55 @@ begin
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
 
   rc := btreeGetPage(pBt, iTable, pPage, 0);
-  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  if rc <> SQLITE_OK then begin
+    releasePage(pPage);
+    Result := rc; Exit;
+  end;
 
   piMoved^ := 0;
-  { No autovacuum: just free the page }
-  freePage(pPage, @rc);
-  releasePage(pPage);
+
+  if pBt^.autoVacuum <> 0 then begin
+    { btree.c:10339..10390 — autovacuum branch. }
+    sqlite3BtreeGetMeta(p, BTREE_LARGEST_ROOT_PAGE, @maxRootPgno);
+
+    if iTable = maxRootPgno then begin
+      { iTable is the largest root-page; just free it. }
+      freePage(pPage, @rc);
+      releasePage(pPage);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end else begin
+      { Move the page at maxRootPgno into the slot left by iTable. }
+      pMove := nil;
+      releasePage(pPage);
+      rc := btreeGetPage(pBt, maxRootPgno, pMove, 0);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      rc := relocatePage(pBt, pMove, PTRMAP_ROOTPAGE, 0, iTable, 0);
+      releasePage(pMove);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      pMove := nil;
+      rc := btreeGetPage(pBt, maxRootPgno, pMove, 0);
+      freePage(pMove, @rc);
+      releasePage(pMove);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      piMoved^ := i32(maxRootPgno);
+    end;
+
+    { btree.c:10378..10390 — Set the new 'max-root-page' value in the database
+      header. This is the old value less one, less one more if that happens to
+      be a root-page number, less one again if that is PENDING_BYTE_PAGE. }
+    Dec(maxRootPgno);
+    { Inline of PTRMAP_ISPAGE (defined later in this unit): the page is a
+      ptrmap page iff ptrmapPageno(pBt, pg) = pg.  See btreeInt.h:628. }
+    while (maxRootPgno = PENDING_BYTE_PAGE(pBt)) or
+          (ptrmapPageno(pBt, maxRootPgno) = maxRootPgno) do
+      Dec(maxRootPgno);
+    Assert(maxRootPgno <> PENDING_BYTE_PAGE(pBt));
+
+    rc := sqlite3BtreeUpdateMeta(p, 4, maxRootPgno);
+  end else begin
+    freePage(pPage, @rc);
+    releasePage(pPage);
+  end;
   Result := rc;
 end;
 
@@ -7965,6 +8244,12 @@ begin
      and (((iPageSize - 1) and iPageSize) = 0) then
   begin
     uPgsz := u32(iPageSize);
+    { btree.c:3092..3093 — adopt the new page size and discard the temp
+      scratch buffer so it gets reallocated at the new (larger) page size.
+      Without freeTempSpace the stale default-sized pTmpSpace is reused and
+      sqlite3BtreeInsert's FillChar overruns it once page_size grows. }
+    pBt^.pageSize := uPgsz;
+    freeTempSpace(pBt);
     rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
     pBt^.pageSize   := uPgsz;
     pBt^.usableSize := uPgsz - u32(nReserve);
@@ -8015,19 +8300,37 @@ function sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
 var
   pBt    : PBtShared;
   rc     : i32;
-  pPage1 : PDbPage;
-  zData  : Pu8;
+  aData  : Pu8;
 begin
   pBt := p^.pBt;
-  rc  := sqlite3PagerGet(pBt^.pPager, 1, @pPage1, 0);
-  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
-  rc := sqlite3PagerWrite(pPage1);
+  Assert((iVersion = 1) or (iVersion = 2));
+
+  { If setting the version fields to 1, do not automatically open the
+    WAL connection, even if the version fields are currently set to 2.
+    The BTS_NO_WAL flag suppresses the WAL-open arm in lockBtree (page1
+    init).  Without going through sqlite3BtreeBeginTrans here the WAL is
+    never created on the `PRAGMA journal_mode=WAL` transition — the old
+    raw page-1 write skipped the begin-trans entirely (btree.c:4290). }
+  pBt^.btsFlags := pBt^.btsFlags and (not BTS_NO_WAL);
+  if iVersion = 1 then
+    pBt^.btsFlags := pBt^.btsFlags or BTS_NO_WAL;
+
+  rc := sqlite3BtreeBeginTrans(p, 0, nil);
   if rc = SQLITE_OK then begin
-    zData := Pu8(sqlite3PagerGetData(pPage1));
-    zData[18] := u8(iVersion);
-    zData[19] := u8(iVersion);
+    aData := pBt^.pPage1^.aData;
+    if (aData[18] <> u8(iVersion)) or (aData[19] <> u8(iVersion)) then begin
+      rc := sqlite3BtreeBeginTrans(p, 2, nil);
+      if rc = SQLITE_OK then begin
+        rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+        if rc = SQLITE_OK then begin
+          aData[18] := u8(iVersion);
+          aData[19] := u8(iVersion);
+        end;
+      end;
+    end;
   end;
-  sqlite3PagerUnref(pPage1);
+
+  pBt^.btsFlags := pBt^.btsFlags and (not BTS_NO_WAL);
   Result := rc;
 end;
 
@@ -8975,17 +9278,16 @@ begin
   if bPartial = 0 then begin
     i := 1;
     while (i <= sCheck.nCkPage) and (sCheck.mxErr <> 0) do begin
-      if pBt^.autoVacuum = 0 then begin
-        if getPageReferenced(@sCheck, i) = 0 then
-          checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
-      end else begin
-        { Auto-vacuum: pointer-map pages must be referenced exactly
-          when PTRMAP_PAGENO(pBt, i) == i.  The Pascal port treats
-          PTRMAP_PAGENO as approximate (per btree.pas:7340) so we
-          fall back to the !autoVacuum check, which is conservative. }
-        if getPageReferenced(@sCheck, i) = 0 then
-          checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
-      end;
+      { Auto-vacuum: pointer-map pages (PTRMAP_PAGENO(pBt,i)=i) are never
+        directly referenced from a btree, so they must be excluded from the
+        "never used" check; conversely a referenced ptrmap page is itself an
+        error.  btree.c:11242..11253. }
+      if (getPageReferenced(@sCheck, i) = 0)
+         and ((ptrmapPageno(pBt, i) <> i) or (pBt^.autoVacuum = 0)) then
+        checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
+      if (getPageReferenced(@sCheck, i) <> 0)
+         and ((ptrmapPageno(pBt, i) = i) and (pBt^.autoVacuum <> 0)) then
+        checkAppendMsg(@sCheck, 'Page %u: pointer map referenced', [i]);
       Inc(i);
     end;
   end;

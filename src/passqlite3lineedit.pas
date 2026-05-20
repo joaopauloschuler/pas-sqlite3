@@ -9,9 +9,12 @@
   Falls back to plain ReadLn when stdin is not a TTY (pipes, here-docs,
   CI runs), so non-interactive callers see no behaviour change.
 
-  History persists in memory only for the lifetime of the process;
-  add LineEditSaveHistory/LineEditLoadHistory if a future task needs
-  on-disk persistence.
+  History persists in memory for the lifetime of the process and may
+  be loaded from / saved to a UTF-8 text file (one entry per line) via
+  LineEditLoadHistory / LineEditSaveHistory.  Mirrors linenoise's
+  linenoiseHistoryLoad / linenoiseHistorySave behaviour as used by
+  shell.c.in (read_history / write_history) at startup / exit of the
+  interactive REPL.
   ---------------------------------------------------------------------- }
 unit passqlite3lineedit;
 
@@ -34,6 +37,20 @@ function LineEditReadLine(const prompt: AnsiString;
 { Append `line` to the in-memory history if it's non-empty and differs
   from the previous entry.  History size capped at HistoryMaxEntries. }
 procedure LineEditAddHistory(const line: AnsiString);
+
+{ Load history entries from `path` (one line per entry).  Silently
+  no-ops when the file does not exist or cannot be opened — mirrors
+  linenoiseHistoryLoad.  Returns True iff the file was opened. }
+function LineEditLoadHistory(const path: AnsiString): Boolean;
+
+{ Persist the current history to `path`, overwriting any existing
+  file.  Mirrors linenoiseHistorySave: returns True on success. }
+function LineEditSaveHistory(const path: AnsiString): Boolean;
+
+{ Cap the in-memory history to at most `n` entries (oldest dropped
+  first).  Mirrors linenoiseHistorySetMaxLen — shell.c.in calls
+  shell_stifle_history(2000) right before write_history. }
+procedure LineEditStifleHistory(n: Integer);
 
 const
   HistoryMaxEntries = 1000;
@@ -124,6 +141,63 @@ begin
   if Length(history) <= historyCount then SetLength(history, historyCount + 32);
   history[historyCount] := line;
   Inc(historyCount);
+end;
+
+function LineEditLoadHistory(const path: AnsiString): Boolean;
+var
+  f:    TextFile;
+  line: AnsiString;
+  ioErr: Integer;
+begin
+  Result := False;
+  if path = '' then Exit;
+  AssignFile(f, string(path));
+  {$I-} Reset(f); {$I+}
+  ioErr := IOResult;
+  if ioErr <> 0 then Exit;
+  Result := True;
+  try
+    while not EOF(f) do begin
+      ReadLn(f, line);
+      if line <> '' then LineEditAddHistory(line);
+    end;
+  finally
+    CloseFile(f);
+  end;
+end;
+
+function LineEditSaveHistory(const path: AnsiString): Boolean;
+var
+  f:     TextFile;
+  i:     Integer;
+  ioErr: Integer;
+begin
+  Result := False;
+  if path = '' then Exit;
+  AssignFile(f, string(path));
+  {$I-} Rewrite(f); {$I+}
+  ioErr := IOResult;
+  if ioErr <> 0 then Exit;
+  try
+    for i := 0 to historyCount - 1 do
+      WriteLn(f, history[i]);
+    Result := True;
+  finally
+    CloseFile(f);
+  end;
+end;
+
+procedure LineEditStifleHistory(n: Integer);
+var i, drop: Integer;
+begin
+  if n < 0 then n := 0;
+  if historyCount <= n then Exit;
+  drop := historyCount - n;
+  for i := 0 to n - 1 do
+    history[i] := history[i + drop];
+  for i := n to historyCount - 1 do
+    history[i] := '';
+  historyCount := n;
 end;
 
 { ---- render ---- }

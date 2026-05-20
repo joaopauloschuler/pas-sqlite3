@@ -23,6 +23,7 @@ uses
   PasTclBridge,
   TestModuleMd5,
   TestModuleTclvar,
+  TestModuleBestindex,
   TestModuleEcho,
   TestModuleTest1,
   TestModuleFunc,
