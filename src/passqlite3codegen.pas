@@ -8508,6 +8508,31 @@ begin
   end;
 end;
 
+{ exprProbability — faithful port of resolve.c:935..943.  The second argument
+  to likelihood() must be a constant floating-point value between 0.0 and 1.0.
+  Return 134,217,728 (2^27) times this value.  Or return -1 if p is not a
+  floating point value between 0.0 and 1.0. }
+function exprProbability(p: PExpr): i32;
+var
+  r: Double;
+begin
+  r := -1.0;
+  if p^.op <> TK_FLOAT then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  Assert((p^.flags and EP_IntValue) = 0);
+  sqlite3AtoF(p^.u.zToken, r);
+  Assert(r >= 0.0);
+  if r > 1.0 then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  Result := Trunc(r * 134217728.0);
+end;
+
 { Minimal sqlite3ResolveExprNames — walk pExpr resolving TK_ID (and rowid
   pseudo-column) against pNC^.pSrcList.  Mirrors the bare-identifier arm of
   sqlite3ResolveSelectNames (resolve.c lookupName), enough for the DELETE /
@@ -8520,8 +8545,44 @@ var
   iCol:   i32;
   pItem:  PSrcItem;
   base:   PSrcItem;
+  pDefU:  PTFuncDef;
+  nArgU:  i32;
 begin
   if pE = nil then Exit;
+  { resolve.c:1140..1161 (TK_FUNCTION arm of resolveExprStep) — validate the
+    SQLITE_FUNC_UNLIKELY family in any resolution context that flows through
+    this lean walker (CREATE INDEX / CHECK / DEFAULT / partial-index WHERE),
+    not just SELECT.  Stamp EP_Unlikely, then for likelihood(X,prob) the
+    second argument must be a constant float in [0.0,1.0]; otherwise raise
+    the diagnostic.  unlikely()/likely() carry the tuned default probability. }
+  if (pE^.op = TK_FUNCTION) and (pParse <> nil)
+     and (pE^.u.zToken <> nil) and ExprUseXList(pE)
+     and not ExprHasProperty(pE, EP_Unlikely) then
+  begin
+    if pE^.x.pList <> nil then nArgU := pE^.x.pList^.nExpr else nArgU := 0;
+    pDefU := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArgU,
+                                 pParse^.db^.enc, 0);
+    if (pDefU <> nil) and ((pDefU^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0) then
+    begin
+      ExprSetProperty(pE, EP_Unlikely);
+      if nArgU = 2 then
+      begin
+        pE^.iTable := exprProbability(ExprListItems(pE^.x.pList)[1].pExpr);
+        if pE^.iTable < 0 then
+        begin
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+            'second argument to %s() must be a constant between 0.0 and 1.0',
+            [pE^.u.zToken]));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        end;
+      end
+      else
+        if pDefU^.zName[0] = 'u' then
+          pE^.iTable := 8388608
+        else
+          pE^.iTable := 125829120;
+    end;
+  end;
   { TK_ROW — resolve.c:976..993.  Rewrites a TK_ROW pseudo-token (used by
     UPDATE...FROM exprRowColumn / DELETE LIMIT) to TK_COLUMN against
     pSrc->a[0]; iColumn is decremented (so a bare TK_ROW with iColumn=0
@@ -11070,7 +11131,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           end;
         end
         else if (pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0 then
+        begin
           ExprSetProperty(pE, EP_Unlikely);
+          if nArg_ = 2 then
+          begin
+            { resolve.c:1142..1149 — the second argument to likelihood() must
+              be a constant float between 0.0 and 1.0; exprProbability returns
+              the 2^27-scaled truth probability or -1 on rejection. }
+            pE^.iTable := exprProbability(ExprListItems(pE^.x.pList)[1].pExpr);
+            if pE^.iTable < 0 then
+            begin
+              sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+                'second argument to %s() must be a constant between 0.0 and 1.0',
+                [pE^.u.zToken]));
+              sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+            end;
+          end
+          else
+            { resolve.c:1159..1160 TUNING: unlikely() probability is 0.0625
+              (8388608 = 0.0625*2^27); likely() is 0.9375 (125829120). }
+            if pDef_^.zName[0] = 'u' then
+              pE^.iTable := 8388608
+            else
+              pE^.iTable := 125829120;
+        end;
         { divbug.14 (residual aggorderby-1.3) — resolve.c:1288..1290.  If
           the resolved FuncDef is NOT an aggregate (xFinalize nil) and the
           TK_FUNCTION node carries an attached ORDER BY (parser put it in
