@@ -53,6 +53,7 @@ uses
   passqlite3normalize,
   passqlite3cksumvfs,
   passqlite3multiplex,
+  passqlite3carray,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -6170,6 +6171,360 @@ begin
   Result := TCL_OK;
 end;
 
+{ ----------------------------------------------------------------------
+  test1.c:4395..4728 — sqlite3_carray_bind.
+
+  Faithful port of test_carray_bind plus its two helpers testCarrayAlloc /
+  testCarrayFree (the -malloc option's custom allocator that prefixes the
+  buffer with 16 bytes so the destructor can recover the real allocation).
+  The C `static` per-call cache (aStaticData/nStaticData/eStaticType) is
+  mirrored here by unit-level globals, cleared on every invocation.
+  ---------------------------------------------------------------------- }
+
+{ test1.c:4409..4449 — bind_carray_intptr STMT IPARAM INT-0 INT-1 ...
+  Binds an int array as the "carray" pointer (idxNum 1's sibling path,
+  used with NN/count= constraints), allocated with Tcl_Alloc and freed
+  by delIntptr (= ckfree). }
+procedure delIntptr(p: Pointer); cdecl;
+begin
+  Tcl_Free(PChar(p));
+end;
+
+function tcl_bind_carray_intptr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  iVar:  cint;
+  aInt:  ^cint;
+  nInt:  cint;
+  ii:    cint;
+  rc:    cint;
+begin
+  iVar := 0;
+  if objc < 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('STMT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  if Tcl_GetIntFromObj(interp, objv[2], @iVar) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  nInt := objc - 3;
+
+  aInt := Pointer(Tcl_Alloc(cuint((nInt + 1) * SizeOf(cint))));
+  for ii := 0 to nInt - 1 do begin
+    if Tcl_GetIntFromObj(interp, objv[3 + ii], @((aInt + ii)^)) <> 0 then begin
+      Tcl_Free(PChar(aInt));
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+
+  rc := sqlite3_bind_pointer(pStmt, iVar, Pointer(aInt), PChar('carray'),
+                             @delIntptr);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+end;
+
+{ test1.c:4395..4407 — the two helpers used by the -malloc option. }
+function testCarrayAlloc(n: cint): Pointer;
+var pRet: PByte;
+begin
+  pRet := PByte(sqlite3_malloc(n + 16));
+  if pRet <> nil then
+    Inc(pRet, 16);
+  Result := Pointer(pRet);
+end;
+
+procedure testCarrayFree(p: Pointer); cdecl;
+var p2: PByte;
+begin
+  if p <> nil then begin
+    p2 := PByte(p);
+    Dec(p2, 16);
+    sqlite3_free(Pointer(p2));
+  end;
+end;
+
+var
+  carrayStaticData: Pointer = nil;
+  carrayNStaticData: cint = 0;
+  carrayEStaticType: cint = 0;
+
+function tcl_test_carray_bind(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt:          PVdbe;
+  eType:          cint;
+  mFlagsOverride: cint;
+  nData:          cint;
+  aData:          Pointer;
+  isTransient:    cint;
+  isStatic:       cint;
+  isV2:           cint;
+  isMalloc:       cint;
+  idx:            cint;
+  i, j:           cint;
+  rc:             cint;
+  xDel:           TxDelProc;
+  z:              PAnsiChar;
+  v:              cint;
+  wv:             Int64;
+  dv:             Double;
+  sv:             PAnsiChar;
+  pDel:           Pointer;
+  nByte:          cint;
+  aByte:          Pointer;
+  p2:             PByte;
+  aI32:           ^cint;
+  aI64:           ^Int64;
+  aDbl:           ^Double;
+  aTxt:           PPAnsiChar;
+  aIov:           PIoVec;
+  blen:           cint;
+  bptr:           PAnsiChar;
+  svLen:          SizeInt;
+label
+  carray_bind_done;
+begin
+  eType          := 0;   { CARRAY_INT32 }
+  mFlagsOverride := 0;
+  nData          := 0;
+  aData          := nil;
+  isTransient    := 0;
+  isStatic       := 0;
+  isV2           := 0;
+  isMalloc       := 0;
+  rc             := SQLITE_OK;
+  xDel           := @sqlite3_free;
+
+  { test1.c:4491..4507 — always clear preexisting static data. }
+  if carrayStaticData <> nil then begin
+    if carrayEStaticType = 3 then
+      for i := 0 to carrayNStaticData - 1 do
+        sqlite3_free(PPAnsiChar(carrayStaticData)[i]);
+    if carrayEStaticType = 4 then
+      for i := 0 to carrayNStaticData - 1 do
+        sqlite3_free(PIoVec(carrayStaticData)[i].iov_base);
+    sqlite3_free(carrayStaticData);
+    carrayStaticData  := nil;
+    carrayNStaticData := 0;
+    carrayEStaticType := 0;
+  end;
+  if objc = 1 then begin Result := TCL_OK; Exit; end;
+
+  { test1.c:4510..4558 — option parsing. }
+  i := 1;
+  while (i < objc) and (Tcl_GetString(objv[i])[0] = '-') do begin
+    z := Tcl_GetString(objv[i]);
+    if StrComp(z, '-transient') = 0 then begin
+      isTransient := 1; isStatic := 0; isMalloc := 0;
+      xDel := TxDelProc(SQLITE_TRANSIENT);
+    end else if StrComp(z, '-static') = 0 then begin
+      isStatic := 1; isMalloc := 0; isTransient := 0;
+      xDel := SQLITE_STATIC;
+    end else if StrComp(z, '-malloc') = 0 then begin
+      isMalloc := 1; isStatic := 0; isTransient := 0;
+      xDel := @testCarrayFree;
+    end else if StrComp(z, '-v2') = 0 then begin
+      isV2 := 1;
+    end else if StrComp(z, '-int32') = 0 then begin
+      eType := 0;
+    end else if StrComp(z, '-int64') = 0 then begin
+      eType := 1;
+    end else if StrComp(z, '-double') = 0 then begin
+      eType := 2;
+    end else if StrComp(z, '-text') = 0 then begin
+      eType := 3;
+    end else if StrComp(z, '-blob') = 0 then begin
+      eType := 4;
+    end else if (i < (objc - 1)) and (StrComp(z, '-flags') = 0) then begin
+      Inc(i);
+      if Tcl_GetIntFromObj(interp, objv[i], @mFlagsOverride) <> 0 then begin
+        Result := TCL_ERROR; Exit;
+      end;
+    end else if StrComp(z, '--') = 0 then begin
+      Break;
+    end else begin
+      Tcl_AppendResult(interp, PChar('unknown option: '), z, Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    Inc(i);
+  end;
+
+  { test1.c:4559..4577 — option validation. }
+  if (eType = 3) and (isStatic = 0) and (isTransient = 0) then begin
+    Tcl_AppendResult(interp,
+      PChar('text data must be either -static or -transient'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if (eType = 4) and (isStatic = 0) and (isTransient = 0) then begin
+    Tcl_AppendResult(interp,
+      PChar('blob data must be either -static or -transient'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if (isStatic <> 0) and (isTransient <> 0) then begin
+    Tcl_AppendResult(interp,
+      PChar('cannot be both -static and -transient'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if (objc - i) < 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('[OPTIONS] STMT IDX VALUE ...'));
+    Result := TCL_ERROR; Exit;
+  end;
+
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[i])));
+  Inc(i);
+  if Tcl_GetIntFromObj(interp, objv[i], @idx) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Inc(i);
+  nData := objc - i;
+
+  { test1.c:4583..4672 — gather the data array. }
+  case eType + 5 * Ord(nData <= 0) of
+    0: begin { INT32 }
+      aI32 := sqlite3_malloc(SizeOf(cint) * nData);
+      if aI32 = nil then begin rc := SQLITE_NOMEM; goto carray_bind_done; end;
+      for j := 0 to nData - 1 do begin
+        if Tcl_GetIntFromObj(interp, objv[i + j], @v) <> 0 then begin
+          sqlite3_free(aI32); Result := TCL_ERROR; Exit;
+        end;
+        (aI32 + j)^ := v;
+      end;
+      aData := aI32;
+    end;
+    1: begin { INT64 }
+      aI64 := sqlite3_malloc(SizeOf(Int64) * nData);
+      if aI64 = nil then begin rc := SQLITE_NOMEM; goto carray_bind_done; end;
+      for j := 0 to nData - 1 do begin
+        if Tcl_GetWideIntFromObj(interp, objv[i + j], @wv) <> 0 then begin
+          sqlite3_free(aI64); Result := TCL_ERROR; Exit;
+        end;
+        (aI64 + j)^ := wv;
+      end;
+      aData := aI64;
+    end;
+    2: begin { DOUBLE }
+      aDbl := sqlite3_malloc(SizeOf(Double) * nData);
+      if aDbl = nil then begin rc := SQLITE_NOMEM; goto carray_bind_done; end;
+      for j := 0 to nData - 1 do begin
+        if Tcl_GetDoubleFromObj(interp, objv[i + j], @dv) <> 0 then begin
+          sqlite3_free(aDbl); Result := TCL_ERROR; Exit;
+        end;
+        (aDbl + j)^ := dv;
+      end;
+      aData := aDbl;
+    end;
+    3: begin { TEXT }
+      aTxt := sqlite3_malloc(SizeOf(PAnsiChar) * nData);
+      if aTxt = nil then
+        rc := SQLITE_NOMEM
+      else
+        FillChar(aTxt^, SizeOf(PAnsiChar) * nData, 0);
+      j := 0;
+      while (rc = SQLITE_OK) and (j < nData) do begin
+        sv := Tcl_GetString(objv[i + j]);
+        if (sv <> nil) and (StrComp(sv, 'NULL') <> 0) then begin
+          { C: sqlite3_mprintf("%s", v) — a plain string dup; the Pascal
+            sqlite3_mprintf has no varargs, so malloc+copy directly. }
+          svLen := StrLen(sv);
+          aTxt[j] := PAnsiChar(sqlite3_malloc(svLen + 1));
+          if aTxt[j] = nil then
+            rc := SQLITE_NOMEM
+          else
+            Move(sv^, aTxt[j]^, svLen + 1);
+        end;
+        Inc(j);
+      end;
+      aData := aTxt;
+    end;
+    4: begin { BLOB }
+      aIov := sqlite3_malloc(SizeOf(TIoVec) * nData);
+      if aIov = nil then
+        rc := SQLITE_NOMEM
+      else
+        FillChar(aIov^, SizeOf(TIoVec) * nData, 0);
+      j := 0;
+      while (rc = SQLITE_OK) and (j < nData) do begin
+        blen := 0;
+        bptr := Tcl_GetByteArrayFromObj(objv[i + j], @blen);
+        aIov[j].iov_len  := SizeUInt(blen);
+        aIov[j].iov_base := sqlite3_malloc64(blen);
+        if aIov[j].iov_base = nil then begin
+          aIov[j].iov_len := 0;
+          rc := SQLITE_NOMEM;
+        end else
+          Move(bptr^, aIov[j].iov_base^, blen);
+        Inc(j);
+      end;
+      aData := aIov;
+    end;
+    5: begin { nData == 0 }
+      aData := PAnsiChar('');
+      xDel := SQLITE_STATIC;
+      isTransient := 0;
+      isStatic := 0;
+    end;
+  end;
+
+  { test1.c:4674..4694 — static/malloc post-processing. }
+  if rc = SQLITE_OK then begin
+    if isStatic <> 0 then begin
+      carrayStaticData  := aData;
+      carrayNStaticData := nData;
+      carrayEStaticType := eType;
+    end else if isMalloc <> 0 then begin
+      if eType = 0 then nByte := SizeOf(cint) * nData
+                   else nByte := SizeOf(Int64) * nData;
+      aByte := testCarrayAlloc(nByte);
+      if aByte = nil then begin
+        sqlite3_free(aData);
+        rc := SQLITE_NOMEM;
+      end else begin
+        Move(aData^, aByte^, nByte);
+        sqlite3_free(aData);
+        aData := aByte;
+        xDel := @testCarrayFree;
+      end;
+    end;
+  end;
+
+  { test1.c:4696..4712 — perform the bind. }
+  if rc = SQLITE_OK then begin
+    if mFlagsOverride = 0 then mFlagsOverride := eType;
+    if isV2 <> 0 then begin
+      if Pointer(xDel) = Pointer(@testCarrayFree) then begin
+        p2 := PByte(aData);
+        Dec(p2, 16);
+        pDel := Pointer(p2);
+        xDel := @sqlite3_free;
+      end else
+        pDel := aData;
+      rc := sqlite3_carray_bind_v2(pStmt, idx, aData, nData, mFlagsOverride,
+                                   xDel, pDel);
+    end else
+      rc := sqlite3_carray_bind(pStmt, idx, aData, nData, mFlagsOverride, xDel);
+  end;
+
+  { test1.c:4713..4721 — release transient-owned data. }
+  if isTransient <> 0 then begin
+    if (eType = 3) and (aData <> nil) then
+      for i := 0 to nData - 1 do
+        sqlite3_free(PPAnsiChar(aData)[i]);
+    if (eType = 4) and (aData <> nil) then
+      for i := 0 to nData - 1 do
+        sqlite3_free(PIoVec(aData)[i].iov_base);
+    sqlite3_free(aData);
+  end;
+
+carray_bind_done:
+  if rc <> 0 then begin
+    Tcl_AppendResult(interp, sqlite3_errstr(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -6557,6 +6912,10 @@ begin
     @test_blob_read, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_write'),
     @test_blob_write, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_carray_bind'),
+    @tcl_test_carray_bind, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('bind_carray_intptr'),
+    @tcl_bind_carray_intptr, nil, nil);
   Result := TCL_OK;
 end;
 
