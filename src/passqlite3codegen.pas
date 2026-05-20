@@ -54157,6 +54157,14 @@ var
   pVtbEntryIc: passqlite3vtab.PVtabModule;
   azVArgIc:   ^PAnsiChar;
   zModVIc:    PAnsiChar;
+  { pragma.c:1275 — PRAGMA table_list locals.  iiTl walks attached dbs;
+    zDbTl is the explicit schema filter (nil = all); zTypeTl is the per-row
+    "table"/"view"/"virtual"/"shadow" tag; xTl walks each schema's tblHash. }
+  iiTl:    i32;
+  zDbTl:   PAnsiChar;
+  zTypeTl: PAnsiChar;
+  xTl:     passqlite3util.PHashElem;
+  pTabTl:  PTable2;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   { pragma.c:2744..2745 — LOCK_STATUS names (slots 0..4) plus
@@ -54535,6 +54543,66 @@ begin
             Inc(i);
             pFKey := Pu8(PPointer(pFKey + 8)^);  { FKEY_PNEXTFROM_OFFSET }
           end;
+        end;
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1275 — PRAGMA table_list [ (name) ].  Emit one row per table,
+      view, virtual table or shadow table across the (filtered) schemas:
+      schema, name, type, ncol, wr (WITHOUT ROWID), strict.  When an explicit
+      db. prefix is supplied zDbTl restricts to that schema; an optional
+      table-name argument (zRight) restricts to that table. }
+    PragTyp_TABLE_LIST: begin
+      pParse^.nMem := 6;
+      if (pId2 <> nil) and (pId2^.n > 0) then
+        zDbTl := db^.aDb[iDb].zDbSName
+      else
+        zDbTl := nil;
+      sqlite3CodeVerifyNamedSchema(pParse, zDbTl);
+      for iiTl := 0 to db^.nDb - 1 do
+      begin
+        if (zDbTl <> nil)
+           and (sqlite3_stricmp(zDbTl, db^.aDb[iiTl].zDbSName) <> 0) then
+          Continue;
+        if db^.aDb[iiTl].pSchema = nil then Continue;
+
+        { pragma.c:1285..1314 — ensure Table.nCol is initialised for every
+          view and virtual table.  The Pascal port resolves this in-place
+          via sqlite3ViewGetColumnNames (no re-prepare/hash-disrupt loop). }
+        xTl := db^.aDb[iiTl].pSchema^.tblHash.first;
+        while xTl <> nil do
+        begin
+          pTabTl := PTable2(xTl^.data);
+          if (pTabTl <> nil) and (pTabTl^.nCol = 0) then
+            sqlite3ViewGetColumnNames(pParse, pTabTl);
+          xTl := xTl^.next;
+        end;
+
+        xTl := db^.aDb[iiTl].pSchema^.tblHash.first;
+        while xTl <> nil do
+        begin
+          pTabTl := PTable2(xTl^.data);
+          if pTabTl = nil then begin xTl := xTl^.next; Continue; end;
+          if (zRight <> '')
+             and (sqlite3_stricmp(PAnsiChar(zRight), pTabTl^.zName) <> 0) then
+          begin xTl := xTl^.next; Continue; end;
+          if IsView(pTabTl) then
+            zTypeTl := 'view'
+          else if pTabTl^.eTabType = TABTYP_VTAB then
+            zTypeTl := 'virtual'
+          else if (pTabTl^.tabFlags and TF_Shadow) <> 0 then
+            zTypeTl := 'shadow'
+          else
+            zTypeTl := 'table';
+          sqlite3VdbeMultiLoad(v, 1, 'sssiii', [
+            Pointer(db^.aDb[iiTl].zDbSName),
+            Pointer(sqlite3PreferredTableName(pTabTl^.zName)),
+            Pointer(zTypeTl),
+            i32(pTabTl^.nCol),
+            i32(Ord((pTabTl^.tabFlags and TF_WithoutRowid) <> 0)),
+            i32(Ord((pTabTl^.tabFlags and TF_Strict) <> 0))]);
+          xTl := xTl^.next;
         end;
       end;
       Exit;
