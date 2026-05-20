@@ -3036,6 +3036,18 @@ type
     pragma.c:475..511).  Installed by passqlite3main at unit init. }
   TFileControlFn = function(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
                             pArg: Pointer): i32; cdecl;
+  { Trampoline for sqlite3_overload_function (main.c:2223), which lives in
+    passqlite3main and cannot be referenced directly from this unit
+    (circular uses).  Wired from passqlite3main initialisation. }
+  TOverloadFunctionFn = function(db: PTsqlite3; zName: PAnsiChar;
+                                 nArg: i32): i32; cdecl;
+  { Trampoline for sqlite3VtabOverloadFunction (vtab.c:1153), which lives in
+    passqlite3vtab (which uses this unit — circular).  Used by
+    sqlite3ExprCodeTarget (expr.c:5418..5436) to redirect an infix
+    function call (LIKE/GLOB/REGEXP/MATCH) to a virtual table's
+    xFindFunction override.  Wired from passqlite3vtab initialisation. }
+  TVtabOverloadFunctionFn = function(db: PTsqlite3; pDef: PTFuncDef;
+                                     nArg: i32; pExpr: PExpr): PTFuncDef;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
@@ -3044,6 +3056,8 @@ var
   gWalAutoCheckpoint: TWalAutoCheckpointFn;
   gWalDefaultHook:   Pointer;
   gFileControl:      TFileControlFn;
+  gOverloadFunction: TOverloadFunctionFn;
+  gVtabOverloadFunction: TVtabOverloadFunctionFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -5647,6 +5661,23 @@ begin
   end
   else
     r1 := 0;
+  { OMIT_VIRTUALTABLE — possibly overload the function if the first
+    argument is a virtual table column (expr.c:5418..5436).  For infix
+    functions (LIKE, GLOB, REGEXP, MATCH) the left operand ends up as the
+    SECOND argument ("A glob B" => glob(B,A)), so test pFarg[1]; otherwise
+    test pFarg[0].  sqlite3VtabOverloadFunction lives in passqlite3vtab
+    (circular uses) so reach it through the gVtabOverloadFunction
+    trampoline wired at startup. }
+  if @gVtabOverloadFunction <> nil then
+  begin
+    items := ExprListItems(pFarg);
+    if (n >= 2) and ExprHasProperty(pExpr, EP_InfixFunc) then
+      pDef := gVtabOverloadFunction(db, pDef, n,
+        PExprListItem(PByte(items) + 1 * SZ_EXPRLIST_ITEM)^.pExpr)
+    else if n > 0 then
+      pDef := gVtabOverloadFunction(db, pDef, n,
+        PExprListItem(items)^.pExpr);
+  end;
   { Phase 6.9-bis 11g.2.f sub-progress 30 — SQLITE_FUNC_NEEDCOLL:
     emit OP_CollSeq before OP_Function when the function's FuncDef carries
     SQLITE_FUNC_NEEDCOLL (mirrors expr.c:5437..5439).  nullif() is the
@@ -60003,9 +60034,19 @@ begin
 end;
 
 procedure sqlite3RegisterPerConnectionBuiltinFunctions(db: PTsqlite3);
+var
+  rc: i32;
 begin
-  { Connection-specific functions (e.g. last_insert_rowid) are already in
-    the global table; no per-connection registration needed in Phase 6.6. }
+  { Faithful port of func.c:2331.  Register the per-connection "MATCH"
+    placeholder so `x MATCH y` (which parses to match(y,x)) resolves to a
+    stub function that a virtual table's xFindFunction can overload.
+    sqlite3_overload_function lives in passqlite3main (circular uses), so
+    reach it through the gOverloadFunction trampoline wired at startup. }
+  if gOverloadFunction = nil then Exit;  { not yet wired }
+  rc := gOverloadFunction(db, 'MATCH', 2);
+  Assert((rc = SQLITE_NOMEM) or (rc = SQLITE_OK));
+  if rc = SQLITE_NOMEM then
+    sqlite3OomFault(db);
 end;
 
 procedure sqlite3RegisterLikeFunctions(db: PTsqlite3; caseSensitive: i32);
