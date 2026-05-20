@@ -4202,10 +4202,16 @@ var
 begin
   if pParse = nil then Exit;
   db := pParse^.db;
+  { util.c:248 — flag the offset as "not yet known" so that any %T/%r
+    conversion (or an explicit sqlite3RecordErrorOffsetOf* call) fired
+    during message formatting can stamp the real byte offset. }
+  if db <> nil then db^.errByteOffset := -2;
   if zFormat <> nil then
     zMsg := sqlite3MPrintf(db, zFormat, [])
   else
     zMsg := nil;
+  { util.c:252 — if nothing recorded a real offset, clamp -2 back to -1. }
+  if (db <> nil) and (db^.errByteOffset < -1) then db^.errByteOffset := -1;
   { build.c sqlite3ErrorMsg: when db->suppressErr is set the message is
     silently dropped and nErr/rc are NOT modified (except on mallocFailed,
     which surfaces as SQLITE_NOMEM). }

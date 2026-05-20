@@ -986,6 +986,28 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:4938..4957 — test_error_offset.
+  Usage: sqlite3_error_offset DB. }
+function test_error_offset(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:          PTsqlite3;
+  iByteOffset: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  iByteOffset := sqlite3_error_offset(db);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(iByteOffset));
+  Result := TCL_OK;
+end;
+
 { test1.c:5035..5082 — test_prepare.
   Usage: sqlite3_prepare DB sql bytes ?tailvar? }
 function test_prepare(clientData: TClientData; interp: PTclInterp;
@@ -6646,6 +6668,9 @@ begin
     @test_exec_printf, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg'),
     @test_errmsg, nil, nil);
+  { test1.c:9137 — sqlite3_error_offset DB (test_error_offset). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_error_offset'),
+    @test_error_offset, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare'),
     @test_prepare, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare_v2'),
