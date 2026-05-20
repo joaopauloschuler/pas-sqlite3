@@ -683,6 +683,31 @@ begin
   end;
 end;
 
+{ test1.c:147 — sqlite3TestErrCode.  In a non-threadsafe build, when the
+  returned rc disagrees with sqlite3_errcode(db) (and is neither MISUSE nor
+  OK), report a mismatch and return 1.  In a threadsafe build (the profile
+  used by the driver) the guard short-circuits and this is a no-op returning
+  0, so a failing bind simply returns TCL_ERROR with an empty result. }
+function sqlite3TestErrCode(interp: PTclInterp; db: PTsqlite3; rc: cint): cint;
+var
+  r2: cint;
+  zBuf: AnsiString;
+begin
+  if (sqlite3_threadsafe = 0) and (rc <> SQLITE_MISUSE) and (rc <> SQLITE_OK)
+     and (sqlite3_errcode(db) <> rc) then
+  begin
+    r2 := sqlite3_errcode(db);
+    zBuf := 'error code ' + AnsiString(t1ErrName(rc)) + ' (' + IntToStr(rc) +
+            ') does not match sqlite3_errcode ' + AnsiString(t1ErrName(r2)) +
+            ' (' + IntToStr(r2) + ')';
+    Tcl_ResetResult(interp);
+    Tcl_AppendResult(interp, PChar(zBuf), Pointer(nil));
+    Result := 1;
+    Exit;
+  end;
+  Result := 0;
+end;
+
 { Format a pointer as the "%p"-flavoured hex test1.c hands to Tcl. }
 procedure ptrToHex(p: Pointer; out zBuf: AnsiString);
 begin
@@ -2898,8 +2923,10 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_int(pStmt, idx, value);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -2926,8 +2953,10 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_int64(pStmt, idx, value);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -2989,8 +3018,10 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_double(pStmt, idx, value);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -3013,8 +3044,10 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_null(pStmt, idx);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -3057,8 +3090,10 @@ begin
   end;
   rc := sqlite3_bind_text(pStmt, idx, value, bytes, SQLITE_TRANSIENT);
   if toFree <> nil then FreeMem(toFree);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -3108,8 +3143,10 @@ begin
   end;
   rc := sqlite3_bind_text16(pStmt, idx, Pointer(value), bytes, xDel);
   if toFree <> nil then FreeMem(toFree);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -3154,8 +3191,10 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_blob(pStmt, idx, value, bytes, xDel);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -3180,6 +3219,9 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_zeroblob(pStmt, idx, n);
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
     Result := TCL_ERROR; Exit;
   end;
@@ -3206,8 +3248,10 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   rc := sqlite3_bind_zeroblob64(pStmt, idx, u64(n));
+  if sqlite3TestErrCode(interp, sqlite3_db_handle(pStmt), rc) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
   if rc <> SQLITE_OK then begin
-    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;

@@ -57619,8 +57619,13 @@ begin
         sqlite3_free(zOut);
       end;
   else begin { SQLITE_TEXT }
+      { func.c:1132..1135 — the TEXT case routes through "%Q", which treats
+        the argument as a NUL-terminated C string (precision is -1, so the
+        printf.c escape loop stops at the first NUL).  Use strlen here, NOT
+        sqlite3_value_bytes, so an embedded NUL truncates exactly as C does
+        (bind-12.1: a 10-byte "abc\0xyz\0pq" TEXT quotes as 'abc'). }
       z := sqlite3_value_text(Psqlite3_value(pVal));
-      n := sqlite3_value_bytes(Psqlite3_value(pVal));
+      n := i32(strlen(z));
       nQuotes := 0;
       for i := 0 to n - 1 do
         if (z + i)^ = '''' then Inc(nQuotes);

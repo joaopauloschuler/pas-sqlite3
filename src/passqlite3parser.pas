@@ -1850,6 +1850,7 @@ var
   ok:    i32;
   i:     i64;
   doAdd: i32;
+  zVarMsg: PAnsiChar;
 begin
   if pExpr = nil then Exit;
   db := pPse^.db;
@@ -1869,7 +1870,14 @@ begin
       end;
       if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
       begin
-        sqlite3ErrorMsg(pPse, 'variable number out of range');
+        { expr.c:1350 — "variable number must be between ?1 and ?%d".
+          sqlite3ErrorMsg has no varargs overload here, so format the
+          SQLITE_LIMIT_VARIABLE_NUMBER bound via sqlite3MPrintf first. }
+        zVarMsg := sqlite3MPrintf(db,
+          'variable number must be between ?1 and ?%d',
+          [db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]]);
+        sqlite3ErrorMsg(pPse, zVarMsg);
+        sqlite3DbFree(db, zVarMsg);
         sqlite3RecordErrorOffsetOfExpr(db, pExpr);
         Exit;
       end;

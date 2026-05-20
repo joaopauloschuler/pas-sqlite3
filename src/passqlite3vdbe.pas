@@ -5751,17 +5751,31 @@ end;
 function vdbeUnbind55(p: PVdbe; i: u32): i32;
 var
   pVar: PMem;
+  db:   PTsqlite3;
 begin
   if p = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  db := p^.db;
   if p^.eVdbeState <> VDBE_READY_STATE then begin
+    { vdbeapi.c:1660-1666 — set the connection error to SQLITE_MISUSE so
+      sqlite3_errmsg reports the standard text. }
+    db^.errCode := SQLITE_MISUSE;
+    if db^.pErr <> nil then sqlite3ValueSetNull(Psqlite3_value(db^.pErr));
+    sqlite3SystemError(db, SQLITE_MISUSE);
     Result := SQLITE_MISUSE; Exit;
   end;
   if i >= u32(p^.nVar) then begin
+    { vdbeapi.c:1667-1671 — sqlite3Error(p->db, SQLITE_RANGE) so the
+      connection error message becomes "column index out of range". }
+    db^.errCode := SQLITE_RANGE;
+    if db^.pErr <> nil then sqlite3ValueSetNull(Psqlite3_value(db^.pErr));
+    sqlite3SystemError(db, SQLITE_RANGE);
     Result := SQLITE_RANGE; Exit;
   end;
   pVar := p^.aVar + i;
   sqlite3VdbeMemRelease(pVar);
   pVar^.flags := MEM_Null;
+  { vdbeapi.c:1675 — successful unbind clears any prior error. }
+  db^.errCode := SQLITE_OK;
   Result := SQLITE_OK;
 end;
 
