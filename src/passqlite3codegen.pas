@@ -8547,6 +8547,21 @@ var
   base:   PSrcItem;
   pDefU:  PTFuncDef;
   nArgU:  i32;
+
+  { resolve.c:835..844 lookupname_end — when a column reference resolves
+    successfully and an authorizer is installed, fire the column-read auth
+    callback.  This lean walker resolves UPDATE/DELETE SET-value and WHERE
+    expressions (sqlite3ResolveExprNames path); the SELECT path uses its own
+    resolver (sqlite3ResolveSelectNames) which fires AuthRead separately, so
+    there is no double-fire here.  pSchema is the matched table's schema,
+    pSrcList is the current pSrc (== pNC->pSrcList). }
+  procedure AuthReadBound(pCol: PExpr);
+  begin
+    if (pParse <> nil) and (pParse^.db <> nil) and (pParse^.db^.xAuth <> nil)
+       and (pCol^.op = TK_COLUMN) and (pCol^.y.pTab <> nil) then
+      sqlite3AuthRead(pParse, pCol, pCol^.y.pTab^.pSchema, pSrc);
+  end;
+
 begin
   if pE = nil then Exit;
   { resolve.c:1140..1161 (TK_FUNCTION arm of resolveExprStep) — validate the
@@ -8596,6 +8611,7 @@ begin
     pE^.iTable  := pItem^.iCursor;
     pE^.iColumn := pE^.iColumn - 1;
     pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+    AuthReadBound(pE);
     Exit;
   end;
   if (pE^.op = TK_DOT) and (pSrc <> nil)
@@ -8636,6 +8652,7 @@ begin
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
         else
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        AuthReadBound(pE);
         Exit;
       end;
     end;
@@ -8659,6 +8676,7 @@ begin
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
         else
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        AuthReadBound(pE);
         Exit;
       end;
     end;
@@ -8674,6 +8692,7 @@ begin
         pE^.iColumn := i16(-1);
         pE^.y.pTab  := pItem^.pSTab;
         pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        AuthReadBound(pE);
         Exit;
       end;
     end;
