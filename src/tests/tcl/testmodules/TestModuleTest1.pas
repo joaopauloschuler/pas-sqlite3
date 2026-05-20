@@ -862,6 +862,52 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:383..397 — db_enter (old-style argc/argv handler).
+  Usage: db_enter DB.  Enters the connection mutex. }
+function db_enter(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result := TCL_OK;
+end;
+
+{ test1.c:399..414 — db_leave (old-style argc/argv handler).
+  Usage: db_leave DB.  Leaves the connection mutex. }
+function db_leave(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := TCL_OK;
+end;
+
 { test1.c:4910..4929 — test_errmsg.
   Usage: sqlite3_errmsg DB. }
 function test_errmsg(clientData: TClientData; interp: PTclInterp;
@@ -1154,6 +1200,61 @@ begin
   pStmt2 := sqlite3TestTextToPtr(Tcl_GetString(objv[2]));
   Tcl_SetObjResult(interp,
     Tcl_NewIntObj(sqlite3_transfer_bindings(PVdbe(pStmt1), PVdbe(pStmt2))));
+  Result := TCL_OK;
+end;
+
+{ test1.c:3172..3189 — test_changes.
+  Usage: sqlite3_changes DB. }
+function test_changes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_changes(db)));
+  Result := TCL_OK;
+end;
+
+{ test1.c:4967..4994 — test_errmsg16.
+  Usage: sqlite3_errmsg16 DB.
+  Returns the UTF-16 representation of the most recent error message as a
+  Tcl byte-array (including the trailing 0x00 0x00 terminator). }
+function test_errmsg16(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  zErr:  Pointer;
+  z:     PAnsiChar;
+  bytes: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  bytes := 0;
+  zErr := sqlite3_errmsg16(db);
+  if zErr <> nil then
+  begin
+    z := PAnsiChar(zErr);
+    while (z[bytes] <> #0) or (z[bytes + 1] <> #0) do
+      Inc(bytes, 2);
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(zErr, bytes));
   Result := TCL_OK;
 end;
 
@@ -6147,6 +6248,17 @@ begin
     @test_prepare16_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_transfer_bindings'),
     @test_transfer_bind, nil, nil);
+  { test1.c:9157 — sqlite3_changes DB (test_changes). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_changes'),
+    @test_changes, nil, nil);
+  { test1.c:9138 — sqlite3_errmsg16 DB (test_errmsg16). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_errmsg16'),
+    @test_errmsg16, nil, nil);
+  { test1.c:9057..9058 — db_enter / db_leave DB (old-style argc/argv). }
+  Tcl_CreateCommand(interp, PChar('db_enter'),
+    @db_enter, nil, nil);
+  Tcl_CreateCommand(interp, PChar('db_leave'),
+    @db_leave, nil, nil);
   { 9.4.divbug.88.001 — sqlite3_expired STMT.  test1.c:3121..3138, 9155. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_expired'),
     @test_expired, nil, nil);
