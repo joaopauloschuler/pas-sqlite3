@@ -34,7 +34,8 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3parser,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
      passqlite3percentile, passqlite3regexp,
-     TestModuleMd5, TestModuleTclvar, TestModuleTest1, TestModuleFunc,
+     TestModuleMd5, TestModuleTclvar, TestModuleBestindex,
+     TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
      TestModuleVfs;
 
@@ -4898,6 +4899,8 @@ begin
   Md5_Init(interp);
   { 9.4.6.l.2 — test_tclvar.c: register the `register_tclvar_module` cmd. }
   Sqlitetesttclvar_Init(interp);
+  { test_bestindex.c: register the `register_tcl_module` cmd. }
+  Sqlitetesttcl_Init(interp);
   { 9.4.6.l.1 — test8.c: register_echo_module / sqlite3_declare_vtab. }
   Sqlitetest8_Init(interp);
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
