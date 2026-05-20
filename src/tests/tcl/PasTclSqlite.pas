@@ -4935,6 +4935,10 @@ begin
               @sqlite3_search_count, TCL_LINK_INT);
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
               @sqlite3_sort_count, TCL_LINK_INT);
+  { test1.c:9378 Tcl_LinkVar( sqlite_open_file_count ) — the OS-layer
+    open-file-handle counter (passqlite3os.pas), read by exclusive-5.x. }
+  Tcl_LinkVar(interp, PChar('sqlite_open_file_count'),
+              @sqlite3_open_file_count, TCL_LINK_INT);
   { Shard 0 fix 2 — attach4.test / attach.test / sqllimits1.test / wal.test
     read $SQLITE_MAX_ATTACHED.  Mirror the C test_config.c:827 LINKVAR
     so the Tcl side sees the same compiled-in limit.  TCL_LINK_READ_ONLY

@@ -688,6 +688,11 @@ var
   sqlite3_io_error_benign   : cint = 0;
   sqlite3_diskfull_pending  : cint = 0;
   sqlite3_diskfull          : cint = 0;
+  { os.c:37 — count of OS file handles currently open.  Bumped on the
+    real fd open in unixOpen (os_unix.c:6253 OpenCounter(+1)) and on the
+    real close in unixClose_impl (os_unix.c:2332 OpenCounter(-1)).
+    Linked into Tcl as $sqlite_open_file_count (test1.c:9378). }
+  sqlite3_open_file_count   : cint = 0;
 {$endif}
 
 
@@ -1594,6 +1599,11 @@ begin
   if pf^.h >= 0 then
     FpClose(pf^.h);
 
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:2332 OpenCounter(-1) — closeUnixFile, after the real close. }
+  Dec(sqlite3_open_file_count);
+  {$endif}
+
   FillChar(pf^, SizeOf(unixFile), 0);
   Result := SQLITE_OK;
 end;
@@ -2386,6 +2396,11 @@ begin
 
   if pOutFlags <> nil then
     pOutFlags^ := flags;
+
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:6253 OpenCounter(+1) — success branch, real fd is open. }
+  Inc(sqlite3_open_file_count);
+  {$endif}
 
   Result := SQLITE_OK;
 end;
