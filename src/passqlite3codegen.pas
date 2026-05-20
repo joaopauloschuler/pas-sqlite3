@@ -10335,6 +10335,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pIt_d:  PSrcItem;
     j_d:    i32;
     pDeep_: PSelect;
+    base_o: PSrcItem;
+    pIt_o:  PSrcItem;
+    k_o:    i32;
   begin
     if (pSel = nil) or (pSel^.pSrc = nil) or (pOuterSrc = nil) then Exit;
     base_d := SrcListItems(pSel^.pSrc);
@@ -10356,6 +10359,31 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         ResolveOuterIDs(pDeep_^.pHaving,         pOuterSrc, pDeep_^.pSrc);
         ResolveOuterIDsInList(pDeep_^.pGroupBy,  pOuterSrc, pDeep_^.pSrc);
         ResolveOuterIDsInList(pDeep_^.pOrderBy,  pOuterSrc, pDeep_^.pSrc);
+        { subquery2-1.21/1.22 — also pre-resolve outer refs inside the JOIN
+          ON clauses of pDeep_'s own FROM-list.  A correlated outer column
+          living in a deep JOIN's ON (e.g. `... t2 JOIN t3 ON d*a=f` where
+          `a` is an OUTER table column) is moved into pWhere by
+          sqlite3ProcessJoin only when the deep subquery is later prepared
+          by sqlite3SelectExpand; if we have not pre-bound it to the outer
+          cursor here, that prep raises "no such column: a" and aborts
+          before sqlite3ExpandSubquery can materialise the deep subquery's
+          result columns — which then surfaces as "no such column: <alias>"
+          when the enclosing SELECT references the (never-built) alias.
+          The ON expr lives in u3.pOn only when the item is not a USING
+          join (fg.fgBits2 bit 3). }
+        if pDeep_^.pSrc <> nil then
+        begin
+          base_o := SrcListItems(pDeep_^.pSrc);
+          for k_o := 0 to pDeep_^.pSrc^.nSrc - 1 do
+          begin
+            pIt_o := PSrcItem(PByte(base_o) + k_o * SizeOf(TSrcItem));
+            if (pIt_o^.fg.fgBits2 and u8($08)) = 0 then  { not isUsing }
+            begin
+              ResolveOuterRefs(pIt_o^.u3.pOn, pOuterSrc, pDeep_^.pSrc);
+              ResolveOuterIDs(pIt_o^.u3.pOn, pOuterSrc, pDeep_^.pSrc);
+            end;
+          end;
+        end;
         { Recurse: this deep SELECT may itself have FROM-subqueries whose
           interiors still reference the outermost pSrc. }
         WalkDeepFromSubqueries(pDeep_, pOuterSrc);
