@@ -406,6 +406,11 @@ procedure Tcl_RegisterChannel(interp: PTclInterp; chan: TTclChannel); cdecl; ext
 function  Tcl_UnregisterChannel(interp: PTclInterp; chan: TTclChannel): cint; cdecl; external 'tcl8.6';
 function  Tcl_GetChannelName(chan: TTclChannel): PChar; cdecl; external 'tcl8.6';
 procedure Tcl_SetResult(interp: PTclInterp; result: PChar; freeProc: Pointer); cdecl; external 'tcl8.6';
+{ Channel lookup / IO — used by test_blob.c blobHandleFromObj. }
+function  Tcl_GetChannel(interp: PTclInterp; chanName: PChar; modePtr: pcint): TTclChannel; cdecl; external 'tcl8.6';
+function  Tcl_GetChannelInstanceData(chan: TTclChannel): TClientData; cdecl; external 'tcl8.6';
+function  Tcl_Flush(chan: TTclChannel): cint; cdecl; external 'tcl8.6';
+function  Tcl_Seek(chan: TTclChannel; offset: Int64; mode: cint): Int64; cdecl; external 'tcl8.6';
 
 { ----------------------------------------------------------------------
   Pascal-side helpers. }

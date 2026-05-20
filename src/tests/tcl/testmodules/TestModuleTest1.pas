@@ -5832,6 +5832,243 @@ begin
   if clientData = nil then ;
 end;
 
+{ ----------------------------------------------------------------------
+  test_blob.c — Tcl wrappers around the sqlite3_blob_* incremental-BLOB API.
+  The underlying engine functions live in passqlite3vdbe; this is the Tcl
+  glue (test_blob.c:33..339). }
+
+{ test_blob.c:33..37 — ptrToText.  Render a pointer as the "%p" text
+  sqlite3TestTextToPtr() can decode back ("0x" + lowercase hex). }
+procedure blobPtrToText(p: Pointer; out zBuf: AnsiString);
+begin
+  zBuf := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+end;
+
+{ test_blob.c:51..79 — blobHandleFromObj.  Extract an sqlite3_blob* from a
+  Tcl object: either an "incrblob_N" channel name or a ptrToText pointer. }
+function blobHandleFromObj(interp: PTclInterp; pObj: PTclObj;
+  out ppBlob: Psqlite3_blob): cint;
+var
+  z:            PAnsiChar;
+  n:            cint;
+  notUsed:      cint;
+  channel:      TTclChannel;
+  instanceData: TClientData;
+begin
+  z := Tcl_GetStringFromObj(pObj, @n);
+  if n = 0 then
+    ppBlob := nil
+  else if (n > 9) and (StrLComp(z, PAnsiChar('incrblob_'), 9) = 0) then
+  begin
+    channel := Tcl_GetChannel(interp, z, @notUsed);
+    if channel = nil then begin Result := TCL_ERROR; Exit; end;
+    Tcl_Flush(channel);
+    Tcl_Seek(channel, 0, 0 { SEEK_SET });
+    instanceData := Tcl_GetChannelInstanceData(channel);
+    { The IncrblobChannel's first field is the sqlite3_blob* pointer. }
+    ppBlob := Psqlite3_blob(PPointer(instanceData)^);
+  end
+  else
+    ppBlob := Psqlite3_blob(sqlite3TestTextToPtr(z));
+  Result := TCL_OK;
+end;
+
+{ test_blob.c:86..91 — blobStringFromObj.  Like Tcl_GetString but returns
+  nil for a 0-byte string. }
+function blobStringFromObj(pObj: PTclObj): PAnsiChar;
+var
+  n: cint;
+  z: PAnsiChar;
+begin
+  z := Tcl_GetStringFromObj(pObj, @n);
+  if n <> 0 then Result := z else Result := nil;
+end;
+
+{ test_blob.c:98..152 — test_blob_open.
+  Usage: sqlite3_blob_open DB DATABASE TABLE COLUMN ROWID FLAGS VARNAME. }
+function test_blob_open(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:       PTsqlite3;
+  zDb:      PAnsiChar;
+  zTable:   PAnsiChar;
+  zColumn:  PAnsiChar;
+  iRowid:   Int64;
+  flags:    cint;
+  zVarname: PAnsiChar;
+  nVarname: cint;
+  pBlob:    Psqlite3_blob;
+  rc:       cint;
+  zPtr:     AnsiString;
+begin
+  if objc <> 8 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('DB DATABASE TABLE COLUMN ROWID FLAGS VARNAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zDb := Tcl_GetString(objv[2]);
+  zTable := blobStringFromObj(objv[3]);
+  zColumn := Tcl_GetString(objv[4]);
+  if Tcl_GetWideIntFromObj(interp, objv[5], @iRowid) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[6], @flags) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zVarname := Tcl_GetStringFromObj(objv[7], @nVarname);
+
+  if nVarname > 0 then
+  begin
+    rc := sqlite3_blob_open(db, zDb, zTable, zColumn, iRowid, flags, pBlob);
+    blobPtrToText(pBlob, zPtr);
+    Tcl_SetVar(interp, zVarname, PChar(zPtr), 0);
+  end
+  else
+    rc := sqlite3_blob_open(db, zDb, zTable, zColumn, iRowid, flags, pBlob);
+
+  if rc = SQLITE_OK then
+    Tcl_ResetResult(interp)
+  else
+  begin
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test_blob.c:158..183 — test_blob_close.
+  Usage: sqlite3_blob_close HANDLE. }
+function test_blob_close(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pBlob: Psqlite3_blob;
+  rc:    cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if blobHandleFromObj(interp, objv[1], pBlob) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_blob_close(pBlob);
+  if rc <> 0 then
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE)
+  else
+    Tcl_ResetResult(interp);
+  Result := TCL_OK;
+end;
+
+{ test_blob.c:188..210 — test_blob_bytes.
+  Usage: sqlite3_blob_bytes HANDLE. }
+function test_blob_bytes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pBlob: Psqlite3_blob;
+  nByte: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('HANDLE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if blobHandleFromObj(interp, objv[1], pBlob) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  nByte := sqlite3_blob_bytes(pBlob);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(nByte));
+  Result := TCL_OK;
+end;
+
+{ test_blob.c:227..280 — test_blob_read.
+  Usage: sqlite3_blob_read CHANNEL OFFSET N. }
+function test_blob_read(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pBlob:   Psqlite3_blob;
+  nByte:   cint;
+  iOffset: cint;
+  zBuf:    PByte;
+  rc:      cint;
+begin
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('CHANNEL OFFSET N'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if blobHandleFromObj(interp, objv[1], pBlob) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if (Tcl_GetIntFromObj(interp, objv[2], @iOffset) <> TCL_OK)
+    or (Tcl_GetIntFromObj(interp, objv[3], @nByte) <> TCL_OK) then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  zBuf := PByte(Tcl_Alloc(nByte));
+  rc := sqlite3_blob_read(pBlob, zBuf, nByte, iOffset);
+  if rc = SQLITE_OK then
+    Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(zBuf, nByte))
+  else
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
+  Tcl_Free(PChar(zBuf));
+
+  if rc = SQLITE_OK then Result := TCL_OK else Result := TCL_ERROR;
+end;
+
+{ test_blob.c:285..339 — test_blob_write.
+  Usage: sqlite3_blob_write CHANNEL OFFSET DATA ?NDATA?. }
+function test_blob_write(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pBlob:   Psqlite3_blob;
+  iOffset: cint;
+  rc:      cint;
+  zBuf:    Pointer;
+  nBuf:    cint;
+begin
+  if (objc <> 4) and (objc <> 5) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('CHANNEL OFFSET DATA ?NDATA?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if blobHandleFromObj(interp, objv[1], pBlob) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @iOffset) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  zBuf := Tcl_GetByteArrayFromObj(objv[3], @nBuf);
+  if objc = 5 then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[4], @nBuf) <> TCL_OK then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  end;
+  rc := sqlite3_blob_write(pBlob, zBuf, nBuf, iOffset);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -6196,6 +6433,18 @@ begin
   { 9.4.divbug.87.005 — sqlite3_table_column_metadata (test1.c:9279). }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_table_column_metadata'),
     @tcl_test_table_column_metadata, nil, nil);
+  { test_blob.c:310..328 — Sqlitetest_blob_Init: the incremental-BLOB
+    Tcl wrappers (sqlite3_blob_open / _close / _bytes / _read / _write). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_open'),
+    @test_blob_open, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_close'),
+    @test_blob_close, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_bytes'),
+    @test_blob_bytes, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_read'),
+    @test_blob_read, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_write'),
+    @test_blob_write, nil, nil);
   Result := TCL_OK;
 end;
 
