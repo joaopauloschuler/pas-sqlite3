@@ -10181,6 +10181,25 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pDeep: PSelect;      { 9.4.divbug.76 — walks FROM-subquery interior selects }
     zDb: PAnsiChar;        { 9.4.divbug.87.058 — 3-part qualifier `db.tab.col` }
     pDbSchema: Pointer;
+
+    { resolve.c:835..844 lookupname_end — when a column reference resolves
+      successfully (cnt==1) and an authorizer is installed, invoke the
+      column-read auth callback.  The Pascal lookupName uses early Exits at
+      each cnt==1 success arm rather than C's single lookupname_end label,
+      so route every successful TK_COLUMN / TK_TRIGGER resolution through
+      this helper just before the Exit.  pSchema is the matched table's
+      schema (resolve.c:512/558 set pSchema = pTab->pSchema); the source
+      list is the current SELECT's pSrc (== pNC->pSrcList).  Must run AFTER
+      pE^.op / iTable / iColumn / y.pTab are set so the SQLITE_IGNORE
+      NULL-rewrite lands on a fully-formed column expr. }
+    procedure AuthReadCol(pCol: PExpr);
+    begin
+      if (pParse^.db^.xAuth <> nil)
+         and ((pCol^.op = TK_COLUMN) or (pCol^.op = TK_TRIGGER))
+         and (pCol^.y.pTab <> nil) then
+        sqlite3AuthRead(pParse, pCol, pCol^.y.pTab^.pSchema, p^.pSrc);
+    end;
+
   begin
     if pE = nil then Exit;
     { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
@@ -10196,6 +10215,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
       if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
         ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
+      AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
       Exit;
     end;
     { NEW.x / OLD.x trigger pseudo-table refs — bind against
@@ -10206,7 +10226,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
        and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
     begin
       resolveTriggerNewOld(pParse, pE);
-      if pE^.op = TK_TRIGGER then Exit;
+      if pE^.op = TK_TRIGGER then
+      begin
+        AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
+        Exit;
+      end;
     end;
     { Handle TK_DOT (qualified col ref: table.column) against current pSrc.
       Do this before the generic recursion to avoid incorrectly resolving
@@ -10314,6 +10338,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               codeAllEqualityTerms emits the OP_IsNull skip-search guard. }
             if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
               ExprSetProperty(pE, EP_CanBeNull);
+            AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
             Exit;
           end;
           { 9.4.divbug.19 — qualified rowid alias (Tab.rowid / sp.oid).
@@ -10339,6 +10364,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
             if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
               ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
+            AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
             Exit;
           end;
         end;
@@ -10525,6 +10551,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
         if (pMatch^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
           ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
+        AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
         Exit;
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 10 — rowid pseudo-column.
@@ -10555,6 +10582,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
           if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
             ExprSetProperty(pE, EP_CanBeNull);  { 87.040 — resolve.c:509 }
+          AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
           Exit;
         end;
       end;
@@ -27161,6 +27189,14 @@ begin
         else
           pColExpr^.iColumn := i16(j);
         pColExpr^.y.pTab  := pTab;
+        { resolve.c:835..844 lookupname_end — in C, `*` expands to TK_DOT
+          nodes that subsequently pass through lookupName, where the
+          column-read authorizer fires.  This port's expandStar builds the
+          fully-formed TK_COLUMN directly (bypassing lookupName), so invoke
+          the auth check here, after op/iTable/iColumn/y.pTab are set, so a
+          SQLITE_IGNORE rewrite to TK_NULL lands on a complete column expr. }
+        if pParse^.db^.xAuth <> nil then
+          sqlite3AuthRead(pParse, pColExpr, pTab^.pSchema, pSrc);
         if j < BMS - 1 then
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
         else
@@ -54997,6 +55033,7 @@ var
   db:   PTsqlite3;
   zDb:  PAnsiChar;
   rc:   i32;
+  z, z2: PAnsiChar;
 begin
   db  := pParse^.db;
   if db^.init.busy <> 0 then begin Result := SQLITE_OK; Exit; end;
@@ -55004,7 +55041,21 @@ begin
   rc  := TxAuthCallback(db^.xAuth)(db^.pAuthArg, SQLITE_READ_AUTH,
            zTab, zCol, zDb, pParse^.zAuthContext);
   if rc = SQLITE_DENY then begin
-    sqlite3ErrorMsg(pParse, 'access to column is prohibited');
+    { auth.c:117..119 — build "zTab.zCol", and prefix the schema name
+      ("zDb.zTab.zCol") when more than the main+temp dbs are attached or
+      the column lives outside the main database.  This printf port's %z is
+      a plain string read (it does NOT free the arg), so free intermediates
+      via sqlite3DbFree explicitly. }
+    z := sqlite3MPrintf(db, '%s.%s', [zTab, zCol]);
+    if (db^.nDb > 2) or (iDb <> 0) then begin
+      z2 := sqlite3MPrintf(db, '%s.%s', [zDb, z]);
+      sqlite3DbFree(db, z);
+      z := z2;
+    end;
+    z2 := sqlite3MPrintf(db, 'access to %s is prohibited', [z]);
+    sqlite3DbFree(db, z);
+    sqlite3ErrorMsg(pParse, z2);
+    sqlite3DbFree(db, z2);
     pParse^.rc := SQLITE_AUTH;
   end else if (rc <> SQLITE_IGNORE) and (rc <> SQLITE_OK) then
     sqliteAuthBadReturnCode(pParse);
