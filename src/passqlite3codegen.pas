@@ -54842,8 +54842,19 @@ begin
         flagMask := 0;
       if bSet <> 0 then
         db^.flags := db^.flags or flagMask
-      else
+      else begin
         db^.flags := db^.flags and (not flagMask);
+        { pragma.c:1176..1183 — IMP: R-60817-01178.  `PRAGMA
+          writable_schema=RESET` disables schema writing (handled by the
+          mask-clear above) and, in addition, reloads the schema so any
+          edits made to sqlite_schema while writable take effect in-memory.
+          Without this the connection keeps the stale Table objects parsed
+          before the edit, so e.g. a STRICT marker added via UPDATE
+          sqlite_schema is never re-applied (strict2-3.0). }
+        if ((flagMask and SQLITE_WriteSchema) <> 0)
+           and (sqlite3_stricmp(PAnsiChar(zRight), 'reset') = 0) then
+          sqlite3ResetAllSchemasOfConnection(db);
+      end;
     end else begin
       if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
@@ -55558,8 +55569,15 @@ begin
         compares the result with reg[7] (rowid tables) or with the PK
         index counter (WITHOUT ROWID tables). }
 
-      { Index-row-count cross-check (pragma.c:1792..1820). }
-      cntIc := 0;
+      { Index-row-count cross-check (pragma.c:1792..1820).  pragma.c:1793
+        seeds cnt = pObjTab ? 1 : 0: when the walk is restricted to one
+        table the aRoot[] array carries a leading 0 sentinel (written
+        above), so OP_IntegrityCk stored the first real per-tree count in
+        reg 8+1, not 8+0.  Without this offset the cross-check compared the
+        sentinel slot (always 0) against the table row count and reported a
+        spurious "wrong # of entries in index" alongside the genuine error
+        (strict2-3.0). }
+      cntIc := Ord(pObjTabIc <> nil);
       sqlite3VdbeLoadString(v, 2, 'wrong # of entries in index ');
       xIc := pTblsIc^.first;
       while xIc <> nil do
