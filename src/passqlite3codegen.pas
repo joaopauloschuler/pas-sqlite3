@@ -9508,10 +9508,97 @@ begin
   resolveExprSubqueries(pParse, pE^.pRight);
 end;
 
+{ notValidImpl — port of resolve.c:907..925.  Raises "<zMsg> prohibited in
+  <context>" for the constraint context recorded in pNC^.ncFlags, neutralises
+  the offending node (op := TK_NULL) and records the error offset.  Only the
+  CHECK / partial-index / index-expr / generated-column contexts that compose
+  NC_SelfRef select a message; the priority order matches C exactly. }
+procedure notValidImpl(pParse: PParse; pNC: PNameContext; zMsg: PAnsiChar;
+  pE: PExpr; pError: PExpr);
+var
+  zIn: PAnsiChar;
+begin
+  zIn := 'partial index WHERE clauses';
+  if (pNC^.ncFlags and NC_IdxExpr) <> 0 then
+    zIn := 'index expressions'
+  else if (pNC^.ncFlags and NC_IsCheck) <> 0 then
+    zIn := 'CHECK constraints'
+  else if (pNC^.ncFlags and NC_GenCol) <> 0 then
+    zIn := 'generated columns';
+  sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db, '%s prohibited in %s',
+    [zMsg, zIn]));
+  if pE <> nil then pE^.op := TK_NULL;
+  sqlite3RecordErrorOffsetOfExpr(pParse^.db, pError);
+end;
+
+{ resolveNotValidSubqueries — mirror of the TK_IN/TK_SELECT/TK_EXISTS arm of
+  resolve.c:resolveExprStep (resolve.c:1363..1391) for the self-reference
+  contexts.  C's walker raises "subqueries prohibited in <context>" the moment
+  it descends onto a subquery node while pNC^.ncFlags has any NC_SelfRef bit
+  set (the column-resolution pass it runs sets those bits in lockstep).  The
+  Pas resolver does not run the per-node resolveExprStep walker, so this
+  dedicated recursive scan supplies the same check.  Runs FIRST in
+  sqlite3ResolveExprNames so the error is reported before any "no such column"
+  surfacing from inside the subquery body (check-3.1). }
+procedure resolveNotValidSubqueries(pParse: PParse; pNC: PNameContext;
+  pE: PExpr);
+var
+  i: i32;
+begin
+  if pE = nil then Exit;
+  if pParse = nil then Exit;
+  if pParse^.nErr <> 0 then Exit;
+  case pE^.op of
+    TK_SELECT, TK_EXISTS, TK_IN:
+      { ExprUseXSelect — only an actual subquery operand, not x IN (list). }
+      if (pE^.flags and EP_xIsSelect) <> 0 then
+      begin
+        notValidImpl(pParse, pNC, 'subqueries', pE, pE);
+        Exit;
+      end;
+    TK_VARIABLE:
+      { resolve.c:1393..1399 — bound parameters are prohibited in every
+        NC_SelfRef context.  TK_VARIABLE is a leaf, so handle it before the
+        leaf guard below. }
+      begin
+        notValidImpl(pParse, pNC, 'parameters', pE, pE);
+        Exit;
+      end;
+  end;
+  { Leaf / token-only nodes have no pLeft/pRight/x to descend into; reading
+    those fields would walk past the allocation.  Stop here. }
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    if pE^.x.pList <> nil then
+      for i := 0 to pE^.x.pList^.nExpr - 1 do
+      begin
+        resolveNotValidSubqueries(pParse, pNC,
+          ExprListItems(pE^.x.pList)[i].pExpr);
+        if pParse^.nErr <> 0 then Exit;
+      end;
+  end;
+  resolveNotValidSubqueries(pParse, pNC, pE^.pLeft);
+  if pParse^.nErr <> 0 then Exit;
+  resolveNotValidSubqueries(pParse, pNC, pE^.pRight);
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
   begin
+    { resolve.c:1379..1380 — in a CHECK / partial-index / index-expression /
+      generated-column context a subquery operand is illegal.  Detect and
+      report before resolving names so the message precedes any inner
+      "no such column" error. }
+    if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_SelfRef) <> 0) then
+    begin
+      resolveNotValidSubqueries(pNC^.pParse, pNC, pExpr);
+      if pNC^.pParse^.nErr > 0 then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+    end;
     if pNC^.pParse <> nil then
       resolveTriggerNewOld(pNC^.pParse, pExpr);
     if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
