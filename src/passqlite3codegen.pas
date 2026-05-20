@@ -56666,12 +56666,18 @@ end;
 type
   TCollNeededProc = procedure(pCtx: Pointer; db: PTsqlite3;
     eTextRep: i32; zName: PAnsiChar); cdecl;
+  TCollNeeded16Proc = procedure(pCtx: Pointer; db: PTsqlite3;
+    eTextRep: i32; zName: Pointer); cdecl;
 
 procedure callCollNeeded(db: PTsqlite3; enc: u8; zName: PAnsiChar);
 var
   zExternal: PAnsiChar;
   cb: TCollNeededProc;
+  cb16: TCollNeeded16Proc;
+  pTmp: Psqlite3_value;
+  zExt16: Pointer;
 begin
+  { assert( !db->xCollNeeded || !db->xCollNeeded16 ) }
   if db^.xCollNeeded <> nil then begin
     zExternal := sqlite3DbStrDup(db, zName);
     if zExternal = nil then Exit;
@@ -56679,7 +56685,17 @@ begin
     cb(db^.pCollNeededArg, db, enc, zExternal);
     sqlite3DbFree(db, zExternal);
   end;
-  { xCollNeeded16 path omitted: SQLITE_OMIT_UTF16-equivalent in Pas port. }
+  { callback.c:32..41 — xCollNeeded16 path. }
+  if db^.xCollNeeded16 <> nil then begin
+    pTmp := sqlite3ValueNew(db);
+    sqlite3ValueSetStr(pTmp, -1, zName, SQLITE_UTF8, SQLITE_STATIC);
+    zExt16 := sqlite3ValueText(pTmp, SQLITE_UTF16NATIVE);
+    if zExt16 <> nil then begin
+      cb16 := TCollNeeded16Proc(db^.xCollNeeded16);
+      cb16(db^.pCollNeededArg, db, i32(db^.enc), zExt16);
+    end;
+    sqlite3ValueFree(pTmp);
+  end;
 end;
 
 function sqlite3GetCollSeq(pParse: PParse; enc: u8;
