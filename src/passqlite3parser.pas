@@ -1649,6 +1649,7 @@ procedure parserDoubleLinkSelect(pPse: PParse; p: PSelect);
 var
   pNxt, pLoop: PSelect;
   mxSelect, cnt: i32;
+  zMsg: PAnsiChar;
 begin
   if p = nil then Exit;
   if p^.pPrior <> nil then begin
@@ -1663,16 +1664,18 @@ begin
       if pLoop = nil then Break;
       Inc(cnt);
       if (pLoop^.pOrderBy <> nil) or (pLoop^.pLimit <> nil) then begin
-        { sqlite3ErrorMsg in this codebase is non-varargs; drop the operator
-          name from the message for now (TODO Phase 8: restore once printf-
-          style formatting lands).  This matches the convention used by
-          rules 23/24 in chunk 7.2e.1. }
         if pLoop^.pOrderBy <> nil then
-          sqlite3ErrorMsg(pPse,
-            'ORDER BY clause should come after compound operator')
+          zMsg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+            '%s clause should come after %s not before',
+            [PAnsiChar('ORDER BY'), sqlite3SelectOpName(pNxt^.op)])
         else
-          sqlite3ErrorMsg(pPse,
-            'LIMIT clause should come after compound operator');
+          zMsg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+            '%s clause should come after %s not before',
+            [PAnsiChar('LIMIT'), sqlite3SelectOpName(pNxt^.op)]);
+        if zMsg <> nil then begin
+          sqlite3ErrorMsg(pPse, zMsg);
+          sqlite3DbFree(pPse^.db, zMsg);
+        end;
         Break;
       end;
     end;
@@ -2101,9 +2104,18 @@ begin
     else
       nExprElem := 1;
     if nExprElem <> nElem then begin
-      if nExprElem > 1 then msg := 'IN(...) element has terms - expected mismatch'
-      else msg := 'IN(...) element has term - expected mismatch';
-      sqlite3ErrorMsg(pPse, msg);
+      if nExprElem > 1 then
+        msg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+          'IN(...) element has %d term%s - expected %d',
+          [nExprElem, PAnsiChar('s'), nElem])
+      else
+        msg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+          'IN(...) element has %d term%s - expected %d',
+          [nExprElem, PAnsiChar(''), nElem]);
+      if msg <> nil then begin
+        sqlite3ErrorMsg(pPse, msg);
+        sqlite3DbFree(pPse^.db, msg);
+      end;
       Break;
     end;
     pSel := sqlite3SelectNew(pPse, pExp^.x.pList, nil, nil, nil, nil, nil,
