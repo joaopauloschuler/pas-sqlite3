@@ -52571,6 +52571,11 @@ begin
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
   AssertH(iDb >= 0, 'analyzeOneTable: iDb<0');
 
+  { Authorisation — port of analyze.c:1029..1034. }
+  if sqlite3AuthCheck(pParse, SQLITE_ANALYZE_AUTH, pTab^.zName, nil,
+       db^.aDb[iDb].zDbSName) <> 0 then
+    Exit;
+
   { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
   iTabCur := iTabLocal; Inc(iTabLocal);
   iIdxCur := iTabLocal; Inc(iTabLocal);
