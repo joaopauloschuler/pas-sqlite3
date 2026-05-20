@@ -8779,6 +8779,16 @@ begin
           else
             pParse^.newmask := $FFFFFFFF;
         end;
+        { resolve.c:835..844 lookupname_end — a successfully-resolved
+          column/trigger ref invokes the SQLITE_READ authorizer.  The
+          generic per-SrcItem resolver (resolveExprAgainstSrcList) only
+          fires AuthReadCol for TK_DOT nodes it rewrites; a NEW/OLD ref
+          rewritten here to TK_TRIGGER (e.g. `NEW.rowid` at the top of an
+          INSERT VALUES list) bypasses that path, so emit the read here.
+          C asserts !IN_RENAME_OBJECT in sqlite3AuthRead, so gate it. }
+        if (pParse^.db <> nil) and (pParse^.db^.xAuth <> nil)
+           and (not InRenameObject(pParse)) and (pTab^.pSchema <> nil) then
+          sqlite3AuthRead(pParse, pE, pTab^.pSchema, nil);
       end
       else
       begin
