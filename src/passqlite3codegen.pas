@@ -10392,6 +10392,104 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { subquery2-1.1/1.2/1.21/1.22 — detect correlation that lives in a FROM
+    subquery nested inside pInner.  After WalkDeepFromSubqueries rewrites a
+    deeply-nested outer reference (e.g. `a` inside
+    `(SELECT DISTINCT f/(a*a) AS x FROM t3)`) to a TK_COLUMN bound to the
+    OUTER cursor, the only durable signal of correlation is a TK_COLUMN whose
+    iTable matches a cursor in pOuterSrc.  C derives the same fact from the
+    pNC->nRef increment in resolve.c:1384..1388; here we scan the deep
+    FROM-subquery interiors (all clauses + JOIN ON exprs) for such a column.
+    Without this the enclosing IN/scalar subquery is never flagged
+    EP_VarSelect/SF_Correlated and is materialised once instead of being
+    recomputed per outer row. }
+  function CursorInSrcList(pSrc: PSrcList; iCur: i32): Boolean;
+  var base_: PSrcItem; pIt: PSrcItem; j_: i32;
+  begin
+    Result := False;
+    if (pSrc = nil) or (iCur < 0) then Exit;
+    base_ := SrcListItems(pSrc);
+    for j_ := 0 to pSrc^.nSrc - 1 do
+    begin
+      pIt := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+      if pIt^.iCursor = iCur then begin Result := True; Exit; end;
+    end;
+  end;
+
+  function ExprRefsOuterCursor(pW: PExpr; pOuterSrc: PSrcList): Boolean;
+  var k_: i32;
+  begin
+    Result := False;
+    if pW = nil then Exit;
+    if (pW^.op = TK_COLUMN) and CursorInSrcList(pOuterSrc, pW^.iTable) then
+    begin Result := True; Exit; end;
+    if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
+    if ExprRefsOuterCursor(pW^.pLeft,  pOuterSrc) then begin Result := True; Exit; end;
+    if ExprRefsOuterCursor(pW^.pRight, pOuterSrc) then begin Result := True; Exit; end;
+    if (pW^.flags and EP_xIsSelect) = 0 then
+    begin
+      if pW^.x.pList <> nil then
+        for k_ := 0 to pW^.x.pList^.nExpr - 1 do
+          if ExprRefsOuterCursor(ExprListItems(pW^.x.pList)[k_].pExpr,
+                                 pOuterSrc) then
+          begin Result := True; Exit; end;
+    end;
+  end;
+
+  function ExprListRefsOuterCursor(pList: PExprList;
+                                   pOuterSrc: PSrcList): Boolean;
+  var k_: i32;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      if ExprRefsOuterCursor(ExprListItems(pList)[k_].pExpr, pOuterSrc) then
+      begin Result := True; Exit; end;
+  end;
+
+  function SelectDeepRefsOuterCursor(pSel: PSelect;
+                                     pOuterSrc: PSrcList): Boolean;
+  var
+    base_d: PSrcItem;
+    pIt_d:  PSrcItem;
+    j_d:    i32;
+    pDeep_: PSelect;
+    base_o: PSrcItem;
+    pIt_o:  PSrcItem;
+    k_o:    i32;
+  begin
+    Result := False;
+    if (pSel = nil) or (pSel^.pSrc = nil) or (pOuterSrc = nil) then Exit;
+    base_d := SrcListItems(pSel^.pSrc);
+    for j_d := 0 to pSel^.pSrc^.nSrc - 1 do
+    begin
+      pIt_d := PSrcItem(PByte(base_d) + j_d * SizeOf(TSrcItem));
+      if (pIt_d^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
+      if pIt_d^.u4.pSubq = nil then Continue;
+      pDeep_ := pIt_d^.u4.pSubq^.pSelect;
+      while pDeep_ <> nil do
+      begin
+        if ExprListRefsOuterCursor(pDeep_^.pEList,   pOuterSrc) then Exit(True);
+        if ExprRefsOuterCursor   (pDeep_^.pWhere,    pOuterSrc) then Exit(True);
+        if ExprRefsOuterCursor   (pDeep_^.pHaving,   pOuterSrc) then Exit(True);
+        if ExprListRefsOuterCursor(pDeep_^.pGroupBy, pOuterSrc) then Exit(True);
+        if ExprListRefsOuterCursor(pDeep_^.pOrderBy, pOuterSrc) then Exit(True);
+        if pDeep_^.pSrc <> nil then
+        begin
+          base_o := SrcListItems(pDeep_^.pSrc);
+          for k_o := 0 to pDeep_^.pSrc^.nSrc - 1 do
+          begin
+            pIt_o := PSrcItem(PByte(base_o) + k_o * SizeOf(TSrcItem));
+            if (pIt_o^.fg.fgBits2 and u8($08)) = 0 then  { not isUsing }
+              if ExprRefsOuterCursor(pIt_o^.u3.pOn, pOuterSrc) then Exit(True);
+          end;
+        end;
+        if SelectDeepRefsOuterCursor(pDeep_, pOuterSrc) then Exit(True);
+        pDeep_ := pDeep_^.pPrior;
+      end;
+    end;
+  end;
+
   { 9.4.divbug.17 — nested-aggregate outward binding.  Mirrors the
     resolve.c:1337..1352 `pNC2` loop: an aggregate function call that
     appears textually inside a subquery but whose arguments only
@@ -11343,6 +11441,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                                    p^.pSrc, pCompArm^.pSrc) then bCorr := True;
             if ExprListRefsOuterID(pCompArm^.pOrderBy,
                                    p^.pSrc, pCompArm^.pSrc) then bCorr := True;
+            { subquery2-1.1/1.2/1.21/1.22 — correlation may live one (or more)
+              FROM-subquery levels deeper than pCompArm's own clauses, e.g.
+                `b IN (SELECT x+1 FROM (SELECT DISTINCT f/(a*a) AS x FROM t3))`
+              where `a` is an outer column inside the DISTINCT FROM-subquery.
+              WalkDeepFromSubqueries (run above) has already rewritten that ref
+              to a TK_COLUMN bound to the outer cursor, so detect it as a
+              durable correlation signal mirroring C's pNC->nRef increment
+              (resolve.c:1384..1388).  Without this the enclosing IN/scalar
+              subquery is materialised once instead of recomputed per row. }
+            if SelectDeepRefsOuterCursor(pCompArm, p^.pSrc) then bCorr := True;
             pCompArm := pCompArm^.pPrior;
           end;
         end;
@@ -15421,8 +15529,21 @@ begin
     { sqlite3ExprCheckIN deferred to 11g.2.c — the rowid-EQ shape never
       generates a TK_IN predicate.  Skip the check, fall through to the
       usage walk so prereqRight is still populated correctly. }
+    { whereexpr.c:1158..1164 — when the IN RHS is a SELECT, prereqRight must
+      be the mask of every cursor the subquery references (exprSelectUsage),
+      NOT 0.  For a correlated IN such as
+        `b IN (SELECT x+1 FROM (SELECT DISTINCT f/(a*a) AS x FROM t3))`
+      the subquery references the OUTER column `a` (bound to the outer
+      cursor by the resolver), so prereqRight includes that cursor's bit.
+      That bit makes the IN term not "ready" while building the outer
+      table's loop, which is exactly what prevents the planner from using
+      an outer index (e.g. t1b) to iterate a once-materialised IN set —
+      a transform that is invalid because the set changes per outer row.
+      The previous `sqlite3WhereExprListUsage(...,nil)` returned 0 and the
+      IN term looked independent, so subquery2-1.2 iterated a stale set and
+      returned no rows. }
     if ExprUseXSelect(pX) then
-      pTerm^.prereqRight := sqlite3WhereExprListUsage(pMaskSet, nil)
+      pTerm^.prereqRight := exprSelectUsage(pMaskSet, pX^.x.pSelect)
     else
       pTerm^.prereqRight := sqlite3WhereExprListUsage(pMaskSet, pX^.x.pList);
     prereqAll := prereqLeft or pTerm^.prereqRight;
