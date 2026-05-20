@@ -11297,6 +11297,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if pOrderBy = nil then Exit;
     if p^.pEList = nil then Exit;
     pItems := ExprListItems(pOrderBy);
+    { resolve.c:1606..1608 — clear the per-term done flag (fg.done, eBits bit 2
+      = $04).  Under PARSE_MODE_RENAME iOrderByCol is left untouched, so done
+      tracking must use fg.done exactly as C does. }
+    for i := 0 to pOrderBy^.nExpr - 1 do
+      pItems[i].fg.eBits := pItems[i].fg.eBits and (not u8($04));
     { resolve.c:1609..1613 — wire pNext along the pPrior chain so the walk
       below can run left-most -> top-most. }
     pTopSel^.pNext := nil;
@@ -11324,15 +11329,21 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       pELItems := ExprListItems(pEList);
       for i := 0 to pOrderBy^.nExpr - 1 do
       begin
-        if pItems[i].u.x.iOrderByCol <> 0 then Continue;
+        if (pItems[i].fg.eBits and $04) <> 0 then Continue;  { fg.done }
         pE := sqlite3ExprSkipCollateAndLikely(pItems[i].pExpr);
         if pE = nil then Continue;
         iCol := 0;
-        { Integer arm — resolve.c:1625. }
+        { Integer arm — resolve.c:1625.  An explicit integer term is in range
+          (the out-of-range case errors above in C); mark it done and, in the
+          non-rename path, record iOrderByCol for the merge-sort path. }
         if sqlite3ExprIsInteger(pE, @iCol, nil) <> 0 then
         begin
           if (iCol >= 1) and (iCol <= pEList^.nExpr) then
-            pItems[i].u.x.iOrderByCol := u16(iCol);
+          begin
+            if not InRenameObject(pParse) then
+              pItems[i].u.x.iOrderByCol := u16(iCol);
+            pItems[i].fg.eBits := pItems[i].fg.eBits or $04;  { fg.done }
+          end;
           Continue;
         end;
         { resolveAsName arm — resolve.c:1631.  Matches a bare TK_ID against
@@ -11367,6 +11378,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               pParse^.nErr := 0;  { suppressed — resolve.c db->suppressErr }
             sqlite3ExprDelete(pParse^.db, pDup);
           end;
+          { resolve.c:1648..1650 — under PARSE_MODE_RENAME, after matching the
+            DUPLICATE term, re-resolve the ACTUAL pE so the resolver's
+            RenameTokenRemap machinery records pE's column token; alter.c then
+            rewrites the column reference in the stored trigger SQL.  Without
+            this the original pE node is never token-mapped and the rename is
+            lost.  The dup re-resolution does not touch pE. }
+          if (iCol > 0) and InRenameObject(pParse) then
+            ResolveExpr(pE);
         end;
         { Structural compare against the already-resolved pEList — covers
           non-left-most leaves where ResolveExpr cannot run. }
@@ -11379,29 +11398,38 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             end;
         if iCol > 0 then
         begin
-          { Rewrite the ORDER BY term into an integer column number,
-            preserving any COLLATE wrapper (resolve.c:1656..1672). }
-          pNew := sqlite3ExprInt32(pParse^.db, iCol);
-          if pNew = nil then Exit;
-          if pItems[i].pExpr = pE then
-            pItems[i].pExpr := pNew
-          else
+          { resolve.c:1656..1672 — convert the ORDER BY term into an integer
+            column number, preserving any COLLATE wrapper.  Under
+            PARSE_MODE_RENAME this rewrite (and the pE delete + iOrderByCol
+            set) is SKIPPED so the original column-reference node survives for
+            alter.c's rename walker; only fg.done is marked. }
+          if not InRenameObject(pParse) then
           begin
-            pDup := pItems[i].pExpr;
-            while (pDup^.pLeft <> nil) and (pDup^.pLeft^.op = TK_COLLATE) do
-              pDup := pDup^.pLeft;
-            pDup^.pLeft := pNew;
+            pNew := sqlite3ExprInt32(pParse^.db, iCol);
+            if pNew = nil then Exit;
+            if pItems[i].pExpr = pE then
+              pItems[i].pExpr := pNew
+            else
+            begin
+              pDup := pItems[i].pExpr;
+              while (pDup^.pLeft <> nil) and (pDup^.pLeft^.op = TK_COLLATE) do
+                pDup := pDup^.pLeft;
+              pDup^.pLeft := pNew;
+            end;
+            sqlite3ExprDelete(pParse^.db, pE);
+            pItems[i].u.x.iOrderByCol := u16(iCol);
           end;
-          sqlite3ExprDelete(pParse^.db, pE);
-          pItems[i].u.x.iOrderByCol := u16(iCol);
+          pItems[i].fg.eBits := pItems[i].fg.eBits or $04;  { fg.done = 1 }
         end;
       end;
       if pSel = pTopSel then Break;
       pSel := pSel^.pNext;
     end;
-    { resolve.c:1680 — any term still unresolved is an error. }
+    { resolve.c:1680 — any term still unresolved (fg.done == 0) is an error.
+      Use fg.done, not iOrderByCol, since the latter is intentionally left 0
+      under PARSE_MODE_RENAME. }
     for i := 0 to pOrderBy^.nExpr - 1 do
-      if pItems[i].u.x.iOrderByCol = 0 then
+      if (pItems[i].fg.eBits and $04) = 0 then
       begin
         sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
           '%r ORDER BY term does not match any column in the result set',
