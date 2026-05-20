@@ -33167,7 +33167,7 @@ begin
         for iFA := 0 to nFuncArg - 1 do argMap[iFA] := iFA;
         vtabBI_OK := False;
         pVTab2 := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab));
-        if (nFuncArg > 0) and (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
+        if (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
            and (pVTab2^.pVtab^.pModule <> nil)
            and (pVTab2^.pVtab^.pModule^.xBestIndex <> nil) then
         begin
@@ -33195,8 +33195,19 @@ begin
             end;
             FillChar(idxInfo, SizeOf(idxInfo), 0);
             idxInfo.nConstraint     := nFuncArg;
-            idxInfo.aConstraint     := @idxConstraints[0];
-            idxInfo.aConstraintUsage:= @idxUsage[0];
+            if nFuncArg > 0 then
+            begin
+              idxInfo.aConstraint     := @idxConstraints[0];
+              idxInfo.aConstraintUsage:= @idxUsage[0];
+            end
+            else
+            begin
+              idxInfo.aConstraint     := nil;
+              idxInfo.aConstraintUsage:= nil;
+            end;
+            { allocateIndexInfo (where.c:1546) seeds colUsed from the
+              SrcItem so xBestIndex can build a covering scan query. }
+            idxInfo.colUsed         := pItem^.colUsed;
             idxInfo.estimatedCost   := 1.0E99;
             if passqlite3vtab.TxBestIndex(pVTab2^.pVtab^.pModule^.xBestIndex)
                    (pVTab2^.pVtab, @idxInfo) = SQLITE_OK then
@@ -33463,7 +33474,7 @@ begin
           for iFA := 0 to nFuncArg - 1 do argMap[iFA] := iFA;
           vtabBI_OK := False;
           pVTab2 := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab));
-          if (nFuncArg > 0) and (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
+          if (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
              and (pVTab2^.pVtab^.pModule <> nil)
              and (pVTab2^.pVtab^.pModule^.xBestIndex <> nil) then
           begin
@@ -33491,8 +33502,19 @@ begin
               end;
               FillChar(idxInfo, SizeOf(idxInfo), 0);
               idxInfo.nConstraint     := nFuncArg;
-              idxInfo.aConstraint     := @idxConstraints[0];
-              idxInfo.aConstraintUsage:= @idxUsage[0];
+              if nFuncArg > 0 then
+              begin
+                idxInfo.aConstraint     := @idxConstraints[0];
+                idxInfo.aConstraintUsage:= @idxUsage[0];
+              end
+              else
+              begin
+                idxInfo.aConstraint     := nil;
+                idxInfo.aConstraintUsage:= nil;
+              end;
+              { allocateIndexInfo (where.c:1546) seeds colUsed from the
+                SrcItem so xBestIndex can build a covering scan query. }
+              idxInfo.colUsed         := pItem^.colUsed;
               idxInfo.estimatedCost   := 1.0E99;
               if passqlite3vtab.TxBestIndex(pVTab2^.pVtab^.pModule^.xBestIndex)
                      (pVTab2^.pVtab, @idxInfo) = SQLITE_OK then
@@ -33877,7 +33899,15 @@ begin
         eponymous vtabs that gate idxNum (json_each, json_tree, generate_
         series) take their "no JSON arg" branch and produce no rows.
         Mirrors C's whereLoopAddVirtualOne -> vtabBestIndex
-        (where.c:4357..4409) reduced to the func-arg-only constraint set. }
+        (where.c:4357..4409) reduced to the func-arg-only constraint set.
+
+        Also drive xBestIndex when there are NO func args (nFuncArg=0):
+        C always calls xBestIndex once with the empty constraint set for
+        every vtab scan (whereLoopAddVirtual where.c:4721), which is what
+        produces a non-NULL idxStr for modules like echo that build their
+        scan query in xBestIndex.  Skipping it here left idxStr=NULL, so
+        `SELECT * FROM <echo-vtab>` passed NULL to sqlite3_prepare inside
+        echoFilter and surfaced as SQLITE_MISUSE. }
       vtabIdxNum   := 0;
       vtabIdxStr   := nil;
       vtabNeedFree := 0;
@@ -33885,7 +33915,7 @@ begin
       for iFA := 0 to nFuncArg - 1 do argMap[iFA] := iFA;  { identity default }
       vtabBI_OK := False;
       pVTab2 := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab));
-      if (nFuncArg > 0) and (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
+      if (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
          and (pVTab2^.pVtab^.pModule <> nil)
          and (pVTab2^.pVtab^.pModule^.xBestIndex <> nil) then
       begin
@@ -33913,8 +33943,21 @@ begin
           end;
           FillChar(idxInfo, SizeOf(idxInfo), 0);
           idxInfo.nConstraint     := nFuncArg;
-          idxInfo.aConstraint     := @idxConstraints[0];
-          idxInfo.aConstraintUsage:= @idxUsage[0];
+          if nFuncArg > 0 then
+          begin
+            idxInfo.aConstraint     := @idxConstraints[0];
+            idxInfo.aConstraintUsage:= @idxUsage[0];
+          end
+          else
+          begin
+            idxInfo.aConstraint     := nil;
+            idxInfo.aConstraintUsage:= nil;
+          end;
+          { allocateIndexInfo (where.c:1546) seeds colUsed from the
+            SrcItem's colUsed bitmask so xBestIndex can build a covering
+            scan (echoSelectList depends on it).  HasRowid(echo)=true so
+            the WITHOUT ROWID PK-column adjustment does not apply here. }
+          idxInfo.colUsed         := pItem^.colUsed;
           idxInfo.estimatedCost   := 1.0E99;
           if passqlite3vtab.TxBestIndex(pVTab2^.pVtab^.pModule^.xBestIndex)
                  (pVTab2^.pVtab, @idxInfo) = SQLITE_OK then
