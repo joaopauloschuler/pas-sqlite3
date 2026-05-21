@@ -54583,6 +54583,79 @@ const
   cFlagPragmasTrusted: TFlagPragma =
     (name: 'trusted_schema'; mask: SQLITE_TrustedSchema);
 
+{ pragma.c:72 getSafetyLevel.  Interpret a keyword/number as a safety level.
+  Note: the returned values are one less than the values passed to
+  sqlite3BtreeSetSafetyLevel (legacy 0=OFF/1=ON support).  When omitFull is
+  non-zero, FULL/EXTRA are rejected (used by sqlite3GetBoolean). }
+function getSafetyLevel(z: PAnsiChar; omitFull: i32; dflt: u8): u8;
+const
+  { /* 123456789 123456789 123 */
+    zText = "onoffalseyestruextrafull" } { on no off false yes tru extra full }
+  zText:    array[0..23] of AnsiChar =
+    ('o','n','o','f','f','a','l','s','e','y','e','s','t','r','u',
+     'e','x','t','r','a','f','u','l','l');
+  iOffset:  array[0..7] of u8 = (0, 1, 2,  4,    9,  12,  15,   20);
+  iLength:  array[0..7] of u8 = (2, 2, 3,  5,    3,   4,   5,    4);
+  iValue:   array[0..7] of u8 = (1, 0, 0,  0,    1,   1,   3,    2);
+var
+  i, n, k: i32;
+  c1, c2:  i32;
+  matched: Boolean;
+begin
+  if (z <> nil) and (sqlite3Isdigit(u8(z[0])) <> 0) then
+  begin
+    Result := u8(sqlite3Atoi(PChar(z)));
+    Exit;
+  end;
+  n := sqlite3Strlen30(z);
+  for i := 0 to 7 do
+  begin
+    if (i32(iLength[i]) = n) and ((omitFull = 0) or (iValue[i] <= 1)) then
+    begin
+      { Case-insensitive ASCII compare of n bytes — mirrors C's
+        sqlite3StrNICmp(&zText[iOffset[i]], z, n)==0 (not yet ported). }
+      matched := True;
+      for k := 0 to n - 1 do
+      begin
+        c1 := Ord(zText[i32(iOffset[i]) + k]);
+        c2 := Ord(z[k]);
+        if (c1 >= Ord('A')) and (c1 <= Ord('Z')) then c1 := c1 + 32;
+        if (c2 >= Ord('A')) and (c2 <= Ord('Z')) then c2 := c2 + 32;
+        if c1 <> c2 then begin matched := False; Break; end;
+      end;
+      if matched then
+      begin
+        Result := iValue[i];
+        Exit;
+      end;
+    end;
+  end;
+  Result := dflt;
+end;
+
+{ pragma.c:241 setAllPagerFlags.  Propagate safety_level | flag bits to the
+  pager of every attached database when in autocommit mode. }
+procedure setAllPagerFlags(db: PTsqlite3);
+var
+  pDb: passqlite3util.PDb;
+  n:   i32;
+begin
+  if db^.autoCommit <> 0 then
+  begin
+    pDb := @db^.aDb[0];
+    n := db^.nDb;
+    Assert((pDb^.safety_level and PAGER_SYNCHRONOUS_MASK) = pDb^.safety_level);
+    while n > 0 do
+    begin
+      Dec(n);
+      if pDb^.pBt <> nil then
+        sqlite3BtreeSetPagerFlags(PBtree(pDb^.pBt),
+          u32(pDb^.safety_level) or u32(db^.flags and PAGER_FLAGS_MASK));
+      Inc(pDb);
+    end;
+  end;
+end;
+
 procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
   const pId2: PToken; pValue: PToken; minusFlag: i32);
 var
@@ -55742,11 +55815,27 @@ begin
     Exit;
   end;
 
-  { PragTyp_SYNCHRONOUS read arm (pragma.c:1132). }
-  if SameText(zName, 'synchronous') and (pValue = nil) then begin
-    iVal := i32(db^.aDb[iDb].safety_level) - 1;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+  { PragTyp_SYNCHRONOUS (pragma.c:1132).  Read arm reports
+    safety_level-1; write arm maps the keyword/number via getSafetyLevel,
+    adds 1, masks, stores it on safety_level and propagates to the pagers. }
+  if SameText(zName, 'synchronous') then begin
+    if pValue = nil then begin
+      iVal := i32(db^.aDb[iDb].safety_level) - 1;
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    end else begin
+      if db^.autoCommit = 0 then
+        sqlite3ErrorMsg(pParse,
+          'Safety level may not be changed inside a transaction')
+      else if iDb <> 1 then begin
+        iVal := (i32(getSafetyLevel(PAnsiChar(zRight), 0, 1)) + 1)
+                and PAGER_SYNCHRONOUS_MASK;
+        if iVal = 0 then iVal := 1;
+        db^.aDb[iDb].safety_level := u8(iVal);
+        db^.aDb[iDb].bSyncSet := 1;
+        setAllPagerFlags(db);
+      end;
+    end;
     Exit;
   end;
 
