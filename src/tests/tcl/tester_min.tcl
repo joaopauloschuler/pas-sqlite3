@@ -325,6 +325,13 @@ set ::sqlite_options(rowid32) 0
 # strict failures / timeouts.  (No test uses `ifcapable stat3`, and
 # test_config.c sets no stat3 cap, so none is added here.)
 set ::sqlite_options(stat4) 0
+# uri2.test is gated by `ifcapable !uri_00_error`.  A vanilla build does NOT
+# define SQLITE_ENABLE_URI_00_ERROR, so test_config.c writes no uri_00_error
+# cap and the oracle SKIPS this test (the !SQLITE_ENABLE_URI_00_ERROR arm in
+# sqlite3ParseUri simply ignores the rest of the path on %00).  Without this,
+# the cap defaults to 1 below → the test wrongly RUNS and expects the
+# "unexpected %00 in uri" error this build never raises.
+set ::sqlite_options(uri_00_error) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
@@ -463,6 +470,47 @@ proc get_pwd {} {
   } else {
     return [pwd]
   }
+}
+
+# test_pwd — upstream tester.tcl:248..264.  Returns the current working
+# directory with $suffix1 appended when the `curdir` capability is present
+# (always true in this build, since the ifcapable stub above runs the BODY),
+# otherwise returns $suffix2.  Used by e_uri.test to build file:// URIs that
+# map to absolute local paths, e.g. [test_pwd /]test.db and [test_pwd / {}].
+proc test_pwd { args } {
+  if {[llength $args] > 0} {
+    set suffix1 [lindex $args 0]
+    if {[llength $args] > 1} {
+      set suffix2 [lindex $args 1]
+    } else {
+      set suffix2 $suffix1
+    }
+  } else {
+    set suffix1 ""; set suffix2 ""
+  }
+  ifcapable curdir {
+    return "[get_pwd]$suffix1"
+  } else {
+    return $suffix2
+  }
+}
+
+# filepath_normalize / do_filepath_test — upstream tester.tcl:873..886.
+# Test cases assume unix-style paths; on the only target here (unix) the
+# path is returned unchanged.  do_filepath_test wraps do_test, normalising
+# both the command result and the expected value.  Used by e_uri.test.
+proc filepath_normalize {p} {
+  if {$::tcl_platform(platform) ne "unix"} {
+    string map [list \\ / \{/ / .db\} .db] \
+        [regsub -nocase -all {[a-z]:[/\\]+} $p {/}]
+  } {
+    set p
+  }
+}
+proc do_filepath_test {name cmd expected} {
+  uplevel [list do_test $name [
+    subst -nocommands { filepath_normalize [ $cmd ] }
+  ] [filepath_normalize $expected]]
 }
 
 # copy_file / forcecopy / do_copy_file — upstream tester.tcl:197..235.

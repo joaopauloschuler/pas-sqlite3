@@ -6271,6 +6271,17 @@ initialization
   passqlite3codegen.gWalAutoCheckpoint :=
     passqlite3codegen.TWalAutoCheckpointFn(@sqlite3_wal_autocheckpoint);
   passqlite3codegen.gWalDefaultHook := @sqlite3WalDefaultHook;
+  { Wire sqlite3_overload_function so sqlite3RegisterPerConnectionBuiltinFunctions
+    (codegen.pas, func.c:2331) can register the per-connection MATCH placeholder
+    at connection open.  Lives here to avoid a circular codegen->main uses. }
+  passqlite3codegen.gOverloadFunction :=
+    passqlite3codegen.TOverloadFunctionFn(@sqlite3_overload_function);
+  { Wire sqlite3VtabOverloadFunction (passqlite3vtab) so sqlite3ExprCodeTarget
+    (codegen.pas, expr.c:5418..5436) can redirect an infix LIKE/GLOB/REGEXP/MATCH
+    call to a virtual table's xFindFunction override.  Lives here to avoid a
+    circular codegen->vtab uses. }
+  passqlite3codegen.gVtabOverloadFunction :=
+    passqlite3codegen.TVtabOverloadFunctionFn(@passqlite3vtab.sqlite3VtabOverloadFunction);
   { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
     dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA. }
   passqlite3codegen.gFileControl :=

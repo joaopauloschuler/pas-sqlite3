@@ -65,6 +65,9 @@ var
   { Backing storage for the Tcl_LinkVar-exposed $SQLITE_MAX_ATTACHED.
     Initialised inside Sqlite3_Init; READ_ONLY on the Tcl side. }
   cv_max_attached: cint;
+  { Backing storage for $SQLITE_MAX_COMPOUND_SELECT (test_config.c:814
+    LINKVAR).  Required by select7.test.  READ_ONLY on the Tcl side. }
+  cv_max_compound_select: cint;
 
 function TclObjTypeName(p: PTclObj): PAnsiChar;
 var
@@ -4932,6 +4935,10 @@ begin
               @sqlite3_search_count, TCL_LINK_INT);
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
               @sqlite3_sort_count, TCL_LINK_INT);
+  { test1.c:9378 Tcl_LinkVar( sqlite_open_file_count ) — the OS-layer
+    open-file-handle counter (passqlite3os.pas), read by exclusive-5.x. }
+  Tcl_LinkVar(interp, PChar('sqlite_open_file_count'),
+              @sqlite3_open_file_count, TCL_LINK_INT);
   { Shard 0 fix 2 — attach4.test / attach.test / sqllimits1.test / wal.test
     read $SQLITE_MAX_ATTACHED.  Mirror the C test_config.c:827 LINKVAR
     so the Tcl side sees the same compiled-in limit.  TCL_LINK_READ_ONLY
@@ -4939,6 +4946,11 @@ begin
   cv_max_attached := SQLITE_MAX_ATTACHED;
   Tcl_LinkVar(interp, PChar('SQLITE_MAX_ATTACHED'),
               @cv_max_attached, TCL_LINK_INT or TCL_LINK_READ_ONLY);
+  { test_config.c:814 LINKVAR( MAX_COMPOUND_SELECT ) — select7.test reads
+    $SQLITE_MAX_COMPOUND_SELECT.  Mirror the compiled-in limit (default 500). }
+  cv_max_compound_select := SQLITE_MAX_COMPOUND_SELECT;
+  Tcl_LinkVar(interp, PChar('SQLITE_MAX_COMPOUND_SELECT'),
+              @cv_max_compound_select, TCL_LINK_INT or TCL_LINK_READ_ONLY);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;

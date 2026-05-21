@@ -5107,6 +5107,16 @@ begin
   if p = nil then begin Result := nil; Exit; end;
   { Zero everything from aOp onwards (offsetof(Vdbe,aOp) = 136) }
   FillChar(PByte(p)[136], SizeOf(TVdbe) - 136, 0);
+  { vdbeaux.c:25 leaves p->pc uninitialized (it sits before aOp, outside the
+    memset) and relies on it being negative until sqlite3VdbeRewind sets it
+    to -1 at exec time.  sqlite3VdbeReset (vdbeaux.c:3605) uses `p->pc>=0` to
+    decide whether to transfer the VM's (clean) error code into db^.errCode.
+    sqlite3DbMallocRawNN here can hand back zeroed memory, so an unexecuted
+    parse-only Vdbe (e.g. the one sqlite3_declare_vtab builds for a rejected
+    CREATE TABLE ... AS SELECT) would have pc=0, wrongly clobber db^.errCode
+    back to SQLITE_OK, and sqlite3_errmsg would report "not an error"
+    (vtabL-1.9/1.10).  Initialise pc<0 explicitly to honour the C invariant. }
+  p^.pc := -1;
   p^.db := db;
   { Insert into db->pVdbe linked list (db->pVdbe at offset 8) }
   pPrevVdbe := PPVdbe(PByte(db) + 8);

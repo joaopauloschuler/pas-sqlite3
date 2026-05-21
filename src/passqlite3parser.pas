@@ -430,6 +430,12 @@ procedure sqlite3VtabArgExtend(pPse: PParse; p: PToken);
   can append the three module-arg slots without duplicating the helper. }
 procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
 
+{ Extract a single field (column iField of nField) from a vector expression
+  pVector (expr.c:574).  Exposed so where-clause analysis in passqlite3codegen
+  can decompose vector ==/IS predicates into per-component terms. }
+function sqlite3ExprForVectorField(pPse: PParse; pVector: PExpr;
+                                   iField, nField: i32): PExpr;
+
 { =========================================================================== }
 
 implementation
@@ -1649,6 +1655,7 @@ procedure parserDoubleLinkSelect(pPse: PParse; p: PSelect);
 var
   pNxt, pLoop: PSelect;
   mxSelect, cnt: i32;
+  zMsg: PAnsiChar;
 begin
   if p = nil then Exit;
   if p^.pPrior <> nil then begin
@@ -1663,16 +1670,18 @@ begin
       if pLoop = nil then Break;
       Inc(cnt);
       if (pLoop^.pOrderBy <> nil) or (pLoop^.pLimit <> nil) then begin
-        { sqlite3ErrorMsg in this codebase is non-varargs; drop the operator
-          name from the message for now (TODO Phase 8: restore once printf-
-          style formatting lands).  This matches the convention used by
-          rules 23/24 in chunk 7.2e.1. }
         if pLoop^.pOrderBy <> nil then
-          sqlite3ErrorMsg(pPse,
-            'ORDER BY clause should come after compound operator')
+          zMsg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+            '%s clause should come after %s not before',
+            [PAnsiChar('ORDER BY'), sqlite3SelectOpName(pNxt^.op)])
         else
-          sqlite3ErrorMsg(pPse,
-            'LIMIT clause should come after compound operator');
+          zMsg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+            '%s clause should come after %s not before',
+            [PAnsiChar('LIMIT'), sqlite3SelectOpName(pNxt^.op)]);
+        if zMsg <> nil then begin
+          sqlite3ErrorMsg(pPse, zMsg);
+          sqlite3DbFree(pPse^.db, zMsg);
+        end;
         Break;
       end;
     end;
@@ -2101,9 +2110,18 @@ begin
     else
       nExprElem := 1;
     if nExprElem <> nElem then begin
-      if nExprElem > 1 then msg := 'IN(...) element has terms - expected mismatch'
-      else msg := 'IN(...) element has term - expected mismatch';
-      sqlite3ErrorMsg(pPse, msg);
+      if nExprElem > 1 then
+        msg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+          'IN(...) element has %d term%s - expected %d',
+          [nExprElem, PAnsiChar('s'), nElem])
+      else
+        msg := sqlite3MPrintf(Psqlite3db(pPse^.db),
+          'IN(...) element has %d term%s - expected %d',
+          [nExprElem, PAnsiChar(''), nElem]);
+      if msg <> nil then begin
+        sqlite3ErrorMsg(pPse, msg);
+        sqlite3DbFree(pPse^.db, msg);
+      end;
       Break;
     end;
     pSel := sqlite3SelectNew(pPse, pExp^.x.pList, nil, nil, nil, nil, nil,
@@ -2496,9 +2514,12 @@ end;
 
 procedure sqlite3VtabBeginParse(pPse: PParse; pName1: PToken; pName2: PToken;
                                 pModuleName: PToken; ifNotExists: i32);
+const
+  SQLITE_CREATE_VTABLE = 29;  { sqlite3.h:97 (passqlite3vdbe.pas:571) }
 var
   pTable: PTable2;
   db:     PTsqlite3;
+  iDb:    i32;
 begin
   sqlite3StartTable(pPse, pName1, pName2, 0, 0, 1, ifNotExists);
   pTable := pPse^.pNewTable;
@@ -2519,12 +2540,18 @@ begin
     PtrUInt(pModuleName^.z) + PtrUInt(pModuleName^.n)
     - PtrUInt(pPse^.sNameToken.z));
 
-  { SQLITE_OMIT_AUTHORIZATION: the second sqlite3AuthCheck call             }
-  { (SQLITE_CREATE_VTABLE) is gated out at build time in upstream when the }
-  { authorizer is omitted.  Our port currently includes the authorizer      }
-  { surface, but sqlite3AuthCheck on a v-table is a defensible follow-up    }
-  { (needs the iDb lookup); left as a TODO so the gate test stays focused   }
-  { on the azArg contract.                                                  }
+  { vtab.c:414..426 — second authorization callback.  The first invocation
+    (SQLITE_INSERT into sqlite_schema) already fired inside sqlite3StartTable;
+    this call obtains permission to create the v-table itself.
+    pTable^.u.vtab.azArg[0] is the module name.
+    SQLITE_CREATE_VTABLE = 29 — value duplicated locally because the parser
+    unit intentionally does not import passqlite3vdbe (sqlite3.h:97). }
+  if pTable^.u.vtab.azArg <> nil then begin
+    iDb := sqlite3SchemaToIndex(db, passqlite3util.PSchema(pTable^.pSchema));
+    Assert(iDb >= 0, 'sqlite3VtabBeginParse: iDb < 0');
+    sqlite3AuthCheck(pPse, SQLITE_CREATE_VTABLE, pTable^.zName,
+            PPAnsiChar(pTable^.u.vtab.azArg)[0], pPse^.db^.aDb[iDb].zDbSName);
+  end;
 end;
 
 procedure sqlite3VtabFinishParse(pPse: PParse; pEnd: PToken);
