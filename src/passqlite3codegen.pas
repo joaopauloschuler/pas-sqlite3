@@ -8777,6 +8777,26 @@ begin
         AuthReadBound(pE);
         Exit;
       end;
+      { tkt3929-1.1 — qualified rowid alias (<tab>.rowid / .oid / ._rowid_)
+        in a trigger UPDATE body.  The table matched by name/alias but no
+        real column did; mirror lookupName at resolve.c:471..503 + 623..638
+        (and the SELECT-context arm at sqlite3ResolveSelectNames): if zCol
+        is a rowid alias and the table has a visible rowid, bind to
+        iColumn=-1 against this source.  WITHOUT-ROWID tables fall through
+        to the "no such column" tail, matching C. }
+      if (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
+         and HasRowid(pItem^.pSTab) then
+      begin
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pItem^.iCursor;
+        pE^.iColumn := i16(-1);
+        pE^.y.pTab  := pItem^.pSTab;
+        pE^.pLeft   := nil;
+        pE^.pRight  := nil;
+        pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        AuthReadBound(pE);
+        Exit;
+      end;
     end;
     Exit;
   end;
