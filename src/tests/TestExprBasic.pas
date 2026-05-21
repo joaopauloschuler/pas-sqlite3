@@ -351,10 +351,22 @@ begin
 end;
 
 procedure Test20_IsVector;
-var e: TExpr;
+{ A TK_VECTOR always carries an ExprList (the parser never builds one with
+  fewer than two entries).  sqlite3ExprIsVector is the faithful expr.c:499
+  `sqlite3ExprVectorSize(pExpr)>1`, so it dereferences x.pList — give it a
+  valid 2-item list rather than a bare op tag. }
+var
+  e:    TExpr;
+  buf:  array[0..SZ_EXPRLIST_HEADER + 2*SZ_EXPRLIST_ITEM - 1] of Byte;
+  pEl:  PExprList;
 begin
   ZeroExpr(e);
-  e.op := TK_VECTOR;
+  FillChar(buf, SizeOf(buf), 0);
+  pEl := PExprList(@buf[0]);
+  pEl^.nExpr := 2;
+  e.op    := TK_VECTOR;
+  e.flags := 0;  { EP_xIsSelect not set => uses pList }
+  e.x.pList := pEl;
   Check('T20 TK_VECTOR is vector',
         sqlite3ExprIsVector(@e) <> 0);
 end;

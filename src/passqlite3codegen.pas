@@ -2413,6 +2413,7 @@ function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
   regDest: i32): i32;
 function  sqlite3ExprCodeTemp(pParse: PParse; pExpr: PExpr;
   pReg: Pi32): i32;
+function  exprCodeVector(pParse: PParse; p: PExpr; piFreeable: Pi32): i32;
 function  sqlite3ExprCodeExprList(pParse: PParse; pList: PExprList;
   target, srcReg: i32; flags: u8): i32;
 
@@ -5509,9 +5510,25 @@ begin
   if pFarg <> nil then n := pFarg^.nExpr else n := 0;
   pDef := sqlite3FindFunction(db, z, n, db^.enc, 0);
   if pDef = nil then
-  begin
     pDef := sqlite3FindFunction(db, z, -1, db^.enc, 0);
-    if pDef = nil then begin Result := False; Exit; end;
+  { expr.c:5362..5365 — pDef==0 (function not registered on this
+    connection) OR pDef->xFinalize!=0 (an aggregate used in scalar
+    context) is an "unknown function" runtime codegen error.  The C
+    %#T format renders just pExpr^.u.zToken, so this produces exactly
+    "unknown function: myfunc()".  Emitting the error here (and
+    returning True so the caller does NOT fall through to OP_Null)
+    mirrors C's sqlite3ErrorMsg+break.  This is the path a CHECK
+    constraint takes at INSERT time on a connection lacking the
+    function (check-7.5). }
+  if (pDef = nil) or Assigned(pDef^.xFinalize) then
+  begin
+    if ExprHasProperty(pExpr, EP_IntValue) or (z = nil) then
+      sqlite3ErrorMsg(pParse, 'unknown function: ()')
+    else
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'unknown function: %s()', [z]));
+    Result := True;
+    Exit;
   end;
   { Phase 6.9-bis 11g.2.f sub-progress 28 — inline COALESCE / IFNULL.
     Faithful port of expr.c:exprCodeInlineFunction's INLINEFUNC_coalesce
@@ -6373,8 +6390,9 @@ begin
               done := True;
               Continue; { restart loop — which will just exit since done=True... actually break }
             end;
-            { exprCodeVector scalar fast-path: code into a temp reg }
-            r1 := sqlite3ExprCodeTemp(pParse, casePDel, @regFree1);
+            { exprCodeVector: handles scalar, vector and sub-select bases
+              (expr.c:5689). }
+            r1 := exprCodeVector(pParse, casePDel, @regFree1);
             sqlite3ExprToRegister(casePDel, r1);
             regFree1 := 0; { do not reuse — ticket b351d95f }
             FillChar(caseOpCmp, SizeOf(caseOpCmp), 0);
@@ -6820,17 +6838,21 @@ end;
 
 function sqlite3ExprIsVector(const pExpr: PExpr): i32;
 begin
-  if ExprUseXList(pExpr) and (pExpr^.op = TK_VECTOR) then Result := 1
-  else if ExprUseXSelect(pExpr) and (pExpr^.x.pSelect <> nil)
-          and (pExpr^.x.pSelect^.pEList^.nExpr > 1) then Result := 1
-  else Result := 0;
+  { Faithful port of expr.c:499..501 — just `sqlite3ExprVectorSize(pExpr)>1`.
+    Routing through sqlite3ExprVectorSize means a TK_REGISTER node stashing
+    its original op in op2 (sqlite3ExprToRegister) is still recognised as a
+    vector — required for the row-value CASE base operand. }
+  Result := Ord(sqlite3ExprVectorSize(pExpr) > 1);
 end;
 
 function sqlite3ExprVectorSize(const pExpr: PExpr): i32;
+var op: u8;
 begin
-  if (pExpr^.op = TK_VECTOR) and ExprUseXList(pExpr) then
+  op := pExpr^.op;
+  if op = TK_REGISTER then op := pExpr^.op2;
+  if (op = TK_VECTOR) and ExprUseXList(pExpr) then
     Result := pExpr^.x.pList^.nExpr
-  else if ExprUseXSelect(pExpr) and (pExpr^.x.pSelect <> nil) then
+  else if (op = TK_SELECT) and ExprUseXSelect(pExpr) and (pExpr^.x.pSelect <> nil) then
     Result := pExpr^.x.pSelect^.pEList^.nExpr
   else
     Result := 1;
@@ -7952,6 +7974,42 @@ begin
     end;
   end;
   Result := r2;
+end;
+
+{ exprCodeVector — port of expr.c:4520..4554.  Evaluate an expression
+  (either a vector or a scalar) and store the result in one or more
+  contiguous registers.  Returns the index of the first result register.
+  For a scalar (nResult=1) this reduces to sqlite3ExprCodeTemp and
+  *piFreeable may be set to a temp reg the caller can release.  For a
+  vector base the fields are coded into nResult consecutive registers
+  (or, for a TK_SELECT base, via sqlite3CodeSubselect) and *piFreeable
+  is 0. }
+function exprCodeVector(pParse: PParse; p: PExpr; piFreeable: Pi32): i32;
+var
+  iResult, nResult, i: i32;
+  aItem: PExprListItem;
+begin
+  nResult := sqlite3ExprVectorSize(p);
+  if nResult = 1 then
+    iResult := sqlite3ExprCodeTemp(pParse, p, piFreeable)
+  else
+  begin
+    piFreeable^ := 0;
+    if p^.op = TK_SELECT then
+      iResult := sqlite3CodeSubselect(pParse, p)
+    else
+    begin
+      iResult := pParse^.nMem + 1;
+      Inc(pParse^.nMem, nResult);
+      Assert(ExprUseXList(p));
+      aItem := ExprListItems(p^.x.pList);
+      for i := 0 to nResult - 1 do
+        sqlite3ExprCodeFactorable(pParse,
+          PExprListItem(PByte(aItem) + i * SZ_EXPRLIST_ITEM)^.pExpr,
+          i + iResult);
+    end;
+  end;
+  Result := iResult;
 end;
 
 { sqlite3ExprCodeExprList — port of expr.c:5953..6006.  Generate code
@@ -31136,6 +31194,7 @@ var
   pHavingLoc:  PExpr;
   pKeyInfoGB:  PKeyInfo2;
   orderByGrp:  i32;
+  iUF2:        i32;
   addrEnd:     i32;
   addrTopOfLoop: i32;
   addrSkip:    i32;
@@ -32299,7 +32358,7 @@ begin
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine)
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
-          or (pDest^.eDest = SRT_Set))
+          or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Upfrom))
   then
   begin
     { 9.4.divbug.82 — SRT_Set admitted so IN-RHS subselect (sqlite3CodeRhsOfIN
@@ -32531,6 +32590,14 @@ begin
       iBMem := pParse^.nMem + 1; pParse^.nMem := pParse^.nMem + nGroupBy;
 
       addrEnd := sqlite3VdbeMakeLabel(pParse);
+
+      { Set the limiter — select.c:8239..8245 (tag-select-0650).  Honoured
+        by the GROUP BY output subroutine via OP_DecrJumpZero(iLimit,
+        addrSetAbort) after the per-row dest write (selectInnerLoop
+        select.c:1522).  No-op when p^.pLimit is nil (iLimit stays 0).
+        Required for UPDATE..FROM .. LIMIT (SRT_Upfrom), upfrom4-520. }
+      if p^.pLimit <> nil then
+        computeLimitRegisters(pParse, p, addrEnd);
 
       sqlite3VdbeAddOp2(v, OP_Integer, 0, iAbortFlag);
       sqlite3VdbeAddOp3(v, OP_Null, 0, iAMem, iAMem + nGroupBy - 1);
@@ -32931,7 +32998,38 @@ begin
           sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
                                pDest^.iSdst, nResultCol);
         sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else if pDest^.eDest = SRT_Upfrom then
+      begin
+        { UPDATE..FROM .. LIMIT (rowid / WITHOUT-ROWID PK target) hands an
+          SRT_Upfrom destination down here when the FROM-driven SELECT
+          carries a synthesised GROUP BY (updateFromSelect, update.c:236..
+          255).  Mirrors the selectInnerLoop SRT_Upfrom arm (select.c:1355
+          ..1377): skip the aggregate empty-row (first result col / rowid
+          NULL → jump to addrSetAbort), then MakeRecord of the SET columns
+          and Insert (i2<0, rowid table) or IdxInsert (i2>=0, WITHOUT ROWID
+          PK key prefix of length i2).  Required for upfrom4-520. }
+        iUF2 := pDest^.iSDParm2;
+        r1   := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp2(v, OP_IsNull, pDest^.iSdst, addrSetAbort);
+        if iUF2 < 0 then
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst + 1,
+                            nResultCol - 1, r1)
+        else
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        if iUF2 < 0 then
+          sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, pDest^.iSdst)
+        else
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                               pDest^.iSdst, iUF2);
+        sqlite3ReleaseTempReg(pParse, r1);
       end;
+      { LIMIT counter — selectInnerLoop select.c:1522..1523.  When a LIMIT
+        is in force (iLimit allocated by computeLimitRegisters above), the
+        group-output subroutine decrements it after each emitted row and
+        aborts the scan once it reaches zero. }
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSetAbort);
       sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
 
       { Subroutine: addrReset. }
@@ -39618,8 +39716,10 @@ end;
   caller's iEph ephemeral table (SRT_Upfrom for rowid/PK tables,
   SRT_Table for vtab/View arms — vtab is irrelevant here, the vtab
   arm goes through updateVirtualTable instead).
-  SQLITE_ENABLE_UPDATE_DELETE_LIMIT arm omitted — not in the default
-  build (so pOrderBy/pLimit are unused; UNUSED_PARAMETER in C). }
+  SQLITE_ENABLE_UPDATE_DELETE_LIMIT arm ported — the UDL-capable parser
+  build accepts ORDER BY / LIMIT on UPDATE..FROM, so pOrderBy/pLimit are
+  duplicated into the FROM-driven SELECT and a GROUP BY on the target
+  rowid/PK is synthesised (update.c:210..255). }
 procedure updateFromSelect(pParse: PParse; iEph: i32; pPk: PIndex2;
   pChanges: PExprList; pTabList: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pLimit: PExpr);
@@ -39645,7 +39745,16 @@ begin
   db := pParse^.db;
   pTab := SrcListItems(pTabList)[0].pSTab;
 
-  { SQLITE_ENABLE_UPDATE_DELETE_LIMIT arm omitted — UNUSED_PARAMETER. }
+  { SQLITE_ENABLE_UPDATE_DELETE_LIMIT arm — update.c:210..220.
+    ORDER BY without LIMIT is an error; otherwise dup ORDER BY + LIMIT
+    so the FROM-driven SELECT honours them. }
+  if (pOrderBy <> nil) and (pLimit = nil) then
+  begin
+    sqlite3ErrorMsg(pParse, PAnsiChar('ORDER BY without LIMIT on UPDATE'));
+    Exit;
+  end;
+  pOrderBy2 := sqlite3ExprListDup(db, pOrderBy, 0);
+  pLimit2 := sqlite3ExprDup(db, pLimit, 0);
 
   pSrc := sqlite3SrcListDup(db, pTabList, 0);
   pWhere2 := sqlite3ExprDup(db, pWhere, 0);
@@ -39668,6 +39777,9 @@ begin
     for i := 0 to i32(pPk^.nKeyCol) - 1 do
     begin
       pNew := exprRowColumn(pParse, pPk^.aiColumn[i]);
+      if pLimit <> nil then
+        pGrp := sqlite3ExprListAppend(pParse, pGrp,
+                  sqlite3ExprDup(db, pNew, 0));
       pList := sqlite3ExprListAppend(pParse, pList, pNew);
     end;
     if pTab^.eTabType = TABTYP_VTAB then eDest := SRT_Table else eDest := SRT_Upfrom;
@@ -39683,6 +39795,9 @@ begin
     if pTab^.eTabType = TABTYP_VTAB then eDest := SRT_Table else eDest := SRT_Upfrom;
     pList := sqlite3ExprListAppend(pParse, nil,
         sqlite3PExpr(pParse, TK_ROW, nil, nil));
+    if pLimit <> nil then
+      pGrp := sqlite3ExprListAppend(pParse, nil,
+                sqlite3PExpr(pParse, TK_ROW, nil, nil));
   end;
 
   AssertH((pChanges <> nil) or (db^.mallocFailed <> 0), 'updateFromSelect pChanges');
