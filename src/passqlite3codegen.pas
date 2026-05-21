@@ -2488,6 +2488,8 @@ function  sqlite3MatchEName(pItem: PExprListItem; zCol: PAnsiChar;
   zTab: PAnsiChar; zDb: PAnsiChar; pbRowid: Pi32): i32;
 function  sqlite3ExprColUsed(pExpr: PExpr): Bitmask;
 function  sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
+procedure sqlite3ExprFunctionUsable(pParse: PParse; pExpr: PExpr;
+  pDef: PTFuncDef);
 function  sqlite3ResolveExprListNames(pNC: PNameContext;
   pList: PExprList): i32;
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
@@ -5630,7 +5632,17 @@ begin
       Result := True;
       Exit;
     end;
-  end;
+  end
+  { expr.c:5371..5373 — codegen-time trusted-schema enforcement.  The
+    name-resolution pass already runs sqlite3ExprFunctionUsable, but a
+    generated-column / CHECK / index expression is resolved (with
+    EP_FromDDL set) at CREATE time when trusted_schema may still be ON,
+    then re-checked here when its code is generated for a later SELECT /
+    INSERT under trusted_schema=OFF.  Only fires for DIRECTONLY or
+    unsafe (non-INNOCUOUS) functions; INLINE functions were handled above
+    and are asserted neither DIRECT nor UNSAFE in C. }
+  else if (pDef^.funcFlags and (SQLITE_FUNC_DIRECT or SQLITE_FUNC_UNSAFE)) <> 0 then
+    sqlite3ExprFunctionUsable(pParse, pExpr, pDef);
   constMask := 0;
   if n > 0 then
   begin
@@ -9788,6 +9800,35 @@ begin
   resolveNotValidSubqueries(pParse, pNC, pE^.pRight);
 end;
 
+{ expr.c:1276 — sqlite3ExprFunctionUsable.  Check whether an
+  application-defined (or DIRECTONLY) function may be invoked from the
+  current context.  The two relevant flags:
+    SQLITE_FUNC_DIRECT  — only usable from top-level SQL
+    SQLITE_FUNC_UNSAFE  — usable if TRUSTED_SCHEMA or from top-level SQL
+  When the function call originates from schema text (EP_FromDDL set, or
+  the whole statement is being prepared from DDL via SQLITE_PREPARE_FROM_DDL)
+  and the function is either DIRECTONLY or unsafe-with-trusted-schema-off,
+  raise "unsafe use of <name>()".  C asserts at least one of
+  (SQLITE_FUNC_DIRECT|SQLITE_FUNC_UNSAFE) is set, so the caller must gate
+  this on that mask. }
+procedure sqlite3ExprFunctionUsable(pParse: PParse; pExpr: PExpr;
+  pDef: PTFuncDef);
+begin
+  Assert((pDef^.funcFlags and (SQLITE_FUNC_DIRECT or SQLITE_FUNC_UNSAFE)) <> 0);
+  if ExprHasProperty(pExpr, EP_FromDDL)
+     or ((pParse^.prepFlags and SQLITE_PREPARE_FROM_DDL) <> 0) then
+  begin
+    if ((pDef^.funcFlags and SQLITE_FUNC_DIRECT) <> 0)
+       or ((pParse^.db^.flags and SQLITE_TrustedSchema) = 0) then
+    begin
+      { %#T renders pExpr^.u.zToken (the function name); see printf.c:954. }
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'unsafe use of %s()', [pExpr^.u.zToken]));
+      sqlite3RecordErrorOffsetOfExpr(pParse^.db, pExpr);
+    end;
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -11468,6 +11509,29 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end;
       end;
     end;
+    { resolve.c:1226..1231 — trusted-schema enforcement in the SELECT
+      resolver.  When the resolved function carries SQLITE_FUNC_DIRECT
+      (SQLITE_DIRECTONLY) or SQLITE_FUNC_UNSAFE (i.e. NOT registered
+      SQLITE_INNOCUOUS), run sqlite3ExprFunctionUsable, which raises
+      "unsafe use of fN()" if the call carries EP_FromDDL (set by the
+      DbFixer on view / trigger bodies in non-TEMP schemas) and
+      SQLITE_DBCONFIG_TRUSTED_SCHEMA is off (or the function is DIRECTONLY).
+      A top-level SELECT never has EP_FromDDL set, so the check is a no-op
+      there.  Gated by 0==IN_RENAME_OBJECT, matching C. }
+    if (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+       and ExprUseXList(pE) and (not InRenameObject(pParse)) then
+    begin
+      if pE^.x.pList <> nil then nArg_ := pE^.x.pList^.nExpr else nArg_ := 0;
+      pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg_,
+                                   pParse^.db^.enc, 0);
+      if pDef_ = nil then
+        pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                     pParse^.db^.enc, 0);
+      if (pDef_ <> nil)
+         and ((pDef_^.funcFlags
+               and (SQLITE_FUNC_DIRECT or SQLITE_FUNC_UNSAFE)) <> 0) then
+        sqlite3ExprFunctionUsable(pParse, pE, pDef_);
+    end;
     { walker.c:71 — only descend into pLeft / pRight when the Expr is a full
       allocation.  Reduced (EP_TokenOnly) or leaf (EP_Leaf) nodes do not
       have pLeft / pRight fields physically present; reading them walks past
@@ -12795,6 +12859,59 @@ begin
   p := pTopSel;
 end;
 
+{ resolve.c:1226..1231 — DDL self-reference trusted-schema enforcement.
+  The Pascal resolver for self-reference contexts (CHECK / index expr /
+  generated columns / partial-index WHERE) is the lean walker
+  resolveExprAgainstSrcList, which does not carry the NameContext flags.
+  Rather than thread NC_FromDDL through it, mirror C's resolveExprStep
+  per-node action with a dedicated post-resolution walk: for every
+  TK_FUNCTION node bound to a DIRECTONLY/unsafe function, set EP_FromDDL
+  when the container is a non-TEMP schema element (bFromDDL) and run
+  sqlite3ExprFunctionUsable.  Gated by 0==IN_RENAME_OBJECT, matching C. }
+procedure resolveSelfRefDDLUsable(pParse: PParse; pE: PExpr; bFromDDL: Boolean);
+var
+  pDef: PTFuncDef;
+  i, n: i32;
+  pList: PExprList;
+begin
+  if (pE = nil) or InRenameObject(pParse) then Exit;
+  if (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil) and ExprUseXList(pE) then
+  begin
+    if pE^.x.pList <> nil then n := pE^.x.pList^.nExpr else n := 0;
+    pDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, n, pParse^.db^.enc, 0);
+    if pDef = nil then
+      pDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                  pParse^.db^.enc, 0);
+    if (pDef <> nil)
+       and ((pDef^.funcFlags and (SQLITE_FUNC_DIRECT or SQLITE_FUNC_UNSAFE)) <> 0)
+    then
+    begin
+      if bFromDDL then ExprSetProperty(pE, EP_FromDDL);
+      sqlite3ExprFunctionUsable(pParse, pE, pDef);
+    end;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  resolveSelfRefDDLUsable(pParse, pE^.pLeft, bFromDDL);
+  resolveSelfRefDDLUsable(pParse, pE^.pRight, bFromDDL);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList := pE^.x.pList;
+    if pList <> nil then
+      for i := 0 to pList^.nExpr - 1 do
+        resolveSelfRefDDLUsable(pParse, ExprListItems(pList)[i].pExpr, bFromDDL);
+  end;
+end;
+
+procedure resolveSelfRefDDLUsableList(pParse: PParse; pList: PExprList;
+  bFromDDL: Boolean);
+var
+  i: i32;
+begin
+  if pList = nil then Exit;
+  for i := 0 to pList^.nExpr - 1 do
+    resolveSelfRefDDLUsable(pParse, ExprListItems(pList)[i].pExpr, bFromDDL);
+end;
+
 function sqlite3ResolveSelfReference(pParse: PParse; pTab: PTable2;
   type_: i32; pExpr: PExpr; pList: PExprList): i32;
 var
@@ -12802,10 +12919,12 @@ var
   pSrc:  PSrcList;
   pItem: PSrcItem;
   sNC:   TNameContext;
+  bFromDDL: Boolean;
 begin
   FillChar(buf, SizeOf(buf), 0);
   FillChar(sNC, SizeOf(sNC), 0);
   pSrc := PSrcList(@buf[0]);
+  bFromDDL := False;
   if pTab <> nil then
   begin
     pSrc^.nSrc  := 1;
@@ -12813,6 +12932,14 @@ begin
     pItem^.zName   := pTab^.zName;
     pItem^.pSTab   := pTab;
     pItem^.iCursor := -1;
+    { resolve.c:2307..2311 — cause EP_FromDDL to be set on TK_FUNCTION nodes
+      of non-TEMP schema elements (CHECK / index / generated-column exprs),
+      so sqlite3ExprFunctionUsable can reject unsafe/DIRECTONLY functions. }
+    if pTab^.pSchema <> pParse^.db^.aDb[1].pSchema then
+    begin
+      type_ := type_ or NC_FromDDL;
+      bFromDDL := True;
+    end;
   end;
   sNC.pParse   := pParse;
   sNC.pSrcList := pSrc;
@@ -12820,6 +12947,14 @@ begin
   Result := sqlite3ResolveExprNames(@sNC, pExpr);
   if (Result = SQLITE_OK) and (pList <> nil) then
     Result := sqlite3ResolveExprListNames(@sNC, pList);
+  { resolve.c:1226..1231 — run the trusted-schema usable check on the
+    resolved DDL expression(s).  Done only when names resolved cleanly so
+    we do not mask a prior "no such column" with the usable error. }
+  if Result = SQLITE_OK then
+  begin
+    resolveSelfRefDDLUsable(pParse, pExpr, bFromDDL);
+    resolveSelfRefDDLUsableList(pParse, pList, bFromDDL);
+  end;
 end;
 
 { resolve.c:35 — incrAggDepth walker callback. }
@@ -57781,7 +57916,7 @@ var
   rc:       i32;
   pDest:    PTFuncDestructor;
 const
-  SQLITE_FUNC_UNSAFE_LOCAL = $00040000;  { SQLITE_FUNC_UNSAFE bit, see sqliteInt.h }
+  SQLITE_FUNC_UNSAFE_LOCAL = $00200000;  { SQLITE_FUNC_UNSAFE bit == SQLITE_INNOCUOUS, sqliteInt.h:2048 }
 begin
   { main.c:1949..1957 — argument validation. }
   if (zFunctionName = nil)
