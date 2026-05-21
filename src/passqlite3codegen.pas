@@ -35220,7 +35220,19 @@ begin
     by "OP_Integer n, iLimit". }
   iLimitReg := 0;
   iLimit0Goto := -1;
-  if isExists and (p^.pLimit <> nil) then
+  { computeLimitRegisters early-return guard (select.c:2515 `if(p->iLimit) return`).
+    When this select arrives with p^.iLimit already set — e.g. a UNION ALL
+    right arm whose shared compound LIMIT/OFFSET registers were allocated by
+    multiSelect and propagated via `p^.iLimit := pPrior^.iLimit` — the inline
+    LIMIT/OFFSET coding below must NOT run again.  Re-running it would allocate
+    a fresh register pair and emit a second OP_OffsetLimit, shadowing the
+    already-adjusted shared counter and re-applying OFFSET from scratch
+    (offset1-1.2.x). }
+  if p^.iLimit <> 0 then
+  begin
+    { fall through with the inherited registers; no new emission }
+  end
+  else if isExists and (p^.pLimit <> nil) then
   begin
     Inc(pParse^.nMem);
     iLimitReg := pParse^.nMem;
