@@ -38274,6 +38274,14 @@ begin
   v := sqlite3GetVdbe(@sSubParse);
   if v <> nil then
   begin
+    { trigger.c:1289..1295 — tag the sub-program's OP_Init with a
+      "-- TRIGGER name" comment so SQLITE_TRACE_STMT / legacy trace emits
+      a per-trigger marker line. }
+    if pTrg^.zName <> nil then
+      sqlite3VdbeChangeP4(v, -1,
+        sqlite3MPrintf(db, PAnsiChar('-- TRIGGER %s'), [pTrg^.zName]),
+        P4_DYNAMIC);
+
     { WHEN clause — jump past trigger body if false or NULL. }
     if pTrg^.pWhen <> nil then
     begin

@@ -1449,6 +1449,12 @@ begin
     `while (p->zSql[0] || p->pPreStmt)` loop of dbEvalStep:1769. }
   while (not bDone) and (zSql <> nil) and (zSql^ <> #0) do
   begin
+    { Trim leading whitespace before each prepare — tclsqlite.c:1413
+      (dbPrepareAndBind).  Keeps the trace / sqlite3_sql text free of the
+      newlines+indent that braces in the test scripts introduce. }
+    while (zSql^ = ' ') or (zSql^ = #9) or (zSql^ = #10) or (zSql^ = #13) do
+      Inc(zSql);
+    if zSql^ = #0 then Break;
     pStmt := nil;
     zTail := nil;
     rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, @zTail);

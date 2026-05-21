@@ -6689,6 +6689,8 @@ var
   i:          i32;
   pVar:       PMem;
   zStart:     PAnsiChar;
+  enc:        u8;
+  utf8:       TMem;
 begin
   Result := nil;
   if (p = nil) or (zRawSql = nil) then Exit;
@@ -6733,7 +6735,21 @@ begin
       else if (pVar^.flags and MEM_Real) <> 0 then
         sqlite3_str_appendf(out_, '%!.15g', [pVar^.u.r])
       else if (pVar^.flags and MEM_Str) <> 0 then begin
+        { vdbetrace.c:137..148 — convert UTF-16 bound text to UTF-8 for
+          display before formatting it as a quoted literal. }
+        enc := db^.enc;
+        if enc <> SQLITE_UTF8 then begin
+          FillChar(utf8, SizeOf(utf8), 0);
+          utf8.db := Psqlite3(db);
+          sqlite3VdbeMemSetStr(@utf8, pVar^.z, pVar^.n, enc, SQLITE_STATIC);
+          if sqlite3VdbeChangeEncoding(@utf8, SQLITE_UTF8) = SQLITE_NOMEM then begin
+            out_^.accError := SQLITE_NOMEM;
+            out_^.nAlloc   := 0;
+          end;
+          pVar := @utf8;
+        end;
         sqlite3_str_appendf(out_, '''%.*q''', [pVar^.n, pVar^.z]);
+        if enc <> SQLITE_UTF8 then sqlite3VdbeMemRelease(@utf8);
       end else if (pVar^.flags and MEM_Zero) <> 0 then
         sqlite3_str_appendf(out_, 'zeroblob(%d)', [pVar^.u.nZero])
       else begin
@@ -8896,10 +8912,11 @@ begin
             zTrcStmt := v^.zSql;
           if zTrcStmt <> nil then begin
             if (db^.mTrace and SQLITE_TRACE_LEGACY) <> 0 then begin
-              { Legacy xTrace receives expanded SQL.  No expander wired in
-                this build — pass zTrcStmt verbatim to keep call shape. }
+              { Legacy xTrace receives expanded SQL (vdbe.c:9072..9075). }
+              zTrcDup := sqlite3VdbeExpandSql(v, zTrcStmt);
               if Assigned(db^.trace.xLegacy) then
-                db^.trace.xLegacy(db^.pTraceArg, zTrcStmt);
+                db^.trace.xLegacy(db^.pTraceArg, zTrcDup);
+              sqlite3_free(zTrcDup);
             end else if db^.nVdbeExec > 1 then begin
               zTrcDup := sqlite3MPrintf(db, '-- %s', [zTrcStmt]);
               if Assigned(db^.trace.xV2) then
