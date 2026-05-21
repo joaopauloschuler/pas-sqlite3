@@ -7175,18 +7175,36 @@ end;
 
 { btree.c lines 4336-4371: btreeEndTransaction }
 procedure btreeEndTransaction(p: PBtree);
-var pBt: PBtShared;
+var
+  pBt: PBtShared;
+  db:  PTsqlite3;
 begin
   pBt := p^.pBt;
+  db  := PTsqlite3(p^.db);
   pBt^.bDoTruncate := 0;   { btree.c:4342 — clear at every txn end. }
-  { No shared-cache table-lock lists to clear (SQLITE_OMIT_SHARED_CACHE) }
-  if p^.inTrans <> TRANS_NONE then begin
-    Dec(pBt^.nTransaction);
-    if pBt^.nTransaction = 0 then
-      pBt^.inTransaction := TRANS_NONE;
+  { btree.c:4344..4367.  If this handle still has a transaction open AND
+    the connection has other active read statements (nVdbeRead>1), then
+    downgrade to a read-only transaction rather than ending it — the other
+    statements may still be reading from the database, so the shared/read
+    lock must persist.  Without this arm, committing the last write
+    statement while a read cursor (e.g. a read-only incremental-blob
+    handle) is still open dropped the b-tree straight to TRANS_NONE; the
+    pager kept the SHARED lock because a cursor was open, but the b-tree
+    then reported TRANS_NONE so the final reader's commit skipped
+    CommitPhaseTwo and never released the lock (e_blobclose-2.1.5).
+    downgradeAllSharedCacheTableLocks is a no-op here (OMIT_SHARED_CACHE). }
+  if (p^.inTrans > TRANS_NONE) and (db <> nil) and (db^.nVdbeRead > 1) then begin
+    p^.inTrans := TRANS_READ;
+  end else begin
+    { No shared-cache table-lock lists to clear (SQLITE_OMIT_SHARED_CACHE) }
+    if p^.inTrans <> TRANS_NONE then begin
+      Dec(pBt^.nTransaction);
+      if pBt^.nTransaction = 0 then
+        pBt^.inTransaction := TRANS_NONE;
+    end;
+    p^.inTrans := TRANS_NONE;
+    unlockBtreeIfUnused(pBt);
   end;
-  p^.inTrans := TRANS_NONE;
-  unlockBtreeIfUnused(pBt);
 end;
 
 { btree.c lines 3594-3798: btreeBeginTrans (simplified: no shared-cache) }
