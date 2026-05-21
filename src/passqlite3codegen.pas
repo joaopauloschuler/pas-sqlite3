@@ -8661,7 +8661,8 @@ end;
   UPDATE WHERE-clause path to drive sqlite3WhereBegin with a properly tagged
   TK_COLUMN tree (so prereqAll picks up the cursor mask and the False-
   WHERE-Term-Bypass does not spuriously fire on `rowid=N`). }
-procedure resolveExprAgainstSrcList(pParse: PParse; pSrc: PSrcList; pE: PExpr);
+procedure resolveExprAgainstSrcList(pParse: PParse; pSrc: PSrcList; pE: PExpr;
+  ncFlags: i32);
 var
   i:      i32;
   iCol:   i32;
@@ -8783,9 +8784,14 @@ begin
         (and the SELECT-context arm at sqlite3ResolveSelectNames): if zCol
         is a rowid alias and the table has a visible rowid, bind to
         iColumn=-1 against this source.  WITHOUT-ROWID tables fall through
-        to the "no such column" tail, matching C. }
+        to the "no such column" tail, matching C.
+        unique2-13.1/13.2 — gate on NC_IdxExpr|NC_GenCol (resolve.c:626):
+        in a CREATE TABLE/INDEX indexed-column list or a generated-column
+        expression the rowid aliases are NOT valid, so `<tab>.rowid` must
+        fall through to "no such column". }
       if (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
-         and HasRowid(pItem^.pSTab) then
+         and HasRowid(pItem^.pSTab)
+         and ((ncFlags and (NC_IdxExpr or NC_GenCol)) = 0) then
       begin
         pE^.op      := TK_COLUMN;
         pE^.iTable  := pItem^.iCursor;
@@ -8822,7 +8828,13 @@ begin
         Exit;
       end;
     end;
-    if sqlite3IsRowid(pE^.u.zToken) <> 0 then
+    { unique2-13.1/13.2 — bare rowid alias resolution is gated on
+      NC_IdxExpr|NC_GenCol (resolve.c:623..627).  In a CREATE TABLE/INDEX
+      indexed-column list or a generated-column expression `rowid`/`oid`/
+      `_rowid_` are NOT valid column names, so they must fall through to
+      the "no such column" error rather than binding to iColumn=-1. }
+    if (sqlite3IsRowid(pE^.u.zToken) <> 0)
+       and ((ncFlags and (NC_IdxExpr or NC_GenCol)) = 0) then
     begin
       for i := 0 to pSrc^.nSrc - 1 do
       begin
@@ -8842,14 +8854,14 @@ begin
   end;
   if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
   begin
-    resolveExprAgainstSrcList(pParse, pSrc, pE^.pLeft);
-    resolveExprAgainstSrcList(pParse, pSrc, pE^.pRight);
+    resolveExprAgainstSrcList(pParse, pSrc, pE^.pLeft, ncFlags);
+    resolveExprAgainstSrcList(pParse, pSrc, pE^.pRight, ncFlags);
     if (pE^.flags and EP_xIsSelect) = 0 then
     begin
       if pE^.x.pList <> nil then
       begin
         for i := 0 to pE^.x.pList^.nExpr - 1 do
-          resolveExprAgainstSrcList(pParse, pSrc, ExprListItems(pE^.x.pList)[i].pExpr);
+          resolveExprAgainstSrcList(pParse, pSrc, ExprListItems(pE^.x.pList)[i].pExpr, ncFlags);
       end;
     end;
   end;
@@ -9871,7 +9883,7 @@ begin
       resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
     if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
       resolveUpsertExcludedRefs(pNC, pExpr);
-    resolveExprAgainstSrcList(pNC^.pParse, pNC^.pSrcList, pExpr);
+    resolveExprAgainstSrcList(pNC^.pParse, pNC^.pSrcList, pExpr, pNC^.ncFlags);
     if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
       resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr)
     else if pNC^.pParse <> nil then
