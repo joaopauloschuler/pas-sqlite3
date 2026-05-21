@@ -8980,7 +8980,15 @@ begin
     if (pE^.flags and EP_DblQuoted) <> 0 then
     begin
       dbFlags := pParse^.db^.flags;
-      if ncIsDDL then
+      { resolve.c:162 — areDoubleQuotedStringsEnabled: when re-parsing the
+        stored schema (db->init.busy) always support double-quoted strings,
+        regardless of the DQS_DDL/DQS_DML flags.  The schema text was already
+        validated when first created (PRAGMA writable_schema), so a
+        double-quoted "null"/"abc"/"w" in a CHECK/index expression must lex as
+        a string literal on reload (Tcl quote-2.3.x..2.5). }
+      if pParse^.db^.init.busy <> 0 then
+        dqsOK := True
+      else if ncIsDDL then
       begin
         dqsOK := (sqlite3WritableSchema(pParse^.db) <> 0)
                  and ((dbFlags and u64($40000000)) <> 0);
@@ -47732,6 +47740,7 @@ var
   pColExpr:    PExpr;
   pCollSeq:    PTCollSeq;
   zCollName:   PAnsiChar;
+  pIdxColList: PExprList;
   jj:          i32;
   isDup:       Boolean;
   sortOrderMask: i32;
@@ -47906,13 +47915,23 @@ begin
   pIndex^.nColumn := u16(i32(pList^.nExpr) + nExtraCol);
   if onError <> OE_None then
     pIndex^.idxFlags := pIndex^.idxFlags or u32($08);  { uniqNotNull = bit 3 }
-  { build.c:4209 — under IN_RENAME_OBJECT the per-column pExpr list is
+  { build.c:4208..4211 — under IN_RENAME_OBJECT the per-column pExpr list is
     pinned on pIndex^.aColExpr so renameColumnFunc's walker can visit the
     TK_ID column-name tokens that reference the renamed column.  Without
     this pin the partial-index DDL rewrite never finds the indexed-column
-    span and emits stale `ON t(val)` text. }
+    span and emits stale `ON t(val)` text.  C nulls pList THE MOMENT it
+    transfers ownership (build.c:4210 `pList = 0;`) so a subsequent
+    `goto exit_create_index` from the resolution loop below frees the list
+    once (via sqlite3FreeIndex→aColExpr) rather than twice; without the
+    immediate null an unresolved index column under sqlite_rename_test
+    (DQS disabled) double-frees pList and corrupts the heap. }
+  pIdxColList := pList;   { build.c:4207 — pListItem = pList->a (stable list
+                            pointer; the per-column loop dereferences this,
+                            never the ownership-tracking pList which C may
+                            null at 4210). }
   if InRenameObject(pParse) then begin
     pIndex^.aColExpr := pList;
+    pList            := nil;
   end;
   { build.c:4190..4196 — honour DESC sort order on indexed columns only
     when the schema file_format is >= 4.  Older databases must ignore the
@@ -47922,10 +47941,10 @@ begin
     sortOrderMask := -1
   else
     sortOrderMask := 0;
-  for i := 0 to i32(pList^.nExpr) - 1 do
+  for i := 0 to i32(pIndex^.nKeyCol) - 1 do
   begin
     n := -1;
-    pColExpr  := PExprListItem(PByte(ExprListItems(pList))
+    pColExpr  := PExprListItem(PByte(ExprListItems(pIdxColList))
                    + i * SizeOf(TExprListItem))^.pExpr;
     { build.c:4216..4219 — convert TK_STRING to TK_ID, then resolve
       column references.  Under IN_RENAME_OBJECT this rewrites simple
@@ -47947,7 +47966,7 @@ begin
       column expression, and capture the wrapper's zToken as the index
       column's collation name.  Mirrors build.c:4253..4276 (TK_COLLATE
       arm of CreateIndex's per-column loop). }
-    pColExpr  := PExprListItem(PByte(ExprListItems(pList))
+    pColExpr  := PExprListItem(PByte(ExprListItems(pIdxColList))
                    + i * SizeOf(TExprListItem))^.pExpr;
     zCollName := nil;
     if (pColExpr <> nil) and (pColExpr^.op = TK_COLLATE) then
@@ -48021,7 +48040,7 @@ begin
     { build.c:4270..4271 — store the per-column ASC/DESC bit (masked by
       sortOrderMask so legacy file_format<4 schemas ignore DESC). }
     requestedSortOrder :=
-      i32(PExprListItem(PByte(ExprListItems(pList))
+      i32(PExprListItem(PByte(ExprListItems(pIdxColList))
                         + i * SizeOf(TExprListItem))^.fg.sortFlags)
       and sortOrderMask;
     (pIndex^.aSortOrder + i)^ := u8(requestedSortOrder);
@@ -48034,17 +48053,17 @@ begin
     byte-different b-tree pages on CREATE INDEX (9.2.divbug.D). }
   if pPk = nil then
   begin
-    n := i32(pList^.nExpr);
+    n := i32(pIndex^.nKeyCol);   { == pIdxColList^.nExpr (build.c:4296) }
     (pIndex^.aiColumn + n)^ := i16(XN_ROWID);
     (PPAnsiChar(pIndex^.azColl) + n)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + n)^ := 0;
   end
   else
   begin
-    { build.c:4278..4292.  i starts at pList^.nExpr (the first PK-suffix
-      slot) and advances only for non-duplicate PK columns; duplicates
-      shrink nColumn instead. }
-    i := i32(pList^.nExpr);
+    { build.c:4278..4292.  i starts at pIndex^.nKeyCol (== pIdxColList^.nExpr,
+      the first PK-suffix slot) and advances only for non-duplicate PK
+      columns; duplicates shrink nColumn instead. }
+    i := i32(pIndex^.nKeyCol);
     for n := 0 to i32(pPk^.nKeyCol) - 1 do
     begin
       { isDupColumn: scan the key prefix [0..nKeyCol) for an entry with
