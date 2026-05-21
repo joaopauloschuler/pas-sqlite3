@@ -16395,10 +16395,14 @@ end;
 
 function sqlite3WhereIsSorted(pWInfo: PWhereInfo): i32;
 begin
-  if (pWInfo^.wctrlFlags and (WHERE_GROUPBY or WHERE_DISTINCTBY)) <> 0 then
-    Result := 0
+  { where.c:5504 — return pWInfo->sorted.  The C body asserts WHERE_GROUPBY|
+    WHERE_DISTINCTBY and WHERE_SORTBYGROUP are set; the `sorted` 1-bit field
+    lives in bitwiseFlags bit 3 in this port (set at the WHERE_SORTBYGROUP
+    path codegen.pas:21752). }
+  if (pWInfo^.bitwiseFlags and (u8(1) shl 3)) <> 0 then
+    Result := 1
   else
-    Result := pWInfo^.nOBSat;
+    Result := 0;
 end;
 
 function sqlite3WhereOrderByLimitOptLabel(pWInfo: PWhereInfo): i32;
@@ -31329,6 +31333,8 @@ var
     differs from GROUP BY, the per-group output row is pushed into a
     secondary sorter and drained at addrEnd — bug 10.1.bug.12 close. }
   needSortOB:    Boolean;
+  obCandidate:   Boolean;        { ORDER BY present + SRT_Output: may need
+                                    a secondary sort; finalized post-WhereBegin }
   iSorterOB:     i32;
   pKeyInfoOB:    PKeyInfo2;
   nOrderByOB:    i32;
@@ -31339,6 +31345,12 @@ var
   regSortOutOB:  i32;
   addrSortBrkOB: i32;
   addrSortLoopOB:i32;
+  groupBySortLoc:i32;            { select.c:8533 — 0 when WhereIsOrdered
+                                    delivers full GROUP BY order via index }
+  addrSortIndexOB:i32;           { addr of the ORDER BY OP_SorterOpen, NOOP'd
+                                    when the sort is unneeded (select.c:8628) }
+  whereSortedOB: i32;            { sqlite3WhereIsSorted(pWInfo) cache }
+  wctrlGB:       u16;            { WhereBegin wctrlFlags for the GROUP BY scan }
   { Eponymous-vtab BestIndex driving (10.1.bug.75 — json_each / json_tree
     returned no rows because the Pas-only fast path emitted OP_Integer 0
     for idxNum without consulting xBestIndex).  Synthesize a minimal
@@ -32435,8 +32447,9 @@ begin
     { ORDER BY handling — orderByGrp arm.  Mirror sqlite3CopySortOrder
       (select.c:7516): when nExpr matches, copy sortFlags from ORDER BY
       onto pGroupBy then ExprListCompare to confirm structural equality. }
-    orderByGrp := 0;
-    needSortOB := False;
+    orderByGrp  := 0;
+    needSortOB  := False;
+    obCandidate := False;
     if p^.pOrderBy <> nil then
     begin
       copyOK := False;
@@ -32453,19 +32466,22 @@ begin
          and (sqlite3ExprListCompare(pGroupByLoc, p^.pOrderBy, -1) = 0) then
       begin
         orderByGrp := 1;
-      end
-      else
+      end;
+      { Bug 10.1.bug.12 — when the ORDER BY ends up not satisfied by the
+        GROUP BY ordering, push per-group output rows into a secondary
+        sorter keyed by pOrderBy and drain it after the group scan.  Only
+        SRT_Output is supported; other destinations stay on the old bail
+        path.  Whether the secondary sort is actually NEEDED depends on
+        select.c:8624 — orderByGrp && (groupBySort || WhereIsSorted) — and
+        groupBySort is not known until after sqlite3WhereBegin, so finalize
+        needSortOB there.  obCandidate just records that pOrderBy must be
+        aggregate-analyzed up front (harmless when orderByGrp=1 since those
+        exprs equal the already-analyzed GROUP BY terms). }
+      if pDest^.eDest = SRT_Output then
+        obCandidate := True
+      else if orderByGrp = 0 then
       begin
-        { Bug 10.1.bug.12 — instead of bailing when ORDER BY does not
-          match GROUP BY, push per-group output rows into a secondary
-          sorter keyed by pOrderBy and drain it after the group scan.
-          Only support SRT_Output here; other destinations stay on the
-          old bail path. }
-        if pDest^.eDest = SRT_Output then
-          needSortOB := True
-        else begin
-          Result := SQLITE_OK; Exit;
-        end;
+        Result := SQLITE_OK; Exit;
       end;
     end;
 
@@ -32488,7 +32504,7 @@ begin
     markAggregateInExprList(pParse, p^.pEList);
     if pHavingLoc <> nil then
       markAggregateInExpr(pParse, pHavingLoc);
-    if needSortOB then
+    if obCandidate then
       markAggregateInExprList(pParse, p^.pOrderBy);
     sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
     if pHavingLoc <> nil then
@@ -32505,7 +32521,7 @@ begin
       end;
       sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc);
     end;
-    if needSortOB then
+    if obCandidate then
       sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pOrderBy);
     pAggI2^.nAccumulator := pAggI2^.nColumn;
     analyzeAggFuncArgs(pAggI2, @sNCAgg);
@@ -32571,20 +32587,25 @@ begin
       sqlite3VdbeAddOp4(v, OP_SorterOpen, pAggI2^.sortingIdx, nGroupBy, 0,
                         PAnsiChar(pKeyInfoGB), P4_KEYINFO);
 
-      { Bug 10.1.bug.12 — secondary sorter for ORDER BY when it does
-        not structurally match GROUP BY.  Payload = pOrderBy keys
-        followed by all result columns. }
-      iSorterOB     := -1;
-      pKeyInfoOB    := nil;
-      nOrderByOB    := 0;
-      if needSortOB then
+      { Bug 10.1.bug.12 — secondary sorter for ORDER BY when the GROUP BY
+        ordering does not satisfy the ORDER BY.  Payload = pOrderBy keys
+        followed by all result columns.  Mirroring C, the OP_SorterOpen is
+        emitted early (when the ORDER BY is a sort candidate) and then
+        NOOP'd after sqlite3WhereBegin if the planner turns out to satisfy
+        the ORDER BY (select.c:8624..8628 sqlite3VdbeChangeToNoop on
+        sSort.addrSortIndex).  needSortOB is finalized at that point. }
+      iSorterOB       := -1;
+      pKeyInfoOB      := nil;
+      nOrderByOB      := 0;
+      addrSortIndexOB := -1;
+      if obCandidate then
       begin
         nOrderByOB := p^.pOrderBy^.nExpr;
         iSorterOB  := pParse^.nTab; Inc(pParse^.nTab);
         pKeyInfoOB := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
                                                  p^.pEList^.nExpr);
-        sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterOB, nOrderByOB, 0,
-                          PAnsiChar(pKeyInfoOB), P4_KEYINFO);
+        addrSortIndexOB := sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterOB,
+                          nOrderByOB, 0, PAnsiChar(pKeyInfoOB), P4_KEYINFO);
       end;
 
       { Register layout — match select.c:8514..8523. }
@@ -32619,6 +32640,7 @@ begin
       pWInfo      := nil;
       addrGBBodyStart := 0;
       addrGBLoopDone  := 0;
+      groupBySortLoc  := 1;
 
       { 9.4.divbug.33 — DISTINCT-aggregate index ride (GROUP BY arm).
         Mirrors select.c:8466..8481.  When there is exactly one aggregate
@@ -32727,9 +32749,17 @@ begin
         {$IFDEF SQLITE_DEBUG}
         TreeTraceLine($2, 'WhereBegin');  { select.c:8518 }
         {$ENDIF}
+        { select.c:8519..8521 — pass WHERE_SORTBYGROUP when orderByGrp so the
+          planner records whether the chosen GROUP BY index also satisfies
+          the ORDER BY (pWInfo->sorted, read back via sqlite3WhereIsSorted).
+          OptimizationEnabled(GroupByOrder) gates the optimization, matching
+          the sSort.pOrderBy-elimination condition at select.c:8624. }
+        wctrlGB := WHERE_GROUPBY or distFlag;
+        if (orderByGrp <> 0)
+           and OptimizationEnabled(pParse^.db, SQLITE_GroupByOrder) then
+          wctrlGB := wctrlGB or WHERE_SORTBYGROUP;
         pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
-                                    pAggDistinct, p,
-                                    WHERE_GROUPBY or distFlag, 0);
+                                    pAggDistinct, p, wctrlGB, 0);
         if pWInfo = nil then
         begin
           sqlite3ExprListDelete(pParse^.db, pAggDistinct);
@@ -32746,18 +32776,61 @@ begin
         {$IFDEF SQLITE_DEBUG}
         TreeTraceLine($2, 'WhereBegin returns');  { select.c:8532 }
         {$ENDIF}
+        { select.c:8533 — when the planner delivers rows in full GROUP BY
+          order (an index covers every GROUP BY term), the temp B-tree
+          sort is unnecessary: groupBySort=0.  This port still emits the
+          sorter bytecode (the OP_OpenEphemeral-cancel codegen path is not
+          ported yet), but the EXPLAIN QUERY PLAN "USE TEMP B-TREE FOR
+          GROUP BY" node must be suppressed to match C's plan, exactly as
+          select.c gates the ExplainQueryPlan2 call (8553) inside the
+          groupBySort=1 else-branch. }
+        if sqlite3WhereIsOrdered(pWInfo) = nGroupBy then
+          groupBySortLoc := 0;
       end;
       assignAggregateRegisters(pParse, pAggI2);
 
+      { Finalize the ORDER BY secondary-sort decision now that groupBySort
+        is known (select.c:8624).  The ORDER BY sort is eliminated when
+        orderByGrp && OptimizationEnabled(GroupByOrder)
+                   && (groupBySort || sqlite3WhereIsSorted(pWInfo)).
+        Otherwise a secondary sort is needed; keep the OP_SorterOpen.  When
+        eliminated, NOOP the OP_SorterOpen we coded earlier (mirrors
+        sqlite3VdbeChangeToNoop on sSort.addrSortIndex, select.c:8628). }
+      needSortOB := False;
+      if obCandidate then
+      begin
+        whereSortedOB := 0;
+        if pWInfo <> nil then
+          whereSortedOB := sqlite3WhereIsSorted(pWInfo);
+        if (orderByGrp <> 0)
+           and OptimizationEnabled(pParse^.db, SQLITE_GroupByOrder)
+           and ((groupBySortLoc <> 0) or (whereSortedOB <> 0)) then
+        begin
+          { ORDER BY satisfied by the GROUP BY ordering — drop the sorter. }
+          if addrSortIndexOB >= 0 then
+            sqlite3VdbeChangeToNoop(v, addrSortIndexOB);
+        end
+        else
+          needSortOB := True;
+      end;
+
       { ExplainQueryPlan2(addrExp, "USE TEMP B-TREE FOR GROUP BY") —
-        select.c:8553..8556.  Emitted on the groupBySort=1 branch (always
-        taken in this port until WhereIsOrdered routing lands). }
-      i := sqlite3VdbeCurrentAddr(v);
-      sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
-                        sqlite3MPrintf(pParse^.db,
-                                       'USE TEMP B-TREE FOR %s',
-                                       ['GROUP BY']),
-                        P4_DYNAMIC);
+        select.c:8553..8556.  C emits this only inside the groupBySort=1
+        else-branch (when the planner does NOT already deliver GROUP BY
+        order via an index).  Gate on groupBySortLoc so an index-covered
+        GROUP BY reports no sort, matching the C plan.  The raw OP_Explain
+        is emitted unconditionally (not via the explain==2-gated helper)
+        to match the SQLITE_DEBUG C reference oracle, which always includes
+        OP_Explain opcodes — TestExplainParity diffs against that build. }
+      if groupBySortLoc <> 0 then
+      begin
+        i := sqlite3VdbeCurrentAddr(v);
+        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                          sqlite3MPrintf(pParse^.db,
+                                         'USE TEMP B-TREE FOR %s',
+                                         ['GROUP BY']),
+                          P4_DYNAMIC);
+      end;
 
       { Push rows into sorter (always groupBySort=1).  Encode pGroupBy
         terms first, then any accumulator columns whose iSorterColumn
@@ -33062,6 +33135,20 @@ begin
         per row, reading result columns from the sorter payload. }
       if needSortOB then
       begin
+        { explainTempTable("ORDER BY") — generateSortTail (select.c:1704).
+          The C aggregate-with-GROUP-BY path leaves sSort.pOrderBy set when
+          orderByGrp=0 and emits this second "USE TEMP B-TREE FOR ORDER BY"
+          node via generateSortTail.  Our secondary sorter must do the same
+          so EXPLAIN QUERY PLAN reports two sorts.  nOBSat is always 0 here
+          (no WHERE-supplied ordering), so the plain prefix-less text.  Raw
+          OP_Explain (unconditional) matches the SQLITE_DEBUG C oracle, same
+          idiom as the GROUP BY node above. }
+        i := sqlite3VdbeCurrentAddr(v);
+        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                          sqlite3MPrintf(pParse^.db,
+                                         'USE TEMP B-TREE FOR %s',
+                                         ['ORDER BY']),
+                          P4_DYNAMIC);
         iSortPTabOB    := pParse^.nTab; Inc(pParse^.nTab);
         regSortOutOB   := sqlite3GetTempReg(pParse);
         sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortPTabOB, regSortOutOB,
