@@ -46015,8 +46015,8 @@ begin
   iCol := -1;
   if pTab = nil then goto primary_key_exit;
   if (pTab^.tabFlags and TF_HasPrimaryKey) <> 0 then begin
-    sqlite3ErrorMsg(pParse,
-      PAnsiChar('table has more than one primary key'));
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'table "%s" has more than one primary key', [pTab^.zName]));
     goto primary_key_exit;
   end;
   pTab^.tabFlags := pTab^.tabFlags or TF_HasPrimaryKey;
