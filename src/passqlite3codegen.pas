@@ -32271,8 +32271,20 @@ begin
       Assert(pPriorSel^.pLimit = nil);
       savedFlagsP  := p^.selFlags;
       savedFlagsPP := pPriorSel^.selFlags;
-      p^.selFlags         := p^.selFlags         and (not u32(SF_Compound));
-      pPriorSel^.selFlags := pPriorSel^.selFlags and (not u32(SF_Compound));
+      { tkt2339.2/2.4 — do NOT clear SF_Compound on the arms.  C
+        (select.c:2998..3050) leaves SF_Compound set on every term of the
+        compound, including the leftmost; that flag is what makes
+        flattenSubquery's restriction (15) (select.c:4329 / codegen.pas:14074
+        `(p->selFlags & SF_Compound) && pSub->pLimit`) reject flattening a
+        LIMIT-bearing FROM-subquery into a compound arm.  Clearing it here
+        let `SELECT * FROM (SELECT ... ORDER BY ... LIMIT n)` flatten the
+        inner LIMIT up into the arm, so the arm's iLimit became the
+        compound's iLimit and the OP_IfNot gate emitted between arms (below)
+        tripped on the exhausted inner-LIMIT counter — dropping every arm
+        after the first.  The per-arm fast-path / FROM-loop gates below were
+        relaxed to ignore SF_Compound instead (they are only ever reached
+        with p^.pPrior=nil, i.e. for a leaf arm, since the compound dispatch
+        Exits above), so leaf-arm codegen is unchanged. }
 
       { Propagate LIMIT to left — register copy + Expr dup
         (select.c:3007..3010). }
@@ -32383,7 +32395,7 @@ begin
     sqlite3ErrorMsg. }
   if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
      and ((p^.selFlags and SF_Distinct) <> 0)
-     and ((p^.selFlags and (SF_Aggregate or SF_Compound)) = 0)
+     and ((p^.selFlags and SF_Aggregate) = 0)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
   then
@@ -32402,7 +32414,7 @@ begin
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
-     and ((p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) = 0)
+     and ((p^.selFlags and (SF_Distinct or SF_Aggregate)) = 0)
   then
   begin
     v := sqlite3GetVdbe(pParse);
@@ -32580,7 +32592,7 @@ begin
     / ResultRow.  See 6.10 step 12(f). }
   if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
      and ((p^.selFlags and SF_Aggregate) <> 0)
-     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and ((p^.selFlags and SF_Distinct) = 0)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin     = nil) and (p^.pOrderBy = nil)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
@@ -32659,7 +32671,7 @@ begin
     C runs this arm whenever pGroupBy != 0, even with no aggregate funcs
     (`SELECT a FROM t GROUP BY a`); SF_Aggregate is not a precondition. }
   if (p^.pGroupBy <> nil)
-     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and ((p^.selFlags and SF_Distinct) = 0)
      and (p^.pWin = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
@@ -33799,7 +33811,7 @@ begin
     fires under EXPLAIN QUERY PLAN (explain==2) so we omit it here, same
     as the C reference under standard EXPLAIN. }
   if ((p^.selFlags and SF_Aggregate) <> 0)
-     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and ((p^.selFlags and SF_Distinct) = 0)
      and (p^.pWhere = nil)
      and (p^.pHaving = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
@@ -33900,7 +33912,7 @@ begin
     OP_ResultRow.  Closes the no-arg DiagPragma `count(*) FROM
     pragma_xxx` divergences. }
   if ((p^.selFlags and SF_Aggregate) <> 0)
-     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and ((p^.selFlags and SF_Distinct) = 0)
      and (p^.pWhere = nil) and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pOrderBy = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
@@ -34063,7 +34075,7 @@ begin
     (i.e. fall back to the pre-agg 3-op stub) — they need extra ephem
     table / collation plumbing not yet ported. }
   if ((p^.selFlags and SF_Aggregate) <> 0)
-     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and ((p^.selFlags and SF_Distinct) = 0)
      and (p^.pGroupBy = nil)
      and (p^.pWin     = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
@@ -34620,8 +34632,15 @@ begin
 
   { SF_Distinct alone (no aggregate, no compound) drops into the trivial
     gate body below, taking the WHERE_DISTINCT_UNORDERED ephemeral-table
-    path emitted around the inner loop. }
-  if (p^.selFlags and (SF_Aggregate or SF_Compound)) <> 0 then
+    path emitted around the inner loop.  SF_Compound is intentionally NOT
+    a bail condition here: by this point p^.pPrior is always nil (the
+    compound dispatch at the top of sqlite3Select Exits for genuine
+    compounds), so a still-set SF_Compound only marks a leaf arm of a
+    UNION ALL that must be coded normally (tkt2339).  Previously the arm
+    cleared SF_Compound before recursing, which also disabled flatten
+    restriction (15); the flag is now kept set for that restriction's
+    sake and the leaf-arm gates ignore it. }
+  if (p^.selFlags and SF_Aggregate) <> 0 then
   begin
     Result := SQLITE_OK; Exit;
   end;
