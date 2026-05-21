@@ -59460,6 +59460,7 @@ var
   v64:     i64;
   vDbl:    Double;
   s:       AnsiString;
+  body:    AnsiString;
   i:       i32;
   zOut:    PAnsiChar;
   nOut:    i32;
@@ -59519,8 +59520,10 @@ var
         end;
     end;
     { length modifiers — consumed but otherwise ignored (Pas i64 path
-      always runs full-width through sqlite3_value_int64) }
-    while p^ in ['l', 'L', 'h', 'j', 'z', 't'] do Inc(p);
+      always runs full-width through sqlite3_value_int64).  NOTE: 'z' is a
+      conversion specifier (etDYNSTRING, %z, an alias for %s) in SQLite, NOT
+      a C size_t length modifier, so it must NOT be swallowed here. }
+    while p^ in ['l', 'L', 'h', 'j', 't'] do Inc(p);
     Result := p^;
   end;
 
@@ -59636,6 +59639,48 @@ var
     for j := 0 to k - 1 do Result[k - j] := buf[j];
   end;
 
+  { Truncate source s for the %q/%Q/%w escape ops per printf.c:871..882: the
+    precision counts INPUT bytes (or characters when the '!' alt-form-2 flag
+    is present).  Returns the (possibly shortened) source string. }
+  function TruncEscSrc(const src: AnsiString): AnsiString;
+  var ii, kk: i32;
+  begin
+    if not metaHavePrec then begin Result := src; Exit; end;
+    ii := 1; kk := metaPrec;
+    while (kk <> 0) and (ii <= Length(src)) do begin
+      if (Pos('!', metaFlags) > 0) and ((Byte(src[ii]) and $C0) = $C0) then
+      begin
+        Inc(ii);
+        while (ii <= Length(src)) and ((Byte(src[ii]) and $C0) = $80) do Inc(ii);
+      end else
+        Inc(ii);
+      Dec(kk);
+    end;
+    Result := Copy(src, 1, ii - 1);
+  end;
+
+  { Apply width padding to an already-escaped body for the %q/%Q/%w ops,
+    mirroring printf.c adjust_width_for_utf8 (839..845) + final pad
+    (1022..1029).  With '!' the width counts characters, so extra UTF-8
+    continuation bytes are added back to the pad budget. }
+  procedure AppEscWidth(const body: AnsiString);
+  var w, ii: i32;
+  begin
+    if (not metaHaveWidth) or (metaWidth <= 0) then begin
+      result_ := result_ + body; Exit;
+    end;
+    w := metaWidth;
+    if Pos('!', metaFlags) > 0 then
+      for ii := 1 to Length(body) do
+        if (Byte(body[ii]) and $C0) = $80 then Inc(w);
+    w := w - Length(body);
+    if w <= 0 then begin result_ := result_ + body; Exit; end;
+    if Pos('-', metaFlags) > 0 then
+      result_ := result_ + body + StringOfChar(' ', w)
+    else
+      result_ := result_ + StringOfChar(' ', w) + body;
+  end;
+
 begin
   if argc < 1 then begin sqlite3_result_null(pCtx); Exit; end;
   zFmt := sqlite3_value_text(Psqlite3_value((argv + 0)^));
@@ -59665,8 +59710,10 @@ begin
     end;
     { Skip optional width / precision / flags, then read the specifier. }
     c := SkipFmtMeta;
-    { consume the current arg if any }
-    if argIdx < argc then begin
+    { consume the current arg if any.  printf.c etSIZE (%n) is silently
+      ignored and consumes NO argument (printf.c:740..745, bArgList branch),
+      so do not advance argIdx for it. }
+    if (c <> 'n') and (argIdx < argc) then begin
       pVal := (argv + argIdx)^; Inc(argIdx);
     end else
       pVal := nil;
@@ -59701,6 +59748,24 @@ begin
         if (Pos('#', metaFlags) > 0) and (v64 <> 0) then s := '0X' + s;
         App(ApplyIntWidth(s, #0));
       end;
+      'p': begin
+        { %p — etPOINTER (printf.c fmtinfo[20]: base 16, charset 0 = the
+          UPPERCASE digit set, prefix only added under '#').  Under bArgList
+          the value comes from getIntArg, so %p is exactly an alias for %X
+          (R-56064-04001). }
+        Inc(p);
+        if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
+        else v64 := 0;
+        s := HexStr(u64(v64), True);
+        if (Pos('#', metaFlags) > 0) and (v64 <> 0) then s := '0x' + s;
+        App(ApplyIntWidth(s, #0));
+      end;
+      'n': begin
+        { %n — etSIZE.  printf.c:740..745: under bArgList it stores nothing,
+          emits nothing, and (handled above) consumes no argument.  Silently
+          ignored (R-02347-27622).  pVal was deliberately left nil. }
+        Inc(p);
+      end;
       'o': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
@@ -59716,8 +59781,11 @@ begin
         else vDbl := 0;
         App(FmtFloat(c, vDbl));
       end;
-      's': begin
-        { %s — honour width / precision per printf.c et_STRING.  Precision
+      's', 'z': begin
+        { %s — honour width / precision per printf.c et_STRING.  %z
+          (etDYNSTRING) is interchangeable with %s in the SQL printf path:
+          printf.c:794..823 takes getTextArg + sets xtype=etSTRING under
+          bArgList (R-17002-27534).  Precision
           truncates the source string to that many bytes; width pads
           (left-aligned with '-' flag, otherwise right-aligned with spaces).
           The '!' alt-form-2 flag (printf.c:769..776, 838..844) treats
@@ -59765,14 +59833,17 @@ begin
         end;
       end;
       'c': begin
-        { %c — first UTF-8 character of textified arg per printf.c:752..761
+        { %c — first UTF-8 character of textified arg per printf.c:751..793
           (bArgList branch).  Function-call printf walks PrintfArguments,
           which always takes the etCHARX branch through getTextArg.
           9.2.divbug.I — precision >1 acts as a repeat count (printf.c:769..790),
-          so printf('%.*c', 1000, 'A') yields 1000 A's.  Without this the
-          WAL / multipage / triggers vectors (which build 1000-byte rows
-          via printf('%.*c',1000,...)) stored 1-byte rows and the
-          round-trip mutator probe diverged by ~4000 bytes per page. }
+          so printf('%.*c', 1000, 'A') yields 1000 A's.
+
+          Width handling mirrors printf.c exactly: after building the char,
+          etCHARX sets flag_altform2 and jumps to adjust_width_for_utf8
+          (printf.c:792..793,839..845) — so width is in CHARACTERS, with the
+          extra UTF-8 continuation bytes added back into the pad count.  The
+          final width pad happens after the switch (printf.c:1022..1029). }
         Inc(p);
         s := '';
         if pVal <> nil then begin
@@ -59787,26 +59858,62 @@ begin
             end;
           end;
         end;
+        { metaWidth_eff: working width that the repeat-count path consumes
+          (printf.c:771 `width -= precision-1`). }
         if metaHavePrec and (metaPrec > 1) and (Length(s) > 0) then begin
+          { Repeat path (printf.c:769..790). }
+          metaWidth := metaWidth - (metaPrec - 1);
+          if (metaWidth > 1) and (Pos('-', metaFlags) = 0) then begin
+            result_ := result_ + StringOfChar(' ', metaWidth - 1);
+            metaWidth := 0;
+          end;
+          { Emit metaPrec copies of the char. }
           for i := 1 to metaPrec do result_ := result_ + s;
         end else
           result_ := result_ + s;
+        { adjust_width_for_utf8 (printf.c:839..845): the '!' behaviour is
+          always on for %c, so add the UTF-8 continuation bytes back into
+          width so it counts characters. }
+        if metaHaveWidth and (metaWidth > 0) then begin
+          for i := 1 to Length(s) do
+            if (Byte(s[i]) and $C0) = $80 then Inc(metaWidth);
+        end;
+        { Final width pad (printf.c:1022..1029): width -= length(=bytes of
+          this char's single emission, i.e. Length(s)). }
+        if metaHaveWidth then begin
+          metaWidth := metaWidth - Length(s);
+          if metaWidth > 0 then begin
+            if Pos('-', metaFlags) > 0 then
+              result_ := result_ + StringOfChar(' ', metaWidth)
+            else begin
+              { Right-justify: the spaces must precede the just-emitted char.
+                Re-splice: trim the char(s) we just appended and re-add with
+                leading pad.  Length(s) bytes were appended last. }
+              i := Length(result_) - Length(s);
+              s := StringOfChar(' ', metaWidth);
+              Insert(s, result_, i + 1);
+            end;
+          end;
+        end;
       end;
       'q': begin
         { %q — double internal single-quotes; do NOT add outer quotes.
-          NULL → "(NULL)" per printf.c:861. }
+          NULL → "(NULL)" per printf.c:861.  Precision truncates the INPUT
+          (printf.c:876..882) and width pads the escaped result. }
         Inc(p);
         if pVal <> nil then begin
           if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then
-            App('(NULL)')
+            AppEscWidth('(NULL)')
           else begin
             zStr := sqlite3_value_text(Psqlite3_value(pVal));
             if zStr = nil then zStr := '';
-            s := AnsiString(zStr);
+            s := TruncEscSrc(AnsiString(zStr));
+            body := '';
             for i := 1 to Length(s) do begin
-              if s[i] = '''' then result_ := result_ + '''';
-              result_ := result_ + s[i];
+              if s[i] = '''' then body := body + '''';
+              body := body + s[i];
             end;
+            AppEscWidth(body);
           end;
         end;
       end;
@@ -59816,15 +59923,17 @@ begin
         Inc(p);
         if pVal <> nil then begin
           if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then
-            App('(NULL)')
+            AppEscWidth('(NULL)')
           else begin
             zStr := sqlite3_value_text(Psqlite3_value(pVal));
             if zStr = nil then zStr := '';
-            s := AnsiString(zStr);
+            s := TruncEscSrc(AnsiString(zStr));
+            body := '';
             for i := 1 to Length(s) do begin
-              if s[i] = '"' then result_ := result_ + '"';
-              result_ := result_ + s[i];
+              if s[i] = '"' then body := body + '"';
+              body := body + s[i];
             end;
+            AppEscWidth(body);
           end;
         end;
       end;
@@ -59834,17 +59943,18 @@ begin
         Inc(p);
         if pVal <> nil then begin
           if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then
-            App('NULL')
+            AppEscWidth('NULL')
           else begin
             zStr := sqlite3_value_text(Psqlite3_value(pVal));
             if zStr = nil then zStr := '';
-            s := AnsiString(zStr);
-            result_ := result_ + '''';
+            s := TruncEscSrc(AnsiString(zStr));
+            body := '''';
             for i := 1 to Length(s) do begin
-              if s[i] = '''' then result_ := result_ + '''';
-              result_ := result_ + s[i];
+              if s[i] = '''' then body := body + '''';
+              body := body + s[i];
             end;
-            result_ := result_ + '''';
+            body := body + '''';
+            AppEscWidth(body);
           end;
         end;
       end;
