@@ -1300,7 +1300,14 @@ begin
   end;
 
   if gap + 2 + nByte > top then begin
-    rc := defragmentPage(pPage, 4);
+    { btree.c:1885 — MIN(4, pPage->nFree - (2+nByte)).  When the residual
+      free space after this allocation is < 4 bytes the fast-path defragment
+      cannot safely leave fragments behind, so a smaller nMaxFrag forces the
+      full repack.  The previous hardcoded 4 left the page with stale
+      fragment bytes (frag=2) and an unaccounted freeblock gap → CORRUPT. }
+    g2 := i32(pPage^.nFree) - (2 + nByte);
+    if g2 > 4 then g2 := 4;
+    rc := defragmentPage(pPage, g2);
     if rc <> SQLITE_OK then begin Result := rc; Exit; end;
     top := get2byteNotZero(data + hdr + 5);
   end;
