@@ -67231,20 +67231,14 @@ begin
     sqlite3VdbeResolveLabel(v, labelOk);
     sqlite3ReleaseTempReg(pParse, regCkNull);
   end else begin
-    { IN_INDEX_EPH (or IN_INDEX_INDEX_*): combined Step3+Step5 NotFound.
-      Emit an OP_Affinity over rLhs first so the probe matches the eph
-      key encoding (expr.c:4164).
-
-      Phase 6.9-bis 11g.2.f sub-progress 21 — emit Step 2 OP_IsNull
-      guards (expr.c:4187..4194) for every LHS field that can be NULL
-      BEFORE the combined NotFound.  When destIfFalse == destIfNull,
-      the IsNull jumps directly to destIfFalse (== addrCont in the
-      residual-filter path), short-circuiting the binary search.  This
-      is required even on the combined-NotFound fast path: NotFound's
-      NULL semantics treat a NULL LHS as not-equal-to-anything, but
-      C's coverage harness emits the IsNull explicitly so the generated
-      bytecode still matches. }
-    sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
+    { Step 1 (expr.c:4158..4175) — for an indexed/eph RHS, emit OP_Affinity
+      over rLhs so the probe matches the key encoding.  IN_INDEX_ROWID skips
+      this: the RHS is a rowid b-tree, the LHS is compared directly via
+      OP_SeekRowid below.  (aiMap LHS-reorder for multi-column indexes is not
+      reached on the shapes this port codes; nVector=1 for the index/rowid
+      arms here.) }
+    if eType <> IN_INDEX_ROWID then
+      sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
 
     { Step 2 (expr.c:4178..4194) — IsNull guard per LHS field that can
       be NULL.  destStep2/destStep6 differ only when destIfFalse !=
@@ -67261,7 +67255,19 @@ begin
         sqlite3VdbeAddOp2(v, OP_IsNull, rLhs + ii, destStep2);
     end;
 
-    if destIfFalse = destIfNull then
+    { Step 3 (expr.c:4198..4228) — binary search the RHS using the LHS as a
+      probe.  Three shapes: IN_INDEX_ROWID (SeekRowid + Goto-true), the
+      combined Step3+Step5 fast-path (NotFound) when FALSE and NULL are not
+      distinguished, and the ordinary Found+Step6 path otherwise. }
+    if eType = IN_INDEX_ROWID then
+    begin
+      { RHS is the ROWID of a table b-tree; the RHS is therefore non-NULL.
+        Combine steps 3 and 4 into a single OP_SeekRowid (expr.c:4200..4207). }
+      Assert(nVector = 1);
+      sqlite3VdbeAddOp3(v, OP_SeekRowid, iTab, destIfFalse, rLhs);
+      addrTruthOp := sqlite3VdbeAddOp0(v, OP_Goto);  { Return True }
+    end
+    else if destIfFalse = destIfNull then
     begin
       { Combined Step 3 + Step 5 (expr.c:4209..4223) — the fast-path
         used when the caller does not distinguish FALSE from NULL. }
@@ -67279,46 +67285,55 @@ begin
       end;
       sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
                            rLhs, nVector);
-    end else
+      { goto sqlite3ExprCodeIN_finished — skip Steps 4..7. }
+      sqlite3ReleaseTempReg(pParse, regFree1);
+      sqlite3DbFree(pParse^.db, zAff);
+      Exit;
+    end
+    else
     begin
       { Ordinary Step 3 (expr.c:4226) — Found jumps to the truthy
         landing patched at the end via JumpHere. }
       addrTruthOp := sqlite3VdbeAddOp4Int(v, OP_Found, iTab, 0,
                                           rLhs, nVector);
-
-      { Step 4 (expr.c:4233..4236) — when RHS is known not to contain
-        NULLs we can skip directly to destIfFalse. }
-      if (rRhsHasNull <> 0) and (nVector = 1) then
-        sqlite3VdbeAddOp2(v, OP_NotNull, rRhsHasNull, destIfFalse);
-
-      { Step 5 skipped in the split-NULL branch (Step 6 handles it). }
-
-      { Step 6 (expr.c:4243..4281) — walk the eph table once and
-        compare each row to the LHS; any equal-with-NULL produces
-        the destIfNull result, all FALSE produces destIfFalse. }
-      sqlite3VdbeResolveLabel(v, destStep6);
-      addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, iTab, destIfFalse);
-      if nVector > 1 then destNotNull := sqlite3VdbeMakeLabel(pParse)
-      else                destNotNull := destIfFalse;
-      for ii := 0 to nVector - 1 do
-      begin
-        pVF   := sqlite3VectorFieldSubexpr(pLeft, ii);
-        pColl := sqlite3ExprCollSeq(pParse, pVF);
-        r3    := sqlite3GetTempReg(pParse);
-        sqlite3VdbeAddOp3(v, OP_Column, iTab, ii, r3);
-        sqlite3VdbeAddOp4(v, OP_Ne, rLhs + ii, destNotNull, r3,
-                          pColl, P4_COLLSEQ);
-        sqlite3ReleaseTempReg(pParse, r3);
-      end;
-      sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfNull);
-      if nVector > 1 then
-      begin
-        sqlite3VdbeResolveLabel(v, destNotNull);
-        sqlite3VdbeAddOp2(v, OP_Next, iTab, addrTop + 1);
-        sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfFalse);
-      end;
-      sqlite3VdbeJumpHere(v, addrTruthOp);
     end;
+
+    { Step 4 (expr.c:4230..4236) — when RHS is known not to contain
+      NULLs and we did not find a match, the result must be FALSE. }
+    if (rRhsHasNull <> 0) and (nVector = 1) then
+      sqlite3VdbeAddOp2(v, OP_NotNull, rRhsHasNull, destIfFalse);
+
+    { Step 5 (expr.c:4240) — if we do not care about FALSE vs NULL, just
+      return false. }
+    if destIfFalse = destIfNull then
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfFalse);
+
+    { Step 6 (expr.c:4248..4281) — walk the RHS once and compare each row
+      to the LHS; any equal-with-NULL produces the destIfNull result, all
+      FALSE produces destIfFalse. }
+    if destStep6 <> 0 then sqlite3VdbeResolveLabel(v, destStep6);
+    addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, iTab, destIfFalse);
+    if nVector > 1 then destNotNull := sqlite3VdbeMakeLabel(pParse)
+    else                destNotNull := destIfFalse;
+    for ii := 0 to nVector - 1 do
+    begin
+      pVF   := sqlite3VectorFieldSubexpr(pLeft, ii);
+      pColl := sqlite3ExprCollSeq(pParse, pVF);
+      r3    := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_Column, iTab, ii, r3);
+      sqlite3VdbeAddOp4(v, OP_Ne, rLhs + ii, destNotNull, r3,
+                        pColl, P4_COLLSEQ);
+      sqlite3ReleaseTempReg(pParse, r3);
+    end;
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfNull);
+    if nVector > 1 then
+    begin
+      sqlite3VdbeResolveLabel(v, destNotNull);
+      sqlite3VdbeAddOp2(v, OP_Next, iTab, addrTop + 1);
+      { Step 7 (expr.c:4276..4279) — reaching here means the result is false. }
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfFalse);
+    end;
+    sqlite3VdbeJumpHere(v, addrTruthOp);
   end;
 
   sqlite3ReleaseTempReg(pParse, regFree1);
