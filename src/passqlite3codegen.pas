@@ -23251,6 +23251,8 @@ var
   iReleaseReg: i32;
   iRowidReg:   i32;
   notReadyResid: Bitmask;
+  iLoopResid:    i32;
+  iNextResid:    i32;
   notReady:      Bitmask;
   colUsedB:      Bitmask;
   nP4Cols:       i32;
@@ -24482,16 +24484,36 @@ begin
   begin
     { notReady for the post-this-level body: clear this loop's bit. }
     notReadyResid := pLevel^.notReady and (not pLoop^.maskSelf);
-    for ii := 0 to pWInfo^.sWC.nTerm - 1 do
-    begin
-      pTerm := @pWInfo^.sWC.a[ii];
-      if (pTerm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then continue;
-      if pTerm^.pExpr = nil then continue;
-      if (pTerm^.prereqAll and notReadyResid) <> 0 then continue;
-      sqlite3ExprIfFalse(pParse, pTerm^.pExpr, pLevel^.addrCont,
-                         SQLITE_JUMPIFNULL);
-      pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
-    end;
+    { wherecode.c:2591..2607 — the "MySQL push-down" multi-pass term-coding
+      loop.  This single-table fast path never carries a pIdx, so iLoop
+      starts at 2 (C: `iLoop = (pIdx ? 1 : 2)`).  iLoop==2 codes every term
+      that does NOT contain a correlated subquery; iLoop==3 codes the
+      remaining TERM_VARSELECT terms last.  Deferring the correlated-subquery
+      term (e.g. `123=(SELECT … f('two') …)`) to pass 3 lets a cheap
+      sibling AND-conjunct (`f('three')=123`) be evaluated first and
+      short-circuit the AND so the subquery side-effect never fires
+      (pushdown-2.2). }
+    iLoopResid := 2;
+    repeat
+      iNextResid := 0;
+      for ii := 0 to pWInfo^.sWC.nTerm - 1 do
+      begin
+        pTerm := @pWInfo^.sWC.a[ii];
+        if (pTerm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then continue;
+        if pTerm^.pExpr = nil then continue;
+        if (pTerm^.prereqAll and notReadyResid) <> 0 then continue;
+        if (iLoopResid < 3)
+           and ((pTerm^.wtFlags and TERM_VARSELECT) <> 0) then
+        begin
+          if iNextResid = 0 then iNextResid := 3;
+          continue;
+        end;
+        sqlite3ExprIfFalse(pParse, pTerm^.pExpr, pLevel^.addrCont,
+                           SQLITE_JUMPIFNULL);
+        pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+      end;
+      iLoopResid := iNextResid;
+    until iLoopResid = 0;
   end;
 
   { Mirror where.c:7634 — publish the level's addrCont so callers
