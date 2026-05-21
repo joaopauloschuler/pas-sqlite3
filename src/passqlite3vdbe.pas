@@ -12310,6 +12310,24 @@ begin
     pCycleOp := nil;
   end;
   {$ENDIF}
+
+  { vdbe.c:9339..9348 — final progress-callback check at the normal exit.
+    A statement that halts (or finishes) without crossing a
+    check_for_interrupt boundary after nVmStep last advanced past
+    nProgressLimit must still invoke xProgress here.  Without this arm a
+    short query (one whose VM-step count exceeds db^.nProgressOps but
+    never re-reaches a check_for_interrupt opcode at the right step) never
+    fires the handler at all (progress-1.7: `db progress 5 ...` with N>1
+    never aborted, so the inner SELECT ran to completion). }
+  while (nVmStep >= nProgressLimit) and (db^.xProgress <> nil) do begin
+    nProgressLimit := nProgressLimit + db^.nProgressOps;
+    if db^.xProgress(db^.pProgressArg) <> 0 then begin
+      nProgressLimit := u64($FFFFFFFFFFFFFFFF);
+      rc := SQLITE_INTERRUPT;
+      goto abort_due_to_error;
+    end;
+  end;
+
   Inc(v^.aCounter[SQLITE_STMTSTATUS_VM_STEP], i32(nVmStep));
   if v^.lockMask <> 0 then
     sqlite3VdbeLeave(v);
