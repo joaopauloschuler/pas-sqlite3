@@ -54711,6 +54711,9 @@ var
   zTypeTl: PAnsiChar;
   xTl:     passqlite3util.PHashElem;
   pTabTl:  PTable2;
+  { pragma.c:566 — VdbeOp* aOp + int size for PRAGMA default_cache_size. }
+  aOpDc:   PVdbeOp;
+  sizeDc:  i32;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   { pragma.c:2744..2745 — LOCK_STATUS names (slots 0..4) plus
@@ -54735,6 +54738,22 @@ const
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
     'THREADSAFE=1'
+  );
+  { pragma.c:555..565 — getCacheSize oplist for PRAGMA default_cache_size
+    read arm.  Reads the persistent BTREE_DEFAULT_CACHE_SIZE cookie; if
+    positive report it, if negative negate it, if zero substitute
+    SQLITE_DEFAULT_CACHE_SIZE (op[6].p1 is patched below). }
+  getCacheSize_OpCount = 9;
+  getCacheSize_aOp: array[0..getCacheSize_OpCount-1] of TVdbeOpList = (
+    { 0 }(opcode: OP_Transaction; p1: 0; p2: 0; p3: 0),
+    { 1 }(opcode: OP_ReadCookie;  p1: 0; p2: 1; p3: BTREE_DEFAULT_CACHE_SIZE),
+    { 2 }(opcode: OP_IfPos;       p1: 1; p2: 8; p3: 0),
+    { 3 }(opcode: OP_Integer;     p1: 0; p2: 2; p3: 0),
+    { 4 }(opcode: OP_Subtract;    p1: 1; p2: 2; p3: 1),
+    { 5 }(opcode: OP_IfPos;       p1: 1; p2: 8; p3: 0),
+    { 6 }(opcode: OP_Integer;     p1: 0; p2: 1; p3: 0),
+    { 7 }(opcode: OP_Noop;        p1: 0; p2: 0; p3: 0),
+    { 8 }(opcode: OP_ResultRow;   p1: 1; p2: 1; p3: 0)
   );
 begin
   if (pParse = nil) or (pId1 = nil) then Exit;
@@ -54766,7 +54785,16 @@ begin
     never had a temp table.  9.4.divbug.69. }
   if (iDb = 1) and (sqlite3OpenTempDatabase(pParse) <> 0) then Exit;
   SetString(zName, pPragmaId^.z, pPragmaId^.n);
-  if pValue <> nil then SetString(zRight, pValue^.z, pValue^.n) else zRight := '';
+  { pragma.c:463..467 — when minusFlag is set the parser stripped the
+    leading '-' into a flag (e.g. `PRAGMA cache_size=-4321`), so rebuild
+    zRight with the sign restored.  Without this every signed-numeric
+    pragma (cache_size, default_cache_size, mmap_size, ...) loses the
+    minus and reports the absolute value. }
+  if pValue <> nil then begin
+    SetString(zRight, pValue^.z, pValue^.n);
+    if minusFlag <> 0 then zRight := '-' + zRight;
+  end else
+    zRight := '';
   { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466).
     `PRAGMA table_info("t")` and `PRAGMA table_info='t'` both arrive with
     the surrounding quote chars still attached; strip a single matched
@@ -55620,6 +55648,39 @@ begin
     Exit;
   end;
 
+  { PragTyp_DEFAULT_CACHE_SIZE (pragma.c:553..585).  The persistent
+    cache size is stored in the database header (BTREE_DEFAULT_CACHE_SIZE
+    cookie, offset 48).  Read arm: emit the getCacheSize oplist which
+    reports the stored value (positive verbatim, negative negated, zero →
+    SQLITE_DEFAULT_CACHE_SIZE).  Write arm: store sqlite3AbsInt32(atoi(N))
+    into the cookie (OP_SetCookie) and into pSchema->cache_size, then
+    propagate to the live pcache via sqlite3BtreeSetCacheSize. }
+  if SameText(zName, 'default_cache_size') then begin
+    sqlite3VdbeUsesBtree(v, iDb);
+    if pValue = nil then begin
+      Inc(pParse^.nMem, 2);
+      sqlite3VdbeVerifyNoMallocRequired(v, getCacheSize_OpCount);
+      aOpDc := sqlite3VdbeAddOpList(v, getCacheSize_OpCount,
+                                    @getCacheSize_aOp[0], 0);
+      if aOpDc = nil then Exit;
+      aOpDc[0].p1 := iDb;
+      aOpDc[1].p1 := iDb;
+      aOpDc[6].p1 := SQLITE_DEFAULT_CACHE_SIZE;
+    end else begin
+      { zRight already carries any leading '-' from minusFlag. }
+      sizeDc := sqlite3Atoi(PAnsiChar(zRight));
+      if sizeDc < 0 then sizeDc := -sizeDc;
+      sqlite3BeginWriteOperation(pParse, 0, iDb);
+      sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_DEFAULT_CACHE_SIZE, sizeDc);
+      if db^.aDb[iDb].pSchema <> nil then
+        db^.aDb[iDb].pSchema^.cache_size := sizeDc;
+      pBtArg := PBtree(db^.aDb[iDb].pBt);
+      if pBtArg <> nil then
+        sqlite3BtreeSetCacheSize(pBtArg, sizeDc);
+    end;
+    Exit;
+  end;
+
   { PragTyp_CACHE_SIZE (pragma.c:882..894).  Default is
     SQLITE_DEFAULT_CACHE_SIZE (-2000); C populates Schema.cache_size in
     sqlite3InitOne (prepare.c:323) which is not yet ported, so a 0 here
@@ -55629,8 +55690,21 @@ begin
     pcache gets resized (without this, exclusive2-1.2.1/2.2.1 fail
     because `PRAGMA cache_size = N` is a silent no-op). }
   if SameText(zName, 'cache_size') then begin
-    if pValue <> nil then begin
-      SetString(zRight, pValue^.z, pValue^.n);
+    if pValue = nil then begin
+      { Read arm (pragma.c:884..885): returnSingleInt(pSchema->cache_size).
+        pSchema->cache_size is seeded in sqlite3InitOne (main.pas:6162),
+        so it is never 0 here; fall back to the default defensively. }
+      if (db^.aDb[iDb].pSchema <> nil)
+         and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
+        iVal := db^.aDb[iDb].pSchema^.cache_size
+      else
+        iVal := SQLITE_DEFAULT_CACHE_SIZE;
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    end else begin
+      { Write arm (pragma.c:886..890): no result row.  zRight already
+        carries any leading '-' from minusFlag (built at the top of
+        sqlite3Pragma); do not rebuild it from pValue here. }
       iVal := sqlite3Atoi(PAnsiChar(zRight));
       if db^.aDb[iDb].pSchema <> nil then
         db^.aDb[iDb].pSchema^.cache_size := iVal;
@@ -55638,13 +55712,6 @@ begin
       if pBtArg <> nil then
         sqlite3BtreeSetCacheSize(pBtArg, iVal);
     end;
-    if (db^.aDb[iDb].pSchema <> nil)
-       and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
-      iVal := db^.aDb[iDb].pSchema^.cache_size
-    else
-      iVal := SQLITE_DEFAULT_CACHE_SIZE;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
     Exit;
   end;
 
