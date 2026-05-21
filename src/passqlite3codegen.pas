@@ -55838,6 +55838,13 @@ begin
            and (sqlite3_stricmp(PAnsiChar(zRight), 'reset') = 0) then
           sqlite3ResetAllSchemasOfConnection(db);
       end;
+      { pragma.c:1186..1191 — many flag-pragmas modify the code the SQL
+        compiler generates (e.g. count_changes, reverse_unordered_selects),
+        so emit OP_Expire to invalidate every other compiled statement.
+        Required once the Tcl statement cache is live: otherwise a cached
+        `SELECT` reused after `PRAGMA reverse_unordered_selects=1` keeps the
+        stale plan (whereA-2.2/3.2). }
+      sqlite3VdbeAddOp0(v, OP_Expire);
     end else begin
       if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);

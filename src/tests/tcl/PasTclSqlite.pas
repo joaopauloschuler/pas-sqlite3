@@ -39,6 +39,11 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
      TestModuleVfs;
 
+const
+  { tclsqlite.c:121..122 — default and hard cap on the LRU statement cache. }
+  NUM_PREPARED_STMTS = 10;
+  MAX_PREPARED_STMTS = 100;
+
 type
   { Minimal Tcl_Obj / Tcl_ObjType peek layout — first fields only.
     tcl.h (Tcl 8.6):
@@ -1387,6 +1392,8 @@ var
   rcBody:     cint;
   zArrName:   PAnsiChar;
   bDone:      Boolean;
+  sEval:      TDbEvalContext;
+  pRet:       PTclObj;
 begin
   if (objc < 3) or (objc > 5) then
   begin
@@ -1427,163 +1434,33 @@ begin
     Exit;
   end;
 
-  emptyNull[0] := #0;
-  if pDb^.zNull <> nil then
-    zNullStr := pDb^.zNull
-  else
-    zNullStr := @emptyNull[0];
-
-  if pScript = nil then
+  { objc==3 flat-list form — faithful port of tclsqlite.c:3320..3338.
+    Routes through the cached DbEvalInit/DbEvalStep/DbEvalFinalize
+    machinery (DbPrepareAndBind/DbReleaseStmt) so that re-running an
+    identical SQL string reuses the cached prepared statement rather than
+    re-preparing it.  This is what lets tkt3871-1.3/1.5 observe only the
+    run-time xFilter callbacks (no recompile-time xBestIndex) on a repeat
+    query, matching C.  The objc>=4 script-body form returned earlier via
+    DbEvalScriptArm, so pScript is always nil here. }
+  pRet := Tcl_NewObj();
+  Tcl_IncrRefCount(pRet);
+  DbEvalInit(@sEval, pDb, ObjvAt(objv, 2), nil, 0);
+  rc := DbEvalStep(@sEval);
+  while rc = TCL_OK do
   begin
-    pList := Tcl_NewListObj(0, nil);
-    Tcl_IncrRefCount(pList);
-  end
-  else
-    pList := nil;
-
-  rcBody := TCL_OK;
-  bDone  := False;
-
-  { Outer loop: walk through zSql, one prepared statement per
-    sqlite3_prepare_v2 call, advancing via pzTail.  Mirrors the
-    `while (p->zSql[0] || p->pPreStmt)` loop of dbEvalStep:1769. }
-  while (not bDone) and (zSql <> nil) and (zSql^ <> #0) do
-  begin
-    { Trim leading whitespace before each prepare — tclsqlite.c:1413
-      (dbPrepareAndBind).  Keeps the trace / sqlite3_sql text free of the
-      newlines+indent that braces in the test scripts introduce. }
-    while (zSql^ = ' ') or (zSql^ = #9) or (zSql^ = #10) or (zSql^ = #13) do
-      Inc(zSql);
-    if zSql^ = #0 then Break;
-    pStmt := nil;
-    zTail := nil;
-    rc := sqlite3_prepare_v2(pDb^.db, zSql, -1, @pStmt, @zTail);
-    if rc <> SQLITE_OK then
-    begin
-      if pList <> nil then Tcl_DecrRefCount(pList);
-      if pScript <> nil then Tcl_DecrRefCount(pScript);
-      Tcl_SetObjResult(interp,
-        Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
-      Result := TCL_ERROR;
-      Exit;
-    end;
-
-    if pStmt = nil then
-    begin
-      { Trailing whitespace / comment — no statement compiled. }
-      zSql := zTail;
-      continue;
-    end;
-
-    { 9.4.divbug.5 — minimal port of tclsqlite.c:dbPrepareAndBind
-      (tclsqlite.c:1490..1556).  Walk the prepared statement's parameter
-      list and substitute `$NAME` / `:NAME` / `@NAME` from the calling
-      Tcl scope.  9.4.divbug.60: route through DbBindOneParam so each
-      bind picks the right sqlite3_bind_xxx based on the Tcl_Obj's
-      typePtr->name (int/wideInt/double/bytearray/boolean) instead of
-      uniformly binding TEXT — without this every `SELECT typeof($x)`
-      answers "text" regardless of $x's internal rep. }
-    nVar := sqlite3_bind_parameter_count(pStmt);
-    for iParam := 1 to nVar do begin
-      zParamName := sqlite3_bind_parameter_name(pStmt, iParam);
-      DbBindOneParam(pDb, pStmt, iParam, zParamName, nil, nil);
-    end;
-
-    { Defer sqlite3_column_count until AFTER the first sqlite3_step.  An
-      automatic SQLITE_SCHEMA reprepare inside step (VdbeSwap) can change
-      the column count, and capturing it before stepping would freeze the
-      stale value (alter2-1.3/2.2/3.3/7.2: SELECT * after a writable_schema
-      ALTER returned only the pre-ALTER columns per row). }
-    nCol := 0;
-
-    repeat
-      rcStep := sqlite3_step(pStmt);
-      if rcStep = SQLITE_ROW then
-      begin
-        if nCol = 0 then nCol := sqlite3_column_count(pStmt);
-        if pScript = nil then
-        begin
-          { objc==3: accumulate typed column values onto the flat list. }
-          for i := 0 to nCol - 1 do
-            Tcl_ListObjAppendElement(interp, pList,
-              DbEvalColumnValue(pStmt, i, zNullStr));
-        end
-        else
-        begin
-          { 3-arg form: populate the target then run the script body.
-            Mirrors the per-row block of DbEvalNextCmd (tclsqlite.c:1930..). }
-          for i := 0 to nCol - 1 do
-          begin
-            pColName := Tcl_NewStringObj(sqlite3_column_name(pStmt, i), -1);
-            Tcl_IncrRefCount(pColName);
-            pColVal  := DbEvalColumnValue(pStmt, i, zNullStr);
-            if pVarName = nil then
-              { pVarName==0: the column NAME itself is the scalar var. }
-              Tcl_ObjSetVar2(interp, pColName, nil, pColVal, 0)
-            else
-              { array form: ARRAY(colName) = colValue. }
-              Tcl_ObjSetVar2(interp, pVarName, pColName, pColVal, 0);
-            Tcl_DecrRefCount(pColName);
-          end;
-
-          rcBody := Tcl_EvalObjEx(interp, pScript, 0);
-          if (rcBody <> TCL_OK) and (rcBody <> TCL_CONTINUE) then
-          begin
-            { TCL_BREAK / TCL_RETURN / TCL_ERROR — stop stepping. }
-            bDone := True;
-            break;  { out of the repeat..until row loop }
-          end;
-        end;
-      end;
-    until rcStep <> SQLITE_ROW;
-
-    { tclsqlite.c:1790..1793 — snapshot per-stmt counters for `db status`
-      before the statement is finalised (9.4.6.c). }
-    pDb^.nStep   := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1);
-    pDb^.nSort   := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_SORT, 1);
-    pDb^.nIndex  := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_AUTOINDEX, 1);
-    pDb^.nVMStep := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, 1);
-
-    sqlite3_finalize(pStmt);
-
-    if bDone then
-    begin
-      { Body asked us to stop; finalize already done above. }
-      break;
-    end;
-
-    if (rcStep <> SQLITE_DONE) and (rcStep <> SQLITE_OK) then
-    begin
-      if pList <> nil then Tcl_DecrRefCount(pList);
-      if pScript <> nil then Tcl_DecrRefCount(pScript);
-      Tcl_SetObjResult(interp,
-        Tcl_NewStringObj(sqlite3_errmsg(pDb^.db), -1));
-      Result := TCL_ERROR;
-      Exit;
-    end;
-
-    zSql := zTail;
+    DbEvalRowInfo(@sEval, @nCol, nil);
+    for i := 0 to nCol - 1 do
+      Tcl_ListObjAppendElement(interp, pRet, DbEvalColumnValueCtx(@sEval, i));
+    rc := DbEvalStep(@sEval);
   end;
-
-  if pScript = nil then
+  DbEvalFinalize(@sEval);
+  if rc = TCL_BREAK then
   begin
-    { objc==3: the flat list is the result. }
-    Tcl_SetObjResult(interp, pList);
-    Tcl_DecrRefCount(pList);
-    Result := TCL_OK;
-    Exit;
+    Tcl_SetObjResult(interp, pRet);
+    rc := TCL_OK;
   end;
-
-  { 3-arg form cleanup — mirrors DbEvalNextCmd tail (tclsqlite.c:1999..2005). }
-  Tcl_DecrRefCount(pScript);
-  if (rcBody = TCL_OK) or (rcBody = TCL_BREAK) or (rcBody = TCL_CONTINUE) then
-  begin
-    Tcl_ResetResult(interp);
-    Result := TCL_OK;
-  end
-  else
-    { TCL_RETURN / TCL_ERROR propagate to the caller verbatim. }
-    Result := rcBody;
+  Tcl_DecrRefCount(pRet);
+  Result := rc;
 end;
 
 { DbNullValueArm — port of the "nullvalue" arm of DbObjCmd
@@ -3351,7 +3228,7 @@ begin
       Result := TCL_ERROR;
       Exit;
     end;
-    { flushStmtCache(pDb) — no stmt cache in this bridge; no-op. }
+    FlushStmtCache(pDb);   { tclsqlite.c:2690 }
   end
   else if (zSubCmd <> nil) and (zSubCmd^ = 's') and
           (StrComp(zSubCmd, PAnsiChar('size')) = 0) then
@@ -3370,7 +3247,15 @@ begin
       Result := TCL_ERROR;
       Exit;
     end;
-    if n < 0 then n := 0;       { flushStmtCache + n=0 upstream }
+    { tclsqlite.c:2704..2709 — n<0 flushes the cache then clamps to 0,
+      n>MAX_PREPARED_STMTS clamps down. }
+    if n < 0 then
+    begin
+      FlushStmtCache(pDb);
+      n := 0;
+    end
+    else if n > MAX_PREPARED_STMTS then
+      n := MAX_PREPARED_STMTS;
     pDb^.maxStmt := n;
   end
   else
@@ -4750,7 +4635,7 @@ begin
   pDb^.pCollate       := nil;
   pDb^.pCollateNeeded := nil;
   pDb^.nTransaction   := 0;
-  pDb^.maxStmt        := 0;
+  pDb^.maxStmt        := NUM_PREPARED_STMTS;  { tclsqlite.c:4399 }
   { tclsqlite.c:4409 — `p->nRef = 1`.  The cmd-delete proc holds the
     initial ref; each long-lived continuation (DbEvalNextCmd /
     DbTransPostCmd) adds another via AddDatabaseRef (9.4.2.x.1.b). }
