@@ -12416,12 +12416,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     ResolveAliasInHavingEx(pE, False);
   end;
 
-  { ResolveAliasInWhere — mirrors ResolveAliasInHaving but enforces
-    resolve.c:674..683 in the NC_AllowAgg=0 / NC_AllowWin=0 context that
-    applies to WHERE.  Aggregate / window aliases referenced in WHERE
-    are illegal; emit the upstream "misuse of aggregate / window function"
-    error rather than swapping the expression in (which would otherwise
-    confuse the WHERE codegen). }
+  { ResolveAliasInWhere — mirrors ResolveAliasInHaving for the
+    name-context that applies to WHERE.  resolve.c:1948..1989 resolves
+    WHERE with NC_AllowAgg still set (for an aggregate query) but
+    NC_AllowWin cleared (line 1954).  Per the alias arm at
+    resolve.c:674..683, an alias to an aggregate is therefore EXPANDED in
+    WHERE (resolveAlias) rather than rejected; the resulting aggregate
+    node carries no AggInfo so the codegen TK_AGG_FUNCTION misuse arm
+    (expr.c:5320) reports "misuse of aggregate: NAME()" (tkt3508-1.1).
+    An alias to a *window* function, by contrast, stays illegal because
+    NC_AllowWin==0 → "misuse of aliased window function" (resolve.c:681). }
   procedure ResolveAliasInWhere(pE: PExpr); forward;
 
   procedure ResolveAliasInWhereList(pList: PExprList);
@@ -12506,12 +12510,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         pOrig := items[iCol - 1].pExpr;
         zAs := items[iCol - 1].zEName;
         aggKind := ExprIsOrContainsAggregate(pOrig);
-        if aggKind = 1 then
-        begin
-          sqlite3ErrorMsg(pParse,
-            PAnsiChar('misuse of aliased aggregate ' + AnsiString(zAs)));
-          Exit;
-        end;
+        { resolve.c:678..683 — NC_AllowWin is cleared for WHERE, so an
+          aliased *window* function is rejected here.  NC_AllowAgg is
+          still set, so an aliased aggregate is NOT rejected: fall through
+          to resolveAlias and let codegen's misuse-of-aggregate arm fire. }
         if aggKind = 2 then
         begin
           sqlite3ErrorMsg(pParse,
@@ -12675,6 +12677,78 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { MarkOrRejectAggInWhere — post-resolution pass over the WHERE clause
+    that mirrors resolve.c:1112..1266 for an aggregate-function TK_FUNCTION
+    node encountered while resolving WHERE.
+
+    resolve.c resolves WHERE with NC_AllowAgg set iff the query is an
+    aggregate (pGroupBy || NC_HasAgg, resolve.c:1961..1967).  When it is
+    set, an aggregate-function call is rewritten to TK_AGG_FUNCTION with no
+    AggInfo (WHERE aggregates are never analysed) → codegen's misuse arm
+    (expr.c:5320) emits "misuse of aggregate: NAME()" (tkt1514-1.1).  When
+    NC_AllowAgg is *not* set (non-aggregate query), resolve.c:1245..1257
+    emits "misuse of aggregate function NAME()" up front.
+
+    The pas resolver lacks NC_AllowAgg tracking and does not rewrite scalar
+    TK_FUNCTION calls to TK_AGG_FUNCTION (markAggregate runs only over the
+    result set / HAVING / ORDER BY of an aggregate query), so without this
+    a WHERE aggregate stayed TK_FUNCTION and codegen hit the unknown-function
+    arm (expr.c:5363) → "unknown function: NAME()". }
+  procedure MarkOrRejectAggInWhere(pX: PExpr; allowAgg: Boolean);
+  var
+    pDef:  PTFuncDef;
+    n:     i32;
+    items: PExprListItem;
+    j:     i32;
+  begin
+    if pX = nil then Exit;
+    if pParse^.nErr > 0 then Exit;
+    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil) then
+    begin
+      if ExprUseXList(pX) and (pX^.x.pList <> nil) then
+        n := pX^.x.pList^.nExpr
+      else
+        n := 0;
+      pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, n,
+                                  pParse^.db^.enc, 0);
+      if (pDef = nil) and (n <> 0) then
+        pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
+                                    pParse^.db^.enc, 0);
+      if (pDef <> nil) and Assigned(pDef^.xFinalize) then
+      begin
+        if allowAgg then
+        begin
+          { resolve.c:1330-style rewrite: leave pAggInfo NULL so codegen's
+            TK_AGG_FUNCTION misuse arm fires. }
+          pX^.op  := TK_AGG_FUNCTION;
+          pX^.op2 := 0;
+        end
+        else if (pX^.flags and EP_IntValue) = 0 then
+        begin
+          { resolve.c:1256/1262 — "misuse of aggregate function NAME()". }
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+            'misuse of aggregate function %s()', [pX^.u.zToken]));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pX);
+          Exit;
+        end;
+      end;
+    end;
+    if not ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then
+    begin
+      MarkOrRejectAggInWhere(pX^.pLeft,  allowAgg);
+      MarkOrRejectAggInWhere(pX^.pRight, allowAgg);
+      if not ExprHasProperty(pX, EP_xIsSelect) and (pX^.x.pList <> nil) then
+      begin
+        items := ExprListItems(pX^.x.pList);
+        for j := 0 to pX^.x.pList^.nExpr - 1 do
+        begin
+          if pParse^.nErr > 0 then Exit;
+          MarkOrRejectAggInWhere(items[j].pExpr, allowAgg);
+        end;
+      end;
+    end;
+  end;
+
 var
   pTopSel:    PSelect;
   isCompound: Boolean;
@@ -12744,6 +12818,13 @@ begin
     ResolveAliasInWhere(p^.pWhere);
   if pParse^.nErr = 0 then
     ResolveExpr    (p^.pWhere);
+  { resolve.c:1112..1266 — an aggregate-function call resolved in WHERE is
+    illegal.  In an aggregate query (NC_AllowAgg set) rewrite it to
+    TK_AGG_FUNCTION so codegen emits "misuse of aggregate: NAME()"
+    (tkt1514-1.1 / tkt3508-1.1); in a non-aggregate query emit
+    "misuse of aggregate function NAME()" directly (select1-2.x). }
+  if (pParse^.nErr = 0) and (p^.pWhere <> nil) then
+    MarkOrRejectAggInWhere(p^.pWhere, SelectIsAggregate(p));
   { 9.4.divbug.72 — vector-size consistency check on the WHERE clause.
     Mirrors resolve.c:1420..1453's per-step comparison/BETWEEN check that
     Pas's lean ResolveExpr lacks; without it `WHERE (b,b) <= 1` slips
