@@ -31537,8 +31537,10 @@ var
     cursor walks the page as if cells held intkey rows, parses garbage
     offsets, and aborts with "database disk image is malformed". }
   pBestCnt:     PIndex2;
+  pIdxCnt:      PIndex2;
   iRootCnt:     i32;
   pKeyInfoCnt:  PKeyInfo2;
+  bCoverCnt:    Boolean;
   zAuthDb:      PAnsiChar;   { tag-select-0410 — zDb for unreferenced-table READ auth }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
@@ -33696,24 +33698,41 @@ begin
         sqlite3CodeVerifySchema(pParse, iDb);
         iCsr := pParse^.nTab;
         Inc(pParse^.nTab);
-        { 9.2.divbug.H — port of select.c:8793..8814.  For WITHOUT ROWID
-          tables the table-root pTab^.tnum IS the PRIMARY KEY index
-          b-tree; OpenRead must carry P4_KEYINFO so the cursor decodes
-          mxRecord-keyed cells (btreeParseCellPtrIndex) instead of
-          intkey-keyed cells (btreeParseCellPtr).  KeyInfo lookup is
-          deferred until after we have iCsr so the explain output
-          matches C bytecode order. }
+        { Port of select.c:8793..8818.  Search for the index with the lowest
+          scan cost (the smallest covering index): skip unordered indices
+          (do not full-scan an unordered index), skip partial indices (do not
+          count rows of a partial index), and require szIdxRow < table row
+          width.  For WITHOUT ROWID tables pBest starts at the PRIMARY KEY
+          index (select.c:8793).  KeyInfo lookup is deferred until after we
+          have iCsr so the explain output matches C bytecode order.
+
+          9.2.divbug.H — for WITHOUT ROWID the table-root pTab^.tnum IS the
+          PRIMARY KEY index b-tree; OpenRead must carry P4_KEYINFO so the
+          cursor decodes mxRecord-keyed cells (btreeParseCellPtrIndex) instead
+          of intkey-keyed cells (btreeParseCellPtr). }
         pBestCnt    := nil;
         iRootCnt    := i32(pTab^.tnum);
         pKeyInfoCnt := nil;
         if not HasRowid(pTab) then
-        begin
           pBestCnt := sqlite3PrimaryKeyIndex(pTab);
-          if pBestCnt <> nil then
+        if (pItem^.fg.fgBits and u8($01)) = 0 then  { not notIndexed }
+        begin
+          pIdxCnt := pTab^.pIndex;
+          while pIdxCnt <> nil do
           begin
-            iRootCnt    := i32(pBestCnt^.tnum);
-            pKeyInfoCnt := sqlite3KeyInfoOfIndex(pParse, pBestCnt);
+            if (indexBUnordered(pIdxCnt) = 0)
+               and (pIdxCnt^.szIdxRow < pTab^.szTabRow)
+               and (pIdxCnt^.pPartIdxWhere = nil)
+               and ((pBestCnt = nil) or (pIdxCnt^.szIdxRow < pBestCnt^.szIdxRow))
+            then
+              pBestCnt := pIdxCnt;
+            pIdxCnt := pIdxCnt^.pNext;
           end;
+        end;
+        if pBestCnt <> nil then
+        begin
+          iRootCnt    := i32(pBestCnt^.tnum);
+          pKeyInfoCnt := sqlite3KeyInfoOfIndex(pParse, pBestCnt);
         end;
         sqlite3VdbeAddOp4Int(v, OP_OpenRead, iCsr, iRootCnt, iDb, 1);
         if pKeyInfoCnt <> nil then
@@ -33725,6 +33744,19 @@ begin
         pDest^.nSdst := 1;
         sqlite3VdbeAddOp2(v, OP_Count, iCsr, regAgg);
         sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+        { explainSimpleCount — port of select.c:8965..8978 + the
+          select.c:8818 call.  Emits the EXPLAIN QUERY PLAN row for the
+          count(*) fast path.  sqlite3VdbeExplain self-gates on explain==2,
+          so it is a no-op outside EXPLAIN QUERY PLAN (matching the C
+          `if(pParse->explain==2)` guard). }
+        bCoverCnt := (pBestCnt <> nil)
+                     and (HasRowid(pTab)
+                          or ((pBestCnt^.idxFlags and 3) <> SQLITE_IDXTYPE_PRIMARYKEY));
+        if bCoverCnt then
+          sqlite3VdbeExplain(pParse, 0, 'SCAN %s USING COVERING INDEX %s',
+                             [pTab^.zName, pBestCnt^.zName])
+        else
+          sqlite3VdbeExplain(pParse, 0, 'SCAN %s', [pTab^.zName]);
         sqlite3VdbeAddOp2(v, OP_Copy, regAgg, pDest^.iSdst);
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, 1);
         Result := SQLITE_OK; Exit;
