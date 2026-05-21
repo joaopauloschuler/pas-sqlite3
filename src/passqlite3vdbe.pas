@@ -11030,7 +11030,10 @@ begin
       pOut := out2Prerelease(v, pOp);
       idx := 0;
       sqlite3BtreeGetMeta(PBtree(db^.aDb[pOp^.p1].pBt), pOp^.p3, @idx);
-      pOut^.u.i := i64(idx);
+      { C: int iMeta; sqlite3BtreeGetMeta(...,(u32*)&iMeta); pOut->u.i=iMeta;
+        — assigning a signed 32-bit int to i64 SIGN-EXTENDS. Cast u32 bits
+        through i32 so the high bit propagates (vdbe.c:4216/4228/4230). }
+      pOut^.u.i := i64(i32(idx));
     end;
 
     { ────── OP_SetCookie ────── (vdbe.c:4249) }

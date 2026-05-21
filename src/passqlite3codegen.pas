@@ -55533,8 +55533,11 @@ begin
     if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION)
        and (iCookie <> BTREE_FREE_PAGE_COUNT) then begin
       { Write arm — Transaction(write) + SetCookie(P5=1).  data_version
-        is ReadOnly per pragma.h flags so writes silently no-op. }
-      SetString(zRight, pValue^.z, pValue^.n);
+        is ReadOnly per pragma.h flags so writes silently no-op.
+        Use the sign-restored zRight built at the top of sqlite3Pragma
+        (minusFlag is folded into it there, pragma.c:463..467); do NOT
+        re-derive from pValue^ — that drops the leading '-' so
+        `PRAGMA user_version=-5` stored +5 (C: aOp[1].p3=sqlite3Atoi(zRight)). }
       sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 1, 0);
       addrOp := sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, iCookie,
                                   sqlite3Atoi(PChar(zRight)));
