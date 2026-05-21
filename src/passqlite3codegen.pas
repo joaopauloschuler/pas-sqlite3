@@ -12124,6 +12124,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pOrderBy: PExprList;
     pItems:   PExprListItem;
     pSel:     PSelect;
+    pSavedP:  PSelect;
     pEList:   PExprList;
     pELItems: PExprListItem;
     i, j:     i32;
@@ -12187,26 +12188,35 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         { resolveAsName arm — resolve.c:1631.  Matches a bare TK_ID against
           this leaf's result-set AS-names. }
         iCol := ResolveAsName(pEList, pE);
-        { resolveOrderByTermToExprList arm — resolve.c:1647.  Only the
-          left-most select has live name resolution here (ResolveExpr is
-          bound to the enclosing `p`); other leaves rely on the integer /
-          alias arms above plus the structural compare below. }
-        if (iCol = 0) and (pSel = p) then
+        { resolveOrderByTermToExprList arm — resolve.c:1647.  C runs this for
+          EVERY arm of the compound, resolving the dup'd term against that
+          arm's own pSrc (resolveOrderByTermToExprList sets nc.pSrcList =
+          pSelect->pSrc, resolve.c:1533) and comparing against that arm's
+          result-set.  This lets a qualified column belonging to a later arm
+          (e.g. `ORDER BY t6b.x` where t6b is the second arm's table) bind to
+          that arm's result column even though it does not name-resolve in the
+          left-most arm (tkt2822-6.5).
+
+          ResolveExpr in this port resolves against `p^.pSrc`; temporarily
+          rebind the captured `p` to the current arm `pSel` for the duration
+          of the dup resolution, then restore it. }
+        if iCol = 0 then
         begin
           pDup := sqlite3ExprDup(pParse^.db, pE, 0);
           if pDup <> nil then
           begin
+            pSavedP := p;
+            p := pSel;
             ResolveExpr(pDup);
+            p := pSavedP;
             if pParse^.nErr = 0 then
             begin
               for j := 0 to pEList^.nExpr - 1 do
                 { resolve.c:1549 — sqlite3ExprCompare(0, eList, pE, -1)<2.
-                  C resolves the dup against the same pSrc/iCursor as the
-                  result-set column; this port can re-resolve against a
-                  different cursor value, so pass the result-set column's
-                  iTable as the iTab tolerance argument. }
-                if sqlite3ExprCompare(nil, pELItems[j].pExpr, pDup,
-                     pELItems[j].pExpr^.iTable) < 2 then
+                  Both pDup and the result-set column are now resolved against
+                  the SAME arm's cursors, so the strict -1 tolerance matches
+                  C exactly. }
+                if sqlite3ExprCompare(nil, pELItems[j].pExpr, pDup, -1) < 2 then
                 begin
                   iCol := j + 1;
                   Break;
@@ -12221,9 +12231,15 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             RenameTokenRemap machinery records pE's column token; alter.c then
             rewrites the column reference in the stored trigger SQL.  Without
             this the original pE node is never token-mapped and the rename is
-            lost.  The dup re-resolution does not touch pE. }
+            lost.  The dup re-resolution does not touch pE.  Resolve against
+            the current arm's pSrc as above. }
           if (iCol > 0) and InRenameObject(pParse) then
+          begin
+            pSavedP := p;
+            p := pSel;
             ResolveExpr(pE);
+            p := pSavedP;
+          end;
         end;
         { Structural compare against the already-resolved pEList — covers
           non-left-most leaves where ResolveExpr cannot run. }
