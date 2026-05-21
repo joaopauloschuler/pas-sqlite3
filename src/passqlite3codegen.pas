@@ -32265,7 +32265,7 @@ begin
        and ((p^.selFlags and SF_Recursive) = 0)
        and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
             or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Mem)
-            or (pDest^.eDest = SRT_Coroutine)) then
+            or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Exists)) then
     begin
       pPriorSel    := p^.pPrior;
       Assert(pPriorSel^.pLimit = nil);
