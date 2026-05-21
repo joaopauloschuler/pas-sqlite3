@@ -33773,7 +33773,7 @@ begin
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
-          or (pDest^.eDest = SRT_Coroutine))
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_EphemTab))
   then
   begin
     canUseAgg := True;
@@ -34293,7 +34293,27 @@ begin
             inner produces a single aggregate row that the outer scans
             via OP_Yield.  Match select.c's selectInnerLoop SRT_Coroutine
             branch (select.c:1438..1442). }
-          sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+          sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else if pDest^.eDest = SRT_EphemTab then
+        begin
+          { e_select-2.2.1.8/9 — when this aggregate-no-GROUP-BY arm is
+            invoked from the multi-source FROM pre-materialise pass
+            (codegen.pas:35236), the single aggregate row must be inserted
+            into the caller's ephemeral rowid cursor at iSDParm.  Without
+            this arm the eph table was opened but never populated, so the
+            join over the materialised subquery scanned an empty table.
+            Mirrors select.c's selectInnerLoop SRT_EphemTab branch
+            (select.c:1349..1370) reached via the
+            selectInnerLoop(...,pDest,...) call at select.c:8898. }
+          r1 := sqlite3GetTempReg(pParse);
+          r2 := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+          sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+          sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+          sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+          sqlite3ReleaseTempReg(pParse, r2);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end;
         if addrSkip <> 0 then
           sqlite3VdbeResolveLabel(v, addrSkip);
         if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
