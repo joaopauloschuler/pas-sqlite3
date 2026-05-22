@@ -63556,9 +63556,13 @@ procedure unixtimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   dt: TDateTime2;
   z: PAnsiChar;
-  jd, epoch: Double;
+  jd: Double;
+  iJD: Int64;
 begin
-  epoch := toJulianDay(1970,1,1,0,0,0.0);
+  { date.c unixepochFunc.  computeJD's iJD is an int64 = julian*86400000,
+    always positive for supported dates, so iJD div 1000 floors correctly
+    (Pascal div truncates toward zero, but the operand is positive here). }
+  dt.useSubsec := False;
   if (argc = 0) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
     jd := currentJD;
@@ -63572,7 +63576,13 @@ begin
     end;
     jd := dt.jd;
   end;
-  sqlite3_result_int64(pCtx, Trunc((jd - epoch) * 86400.0));
+  iJD := Round(jd * 86400000.0);
+  if dt.useSubsec then
+    sqlite3_result_double(pCtx,
+      Double(iJD - Int64(21086676) * Int64(10000000)) / 1000.0)
+  else
+    sqlite3_result_int64(pCtx,
+      iJD div Int64(1000) - Int64(21086676) * Int64(10000));
 end;
 
 procedure strftimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
