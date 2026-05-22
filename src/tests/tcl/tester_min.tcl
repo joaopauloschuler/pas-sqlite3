@@ -342,6 +342,15 @@ set ::sqlite_options(columnmetadata) 0
 # the cap defaults to 1 below → the test wrongly RUNS and expects the
 # "unexpected %00 in uri" error this build never raises.
 set ::sqlite_options(uri_00_error) 0
+# func6.test gates its expected sqlite_offset() values on `ifcapable null_trim`.
+# The oracle build does NOT define SQLITE_ENABLE_NULL_TRIM (verified:
+# sqlite_compileoption_used('ENABLE_NULL_TRIM')=0 on the reference .so), so
+# test_config.c writes null_trim=0 and the oracle's on-disk records keep
+# trailing-NULL serial bytes — making the first row's sqlite_offset(d) == 8179.
+# pas-sqlite3 likewise does no null-trimming (codegen makeRecord no-op), so it
+# produces 8179 too.  Without pinning, the cap defaults to 1 below → func6 takes
+# the bNullTrim=1 branch and wrongly expects 8180.
+set ::sqlite_options(null_trim) 0
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""

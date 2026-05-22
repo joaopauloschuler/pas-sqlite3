@@ -5631,6 +5631,19 @@ begin
       sqlite3ExprCode(pParse, PExprListItem(items)^.pExpr, target);
       Result := True;
       Exit;
+    end
+    else if PtrInt(pDef^.pUserData) = INLINEFUNC_sqlite_offset then
+    begin
+      { expr.c:4609..4617 — sqlite_offset(col) emits OP_Offset for a real
+        table column (TK_COLUMN with iTable>=0), else OP_Null. }
+      items := ExprListItems(pFarg);
+      pArg := PExprListItem(items)^.pExpr;
+      if (pArg^.op = TK_COLUMN) and (pArg^.iTable >= 0) then
+        sqlite3VdbeAddOp3(v, OP_Offset, pArg^.iTable, pArg^.iColumn, target)
+      else
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      Result := True;
+      Exit;
     end;
   end
   { expr.c:5371..5373 — codegen-time trusted-schema enforcement.  The
@@ -25176,16 +25189,29 @@ begin
           pOpR := sqlite3VdbeGetOp(v, kAddr);
           if pOpR^.p1 = pLevel^.iTabCur then
           begin
-            if pOpR^.opcode = OP_Column then
+            { where.c:7822..7846 — SQLITE_ENABLE_OFFSET_SQL_FUNC folds
+              OP_Offset into the same `opcode==OP_Column` arm.  For OP_Offset
+              the HasRowid PK / storage-column remap of x is SKIPPED ("do not
+              need to translate the column number" — p2 already holds the
+              original table column), but the sqlite3TableColumnToIndex(pIdx,x)
+              gate STILL runs: only when that column is actually part of the
+              index (x>=0) is the cursor remapped to iIdxCur.  This is what
+              keeps sqlite_offset(d) on the table cursor for a NON-covering
+              index scan (d not in t1a → x<0 → no remap) while remapping
+              sqlite_offset(a) onto the covering index cursor. }
+            if (pOpR^.opcode = OP_Column) or (pOpR^.opcode = OP_Offset) then
             begin
               xCol := pOpR^.p2;
-              if not HasRowid(pTabR) then
+              if pOpR^.opcode <> OP_Offset then
               begin
-                pPkR := sqlite3PrimaryKeyIndex(pTabR);
-                xCol := pPkR^.aiColumn[xCol];
+                if not HasRowid(pTabR) then
+                begin
+                  pPkR := sqlite3PrimaryKeyIndex(pTabR);
+                  xCol := pPkR^.aiColumn[xCol];
+                end;
+                { sqlite3StorageColumnToTable is a no-op pass-through unless
+                  SQLITE_ENABLE_HIDDEN_COLUMNS is defined (sqliteInt.h:4985) — skip. }
               end;
-              { sqlite3StorageColumnToTable is a no-op pass-through unless
-                SQLITE_ENABLE_HIDDEN_COLUMNS is defined (sqliteInt.h:4985) — skip. }
               xCol := sqlite3TableColumnToIndex(pIdxR, i16(xCol));
               if xCol >= 0 then
               begin
@@ -60977,7 +61003,7 @@ const
   FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
-  aBuiltinFuncs: array[0..87] of TFuncDef;
+  aBuiltinFuncs: array[0..88] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -61212,6 +61238,16 @@ begin
   aBuiltinFuncs[86].pUserData := Pointer(PtrInt(MATH_TAG_ASINH));
   MakeFD(aBuiltinFuncs[87], 1, FUNC_ENC, @math1Func,  nil, 'atanh');
   aBuiltinFuncs[87].pUserData := Pointer(PtrInt(MATH_TAG_ATANH));
+  { sqlite_offset(X) — func.c:3288: INLINE_FUNC(sqlite_offset, 1,
+    INLINEFUNC_sqlite_offset, 0) under SQLITE_ENABLE_OFFSET_SQL_FUNC.
+    INLINE_FUNC expands flags to BUILTIN|UTF8|INLINE|CONSTANT and xFunc
+    to noopFunc (#define noopFunc versionFunc) — never invoked because
+    SQLITE_FUNC_INLINE routes codegen inline (expr.c:4609..4617 emits
+    OP_Offset).  FUNC_ENC already carries BUILTIN|UTF8|CONSTANT, so this
+    matches the C macro expansion. }
+  MakeFD(aBuiltinFuncs[88], 1, FUNC_ENC or SQLITE_FUNC_INLINE,
+    @versionFunc, nil, 'sqlite_offset');
+  aBuiltinFuncs[88].pUserData := Pointer(PtrInt(INLINEFUNC_sqlite_offset));
 end;
 
 var
