@@ -45050,6 +45050,30 @@ begin
     aRowEst[i] := 23;
 end;
 
+{ estimateIndexWidth — port of build.c:2236..2246.
+  Estimate the average size of a row for an index and store it as a LogEst
+  in pIdx^.szIdxRow.  Walks the index columns; XN_ROWID (negative aiColumn)
+  contributes width 1, real columns contribute aCol[x].szEst.  Required by
+  whereLoopAddBtree's covering-scan cost arm (the `szIdxRow < szTabRow`
+  gate); a standalone CREATE INDEX leaves szIdxRow=0 without this. }
+procedure estimateIndexWidth(pIdx: PIndex2);
+var
+  wIndex: u32;
+  i: i32;
+  aCol: PColumn;
+  x: i16;
+begin
+  wIndex := 0;
+  aCol := pIdx^.pTable^.aCol;
+  for i := 0 to pIdx^.nColumn - 1 do
+  begin
+    x := (pIdx^.aiColumn + i)^;
+    if x < 0 then Inc(wIndex, 1)
+    else Inc(wIndex, (aCol + x)^.szEst);
+  end;
+  pIdx^.szIdxRow := sqlite3LogEst(u64(wIndex) * 4);
+end;
+
 { decodeIntArray — port of analyze.c:1520..1580.
   Decode a space-separated list of decimal integers into aLog[] (LogEst
   form).  Then scan trailing tokens (`unordered`, `sz=N`, `noskipscan`)
@@ -47270,13 +47294,7 @@ begin
       counts their full-scan cost vs the C oracle's EXPLAIN p3. }
     pIdxEW := pTab^.pIndex;
     while pIdxEW <> nil do begin
-      wIndex := 0;
-      for iC := 0 to pIdxEW^.nColumn - 1 do begin
-        xIC := pIdxEW^.aiColumn[iC];
-        if xIC < 0 then Inc(wIndex, 1)
-        else Inc(wIndex, pTab^.aCol[xIC].szEst);
-      end;
-      pIdxEW^.szIdxRow := sqlite3LogEst(u64(wIndex) * 4);
+      estimateIndexWidth(pIdxEW);
       pIdxEW := pIdxEW^.pNext;
     end;
   end;
@@ -48687,6 +48705,11 @@ begin
   end;
 
   sqlite3DefaultRowEst(pIndex);
+  { build.c:4298 — standalone CREATE INDEX (pNewTable=nil) needs its
+    szIdxRow estimated here; CREATE-TABLE-time indices get it via
+    sqlite3EndTable instead.  Without this szIdxRow stays 0, making the
+    covering-scan gate `szIdxRow < szTabRow` wrongly true. }
+  if pParse^.pNewTable = nil then estimateIndexWidth(pIndex);
 
   { build.c:4227..4228 — once an expression-index slot has pinned pList
     onto pIndex^.aColExpr, ownership has transferred; null the local so
