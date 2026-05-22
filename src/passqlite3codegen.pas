@@ -58736,20 +58736,10 @@ const
   sqlite3_value_numeric_type's filter (returning SQLITE_INTEGER /
   SQLITE_FLOAT).  May coerce pVal in place via applyNumericAffinity. }
 function valueIsNumericLike(pVal: PMem): i32;
-var r: Double;
+var t: i32;
 begin
-  if (pVal^.flags and (MEM_Int or MEM_Real or MEM_IntReal)) <> 0 then begin
-    Result := 1; Exit;
-  end;
-  if (pVal^.flags and MEM_Null) <> 0 then begin
-    Result := 0; Exit;
-  end;
-  if (pVal^.flags and MEM_Str) <> 0 then begin
-    if sqlite3MemRealValueRC(pVal, r) <= 0 then begin
-      Result := 1; Exit;
-    end;
-  end;
-  Result := 0;
+  t := sqlite3_value_numeric_type(Psqlite3_value(pVal));
+  Result := Ord((t = SQLITE_INTEGER) or (t = SQLITE_FLOAT));
 end;
 
 { ceilingFunc — port of func.c:2455.  ceil(X) / ceiling(X) / floor(X) /
@@ -58799,7 +58789,7 @@ begin
     if b <= 0.0 then Exit;
     x := sqlite3_value_double(Psqlite3_value(pB));
     if x <= 0.0 then Exit;
-    ans := System.Ln(x) / b;
+    ans := Double(System.Ln(x)) / b;
   end else begin
     tag := PtrInt(sqlite3_user_data(pCtx));
     case tag of
@@ -60933,7 +60923,7 @@ const
   FUNC_DENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
 
 var
-  aBuiltinFuncs: array[0..84] of TFuncDef;
+  aBuiltinFuncs: array[0..87] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -61158,6 +61148,16 @@ begin
     Closes func9-210 "no such function: unistr_quote". }
   MakeFD(aBuiltinFuncs[84], 1, FUNC_ENC, @quoteFunc, nil, 'unistr_quote');
   aBuiltinFuncs[84].pUserData := Pointer(PtrInt(1));
+  { Hyperbolic inverse functions — func.c:3418..3420
+    MFUNCTION(acosh/asinh/atanh, 1, ..., math1Func).  The math1Func cases
+    (MATH_TAG_ACOSH/ASINH/ATANH) were already wired; only the registrations
+    were missing, leaving "no such function: asinh" (func7-pg-530/540/550). }
+  MakeFD(aBuiltinFuncs[85], 1, FUNC_ENC, @math1Func,  nil, 'acosh');
+  aBuiltinFuncs[85].pUserData := Pointer(PtrInt(MATH_TAG_ACOSH));
+  MakeFD(aBuiltinFuncs[86], 1, FUNC_ENC, @math1Func,  nil, 'asinh');
+  aBuiltinFuncs[86].pUserData := Pointer(PtrInt(MATH_TAG_ASINH));
+  MakeFD(aBuiltinFuncs[87], 1, FUNC_ENC, @math1Func,  nil, 'atanh');
+  aBuiltinFuncs[87].pUserData := Pointer(PtrInt(MATH_TAG_ATANH));
 end;
 
 var
