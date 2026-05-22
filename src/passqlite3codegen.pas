@@ -36590,6 +36590,18 @@ begin
       end;
       sqlite3ReleaseTempReg(pParse, r1);
     end
+    else if pDest^.eDest = SRT_Discard then
+    begin
+      { selectInnerLoop default arm (select.c:1511..1513):
+          default: { assert( eDest==SRT_Discard ); break; }
+        SRT_Discard throws the row away — no opcode is emitted.  The
+        previous code lacked this case, so a trigger body's
+        `SELECT ... FROM <tab>` (compiled with SRT_Discard, iSDParm=0)
+        fell through to the SRT_Set default below and emitted
+        OP_MakeRecord + OP_IdxInsert into iSDParm=0 — i.e. an insert into
+        the SELECT's own read cursor.  That corrupted the parent INSERT's
+        record register at runtime (BEFORE-trigger crash). }
+    end
     else
     begin
       i := sqlite3GetTempReg(pParse);
