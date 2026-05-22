@@ -351,6 +351,16 @@ set ::sqlite_options(uri_00_error) 0
 # produces 8179 too.  Without pinning, the cap defaults to 1 below → func6 takes
 # the bNullTrim=1 branch and wrongly expects 8180.
 set ::sqlite_options(null_trim) 0
+# The oracle build (../sqlite3, verified via pragma_compile_options) does NOT
+# define these compile flags, so its test_config.c writes each capability = 0.
+# Our harness otherwise defaults unset caps to 1 (below), making ifcapable-gated
+# tests RUN feature paths the engine lacks (e.g. "preupdate_hook was omitted at
+# compile-time") instead of skipping as on the oracle.  Pin them to match.
+set ::sqlite_options(preupdate) 0      ;# no SQLITE_ENABLE_PREUPDATE_HOOK
+set ::sqlite_options(snapshot) 0       ;# no SQLITE_ENABLE_SNAPSHOT
+set ::sqlite_options(session) 0        ;# no SQLITE_ENABLE_SESSION
+set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
+set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
