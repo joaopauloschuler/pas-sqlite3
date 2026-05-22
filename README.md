@@ -182,10 +182,10 @@ window for db-blob mismatches) so each one is bisectable against the C
 oracle — see Phase 9.1 in `tasklist.md` for the workflow.  Supporting
 artefacts:
 
-- `src/tests/corpus/MANIFEST.txt` — tier-1 / tier-2 source-file inventory
-- `src/tests/corpus/MASK.md` — masked db-header byte ranges + C cites
-- `src/tests/SQLLiteralExtractor.pas` — the literal-extraction scanner
-- `src/tests/CorpusOracle.pas` — Pascal-port + libsqlite3 oracle plumbing
+- [`src/tests/corpus/MANIFEST.txt`](src/tests/corpus/MANIFEST.txt) — tier-1 / tier-2 source-file inventory
+- [`src/tests/corpus/MASK.md`](src/tests/corpus/MASK.md) — masked db-header byte ranges + C cites
+- [`src/tests/SQLLiteralExtractor.pas`](src/tests/SQLLiteralExtractor.pas) — the literal-extraction scanner
+- [`src/tests/CorpusOracle.pas`](src/tests/CorpusOracle.pas) — Pascal-port + libsqlite3 oracle plumbing
 
 The harness exits rc=0 even when divergences exist (catalogue-only by
 design); promotion to a hard CI gate is tracked under `9.1.5`.
