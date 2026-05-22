@@ -8655,6 +8655,31 @@ begin
   Result := Trunc(r * 134217728.0);
 end;
 
+{ resolveNotValidNC — notValidImpl (resolve.c:907..925) keyed on a raw
+  ncFlags value rather than a NameContext, for the lean walker
+  (resolveExprAgainstSrcList) which carries ncFlags directly.  Raises
+  "<zMsg> prohibited in <context>", neutralises the offending node
+  (op := TK_NULL) and records the error offset.  Context priority matches
+  C: index expressions > CHECK constraints > generated columns > partial
+  index WHERE clauses. }
+procedure resolveNotValidNC(pParse: PParse; ncFlags: i32; zMsg: PAnsiChar;
+  pE: PExpr; pError: PExpr);
+var
+  zIn: PAnsiChar;
+begin
+  zIn := 'partial index WHERE clauses';
+  if (ncFlags and NC_IdxExpr) <> 0 then
+    zIn := 'index expressions'
+  else if (ncFlags and NC_IsCheck) <> 0 then
+    zIn := 'CHECK constraints'
+  else if (ncFlags and NC_GenCol) <> 0 then
+    zIn := 'generated columns';
+  sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db, '%s prohibited in %s',
+    [zMsg, zIn]));
+  if pE <> nil then pE^.op := TK_NULL;
+  sqlite3RecordErrorOffsetOfExpr(pParse^.db, pError);
+end;
+
 { Minimal sqlite3ResolveExprNames — walk pExpr resolving TK_ID (and rowid
   pseudo-column) against pNC^.pSrcList.  Mirrors the bare-identifier arm of
   sqlite3ResolveSelectNames (resolve.c lookupName), enough for the DELETE /
@@ -8670,6 +8695,8 @@ var
   base:   PSrcItem;
   pDefU:  PTFuncDef;
   nArgU:  i32;
+  pDefCF: PTFuncDef;
+  nArgCF: i32;
 
   { resolve.c:835..844 lookupname_end — when a column reference resolves
     successfully and an authorizer is installed, fire the column-read auth
@@ -8719,6 +8746,48 @@ begin
           pE^.iTable := 8388608
         else
           pE^.iTable := 125829120;
+    end;
+  end;
+  { resolve.c:1195..1214 — function deterministic-context bookkeeping.  After
+    a TK_FUNCTION resolves, mark EP_ConstFunc when the def is CONSTANT or
+    SLOCHNG (constant for the duration of one query → can be hoisted out of
+    inner loops).  When NOT CONSTANT (random(), sqlite_version(), …) the call
+    is illegal in an index / generated-column / partial-index WHERE →
+    sqlite3ResolveNotValid.  When CONSTANT (incl. PURE_DATE date/time funcs)
+    stamp Expr.op2 with the current DDL self-reference context bits
+    (NC_PartIdx|NC_IsCheck|NC_GenCol|NC_IdxExpr); sqlite3VdbeAddFunctionCall
+    then emits OP_PureFunc with P5=op2, and sqlite3NotPureFunc fires the
+    "non-deterministic use of X() in a CHECK constraint / generated column /
+    index" runtime error when such a func evaluates 'now' (date2-110/140/
+    210/220). }
+  if (pE^.op = TK_FUNCTION) and (pParse <> nil)
+     and (pE^.u.zToken <> nil) and ExprUseXList(pE) then
+  begin
+    if pE^.x.pList <> nil then nArgCF := pE^.x.pList^.nExpr else nArgCF := 0;
+    pDefCF := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArgCF,
+                                  pParse^.db^.enc, 0);
+    if (pDefCF = nil) and (nArgCF <> 0) then
+      pDefCF := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -1,
+                                    pParse^.db^.enc, 0);
+    if pDefCF <> nil then
+    begin
+      if (pDefCF^.funcFlags
+          and (SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG)) <> 0 then
+        ExprSetProperty(pE, EP_ConstFunc);
+      if (pDefCF^.funcFlags and SQLITE_FUNC_CONSTANT) = 0 then
+      begin
+        { sqlite3ResolveNotValid(pParse, pNC, "non-deterministic functions",
+            NC_IdxExpr|NC_PartIdx|NC_GenCol, 0, pExpr) — macro: fire only when
+          the current context has one of the prohibited bits.  Note the
+          validMask EXCLUDES NC_IsCheck: non-deterministic funcs ARE allowed
+          in a CHECK constraint (resolve.c:1207 comment). }
+        if (ncFlags and (NC_IdxExpr or NC_PartIdx or NC_GenCol)) <> 0 then
+          resolveNotValidNC(pParse, ncFlags, 'non-deterministic functions',
+                            nil, pE);
+      end
+      else
+        { assert((NC_SelfRef & 0xff)==NC_SelfRef) — fits in op2 (u8). }
+        pE^.op2 := u8(ncFlags and NC_SelfRef);
     end;
   end;
   { TK_ROW — resolve.c:976..993.  Rewrites a TK_ROW pseudo-token (used by
@@ -62752,7 +62821,8 @@ function currentJD: Double; forward;
     HH:MM[:SS[.FFF]]                        (time-only — date defaults to 2000-01-01)
     now                                     (current UTC date/time)
 }
-function parseDateTime(zStr: PAnsiChar; var dt: TDateTime2): Boolean;
+function parseDateTime(pCtx: Psqlite3_context; zStr: PAnsiChar;
+  var dt: TDateTime2): Boolean;
 var
   s: AnsiString;
   y, m, d, h, mn: i32;
@@ -62841,12 +62911,18 @@ begin
   dt.rawS := False;
   dt.rawSec := 0.0;
   dt.isError := False;
-  { date.c:parseDateOrTime — `now` keyword: setDateTimeToCurrent. }
+  { date.c:430 parseDateOrTime — `now` keyword: setDateTimeToCurrent.  C gates
+    this on `&& sqlite3NotPureFunc(context)`: if the func was coded as
+    OP_PureFunc (used inside a CHECK/gencol/index expression), NotPureFunc
+    sets the "non-deterministic use of X() in ..." error and returns 0, so the
+    parse FAILS (return False) — the caller leaves the error in place and must
+    not overwrite it with result_null. }
   if (Length(s) = 3)
      and ((s[1] = 'n') or (s[1] = 'N'))
      and ((s[2] = 'o') or (s[2] = 'O'))
      and ((s[3] = 'w') or (s[3] = 'W')) then
   begin
+    if sqlite3NotPureFunc(pCtx) = 0 then begin Result := False; Exit; end;
     rJD := currentJD;
     fromJulianDay(rJD, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
     dt.jd := rJD;
@@ -63059,7 +63135,8 @@ end;
   fromJulianDay for sub-day units; for day/month/year units bumps the
   field directly and normalises with default-ceiling semantics
   (matching C's computeFloor(nFloor=0)). }
-function applyModifier(z: PAnsiChar; idx: i32; var dt: TDateTime2): Boolean;
+function applyModifier(pCtx: Psqlite3_context; z: PAnsiChar; idx: i32;
+  var dt: TDateTime2): Boolean;
 var
   zMod, unit_: PAnsiChar;
   buf: array[0..31] of AnsiChar;
@@ -63177,15 +63254,21 @@ begin
     Result := True; Exit;
   end;
 
-  { localtime — date.c:803..815.  Treat dt as UTC and shift to local. }
+  { localtime — date.c:810..814.  Treat dt as UTC and shift to local.  C gates
+    on `&& sqlite3NotPureFunc(pCtx)`: when coded as OP_PureFunc the modifier
+    is non-deterministic, so NotPureFunc sets the error and returns 0, leaving
+    rc at its error default → modifier fails (Result stays False). }
   if sqlite3StrICmp(zMod, 'localtime') = 0 then begin
+    if sqlite3NotPureFunc(pCtx) = 0 then begin Result := False; Exit; end;
     Result := toLocaltimeDT(dt);
     Exit;
   end;
 
   { utc — date.c:837..865.  Treat dt as local time and shift to UTC by
-    iterating localtime() so that the round-trip lands back on the input. }
+    iterating localtime() so that the round-trip lands back on the input.
+    Same NotPureFunc gate as localtime (date.c:837). }
   if sqlite3StrICmp(zMod, 'utc') = 0 then begin
+    if sqlite3NotPureFunc(pCtx) = 0 then begin Result := False; Exit; end;
     Result := toUtcDT(dt);
     Exit;
   end;
@@ -63399,8 +63482,8 @@ end;
 
 { applyModifiers — apply argv[fromIdx..argc-1] modifiers to dt.
   Returns True on success; False if any modifier failed. }
-function applyModifiers(argc, fromIdx: i32; argv: PPMem;
-  var dt: TDateTime2): Boolean;
+function applyModifiers(pCtx: Psqlite3_context; argc, fromIdx: i32;
+  argv: PPMem; var dt: TDateTime2): Boolean;
 var
   i: i32;
   zMod: PAnsiChar;
@@ -63415,7 +63498,7 @@ begin
     { date.c isDate: parseModifier is called with the 1-based modifier
       index (the FIRST modifier is idx=1).  C indexes from argv[1] (date at
       argv[0]); here the date is at argv[fromIdx-1], so idx = i-fromIdx+1. }
-    if not applyModifier(zMod, i - fromIdx + 1, dt) then begin
+    if not applyModifier(pCtx, zMod, i - fromIdx + 1, dt) then begin
       Result := False; Exit;
     end;
     Inc(i);
@@ -63461,17 +63544,20 @@ var
 begin
   if (argc = 0) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    { date.c:1117..1119 — argc==0 reads the current time; gated on
+      sqlite3NotPureFunc.  When it fails the error is set; leave it. }
+    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
     emitDateYMD(pCtx, y2, m2, d2);
     Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
-  if not parseDateTime(z, dt) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if not parseDateTime(pCtx, z, dt) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
   if not finalizeDate(dt) then begin
     sqlite3_result_null(pCtx); Exit;
@@ -63490,6 +63576,7 @@ var
 begin
   if (argc = 0) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
     snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]);
@@ -63497,11 +63584,11 @@ begin
     Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
-  if not parseDateTime(z, dt) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if not parseDateTime(pCtx, z, dt) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
   if not finalizeDate(dt) then begin
     sqlite3_result_null(pCtx); Exit;
@@ -63561,17 +63648,18 @@ var
 begin
   if (argc = 0) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
     emitDateTime(pCtx, y2, m2, d2, h2, mn2, s2, False);
     Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
-  if not parseDateTime(z, dt) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if not parseDateTime(pCtx, z, dt) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
   if not finalizeDate(dt) then begin
     sqlite3_result_null(pCtx); Exit;
@@ -63586,14 +63674,15 @@ var
 begin
   if (argc = 0) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
     sqlite3_result_double(pCtx, currentJD); Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
-  if not parseDateTime(z, dt) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if not parseDateTime(pCtx, z, dt) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
   if not finalizeDate(dt) then begin
     sqlite3_result_null(pCtx); Exit;
@@ -63614,14 +63703,15 @@ begin
   dt.useSubsec := False;
   if (argc = 0) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
     jd := currentJD;
   end else begin
     z := sqlite3_value_text(Psqlite3_value(argv^));
-    if not parseDateTime(z, dt) then begin
-      sqlite3_result_null(pCtx); Exit;
+    if not parseDateTime(pCtx, z, dt) then begin
+      if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
     end;
-    if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
-      sqlite3_result_null(pCtx); Exit;
+    if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
+      if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
     end;
     jd := dt.jd;
   end;
@@ -63656,12 +63746,22 @@ begin
   zFmt  := sqlite3_value_text(Psqlite3_value(argv^));
   zDate := sqlite3_value_text(Psqlite3_value((argv+1)^));
   if (zFmt = nil) then begin sqlite3_result_null(pCtx); Exit; end;
-  if (zDate = nil) or not parseDateTime(zDate, dt) then begin
+  if (zDate = nil) then begin
+    { date.c:1424 isDate(context, argc-1, argv+1) with a NULL/absent date arg
+      → current-time path, gated on sqlite3NotPureFunc.  When it fails the
+      error is set; leave it (C `return`). }
+    if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
+  end else if not parseDateTime(pCtx, zDate, dt) then begin
+    { Parse failed — if NotPureFunc set an error (e.g. 'now' inside a
+      CHECK/gencol/index), leave it; otherwise emit NULL (C `return` with a
+      fresh NULL result register). }
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx);
+    Exit;
   end else begin
-    if (argc > 2) and (not applyModifiers(argc, 2, argv, dt)) then begin
-      sqlite3_result_null(pCtx); Exit;
+    if (argc > 2) and (not applyModifiers(pCtx, argc, 2, argv, dt)) then begin
+      if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
     end;
     if not finalizeDate(dt) then begin
       sqlite3_result_null(pCtx); Exit;
@@ -63822,12 +63922,12 @@ const
 begin
   if argc < 2 then begin sqlite3_result_null(pCtx); Exit; end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
-  if (z = nil) or not parseDateTime(z, d1) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if (z = nil) or not parseDateTime(pCtx, z, d1) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if (z = nil) or not parseDateTime(z, d2) then begin
-    sqlite3_result_null(pCtx); Exit;
+  if (z = nil) or not parseDateTime(pCtx, z, d2) then begin
+    if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
   if d1.jd >= d2.jd then begin
     sign := '+';
@@ -63910,7 +64010,15 @@ procedure MakeFD(var fd: TFuncDef; n: i16; sfunc: TxSFuncProc;
 begin
   FillChar(fd, SizeOf(fd), 0);
   fd.nArg      := n;
-  fd.funcFlags := SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
+  { date.c:2160 PURE_DATE = SQLITE_FUNC_BUILTIN | SQLITE_FUNC_SLOCHNG |
+    SQLITE_UTF8 | SQLITE_FUNC_CONSTANT.  SLOCHNG ("slow change") marks these
+    funcs constant-for-one-query (so they pass resolve-time validity inside
+    a CHECK/index/gencol) yet, because they ARE SQLITE_FUNC_CONSTANT, the
+    resolver stamps Expr.op2 with the DDL context and codegen emits
+    OP_PureFunc — caught at runtime by sqlite3NotPureFunc when 'now' is used
+    (date2-110/140/210/220). }
+  fd.funcFlags := SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG
+                  or SQLITE_FUNC_CONSTANT;
   fd.xSFunc    := sfunc;
   fd.zName     := nm;
 end;
