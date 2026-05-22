@@ -674,6 +674,7 @@ type
   PPmaReader    = ^TPmaReader;     { PmaReader    — vdbesort.c:354 }
   PPmaWriter    = ^TPmaWriter;     { PmaWriter    — vdbesort.c:418 }
   PIncrMerger   = ^TIncrMerger;    { IncrMerger   — vdbesort.c:400 }
+  PPIncrMerger  = ^PIncrMerger;    { IncrMerger** — out-param for IncrMergerNew }
   PSortSubtask  = ^TSortSubtask;   { SortSubtask  — vdbesort.c:295 }
 
   { -----------------------------------------------------------------------
@@ -7182,14 +7183,16 @@ end;
   already-ported vdbeSorterMapFile.  Not yet wired into production
   (5.7.b.6/.8/.9 do that).
 
-  IncrMerger stubs: vdbeIncrFree/vdbeIncrSwap referenced below are forward-
-  declared here with inert placeholder bodies; the real single-threaded
-  IncrMerger logic lands in 5.7.b.7, which replaces those bodies.
+  IncrMerger: vdbeIncrFree/vdbeIncrSwap referenced below are forward-declared
+  here; their real single-threaded bodies (5.7.b.7) appear after the
+  PmaReader/MergeEngine helpers they depend on.
   ============================================================================ }
 
-{ Forward stubs — replaced by the real IncrMerger port in 5.7.b.7. }
+{ Forward declarations — real single-threaded IncrMerger bodies in 5.7.b.7. }
 procedure vdbeIncrFree(pIncr: PIncrMerger); forward;
 function  vdbeIncrSwap(pIncr: PIncrMerger): i32; forward;
+function  vdbeIncrPopulate(pIncr: PIncrMerger): i32; forward;
+procedure vdbeMergeEngineFree(pMerger: PMergeEngine); forward;
 
 { vdbePmaReaderClear — vdbesort.c:474..480 }
 procedure vdbePmaReaderClear(pReadr: PPmaReader);
@@ -7436,16 +7439,34 @@ begin
   Result := rc;
 end;
 
-{ Placeholder IncrMerger bodies — 5.7.b.7 will replace these with the real
-  single-threaded port (vdbesort.c:1909..2047). }
+{ vdbeIncrFree — vdbesort.c:1229..1241.  Free the IncrMerger's MergeEngine and
+  the struct itself.  The threaded aFile[0]/aFile[1] teardown is gated
+  #if SQLITE_MAX_WORKER_THREADS>0 in C and omitted here: a single-threaded
+  IncrMerger does not own its temp files (it borrows a region of
+  pTask->file2), so there is nothing to close. }
 procedure vdbeIncrFree(pIncr: PIncrMerger);
 begin
-  { 5.7.b.7 will implement }
+  if pIncr <> nil then begin
+    vdbeMergeEngineFree(pIncr^.pMerger);
+    sqlite3_free(pIncr);
+  end;
 end;
 
+{ vdbeIncrSwap — vdbesort.c:1985..2023, single-threaded (#else) arm only.
+  Called when the PmaReader has finished reading aFile[0]; "refills" the
+  region by literally reading keys from pIncr->pMerger via vdbeIncrPopulate,
+  copies aFile[1] (the just-written region) onto aFile[0], and flags EOF when
+  the population produced no new bytes (iEof back at iStartOff).  The
+  SQLITE_MAX_WORKER_THREADS>0 thread-join/file-swap arm is omitted. }
 function vdbeIncrSwap(pIncr: PIncrMerger): i32;
+var
+  rc: i32;
 begin
-  Result := SQLITE_OK;   { 5.7.b.7 will implement }
+  rc := vdbeIncrPopulate(pIncr);
+  pIncr^.aFile[0] := pIncr^.aFile[1];
+  if pIncr^.aFile[0].iEof = pIncr^.iStartOff then
+    pIncr^.bEof := 1;
+  Result := rc;
 end;
 
 { ----------------------------------------------------------------------------
@@ -7456,9 +7477,8 @@ end;
   Not yet wired into production (5.7.b.8/.9 do that).
   ---------------------------------------------------------------------------- }
 
-{ Forward stub — 5.7.b.7 replaces this with the real IncrMerger initialiser.
-  In single-threaded / no-incr mode (pReadr^.pIncr always nil here), the
-  correct behaviour is simply to advance the reader to its first key. }
+{ Forward declaration — real single-threaded body is in the 5.7.b.7 block
+  (vdbesort.c:2220..2280); vdbeMergeEngineInit calls it for each reader. }
 function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32; forward;
 
 { vdbeMergeEngineNew — vdbesort.c:1193..1215.  Allocate a MergeEngine able to
@@ -7627,8 +7647,7 @@ end;
 { vdbeMergeEngineInit — vdbesort.c:2144..2218.  Initialise every PmaReader,
   then build the initial aTree[] bottom-up.  Single-threaded: eMode is always
   INCRINIT_NORMAL, so each reader is initialised via vdbePmaReaderIncrMergeInit
-  (the forward-stubbed no-incr path); the INCRINIT_ROOT / bg-thread arms are
-  omitted. }
+  (5.7.b.7); the INCRINIT_ROOT / bg-thread arms are omitted. }
 function vdbeMergeEngineInit(pTask: PSortSubtask; pMerger: PMergeEngine;
                             eMode: i32): i32;
 var
@@ -7696,15 +7715,168 @@ begin
   Result := rc;
 end;
 
-{ Temporary inert body for vdbePmaReaderIncrMergeInit — 5.7.b.7 replaces this
-  with the real single-threaded IncrMerger initialiser.  In the no-incr case
-  (pReadr^.pIncr = nil, always true until 5.7.b.7) the correct behaviour is to
-  advance the reader to its first key, which is exactly what the real
-  INCRINIT_NORMAL / no-pIncr path reduces to. }
-function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32;
+{ ----------------------------------------------------------------------------
+  Phase 5.7.b.7 — single-threaded IncrMerger.  Reads keys from a wrapped
+  MergeEngine and incrementally merges them into a refillable region of
+  pTask->file2.  Ports vdbeIncrPopulate / vdbeIncrSwap / vdbeIncrFree /
+  vdbeIncrMergerNew / vdbeIncrMergerSetThreads / vdbePmaReaderIncrMergeInit /
+  vdbePmaReaderIncrInit (vdbeIncrFree/Swap bodies appear earlier, after the
+  PmaReader helpers).  Single-threaded only: all SQLITE_MAX_WORKER_THREADS>0
+  / INCRINIT_TASK / INCRINIT_ROOT / bg-thread arms are omitted.  In this mode
+  an IncrMerger borrows a region of pTask->file2 rather than owning temp files.
+  ---------------------------------------------------------------------------- }
+
+{ vdbeIncrPopulate — vdbesort.c:1908..1942.  Read keys from pIncr->pMerger and
+  populate pIncr->aFile[1].  The on-disk format matches a regular PMA except
+  the leading number-of-bytes varint is omitted (vdbesort.c:1903..1906).
+  Steps the merge engine, writing each winner key, until the output region is
+  full (iEof+nKey+VarintLen(nKey) would exceed iStartOff+mxSz) or the input is
+  exhausted (winning reader's pFd became nil). }
+function vdbeIncrPopulate(pIncr: PIncrMerger): i32;
+var
+  rc, rc2:  i32;
+  iStart:   i64;
+  pOut:     PSorterFile;
+  pTask:    PSortSubtask;
+  pMerger:  PMergeEngine;
+  writer:   TPmaWriter;
+  dummy:    i32;
+  pReader:  PPmaReader;
+  nKey:     i32;
+  iEof:     i64;
 begin
-  { 5.7.b.7 replaces this }
-  Result := vdbePmaReaderNext(pReadr);
+  rc := SQLITE_OK;
+  iStart  := pIncr^.iStartOff;
+  pOut    := @pIncr^.aFile[1];
+  pTask   := pIncr^.pTask;
+  pMerger := pIncr^.pMerger;
+  Assert(pIncr^.bEof = 0);
+
+  vdbePmaWriterInit(pOut^.pFd, @writer, pTask^.pSorter^.pgsz, iStart);
+  while rc = SQLITE_OK do begin
+    pReader := @pMerger^.aReadr[pMerger^.aTree[1]];
+    nKey := pReader^.nKey;
+    iEof := writer.iWriteOff + writer.iBufEnd;
+
+    { Check if the output file is full or if the input has been exhausted.
+      In either case exit the loop. }
+    if pReader^.pFd = nil then Break;
+    if (iEof + nKey + i64(sqlite3VarintLen(u64(nKey)))) > (iStart + pIncr^.mxSz) then
+      Break;
+
+    { Write the next key to the output. }
+    vdbePmaWriteVarint(@writer, u64(nKey));
+    vdbePmaWriteBlob(@writer, pReader^.aKey, nKey);
+    Assert(pIncr^.pMerger^.pTask = pTask);
+    rc := vdbeMergeEngineStep(pIncr^.pMerger, @dummy);
+  end;
+
+  rc2 := vdbePmaWriterFinish(@writer, @pOut^.iEof, @pTask^.nSpill);
+  if rc = SQLITE_OK then rc := rc2;
+  Result := rc;
+end;
+
+{ vdbeIncrMergerNew — vdbesort.c:2024..2047.  Allocate an IncrMerger wrapping
+  pMerger and assign it to pTask.  mxSz = MAX(mxKeysize+9, mxPmaSize/2); the
+  task's file2 reservation grows by mxSz.  On OOM, free pMerger and return
+  SQLITE_NOMEM_BKPT (the contract: *ppOut<>nil iff rc=SQLITE_OK). }
+function vdbeIncrMergerNew(pTask: PSortSubtask; pMerger: PMergeEngine;
+                          ppOut: PPIncrMerger): i32;
+var
+  rc:    i32;
+  pIncr: PIncrMerger;
+  a, b:  i32;
+begin
+  rc := SQLITE_OK;
+  if sqlite3FaultSim(100) <> 0 then
+    pIncr := nil
+  else
+    pIncr := PIncrMerger(sqlite3MallocZero(SizeOf(TIncrMerger)));
+  ppOut^ := pIncr;
+  if pIncr <> nil then begin
+    pIncr^.pMerger := pMerger;
+    pIncr^.pTask   := pTask;
+    a := pTask^.pSorter^.mxKeysize + 9;
+    b := pTask^.pSorter^.mxPmaSize div 2;
+    if a > b then pIncr^.mxSz := a else pIncr^.mxSz := b;
+    Inc(pTask^.file2.iEof, pIncr^.mxSz);
+  end else begin
+    vdbeMergeEngineFree(pMerger);
+    rc := SQLITE_NOMEM_BKPT;
+  end;
+  Assert((ppOut^ <> nil) or (rc <> SQLITE_OK));
+  Result := rc;
+end;
+
+{ vdbeIncrMergerSetThreads — vdbesort.c:2049..2061.  Gated
+  #if SQLITE_MAX_WORKER_THREADS>0 in C; a no-op in single-threaded builds
+  (there are no bg threads to enable).  Provided for callers (5.7.b.8/.9). }
+procedure vdbeIncrMergerSetThreads(pIncr: PIncrMerger);
+begin
+  { single-threaded: no bg thread to enable; the threaded body that sets
+    bUseThread and reclaims file2.iEof is omitted. }
+end;
+
+{ vdbePmaReaderIncrMergeInit — vdbesort.c:2220..2280, single-threaded arm.
+  Initialise the wrapped MergeEngine, then reserve a region of pTask->file2
+  for this IncrMerger (opening file2 on first use, sized to its accumulated
+  iEof reservation).  Finally advance the reader to its first key, which
+  triggers the initial vdbeIncrSwap/Populate fill.  eMode is always
+  INCRINIT_NORMAL here; the threaded / INCRINIT_TASK / INCRINIT_ROOT arms and
+  the bg-thread populate are omitted. }
+function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32;
+var
+  rc:    i32;
+  pIncr: PIncrMerger;
+  pTask: PSortSubtask;
+  db:    PTsqlite3;
+  mxSz:  i32;
+begin
+  rc    := SQLITE_OK;
+  pIncr := pReadr^.pIncr;
+  pTask := pIncr^.pTask;
+  db    := pTask^.pSorter^.db;
+
+  { eMode is always INCRINIT_NORMAL in single-threaded mode. }
+  Assert(eMode = INCRINIT_NORMAL);
+
+  rc := vdbeMergeEngineInit(pTask, pIncr^.pMerger, eMode);
+
+  { Set up the required files for pIncr.  A single-threaded object only
+    requires a region of pTask->file2 (the multi-threaded two-temp-file arm
+    is omitted). }
+  if rc = SQLITE_OK then begin
+    mxSz := pIncr^.mxSz;
+    if pTask^.file2.pFd = nil then begin
+      Assert(pTask^.file2.iEof > 0);
+      rc := vdbeSorterOpenTempFile(db, pTask^.file2.iEof, @pTask^.file2.pFd);
+      pTask^.file2.iEof := 0;
+    end;
+    if rc = SQLITE_OK then begin
+      pIncr^.aFile[1].pFd := pTask^.file2.pFd;
+      pIncr^.iStartOff    := pTask^.file2.iEof;
+      Inc(pTask^.file2.iEof, mxSz);
+    end;
+  end;
+
+  { SQLITE_MAX_WORKER_THREADS==0: eMode!=INCRINIT_TASK always holds. }
+  if rc = SQLITE_OK then
+    rc := vdbePmaReaderNext(pReadr);
+
+  Result := rc;
+end;
+
+{ vdbePmaReaderIncrInit — vdbesort.c:2308..2336, single-threaded arm.  If
+  pReadr->pIncr is set, drive vdbePmaReaderIncrMergeInit on the current thread
+  (the threaded bg-thread launch is omitted).  No-op otherwise. }
+function vdbePmaReaderIncrInit(pReadr: PPmaReader; eMode: i32): i32;
+var
+  pIncr: PIncrMerger;
+begin
+  pIncr  := pReadr^.pIncr;
+  Result := SQLITE_OK;
+  if pIncr <> nil then
+    Result := vdbePmaReaderIncrMergeInit(pReadr, eMode);
 end;
 
 { ============================================================================
