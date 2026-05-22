@@ -666,6 +666,14 @@ type
   PVTable   = Pointer;  { VTable   — Phase 6.bis (vtab.c) }
   Psqlite3_vtab_cursor = Pointer;  { vtab cursor — Phase 6.bis }
   PVdbeSorter = ^TVdbeSorter;      { VdbeSorter  — Phase 5.7 (vdbesort.c) }
+  { vdbesort.c private objects (Phase 5.7.b.1) — forward pointer typedefs;
+    full record layouts declared in the Phase 5.7 sorter type block below. }
+  PSorterRecord = ^TSorterRecord;  { SorterRecord — vdbesort.c:447 }
+  PMergeEngine  = ^TMergeEngine;   { MergeEngine  — vdbesort.c:256 }
+  PPmaReader    = ^TPmaReader;     { PmaReader    — vdbesort.c:354 }
+  PPmaWriter    = ^TPmaWriter;     { PmaWriter    — vdbesort.c:418 }
+  PIncrMerger   = ^TIncrMerger;    { IncrMerger   — vdbesort.c:400 }
+  PSortSubtask  = ^TSortSubtask;   { SortSubtask  — vdbesort.c:295 }
 
   { -----------------------------------------------------------------------
     Pointer forward declarations for VDBE types — mutual references require
@@ -1218,33 +1226,104 @@ type
   end;
 
   { -----------------------------------------------------------------------
-    Phase 5.7 — vdbesort.c external sorter types.
-    Full implementations of PmaReader, MergeEngine, SortSubtask, and
-    SorterRecord are deferred to Phase 7 (SQL compiler available).
-    We define TVdbeSorter with the fields needed by the stub public API.
+    Phase 5.7 — vdbesort.c external sorter types (C-faithful layout).
+    Ported 1:1 from ../sqlite3/src/vdbesort.c:173..461.  Single-threaded
+    subset (SQLITE_MAX_WORKER_THREADS==0): thread fields are declared for
+    layout fidelity but unused.  Function bodies for the PMA disk-spill
+    subsystem land in Phase 5.7.b.2..b.9.
     ----------------------------------------------------------------------- }
 
+  { typedef int (*SorterCompare)(SortSubtask*,int*,const void*,int,
+                                 const void*,int);  vdbesort.c:294 }
+  TSorterCompare = function(pTask: PSortSubtask; pbKey2Cached: Pi32;
+    pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
+
+  { struct SorterFile — vdbesort.c:173 }
   TSorterFile = record
-    pFd:  Pointer;         { sqlite3_file* }
+    pFd:  Psqlite3_file;   { file handle }
     iEof: i64;             { bytes of data stored in pFd }
   end;
 
+  { struct SorterList — vdbesort.c:186 }
   TSorterList = record
-    pList:   Pointer;      { SorterRecord* linked list }
+    pList:   PSorterRecord; { linked list of records }
     aMemory: Pu8;          { bulk memory for pList (nil if individual allocs) }
     szPMA:   i64;          { size of pList as PMA in bytes }
   end;
 
+  { struct MergeEngine — vdbesort.c:256 }
+  TMergeEngine = record
+    nTree:  i32;           { used size of aTree/aReadr (power of 2) }
+    pTask:  PSortSubtask;  { used by this thread only }
+    aTree:  Pi32;          { current state of incremental merge }
+    aReadr: PPmaReader;    { array of PmaReaders to merge data from }
+  end;
+
+  { struct PmaReader — vdbesort.c:354 }
+  TPmaReader = record
+    iReadOff: i64;         { current read offset }
+    iEof:     i64;         { 1 byte past EOF for this PmaReader }
+    nAlloc:   i32;         { bytes of space at aAlloc }
+    nKey:     i32;         { number of bytes in key }
+    pFd:      Psqlite3_file; { file handle we are reading from }
+    aAlloc:   Pu8;         { space for aKey if aBuffer/pMap wont work }
+    aKey:     Pu8;         { pointer to current key }
+    aBuffer:  Pu8;         { current read buffer }
+    nBuffer:  i32;         { size of read buffer in bytes }
+    aMap:     Pu8;         { pointer to mapping of entire file }
+    pIncr:    PIncrMerger; { incremental merger }
+  end;
+
+  { struct IncrMerger — vdbesort.c:400 (single-threaded: aFile[1] unused) }
+  TIncrMerger = record
+    pTask:      PSortSubtask;        { task that owns this merger }
+    pMerger:    PMergeEngine;        { merge engine thread reads data from }
+    iStartOff:  i64;                 { offset to start writing file at }
+    mxSz:       i32;                 { maximum bytes of data to store }
+    bEof:       i32;                 { set true when merge is finished }
+    bUseThread: i32;                 { true to use a bg thread (unused here) }
+    aFile:      array[0..1] of TSorterFile; { [0]=reading, [1]=writing }
+  end;
+
+  { struct PmaWriter — vdbesort.c:418 }
+  TPmaWriter = record
+    eFWErr:    i32;        { non-zero if in an error state }
+    aBuffer:   Pu8;        { pointer to write buffer }
+    nBuffer:   i32;        { size of write buffer in bytes }
+    iBufStart: i32;        { first byte of buffer to write }
+    iBufEnd:   i32;        { last byte of buffer to write }
+    iWriteOff: i64;        { offset of start of buffer in file }
+    pFd:       Psqlite3_file; { file handle to write to }
+    nPmaSpill: u64;        { total number of bytes written }
+  end;
+
+  { struct SortSubtask — vdbesort.c:295 }
+  TSortSubtask = record
+    pThread:   Pointer;        { SQLiteThread* — threads unused }
+    bDone:     i32;            { set if thread is finished but not joined }
+    nPMA:      i32;            { number of PMAs currently in file }
+    pSorter:   PVdbeSorter;    { sorter that owns this sub-task }
+    pUnpacked: PUnpackedRecord; { space to unpack a record }
+    list:      TSorterList;    { list for thread to write to a PMA }
+    xCompare:  TSorterCompare; { compare function to use }
+    file_:     TSorterFile;    { temp file for level-0 PMAs (C: file) }
+    file2:     TSorterFile;    { space for other PMAs }
+    nSpill:    u64;            { total bytes written by this task }
+  end;
+
+  { struct VdbeSorter — vdbesort.c:318.  C has SortSubtask aTask[FLEXARRAY]
+    as the trailing field; this port is single-threaded (nTask always 1)
+    so a single inline aTask suffices. }
   TVdbeSorter = record
     mnPmaSize:   i32;      { minimum PMA size, in bytes }
     mxPmaSize:   i32;      { maximum PMA size, in bytes; 0=no limit }
     mxKeysize:   i32;      { largest serialised key seen so far }
     pgsz:        i32;      { main database page size }
-    pReader:     Pointer;  { PmaReader* — read data after Rewind() }
-    pMerger:     Pointer;  { MergeEngine* — used when bUseThreads=0 }
+    pReader:     PPmaReader;  { read data from here after Rewind() }
+    pMerger:     PMergeEngine; { or here, if bUseThreads=0 }
     db:          PTsqlite3; { database connection }
     pKeyInfo:    PKeyInfo; { how to compare records }
-    pUnpacked:   Pointer;  { UnpackedRecord* — used by VdbeSorterCompare }
+    pUnpacked:   PUnpackedRecord; { used by VdbeSorterCompare }
     list:        TSorterList; { in-memory record list }
     iMemory:     i32;      { offset of free space in list.aMemory }
     nMemory:     i32;      { size of list.aMemory allocation }
@@ -1253,7 +1332,37 @@ type
     iPrev:       u8;       { previous thread used to flush PMA }
     nTask:       u8;       { size of aTask array }
     typeMask:    u8;       { SORTER_TYPE_INTEGER|TEXT mask }
+    aTask:       TSortSubtask; { one or more subtasks (single-threaded: 1) }
   end;
+
+  { struct SorterRecord — vdbesort.c:447.  C-faithful layout:
+      nVal:i32 @0; union{pNext:PSorterRecord|iNext:i32} @8 (8-byte ptr
+      alignment forces 4 pad bytes @4); record data follows the header so
+      SRVAL(p)=PByte(p)+SizeOf(TSorterRecord)=p+16. }
+  TSorterRecord = record
+    nVal: i32;             { size of the record in bytes (@0) }
+    u: record             { union u — vdbesort.c:449..452 (@8) }
+      case Integer of
+        0: (pNext: PSorterRecord);  { pointer to next record in list }
+        1: (iNext: i32);            { offset within aMemory of next record }
+    end;
+    { the data for the record immediately follows this header (SRVAL) }
+  end;
+
+const
+  { vdbesort.c constants (Phase 5.7.b.1) }
+  SQLITE_MAX_PMASZ       = (1 shl 29); { 512MiB — vdbesort.c:155 }
+  SORTER_TYPE_INTEGER    = $01;        { vdbesort.c:342 }
+  SORTER_TYPE_TEXT       = $02;        { vdbesort.c:343 }
+  SORTER_MAX_MERGE_COUNT = 16;         { vdbesort.c:465 }
+  INCRINIT_NORMAL        = 0;          { vdbesort.c:2115 }
+  INCRINIT_TASK          = 1;          { vdbesort.c:2116 }
+  INCRINIT_ROOT          = 2;          { vdbesort.c:2117 }
+  { sizeof(SorterRecord)=16; record data starts here — SRVAL(p)=p+16 }
+  SZ_SORTER_RECORD       = 16;
+
+{ SRVAL(p) — vdbesort.c:461 — pointer to record data after the header. }
+function SRVAL(p: PSorterRecord): Pointer; inline;
 
   { -----------------------------------------------------------------------
     Phase 5.4j — RowSet types (rowset.c).
@@ -6846,6 +6955,12 @@ end;
   SortSubtask disk-spill subsystem — ORDER BY past the in-memory cap
   silently truncates to RAM-only sort (no PMA spill).
   ============================================================================ }
+
+{ SRVAL(p) — vdbesort.c:461 — record data immediately follows the header. }
+function SRVAL(p: PSorterRecord): Pointer; inline;
+begin
+  Result := PByte(p) + SZ_SORTER_RECORD;
+end;
 
 function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
                                pCsr: PVdbeCursor): i32;
