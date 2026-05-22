@@ -196,11 +196,7 @@ design); promotion to a hard CI gate is tracked under `9.1.5`.
 each `.test` file under a **20 s per-test watchdog**.  Read this before
 launching a run — picking the wrong invocation costs 25+ minutes.
 
-- **Never run unsharded.**  The single-process invocation
-  `bin/TclTestDriver --gate strict` is ~25 minutes on a quiet box and
-  hits the 20-min outer wall-clock used by most CI runners and agent
-  harnesses — you will get a truncated log, not a verdict.
-- **Always shard, but run the shards sequentially — never in parallel.**
+- **Run the shards sequentially — never in parallel.**
   Running shards (or multiple `Test*` binaries) concurrently exhausts
   RAM on a typical workstation: each driver loads its own `libpassqlite3tcl.so`
   + tclsh and many tests allocate multi-MB page caches.  Run one shard
@@ -209,6 +205,8 @@ launching a run — picking the wrong invocation costs 25+ minutes.
 ```bash
 rm bin/shard-*.log
 rm bin/shard-*.err
+./src/tests/build_tcl_lib.sh
+./src/tests/build_tcl_driver.sh
 for s in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   echo "=== shard $s/16 ==="
   timeout 3600 bin/TclTestDriver --gate strict \
@@ -225,6 +223,8 @@ whose path contains `SUBSTR` are run.  Combine with `--limit 1` if the
 substring still matches more than one entry:
 
 ```bash
+./src/tests/build_tcl_lib.sh
+./src/tests/build_tcl_driver.sh
 bin/TclTestDriver --filter select1            # every entry matching "select1"
 bin/TclTestDriver --filter select1 --limit 1  # just the first match
 ```
