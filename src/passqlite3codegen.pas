@@ -62828,7 +62828,7 @@ var
     while (pos <= Length(s)) and (s[pos] = ' ') do Inc(pos);
     Result := pos > Length(s);
   end;
-var tpos, hmsEnd, tzMin: i32; rJD: Double;
+var tpos, hmsEnd, tzMin, ymdBase, yNeg: i32; rJD: Double;
 begin
   Result := False;
   if zStr = nil then Exit;
@@ -62886,15 +62886,21 @@ begin
     y := 2000; m := 1; d := 1;
     if not parseTimezone(hmsEnd, tzMin) then Exit;
   end else begin
-    if Length(s) < 10 then Exit;
-    y := getN(1,4); if y < 0 then Exit;
-    if s[5] <> '-' then Exit;
-    m := getN(6,2); if m < 1 then Exit;
-    if s[8] <> '-' then Exit;
-    d := getN(9,2); if d < 1 then Exit;
+    { date.c:parseYyyyMmDd — an optional leading '-' marks a negative
+      (BCE) year.  Skip it, parse the magnitude, then negate.  ymdBase is
+      the 1-based offset of the first year digit. }
+    yNeg := 0; ymdBase := 1;
+    if (Length(s) >= 1) and (s[1] = '-') then begin yNeg := 1; ymdBase := 2; end;
+    if Length(s) < ymdBase + 9 then Exit;
+    y := getN(ymdBase, 4); if y < 0 then Exit;
+    if s[ymdBase+4] <> '-' then Exit;
+    m := getN(ymdBase+5, 2); if m < 1 then Exit;
+    if s[ymdBase+7] <> '-' then Exit;
+    d := getN(ymdBase+8, 2); if d < 1 then Exit;
+    if yNeg <> 0 then y := -y;
     { Optional time component: skip space or 'T', then parse HH:MM[:SS[.FFF]] }
-    if Length(s) > 10 then begin
-      tpos := 11;
+    if Length(s) > ymdBase + 9 then begin
+      tpos := ymdBase + 10;
       while (tpos <= Length(s)) and ((s[tpos] = ' ') or (s[tpos] = 'T')) do Inc(tpos);
       if tpos <= Length(s) then begin
         if not parseHhMmSs(tpos, h, mn, sec, hmsEnd) then Exit;
@@ -63379,11 +63385,39 @@ begin
   end;
 end;
 
+{ date.c:dateFunc — render YYYY-MM-DD into zBuf using manual digit
+  extraction.  The year is rendered as |Y| zero-padded to exactly 4
+  digits; a leading '-' is prepended (and the full 11-byte buffer used)
+  when Y<0, matching C exactly. }
+procedure emitDateYMD(pCtx: Psqlite3_context; yr, mo, dy: i32);
+var
+  zBuf: array[0..15] of AnsiChar;
+  Y: i32;
+begin
+  Y := yr;
+  if Y < 0 then Y := -Y;
+  zBuf[1] := AnsiChar(Ord('0') + (Y div 1000) mod 10);
+  zBuf[2] := AnsiChar(Ord('0') + (Y div 100) mod 10);
+  zBuf[3] := AnsiChar(Ord('0') + (Y div 10) mod 10);
+  zBuf[4] := AnsiChar(Ord('0') + Y mod 10);
+  zBuf[5] := '-';
+  zBuf[6] := AnsiChar(Ord('0') + (mo div 10) mod 10);
+  zBuf[7] := AnsiChar(Ord('0') + mo mod 10);
+  zBuf[8] := '-';
+  zBuf[9] := AnsiChar(Ord('0') + (dy div 10) mod 10);
+  zBuf[10] := AnsiChar(Ord('0') + dy mod 10);
+  zBuf[11] := #0;
+  if yr < 0 then begin
+    zBuf[0] := '-';
+    sqlite3_result_text(pCtx, @zBuf[0], 11, SQLITE_TRANSIENT);
+  end else
+    sqlite3_result_text(pCtx, @zBuf[1], 10, SQLITE_TRANSIENT);
+end;
+
 procedure dateFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   dt: TDateTime2;
   z: PAnsiChar;
-  buf: array[0..15] of AnsiChar;
   jd: Double;
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
@@ -63392,8 +63426,7 @@ begin
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
-    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d', [y2, m2, d2]);
-    sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+    emitDateYMD(pCtx, y2, m2, d2);
     Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
@@ -63403,8 +63436,7 @@ begin
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d', [dt.yr, dt.mo, dt.dy]);
-  sqlite3_result_text(pCtx, buf, 10, SQLITE_TRANSIENT);
+  emitDateYMD(pCtx, dt.yr, dt.mo, dt.dy);
 end;
 
 procedure timeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -63438,11 +63470,48 @@ begin
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
 end;
 
+{ date.c:datetimeFunc — render '[-]YYYY-MM-DD HH:MM:SS[.FFF]'.  The date
+  portion uses the same |year| zero-padded, sign-prefixed manual digit
+  layout as dateFunc; the time portion keeps the existing snpFmt path
+  (incl. subsec).  We build the date prefix manually then append the
+  snpFmt'd time tail. }
+procedure emitDateTime(pCtx: Psqlite3_context; yr, mo, dy, hr, mi: i32;
+  sec: Double; useSubsec: Boolean);
+var
+  buf: array[0..31] of AnsiChar;
+  tail: array[0..15] of AnsiChar;
+  Y, i, p: i32;
+begin
+  Y := yr; if Y < 0 then Y := -Y;
+  p := 0;
+  if yr < 0 then begin buf[p] := '-'; Inc(p); end;
+  buf[p] := AnsiChar(Ord('0') + (Y div 1000) mod 10); Inc(p);
+  buf[p] := AnsiChar(Ord('0') + (Y div 100) mod 10); Inc(p);
+  buf[p] := AnsiChar(Ord('0') + (Y div 10) mod 10); Inc(p);
+  buf[p] := AnsiChar(Ord('0') + Y mod 10); Inc(p);
+  buf[p] := '-'; Inc(p);
+  buf[p] := AnsiChar(Ord('0') + (mo div 10) mod 10); Inc(p);
+  buf[p] := AnsiChar(Ord('0') + mo mod 10); Inc(p);
+  buf[p] := '-'; Inc(p);
+  buf[p] := AnsiChar(Ord('0') + (dy div 10) mod 10); Inc(p);
+  buf[p] := AnsiChar(Ord('0') + dy mod 10); Inc(p);
+  buf[p] := ' '; Inc(p);
+  if useSubsec then
+    snpFmt(SizeOf(tail), tail, '%02d:%02d:%06.3f', [hr, mi, sec])
+  else
+    snpFmt(SizeOf(tail), tail, '%02d:%02d:%02d', [hr, mi, Trunc(sec)]);
+  i := 0;
+  while (tail[i] <> #0) and (p < SizeOf(buf) - 1) do begin
+    buf[p] := tail[i]; Inc(p); Inc(i);
+  end;
+  buf[p] := #0;
+  sqlite3_result_text(pCtx, @buf[0], p, SQLITE_TRANSIENT);
+end;
+
 procedure datetimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   dt: TDateTime2;
   z: PAnsiChar;
-  buf: array[0..23] of AnsiChar;
   jd: Double;
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
@@ -63451,9 +63520,7 @@ begin
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
-    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
-      [y2, m2, d2, h2, mn2, Trunc(s2)]);
-    sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+    emitDateTime(pCtx, y2, m2, d2, h2, mn2, s2, False);
     Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
@@ -63463,13 +63530,7 @@ begin
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  if dt.useSubsec then
-    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%06.3f',
-      [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s])
-  else
-    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
-      [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, Trunc(dt.s)]);
-  sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+  emitDateTime(pCtx, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s, dt.useSubsec);
 end;
 
 procedure juliandayFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
