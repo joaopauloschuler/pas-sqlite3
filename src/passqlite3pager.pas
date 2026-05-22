@@ -244,6 +244,9 @@ type
   Psqlite3_backup = Pointer;   { backup.c -- ported in Phase 8.7 }
   TDbPage         = PgHdr;     { pager.h: typedef struct PgHdr DbPage }
   PDbPage         = ^TDbPage;
+  { pager.c:6855 — static int a[11] returned by sqlite3PagerStats. }
+  TPagerStatsArray = array[0..10] of i32;
+  PPagerStatsArray = ^TPagerStatsArray;
 
   { pager.c PagerSavepoint -- active savepoint state.
     Field order matches C exactly. }
@@ -327,6 +330,7 @@ type
     xBusyHandler   : TBusyHandler;              { Function to call when busy }
     pBusyHandlerArg: Pointer;        { Context argument for xBusyHandler }
     aStat          : array[0..3] of u32;  { Cache hits, misses, writes, spills }
+    nRead          : i32;            { Database pages read (pager.c:693, SQLITE_TEST) }
     xReiniter      : TDbPageReinit;         { Called when reloading pages }
     xGet           : TPageGetter;                          { Fetch a page }
     pTmpSpace      : PChar;          { Pager.pageSize bytes of tmp space }
@@ -373,6 +377,9 @@ function  sqlite3PagerPagenumber(pPg: PDbPage): Pgno;
 function  sqlite3PagerIswriteable(pPg: PDbPage): i32;
 function  sqlite3PagerRefcount(pPager: PPager): i32;
 function  sqlite3PagerPageRefcount(pPg: PDbPage): i32;
+{ pager.c:6854 — sqlite3PagerStats (SQLITE_TEST).  Returns a pointer to a
+  static 11-element int array of pager statistics (see TPagerStatsArray). }
+function  sqlite3PagerStats(pPager: PPager): PPagerStatsArray;
 
 { 3.B.2a: Page access }
 function  sqlite3PagerSharedLock(pPager: PPager): i32;
@@ -2112,6 +2119,8 @@ begin
       Move(pDbVers^, pPgr^.dbFileVers, SizeOf(pPgr^.dbFileVers));
     end;
   end;
+  { pager.c:3068 PAGER_INCR(pPager->nRead) — testing/analysis counter }
+  Inc(pPgr^.nRead);
   Result := rc;
 end;
 
@@ -2354,6 +2363,29 @@ end;
 function sqlite3PagerRefcount(pPager: PPager): i32;
 begin
   Result := i32(sqlite3PcacheRefCount(pPager^.pPCache));
+end;
+
+{ pager.c:6854 — sqlite3PagerStats (SQLITE_TEST).  Used for testing and
+  analysis only.  Returns a pointer to a static 11-element int array. }
+var
+  sqlite3PagerStats_a: TPagerStatsArray;
+function sqlite3PagerStats(pPager: PPager): PPagerStatsArray;
+begin
+  sqlite3PagerStats_a[0] := i32(sqlite3PcacheRefCount(pPager^.pPCache));
+  sqlite3PagerStats_a[1] := sqlite3PcachePagecount(pPager^.pPCache);
+  sqlite3PagerStats_a[2] := sqlite3PcacheGetCachesize(pPager^.pPCache);
+  if pPager^.eState = PAGER_OPEN then
+    sqlite3PagerStats_a[3] := -1
+  else
+    sqlite3PagerStats_a[3] := i32(pPager^.dbSize);
+  sqlite3PagerStats_a[4] := pPager^.eState;
+  sqlite3PagerStats_a[5] := pPager^.errCode;
+  sqlite3PagerStats_a[6] := i32(pPager^.aStat[PAGER_STAT_HIT] and $7fffffff);
+  sqlite3PagerStats_a[7] := i32(pPager^.aStat[PAGER_STAT_MISS] and $7fffffff);
+  sqlite3PagerStats_a[8] := 0;  { Used to be pPager->nOvfl }
+  sqlite3PagerStats_a[9] := pPager^.nRead;
+  sqlite3PagerStats_a[10] := i32(pPager^.aStat[PAGER_STAT_WRITE] and $7fffffff);
+  Result := @sqlite3PagerStats_a;
 end;
 
 { pager.c:6846 — sqlite3PagerPageRefcount. }

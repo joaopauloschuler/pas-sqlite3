@@ -121,6 +121,7 @@ function  sqlite3PcacheRefCount(pCache: PPCache): i64;
 procedure sqlite3PcacheRef(p: PPgHdr);
 function  sqlite3PcachePageRefcount(p: PPgHdr): i64;
 function  sqlite3PcachePagecount(pCache: PPCache): i32;
+function  sqlite3PcacheGetCachesize(pCache: PPCache): i32;
 procedure sqlite3PcacheSetCachesize(pCache: PPCache; mxPage: i32);
 function  sqlite3PcacheSetSpillsize(p: PPCache; mxPage: i32): i32;
 procedure sqlite3PcacheShrink(pCache: PPCache);
@@ -138,6 +139,8 @@ function  sqlite3Pcache1MutexActual: Psqlite3_mutex;
 function  sqlite3PageMalloc(sz: i32): Pointer;
 procedure sqlite3PageFree(p: Pointer);
 function  sqlite3HeaderSizePcache1: i32;
+{ pcache1.c:1261 — pcache1 global statistics (SQLITE_TEST). }
+procedure sqlite3PcacheStats(pnCurrent, pnMax, pnMin, pnRecyclable: Pi32);
 
 implementation
 
@@ -659,6 +662,12 @@ begin Result := p^.nRef; end;
 function sqlite3PcachePagecount(pCache: PPCache): i32;
 begin
   Result := sqlite3GlobalConfig.pcache2.xPagecount(pCache^.pCache);
+end;
+
+{ pcache.c:855 — Get the suggested cache-size value (SQLITE_TEST only). }
+function sqlite3PcacheGetCachesize(pCache: PPCache): i32;
+begin
+  Result := numberOfCachePages(pCache);
 end;
 
 procedure sqlite3PcacheSetCachesize(pCache: PPCache; mxPage: i32);
@@ -1314,6 +1323,30 @@ begin Result := ROUND8(SizeOf(PgHdr1)); end;
 
 function sqlite3Pcache1MutexActual: Psqlite3_mutex;
 begin Result := pcache1_g.mutex; end;
+
+{ pcache1.c:1261 — sqlite3PcacheStats (SQLITE_TEST).
+    pnCurrent     OUT: Total number of pages cached
+    pnMax         OUT: Global maximum cache size
+    pnMin         OUT: Sum of PCache1.nMin for purgeable caches
+    pnRecyclable  OUT: Total number of pages available for recycling }
+procedure sqlite3PcacheStats(pnCurrent, pnMax, pnMin, pnRecyclable: Pi32);
+var
+  p:           PPgHdr1;
+  nRecyclable: i32;
+begin
+  nRecyclable := 0;
+  p := pcache1_g.grp.lru.pLruNext;
+  while (p <> nil) and (p^.isAnchor = 0) do
+  begin
+    { assert PAGE_IS_UNPINNED(p) }
+    Inc(nRecyclable);
+    p := p^.pLruNext;
+  end;
+  pnCurrent^    := i32(pcache1_g.grp.nPurgeable);
+  pnMax^        := i32(pcache1_g.grp.nMaxPage);
+  pnMin^        := i32(pcache1_g.grp.nMinPage);
+  pnRecyclable^ := nRecyclable;
+end;
 
 initialization
   { Publish SetDefault to passqlite3util so SQLITE_CONFIG_GETPCACHE2 can install
