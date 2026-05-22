@@ -122,6 +122,31 @@ FPC porting traps that recur often enough to call out up-front:
 
 - [X] **6.32** DiagTxn savepoint-rollback hang — closed 2026-05-12 as no-longer-reproduces (likely fixed in-passing by 6.10/6.11 OP_Savepoint work + 6.16 VdbeMakeReady zero-init).
 
+### 6.40 — Unported feature/extension gaps surfaced by Tcl sweep (2026-05-22)
+
+> Each bullet is a Tcl `.test` failure whose *root cause is a missing ported
+> feature*, not a runtime divergence. Counts are occurrences across the
+> 2026-05-22 full-suite run (612 pass / 347 fail). "ENGINE" = real library
+> feature to port; "EXT" = loadable/test extension to register; "HARNESS" =
+> testfixture-only Tcl command. Port the C source 1:1 as usual; for HARNESS
+> entries the C lives in `../sqlite3/src/test*.c` and is registered through the
+> Tcl bridge (`src/tests/tcl/testmodules/`), not the engine.
+
+- [ ] **6.40.1** **FTS3/FTS4 full-text search** (ENGINE/EXT, XL — not yet ported at all). `no such module: fts4` (19 tests), `fts4aux` (26), `fts3tokenize` (2), `no such function: fts3_tokenizer_test` (77). Port `../sqlite3/ext/fts3/fts3*.c` (fts3.c, fts3_aux.c, fts3_tokenizer.c, fts3_porter.c, fts3_write.c, fts3_snippet.c, …) and auto-register the `fts3`/`fts4`/`fts4aux`/`fts3tokenize` modules + the `fts3_tokenizer`/`fts3_tokenizer_test` SQL funcs. Affects all `fts3*`/`fts4*` tests. Split into per-file sub-tasks when started.
+- [ ] **6.40.2** **ICU extension** (EXT, needs libicu). `no such function: icu_load_collation` / `icu_*` (icu.test, 6 errors). Port `../sqlite3/ext/icu/icu.c` (registers `icu_load_collation`, `regexp`, `lower`/`upper` ICU overrides) and link libicu in the test build, OR pin `sqlite_options(icu)=0` in tester_min.tcl if libicu is unavailable on the oracle.
+- [ ] **6.40.3** **preupdate_hook engine API** (ENGINE). Build omits `SQLITE_ENABLE_PREUPDATE_HOOK` → `SOURCE-ERROR: preupdate_hook was omitted at compile-time` (5 tests incl. bind2, preupdate, sessionfault). The `db preupdate_hook` Tcl shim already exists (9.4.2.u); port the engine side: `sqlite3_preupdate_hook`/`_old`/`_new`/`_count`/`_depth`/`_blobwrite` (vdbeapi.c) + the `sqlite3PreUpdate*` firing in `sqlite3VdbeExec` OP_Insert/OP_Delete arms (vdbe.c), gated on the enable flag, and turn the flag on in the test build.
+- [ ] **6.40.4** **Loadable test/SQL extensions registration** (EXT). `no such extension:` for `series` (bestindexC, join8, tabfunc01, with2), `spellfix` (spellfix2), `closure` (closure01), `csv` (csv01), `fuzzer` (fuzzer1/2/fault), `prefixes` (prefixes), `randomjson` (json106/108), `appendvfs` (avfs); plus vtab modules `echo` (vtab2) and `register_schema_module`/`register_fs_module` (vtabH). Most have Pascal ports already (generate_series exists) but are not exposed under the names the tests `load_extension`/register. Auto-register each via the `aExtension[]`/auto-extension template used in 9.4.divbug.90, or port the missing `../sqlite3/ext/misc/*.c` (spellfix, closure, csv, fuzzer, prefixes, randomjson) and `../sqlite3/src/test_*.c` vtab shims.
+- [ ] **6.40.5** **`sqlite3_prepare_v3` + SQL-normalization Tcl trampolines** (HARNESS, high-impact). `invalid command name "sqlite3_prepare_v3"` is the single most frequent gap (68–74 occurrences; normalize.test 55 errors, without_rowid7-3.4/3.5, many others). Extends 9.4.divbug.62.b: register `sqlite3_prepare_v3` (and confirm `sqlite3_normalize` / `sqlite3_expanded_sql` / `sqlite3_normalized_sql` are wired) in TestModuleTest1.pas mirroring test1.c.
+- [ ] **6.40.6** **Crash / pager / IO-error test harness commands** (HARNESS). High-frequency testfixture-only commands: `crash_on_write` (1214), `btree_pager_stats` (402), `catchcmd`/`catchcmdex` (325+), `sqlite3_pager_refcounts` (146), `btree_open` (8), `pcache_stats` (16), `uses_stmt_journal` (26), `file_control_powersafe_overwrite`, `sqlite3_config_heap`, `extra_schema_checks`, `allcksum`, `clear/install_mutex_counters`, `clock_seconds`, `isquick`, `sorter_test_fakeheap`/`sorter_test_sort4_helper`. Port the corresponding `../sqlite3/src/test_*.c` (test6.c crash VFS, test_btree.c, test1.c pager stats, …) into the Tcl bridge. Many gate whole crash/IO-error families.
+- [ ] **6.40.7** **Snapshot API Tcl trampolines** (HARNESS). `sqlite3_snapshot_get`/`_recover`/`_get_blob`/`_open`/`_cmp`/`_free` (snapshot, snapshot3, snapshot4, snapshot_up, snapshot_fault — ~60 occurrences). Engine `sqlite3_snapshot_*` may already exist; register the test1.c Tcl wrappers.
+- [ ] **6.40.8** **Misc test SQL functions** (HARNESS/test_func.c). `x_sqlite_exec` (misuse), `test_setsubtype`/`test_getsubtype`, `parse_create_index`, `ieee754_from_int`, `test_create_sumint` (window5), `sqlite3_set_errmsg` (misuse-6.x). Register via the `autoinstall_test_functions` template (test_func.c) in the Tcl bridge.
+- [ ] **6.40.9** **WAL / blob test harness commands** (HARNESS). `sqlite3_blob_reopen` (13), `sqlite3_wal_checkpoint_v2` (10), `sqlite3_mmap_warm` (6), `sqlite3_is_interrupted`/`sqlite3_interrupt` (3), `sqlite3_quota_glob` (133 — quota vtab shim, test_quota.c), `utf8_to_utf8` (13). Port the matching test_*.c Tcl commands.
+
+> NOTE (2026-05-22): securedel.test failures are NOT an engine porting gap — the
+> engine returns the correct `secure_delete` propagation when driven via the CLI;
+> the residual `{1 0}` is a Tcl-bridge prepared-statement-caching interaction with
+> codegen-time pragma side effects. Track separately if pursued.
+
 ---
 
 ## Phase 7 — Parser
