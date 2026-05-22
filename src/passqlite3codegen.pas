@@ -46984,6 +46984,7 @@ var
   addrInsLoopAS: i32;
   pIdxRD: PIndex2;
   nPkRD, nNewRD, iRD, jRD, kRD: i32;
+  iDup, jDup, kDup: i32;
   isDupRD: Boolean;
   { 9.4.divbug.71 STRICT arm }
   pCol_eTC:    PColumn;
@@ -47144,12 +47145,11 @@ begin
       schema-row INSERT sequence; converting that Noop to OP_Goto jumps
       over the whole sub-sequence so the WITHOUT-ROWID PK shares the
       table's root page (set just below: pPk^.tnum := pTab^.tnum). }
-    { build.c:2385..2433 — locate the PK index, or synthesise one when
+    { build.c:2385..2434 — locate the PK index, or synthesise one when
       the table was declared INTEGER PRIMARY KEY (iPKey >= 0): there is
-      no index object yet, so build one via sqlite3CreateIndex.  The
-      non-IPK redundant-column dedup loop (build.c:2417..2432) is a
-      no-op for the single-column keys our parser produces and is
-      skipped. }
+      no index object yet, so build one via sqlite3CreateIndex.  In the
+      non-IPK else branch port build.c:2417..2432's redundant-column
+      dedup loop so PRIMARY KEY(a,a,b) collapses to (a,b). }
     if pTab^.iPKey >= 0 then begin
       sqlite3TokenInit(@ipkTokenPk, pTab^.aCol[pTab^.iPKey].zCnName);
       pListPk := sqlite3ExprListAppend(pParse, nil,
@@ -47167,6 +47167,37 @@ begin
         pTab^.tabFlags := pTab^.tabFlags and not TF_WithoutRowid;
         Exit;
       end;
+    end else begin
+      { build.c:2413..2434 — remove redundant columns from the explicit
+        PRIMARY KEY via isDupColumn (build.c:2274..2293). }
+      pPk2 := sqlite3PrimaryKeyIndex(pTab);
+      jDup := 1;
+      iDup := 1;
+      while iDup < i32(pPk2^.nKeyCol) do begin
+        { isDupColumn(pPk2, jDup, pPk2, iDup): scan key prefix [0..jDup). }
+        isDupRD := False;
+        kDup := i32((pPk2^.aiColumn + iDup)^);
+        for iRD := 0 to jDup - 1 do begin
+          if ((pPk2^.aiColumn + iRD)^ = i16(kDup))
+             and ((PPAnsiChar(pPk2^.azColl) + iRD)^ <> nil)
+             and ((PPAnsiChar(pPk2^.azColl) + iDup)^ <> nil)
+             and (sqlite3StrICmp((PPAnsiChar(pPk2^.azColl) + iRD)^,
+                                 (PPAnsiChar(pPk2^.azColl) + iDup)^) = 0) then
+          begin
+            isDupRD := True; Break;
+          end;
+        end;
+        if isDupRD then
+          Dec(pPk2^.nColumn)
+        else begin
+          (PPAnsiChar(pPk2^.azColl) + jDup)^ := (PPAnsiChar(pPk2^.azColl) + iDup)^;
+          (pPk2^.aSortOrder + jDup)^ := (pPk2^.aSortOrder + iDup)^;
+          (pPk2^.aiColumn + jDup)^ := (pPk2^.aiColumn + iDup)^;
+          Inc(jDup);
+        end;
+        Inc(iDup);
+      end;
+      pPk2^.nKeyCol := u16(jDup);
     end;
     pPk2 := sqlite3PrimaryKeyIndex(pTab);
     if (db^.init.busy = 0) then begin
@@ -48331,6 +48362,9 @@ var
   zStmtReparse: PAnsiChar;
   nName:       i32;
   i, n:        i32;
+  nExtra:      i32;
+  nColl:       i32;
+  pExprNE:     PExpr;
   nExtraCol:   i32;
   iDb:         i32;
   iMem:        i32;
@@ -48342,7 +48376,6 @@ var
   pSchemaT:    passqlite3util.PSchema;
   prevColTok:  TToken;
   pColExpr:    PExpr;
-  pCollSeq:    PTCollSeq;
   zCollName:   PAnsiChar;
   pIdxColList: PExprList;
   jj:          i32;
@@ -48496,12 +48529,24 @@ begin
   nName     := sqlite3Strlen30(zName);
   nExtraCol := 1;
   if pPk <> nil then nExtraCol := i32(pPk^.nKeyCol);
+  { build.c:4152..4159 — reserve extra arena bytes for every explicit
+    COLLATE token text so the verbatim collation name persists past the
+    transient parse tree. }
+  nExtra := 0;
+  for i := 0 to i32(pList^.nExpr) - 1 do
+  begin
+    pExprNE := PExprListItem(PByte(ExprListItems(pList))
+                 + i * SizeOf(TExprListItem))^.pExpr;
+    if (pExprNE <> nil) and (pExprNE^.op = TK_COLLATE) then
+      Inc(nExtra, 1 + sqlite3Strlen30(pExprNE^.u.zToken));
+  end;
   pIndex    := sqlite3AllocateIndexObject(db,
                  i16(i32(pList^.nExpr) + nExtraCol),
-                 nName + 1, @zExtra);
+                 nName + nExtra + 1, @zExtra);
   if (pIndex = nil) or (db^.mallocFailed <> 0) then goto exit_create_index;
   pIndex^.zName := zExtra;
   Move(zName^, zExtra^, nName + 1);
+  Inc(zExtra, nName + 1);   { build.c:4175 — advance past the index name. }
   pIndex^.pTable   := pTab;
   pIndex^.onError  := u8(onError);
   { idxType lives in low 2 bits of idxFlags. }
@@ -48630,11 +48675,20 @@ begin
       TEMP B-TREE sorter, scrambling row order vs C (9.4.divbug.79). }
     if zCollName <> nil then
     begin
-      pCollSeq := PTCollSeq(sqlite3LocateCollSeq(pParse, zCollName));
-      if pCollSeq <> nil then
-        (PPAnsiChar(pIndex^.azColl) + i)^ := pCollSeq^.zName
-      else
-        (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
+      { build.c:4252..4267 — copy the verbatim COLLATE token into the
+        index's persistent arena (zExtra) and store THAT pointer, rather
+        than the resolved collation's canonical name, so PRAGMA
+        index_xinfo reports the declared case (e.g. `nocase` not
+        `NOCASE`).  Validate the name still exists (unless reloading
+        schema) so an unknown collation aborts up-front. }
+      nColl := sqlite3Strlen30(zCollName) + 1;
+      Move(zCollName^, zExtra^, nColl);
+      zCollName := zExtra;
+      Inc(zExtra, nColl);
+      if (db^.init.busy = 0)
+         and (sqlite3LocateCollSeq(pParse, zCollName) = nil) then
+        goto exit_create_index;
+      (PPAnsiChar(pIndex^.azColl) + i)^ := zCollName;
     end else if n >= 0 then
     begin
       zCollName := sqlite3ColumnColl(@PColumn(pTab^.aCol)[n]);
