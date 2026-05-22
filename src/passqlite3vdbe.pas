@@ -1239,10 +1239,13 @@ type
     pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
 
   { struct SorterFile — vdbesort.c:173 }
+  PSorterFile = ^TSorterFile;
   TSorterFile = record
     pFd:  Psqlite3_file;   { file handle }
     iEof: i64;             { bytes of data stored in pFd }
   end;
+  PPsqlite3_file = ^Psqlite3_file;  { sqlite3_file** out-param helper }
+  PPByte         = ^PByte;          { u8** out-param helper }
 
   { struct SorterList — vdbesort.c:186 }
   TSorterList = record
@@ -6960,6 +6963,102 @@ end;
 function SRVAL(p: PSorterRecord): Pointer; inline;
 begin
   Result := PByte(p) + SZ_SORTER_RECORD;
+end;
+
+{ ============================================================================
+  Temp-file plumbing — vdbesort.c:619..634, 1308..1352  (tasklist 5.7.b.2)
+
+  MMAP PATH: this port treats SQLITE_MAX_MMAP_SIZE as 0 (see passqlite3os.pas
+  ~line 47 — no mmap paths are ported in the OS layer).  That is exactly the
+  SQLITE_MAX_MMAP_SIZE==0 configuration of these same C functions, NOT a
+  deviation:
+    * vdbeSorterMapFile sets pp:=nil (no mapping → callers fall back to
+      buffered reads, byte-identical results).  Faithfully it still calls
+      sqlite3OsFetch, which in this port returns pp:=nil + SQLITE_OK whenever
+      the VFS exposes no xFetch (passqlite3os.pas:1250), so the mapped vs
+      unmapped behaviour is identical here.
+    * vdbeSorterExtendFile still issues the CHUNK_SIZE / SIZE_HINT hints to
+      truncate/extend the file, but skips the OsFetch pre-fault (the prefault
+      only matters when a real mmap is active).
+    * vdbeSorterOpenTempFile skips the SQLITE_FCNTL_MMAP_SIZE control (it has
+      no effect with mmap disabled).
+  ============================================================================ }
+
+{ vdbesort.c:1308..1326 — extend/truncate temp file pFd to nByte.  Gated
+  #if SQLITE_MAX_MMAP_SIZE>0 in C; here SQLITE_MAX_MMAP_SIZE==0, so we keep
+  the truncate/extend hints (db->nMaxSorterMmap is 0 by default, so this is a
+  no-op unless PRAGMA/limit raised it) and omit the OsFetch/OsUnfetch
+  pre-fault. }
+procedure vdbeSorterExtendFile(db: PTsqlite3; pFd: Psqlite3_file; nByte: i64);
+var
+  chunksize: i32;
+begin
+  if (nByte <= i64(db^.nMaxSorterMmap)) and (pFd^.pMethods^.iVersion >= 3) then
+  begin
+    chunksize := 4 * 1024;
+    sqlite3OsFileControlHint(pFd, SQLITE_FCNTL_CHUNK_SIZE, @chunksize);
+    sqlite3OsFileControlHint(pFd, SQLITE_FCNTL_SIZE_HINT, @nByte);
+    { mmap disabled (SQLITE_MAX_MMAP_SIZE==0): skip the OsFetch/OsUnfetch
+      pre-fault that the SQLITE_MAX_MMAP_SIZE>0 body performs here. }
+  end;
+end;
+
+{ vdbesort.c:1327..1352 — allocate a file-handle and open a temp file.  On
+  success set ppFd^ and return SQLITE_OK; otherwise set ppFd^:=nil and return
+  an error code.  This port lacks sqlite3OsOpenMalloc, so its faithful body
+  (os.c:308 — MallocZero(szOsFile) + OsOpen + free-on-error) is inlined. }
+function vdbeSorterOpenTempFile(db: PTsqlite3; nExtend: i64;
+                               ppFd: PPsqlite3_file): i32;
+var
+  rc: i32;
+  pFile: Psqlite3_file;
+  pVfs: Psqlite3_vfs;
+begin
+  if sqlite3FaultSim(202) <> 0 then begin Result := SQLITE_IOERR_ACCESS; Exit; end;
+
+  pVfs := Psqlite3_vfs(db^.pVfs);
+  { inlined sqlite3OsOpenMalloc (os.c:308) }
+  pFile := Psqlite3_file(sqlite3MallocZero(csize_t(pVfs^.szOsFile)));
+  if pFile = nil then begin
+    ppFd^ := nil;
+    Result := SQLITE_NOMEM_BKPT;
+    Exit;
+  end;
+  rc := sqlite3OsOpen(pVfs, nil, pFile,
+      SQLITE_OPEN_TEMP_JOURNAL or
+      SQLITE_OPEN_READWRITE    or SQLITE_OPEN_CREATE or
+      SQLITE_OPEN_EXCLUSIVE    or SQLITE_OPEN_DELETEONCLOSE, nil);
+  if rc <> SQLITE_OK then begin
+    sqlite3_free(pFile);
+    ppFd^ := nil;
+  end else
+    ppFd^ := pFile;
+
+  if rc = SQLITE_OK then begin
+    { mmap disabled (SQLITE_MAX_MMAP_SIZE==0): skip the SQLITE_FCNTL_MMAP_SIZE
+      control the C body issues here. }
+    if nExtend > 0 then
+      vdbeSorterExtendFile(db, ppFd^, nExtend);
+  end;
+  Result := rc;
+end;
+
+{ vdbesort.c:619..634 — attempt to memory-map SorterFile pFile.  If not
+  attempted (file too large, or VFS not configured for mmap) return SQLITE_OK
+  with pp^:=nil.  Here mmap is disabled, so sqlite3OsFetch returns pp^:=nil. }
+function vdbeSorterMapFile(pTask: PSortSubtask; pFile: PSorterFile;
+                          pp: PPByte): i32;
+var
+  rc: i32;
+  pFd: Psqlite3_file;
+begin
+  rc := SQLITE_OK;
+  if pFile^.iEof <= i64(pTask^.pSorter^.db^.nMaxSorterMmap) then begin
+    pFd := pFile^.pFd;
+    if pFd^.pMethods^.iVersion >= 3 then
+      rc := sqlite3OsFetch(pFd, 0, i32(pFile^.iEof), PPointer(pp));
+  end;
+  Result := rc;
 end;
 
 function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
