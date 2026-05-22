@@ -31533,6 +31533,8 @@ var
   pAggDistinct: PExprList;       { 9.4.divbug.33 }
   distFlag:    u16;              { 9.4.divbug.33 }
   eDistResult: i32;              { 9.4.divbug.33 }
+  sDistinctIsTnct: i32;          { select.c DistinctCtx.isTnct (0/1/2) }
+  bDistinctOverGroupOK: Boolean; { admit SF_Distinct into GROUP BY arm }
   { DISTINCT codegen locals (select.c:8253..8260) — only the
     WHERE_DISTINCT_UNORDERED ephemeral-table path is implemented;
     UNIQUE/ORDERED optimisations stay deferred (matches a build that
@@ -32164,6 +32166,12 @@ begin
     Action: clear SF_Distinct; pGroupBy := ExprListDup(pEList); seed
     iOrderByCol = i+1 on each new GROUP BY slot; set SF_Aggregate.
     sSort.pOrderBy is Pas's `p^.pOrderBy` (no separate sSort tracker yet). }
+  { select.c:8142 — DistinctCtx.isTnct = (selFlags & SF_Distinct)!=0.
+    Tracks the *original* DISTINCT setting; bumped to 2 by the
+    DISTINCT->GROUP BY transform below so the GROUP BY WhereBegin can
+    pass WHERE_DISTINCTBY instead of WHERE_GROUPBY (select.c:8520). }
+  if (p^.selFlags and SF_Distinct) <> 0 then sDistinctIsTnct := 1
+  else sDistinctIsTnct := 0;
   if ((p^.selFlags and (SF_Distinct or SF_Aggregate)) = SF_Distinct)
      and (p^.pEList <> nil) and (p^.pOrderBy <> nil)
      and (p^.pEList^.nExpr = p^.pOrderBy^.nExpr)
@@ -32187,6 +32195,11 @@ begin
           ExprListItems(p^.pGroupBy)[i].u.x.iOrderByCol := u16(i + 1);
       end;
       p^.selFlags := p^.selFlags or SF_Aggregate;
+      { select.c:8184..8188 — SF_Distinct has been cleared from selFlags but
+        isTnct retains the original DISTINCT setting; bump to 2 to flag the
+        "DISTINCT and ORDER BY" case so the GROUP BY WhereBegin requests
+        WHERE_DISTINCTBY. }
+      sDistinctIsTnct := 2;
       {$IFDEF SQLITE_DEBUG}
       { 10.1.42.a.12 — TREETRACE(0x20000) "Transform DISTINCT into GROUP BY"
         (select.c:8190..8195). }
@@ -32739,8 +32752,25 @@ begin
     Always pushes rows through OP_SorterOpen (no whereIsOrdered shortcut).
     C runs this arm whenever pGroupBy != 0, even with no aggregate funcs
     (`SELECT a FROM t GROUP BY a`); SF_Aggregate is not a precondition. }
+  { C runs the GROUP BY arm for every pGroupBy query regardless of
+    SF_Distinct (select.c:8456); the DISTINCT dedup then runs inside
+    selectInnerLoop.  This port's GROUP BY arm renders output directly
+    and does NOT apply the DISTINCT ephemeral, so it can only admit
+    SF_Distinct when the DISTINCT is provably redundant over the GROUP
+    BY key (every GROUP BY group already yields a unique result row).
+    The exact-match case `SELECT DISTINCT <cols> ... GROUP BY <same cols>`
+    is that case; admit it so the GROUP BY WhereBegin (WHERE_GROUPBY) is
+    reached and sqlite3_vtab_distinct reports eDistinct=1 to match C.
+    Non-redundant DISTINCT+GROUP BY still falls through to the simple
+    DISTINCT path, which applies the dedup ephemeral correctly. }
+  bDistinctOverGroupOK := ((p^.selFlags and SF_Distinct) = 0);
+  if (not bDistinctOverGroupOK)
+     and (p^.pGroupBy <> nil) and (p^.pEList <> nil)
+     and (p^.pEList^.nExpr = p^.pGroupBy^.nExpr)
+     and (sqlite3ExprListCompare(p^.pEList, p^.pGroupBy, -1) = 0) then
+    bDistinctOverGroupOK := True;
   if (p^.pGroupBy <> nil)
-     and ((p^.selFlags and SF_Distinct) = 0)
+     and bDistinctOverGroupOK
      and (p^.pWin = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
@@ -33123,7 +33153,14 @@ begin
           the ORDER BY (pWInfo->sorted, read back via sqlite3WhereIsSorted).
           OptimizationEnabled(GroupByOrder) gates the optimization, matching
           the sSort.pOrderBy-elimination condition at select.c:8624. }
-        wctrlGB := WHERE_GROUPBY or distFlag;
+        { select.c:8520 — (isTnct==2 ? WHERE_DISTINCTBY : WHERE_GROUPBY).
+          A DISTINCT transformed into GROUP BY (sDistinctIsTnct=2) wants
+          WHERE_DISTINCTBY so the planner / sqlite3_vtab_distinct reports
+          eDistinct=2+bSortByGroup; a plain GROUP BY uses WHERE_GROUPBY. }
+        if sDistinctIsTnct = 2 then
+          wctrlGB := WHERE_DISTINCTBY or distFlag
+        else
+          wctrlGB := WHERE_GROUPBY or distFlag;
         if (orderByGrp <> 0)
            and OptimizationEnabled(pParse^.db, SQLITE_GroupByOrder) then
           wctrlGB := wctrlGB or WHERE_SORTBYGROUP;
