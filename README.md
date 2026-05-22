@@ -60,6 +60,48 @@ This will:
    `SQLITE_ENABLE_API_ARMOR` for differential-testing fidelity).
 2. Compile all Pascal test binaries into `bin/`.
 
+### Compile-time feature parity with the oracle
+
+Because correctness is defined **differentially against the C oracle**, the
+Pascal port and the Tcl harness must expose the *same compile-time feature set*
+as the oracle build. A mismatch makes tests fail (or pass) for the wrong
+reason, even when the engine itself is correct.
+
+Inspect the oracle's flags at any time with:
+
+```bash
+../sqlite3/sqlite3 :memory: "SELECT name FROM pragma_compile_options;"
+```
+
+As of 3.53.0 the oracle build **enables** `ENABLE_FTS3`/`FTS4`, `ENABLE_RTREE`,
+`ENABLE_PERCENTILE`, `ENABLE_OFFSET_SQL_FUNC`, `ENABLE_DBPAGE_VTAB`,
+`ENABLE_DBSTAT_VTAB`, `ENABLE_BYTECODE_VTAB`, `ENABLE_STMTVTAB`,
+`ENABLE_UNKNOWN_SQL_FUNCTION`, `ENABLE_MATH_FUNCTIONS`, `STRICT_SUBTYPE`,
+`DQS=0`; and **does not** define `ENABLE_PREUPDATE_HOOK`, `ENABLE_SNAPSHOT`,
+`ENABLE_SESSION`, `ENABLE_MEMORY_MANAGEMENT`, `ENABLE_UNLOCK_NOTIFY`,
+`ENABLE_COLUMN_METADATA`, `ENABLE_NULL_TRIM`, `ENABLE_FTS5`, or
+`ENABLE_UPDATE_DELETE_LIMIT`. The core on-disk defaults (`auto_vacuum=0`,
+`page_size=4096`, `encoding=UTF-8`, `journal=delete`, `cache_size=-2000`,
+`synchronous=2`) match the port.
+
+Two mechanisms keep the harness aligned:
+
+- **`ifcapable` flags** live in `src/tests/tcl/tester_min.tcl` (mirroring
+  upstream `test_config.c`). Any capability **not** explicitly pinned there
+  defaults to `1`, so a feature the oracle *omits* must be pinned to `0` or its
+  tests will run a feature path the engine lacks (symptom: `... was omitted at
+  compile-time`, `no such function`, or a wrong-branch result). Currently
+  pinned to `0`: `columnmetadata`, `null_trim`, `preupdate`, `snapshot`,
+  `session`, `memorymanage`, `unlock_notify`, `fts3`/`fts5`, `stat4`, … Before
+  "fixing" a compile-flag-gated test, check `sqlite_compileoption_used` on the
+  real oracle `.so` rather than implementing the feature.
+- **Engine defines** live in `src/passqlite3.inc`. Keep these in lockstep with
+  the oracle. **Known divergence:** the port's parser is built
+  `SQLITE_UDL_CAPABLE_PARSER`, so it *accepts* `DELETE/UPDATE … LIMIT` whereas
+  the oracle (no `ENABLE_UPDATE_DELETE_LIMIT`) rejects it as a syntax error —
+  this diverges `e_delete`, `upfrom2`, `wherelimit2`. See `tasklist.md` 6.40 for
+  the full feature-gap inventory.
+
 ---
 
 ## Running the smoke test
