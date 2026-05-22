@@ -56455,6 +56455,26 @@ begin
     Exit;
   end;
 
+  { PragTyp_CACHE_SPILL write arm (pragma.c:922..932).  Parse the RHS as an
+    optional spill size, propagate via sqlite3BtreeSetSpillSize, then set or
+    clear SQLITE_CacheSpill connection-wide (db->flags applies to all
+    attached schemas) and re-derive every pager's spill flag.  No result
+    row is emitted. }
+  if SameText(zName, 'cache_spill') and (pValue <> nil) then begin
+    iVal := 1; { int size = 1; }
+    if sqlite3GetInt32(PAnsiChar(zRight), @iVal) <> 0 then begin
+      pBtArg := PBtree(db^.aDb[iDb].pBt);
+      if pBtArg <> nil then
+        sqlite3BtreeSetSpillSize(pBtArg, iVal);
+    end;
+    if sqlite3GetBoolean(PAnsiChar(zRight), u8(ord(iVal <> 0))) <> 0 then
+      db^.flags := db^.flags or SQLITE_CacheSpill
+    else
+      db^.flags := db^.flags and not u64(SQLITE_CacheSpill);
+    setAllPagerFlags(db);
+    Exit;
+  end;
+
   { PragTyp_SYNCHRONOUS (pragma.c:1132).  Read arm reports
     safety_level-1; write arm maps the keyword/number via getSafetyLevel,
     adds 1, masks, stores it on safety_level and propagates to the pagers. }
