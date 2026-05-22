@@ -19,6 +19,16 @@
 
   CLI:
       --limit N           cap number of tcl-feature entries processed
+      --pct P             run only P percent of the post-filter tcl-feature
+                          entries, taken as an EVENLY-SPACED sample across
+                          the (filtered) manifest so the subset is
+                          representative of the whole suite rather than a
+                          leading prefix.  P may be fractional (e.g. 0.5).
+                          Applied AFTER --filter but BEFORE --limit/--shard,
+                          so `--pct 1` first thins to ~1%, then --limit/
+                          --shard slice that thinned set.  At least one entry
+                          is always kept when P>0 and the filtered set is
+                          non-empty.
       --filter SUBSTR     only paths whose name contains SUBSTR
       --manifest PATH     override manifest location
       --shard I/N         (9.4.5.b) run only entries in slice I of N
@@ -172,6 +182,8 @@ var
   gTclDir     : string;        { absolute path to src/tests/tcl }
   gManifest   : string;        { absolute manifest path }
   gLimit      : Integer = -1;
+  gPct        : Double  = -1;       { evenly-spaced %-sample of filtered set; -1 = unset }
+  gPctFmt     : TFormatSettings;    { '.'-separator parse for --pct (locale-independent) }
   gFilter     : string  = '';
   gShardI     : Integer = -1;       { 9.4.5.b — -1 = no sharding }
   gShardN     : Integer = -1;
@@ -319,6 +331,13 @@ begin
     a := ParamStr(i);
     if a = '--limit' then begin
       Inc(i); gLimit := StrToIntDef(ParamStr(i), -1);
+    end else if a = '--pct' then begin
+      Inc(i);
+      gPct := StrToFloatDef(ParamStr(i), -1, gPctFmt);
+      if (gPct <= 0) or (gPct > 100) then begin
+        Writeln(StdErr, 'TclTestDriver: --pct expects a number in (0, 100], got: ', ParamStr(i));
+        Halt(2);
+      end;
     end else if a = '--filter' then begin
       Inc(i); gFilter := ParamStr(i);
     end else if a = '--manifest' then begin
@@ -1365,6 +1384,9 @@ var
   startTotal: QWord;
   shardLo, shardHi: Integer;
   strictRegressions: Integer;
+  sampled  : TStringList;        { --pct evenly-spaced subset }
+  keepN, j : Integer;
+  rawKeep  : Double;
 begin
   gRoot := ResolveRoot;
   gBinDir := IncludeTrailingPathDelimiter(gRoot) + 'bin';
@@ -1372,6 +1394,8 @@ begin
   gTclDir := IncludeTrailingPathDelimiter(gRoot) + 'src' + DirectorySeparator + 'tests' + DirectorySeparator + 'tcl';
   gManifest := IncludeTrailingPathDelimiter(gTclDir) + 'MANIFEST.txt';
 
+  gPctFmt := DefaultFormatSettings;
+  gPctFmt.DecimalSeparator := '.';
   ParseArgs;
 
   { 9.4.7.e — resolve --permutation NAME to a presql pragma string and
@@ -1470,6 +1494,30 @@ begin
         if tag <> 'tcl-feature' then Continue;
         if (gFilter <> '') and (Pos(gFilter, ExtractFileName(p)) = 0) then Continue;
         filtered.Add(p);
+      end;
+
+      { --pct: thin the filtered set to an evenly-spaced P% sample BEFORE
+        --limit/--shard, so the kept entries are spread across the suite
+        rather than a leading prefix.  Index map j -> (j*N) div keepN is
+        strictly increasing for keepN<=N (floor(x+s)>=floor(x)+floor(s),
+        s=N/keepN>=1), so the picks are distinct and in MANIFEST order. }
+      if (gPct > 0) and (filtered.Count > 0) then begin
+        rawKeep := (filtered.Count * gPct) / 100.0;
+        keepN := Trunc(rawKeep);
+        if keepN < rawKeep then Inc(keepN);   { ceil — keep a sliver, never 0 }
+        if keepN < 1 then keepN := 1;
+        if keepN < filtered.Count then begin
+          sampled := TStringList.Create;
+          try
+            for j := 0 to keepN - 1 do
+              sampled.Add(filtered[(j * filtered.Count) div keepN]);
+            filtered.Assign(sampled);
+          finally
+            sampled.Free;
+          end;
+        end;
+        Writeln(StdErr, Format('--pct %g: kept %d entries (evenly spaced)',
+          [gPct, filtered.Count]));
       end;
 
       if (gLimit > 0) and (gLimit < filtered.Count) then
