@@ -7061,6 +7061,90 @@ begin
   Result := rc;
 end;
 
+{ ============================================================================
+  PmaWriter — incremental, buffered, page-aligned PMA writer.
+  vdbesort.c:1479..1576  (tasklist 5.7.b.3)
+
+  Single-threaded only.  Reuses sqlite3Malloc/sqlite3_free for aBuffer (as C),
+  sqlite3OsWrite(id,pBuf,amt,offset) for flushes, sqlite3PutVarint for varints.
+  Not yet wired into production paths (that lands in 5.7.b.5).
+  ============================================================================ }
+
+{ vdbePmaWriterInit — vdbesort.c:1479..1500 }
+procedure vdbePmaWriterInit(pFd: Psqlite3_file; p: PPmaWriter;
+                            nBuf: i32; iStart: i64);
+begin
+  FillChar(p^, SizeOf(TPmaWriter), 0);
+  p^.aBuffer := Pu8(sqlite3Malloc(nBuf));
+  if p^.aBuffer = nil then begin
+    p^.eFWErr := SQLITE_NOMEM_BKPT;
+  end else begin
+    p^.iBufStart := i32(iStart mod nBuf);
+    p^.iBufEnd   := p^.iBufStart;
+    p^.iWriteOff := iStart - p^.iBufStart;
+    p^.nBuffer   := nBuf;
+    p^.pFd       := pFd;
+  end;
+end;
+
+{ vdbePmaWriteBlob — vdbesort.c:1501..1535 }
+procedure vdbePmaWriteBlob(p: PPmaWriter; pData: Pu8; nData: i32);
+var
+  nRem, nCopy: i32;
+begin
+  nRem := nData;
+  while (nRem > 0) and (p^.eFWErr = 0) do begin
+    nCopy := nRem;
+    if nCopy > (p^.nBuffer - p^.iBufEnd) then
+      nCopy := p^.nBuffer - p^.iBufEnd;
+
+    Move((pData + (nData - nRem))^, (p^.aBuffer + p^.iBufEnd)^, nCopy);
+    Inc(p^.iBufEnd, nCopy);
+    if p^.iBufEnd = p^.nBuffer then begin
+      p^.eFWErr := sqlite3OsWrite(p^.pFd,
+          p^.aBuffer + p^.iBufStart, p^.iBufEnd - p^.iBufStart,
+          p^.iWriteOff + p^.iBufStart);
+      Inc(p^.nPmaSpill, u64(p^.iBufEnd - p^.iBufStart));
+      p^.iBufStart := 0;
+      p^.iBufEnd   := 0;
+      Inc(p^.iWriteOff, p^.nBuffer);
+    end;
+    Assert(p^.iBufEnd < p^.nBuffer);
+
+    Dec(nRem, nCopy);
+  end;
+end;
+
+{ vdbePmaWriterFinish — vdbesort.c:1536..1556 }
+function vdbePmaWriterFinish(p: PPmaWriter; piEof: Pi64; pnSpill: Pu64): i32;
+var
+  rc: i32;
+begin
+  if (p^.eFWErr = 0) and (p^.aBuffer <> nil) and (p^.iBufEnd > p^.iBufStart) then
+  begin
+    p^.eFWErr := sqlite3OsWrite(p^.pFd,
+        p^.aBuffer + p^.iBufStart, p^.iBufEnd - p^.iBufStart,
+        p^.iWriteOff + p^.iBufStart);
+    Inc(p^.nPmaSpill, u64(p^.iBufEnd - p^.iBufStart));
+  end;
+  piEof^ := p^.iWriteOff + p^.iBufEnd;
+  Inc(pnSpill^, p^.nPmaSpill);
+  sqlite3_free(p^.aBuffer);
+  rc := p^.eFWErr;
+  FillChar(p^, SizeOf(TPmaWriter), 0);
+  Result := rc;
+end;
+
+{ vdbePmaWriteVarint — vdbesort.c:1557..1576 }
+procedure vdbePmaWriteVarint(p: PPmaWriter; iVal: u64);
+var
+  nByte: i32;
+  aByte: array[0..9] of u8;
+begin
+  nByte := sqlite3PutVarint(@aByte[0], iVal);
+  vdbePmaWriteBlob(p, @aByte[0], nByte);
+end;
+
 function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
                                pCsr: PVdbeCursor): i32;
 var
