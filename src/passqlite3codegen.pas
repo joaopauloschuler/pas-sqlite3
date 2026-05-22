@@ -34269,10 +34269,31 @@ begin
             and (pItem^.u4.pSubq^.pSelect <> nil) then
       isSubqueryAgg := True
     else begin
+      { 9.4.divbug.87.070 — multi-source aggregate (no GROUP BY) over a
+        FROM list that mixes a materialisable VIEW / subquery source with
+        ordinary base tables (e.g. `SELECT count(*) FROM <agg-view>,t2`).
+        Such a source carries SRCITEM_FG_IS_SUBQUERY (view-expanded) and
+        a non-coroutine pSubq.  C codes the FROM term as a co-routine and
+        joins it through WhereBegin (select.c:8054, fromClauseTermCanBe-
+        Coroutine); this port pre-materialises it into an ephemeral cursor
+        (see the GROUP BY arm at codegen.pas:33167) and then drives the
+        general WhereBegin arm below over p^.pSrc, where WhereBegin skips
+        opening a cursor for the already-materialised eph source
+        (where.c:7259, codegen.pas:24133).  Only an unhandled shape
+        (vtab, coroutine subquery without a recursable pSelect, or a
+        plain NULL pSTab) still bails to the 3-op stub. }
       for jAgg := 0 to p^.pSrc^.nSrc - 1 do
       begin
         pTab := pItem[jAgg].pSTab;
-        if (pTab = nil)
+        if ((pItem[jAgg].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+           and ((pItem[jAgg].fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0)
+           and (pItem[jAgg].u4.pSubq <> nil)
+           and (pItem[jAgg].u4.pSubq^.pSelect <> nil)
+           and (pTab <> nil)
+           and (pTab^.eTabType <> TABTYP_VTAB) then
+          { materialisable subquery / view source — handled by the
+            pre-materialise loop after this gate; do not bail. }
+        else if (pTab = nil)
            or (pTab^.eTabType = TABTYP_VTAB)
            or (pTab^.eTabType = TABTYP_VIEW)
            or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
@@ -34664,6 +34685,39 @@ begin
         end
         else
         begin
+          { 9.4.divbug.87.070 — pre-materialise FROM-subquery / view
+            sources (view-expanded items carry SRCITEM_FG_IS_SUBQUERY)
+            into an ephemeral cursor before sqlite3WhereBegin, mirroring
+            the GROUP BY arm at codegen.pas:33167.  Required for a
+            multi-source aggregate (no GROUP BY) over a VIEW / subquery
+            FROM joined to base tables, e.g.
+            `SELECT count(*) FROM <agg-view>,t2`.  WhereBegin then scans
+            the materialised cursor as an ordinary ephemeral source
+            (it skips opening a cursor for it — codegen.pas:24133). }
+          for iSrcCheck := 0 to p^.pSrc^.nSrc - 1 do
+          begin
+            pItemCheck := @SrcListItems(p^.pSrc)[iSrcCheck];
+            if ((pItemCheck^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+               and ((pItemCheck^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0)
+               and (pItemCheck^.u4.pSubq <> nil)
+               and (pItemCheck^.u4.pSubq^.pSelect <> nil)
+               and (pItemCheck^.pSTab <> nil) then
+            begin
+              if pItemCheck^.iCursor < 0 then
+              begin
+                pItemCheck^.iCursor := pParse^.nTab;
+                Inc(pParse^.nTab);
+              end;
+              sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItemCheck^.iCursor,
+                                pItemCheck^.pSTab^.nCol);
+              sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItemCheck^.iCursor);
+              if sqlite3Select(pParse, pItemCheck^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+              begin
+                Result := SQLITE_ERROR; Exit;
+              end;
+            end;
+          end;
+
           { MIN/MAX optimisation gate — select.c:8433.  minMaxFlag /
             pMinMaxOrderBy were computed earlier (before analyzeAggFuncArgs,
             so sqlite3ExprCanBeNull still sees the TK_COLUMN arg) and carry
