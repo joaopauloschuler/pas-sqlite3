@@ -7145,6 +7145,281 @@ begin
   vdbePmaWriteBlob(p, @aByte[0], nByte);
 end;
 
+{ ============================================================================
+  PmaReader — incrementally read one PMA in sorted order.
+  vdbesort.c:474..761  (tasklist 5.7.b.4)
+
+  Single-threaded only.  Reuses sqlite3OsRead(id,pBuf,amt,offset),
+  sqlite3Realloc(p,n), sqlite3Malloc/sqlite3_free, sqlite3GetVarint and the
+  already-ported vdbeSorterMapFile.  Not yet wired into production
+  (5.7.b.6/.8/.9 do that).
+
+  IncrMerger stubs: vdbeIncrFree/vdbeIncrSwap referenced below are forward-
+  declared here with inert placeholder bodies; the real single-threaded
+  IncrMerger logic lands in 5.7.b.7, which replaces those bodies.
+  ============================================================================ }
+
+{ Forward stubs — replaced by the real IncrMerger port in 5.7.b.7. }
+procedure vdbeIncrFree(pIncr: PIncrMerger); forward;
+function  vdbeIncrSwap(pIncr: PIncrMerger): i32; forward;
+
+{ vdbePmaReaderClear — vdbesort.c:474..480 }
+procedure vdbePmaReaderClear(pReadr: PPmaReader);
+begin
+  sqlite3_free(pReadr^.aAlloc);
+  sqlite3_free(pReadr^.aBuffer);
+  if pReadr^.aMap <> nil then sqlite3OsUnfetch(pReadr^.pFd, 0, pReadr^.aMap);
+  vdbeIncrFree(pReadr^.pIncr);
+  FillChar(pReadr^, SizeOf(TPmaReader), 0);
+end;
+
+{ vdbePmaReadBlob — vdbesort.c:491..585.  Read nByte from the PMA, set ppOut^
+  to a buffer holding the data (a pointer into aMap/aBuffer, or a copy in the
+  grown aAlloc).  The buffer is valid only until the next call. }
+function vdbePmaReadBlob(p: PPmaReader; nByte: i32; ppOut: PPByte): i32;
+var
+  iBuf:   i32;   { offset within buffer to read from }
+  nAvail: i32;   { bytes of data available in buffer }
+  nRead:  i32;   { bytes to read from disk }
+  rc:     i32;   { sqlite3OsRead() return code }
+  nRem:   i32;   { bytes remaining to copy }
+  nCopy:  i32;   { number of bytes to copy }
+  aNext:  Pu8;   { pointer to buffer to copy data from }
+  aNew:   Pu8;
+  nNew:   i64;
+begin
+  if p^.aMap <> nil then begin
+    ppOut^ := @p^.aMap[p^.iReadOff];
+    Inc(p^.iReadOff, nByte);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  Assert(p^.aBuffer <> nil);
+
+  { If there is no more data to be read from the buffer, read the next
+    p->nBuffer bytes of data from the file into it. Or, if there are less
+    than p->nBuffer bytes remaining in the PMA, read all remaining data.  }
+  iBuf := i32(p^.iReadOff mod p^.nBuffer);
+  if iBuf = 0 then begin
+    { Determine how many bytes of data to read. }
+    if (p^.iEof - p^.iReadOff) > i64(p^.nBuffer) then
+      nRead := p^.nBuffer
+    else
+      nRead := i32(p^.iEof - p^.iReadOff);
+    Assert(nRead > 0);
+
+    { Read data from the file. Return early if an error occurs. }
+    rc := sqlite3OsRead(p^.pFd, p^.aBuffer, nRead, p^.iReadOff);
+    Assert(rc <> SQLITE_IOERR_SHORT_READ);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+  nAvail := p^.nBuffer - iBuf;
+
+  if nByte <= nAvail then begin
+    { The requested data is available in the in-memory buffer.  Return a
+      pointer into the buffer rather than copying. }
+    ppOut^ := @p^.aBuffer[iBuf];
+    Inc(p^.iReadOff, nByte);
+  end else begin
+    { The requested data is not all available in the in-memory buffer.
+      Allocate space at p->aAlloc[] to copy the requested range into, then
+      return a copy of pointer p->aAlloc to the caller. }
+
+    { Extend the p->aAlloc[] allocation if required. }
+    if p^.nAlloc < nByte then begin
+      nNew := 2 * i64(p^.nAlloc);          { MAX(128, 2*nAlloc) — vdbesort.c:556 }
+      if nNew < 128 then nNew := 128;
+      while nByte > nNew do nNew := nNew * 2;
+      aNew := Pu8(sqlite3Realloc(p^.aAlloc, u64(nNew)));
+      if aNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+      p^.nAlloc := i32(nNew);
+      p^.aAlloc := aNew;
+    end;
+
+    { Copy as much data as is available in the buffer into the start of
+      p->aAlloc[]. }
+    Move(p^.aBuffer[iBuf], p^.aAlloc^, nAvail);
+    Inc(p^.iReadOff, nAvail);
+    nRem := nByte - nAvail;
+
+    { The following loop copies up to p->nBuffer bytes per iteration into
+      the p->aAlloc[] buffer. }
+    while nRem > 0 do begin
+      aNext := nil;
+      nCopy := nRem;
+      if nRem > p^.nBuffer then nCopy := p^.nBuffer;
+      rc := vdbePmaReadBlob(p, nCopy, @aNext);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      Assert(aNext <> p^.aAlloc);
+      Assert(aNext <> nil);
+      Move(aNext^, p^.aAlloc[nByte - nRem], nCopy);
+      Dec(nRem, nCopy);
+    end;
+
+    ppOut^ := p^.aAlloc;
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ vdbePmaReadVarint — vdbesort.c:586..618.  Read a varint from the stream,
+  set pnOut^ to the value. }
+function vdbePmaReadVarint(p: PPmaReader; pnOut: Pu64): i32;
+var
+  iBuf:    i32;
+  aVarint: array[0..15] of u8;
+  a:       Pu8;
+  i, rc:   i32;
+  v:       u64;
+begin
+  if p^.aMap <> nil then begin
+    Inc(p^.iReadOff, sqlite3GetVarint(@p^.aMap[p^.iReadOff], pnOut^));
+  end else begin
+    iBuf := i32(p^.iReadOff mod p^.nBuffer);
+    if (iBuf <> 0) and ((p^.nBuffer - iBuf) >= 9) then begin
+      Inc(p^.iReadOff, sqlite3GetVarint(@p^.aBuffer[iBuf], pnOut^));
+    end else begin
+      i := 0;
+      a := nil;
+      repeat
+        rc := vdbePmaReadBlob(p, 1, @a);
+        if rc <> 0 then begin Result := rc; Exit; end;
+        aVarint[(i) and $f] := a[0];
+        Inc(i);
+      until (a[0] and $80) = 0;
+      sqlite3GetVarint(@aVarint[0], v);
+      pnOut^ := v;
+    end;
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ vdbePmaReaderSeek — vdbesort.c:636..682.  Attach pReadr to pFile and seek it
+  to offset iOff. }
+function vdbePmaReaderSeek(pTask: PSortSubtask; pReadr: PPmaReader;
+                          pFile: PSorterFile; iOff: i64): i32;
+var
+  rc:    i32;
+  pgsz:  i32;
+  iBuf:  i32;
+  nRead: i32;
+begin
+  rc := SQLITE_OK;
+
+  Assert((pReadr^.pIncr = nil) or (pReadr^.pIncr^.bEof = 0));
+
+  if sqlite3FaultSim(201) <> 0 then begin Result := SQLITE_IOERR_READ; Exit; end;
+  if pReadr^.aMap <> nil then begin
+    sqlite3OsUnfetch(pReadr^.pFd, 0, pReadr^.aMap);
+    pReadr^.aMap := nil;
+  end;
+  pReadr^.iReadOff := iOff;
+  pReadr^.iEof     := pFile^.iEof;
+  pReadr^.pFd      := pFile^.pFd;
+
+  rc := vdbeSorterMapFile(pTask, pFile, @pReadr^.aMap);
+  if (rc = SQLITE_OK) and (pReadr^.aMap = nil) then begin
+    pgsz := pTask^.pSorter^.pgsz;
+    iBuf := i32(pReadr^.iReadOff mod pgsz);
+    if pReadr^.aBuffer = nil then begin
+      pReadr^.aBuffer := Pu8(sqlite3Malloc(pgsz));
+      if pReadr^.aBuffer = nil then rc := SQLITE_NOMEM_BKPT;
+      pReadr^.nBuffer := pgsz;
+    end;
+    if (rc = SQLITE_OK) and (iBuf <> 0) then begin
+      nRead := pgsz - iBuf;
+      if (pReadr^.iReadOff + nRead) > pReadr^.iEof then
+        nRead := i32(pReadr^.iEof - pReadr^.iReadOff);
+      rc := sqlite3OsRead(pReadr^.pFd, @pReadr^.aBuffer[iBuf], nRead,
+                          pReadr^.iReadOff);
+    end;
+  end;
+
+  Result := rc;
+end;
+
+{ vdbePmaReaderNext — vdbesort.c:683..729.  Advance pReadr to the next key. }
+function vdbePmaReaderNext(pReadr: PPmaReader): i32;
+var
+  rc:    i32;
+  nRec:  u64;
+  bEof:  i32;
+  pIncr: PIncrMerger;
+begin
+  rc   := SQLITE_OK;
+  nRec := 0;
+
+  if pReadr^.iReadOff >= pReadr^.iEof then begin
+    pIncr := pReadr^.pIncr;
+    bEof := 1;
+    if pIncr <> nil then begin
+      rc := vdbeIncrSwap(pIncr);
+      if (rc = SQLITE_OK) and (pIncr^.bEof = 0) then begin
+        rc := vdbePmaReaderSeek(pIncr^.pTask, pReadr, @pIncr^.aFile[0],
+                                pIncr^.iStartOff);
+        bEof := 0;
+      end;
+    end;
+
+    if bEof <> 0 then begin
+      { This is an EOF condition }
+      vdbePmaReaderClear(pReadr);
+      Result := rc;
+      Exit;
+    end;
+  end;
+
+  if rc = SQLITE_OK then
+    rc := vdbePmaReadVarint(pReadr, @nRec);
+  if rc = SQLITE_OK then begin
+    pReadr^.nKey := i32(nRec);
+    rc := vdbePmaReadBlob(pReadr, i32(nRec), @pReadr^.aKey);
+  end;
+
+  Result := rc;
+end;
+
+{ vdbePmaReaderInit — vdbesort.c:730..761.  Initialise pReadr to scan the PMA
+  in pFile starting at iStart.  If pnByte is nil the PMA omits its initial
+  length varint. }
+function vdbePmaReaderInit(pTask: PSortSubtask; pFile: PSorterFile;
+                          iStart: i64; pReadr: PPmaReader; pnByte: Pi64): i32;
+var
+  rc:    i32;
+  nByte: u64;
+begin
+  Assert(pFile^.iEof > iStart);
+  Assert((pReadr^.aAlloc = nil) and (pReadr^.nAlloc = 0));
+  Assert(pReadr^.aBuffer = nil);
+  Assert(pReadr^.aMap = nil);
+
+  rc := vdbePmaReaderSeek(pTask, pReadr, pFile, iStart);
+  if rc = SQLITE_OK then begin
+    nByte := 0;
+    rc := vdbePmaReadVarint(pReadr, @nByte);
+    pReadr^.iEof := pReadr^.iReadOff + i64(nByte);
+    Inc(pnByte^, i64(nByte));
+  end;
+
+  if rc = SQLITE_OK then
+    rc := vdbePmaReaderNext(pReadr);
+  Result := rc;
+end;
+
+{ Placeholder IncrMerger bodies — 5.7.b.7 will replace these with the real
+  single-threaded port (vdbesort.c:1909..2047). }
+procedure vdbeIncrFree(pIncr: PIncrMerger);
+begin
+  { 5.7.b.7 will implement }
+end;
+
+function vdbeIncrSwap(pIncr: PIncrMerger): i32;
+begin
+  Result := SQLITE_OK;   { 5.7.b.7 will implement }
+end;
+
 function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
                                pCsr: PVdbeCursor): i32;
 var
