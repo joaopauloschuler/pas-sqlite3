@@ -32512,6 +32512,26 @@ begin
      and (p^.pWin = nil)
   then
     p^.selFlags := p^.selFlags and not u32(SF_Distinct);
+  { 9.4.divbug.87.055 — DISTINCT over an aggregate query with no GROUP BY
+    yields exactly one output row, so DISTINCT is a trivial no-op.  Strip
+    SF_Distinct before the aggregate gates below so `SELECT DISTINCT
+    sum(x) FROM t;` (and the no-FROM `SELECT DISTINCT count(*)` form)
+    reaches the same aggregate codegen body as the non-DISTINCT flavour.
+    Without this strip those gates exclude SF_Distinct → the statement
+    falls through every later arm and sqlite3Select returns SQLITE_OK
+    coding no opcodes → zero rows.  Mirrors C select.c:8253..8263 +
+    8265.. where SF_Distinct sets sDistinct.eTnctType but the single
+    aggregate output row is deduped against an empty ephemeral index
+    (a no-op); the agg path (the !isAgg && pGroupBy==0 else-branch at
+    8344) runs unchanged regardless of SF_Distinct.  GROUP BY is excluded
+    here — that case keeps SF_Distinct and is handled by the redundant-
+    over-GROUP-BY gate / simple DISTINCT path below. }
+  if ((p^.selFlags and SF_Aggregate) <> 0)
+     and ((p^.selFlags and SF_Distinct) <> 0)
+     and (p^.pGroupBy = nil)
+     and (p^.pWin = nil)
+  then
+    p^.selFlags := p^.selFlags and not u32(SF_Distinct);
   { No-FROM fast path — `SELECT <expr-list>;` with no source table.
     Emit OP_Explain + per-result-col sqlite3ExprCode + OP_ResultRow.
     Mirrors the tail of selectInnerLoop for SRT_Output when WhereBegin
