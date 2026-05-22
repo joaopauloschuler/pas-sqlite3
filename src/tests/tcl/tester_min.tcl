@@ -325,6 +325,16 @@ set ::sqlite_options(rowid32) 0
 # strict failures / timeouts.  (No test uses `ifcapable stat3`, and
 # test_config.c sets no stat3 cap, so none is added here.)
 set ::sqlite_options(stat4) 0
+# capi2-11.x/12.x/13.x — the C reference oracle build does NOT define
+# SQLITE_ENABLE_COLUMN_METADATA (sqlite3_compileoption_used returns 0 for it;
+# only Makefile.msc enables it).  test_config.c:353..355 then writes
+# columnmetadata=0, so upstream SKIPS the check_origins blocks that exercise
+# sqlite3_column_{database,table,origin}_name.  pas-sqlite3 likewise builds the
+# non-SQLITE_ENABLE_COLUMN_METADATA arm of columnType (passqlite3codegen.pas
+# :28019), so COLNAME_N=2 and those names are never populated — matching the
+# oracle.  Without this, the cap defaults to 1 below and the section wrongly
+# RUNS, expecting {main tab1 colN} where the engine honestly returns {}.
+set ::sqlite_options(columnmetadata) 0
 # uri2.test is gated by `ifcapable !uri_00_error`.  A vanilla build does NOT
 # define SQLITE_ENABLE_URI_00_ERROR, so test_config.c writes no uri_00_error
 # cap and the oracle SKIPS this test (the !SQLITE_ENABLE_URI_00_ERROR arm in
