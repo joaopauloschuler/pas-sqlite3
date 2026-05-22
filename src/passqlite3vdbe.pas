@@ -6986,7 +6986,7 @@ const
 
     *** 5.7.b.9 MUST flip this to True AND verify the merge read-back. ***
     ---------------------------------------------------------------------- }
-  SORTER_PMA_ENABLED = False;
+  SORTER_PMA_ENABLED = True;   { 5.7.b.9: spill + merge read-back enabled }
 
 { SRVAL(p) — vdbesort.c:461 — record data immediately follows the header. }
 function SRVAL(p: PSorterRecord): Pointer; inline;
@@ -7480,6 +7480,7 @@ end;
 { Forward declaration — real single-threaded body is in the 5.7.b.7 block
   (vdbesort.c:2220..2280); vdbeMergeEngineInit calls it for each reader. }
 function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32; forward;
+function vdbePmaReaderIncrInit(pReadr: PPmaReader; eMode: i32): i32; forward;
 
 { vdbeMergeEngineNew — vdbesort.c:1193..1215.  Allocate a MergeEngine able to
   merge up to nReader inputs.  nReader is rounded up to the next power of two
@@ -7669,7 +7670,11 @@ begin
 
   nTree := pMerger^.nTree;
   for i := 0 to nTree - 1 do begin
-    rc := vdbePmaReaderIncrMergeInit(@pMerger^.aReadr[i], INCRINIT_NORMAL);
+    { vdbesort.c:2176 — the INCRINIT_NORMAL (else) arm calls IncrInit, which
+      no-ops on a level-0 reader (pIncr=nil) and only recurses through the
+      tree on incremental readers.  Calling IncrMergeInit directly would
+      deref a nil pIncr on the leaf readers. }
+    rc := vdbePmaReaderIncrInit(@pMerger^.aReadr[i], INCRINIT_NORMAL);
     if rc <> SQLITE_OK then begin Result := rc; Exit; end;
   end;
 
@@ -8204,11 +8209,15 @@ end;
 
 procedure sqlite3VdbeSorterReset(db: PTsqlite3; pSorter: PVdbeSorter);
 begin
-  { vdbesort.c:1247..1275 (single-threaded subset).  No thread joins, no
-    pReader free (bUseThreads==0), merger teardown deferred to 5.7.b.9. }
+  { vdbesort.c:1247..1275 (single-threaded subset).  No thread joins
+    (bUseThreads==0); the SQLITE_MAX_WORKER_THREADS pReader-free arm is
+    omitted (pReader stays nil single-threaded), but the merge engine and
+    pUnpacked still need releasing.  vdbeMergeEngineFree walks aReadr[] and
+    frees each PmaReader's buffers + the engine block; subtask cleanup
+    closes the temp files (vdbesort.c:1063..1083). }
   if pSorter = nil then Exit;
   Assert((pSorter^.bUseThreads <> 0) or (pSorter^.pReader = nil));
-  { vdbeMergeEngineFree(pSorter^.pMerger) — lands 5.7.b.6/.9 }
+  vdbeMergeEngineFree(pSorter^.pMerger);
   pSorter^.pMerger := nil;
   vdbeSortSubtaskCleanup(db, @pSorter^.aTask);
   pSorter^.aTask.pSorter := pSorter;
@@ -8641,9 +8650,18 @@ begin
     Exit;
   end;
 
-  { PMA read-back — 5.7.b.9 (vdbeSorterFlushPMA + vdbeSorterSetupMerge).
-    Unreachable while SORTER_PMA_ENABLED=False keeps bUsePMA at 0. }
-  Result := SQLITE_ERROR;
+  { Write the residual in-memory list to a final PMA, then build the merge
+    tree.  After a spill VdbeSorterWrite always re-seeds list.pList with one
+    key, so the list is never empty here (vdbesort.c:2632..2654). }
+  Assert(pSorter^.list.pList <> nil);
+  rc := vdbeSorterFlushPMA(pSorter);
+  { vdbeSorterJoinAll is a no-op single-threaded; skipped. }
+  Assert(pSorter^.pReader = nil);
+  if rc = SQLITE_OK then begin
+    rc := vdbeSorterSetupMerge(pSorter);
+    pbEof := 0;
+  end;
+  Result := rc;
 end;
 
 { sqlite3VdbeSorterNext — vdbesort.c:2664..2696.  In-memory path: advance the
@@ -8652,14 +8670,21 @@ function sqlite3VdbeSorterNext(db: PTsqlite3; pCsr: PVdbeCursor): i32;
 var
   pSorter: PVdbeSorter;
   pFree:   PSorterRecord;
+  rc:      i32;
+  res:     i32;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
   pSorter := pCsr^.uc.pSorter;
   if pSorter^.bUsePMA <> 0 then begin
-    { PMA merge step — 5.7.b.9 }
-    Result := SQLITE_ERROR;
+    { Single-threaded: drive the merge from pSorter->pMerger (vdbesort.c:
+      2681..2687).  res<>0 means the merge tree is exhausted. }
+    Assert(pSorter^.pMerger <> nil);
+    res := 0;
+    rc  := vdbeMergeEngineStep(pSorter^.pMerger, @res);
+    if (rc = SQLITE_OK) and (res <> 0) then rc := SQLITE_DONE;
+    Result := rc;
     Exit;
   end;
   pFree := pSorter^.list.pList;
@@ -8674,11 +8699,15 @@ end;
 { vdbeSorterRowkey — vdbesort.c:2702..2724.  Returns the current key buffer
   (in-memory path: SRVAL of the list head). }
 function vdbeSorterRowkey(pSorter: PVdbeSorter; out pnKey: i32): Pointer;
+var
+  pReadr: PPmaReader;
 begin
   if pSorter^.bUsePMA <> 0 then begin
-    { PMA reader key — 5.7.b.9 }
-    pnKey := 0;
-    Result := nil;
+    { Single-threaded: the winning reader is aReadr[aTree[1]] (vdbesort.c:
+      2714..2719). }
+    pReadr := @pSorter^.pMerger^.aReadr[pSorter^.pMerger^.aTree[1]];
+    pnKey  := pReadr^.nKey;
+    Result := pReadr^.aKey;
   end else begin
     pnKey := pSorter^.list.pList^.nVal;
     Result := SRVAL(pSorter^.list.pList);
