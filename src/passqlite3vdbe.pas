@@ -670,6 +670,7 @@ type
     full record layouts declared in the Phase 5.7 sorter type block below. }
   PSorterRecord = ^TSorterRecord;  { SorterRecord — vdbesort.c:447 }
   PMergeEngine  = ^TMergeEngine;   { MergeEngine  — vdbesort.c:256 }
+  PPMergeEngine = ^PMergeEngine;   { MergeEngine** — out-param for Level0 }
   PPmaReader    = ^TPmaReader;     { PmaReader    — vdbesort.c:354 }
   PPmaWriter    = ^TPmaWriter;     { PmaWriter    — vdbesort.c:418 }
   PIncrMerger   = ^TIncrMerger;    { IncrMerger   — vdbesort.c:400 }
@@ -7445,6 +7446,265 @@ end;
 function vdbeIncrSwap(pIncr: PIncrMerger): i32;
 begin
   Result := SQLITE_OK;   { 5.7.b.7 will implement }
+end;
+
+{ ----------------------------------------------------------------------------
+  Phase 5.7.b.6 — MergeEngine (the aTree[] loser/winner tournament that
+  combines up to SORTER_MAX_MERGE_COUNT PmaReaders).  Ports vdbeMergeEngineNew/
+  Free/Compare/Step/Init/Level0 from vdbesort.c.  Single-threaded only:
+  the SQLITE_MAX_WORKER_THREADS>0 and INCRINIT_TASK/ROOT arms are omitted.
+  Not yet wired into production (5.7.b.8/.9 do that).
+  ---------------------------------------------------------------------------- }
+
+{ Forward stub — 5.7.b.7 replaces this with the real IncrMerger initialiser.
+  In single-threaded / no-incr mode (pReadr^.pIncr always nil here), the
+  correct behaviour is simply to advance the reader to its first key. }
+function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32; forward;
+
+{ vdbeMergeEngineNew — vdbesort.c:1193..1215.  Allocate a MergeEngine able to
+  merge up to nReader inputs.  nReader is rounded up to the next power of two
+  (N), and a single allocation holds the MergeEngine header followed by the
+  aReadr[N] PmaReader array and the aTree[N] int array. }
+function vdbeMergeEngineNew(nReader: i32): PMergeEngine;
+var
+  N:     i32;     { smallest power of two >= nReader }
+  nByte: i64;     { total bytes of space to allocate }
+  pNew:  PMergeEngine;
+begin
+  N := 2;
+  Assert(nReader <= SORTER_MAX_MERGE_COUNT);
+
+  while N < nReader do N := N + N;
+  nByte := SizeOf(TMergeEngine) + i64(N) * (SizeOf(i32) + SizeOf(TPmaReader));
+
+  if sqlite3FaultSim(100) <> 0 then
+    pNew := nil
+  else
+    pNew := PMergeEngine(sqlite3MallocZero(csize_t(nByte)));
+  if pNew <> nil then begin
+    pNew^.nTree  := N;
+    pNew^.pTask  := nil;
+    { aReadr = &pNew[1] (the PmaReader array immediately follows the header);
+      aTree = &aReadr[N] (the int array immediately follows that). }
+    pNew^.aReadr := PPmaReader(PByte(pNew) + SizeOf(TMergeEngine));
+    pNew^.aTree  := Pi32(PByte(pNew^.aReadr) + i64(N) * SizeOf(TPmaReader));
+  end;
+  Result := pNew;
+end;
+
+{ vdbeMergeEngineFree — vdbesort.c:1216..1229.  Clear each PmaReader, then
+  free the single MergeEngine allocation. }
+procedure vdbeMergeEngineFree(pMerger: PMergeEngine);
+var
+  i: i32;
+begin
+  if pMerger <> nil then begin
+    for i := 0 to pMerger^.nTree - 1 do
+      vdbePmaReaderClear(@pMerger^.aReadr[i]);
+  end;
+  sqlite3_free(pMerger);
+end;
+
+{ vdbeMergeEngineCompare — vdbesort.c:2062..2114.  Recompute aTree[iOut] by
+  comparing the next keys on the two PmaReaders feeding that entry.  Neither
+  reader is advanced.  EOF reader is "greatest"; on a tie the lower-index
+  (older) reader wins (res<=0 -> i1). }
+procedure vdbeMergeEngineCompare(pMerger: PMergeEngine; iOut: i32);
+var
+  i1, i2, iRes: i32;
+  p1, p2:       PPmaReader;
+  pTask:        PSortSubtask;
+  bCached:      i32;
+  res:          i32;
+begin
+  Assert((iOut < pMerger^.nTree) and (iOut > 0));
+
+  if iOut >= (pMerger^.nTree div 2) then begin
+    i1 := (iOut - pMerger^.nTree div 2) * 2;
+    i2 := i1 + 1;
+  end else begin
+    i1 := pMerger^.aTree[iOut * 2];
+    i2 := pMerger^.aTree[iOut * 2 + 1];
+  end;
+
+  p1 := @pMerger^.aReadr[i1];
+  p2 := @pMerger^.aReadr[i2];
+
+  if p1^.pFd = nil then
+    iRes := i2
+  else if p2^.pFd = nil then
+    iRes := i1
+  else begin
+    pTask := pMerger^.pTask;
+    bCached := 0;
+    Assert(pTask^.pUnpacked <> nil);  { from vdbeSortSubtaskMain() }
+    res := pTask^.xCompare(pTask, @bCached,
+        p1^.aKey, p1^.nKey, p2^.aKey, p2^.nKey);
+    if res <= 0 then iRes := i1
+    else             iRes := i2;
+  end;
+
+  pMerger^.aTree[iOut] := iRes;
+end;
+
+{ vdbeMergeEngineStep — vdbesort.c:1642..1712.  Advance the current winner
+  (aTree[1]) one key, then walk UP the tree recomputing comparisons.  The C
+  pReadr1/pReadr2 pointers and the `pReadr1 - aReadr` index math / `pReadr1 <
+  pReadr2` tie rule are reproduced here via integer element indices into
+  aReadr[] (iReadr1/iReadr2), which preserves C's exact semantics. }
+function vdbeMergeEngineStep(pMerger: PMergeEngine; pbEof: Pi32): i32;
+var
+  rc:       i32;
+  iPrev:    i32;          { index of PmaReader to advance }
+  pTask:    PSortSubtask;
+  i:        i32;          { index of aTree[] to recalculate }
+  iReadr1:  i32;          { index of first PmaReader to compare }
+  iReadr2:  i32;          { index of second PmaReader to compare }
+  bCached:  i32;
+  iRes:     i32;
+  p1, p2:   PPmaReader;
+begin
+  iPrev := pMerger^.aTree[1];
+  pTask := pMerger^.pTask;
+
+  { Advance the current PmaReader }
+  rc := vdbePmaReaderNext(@pMerger^.aReadr[iPrev]);
+
+  { Update contents of aTree[] }
+  if rc = SQLITE_OK then begin
+    bCached := 0;
+
+    { Find the first two PmaReaders to compare. The one that was just
+      advanced (iPrev) and the one next to it in the array. }
+    iReadr1 := iPrev and $FFFE;
+    iReadr2 := iPrev or  $0001;
+
+    i := (pMerger^.nTree + iPrev) div 2;
+    while i > 0 do begin
+      { Compare the two readers. Store the result in iRes. }
+      p1 := @pMerger^.aReadr[iReadr1];
+      p2 := @pMerger^.aReadr[iReadr2];
+      if p1^.pFd = nil then
+        iRes := +1
+      else if p2^.pFd = nil then
+        iRes := -1
+      else
+        iRes := pTask^.xCompare(pTask, @bCached,
+            p1^.aKey, p1^.nKey, p2^.aKey, p2^.nKey);
+
+      { If pReadr1 contained the smaller value, set aTree[i] to its index.
+        Then set pReadr2 to the next PmaReader to compare to pReadr1.
+
+        Alternatively, if pReadr2 contains the smaller of the two values,
+        set aTree[i] to its index and update pReadr1.  If the comparison
+        was actually called above, then pTask->pUnpacked now contains a
+        value equivalent to pReadr2, so leave bCached set to prevent it
+        being decoded again.
+
+        If the two values were equal, the value from the oldest PMA (lower
+        aReadr[] index, i.e. iReadr1 < iReadr2) is considered smaller. }
+      if (iRes < 0) or ((iRes = 0) and (iReadr1 < iReadr2)) then begin
+        pMerger^.aTree[i] := iReadr1;
+        iReadr2 := pMerger^.aTree[i xor $0001];
+        bCached := 0;
+      end else begin
+        if p1^.pFd <> nil then bCached := 0;
+        pMerger^.aTree[i] := iReadr2;
+        iReadr1 := pMerger^.aTree[i xor $0001];
+      end;
+
+      i := i div 2;
+    end;
+    pbEof^ := Ord(pMerger^.aReadr[pMerger^.aTree[1]].pFd = nil);
+  end;
+
+  if rc = SQLITE_OK then
+    Result := pTask^.pUnpacked^.errCode
+  else
+    Result := rc;
+end;
+
+{ vdbeMergeEngineInit — vdbesort.c:2144..2218.  Initialise every PmaReader,
+  then build the initial aTree[] bottom-up.  Single-threaded: eMode is always
+  INCRINIT_NORMAL, so each reader is initialised via vdbePmaReaderIncrMergeInit
+  (the forward-stubbed no-incr path); the INCRINIT_ROOT / bg-thread arms are
+  omitted. }
+function vdbeMergeEngineInit(pTask: PSortSubtask; pMerger: PMergeEngine;
+                            eMode: i32): i32;
+var
+  rc:    i32;
+  i:     i32;
+  nTree: i32;
+begin
+  rc := SQLITE_OK;
+
+  { Failure to allocate the merge would have been detected before now. }
+  Assert(pMerger <> nil);
+
+  { eMode is always INCRINIT_NORMAL in single-threaded mode. }
+  Assert(eMode = INCRINIT_NORMAL);
+
+  { Verify that the MergeEngine is assigned to a single thread. }
+  Assert(pMerger^.pTask = nil);
+  pMerger^.pTask := pTask;
+
+  nTree := pMerger^.nTree;
+  for i := 0 to nTree - 1 do begin
+    rc := vdbePmaReaderIncrMergeInit(@pMerger^.aReadr[i], INCRINIT_NORMAL);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  for i := pMerger^.nTree - 1 downto 1 do
+    vdbeMergeEngineCompare(pMerger, i);
+  Result := pTask^.pUnpacked^.errCode;
+end;
+
+{ vdbeMergeEngineLevel0 — vdbesort.c:2338..2375.  Build a level-0 MergeEngine
+  reading nPMA PMAs directly from pTask->file starting at *piOffset; advance
+  *piOffset past the last PMA read. }
+function vdbeMergeEngineLevel0(pTask: PSortSubtask; nPMA: i32;
+                              piOffset: Pi64; ppOut: PPMergeEngine): i32;
+var
+  pNew:   PMergeEngine;
+  iOff:   i64;
+  i:      i32;
+  rc:     i32;
+  nDummy: i64;
+  pReadr: PPmaReader;
+begin
+  iOff := piOffset^;
+  rc := SQLITE_OK;
+
+  pNew := vdbeMergeEngineNew(nPMA);
+  ppOut^ := pNew;
+  if pNew = nil then rc := SQLITE_NOMEM_BKPT;
+
+  i := 0;
+  while (i < nPMA) and (rc = SQLITE_OK) do begin
+    nDummy := 0;
+    pReadr := @pNew^.aReadr[i];
+    rc := vdbePmaReaderInit(pTask, @pTask^.file_, iOff, pReadr, @nDummy);
+    iOff := pReadr^.iEof;
+    Inc(i);
+  end;
+
+  if rc <> SQLITE_OK then begin
+    vdbeMergeEngineFree(pNew);
+    ppOut^ := nil;
+  end;
+  piOffset^ := iOff;
+  Result := rc;
+end;
+
+{ Temporary inert body for vdbePmaReaderIncrMergeInit — 5.7.b.7 replaces this
+  with the real single-threaded IncrMerger initialiser.  In the no-incr case
+  (pReadr^.pIncr = nil, always true until 5.7.b.7) the correct behaviour is to
+  advance the reader to its first key, which is exactly what the real
+  INCRINIT_NORMAL / no-pIncr path reduces to. }
+function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32;
+begin
+  { 5.7.b.7 replaces this }
+  Result := vdbePmaReaderNext(pReadr);
 end;
 
 { ============================================================================
