@@ -62666,6 +62666,8 @@ type
                           when input is a bare number; cleared by 'unixepoch',
                           'auto', 'julianday', and any time-shifting modifier. }
     rawSec: Double;     { the raw input number when rawS=True. }
+    isError: Boolean;   { date.c isError — set by datetimeError (computeJD
+                          out-of-range / leftover rawS) → function NULL. }
   end;
 
 function dateIsLeap(y: i32): Boolean; inline;
@@ -62838,6 +62840,7 @@ begin
   dt.useSubsec := False;
   dt.rawS := False;
   dt.rawSec := 0.0;
+  dt.isError := False;
   { date.c:parseDateOrTime — `now` keyword: setDateTimeToCurrent. }
   if (Length(s) = 3)
      and ((s[1] = 'n') or (s[1] = 'N'))
@@ -63056,7 +63059,7 @@ end;
   fromJulianDay for sub-day units; for day/month/year units bumps the
   field directly and normalises with default-ceiling semantics
   (matching C's computeFloor(nFloor=0)). }
-function applyModifier(z: PAnsiChar; var dt: TDateTime2): Boolean;
+function applyModifier(z: PAnsiChar; idx: i32; var dt: TDateTime2): Boolean;
 var
   zMod, unit_: PAnsiChar;
   buf: array[0..31] of AnsiChar;
@@ -63137,6 +63140,7 @@ begin
     first modifier, and only when rawS is set. }
   if sqlite3StrICmp(zMod, 'unixepoch') = 0 then begin
     if not dt.rawS then Exit;
+    if idx > 1 then Exit;  { date.c:826 IMP: R-49255-55373 }
     r := dt.rawSec * 1000.0 + 210866760000000.0;
     if (r < 0.0) or (r >= 464269060800000.0) then Exit;
     dt.jd := r / 86400000.0;
@@ -63151,23 +63155,25 @@ begin
     rawS.  Otherwise (number out of JD range but in unix-epoch range),
     re-interpret as seconds since 1970. }
   if sqlite3StrICmp(zMod, 'auto') = 0 then begin
-    if not dt.rawS then begin Result := True; Exit; end;
-    if dt.validJD then begin
+    if idx > 1 then Exit;  { date.c:748 IMP: R-33611-57934 }
+    { date.c:autoAdjustDate (date.c:686..698).  If not a raw number, or it
+      already resolved to a julian day, just clear rawS.  Otherwise, if the
+      raw seconds fall in the unix-epoch-encodable range, re-interpret as
+      seconds since 1970 and clear rawS.  CRITICAL: when the value is OUT OF
+      RANGE, leave rawS set and validJD unset so the later finalize step
+      errors → SQL NULL. }
+    if (not dt.rawS) or dt.validJD then begin
       dt.rawS := False;
-      Result := True; Exit;
-    end;
-    { date.c:autoAdjustDate — accept inputs in [-21086676*10000,
-      25340230*10000+799] (rough bounds for julian-day-encodable
-      seconds-since-1970). }
-    if (dt.rawSec >= -21086676 * 10000.0)
-       and (dt.rawSec <= 25340230 * 10000.0 + 799.0) then
+    end
+    else if (dt.rawSec >= Double(-Int64(21086676) * Int64(10000)))
+            and (dt.rawSec <= Double(Int64(25340230) * Int64(10000) + 799)) then
     begin
       r := dt.rawSec * 1000.0 + 210866760000000.0;
       dt.jd := r / 86400000.0;
       fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
       dt.validJD := True;
+      dt.rawS := False;
     end;
-    dt.rawS := False;
     Result := True; Exit;
   end;
 
@@ -63189,6 +63195,7 @@ begin
     modifier.  Result is NULL when validJD is not set (number out
     of julian-day range). }
   if sqlite3StrICmp(zMod, 'julianday') = 0 then begin
+    if idx > 1 then Exit;  { date.c:795 IMP: R-31176-64601 }
     if not (dt.validJD and dt.rawS) then Exit;
     dt.rawS := False;
     Result := True; Exit;
@@ -63363,6 +63370,33 @@ begin
   Result := True;
 end;
 
+{ finalizeDate — mirror date.c isDate's terminal checks (date.c:1135..1136):
+      computeJD(p);
+      if( p->isError || !validJulianDay(p->iJD) ) return 1;  // -> SQL NULL
+  computeJD (date.c:260..298) sets isError when the year is outside
+  [-4713,9999] OR rawS is still set (a raw number that no modifier
+  successfully reinterpreted).  validJulianDay (date.c:458) requires
+  0 <= iJD <= 464269060799999.  Returns False to signal SQL NULL. }
+function finalizeDate(var dt: TDateTime2): Boolean;
+var
+  Y: i32;
+  iJD: Int64;
+begin
+  Result := False;
+  if dt.isError then Exit;
+  { computeJD (date.c:263) returns early when validJD is already set, so the
+    Y-range / rawS error only fires when the value has NOT yet resolved to a
+    julian day.  A leftover raw number that landed in JD range (validJD=True,
+    rawS still 1) is therefore accepted — matching datetime(2459607.05). }
+  if not dt.validJD then begin
+    Y := dt.yr;
+    if dt.rawS or (Y < -4713) or (Y > 9999) then Exit;
+  end;
+  iJD := Round(dt.jd * 86400000.0);
+  if (iJD < 0) or (iJD > Int64(464269060799999)) then Exit;
+  Result := True;
+end;
+
 { applyModifiers — apply argv[fromIdx..argc-1] modifiers to dt.
   Returns True on success; False if any modifier failed. }
 function applyModifiers(argc, fromIdx: i32; argv: PPMem;
@@ -63378,7 +63412,10 @@ begin
       Result := False; Exit;
     end;
     zMod := sqlite3_value_text(Psqlite3_value((argv+i)^));
-    if not applyModifier(zMod, dt) then begin
+    { date.c isDate: parseModifier is called with the 1-based modifier
+      index (the FIRST modifier is idx=1).  C indexes from argv[1] (date at
+      argv[0]); here the date is at argv[fromIdx-1], so idx = i-fromIdx+1. }
+    if not applyModifier(zMod, i - fromIdx + 1, dt) then begin
       Result := False; Exit;
     end;
     Inc(i);
@@ -63436,6 +63473,9 @@ begin
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
+  if not finalizeDate(dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
   emitDateYMD(pCtx, dt.yr, dt.mo, dt.dy);
 end;
 
@@ -63461,6 +63501,9 @@ begin
     sqlite3_result_null(pCtx); Exit;
   end;
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  if not finalizeDate(dt) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   if dt.useSubsec then
@@ -63530,6 +63573,9 @@ begin
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
+  if not finalizeDate(dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
   emitDateTime(pCtx, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s, dt.useSubsec);
 end;
 
@@ -63547,6 +63593,9 @@ begin
     sqlite3_result_null(pCtx); Exit;
   end;
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  if not finalizeDate(dt) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   sqlite3_result_double(pCtx, dt.jd);
@@ -63612,6 +63661,9 @@ begin
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
   end else begin
     if (argc > 2) and (not applyModifiers(argc, 2, argv, dt)) then begin
+      sqlite3_result_null(pCtx); Exit;
+    end;
+    if not finalizeDate(dt) then begin
       sqlite3_result_null(pCtx); Exit;
     end;
     jd := dt.jd;
