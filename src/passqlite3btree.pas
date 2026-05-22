@@ -1300,7 +1300,14 @@ begin
   end;
 
   if gap + 2 + nByte > top then begin
-    rc := defragmentPage(pPage, 4);
+    { btree.c:1885 — MIN(4, pPage->nFree - (2+nByte)).  When the residual
+      free space after this allocation is < 4 bytes the fast-path defragment
+      cannot safely leave fragments behind, so a smaller nMaxFrag forces the
+      full repack.  The previous hardcoded 4 left the page with stale
+      fragment bytes (frag=2) and an unaccounted freeblock gap → CORRUPT. }
+    g2 := i32(pPage^.nFree) - (2 + nByte);
+    if g2 > 4 then g2 := 4;
+    rc := defragmentPage(pPage, g2);
     if rc <> SQLITE_OK then begin Result := rc; Exit; end;
     top := get2byteNotZero(data + hdr + 5);
   end;
@@ -7175,18 +7182,36 @@ end;
 
 { btree.c lines 4336-4371: btreeEndTransaction }
 procedure btreeEndTransaction(p: PBtree);
-var pBt: PBtShared;
+var
+  pBt: PBtShared;
+  db:  PTsqlite3;
 begin
   pBt := p^.pBt;
+  db  := PTsqlite3(p^.db);
   pBt^.bDoTruncate := 0;   { btree.c:4342 — clear at every txn end. }
-  { No shared-cache table-lock lists to clear (SQLITE_OMIT_SHARED_CACHE) }
-  if p^.inTrans <> TRANS_NONE then begin
-    Dec(pBt^.nTransaction);
-    if pBt^.nTransaction = 0 then
-      pBt^.inTransaction := TRANS_NONE;
+  { btree.c:4344..4367.  If this handle still has a transaction open AND
+    the connection has other active read statements (nVdbeRead>1), then
+    downgrade to a read-only transaction rather than ending it — the other
+    statements may still be reading from the database, so the shared/read
+    lock must persist.  Without this arm, committing the last write
+    statement while a read cursor (e.g. a read-only incremental-blob
+    handle) is still open dropped the b-tree straight to TRANS_NONE; the
+    pager kept the SHARED lock because a cursor was open, but the b-tree
+    then reported TRANS_NONE so the final reader's commit skipped
+    CommitPhaseTwo and never released the lock (e_blobclose-2.1.5).
+    downgradeAllSharedCacheTableLocks is a no-op here (OMIT_SHARED_CACHE). }
+  if (p^.inTrans > TRANS_NONE) and (db <> nil) and (db^.nVdbeRead > 1) then begin
+    p^.inTrans := TRANS_READ;
+  end else begin
+    { No shared-cache table-lock lists to clear (SQLITE_OMIT_SHARED_CACHE) }
+    if p^.inTrans <> TRANS_NONE then begin
+      Dec(pBt^.nTransaction);
+      if pBt^.nTransaction = 0 then
+        pBt^.inTransaction := TRANS_NONE;
+    end;
+    p^.inTrans := TRANS_NONE;
+    unlockBtreeIfUnused(pBt);
   end;
-  p^.inTrans := TRANS_NONE;
-  unlockBtreeIfUnused(pBt);
 end;
 
 { btree.c lines 3594-3798: btreeBeginTrans (simplified: no shared-cache) }

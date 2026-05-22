@@ -49,6 +49,7 @@ uses
   passqlite3explain,
   passqlite3wholenumber,
   passqlite3decimal,
+  passqlite3qpvtab,
   passqlite3printf,
   passqlite3normalize,
   passqlite3cksumvfs,
@@ -566,12 +567,22 @@ begin
   Result := sqlite3DecimalInit(db);
 end;
 
+{ qpvtab — ported passqlite3qpvtab unit (ext/misc/qpvtab.c).
+  Needed by vtabdistinct.test / vtabrhs1.test which load it via
+  `load_static_extension db qpvtab` (test1.c registers
+  sqlite3_qpvtab_init the same way for the C build). }
+function qpvtab_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3QpvtabInit(db);
+end;
+
 function tclLoadStaticExtensionCmd(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
 const
   SQLITE_OK_LOAD_PERMANENTLY = 256;  { sqlite3.h — SQLITE_OK | (8<<8) }
 var
-  aExtension: array[0..9] of TStaticExt;
+  aExtension: array[0..10] of TStaticExt;
   db:         PTsqlite3;
   zName:      PAnsiChar;
   i, j, rc:   cint;
@@ -587,6 +598,7 @@ begin
   aExtension[7].zExtName := 'explain';     aExtension[7].pInit := @explain_ext_init;
   aExtension[8].zExtName := 'wholenumber'; aExtension[8].pInit := @wholenumber_ext_init;
   aExtension[9].zExtName := 'decimal';     aExtension[9].pInit := @decimal_ext_init;
+  aExtension[10].zExtName := 'qpvtab';     aExtension[10].pInit := @qpvtab_ext_init;
   zErrMsg := nil;
   if objc < 3 then
   begin
@@ -6317,6 +6329,7 @@ begin
     SQLITE_CONSTRAINT_FOREIGNKEY: Result := PChar('SQLITE_CONSTRAINT_FOREIGNKEY');
     SQLITE_CONSTRAINT_NOTNULL:    Result := PChar('SQLITE_CONSTRAINT_NOTNULL');
     SQLITE_CONSTRAINT_PRIMARYKEY: Result := PChar('SQLITE_CONSTRAINT_PRIMARYKEY');
+    SQLITE_CONSTRAINT_TRIGGER:    Result := PChar('SQLITE_CONSTRAINT_TRIGGER');
     SQLITE_CONSTRAINT_UNIQUE:     Result := PChar('SQLITE_CONSTRAINT_UNIQUE');
   else
     Result := t1ErrName(rc);

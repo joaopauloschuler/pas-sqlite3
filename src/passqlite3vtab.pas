@@ -439,6 +439,12 @@ function sqlite3VtabOverloadFunction(db: PTsqlite3;
   pDef: passqlite3vdbe.PTFuncDef; nArg: i32;
   pExpr: passqlite3codegen.PExpr): passqlite3vdbe.PTFuncDef;
 
+{ whereexpr.c:449..468 helper — query a vtab module's xFindFunction for an
+  operator-overload of zName/nArg.  Exposed for the gVtabFindFunctionOp
+  trampoline used by isAuxiliaryVtabOperator. }
+function sqlite3VtabFindFunctionOp(db: PTsqlite3; pTab: Pointer;
+  zName: PAnsiChar; nArg: i32): i32;
+
 { vtab.c:1223 — ensure pTab appears in pParse->pToplevel->apVtabLock so
   an OP_VBegin gets emitted for it.  No-op if already present. }
 procedure sqlite3VtabMakeWritable(pParse: passqlite3codegen.PParse;
@@ -1422,6 +1428,36 @@ begin
   Result := pNew;
 end;
 
+{ Trampoline wired into passqlite3codegen.gVtabFindFunctionOp so the
+  xFindFunction-overload arm of isAuxiliaryVtabOperator (whereexpr.c:449..468)
+  can ask a virtual table's module whether it overloads function zName/nArg.
+  Returns the eOp value xFindFunction reports, or 0 if no overload. }
+function sqlite3VtabFindFunctionOp(db: PTsqlite3; pTab: Pointer;
+  zName: PAnsiChar; nArg: i32): i32;
+var
+  pTb:    passqlite3codegen.PTable2;
+  pVT:    PVTable;
+  pVtab:  PSqlite3Vtab;
+  pMd:    PSqlite3Module;
+  xFind:  TVtabFindFn;
+  xSFunc: Pointer;
+  pArg:   Pointer;
+begin
+  Result := 0;
+  pTb := passqlite3codegen.PTable2(pTab);
+  if (pTb = nil) or (pTb^.eTabType <> passqlite3codegen.TABTYP_VTAB) then Exit;
+  pVT := sqlite3GetVTable(db, pTb);
+  if pVT = nil then Exit;
+  pVtab := pVT^.pVtab;
+  if (pVtab = nil) or (pVtab^.pModule = nil) then Exit;
+  pMd := pVtab^.pModule;
+  if pMd^.xFindFunction = nil then Exit;
+  xSFunc := nil;
+  pArg   := nil;
+  xFind  := TVtabFindFn(pMd^.xFindFunction);
+  Result := xFind(pVtab, nArg, zName, @xSFunc, @pArg);
+end;
+
 procedure sqlite3VtabMakeWritable(pParse: passqlite3codegen.PParse;
   pTab: passqlite3codegen.PTable2);
 var
@@ -1706,30 +1742,97 @@ begin
   Result := zBINARY;
 end;
 
+{ HiddenInfoOf — recover the THiddenIndexInfo header that allocateIndexInfo
+  places immediately after the Tsqlite3_index_info block (where.c:&pIdxInfo[1]). }
+function HiddenInfoOf(pIdxInfo: PSqlite3IndexInfo): PHiddenIndexInfo; inline;
+begin
+  Result := PHiddenIndexInfo(PByte(pIdxInfo) + SizeOf(Tsqlite3_index_info));
+end;
+
+{ where.c:4628 — sqlite3_vtab_distinct.  Returns the eDistinct flag (0..3)
+  the planner computed in allocateIndexInfo and stashed in HiddenIndexInfo. }
 function sqlite3_vtab_distinct(pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
+var
+  pHidden: PHiddenIndexInfo;
 begin
   if pIdxInfo = nil then begin Result := 0; Exit; end;
-  Result := 0;
+  pHidden := HiddenInfoOf(pIdxInfo);
+  Assert((pHidden^.eDistinct >= 0) and (pHidden^.eDistinct <= 3),
+    'sqlite3_vtab_distinct: eDistinct out of range');
+  Result := pHidden^.eDistinct;
 end;
 
+{ where.c:4573 — sqlite3_vtab_in.  Returns 1 if constraint iCons is really an
+  IN(...) constraint, setting/clearing the mHandleIn iterator flag per bHandle. }
 function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
   iCons: i32; bHandle: i32): i32; cdecl;
+var
+  pHidden: PHiddenIndexInfo;
+  m:       u32;
 begin
+  if pIdxInfo = nil then begin Result := 0; Exit; end;
+  pHidden := HiddenInfoOf(pIdxInfo);
+  { SMASKBIT32(iCons): 1<<iCons for iCons<32, else 0 (where.c). }
+  if (iCons >= 0) and (iCons < 32) then m := u32(1) shl iCons
+  else m := 0;
+  if (m and pHidden^.mIn) <> 0 then
+  begin
+    if bHandle = 0 then
+      pHidden^.mHandleIn := pHidden^.mHandleIn and (not m)
+    else if bHandle > 0 then
+      pHidden^.mHandleIn := pHidden^.mHandleIn or m;
+    Result := 1;
+    Exit;
+  end;
   Result := 0;
 end;
 
+{ where.c:4593 — sqlite3_vtab_rhs_value.  If possible, set *ppVal to the
+  sqlite3_value on the RHS of constraint iCons.  The value is lazily extracted
+  via sqlite3ValueFromExpr and cached in the HiddenIndexInfo.aRhs[] slot. }
 function sqlite3_vtab_rhs_value(pIdxInfo: PSqlite3IndexInfo;
   iCons: i32; ppVal: passqlite3vdbe.PPMem): i32; cdecl;
+var
+  pH:    PHiddenIndexInfo;
+  pVal:  passqlite3vdbe.PMem;
+  rc:    i32;
+  aRhs:  PPointer;
+  pTerm: PWhereTerm;
+  pExpr: passqlite3codegen.PExpr;
+  db:    PTsqlite3;
+  pNewVal: passqlite3vdbe.PMem;
 begin
-  if ppVal <> nil then ppVal^ := nil;
-  if (pIdxInfo = nil)
-     or (iCons < 0)
-     or (iCons >= pIdxInfo^.nConstraint) then
+  pVal := nil;
+  rc   := SQLITE_OK;
+  if (pIdxInfo = nil) or (iCons < 0) or (iCons >= pIdxInfo^.nConstraint) then
   begin
-    Result := SQLITE_MISUSE;
-    Exit;
+    rc := SQLITE_MISUSE;
+  end
+  else
+  begin
+    pH   := HiddenInfoOf(pIdxInfo);
+    aRhs := HiddenIndexInfoRhs(pH);
+    if aRhs[iCons] = nil then
+    begin
+      pTerm := termFromWhereClause(pH^.pWC,
+                 pIdxInfo^.aConstraint[iCons].iTermOffset);
+      pExpr := nil;
+      if (pTerm <> nil) and (pTerm^.pExpr <> nil) then
+        pExpr := pTerm^.pExpr^.pRight;
+      pNewVal := nil;
+      db := PTsqlite3(pH^.pParse^.db);
+      rc := sqlite3ValueFromExpr(Pointer(db), pExpr,
+              db^.enc, SQLITE_AFF_BLOB, pNewVal);
+      aRhs[iCons] := pNewVal;
+    end;
+    pVal := passqlite3vdbe.PMem(aRhs[iCons]);
   end;
-  Result := SQLITE_NOTFOUND;
+  if ppVal <> nil then ppVal^ := pVal;
+
+  if (rc = SQLITE_OK) and (pVal = nil) then
+    rc := SQLITE_NOTFOUND;
+
+  Result := rc;
 end;
 
 end.

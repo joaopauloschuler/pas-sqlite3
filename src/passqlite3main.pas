@@ -634,7 +634,9 @@ function sqlite3CantopenError(lineno: i32): i32;
 implementation
 
 uses
-  passqlite3printf;  { Phase 6.9-bis step 11g.1 — sqlite3MPrintf in OP_ParseSchema worker }
+  passqlite3printf,  { Phase 6.9-bis step 11g.1 — sqlite3MPrintf in OP_ParseSchema worker }
+  passqlite3dbpage,  { sqlite3DbpageRegister — built-in extension (main.c:3614) }
+  passqlite3dbstat;  { sqlite3DbstatRegister — built-in extension (main.c:3614) }
 
 { ----------------------------------------------------------------------
   aHardLimit — default per-connection limits (mirrors main.c aHardLimit).
@@ -975,6 +977,24 @@ begin
 
   sqlite3Error(db, SQLITE_OK);
   rc := SQLITE_OK;
+
+  { Register the in-tree built-in extensions before auto-loading user
+    extensions.  Port of main.c:3604..3617 — the sqlite3BuiltinExtensions[]
+    loop run under SQLITE_ENABLE_DBPAGE_VTAB / SQLITE_ENABLE_DBSTAT_VTAB
+    (both enabled in the standard test build).  These install the
+    eponymous sqlite_dbpage and dbstat virtual tables on every connection;
+    the C versions return rc (SQLITE_OK / SQLITE_NOMEM) checked in the
+    loop, the Pascal versions return a PVtabModule slot (nil on OOM), so
+    guard the second call on the first not having faulted malloc. }
+  if db^.mallocFailed = 0 then
+    sqlite3DbpageRegister(db);
+  if db^.mallocFailed = 0 then
+    sqlite3DbstatRegister(db);
+  if db^.mallocFailed <> 0 then begin
+    sqlite3OomFault(db);
+    rc := SQLITE_NOMEM;
+    goto opendb_out;
+  end;
 
   { Load automatic extensions — extensions registered via
     sqlite3_auto_extension().  Port of main.c:3618..3627. }
@@ -6282,6 +6302,10 @@ initialization
     circular codegen->vtab uses. }
   passqlite3codegen.gVtabOverloadFunction :=
     passqlite3codegen.TVtabOverloadFunctionFn(@passqlite3vtab.sqlite3VtabOverloadFunction);
+  { Wire sqlite3VtabFindFunctionOp so isAuxiliaryVtabOperator (codegen.pas,
+    whereexpr.c:449) can query a vtab module's xFindFunction overload. }
+  passqlite3codegen.gVtabFindFunctionOp :=
+    passqlite3codegen.TVtabFindFunctionOpFn(@passqlite3vtab.sqlite3VtabFindFunctionOp);
   { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
     dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA. }
   passqlite3codegen.gFileControl :=

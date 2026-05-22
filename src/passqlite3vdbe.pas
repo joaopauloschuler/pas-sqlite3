@@ -1324,6 +1324,7 @@ procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar;
                                const args: array of const);
 function  sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
                                     nArg: i32; pFunc: PFuncDef; p5: i32): i32;
+function  sqlite3NotPureFunc(pCtx: Psqlite3_context): i32;
 function  sqlite3VdbeExplainParent(pParse: PParse): i32;
 procedure sqlite3ExplainBreakpoint(z1, z2: PAnsiChar);
 function  sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar;
@@ -2613,11 +2614,58 @@ begin
   else
     op := OP_Function;
   addr := sqlite3VdbeAddOp4(v, op, p1, p2, p3, PAnsiChar(pCtx), P4_FUNCCTX);
-  { Note: ChangeP5(nArg) elided — current libsqlite3 (matches the EXPLAIN
-    oracle) does not write P5 for OP_Function/OP_PureFunc; argc is read
-    from pCtx^.argc at runtime, not pOp^.p5.  Setting P5 introduces a
-    spurious bytecode-diff against the oracle. }
+  { vdbeaux.c:465 — sqlite3VdbeChangeP5(v, eCallCtx & NC_SelfRef).  NC_SelfRef
+    = 0x2E (NC_PartIdx|NC_IsCheck|NC_GenCol|NC_IdxExpr, sqliteInt.h:3532); the
+    masked context bits become the OP_PureFunc P5 byte that sqlite3NotPureFunc
+    reads to choose "a CHECK constraint" / "a generated column" / "an index".
+    For an ordinary (non-DDL) function call eCallCtx is 0, so P5 stays 0 and
+    no ChangeP5 fires — preserving byte-identical bytecode vs the EXPLAIN
+    oracle (which never writes P5 for OP_Function).  argc is read from
+    pCtx^.argc at runtime, not pOp^.p5. }
+  if (p5 and $2E) <> 0 then
+    sqlite3VdbeChangeP5(v, u16(p5 and $2E));
   Result := addr;
+end;
+
+{ sqlite3NotPureFunc — port of vdbeaux.c:5627..5650.  Invoked by date/time
+  functions that use non-deterministic features (e.g. 'now', 'localtime',
+  'utc', 'subsec').  Returns 1 normally; but when the function was coded as
+  OP_PureFunc (i.e. it appears in a CHECK constraint / generated column /
+  index expression — context recorded in the opcode's P5 byte by
+  sqlite3VdbeAddFunctionCall), it sets a "non-deterministic use of X() in ..."
+  error on pCtx and returns 0.  The date function then aborts the parse,
+  leaving the error in place (and must NOT subsequently call result_null). }
+function sqlite3NotPureFunc(pCtx: Psqlite3_context): i32;
+var
+  pOp:      PVdbeOp;
+  zContext: PAnsiChar;
+  zMsg:     PAnsiChar;
+  pFn:      PTFuncDef;
+begin
+  { SQLITE_ENABLE_STAT4 guard (vdbeaux.c:5630): pVdbe may be nil when a
+    function is evaluated outside the VM (STAT4 sample analysis).  Harmless
+    to keep unconditionally. }
+  if (pCtx = nil) or (pCtx^.pVdbe = nil) then begin Result := 1; Exit; end;
+  pOp := PVdbeOp(PByte(pCtx^.pVdbe^.aOp) + u32(pCtx^.iOp) * SizeOf(TVdbeOp));
+  if pOp^.opcode = OP_PureFunc then
+  begin
+    { NC_IsCheck=0x04, NC_GenCol=0x08 (sqliteInt.h:3528..3529).  P5 holds the
+      DDL context bits (eCallCtx & NC_SelfRef). }
+    if (pOp^.p5 and $04) <> 0 then
+      zContext := 'a CHECK constraint'
+    else if (pOp^.p5 and $08) <> 0 then
+      zContext := 'a generated column'
+    else
+      zContext := 'an index';
+    pFn := PTFuncDef(pCtx^.pFunc);
+    zMsg := sqlite3MPrintf(pCtx^.pVdbe^.db,
+      'non-deterministic use of %s() in %s', [pFn^.zName, zContext]);
+    sqlite3_result_error(pCtx, zMsg, -1);
+    sqlite3DbFree(pCtx^.pVdbe^.db, zMsg);
+    Result := 0;
+    Exit;
+  end;
+  Result := 1;
 end;
 
 { --- Label management --- }
@@ -6689,6 +6737,8 @@ var
   i:          i32;
   pVar:       PMem;
   zStart:     PAnsiChar;
+  enc:        u8;
+  utf8:       TMem;
 begin
   Result := nil;
   if (p = nil) or (zRawSql = nil) then Exit;
@@ -6733,7 +6783,21 @@ begin
       else if (pVar^.flags and MEM_Real) <> 0 then
         sqlite3_str_appendf(out_, '%!.15g', [pVar^.u.r])
       else if (pVar^.flags and MEM_Str) <> 0 then begin
+        { vdbetrace.c:137..148 — convert UTF-16 bound text to UTF-8 for
+          display before formatting it as a quoted literal. }
+        enc := db^.enc;
+        if enc <> SQLITE_UTF8 then begin
+          FillChar(utf8, SizeOf(utf8), 0);
+          utf8.db := Psqlite3(db);
+          sqlite3VdbeMemSetStr(@utf8, pVar^.z, pVar^.n, enc, SQLITE_STATIC);
+          if sqlite3VdbeChangeEncoding(@utf8, SQLITE_UTF8) = SQLITE_NOMEM then begin
+            out_^.accError := SQLITE_NOMEM;
+            out_^.nAlloc   := 0;
+          end;
+          pVar := @utf8;
+        end;
         sqlite3_str_appendf(out_, '''%.*q''', [pVar^.n, pVar^.z]);
+        if enc <> SQLITE_UTF8 then sqlite3VdbeMemRelease(@utf8);
       end else if (pVar^.flags and MEM_Zero) <> 0 then
         sqlite3_str_appendf(out_, 'zeroblob(%d)', [pVar^.u.nZero])
       else begin
@@ -8896,10 +8960,11 @@ begin
             zTrcStmt := v^.zSql;
           if zTrcStmt <> nil then begin
             if (db^.mTrace and SQLITE_TRACE_LEGACY) <> 0 then begin
-              { Legacy xTrace receives expanded SQL.  No expander wired in
-                this build — pass zTrcStmt verbatim to keep call shape. }
+              { Legacy xTrace receives expanded SQL (vdbe.c:9072..9075). }
+              zTrcDup := sqlite3VdbeExpandSql(v, zTrcStmt);
               if Assigned(db^.trace.xLegacy) then
-                db^.trace.xLegacy(db^.pTraceArg, zTrcStmt);
+                db^.trace.xLegacy(db^.pTraceArg, zTrcDup);
+              sqlite3_free(zTrcDup);
             end else if db^.nVdbeExec > 1 then begin
               zTrcDup := sqlite3MPrintf(db, '-- %s', [zTrcStmt]);
               if Assigned(db^.trace.xV2) then
@@ -11030,7 +11095,10 @@ begin
       pOut := out2Prerelease(v, pOp);
       idx := 0;
       sqlite3BtreeGetMeta(PBtree(db^.aDb[pOp^.p1].pBt), pOp^.p3, @idx);
-      pOut^.u.i := i64(idx);
+      { C: int iMeta; sqlite3BtreeGetMeta(...,(u32*)&iMeta); pOut->u.i=iMeta;
+        — assigning a signed 32-bit int to i64 SIGN-EXTENDS. Cast u32 bits
+        through i32 so the high bit propagates (vdbe.c:4216/4228/4230). }
+      pOut^.u.i := i64(i32(idx));
     end;
 
     { ────── OP_SetCookie ────── (vdbe.c:4249) }
@@ -12310,6 +12378,24 @@ begin
     pCycleOp := nil;
   end;
   {$ENDIF}
+
+  { vdbe.c:9339..9348 — final progress-callback check at the normal exit.
+    A statement that halts (or finishes) without crossing a
+    check_for_interrupt boundary after nVmStep last advanced past
+    nProgressLimit must still invoke xProgress here.  Without this arm a
+    short query (one whose VM-step count exceeds db^.nProgressOps but
+    never re-reaches a check_for_interrupt opcode at the right step) never
+    fires the handler at all (progress-1.7: `db progress 5 ...` with N>1
+    never aborted, so the inner SELECT ran to completion). }
+  while (nVmStep >= nProgressLimit) and (db^.xProgress <> nil) do begin
+    nProgressLimit := nProgressLimit + db^.nProgressOps;
+    if db^.xProgress(db^.pProgressArg) <> 0 then begin
+      nProgressLimit := u64($FFFFFFFFFFFFFFFF);
+      rc := SQLITE_INTERRUPT;
+      goto abort_due_to_error;
+    end;
+  end;
+
   Inc(v^.aCounter[SQLITE_STMTSTATUS_VM_STEP], i32(nVmStep));
   if v^.lockMask <> 0 then
     sqlite3VdbeLeave(v);
