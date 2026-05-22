@@ -48210,6 +48210,9 @@ var
   sortOrderMask: i32;
   requestedSortOrder: i32;
   zSchemaTab:  PAnsiChar;
+  ppFrom:      ^PIndex2;
+  pThis:       PIndex2;
+  pNext:       PIndex2;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -48722,6 +48725,43 @@ begin
 
 exit_create_index:
   if pIndex <> nil then sqlite3FreeIndex(db, pIndex);
+  if pTab <> nil then begin
+    { Ensure all REPLACE indexes on pTab are at the end of the pIndex list.
+      The list was already ordered when this routine was entered, so at this
+      point at most a single index (the newly added index) will be out of
+      order.  So we have to reorder at most one index.  (build.c:4498) }
+    ppFrom := @pTab^.pIndex;
+    while True do begin
+      pThis := ppFrom^;
+      if pThis = nil then break;
+      if pThis^.onError <> OE_Replace then begin
+        ppFrom := @pThis^.pNext;
+        continue;
+      end;
+      pNext := pThis^.pNext;
+      while (pNext <> nil) and (pNext^.onError <> OE_Replace) do begin
+        ppFrom^         := pNext;
+        pThis^.pNext    := pNext^.pNext;
+        pNext^.pNext    := pThis;
+        ppFrom          := @pNext^.pNext;
+        pNext           := pThis^.pNext;
+      end;
+      break;
+    end;
+{$IFDEF SQLITE_DEBUG}
+    { Verify that all REPLACE indexes really are now at the end of the
+      index list.  In other words, no other index type ever comes after a
+      REPLACE index on the list. }
+    pThis := pTab^.pIndex;
+    while pThis <> nil do begin
+      AssertH((pThis^.onError <> OE_Replace)
+           or (pThis^.pNext = nil)
+           or (pThis^.pNext^.onError = OE_Replace),
+           'CreateIndex REPLACE reorder');
+      pThis := pThis^.pNext;
+    end;
+{$ENDIF}
+  end;
   sqlite3ExprDelete(db, pPIWhere);
   sqlite3ExprListDelete(db, pList);
   sqlite3SrcListDelete(db, pTblName);
