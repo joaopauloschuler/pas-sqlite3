@@ -1214,4 +1214,4 @@ pas-strict	../sqlite3/test/zerodamage.test	-
 pas-strict	../sqlite3/test/zipfile.test	-
 pas-strict	../sqlite3/test/zipfile2.test	-
 pas-skip	../sqlite3/test/zipfilefault.test	unswept
-pas-soft	src/tests/tcl/preupdate.test	9.4.2.u.1-needs-PREUPDATE=1
+pas-strict	src/tests/tcl/preupdate.test	6.40.3-runtime-skip-on-default-lib

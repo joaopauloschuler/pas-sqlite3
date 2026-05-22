@@ -50,12 +50,29 @@ uses
   passqlite3wholenumber,
   passqlite3decimal,
   passqlite3qpvtab,
+  { 6.40.4 — more statically-linked test extensions for load_static_extension. }
+  passqlite3series,
+  passqlite3spellfix,
+  passqlite3closure,
+  passqlite3csv,
+  passqlite3fuzzer,
+  passqlite3prefixes,
+  passqlite3randomjson,
+  passqlite3appendvfs,
+  passqlite3amatch,
+  passqlite3nextchar,
+  passqlite3remember,
+  passqlite3unionvtab,
   passqlite3printf,
   passqlite3normalize,
   passqlite3cksumvfs,
   passqlite3multiplex,
   passqlite3carray,
   passqlite3internal,
+  passqlite3mmapwarm,
+  passqlite3btree,
+  passqlite3pager,
+  passqlite3pcache,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -80,6 +97,8 @@ const
   { sqlite3.h — opcode 20.  Defined in passqlite3main implementation but
     not re-exported in the unit's interface; mirror locally. }
   SQLITE_TESTCTRL_NEVER_CORRUPT_OP = 20;
+  { sqlite3.h — opcode 29.  Mirrored locally (see comment above). }
+  SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP = 29;
   SEEK_SET = 0;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -577,12 +596,99 @@ begin
   Result := sqlite3QpvtabInit(db);
 end;
 
+{ 6.40.4 — twelve more aExtension[] slots mirroring test1.c:8406..8435.
+  Each Pas port already exists (ext/misc/*.c); only the C-ABI shim + the
+  table row were missing.
+    * series      — ext/misc/series.c     (bestindexC, join8, tabfunc01, with2)
+    * spellfix    — ext/misc/spellfix.c   (spellfix2)
+    * closure     — ext/misc/closure.c    (closure01)
+    * csv         — ext/misc/csv.c        (csv01)
+    * fuzzer      — ext/misc/fuzzer.c     (fuzzer1/fuzzer2/fuzzerfault)
+    * prefixes    — ext/misc/prefixes.c   (prefixes)
+    * randomjson  — ext/misc/randomjson.c (json106, json108)
+    * appendvfs   — ext/misc/appendvfs.c  (avfs)
+    * amatch      — ext/misc/amatch.c
+    * nextchar    — ext/misc/nextchar.c
+    * remember    — ext/misc/remember.c   (tabfunc01)
+    * unionvtab   — ext/misc/unionvtab.c }
+function series_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3SeriesInit(db);
+end;
+
+function spellfix_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3SpellfixInit(db);
+end;
+
+function closure_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3ClosureInit(db);
+end;
+
+function csv_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3CsvInit(db);
+end;
+
+function fuzzer_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3FuzzerInit(db);
+end;
+
+function prefixes_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3PrefixesInit(db);
+end;
+
+function randomjson_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3RandomJsonInit(db);
+end;
+
+function appendvfs_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3AppendvfsInit(db);
+end;
+
+function amatch_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3AmatchInit(db);
+end;
+
+function nextchar_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3NextcharInit(db);
+end;
+
+function remember_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3RememberInit(db);
+end;
+
+function unionvtab_ext_init(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+  pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3UnionvtabInit(db);
+end;
+
 function tclLoadStaticExtensionCmd(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
 const
   SQLITE_OK_LOAD_PERMANENTLY = 256;  { sqlite3.h — SQLITE_OK | (8<<8) }
 var
-  aExtension: array[0..10] of TStaticExt;
+  aExtension: array[0..22] of TStaticExt;
   db:         PTsqlite3;
   zName:      PAnsiChar;
   i, j, rc:   cint;
@@ -599,6 +705,18 @@ begin
   aExtension[8].zExtName := 'wholenumber'; aExtension[8].pInit := @wholenumber_ext_init;
   aExtension[9].zExtName := 'decimal';     aExtension[9].pInit := @decimal_ext_init;
   aExtension[10].zExtName := 'qpvtab';     aExtension[10].pInit := @qpvtab_ext_init;
+  aExtension[11].zExtName := 'series';     aExtension[11].pInit := @series_ext_init;
+  aExtension[12].zExtName := 'spellfix';   aExtension[12].pInit := @spellfix_ext_init;
+  aExtension[13].zExtName := 'closure';    aExtension[13].pInit := @closure_ext_init;
+  aExtension[14].zExtName := 'csv';        aExtension[14].pInit := @csv_ext_init;
+  aExtension[15].zExtName := 'fuzzer';     aExtension[15].pInit := @fuzzer_ext_init;
+  aExtension[16].zExtName := 'prefixes';   aExtension[16].pInit := @prefixes_ext_init;
+  aExtension[17].zExtName := 'randomjson'; aExtension[17].pInit := @randomjson_ext_init;
+  aExtension[18].zExtName := 'appendvfs';  aExtension[18].pInit := @appendvfs_ext_init;
+  aExtension[19].zExtName := 'amatch';     aExtension[19].pInit := @amatch_ext_init;
+  aExtension[20].zExtName := 'nextchar';   aExtension[20].pInit := @nextchar_ext_init;
+  aExtension[21].zExtName := 'remember';   aExtension[21].pInit := @remember_ext_init;
+  aExtension[22].zExtName := 'unionvtab';  aExtension[22].pInit := @unionvtab_ext_init;
   zErrMsg := nil;
   if objc < 3 then
   begin
@@ -1758,6 +1876,56 @@ begin
   if clientData = nil then ;
 end;
 
+{ test3.c:147..190 — btree_pager_stats ID.
+  Returns pager statistics as a Tcl list of name/value pairs.  ID is the
+  "%p" text of a Btree* (from btree_from_db).  The Btree may belong to an
+  open SQLite connection, so acquire pBt->db->mutex before BtreeEnter.
+  6.40.6 (HARNESS). }
+function btree_pager_stats(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+type
+  TArgvArr = array[0..16] of PAnsiChar;
+  PArgvArr = ^TArgvArr;
+const
+  zName: array[0..10] of PChar = (
+    'ref', 'page', 'max', 'size', 'state', 'err',
+    'hit', 'miss', 'ovfl', 'read', 'write');
+var
+  av:    PArgvArr;
+  pBt:   PBtree;
+  a:     PPagerStatsArray;
+  i:     cint;
+  zBuf:  array[0..99] of AnsiChar;
+  s:     AnsiString;
+begin
+  av := PArgvArr(argv);
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av^[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(av^[1]));
+
+  { The Btree handle may have been obtained from an open SQLite connection
+    (via btree_from_db), so take the controlling handle's mutex first. }
+  sqlite3_mutex_enter(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3BtreeEnter(pBt);
+  a := sqlite3PagerStats(sqlite3BtreePager(pBt));
+  for i := 0 to 10 do
+  begin
+    Tcl_AppendElement(interp, zName[i]);
+    s := IntToStr(a^[i]);  { C: sqlite3_snprintf(zBuf,"%d",a[i]) }
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    Move(s[1], zBuf[0], Length(s));
+    Tcl_AppendElement(interp, @zBuf[0]);
+  end;
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(PTsqlite3(pBt^.db)^.mutex);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test3.c:429..502 — btree_varint_test START MULTIPLIER COUNT INCREMENT.
   Round-trips integers through sqlite3PutVarint / sqlite3GetVarint to
   validate the codec.  Mirrors C 1:1 including the inner 19x getVarint
@@ -2346,6 +2514,91 @@ begin
   rc := sqlite3_reset(pStmt);
   Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
   Result := TCL_OK;
+end;
+
+{ test1.c:3056..3078 — uses_stmt_journal STMT.
+  Return true if STMT uses a statement journal.  6.40.6 (HARNESS). }
+function uses_stmt_journal(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pStmt: PVdbe;
+  b:     cint;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' STMT'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pStmt := PVdbe(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+  sqlite3_stmt_readonly(pStmt);
+  if (pStmt^.vdbeFlags and VDBF_UsesStmtJournal) <> 0 then b := 1 else b := 0;
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(b));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:6553..6589 — sqlite3_pager_refcounts DB.
+  Return a list of the PagerRefcount for each pager on the connection
+  (or -1 if a backend has no Btree).  6.40.6 (HARNESS). }
+function test_pager_refcounts(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:      PTsqlite3;
+  i, v:    cint;
+  a:       PPagerStatsArray;
+  pBt:     PBtree;
+  pResult: PTclObj;
+begin
+  if objc <> 2 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  pResult := Tcl_NewObj();
+  for i := 0 to db^.nDb - 1 do
+  begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt = nil then
+      v := -1
+    else
+    begin
+      sqlite3_mutex_enter(db^.mutex);
+      a := sqlite3PagerStats(sqlite3BtreePager(pBt));
+      v := a^[0];
+      sqlite3_mutex_leave(db^.mutex);
+    end;
+    Tcl_ListObjAppendElement(nil, pResult, Tcl_NewIntObj(v));
+  end;
+  Tcl_SetObjResult(interp, pResult);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:7571..7598 — pcache_stats.
+  Return the global pcache statistics as a name/value list.  6.40.6. }
+function test_pcache_stats(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  nMin, nMax, nCurrent, nRecyclable: cint;
+  pRet: PTclObj;
+begin
+  sqlite3PcacheStats(@nCurrent, @nMax, @nMin, @nRecyclable);
+  pRet := Tcl_NewObj();
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewStringObj(PChar('current'), -1));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(nCurrent));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewStringObj(PChar('max'), -1));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(nMax));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewStringObj(PChar('min'), -1));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(nMin));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewStringObj(PChar('recyclable'), -1));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(nRecyclable));
+  Tcl_SetObjResult(interp, pRet);
+  Result := TCL_OK;
+  if (clientData = nil) or (objc < 0) or (objv = nil) then ;
 end;
 
 { ----------------------------------------------------------------------
@@ -5324,6 +5577,55 @@ begin
   if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
 end;
 
+{ test1.c:7515..7536 — extra_schema_checks BOOLEAN.
+  Enable/disable schema checks when parsing sqlite_schema.  6.40.6 (HARNESS). }
+function extra_schema_checks(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+begin
+  i := 0;
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @i) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_test_control(SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP, i);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:7185..7214 — file_control_powersafe_overwrite DB PSOW-FLAG.
+  Runs sqlite3_file_control with SQLITE_FCNTL_POWERSAFE_OVERWRITE.
+  Result is "<rc> <b>".  6.40.6 (HARNESS). }
+function file_control_powersafe_overwrite(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:  PTsqlite3;
+  rc:  cint;
+  b:   cint;
+  s:   AnsiString;
+begin
+  if objc <> 3 then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB FLAG'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[2], @b) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_file_control(db, nil, SQLITE_FCNTL_POWERSAFE_OVERWRITE, @b);
+  s := IntToStr(rc) + ' ' + IntToStr(b);
+  Tcl_AppendResult(interp, PChar(s), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.63.a — test1.c:6169..6186 tcl_variable_type.
   Usage:  tcl_variable_type VARIABLENAME
   Return the name of the internal Tcl_Obj type of the named variable's
@@ -7187,6 +7489,227 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:1824..1848 — test_blob_reopen.
+  Usage: sqlite3_blob_reopen CHANNEL ROWID. }
+function test_blob_reopen(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  iRowid: Int64;
+  pBlob:  Psqlite3_blob;
+  rc:     cint;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('CHANNEL ROWID'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if blobHandleFromObj(interp, objv[1], pBlob) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, objv[2], @iRowid) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_blob_reopen(pBlob, iRowid);
+  if rc <> SQLITE_OK then
+    Tcl_SetResult(interp, t1ErrName(rc), TCL_VOLATILE);
+  if rc = SQLITE_OK then Result := TCL_OK else Result := TCL_ERROR;
+end;
+
+{ test1.c:5984..5998 — test_interrupt (old-style argc/argv handler).
+  Usage: sqlite3_interrupt DB. }
+function test_interrupt(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_interrupt(db);
+  Result := TCL_OK;
+end;
+
+{ test1.c:6005..6021 — test_is_interrupted (old-style argc/argv handler).
+  Usage: sqlite3_is_interrupted DB.  Returns 1 if an interrupt is in effect. }
+function test_is_interrupted(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  av: PPAnsiCharArr;
+  rc: cint;
+begin
+  av := argv;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_is_interrupted(db);
+  if rc <> 0 then
+    Tcl_AppendResult(interp, PChar('1'), Pointer(nil))
+  else
+    Tcl_AppendResult(interp, PChar('0'), Pointer(nil));
+  Result := TCL_OK;
+end;
+
+{ test1.c:7685..7740 — test_wal_checkpoint_v2.
+  Usage: sqlite3_wal_checkpoint_v2 db MODE ?NAME?. }
+function test_wal_checkpoint_v2(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  aMode: array[0..5] of PChar =
+    ('noop', 'passive', 'full', 'restart', 'truncate', nil);
+var
+  zDb:   PAnsiChar;
+  db:    PTsqlite3;
+  rc:    cint;
+  eMode: cint;
+  nLog:  cint;
+  nCkpt: cint;
+  pRet:  PTclObj;
+  zErrCode: PAnsiChar;
+begin
+  zDb := nil;
+  nLog := -555;
+  nCkpt := -555;
+  if (objc <> 3) and (objc <> 4) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB MODE ?NAME?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 4 then
+    zDb := Tcl_GetString(objv[3]);
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(nil, objv[2], @eMode) <> TCL_OK then
+  begin
+    if Tcl_GetIndexFromObj(interp, objv[2], @aMode[0], PChar('mode'), 0,
+        @eMode) <> TCL_OK then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+    eMode := eMode - 1;
+  end;
+
+  rc := sqlite3_wal_checkpoint_v2(db, zDb, eMode, @nLog, @nCkpt);
+  if (rc <> SQLITE_OK) and (rc <> SQLITE_BUSY) then
+  begin
+    zErrCode := t1ErrName(rc);
+    Tcl_ResetResult(interp);
+    Tcl_AppendResult(interp, zErrCode, PChar(' - '), sqlite3_errmsg(db),
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+
+  pRet := Tcl_NewObj();
+  if rc = SQLITE_BUSY then
+    Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(1))
+  else
+    Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(0));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(nLog));
+  Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(nCkpt));
+  Tcl_SetObjResult(interp, pRet);
+  Result := TCL_OK;
+end;
+
+{ test1.c:8734..8758 — test_mmap_warm.
+  Usage: sqlite3_mmap_warm DB ?DBNAME?. }
+function test_mmap_warm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc:  cint;
+  db:  PTsqlite3;
+  zDb: PAnsiChar;
+begin
+  if (objc <> 2) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB ?DBNAME?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zDb := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc = 3 then
+    zDb := Tcl_GetString(objv[2]);
+  rc := sqlite3_mmap_warm(db, zDb);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
+  Result := TCL_OK;
+end;
+
+{ utf.c:505..518 — sqlite3Utf8To8 (SQLITE_TEST && SQLITE_DEBUG only).
+  Translate UTF-8 to UTF-8 in place: make sure the string is well-formed,
+  dropping miscoded (0xFFFD) characters.  Aborts if the output overruns the
+  input.  Returns the new byte length.  Ported here because the engine omits
+  this test-only helper. }
+function utf8To8Inplace(zIn: PByte): cint;
+var
+  zOut:   PByte;
+  zStart: PByte;
+  pRead:  PChar;
+  c:      u32;
+begin
+  zOut := zIn;
+  zStart := zIn;
+  while (zIn[0] <> 0) and (PtrUInt(zOut) <= PtrUInt(zIn)) do
+  begin
+    pRead := PChar(zIn);
+    c := sqlite3Utf8Read(@pRead);
+    zIn := PByte(pRead);
+    if c <> $fffd then
+      Inc(zOut, sqlite3AppendOneUtf8Character(PChar(zOut), c));
+  end;
+  zOut^ := 0;
+  Result := cint(PtrUInt(zOut) - PtrUInt(zStart));
+end;
+
+{ test_hexio.c:299..336 — utf8_to_utf8 HEX.
+  The argument is a UTF8 string in hex; convert it back to binary, run it
+  through sqlite3Utf8To8 (well-form it), then re-hex and return.  Built with
+  -DSQLITE_DEBUG so the function is available (no #else stub). }
+function utf8_to_utf8(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  n:     cint;
+  nOut:  cint;
+  zOrig: PByte;
+  z:     PByte;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('HEX'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zOrig := PByte(Tcl_GetStringFromObj(objv[1], @n));
+  z := sqlite3_malloc64(u64(n) + 4);
+  n := t1HexToBin(zOrig, n, z);
+  (z + n)^ := 0;
+  nOut := utf8To8Inplace(z);
+  t1BinToHex(z, nOut);
+  Tcl_AppendResult(interp, PChar(z), Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
 { ----------------------------------------------------------------------
   test1.c:4395..4728 — sqlite3_carray_bind.
 
@@ -7672,6 +8195,9 @@ begin
   { 9.4.divbug.88.011 — btree_from_db.  test3.c:676. }
   Tcl_CreateCommand(interp, PChar('btree_from_db'),
     @btree_from_db, nil, nil);
+  { 6.40.6 (HARNESS) — btree_pager_stats.  test3.c:668. }
+  Tcl_CreateCommand(interp, PChar('btree_pager_stats'),
+    @btree_pager_stats, nil, nil);
   { 9.4.divbug.88.062 — btree_varint_test.  test3.c:675. }
   Tcl_CreateCommand(interp, PChar('btree_varint_test'),
     @btree_varint_test, nil, nil);
@@ -7721,6 +8247,15 @@ begin
     @tcl_test_finalize, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_reset'),
     @tcl_test_reset, nil, nil);
+  { 6.40.6 (HARNESS) — uses_stmt_journal.  test1.c:9169. }
+  Tcl_CreateObjCommand(interp, PChar('uses_stmt_journal'),
+    @uses_stmt_journal, nil, nil);
+  { 6.40.6 (HARNESS) — sqlite3_pager_refcounts.  test1.c:9181. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_pager_refcounts'),
+    @test_pager_refcounts, nil, nil);
+  { 6.40.6 (HARNESS) — pcache_stats.  test1.c:9283. }
+  Tcl_CreateObjCommand(interp, PChar('pcache_stats'),
+    @test_pcache_stats, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_column_count'),
     @tcl_column_count, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_data_count'),
@@ -7934,6 +8469,12 @@ begin
     @database_never_corrupt, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('database_may_be_corrupt'),
     @database_may_be_corrupt, nil, nil);
+  { 6.40.6 (HARNESS) — extra_schema_checks.  test1.c:9193. }
+  Tcl_CreateObjCommand(interp, PChar('extra_schema_checks'),
+    @extra_schema_checks, nil, nil);
+  { 6.40.6 (HARNESS) — file_control_powersafe_overwrite.  test1.c:9256. }
+  Tcl_CreateObjCommand(interp, PChar('file_control_powersafe_overwrite'),
+    @file_control_powersafe_overwrite, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('tcl_variable_type'),
     @tcl_variable_type, nil, nil);
   { 9.4.divbug.63.b — file_control_reservebytes (test1.c:9258 / 7249..7276). }
@@ -8001,6 +8542,22 @@ begin
     @test_blob_read, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_write'),
     @test_blob_write, nil, nil);
+  { 6.40.9 — WAL/blob test-harness commands.
+    test1.c:9281 blob_reopen, 9288 wal_checkpoint_v2, 9323 mmap_warm;
+    test1.c:9090/9091 interrupt + is_interrupted (old-style);
+    test_hexio.c:466 utf8_to_utf8. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_blob_reopen'),
+    @test_blob_reopen, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_wal_checkpoint_v2'),
+    @test_wal_checkpoint_v2, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_mmap_warm'),
+    @test_mmap_warm, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('utf8_to_utf8'),
+    @utf8_to_utf8, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_interrupt'),
+    @test_interrupt, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_is_interrupted'),
+    @test_is_interrupted, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_carray_bind'),
     @tcl_test_carray_bind, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('bind_carray_intptr'),

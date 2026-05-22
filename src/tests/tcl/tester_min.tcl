@@ -361,6 +361,8 @@ set ::sqlite_options(snapshot) 0       ;# no SQLITE_ENABLE_SNAPSHOT
 set ::sqlite_options(session) 0        ;# no SQLITE_ENABLE_SESSION
 set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
+set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
+set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
@@ -522,6 +524,63 @@ proc test_pwd { args } {
   } else {
     return $suffix2
   }
+}
+
+# dumpbytes / catchcmd / catchsafecmd / catchcmdex — upstream tester.tcl:821..871.
+# 6.40.6 (HARNESS).  Pure-Tcl helpers used by shell*.test / avfs.test /
+# sqldiff*.test.  They shell out to the on-disk CLI via the global $CLI,
+# which those tests set with `set CLI [test_cli_invocation]`.  When the
+# upstream `sqlite3` CLI binary is absent test_cli_invocation does
+# `return -code return` and the whole test skips, so these procs are only
+# ever reached when a CLI is present.  Ported verbatim.
+proc dumpbytes {s} {
+  set r ""
+  for {set i 0} {$i < [string length $s]} {incr i} {
+    if {$i > 0} {append r " "}
+    append r [format %02X [scan [string index $s $i] %c]]
+  }
+  return $r
+}
+proc catchcmd {db {cmd ""}} {
+  global CLI
+  set out [open cmds.txt w]
+  puts $out $cmd
+  close $out
+  set line "exec $CLI $db < cmds.txt"
+  set rc [catch { eval $line } msg]
+  list $rc $msg
+}
+proc catchsafecmd {db {cmd ""}} {
+  global CLI
+  set out [open cmds.txt w]
+  puts $out $cmd
+  close $out
+  set line "exec $CLI -safe $db < cmds.txt"
+  set rc [catch { eval $line } msg]
+  list $rc $msg
+}
+proc catchcmdex {db {cmd ""}} {
+  global CLI
+  set out [open cmds.txt w]
+  fconfigure $out -translation binary
+  puts -nonewline $out $cmd
+  close $out
+  set line "exec -keepnewline -- $CLI $db < cmds.txt"
+  set chans [list stdin stdout stderr]
+  foreach chan $chans {
+    catch {
+      set modes($chan) [fconfigure $chan]
+      fconfigure $chan -translation binary -buffering none
+    }
+  }
+  set rc [catch { eval $line } msg]
+  foreach chan $chans {
+    catch {
+      eval fconfigure [list $chan] $modes($chan)
+    }
+  }
+  # puts [dumpbytes $msg]
+  list $rc $msg
 }
 
 # filepath_normalize / do_filepath_test — upstream tester.tcl:873..886.
@@ -1161,6 +1220,39 @@ if {[llength [info commands dbcksum]]==0} {
     return [md5 $txt]
   }
 }
+# allcksum — verbatim port of tester.tcl:2145..2170.  6.40.6 (HARNESS).
+# Generates an md5 over the contents of every table (plus the schema
+# tables and default_cache_size) of $db.  Used by corruptN/io/oserror/
+# walcrash-class tests to confirm a database is unchanged after a fault.
+if {[llength [info commands allcksum]]==0} {
+  proc allcksum {{db db}} {
+    set ret [list]
+    ifcapable tempdb {
+      set sql {
+        SELECT name FROM sqlite_master WHERE type = 'table' UNION
+        SELECT name FROM sqlite_temp_master WHERE type = 'table' UNION
+        SELECT 'sqlite_master' UNION
+        SELECT 'sqlite_temp_master' ORDER BY 1
+      }
+    } else {
+      set sql {
+        SELECT name FROM sqlite_master WHERE type = 'table' UNION
+        SELECT 'sqlite_master' ORDER BY 1
+      }
+    }
+    set tbllist [$db eval $sql]
+    set txt {}
+    foreach tbl $tbllist {
+      append txt [$db eval "SELECT * FROM $tbl"]
+    }
+    foreach prag {default_cache_size} {
+      append txt $prag-[$db eval "PRAGMA $prag"]\n
+    }
+    # puts txt=$txt
+    return [md5 $txt]
+  }
+}
+
 # output2 — verbatim port of tester.tcl: writes to stdout.
 if {[llength [info commands output2]]==0} {
   proc output2 {args} { uplevel puts $args }
