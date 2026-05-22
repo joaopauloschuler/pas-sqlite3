@@ -50461,12 +50461,17 @@ end;
 
 { alter.c:53 — renameTestSchema.  Generate code that raises an error if any
   remaining schema row fails to re-parse after a rename.  Static in C; unit-
-  level here.  bTemp/bNoDQS are 0/1 ints.  Note: pParse^.colNamesSet has no
-  Pascal counterpart yet; the SELECT we emit is a top-level NestedParse that
-  returns no rows on the success path, so the missing flag is benign. }
+  level here.  bTemp/bNoDQS are 0/1 ints.  C sets pParse->colNamesSet=1
+  (alter.c:60) before the nested "SELECT 1" so sqlite3GenerateColumnNames
+  short-circuits and never calls sqlite3VdbeSetNumCols — keeping the outer
+  ALTER statement's nResColumn at 0.  PARSEFLAG_ColNamesSet is this port's
+  counterpart for that field; without setting it the nested SELECT pushes
+  nResColumn to 1 and sqlite3_column_count wrongly reports 1 (columncount-
+  1.3/1.4). }
 procedure renameTestSchema(pParse: PParse; zDb: PAnsiChar; bTemp: i32;
   zWhen: PAnsiChar; bNoDQS: i32);
 begin
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_ColNamesSet;
   sqlite3NestedParse(pParse,
     'SELECT 1 '
     + 'FROM "%w".' + LEGACY_SCHEMA_TABLE + ' '
