@@ -26201,6 +26201,7 @@ begin
     { Run a separate WHERE clause for each term of the OR clause (wherecode.c:
       2397..2533).  After eliminating duplicates from prior sub-WHEREs, each
       disjunct's body becomes a Gosub into the shared loop body. }
+    sqlite3VdbeExplain(pParse, 1, 'MULTI-INDEX OR', []);
     for ii5 := 0 to pOrWc^.nTerm - 1 do
     begin
       pOrTerm := @pOrWc^.a[ii5];
@@ -26221,6 +26222,7 @@ begin
           pOrExpr := pAndExpr5;
         end;
 
+        sqlite3VdbeExplain(pParse, 1, 'INDEX %d', [ii5 + 1]);
         pSubWInfo := sqlite3WhereBegin(pParse, pOrTab, pOrExpr,
                                        nil, nil, nil,
                                        WHERE_OR_SUBCLAUSE, iCovCur);
@@ -26303,10 +26305,12 @@ begin
             pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or u8($01);
 
           sqlite3WhereEnd(pSubWInfo);
+          sqlite3VdbeExplainPop(pParse);
         end;
         sqlite3ExprDelete(pParse^.db, pDelete);
       end;
     end;
+    sqlite3VdbeExplainPop(pParse);
 
     Assert(pLevel^.pWLoop = pLoop);
     Assert((pLoop^.wsFlags and WHERE_MULTI_OR) <> 0);
