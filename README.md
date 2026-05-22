@@ -192,6 +192,62 @@ design); promotion to a hard CI gate is tracked under `9.1.5`.
 
 ### Upstream Tcl test suite (`bin/TclTestDriver`)
 
+#### How the integration works
+
+SQLite ships a large `.test` corpus written in Tcl.  Each test file drives
+the engine through a Tcl command named `sqlite3`, which upstream defines in
+C in `tclsqlite.c`.  Rather than rewrite those tests, this project makes the
+**Pascal engine impersonate that C shim**, so the *unmodified* upstream
+`.test` files run against pas-sqlite3 as a differential acceptance gate.
+
+Four layers cooperate (full design in [`src/tests/tcl/PLAN.md`](src/tests/tcl/PLAN.md)):
+
+```
+bin/TclTestDriver (Pascal)   forks system tclsh once per .test file,
+        │                    collects PASS / FAIL / SKIP + timing
+        ▼
+tclsh (system Tcl 8.6)       load bin/libpassqlite3tcl.so Sqlite3
+        │                    source tester_min.tcl   (harness shim)
+        │                    source <name>.test       (UNMODIFIED upstream test)
+        ▼
+libpassqlite3tcl.so          FPC-built bridge: registers the `sqlite3` Tcl
+        │                    command (PasTclBridge.pas + PasTclSqlite.pas,
+        │                    a faithful port of tclsqlite.c) + test-only
+        │                    vtab/extension modules (testmodules/)
+        ▼
+passqlite3 core              the pure-Pascal engine, called via the C ABI
+```
+
+Key points:
+
+- The driver **never links Tcl itself** — it shells out to `/usr/bin/tclsh`,
+  and the bridge `.so` is the *only* artefact that imports libtcl symbols.
+  This keeps the production engine build free of any Tcl dependency.
+- `src/tests/tcl/tester_min.tcl` is a trimmed port of upstream `tester.tcl`,
+  supplying the procs every test assumes (`do_test`, `do_execsql_test`,
+  `execsql`, `ifcapable`, `integrity_check`, `finalize_testing`, …) plus the
+  `ifcapable` capability map described under *Compile-time feature parity*
+  above.
+- The bridge is built **separately** by `src/tests/build_tcl_lib.sh` (with
+  `-dSQLITE_TEST`), **not** by `src/tests/build.sh`.  Re-run it after any
+  engine edit, or the sweep silently tests a stale `.so`.
+- Each test's verdict is tracked in `src/tests/tcl/STATUS.txt` as
+  `pas-strict` (must pass — the CI gate), `pas-soft` (a documented, tracked
+  divergence), or `pas-skip` (not yet exercisable).
+  `src/tests/tcl/check_status_regression.sh` fails only when a `pas-strict`
+  test regresses.
+
+The minimal build → run → gate sequence:
+
+```bash
+./src/tests/build_tcl_lib.sh          # → bin/libpassqlite3tcl.so  (rerun after engine edits)
+./src/tests/build_tcl_driver.sh       # → bin/TclTestDriver
+bin/TclTestDriver --filter select1    # run a subset (or omit --filter for all)
+bin/TclTestDriver --filter select1 | src/tests/tcl/check_status_regression.sh /dev/stdin
+```
+
+#### Running the full sweep
+
 `TclTestDriver` walks `src/tests/tcl/MANIFEST.txt` (~959 entries) and runs
 each `.test` file under a **20 s per-test watchdog**.  Read this before
 launching a run — picking the wrong invocation costs 25+ minutes.
