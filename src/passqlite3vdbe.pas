@@ -7879,6 +7879,196 @@ begin
     Result := vdbePmaReaderIncrMergeInit(pReadr, eMode);
 end;
 
+{ ----------------------------------------------------------------------------
+  Phase 5.7.b.8 — merge-tree builder + final reader/merger setup.
+  Ports vdbeSorterTreeDepth / vdbeSorterAddToTree / vdbeSorterMergeTreeBuild /
+  vdbeSorterSetupMerge (vdbesort.c:2377..2611).  Single-threaded only
+  (SQLITE_MAX_WORKER_THREADS==0): nTask==1, bUseThreads==0; the >0 per-task
+  fan-out, INCRINIT_TASK/ROOT and bg-init branches are omitted.  Not yet wired
+  into Rewind (5.7.b.9 does that).
+  ---------------------------------------------------------------------------- }
+
+{ vdbeSorterTreeDepth — vdbesort.c:2377..2394.  Compute the depth of the
+  incremental-merge tree needed for nPMA PMAs: the number of times nDiv must be
+  multiplied by SORTER_MAX_MERGE_COUNT (starting at SORTER_MAX_MERGE_COUNT)
+  before it equals or exceeds nPMA. }
+function vdbeSorterTreeDepth(nPMA: i32): i32;
+var
+  nDepth: i32;
+  nDiv:   i64;
+begin
+  nDepth := 0;
+  nDiv   := SORTER_MAX_MERGE_COUNT;
+  while nDiv < i64(nPMA) do begin
+    nDiv := nDiv * SORTER_MAX_MERGE_COUNT;
+    Inc(nDepth);
+  end;
+  Result := nDepth;
+end;
+
+{ vdbeSorterAddToTree — vdbesort.c:2395..2450.  pRoot is the root of an
+  incremental merge-tree of depth nDepth (per vdbeSorterTreeDepth).  pLeaf is
+  the iSeq'th leaf (counting from zero); add it to the tree, creating the
+  intermediate MergeEngine+IncrMerger nodes on the descent path as needed.
+  On error pLeaf is freed (via vdbeIncrFree of the IncrMerger that wraps it). }
+function vdbeSorterAddToTree(pTask: PSortSubtask; nDepth: i32; iSeq: i32;
+                            pRoot: PMergeEngine; pLeaf: PMergeEngine): i32;
+var
+  rc:     i32;
+  nDiv:   i32;
+  i:      i32;
+  p:      PMergeEngine;
+  pIncr:  PIncrMerger;
+  iIter:  i32;
+  pReadr: PPmaReader;
+  pNew:   PMergeEngine;
+begin
+  rc   := SQLITE_OK;
+  nDiv := 1;
+  p    := pRoot;
+
+  rc := vdbeIncrMergerNew(pTask, pLeaf, @pIncr);
+
+  i := 1;
+  while i < nDepth do begin
+    nDiv := nDiv * SORTER_MAX_MERGE_COUNT;
+    Inc(i);
+  end;
+
+  i := 1;
+  while (i < nDepth) and (rc = SQLITE_OK) do begin
+    iIter  := (iSeq div nDiv) mod SORTER_MAX_MERGE_COUNT;
+    pReadr := @p^.aReadr[iIter];
+
+    if pReadr^.pIncr = nil then begin
+      pNew := vdbeMergeEngineNew(SORTER_MAX_MERGE_COUNT);
+      if pNew = nil then
+        rc := SQLITE_NOMEM_BKPT
+      else
+        rc := vdbeIncrMergerNew(pTask, pNew, @pReadr^.pIncr);
+    end;
+    if rc = SQLITE_OK then begin
+      p    := pReadr^.pIncr^.pMerger;
+      nDiv := nDiv div SORTER_MAX_MERGE_COUNT;
+    end;
+    Inc(i);
+  end;
+
+  if rc = SQLITE_OK then
+    p^.aReadr[iSeq mod SORTER_MAX_MERGE_COUNT].pIncr := pIncr
+  else
+    vdbeIncrFree(pIncr);
+  Result := rc;
+end;
+
+{ vdbeSorterMergeTreeBuild — vdbesort.c:2451..2529.  Build a tree of
+  MergeEngine/IncrMerger/PmaReader objects spanning all PMAs on disk; set
+  *ppOut to the root MergeEngine.  Single-threaded subset: the
+  SQLITE_MAX_WORKER_THREADS>0 multi-task top-level MergeEngine and per-task
+  IncrMerger wiring collapse to one task (aTask[0]) whose root becomes pMain. }
+function vdbeSorterMergeTreeBuild(pSorter: PVdbeSorter;
+                                 ppOut: PPMergeEngine): i32;
+var
+  pMain:    PMergeEngine;
+  rc:       i32;
+  iTask:    i32;
+  pTask:    PSortSubtask;
+  pRoot:    PMergeEngine;
+  nDepth:   i32;
+  iReadOff: i64;
+  i:        i32;
+  iSeq:     i32;
+  pMerger:  PMergeEngine;
+  nReader:  i32;
+begin
+  pMain := nil;
+  rc    := SQLITE_OK;
+
+  { SQLITE_MAX_WORKER_THREADS>0 top-level MergeEngine block omitted. }
+
+  iTask := 0;
+  while (rc = SQLITE_OK) and (iTask < pSorter^.nTask) do begin
+    pTask := @pSorter^.aTask;   { single-threaded: aTask[0] }
+    { C: assert(pTask->nPMA>0 || SQLITE_MAX_WORKER_THREADS>0).  With
+      SQLITE_MAX_WORKER_THREADS==0 the second disjunct is false, so the
+      assertion reduces to nPMA>0. }
+    Assert(pTask^.nPMA > 0);
+    { SQLITE_MAX_WORKER_THREADS==0: the guard is always taken. }
+    begin
+      pRoot    := nil;          { Root node of tree for this task }
+      nDepth   := vdbeSorterTreeDepth(pTask^.nPMA);
+      iReadOff := 0;
+
+      if pTask^.nPMA <= SORTER_MAX_MERGE_COUNT then begin
+        rc := vdbeMergeEngineLevel0(pTask, pTask^.nPMA, @iReadOff, @pRoot);
+      end else begin
+        iSeq  := 0;
+        pRoot := vdbeMergeEngineNew(SORTER_MAX_MERGE_COUNT);
+        if pRoot = nil then rc := SQLITE_NOMEM_BKPT;
+        i := 0;
+        while (i < pTask^.nPMA) and (rc = SQLITE_OK) do begin
+          pMerger := nil;       { New level-0 PMA merger }
+          { Number of level-0 PMAs to merge }
+          if (pTask^.nPMA - i) < SORTER_MAX_MERGE_COUNT then
+            nReader := pTask^.nPMA - i
+          else
+            nReader := SORTER_MAX_MERGE_COUNT;
+          rc := vdbeMergeEngineLevel0(pTask, nReader, @iReadOff, @pMerger);
+          if rc = SQLITE_OK then begin
+            rc := vdbeSorterAddToTree(pTask, nDepth, iSeq, pRoot, pMerger);
+            Inc(iSeq);
+          end;
+          Inc(i, SORTER_MAX_MERGE_COUNT);
+        end;
+      end;
+
+      if rc = SQLITE_OK then begin
+        { SQLITE_MAX_WORKER_THREADS>0 pMain<>nil arm omitted. }
+        Assert(pMain = nil);
+        pMain := pRoot;
+      end else
+        vdbeMergeEngineFree(pRoot);
+    end;
+    Inc(iTask);
+  end;
+
+  if rc <> SQLITE_OK then begin
+    vdbeMergeEngineFree(pMain);
+    pMain := nil;
+  end;
+  ppOut^ := pMain;
+  Result := rc;
+end;
+
+{ vdbeSorterSetupMerge — vdbesort.c:2530..2611.  Build the merge tree and set
+  up the final iterator.  Single-threaded only: SQLITE_MAX_WORKER_THREADS==0 so
+  bUseThreads==0; the result always goes through pSorter->pMerger (the bg-init
+  pReader branch is omitted).  After this returns OK, pSorter->pMerger points
+  at a ready-to-step engine. }
+function vdbeSorterSetupMerge(pSorter: PVdbeSorter): i32;
+var
+  rc:     i32;
+  pTask0: PSortSubtask;
+  pMain:  PMergeEngine;
+begin
+  pTask0 := @pSorter^.aTask;   { &pSorter->aTask[0] }
+  pMain  := nil;
+
+  { SQLITE_MAX_WORKER_THREADS xCompare-per-task setup omitted. }
+
+  rc := vdbeSorterMergeTreeBuild(pSorter, @pMain);
+  if rc = SQLITE_OK then begin
+    { bUseThreads==0: the threaded pReader/bg-init arm is omitted. }
+    rc := vdbeMergeEngineInit(pTask0, pMain, INCRINIT_NORMAL);
+    pSorter^.pMerger := pMain;
+    pMain := nil;
+  end;
+
+  if rc <> SQLITE_OK then
+    vdbeMergeEngineFree(pMain);
+  Result := rc;
+end;
+
 { ============================================================================
   In-memory sort engine + write-side PMA — vdbesort.c  (tasklist 5.7.b.5)
 
