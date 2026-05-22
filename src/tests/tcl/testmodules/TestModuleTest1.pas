@@ -1143,6 +1143,75 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:5159..5229 — test_prepare_v3.
+  Usage: sqlite3_prepare_v3 DB sql bytes flags ?tailvar?  Mirrors the _v2
+  sibling but takes an explicit prepFlags argument (objv[4]); the optional
+  tailvar moves to objv[5].  Like the Pascal _v2 trampoline we skip the
+  malloc-copy (valgrind aid) and exercise the same engine path directly. }
+function test_prepare_v3(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:    PTsqlite3;
+  zSql:  PAnsiChar;
+  zTail: PAnsiChar;
+  pStmt: Pointer;
+  bytes: cint;
+  flags: cint;
+  rc:    i32;
+  hex:   AnsiString;
+  zBuf:  array[0..63] of AnsiChar;
+begin
+  if (objc <> 6) and (objc <> 5) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      Tcl_GetString(objv[0]), PChar(' DB sql bytes flags tailvar'),
+      Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zSql := Tcl_GetString(objv[2]);
+  if Tcl_GetIntFromObj(interp, objv[3], @bytes) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[4], @flags) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zTail := nil;
+  pStmt := nil;
+  if objc >= 6 then
+    rc := sqlite3_prepare_v3(db, zSql, bytes, u32(flags), @pStmt, @zTail)
+  else
+    rc := sqlite3_prepare_v3(db, zSql, bytes, u32(flags), @pStmt, nil);
+  Tcl_ResetResult(interp);
+  if (rc = SQLITE_OK) and (zTail <> nil) and (objc >= 6) then
+  begin
+    if bytes >= 0 then
+      bytes := bytes - cint(PtrUInt(zTail) - PtrUInt(zSql));
+    Tcl_ObjSetVar2(interp, objv[5], nil,
+      Tcl_NewStringObj(zTail, bytes), 0);
+  end;
+  if rc <> SQLITE_OK then
+  begin
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    StrPCopy(zBuf, '(' + IntToStr(rc) + ') ');
+    Tcl_AppendResult(interp, @zBuf[0], sqlite3_errmsg(db), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if pStmt <> nil then
+  begin
+    ptrToHex(pStmt, hex);
+    FillChar(zBuf, SizeOf(zBuf), 0);
+    Move(hex[1], zBuf[0], Length(hex));
+    Tcl_AppendResult(interp, @zBuf[0], Pointer(nil));
+  end;
+  Result := TCL_OK;
+end;
+
 { 9.4.divbug.88.004 — test1.c:5280..5330 — test_prepare16.
   Usage: sqlite3_prepare16 DB sql bytes ?tailvar?
   Mirrors the UTF-8 sibling but routes through sqlite3_prepare16 and
@@ -5003,9 +5072,88 @@ begin
   if (clientData = nil) and (interp = nil) and (objc = 0) and (objv = nil) then ;
 end;
 
+{ test1.c:780..847 — the x_sqlite_exec() SQL function.  Runs its single
+  TEXT argument as SQL on the connection passed as user-data, gathering
+  every result column into a space-separated string.  Used by misuse.test
+  to exercise re-entrant sqlite3_exec().  C registers this via
+  sqlite3_create_function16; the body is encoding-independent so we
+  register the UTF-8 entry directly (test_create_function below). }
+type
+  Tdstr = record
+    nAlloc: cint;   { space allocated }
+    nUsed:  cint;   { space used      }
+    z:      PAnsiChar;
+  end;
+  Pdstr = ^Tdstr;
+
+procedure dstrAppend(p: Pdstr; z: PAnsiChar; divider: cint);
+var
+  n:    cint;
+  zNew: PAnsiChar;
+begin
+  n := StrLen(z);
+  if p^.nUsed + n + 2 > p^.nAlloc then
+  begin
+    p^.nAlloc := p^.nAlloc * 2 + n + 200;
+    zNew := sqlite3_realloc(p^.z, p^.nAlloc);
+    if zNew = nil then
+    begin
+      sqlite3_free(p^.z);
+      FillChar(p^, SizeOf(p^), 0);
+      Exit;
+    end;
+    p^.z := zNew;
+  end;
+  if (divider <> 0) and (p^.nUsed > 0) then
+  begin
+    p^.z[p^.nUsed] := AnsiChar(divider);
+    Inc(p^.nUsed);
+  end;
+  Move(z^, (p^.z + p^.nUsed)^, n + 1);
+  Inc(p^.nUsed, n);
+end;
+
+function execFuncCallback(pData: Pointer; argc: cint;
+  argv: PPAnsiChar; NotUsed: PPAnsiChar): cint; cdecl;
+var
+  p:  Pdstr;
+  i:  cint;
+  z:  PAnsiChar;
+begin
+  p := Pdstr(pData);
+  for i := 0 to argc - 1 do
+  begin
+    z := PPAnsiChar(PtrUInt(argv) + PtrUInt(i) * SizeOf(Pointer))^;
+    if z = nil then
+      dstrAppend(p, PAnsiChar('NULL'), Ord(' '))
+    else
+      dstrAppend(p, z, Ord(' '));
+  end;
+  Result := 0;
+  if NotUsed = nil then ;
+end;
+
+procedure sqlite3ExecFunc(context: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..255] of Psqlite3_value;
+var
+  x:  Tdstr;
+  pa: PValueArr;
+begin
+  pa := PValueArr(argv);
+  FillChar(x, SizeOf(x), 0);
+  sqlite3_exec(PTsqlite3(sqlite3_user_data(context)),
+    PAnsiChar(sqlite3_value_text(pa^[0])), @execFuncCallback, @x, nil);
+  sqlite3_result_text(context, x.z, x.nUsed, SQLITE_TRANSIENT);
+  sqlite3_free(x.z);
+end;
+
 { test1.c:1088..1226 — test_create_function: register the UDFs above
-  on DB.  Returns the rc enum-name.  Skips the UTF-16 hex16 / x_sqlite_exec
-  arms (SQLITE_OMIT_UTF16-equivalent gate). }
+  on DB.  Returns the rc enum-name.  hex16 / x_sqlite_exec are registered
+  via sqlite3_create_function16 in C (SQLITE_OMIT_UTF16 gate); the bodies
+  are encoding-independent so we register UTF-8 entries directly. }
 function test_create_function(clientData: TClientData; interp: PTclInterp;
   argc: cint; argv: PPAnsiCharArr): cint; cdecl;
 type
@@ -5075,6 +5223,12 @@ begin
   if rc = SQLITE_OK then
     rc := sqlite3_create_function(db, PChar('inttoptr'), 1, SQLITE_UTF8,
             nil, @inttoptrFunc, nil, nil);
+  { test1.c:1202..1221 — x_sqlite_exec.  C registers via
+    sqlite3_create_function16 (UTF-16); we register the UTF-8 entry with
+    db as user-data so the function can re-enter sqlite3_exec. }
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, PChar('x_sqlite_exec'), 1, SQLITE_UTF8,
+            db, @sqlite3ExecFunc, nil, nil);
   Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
   Result := TCL_OK;
   if clientData = nil then ;
@@ -5922,6 +6076,199 @@ begin
   if p^.xValue   <> nil then Tcl_DecrRefCount(p^.xValue);
   if p^.xInverse <> nil then Tcl_DecrRefCount(p^.xInverse);
   sqlite3_free(p);
+end;
+
+{ test_window.c:225..241 sumintStep — xStep for sumint(). }
+procedure sumintStep(ctx: Psqlite3_context; nArg: cint;
+  apArg: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..255] of Psqlite3_value;
+var
+  pa:   PValueArr;
+  pInt: ^sqlite3_int64;
+begin
+  pa := PValueArr(apArg);
+  if sqlite3_value_type(pa^[0]) <> SQLITE_INTEGER then
+  begin
+    sqlite3_result_error(ctx, PChar('invalid argument'), -1);
+    Exit;
+  end;
+  pInt := sqlite3_aggregate_context(ctx, SizeOf(sqlite3_int64));
+  if pInt <> nil then
+    pInt^ := pInt^ + sqlite3_value_int64(pa^[0]);
+end;
+
+{ test_window.c:246..254 sumintInverse — xInverse for sumint(). }
+procedure sumintInverse(ctx: Psqlite3_context; nArg: cint;
+  apArg: PPsqlite3_value); cdecl;
+type
+  PValueArr = ^TValueArr;
+  TValueArr = array[0..255] of Psqlite3_value;
+var
+  pa:   PValueArr;
+  pInt: ^sqlite3_int64;
+begin
+  pa := PValueArr(apArg);
+  pInt := sqlite3_aggregate_context(ctx, SizeOf(sqlite3_int64));
+  pInt^ := pInt^ - sqlite3_value_int64(pa^[0]);
+end;
+
+{ test_window.c:259..265 sumintFinal — xFinal for sumint(). }
+procedure sumintFinal(ctx: Psqlite3_context); cdecl;
+var
+  res:  sqlite3_int64;
+  pInt: ^sqlite3_int64;
+begin
+  res := 0;
+  pInt := sqlite3_aggregate_context(ctx, 0);
+  if pInt <> nil then res := pInt^;
+  sqlite3_result_int64(ctx, res);
+end;
+
+{ test_window.c:270..276 sumintValue — xValue for sumint(). }
+procedure sumintValue(ctx: Psqlite3_context); cdecl;
+var
+  res:  sqlite3_int64;
+  pInt: ^sqlite3_int64;
+begin
+  res := 0;
+  pInt := sqlite3_aggregate_context(ctx, 0);
+  if pInt <> nil then res := pInt^;
+  sqlite3_result_int64(ctx, res);
+end;
+
+{ test_window.c:278..303 test_create_sumint.
+  Usage: test_create_sumint DB — register the sumint() window function. }
+function tcl_test_create_sumint(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_window_function(db, PChar('sumint'), 1, SQLITE_UTF8,
+    nil, @sumintStep, @sumintFinal, @sumintValue, @sumintInverse, nil);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:4996..5025 test_set_errmsg.
+  Usage: sqlite3_set_errmsg DB ERRCODE ERRMSG }
+function tcl_test_set_errmsg(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zDb, zErr: PAnsiChar;
+  iErr:      cint;
+  db:        PTsqlite3;
+  rc:        cint;
+begin
+  zErr := nil;
+  iErr := 0;
+  db   := nil;
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB ERRCODE ERRMSG'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zDb := Tcl_GetString(objv[1]);
+  if zDb[0] <> #0 then
+    if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+    begin
+      Result := TCL_ERROR; Exit;
+    end;
+  if Tcl_GetIntFromObj(interp, objv[2], @iErr) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zErr := Tcl_GetString(objv[3]);
+  if zErr[0] = #0 then zErr := nil;
+  rc := sqlite3_set_errmsg(db, iErr, zErr);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_window.c:179..220 test_create_window_misuse — verify that
+  sqlite3_create_window_function returns SQLITE_MISUSE if any of the
+  four window callbacks is missing. }
+function tcl_test_create_window_misuse(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+label
+  error;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_window_function(db, PChar('fff'), -1, SQLITE_UTF8,
+    nil, nil, @testWindowFinal, @testWindowValue, @testWindowInverse, nil);
+  if rc <> SQLITE_MISUSE then goto error;
+  rc := sqlite3_create_window_function(db, PChar('fff'), -1, SQLITE_UTF8,
+    nil, @testWindowStep, nil, @testWindowValue, @testWindowInverse, nil);
+  if rc <> SQLITE_MISUSE then goto error;
+  rc := sqlite3_create_window_function(db, PChar('fff'), -1, SQLITE_UTF8,
+    nil, @testWindowStep, @testWindowFinal, nil, @testWindowInverse, nil);
+  if rc <> SQLITE_MISUSE then goto error;
+  rc := sqlite3_create_window_function(db, PChar('fff'), -1, SQLITE_UTF8,
+    nil, @testWindowStep, @testWindowFinal, @testWindowValue, nil, nil);
+  if rc <> SQLITE_MISUSE then goto error;
+  Result := TCL_OK;
+  if clientData = nil then ;
+  Exit;
+error:
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(PChar('misuse test error'), -1));
+  Result := TCL_ERROR;
+end;
+
+{ test_window.c:305..329 test_override_sum — override the built-in sum()
+  with the sumint() step/final implementation (no xValue/xInverse, so it
+  is a plain aggregate). }
+function tcl_test_override_sum(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_function(db, PChar('sum'), -1, SQLITE_UTF8, nil,
+    nil, @sumintStep, @sumintFinal);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
 end;
 
 { test_window.c:136..177 test_create_window. }
@@ -7285,6 +7632,10 @@ begin
     @test_prepare, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare_v2'),
     @test_prepare_v2, nil, nil);
+  { test1.c:9149 — sqlite3_prepare_v3 DB sql bytes flags ?tailvar?
+    (test_prepare_v3). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare_v3'),
+    @test_prepare_v3, nil, nil);
   { 9.4.divbug.88.004 — sqlite3_prepare16 / sqlite3_prepare16_v2.
     test1.c:5280..5330, 5340..5390; registered at test1.c:9147 and 9151. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_prepare16'),
@@ -7617,6 +7968,18 @@ begin
     @tcl_test_create_collation_v2, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_create_window_function'),
     @tcl_test_create_window, nil, nil);
+  { 6.40.8 — test_window.c:338 test_create_window_function_misuse. }
+  Tcl_CreateObjCommand(interp, PChar('test_create_window_function_misuse'),
+    @tcl_test_create_window_misuse, nil, nil);
+  { 6.40.8 — test_window.c:339 test_create_sumint. }
+  Tcl_CreateObjCommand(interp, PChar('test_create_sumint'),
+    @tcl_test_create_sumint, nil, nil);
+  { 6.40.8 — test_window.c:340 test_override_sum. }
+  Tcl_CreateObjCommand(interp, PChar('test_override_sum'),
+    @tcl_test_override_sum, nil, nil);
+  { 6.40.8 — test1.c:9139 sqlite3_set_errmsg. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_set_errmsg'),
+    @tcl_test_set_errmsg, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_load_extension'),
     @tcl_test_load_extension, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_simulate_device'),
