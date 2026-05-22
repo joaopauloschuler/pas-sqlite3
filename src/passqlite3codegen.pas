@@ -1912,6 +1912,8 @@ procedure whereAddIndexedExpr(pParse: PParse; pIdx: PIndex2; iIdxCur: i32;
   pTabItem: PSrcItem);
 function sqlite3IndexedExprLookup(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
+function exprPartidxExprLookup(pParse: PParse; pExpr: PExpr;
+  iTarget: i32): i32;
 function sqlite3ExprCanReturnSubtype(pParse: PParse; pExpr: PExpr): i32;
 
 { Phase 6.9-bis (step 11g.2.d sub-progress) — auto-index pre-flight cluster
@@ -6344,15 +6346,31 @@ begin
             via OP_Rowid and ordinary columns via OP_Column. }
           else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
           begin
-            sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
-              pExpr^.iTable, pExpr^.iColumn, target);
-            { Honour op2 — emitScalarFunctionCall stamps OPFLAG_LENGTHARG /
-              OPFLAG_TYPEOFARG onto a column-arg's op2 so the OP_Column
-              read can short-circuit the payload load.  Mirrors
-              expr.c sqlite3ExprCodeGetColumn's `sqlite3VdbeChangeP5(v, p5)`
-              tail when the most recent op is the just-emitted OP_Column. }
-            if pExpr^.op2 <> 0 then
-              sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
+            { expr.c:5077..5081 — partial-index constant substitution.  When
+              iTab>=0 and the column matches an entry on pParse^.pIdxPartExpr
+              (a column pinned to a constant by a partial index's WHERE
+              clause driving the loop), emit the constant + affinity instead
+              of an OP_Column.  This lets a covering partial index serve the
+              pinned column without ever opening the table cursor
+              (9.4.divbug.87.029, indexA-1.2).  0 is the unambiguous
+              "no match" return (a real result register is never 0). }
+            r1 := 0;
+            if pParse^.pIdxPartExpr <> nil then
+              r1 := exprPartidxExprLookup(pParse, pExpr, target);
+            if r1 <> 0 then
+              Result := r1
+            else
+            begin
+              sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
+                pExpr^.iTable, pExpr^.iColumn, target);
+              { Honour op2 — emitScalarFunctionCall stamps OPFLAG_LENGTHARG /
+                OPFLAG_TYPEOFARG onto a column-arg's op2 so the OP_Column
+                read can short-circuit the payload load.  Mirrors
+                expr.c sqlite3ExprCodeGetColumn's `sqlite3VdbeChangeP5(v, p5)`
+                tail when the most recent op is the just-emitted OP_Column. }
+              if pExpr^.op2 <> 0 then
+                sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
+            end;
             done := True;
           end else
           begin
@@ -6646,10 +6664,25 @@ begin
         end
         else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
         begin
-          sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
-            pExpr^.iTable, pExpr^.iColumn, target);
-          if pExpr^.op2 <> 0 then
-            sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
+          { expr.c:4999..5081 — TK_AGG_COLUMN in directMode falls through to
+            the TK_COLUMN case, so it must also honour the partial-index
+            constant substitution (exprPartidxExprLookup).  Without this, a
+            bare aggregate column pinned by a partial index's WHERE clause is
+            read as OP_Column from the (covering, never-opened) table cursor
+            → crash (9.4.divbug.87.029, indexA-4.1.1: `SELECT sum(a),b FROM t2
+            WHERE b='two'` with INDEX(a) WHERE b='two'). }
+          r1 := 0;
+          if pParse^.pIdxPartExpr <> nil then
+            r1 := exprPartidxExprLookup(pParse, pExpr, target);
+          if r1 <> 0 then
+            Result := r1
+          else
+          begin
+            sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
+              pExpr^.iTable, pExpr^.iColumn, target);
+            if pExpr^.op2 <> 0 then
+              sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
+          end;
           done := True;
         end
         else
@@ -17925,6 +17958,47 @@ begin
   Result := -1;
 end;
 
+{ exprPartidxExprLookup — expr.c:4810..4842.  pExpr is a TK_COLUMN.  If the
+  column matches an entry on pParse^.pIdxPartExpr (a column pinned to a
+  constant by a partial index's WHERE clause), generate code that loads the
+  constant into iTarget, applies the column affinity, and return the result
+  register.  Return 0 if no match (note: a real result register is never 0,
+  so 0 is an unambiguous "not found" sentinel, matching the C). }
+function exprPartidxExprLookup(pParse: PParse; pExpr: PExpr;
+  iTarget: i32): i32;
+var
+  p:    PIndexedExpr;
+  v:    PVdbe;
+  addr: i32;
+  ret:  i32;
+  affBuf: array[0..0] of u8;
+begin
+  p := PIndexedExpr(pParse^.pIdxPartExpr);
+  while p <> nil do
+  begin
+    if (pExpr^.iColumn = i32(p^.iIdxCol))
+       and (pExpr^.iTable = p^.iDataCur) then
+    begin
+      v    := pParse^.pVdbe;
+      addr := 0;
+      if p^.bMaybeNullRow <> 0 then
+        addr := sqlite3VdbeAddOp1(v, OP_IfNullRow, p^.iIdxCur);
+      ret := sqlite3ExprCodeTarget(pParse, p^.pExpr, iTarget);
+      affBuf[0] := p^.aff;
+      sqlite3VdbeAddOp4(v, OP_Affinity, ret, 1, 0, @affBuf[0], 1);
+      if addr <> 0 then
+      begin
+        sqlite3VdbeJumpHere(v, addr);
+        sqlite3VdbeChangeP3(v, addr, ret);
+      end;
+      Result := ret;
+      Exit;
+    end;
+    p := p^.pIENext;
+  end;
+  Result := 0;
+end;
+
 { whereAddIndexedExpr — where.c:6668..6716.  Walk all expression
   columns of pIdx (XN_EXPR slots, plus VIRTUAL generated columns)
   and add IndexedExpr entries to pParse^.pIdxEpr so subsequent
@@ -22858,12 +22932,19 @@ begin
     shortcut so simple `WHERE rowid>?` cases don't pay the planner cost. }
   if pLoop^.wsFlags = 0 then
   begin
+    { 9.4.divbug.87.029 (indexA-1.2) — defer to the cost-based planner
+      whenever pTab has ANY index, partial or not.  A partial index whose
+      WHERE clause is implied by the query's WHERE terms is a valid (and
+      often covering) plan; whereLoopAddBtree → whereUsablePartialIndex
+      (where.c:6389..6395 / 3699..3728) decides usability and either adds
+      the index loop or skips it, letting the SCAN / IPK-range baseline win.
+      Taking this Pas-only IPK-range shortcut here bypassed that test, so a
+      query matching a partial index's WHERE never reached the planner and
+      always SCANned.  C's whereShortCut never builds an IPK-range plan at
+      all (it returns 0 → full planner); deferring on any index is the
+      faithful behaviour. }
     pIdx := pTab^.pIndex;
-    while pIdx <> nil do
-    begin
-      if pIdx^.pPartIdxWhere = nil then Exit(0);
-      pIdx := pIdx^.pNext;
-    end;
+    if pIdx <> nil then Exit(0);
     pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_GT_WO or WO_GE, nil);
     while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
       pTerm := whereScanNext(@scan);
@@ -22986,29 +23067,22 @@ begin
       whereLoopAddBtree path 2 selection.  Without this, the synthetic
       table-scan stand-in below would short-circuit the planner and pin the
       plan to an OP_OpenRead on the heap, diverging from the C oracle. }
-    { Defer to the cost-based planner whenever the table has any non-partial
-      index that could plausibly compete with a heap SCAN.  The synthetic
-      SCAN below is a fallback for tables with no usable index at all
-      (or only partial indices that don't apply); when an index exists,
-      whereLoopAddBtree / wherePathSolver must rank covering / range scans
-      against the SCAN baseline.  Tasklist 6.8.4 covering-index arm. }
+    { Defer to the cost-based planner whenever the table has ANY index,
+      partial or not, that could plausibly compete with a heap SCAN.  The
+      synthetic SCAN below is a fallback only for tables with no index at
+      all; when an index exists, whereLoopAddBtree / wherePathSolver must
+      rank covering / range scans against the SCAN baseline.  Tasklist
+      6.8.4 covering-index arm.
+      9.4.divbug.87.029 (indexA-1.2): a partial index whose WHERE clause is
+      implied by the query's WHERE is a valid covering plan.  Previously the
+      guard only deferred on a NON-partial index, so a table with only
+      partial indexes fell through to this SCAN stand-in and never reached
+      whereLoopAddBtree → whereUsablePartialIndex (where.c:6389/3699..3728),
+      so `SELECT * FROM t1 WHERE a='abc'` with `INDEX i1(b,c) WHERE a='abc'`
+      always SCANned.  C's whereShortCut returns 0 here (it only succeeds on
+      WHERE_ONEROW), so deferring on any index is faithful. }
     pIdx := pTab^.pIndex;
-    while pIdx <> nil do
-    begin
-      if pIdx^.pPartIdxWhere = nil then
-        Exit(0);
-      pIdx := pIdx^.pNext;
-    end;
-    { TRIAGE (divbug.87.027..029): a partial-index that matches the query's
-      WHERE-clause is NOT considered here.  Deferring to the full planner
-      would correctly enter whereLoopAddBtree → whereUsablePartialIndex,
-      but the WhereEnd Index→table column rewrite arm (where.c:7732..7886)
-      is still deferred in this port (codegen.pas:22584).  Without it any
-      WHERE_IDX_ONLY plan that pas chooses would crash at runtime because
-      OP_Column refs against an unopened table cursor still reach the VDBE.
-      Left as a deeper deferred — fixing it requires porting that rewrite
-      in tandem.  index8-1.1eqp / index9-1.1..4.4 / indexA-1.2 remain
-      diverging. }
+    if pIdx <> nil then Exit(0);
     { 9.4.divbug.30 — when caller passed an ORDER BY / GROUP BY / DISTINCT,
       the fallback SCAN below bypasses wherePathSolver and therefore the
       wherePathSatisfiesOrderBy gate.  That means a plain `SELECT * FROM t
@@ -24240,6 +24314,21 @@ begin
                and OptimizationEnabled(db, SQLITE_IndexedExpr) then
               whereAddIndexedExpr(pParse, pLoop^.u.btree.pIndex,
                                   pLevel^.iIdxCur, pTabItem);
+            { where.c:7351..7355 — for a partial index that is NOT the inner
+              of a RIGHT JOIN, register IndexedExpr entries for each column
+              the partial-index WHERE clause pins to a constant, so the
+              expression code generator (exprPartidxExprLookup) emits the
+              constant instead of an OP_Column against the (possibly never
+              opened) table cursor.  Without this, a covering partial-index
+              plan whose result set references the pinned column crashes:
+              the WhereEnd Index→table rewrite leaves an OP_Column on an
+              unopened table cursor (9.4.divbug.87.029, indexA-1.2). }
+            if (pLoop^.u.btree.pIndex <> nil)
+               and (pLoop^.u.btree.pIndex^.pPartIdxWhere <> nil)
+               and ((pTabItem^.fg.jointype and JT_RIGHT) = 0) then
+              wherePartIdxExpr(pParse, pLoop^.u.btree.pIndex,
+                               pLoop^.u.btree.pIndex^.pPartIdxWhere,
+                               nil, pLevel^.iIdxCur, pTabItem);
             if pLoop^.u.btree.pIndex <> nil then
             begin
               sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
@@ -36201,8 +36290,20 @@ begin
       for i := 0 to nResultCol - 1 do
       begin
         pE := items[i].pExpr;
+        { 9.4.divbug.87.029 — when a partial index (pIdxPartExpr) or an
+          expression index (pIdxEpr) is driving the loop, a TK_COLUMN result
+          must go through the full expression code generator so the constant /
+          index-read substitution in sqlite3ExprCodeTarget fires.  C always
+          routes selectInnerLoop result columns through sqlite3ExprCodeExprList
+          (select.c:1285 innerLoopLoadRow → expr.c sqlite3ExprCodeTarget); the
+          Pas-only OP_Column-direct-to-target shortcut below skips that path,
+          leaving an OP_Column against the (covering, never-opened) table
+          cursor → crash on indexA-1.2.  Falling back to sqlite3ExprCode keeps
+          the existing bytecode shape whenever no substitution list is active. }
         if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
-           and (pE^.y.pTab <> nil) then
+           and (pE^.y.pTab <> nil)
+           and (pParse^.pIdxPartExpr = nil)
+           and (pParse^.pIdxEpr = nil) then
           sqlite3ExprCodeGetColumnOfTable(v, pE^.y.pTab, pE^.iTable, pE^.iColumn,
                                           pDest^.iSdst + i)
         else
