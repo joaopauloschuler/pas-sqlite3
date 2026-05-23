@@ -8974,6 +8974,18 @@ function fts3PoslistPhraseMerge(pp, pp1, pp2: PPChar;
 function fts3DoclistPhraseMerge(bDescDoclist, nDist: cint;
   aLeft: PChar; nLeft: cint; paRight: PPChar; pnRight: Pcint): cint; forward;
 procedure fts3ReversePoslist(pStart: PChar; ppPoslist: PPChar); forward;
+{ fts3_snippet.c (6.40.1.l) — used by the fts3.c eval-stats helpers above
+  the snippet bodies; defined in the snippet block below. }
+type
+  TFts3ExprIterCb = function(pExpr: PFts3Expr; iPhrase: cint;
+    pCtx: Pointer): cint; cdecl;
+function sqlite3Fts3ExprIterate(pExpr: PFts3Expr; x: TFts3ExprIterCb;
+  pCtx: Pointer): cint; forward;
+procedure fts3GetDeltaPosition(pp: PPChar; piPos: Psqlite3_int64); forward;
+{ MatchinfoBuffer free, used by fts3ClearCursor; real record type is the
+  TMatchinfoBufferR defined in the snippet block.  pMIBuffer is the opaque
+  PMatchinfoBuffer (=Pointer) field, cast at the call site. }
+procedure sqlite3Fts3MIBufferFree(p: Pointer); forward;
 
 { --------------------------------------------------------------------- }
 { fts3.c:524 — fts3DisconnectMethod.                                     }
@@ -9840,7 +9852,7 @@ begin
   fts3CursorFinalizeStmt(pCsr);
   sqlite3Fts3FreeDeferredTokens(pCsr);
   sqlite3_free(pCsr^.aDoclist);
-  { TODO(6.40.1.l): sqlite3Fts3MIBufferFree(pCsr->pMIBuffer). }
+  sqlite3Fts3MIBufferFree(pCsr^.pMIBuffer);
   pCsr^.pMIBuffer := nil;
   sqlite3Fts3ExprFree(pCsr^.pExpr);
   libc_memset(PByte(@pCsr^.base) + SizeOf(Tsqlite3_vtab_cursor), 0,
@@ -11733,6 +11745,340 @@ begin
   ppPoslist^ := p;
 end;
 
+{ ===================================================================== }
+{ fts3.c eval helpers consumed by fts3_snippet.c (6.40.1.l).  These were   }
+{ left out of the .k port (they are only reachable through snippet/offsets/ }
+{ matchinfo); ported faithfully here.  The deferred-token arms degenerate   }
+{ to no-ops because fts3EvalStart selects no deferred tokens in this build   }
+{ (pCsr->pDeferred is always nil — see fts3EvalStart / .k note).            }
+{ ===================================================================== }
+
+{ fts3.c:5746 — fts3EvalRestart. }
+procedure fts3EvalRestart(pCsr: PFts3Cursor; pExpr: PFts3Expr; pRc: Pcint);
+var
+  pPhrase: PFts3Phrase;
+  i: cint;
+  pToken: PFts3PhraseToken;
+begin
+  if (pExpr <> nil) and (pRc^ = SQLITE_OK) then begin
+    pPhrase := pExpr^.pPhrase;
+    if pPhrase <> nil then begin
+      fts3EvalInvalidatePoslist(pPhrase);
+      if pPhrase^.bIncr <> 0 then begin
+        for i := 0 to pPhrase^.nToken - 1 do begin
+          pToken := fts3PhraseTokenAt(pPhrase, i);
+          Assert(pToken^.pDeferred = nil);
+          if pToken^.pSegcsr <> nil then
+            sqlite3Fts3MsrIncrRestart(PFts3MultiSegReader(pToken^.pSegcsr));
+        end;
+        pRc^ := fts3EvalPhraseStart(pCsr, 0, pPhrase);
+      end;
+      pPhrase^.doclist.pNextDocid := nil;
+      pPhrase^.doclist.iDocid := 0;
+      pPhrase^.pOrPoslist := nil;
+    end;
+
+    pExpr^.iDocid := 0;
+    pExpr^.bEof := 0;
+    pExpr^.bStart := 0;
+
+    fts3EvalRestart(pCsr, pExpr^.pLeft, pRc);
+    fts3EvalRestart(pCsr, pExpr^.pRight, pRc);
+  end;
+end;
+
+{ fts3.c:5807 — fts3EvalUpdateCounts. }
+procedure fts3EvalUpdateCounts(pExpr: PFts3Expr; nCol: cint);
+var
+  pPhrase: PFts3Phrase;
+  iCol: cint;
+  p: PChar;
+  c: Byte;
+  iCnt: cint;
+begin
+  if pExpr <> nil then begin
+    pPhrase := pExpr^.pPhrase;
+    if (pPhrase <> nil) and (pPhrase^.doclist.pList <> nil) then begin
+      iCol := 0;
+      p := pPhrase^.doclist.pList;
+
+      repeat
+        c := 0;
+        iCnt := 0;
+        while ($FE and (Byte(p^) or c)) <> 0 do begin
+          if (c and $80) = 0 then Inc(iCnt);
+          c := Byte(p^) and $80; Inc(p);
+        end;
+
+        { aMI[iCol*3 + 1] = Number of occurrences
+          aMI[iCol*3 + 2] = Number of rows containing at least one instance }
+        Pu32(pExpr^.aMI)[iCol*3 + 1] := Pu32(pExpr^.aMI)[iCol*3 + 1] + u32(iCnt);
+        if iCnt > 0 then
+          Pu32(pExpr^.aMI)[iCol*3 + 2] := Pu32(pExpr^.aMI)[iCol*3 + 2] + 1;
+        if Byte(p^) = 0 then break;
+        Inc(p);
+        p := @p[fts3GetVarint32(p, @iCol)];
+      until iCol >= nCol;
+    end;
+
+    fts3EvalUpdateCounts(pExpr^.pLeft, nCol);
+    fts3EvalUpdateCounts(pExpr^.pRight, nCol);
+  end;
+end;
+
+{ fts3.c:5843 — fts3AllocateMSI (sqlite3Fts3ExprIterate callback). }
+function fts3AllocateMSI(pExpr: PFts3Expr; iPhrase: cint; pCtx: Pointer): cint; cdecl;
+var
+  pTab: PFts3Table;
+begin
+  pTab := PFts3Table(pCtx);
+  if pExpr^.aMI = nil then begin
+    pExpr^.aMI := Pcuint(sqlite3_malloc64(u64(pTab^.nColumn * 3 * SizeOf(u32))));
+    if pExpr^.aMI = nil then Exit(SQLITE_NOMEM);
+  end;
+  libc_memset(pExpr^.aMI, 0, NativeUInt(pTab^.nColumn * 3 * SizeOf(u32)));
+  Result := SQLITE_OK;
+end;
+
+{ fts3.c:5865 — fts3EvalGatherStats. }
+function fts3EvalGatherStats(pCsr: PFts3Cursor; pExpr: PFts3Expr): cint;
+var
+  rc: cint;
+  pTab: PFts3Table;
+  pRoot: PFts3Expr;
+  iPrevId, iDocid: sqlite3_int64;
+  bEof: cuchar;
+begin
+  rc := SQLITE_OK;
+  Assert(pExpr^.eType = FTSQUERY_PHRASE);
+  if pExpr^.aMI = nil then begin
+    pTab := PFts3Table(pCsr^.base.pVtab);
+
+    iPrevId := pCsr^.iPrevId;
+
+    { Find the root of the NEAR expression }
+    pRoot := pExpr;
+    while (pRoot^.pParent <> nil)
+      and ((pRoot^.pParent^.eType = FTSQUERY_NEAR) or (pRoot^.bDeferred <> 0)) do
+      pRoot := pRoot^.pParent;
+    iDocid := pRoot^.iDocid;
+    bEof := pRoot^.bEof;
+    Assert(pRoot^.bStart <> 0);
+
+    { Allocate space for the aMI[] array of each FTSQUERY_PHRASE node }
+    rc := sqlite3Fts3ExprIterate(pRoot, @fts3AllocateMSI, Pointer(pTab));
+    if rc <> SQLITE_OK then Exit(rc);
+    fts3EvalRestart(pCsr, pRoot, @rc);
+
+    while (pCsr^.isEof = 0) and (rc = SQLITE_OK) do begin
+
+      repeat
+        { Ensure the %_content statement is reset. }
+        if pCsr^.isRequireSeek = 0 then sqlite3_reset(pCsr^.pStmt);
+        Assert(sqlite3_data_count(pCsr^.pStmt) = 0);
+
+        { Advance to the next document }
+        fts3EvalNextRow(pCsr, pRoot, @rc);
+        pCsr^.isEof := pRoot^.bEof;
+        pCsr^.isRequireSeek := 1;
+        pCsr^.isMatchinfoNeeded := 1;
+        pCsr^.iPrevId := pRoot^.iDocid;
+      until not ((pCsr^.isEof = 0)
+           and (pRoot^.eType = FTSQUERY_NEAR)
+           and (sqlite3Fts3EvalTestDeferred(pCsr, @rc) <> 0));
+
+      if (rc = SQLITE_OK) and (pCsr^.isEof = 0) then
+        fts3EvalUpdateCounts(pRoot, pTab^.nColumn);
+    end;
+
+    pCsr^.isEof := 0;
+    pCsr^.iPrevId := iPrevId;
+
+    if bEof <> 0 then begin
+      pRoot^.bEof := bEof;
+    end else begin
+      fts3EvalRestart(pCsr, pRoot, @rc);
+      repeat
+        fts3EvalNextRow(pCsr, pRoot, @rc);
+        if pRoot^.bEof <> 0 then rc := FTS_CORRUPT_VTAB;
+      until not ((pRoot^.iDocid <> iDocid) and (rc = SQLITE_OK));
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3.c:5972 — sqlite3Fts3EvalPhraseStats. }
+function sqlite3Fts3EvalPhraseStats(pCsr: PFts3Cursor; pExpr: PFts3Expr;
+  aiOut: Pcuint): cint;
+var
+  pTab: PFts3Table;
+  rc: cint;
+  iCol: cint;
+begin
+  pTab := PFts3Table(pCsr^.base.pVtab);
+  rc := SQLITE_OK;
+
+  if (pExpr^.bDeferred <> 0) and (pExpr^.pParent^.eType <> FTSQUERY_NEAR) then begin
+    Assert(pCsr^.nDoc > 0);
+    for iCol := 0 to pTab^.nColumn - 1 do begin
+      Pu32(aiOut)[iCol*3 + 1] := u32(pCsr^.nDoc);
+      Pu32(aiOut)[iCol*3 + 2] := u32(pCsr^.nDoc);
+    end;
+  end else begin
+    rc := fts3EvalGatherStats(pCsr, pExpr);
+    if rc = SQLITE_OK then begin
+      Assert(pExpr^.aMI <> nil);
+      for iCol := 0 to pTab^.nColumn - 1 do begin
+        Pu32(aiOut)[iCol*3 + 1] := Pu32(pExpr^.aMI)[iCol*3 + 1];
+        Pu32(aiOut)[iCol*3 + 2] := Pu32(pExpr^.aMI)[iCol*3 + 2];
+      end;
+    end;
+  end;
+
+  Result := rc;
+end;
+
+{ fts3.c:6020 — sqlite3Fts3EvalPhrasePoslist. }
+function sqlite3Fts3EvalPhrasePoslist(pCsr: PFts3Cursor; pExpr: PFts3Expr;
+  iCol: cint; ppOut: PPChar): cint;
+var
+  pPhrase: PFts3Phrase;
+  pTab: PFts3Table;
+  pIter: PChar;
+  iThis: cint;
+  iDocid: sqlite3_int64;
+  rc: cint;
+  bDescDoclist, bOr: cint;
+  bTreeEof: cuchar;
+  p, pNear, pRun: PFts3Expr;
+  bMatch: cint;
+  bEof: cuchar;
+  pTest: PFts3Expr;
+  pPh: PFts3Phrase;
+  iDum: cint;
+begin
+  pPhrase := pExpr^.pPhrase;
+  pTab := PFts3Table(pCsr^.base.pVtab);
+
+  ppOut^ := nil;
+  Assert((iCol >= 0) and (iCol < pTab^.nColumn));
+  if (pPhrase^.iColumn < pTab^.nColumn) and (pPhrase^.iColumn <> iCol) then
+    Exit(SQLITE_OK);
+
+  iDocid := pExpr^.iDocid;
+  pIter := pPhrase^.doclist.pList;
+  if (iDocid <> pCsr^.iPrevId) or (pExpr^.bEof <> 0) then begin
+    rc := SQLITE_OK;
+    bDescDoclist := pTab^.bDescIdx;
+    bOr := 0;
+    bTreeEof := 0;
+
+    pNear := pExpr;
+    p := pExpr^.pParent;
+    while p <> nil do begin
+      if p^.eType = FTSQUERY_OR then bOr := 1;
+      if p^.eType = FTSQUERY_NEAR then pNear := p;
+      if p^.bEof <> 0 then bTreeEof := 1;
+      p := p^.pParent;
+    end;
+    if bOr = 0 then Exit(SQLITE_OK);
+    pRun := pNear;
+    while pRun^.bDeferred <> 0 do begin
+      Assert(pRun^.pParent <> nil);
+      pRun := pRun^.pParent;
+    end;
+
+    { This is the descendent of an OR node.  Load the entire doclist. }
+    if pPhrase^.bIncr <> 0 then begin
+      iDum := pRun^.bEof;  { bEofSave }
+      fts3EvalRestart(pCsr, pRun, @rc);
+      while (rc = SQLITE_OK) and (pRun^.bEof = 0) do begin
+        fts3EvalNextRow(pCsr, pRun, @rc);
+        if (iDum = 0) and (pRun^.iDocid = iDocid) then break;
+      end;
+      Assert((rc <> SQLITE_OK) or (pPhrase^.bIncr = 0));
+      if (rc = SQLITE_OK) and (pRun^.bEof <> cuchar(iDum)) then
+        rc := FTS_CORRUPT_VTAB;
+    end;
+    if bTreeEof <> 0 then begin
+      while (rc = SQLITE_OK) and (pRun^.bEof = 0) do
+        fts3EvalNextRow(pCsr, pRun, @rc);
+    end;
+    if rc <> SQLITE_OK then Exit(rc);
+
+    bMatch := 1;
+    p := pNear;
+    while p <> nil do begin
+      bEof := 0;
+      pTest := p;
+      Assert((pTest^.eType = FTSQUERY_NEAR) or (pTest^.eType = FTSQUERY_PHRASE));
+      if pTest^.eType = FTSQUERY_NEAR then pTest := pTest^.pRight;
+      Assert(pTest^.eType = FTSQUERY_PHRASE);
+      pPh := pTest^.pPhrase;
+
+      pIter := pPh^.pOrPoslist;
+      iDocid := pPh^.iOrDocid;
+      if pCsr^.bDesc = cuchar(bDescDoclist) then begin
+        bEof := cuchar(Ord((pPh^.doclist.nAll = 0) or
+          (PtrUInt(pIter) >= PtrUInt(@pPh^.doclist.aAll[pPh^.doclist.nAll]))));
+        while ((pIter = nil) or (DOCID_CMP(iDocid, pCsr^.iPrevId, bDescDoclist) < 0))
+          and (bEof = 0) do
+          sqlite3Fts3DoclistNext(bDescDoclist, pPh^.doclist.aAll, pPh^.doclist.nAll,
+            @pIter, @iDocid, @bEof);
+      end else begin
+        bEof := cuchar(Ord((pPh^.doclist.nAll = 0) or
+          ((pIter <> nil) and (PtrUInt(pIter) <= PtrUInt(pPh^.doclist.aAll)))));
+        while ((pIter = nil) or (DOCID_CMP(iDocid, pCsr^.iPrevId, bDescDoclist) > 0))
+          and (bEof = 0) do
+          sqlite3Fts3DoclistPrev(bDescDoclist, pPh^.doclist.aAll, pPh^.doclist.nAll,
+            @pIter, @iDocid, @iDum, @bEof);
+      end;
+      pPh^.pOrPoslist := pIter;
+      pPh^.iOrDocid := iDocid;
+      if (bEof <> 0) or (iDocid <> pCsr^.iPrevId) then bMatch := 0;
+      p := p^.pLeft;
+    end;
+
+    if bMatch <> 0 then pIter := pPhrase^.pOrPoslist
+    else pIter := nil;
+  end;
+  if pIter = nil then Exit(SQLITE_OK);
+
+  if pIter^ = #1 then begin
+    Inc(pIter);
+    pIter := @pIter[fts3GetVarint32(pIter, @iThis)];
+  end else
+    iThis := 0;
+  while iThis < iCol do begin
+    fts3ColumnlistCopy(nil, @pIter);
+    if pIter^ = #0 then Exit(SQLITE_OK);
+    Inc(pIter);
+    pIter := @pIter[fts3GetVarint32(pIter, @iThis)];
+  end;
+  if pIter^ = #0 then pIter := nil;
+
+  if iCol = iThis then ppOut^ := pIter else ppOut^ := nil;
+  Result := SQLITE_OK;
+end;
+
+{ fts3.c:5786 — sqlite3Fts3MsrCancel. }
+function sqlite3Fts3MsrCancel(pCsr: PFts3Cursor; pExpr: PFts3Expr): cint;
+var
+  rc: cint;
+  iDocid: sqlite3_int64;
+begin
+  rc := SQLITE_OK;
+  if pExpr^.bEof = 0 then begin
+    iDocid := pExpr^.iDocid;
+    fts3EvalRestart(pCsr, pExpr, @rc);
+    while (rc = SQLITE_OK) and (pExpr^.iDocid <> iDocid) do begin
+      fts3EvalNextRow(pCsr, pExpr, @rc);
+      if pExpr^.bEof <> 0 then rc := FTS_CORRUPT_VTAB;
+    end;
+  end;
+  Result := rc;
+end;
+
 { fts3.c:3680 — fts3FunctionArg. }
 function fts3FunctionArg(pContext: Psqlite3_context; const zFunc: PChar;
   pVal: Psqlite3_value; ppCsr: PPFts3Cursor): cint;
@@ -11750,30 +12096,1427 @@ begin
   end;
 end;
 
-{ fts3.c:3702/3749/3809 — snippet/offsets/matchinfo SQL functions.
-  TODO(6.40.1.l): the real bodies live in fts3_snippet.c.  Here they emit a
-  clean error so an actual call does not crash; the xFindFunction dispatch +
-  overload machinery (below) is fully correct. }
+{ ===================================================================== }
+{ 6.40.1.l — fts3_snippet.c (1778L): snippet()/offsets()/matchinfo().      }
+{ Faithful port.  Structs, MatchinfoBuffer lifecycle, phrase/poslist        }
+{ plumbing, the snippet selector + text builder, offsets builder, and       }
+{ matchinfo format-code handlers (p,c,n,a,l,s,x,y,b).  The deferred-token    }
+{ machinery is the faithful no-deferred subset (pCsr->pDeferred==nil), so    }
+{ the FTS3_MATCHINFO_HITS 'x' deferred arm degenerates as in the .k notes.  }
+{ ===================================================================== }
+
+const
+  FTS3_MATCHINFO_NPHRASE   = 'p';   { 1 value }
+  FTS3_MATCHINFO_NCOL      = 'c';   { 1 value }
+  FTS3_MATCHINFO_NDOC      = 'n';   { 1 value }
+  FTS3_MATCHINFO_AVGLENGTH = 'a';   { nCol values }
+  FTS3_MATCHINFO_LENGTH    = 'l';   { nCol values }
+  FTS3_MATCHINFO_LCS       = 's';   { nCol values }
+  FTS3_MATCHINFO_HITS      = 'x';   { 3*nCol*nPhrase values }
+  FTS3_MATCHINFO_LHITS     = 'y';   { nCol*nPhrase values }
+  FTS3_MATCHINFO_LHITS_BM  = 'b';   { nCol*nPhrase values }
+  FTS3_MATCHINFO_DEFAULT   = 'pcx';
+
+type
+  PPcuint = ^Pcuint;
+
+  { fts3_snippet.c:43..48 — LoadDoclistCtx. }
+  PLoadDoclistCtx = ^TLoadDoclistCtx;
+  TLoadDoclistCtx = record
+    pCsr    : PFts3Cursor;
+    nPhrase : cint;
+    nToken  : cint;
+  end;
+
+  { fts3_snippet.c:67..74 — SnippetPhrase. }
+  PSnippetPhrase = ^TSnippetPhrase;
+  TSnippetPhrase = record
+    nToken : cint;
+    pList  : PChar;
+    iHead  : sqlite3_int64;
+    pHead  : PChar;
+    iTail  : sqlite3_int64;
+    pTail  : PChar;
+  end;
+
+  { fts3_snippet.c:58..65 — SnippetIter. }
+  PSnippetIter = ^TSnippetIter;
+  TSnippetIter = record
+    pCsr     : PFts3Cursor;
+    iCol     : cint;
+    nSnippet : cint;
+    nPhrase  : cint;
+    aPhrase  : PSnippetPhrase;
+    iCurrent : cint;
+  end;
+
+  { fts3_snippet.c:76..81 — SnippetFragment. }
+  PSnippetFragment = ^TSnippetFragment;
+  TSnippetFragment = record
+    iCol    : cint;
+    iPos    : cint;
+    covered : u64;
+    hlmask  : u64;
+  end;
+
+  { fts3_snippet.c:87..95 — MatchInfo. }
+  PMatchInfo = ^TMatchInfo;
+  TMatchInfo = record
+    pCursor    : PFts3Cursor;
+    nCol       : cint;
+    nPhrase    : cint;
+    nDoc       : sqlite3_int64;
+    flag       : AnsiChar;
+    aMatchinfo : Pcuint;
+  end;
+
+  { fts3_snippet.c:102..108 — MatchinfoBuffer.  aMI is a trailing flexible
+    array; allocated as one block by fts3MIBufferNew. }
+  PMatchinfoBufferR = ^TMatchinfoBufferR;
+  TMatchinfoBufferR = record
+    aRef        : array[0..2] of cuchar;
+    nElem       : cint;
+    bGlobal     : cint;
+    zMatchinfo  : PChar;
+    aMI         : array[0..0] of u32;  { FLEXARRAY }
+  end;
+
+  { fts3_snippet.c:120..125 — StrBuffer. }
+  PStrBuffer = ^TStrBuffer;
+  TStrBuffer = record
+    z      : PChar;
+    n      : cint;
+    nAlloc : cint;
+  end;
+
+  { fts3_snippet.c:1086..1092 — LcsIterator. }
+  PLcsIterator = ^TLcsIterator;
+  TLcsIterator = record
+    pExpr      : PFts3Expr;
+    iPosOffset : cint;
+    pRead      : PChar;
+    iPos       : cint;
+  end;
+
+  { fts3_snippet.c:1546..1557 — TermOffset / TermOffsetCtx. }
+  PTermOffset = ^TTermOffset;
+  TTermOffset = record
+    pList : PChar;
+    iPos  : sqlite3_int64;
+    iOff  : sqlite3_int64;
+  end;
+
+  PTermOffsetCtx = ^TTermOffsetCtx;
+  TTermOffsetCtx = record
+    pCsr   : PFts3Cursor;
+    iCol   : cint;
+    iTerm  : cint;
+    iDocid : sqlite3_int64;
+    aTerm  : PTermOffset;
+  end;
+
+{ Size (in bytes) of a MatchinfoBuffer sufficient for N elements.
+  fts3_snippet.c:111..112 SZ_MATCHINFOBUFFER: offsetof(aMI) + ((N+1)/2)*8. }
+function SZ_MATCHINFOBUFFER(N: sqlite3_int64): sqlite3_int64; inline;
+begin
+  Result := sqlite3_int64(PtrUInt(@PMatchinfoBufferR(nil)^.aMI[0]))
+            + ((N + 1) div 2) * SizeOf(u64);
+end;
+
+{ Access the trailing flexible aMI[] array of a MatchinfoBuffer as an
+  unbounded u32 array (avoids range-checks on the [0..0] decl). }
+function MIBufAMI(p: PMatchinfoBufferR): Pu32; inline;
+begin
+  Result := Pu32(@p^.aMI[0]);
+end;
+
+{ fts3_snippet.c:135..153 — fts3MIBufferNew. }
+function fts3MIBufferNew(nElem: NativeUInt; const zMatchinfo: PChar):
+  PMatchinfoBufferR;
+var
+  pRet: PMatchinfoBufferR;
+  nByte, nStr: sqlite3_int64;
+begin
+  nByte := SizeOf(u32) * (2*sqlite3_int64(nElem) + 1) + SZ_MATCHINFOBUFFER(1);
+  nStr := sqlite3_int64(libc_strlen(zMatchinfo));
+
+  pRet := PMatchinfoBufferR(sqlite3Fts3MallocZero(nByte + nStr + 1));
+  if pRet <> nil then begin
+    MIBufAMI(pRet)[0] := u32(PtrUInt(@MIBufAMI(pRet)[1]) - PtrUInt(pRet));
+    MIBufAMI(pRet)[1+nElem] := MIBufAMI(pRet)[0] + SizeOf(u32)*(cint(nElem)+1);
+    pRet^.nElem := cint(nElem);
+    pRet^.zMatchinfo := @(PChar(pRet))[nByte];
+    libc_memcpy(pRet^.zMatchinfo, zMatchinfo, NativeUInt(nStr+1));
+    pRet^.aRef[0] := 1;
+  end;
+  Result := pRet;
+end;
+
+{ fts3_snippet.c:155..170 — fts3MIBufferFree (the void* destructor). }
+procedure fts3MIBufferFree(p: Pointer); cdecl;
+var
+  pBuf: PMatchinfoBufferR;
+begin
+  pBuf := PMatchinfoBufferR(PChar(p) - Pu32(p)[-1]);
+  if Pu32(p) = @MIBufAMI(pBuf)[1] then
+    pBuf^.aRef[1] := 0
+  else
+    pBuf^.aRef[2] := 0;
+
+  if (pBuf^.aRef[0] = 0) and (pBuf^.aRef[1] = 0) and (pBuf^.aRef[2] = 0) then
+    sqlite3_free(pBuf);
+end;
+
+{ fts3_snippet.c:172..195 — fts3MIBufferAlloc.  Returns the destructor fn
+  (or nil on OOM) and writes the chosen buffer to paOut^. }
+function fts3MIBufferAlloc(p: PMatchinfoBufferR; paOut: PPcuint): TxDelProc;
+var
+  xRet: TxDelProc;
+  aOut: Pcuint;
+begin
+  xRet := nil;
+  aOut := nil;
+
+  if p^.aRef[1] = 0 then begin
+    p^.aRef[1] := 1;
+    aOut := Pcuint(@MIBufAMI(p)[1]);
+    xRet := @fts3MIBufferFree;
+  end
+  else if p^.aRef[2] = 0 then begin
+    p^.aRef[2] := 1;
+    aOut := Pcuint(@MIBufAMI(p)[p^.nElem+2]);
+    xRet := @fts3MIBufferFree;
+  end else begin
+    aOut := Pcuint(sqlite3_malloc64(u64(p^.nElem) * SizeOf(u32)));
+    if aOut <> nil then begin
+      xRet := @sqlite3_free;
+      if p^.bGlobal <> 0 then
+        libc_memcpy(aOut, @MIBufAMI(p)[1], NativeUInt(p^.nElem)*SizeOf(u32));
+    end;
+  end;
+
+  paOut^ := aOut;
+  Result := xRet;
+end;
+
+{ fts3_snippet.c:197..200 — fts3MIBufferSetGlobal. }
+procedure fts3MIBufferSetGlobal(p: PMatchinfoBufferR);
+begin
+  p^.bGlobal := 1;
+  libc_memcpy(@MIBufAMI(p)[2+p^.nElem], @MIBufAMI(p)[1],
+    NativeUInt(p^.nElem)*SizeOf(u32));
+end;
+
+{ fts3_snippet.c:205..213 — sqlite3Fts3MIBufferFree.  Param typed Pointer to
+  match the forward decl (pMIBuffer is the opaque PMatchinfoBuffer field). }
+procedure sqlite3Fts3MIBufferFree(p: Pointer);
+var pBuf: PMatchinfoBufferR;
+begin
+  pBuf := PMatchinfoBufferR(p);
+  if pBuf <> nil then begin
+    Assert(pBuf^.aRef[0] = 1);
+    pBuf^.aRef[0] := 0;
+    if (pBuf^.aRef[0] = 0) and (pBuf^.aRef[1] = 0) and (pBuf^.aRef[2] = 0) then
+      sqlite3_free(pBuf);
+  end;
+end;
+
+{ fts3_snippet.c:240..244 — fts3GetDeltaPosition. }
+procedure fts3GetDeltaPosition(pp: PPChar; piPos: Psqlite3_int64);
+var iVal: cint;
+begin
+  iVal := 0;
+  pp^ := @pp^[fts3GetVarint32(pp^, @iVal)];
+  piPos^ := piPos^ + (iVal - 2);
+end;
+
+{ fts3_snippet.c:249..269 — fts3ExprIterate2. }
+function fts3ExprIterate2(pExpr: PFts3Expr; piPhrase: Pcint;
+  x: TFts3ExprIterCb; pCtx: Pointer): cint;
+var
+  rc, eType: cint;
+begin
+  eType := pExpr^.eType;
+  if eType <> FTSQUERY_PHRASE then begin
+    Assert((pExpr^.pLeft <> nil) and (pExpr^.pRight <> nil));
+    rc := fts3ExprIterate2(pExpr^.pLeft, piPhrase, x, pCtx);
+    if (rc = SQLITE_OK) and (eType <> FTSQUERY_NOT) then
+      rc := fts3ExprIterate2(pExpr^.pRight, piPhrase, x, pCtx);
+  end else begin
+    rc := x(pExpr, piPhrase^, pCtx);
+    Inc(piPhrase^);
+  end;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:281..288 — sqlite3Fts3ExprIterate. }
+function sqlite3Fts3ExprIterate(pExpr: PFts3Expr; x: TFts3ExprIterCb;
+  pCtx: Pointer): cint;
+var iPhrase: cint;
+begin
+  iPhrase := 0;
+  Result := fts3ExprIterate2(pExpr, @iPhrase, x, pCtx);
+end;
+
+{ fts3_snippet.c:295..306 — fts3ExprLoadDoclistsCb. }
+function fts3ExprLoadDoclistsCb(pExpr: PFts3Expr; iPhrase: cint;
+  ctx: Pointer): cint; cdecl;
+var p: PLoadDoclistCtx;
+begin
+  p := PLoadDoclistCtx(ctx);
+  Inc(p^.nPhrase);
+  p^.nToken := p^.nToken + pExpr^.pPhrase^.nToken;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_snippet.c:318..330 — fts3ExprLoadDoclists. }
+function fts3ExprLoadDoclists(pCsr: PFts3Cursor; pnPhrase, pnToken: Pcint): cint;
+var
+  rc: cint;
+  sCtx: TLoadDoclistCtx;
+begin
+  sCtx.pCsr := pCsr; sCtx.nPhrase := 0; sCtx.nToken := 0;
+  rc := sqlite3Fts3ExprIterate(pCsr^.pExpr, @fts3ExprLoadDoclistsCb, @sCtx);
+  if pnPhrase <> nil then pnPhrase^ := sCtx.nPhrase;
+  if pnToken <> nil then pnToken^ := sCtx.nToken;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:332..341 — fts3ExprPhraseCount. }
+function fts3ExprPhraseCountCb(pExpr: PFts3Expr; iPhrase: cint;
+  ctx: Pointer): cint; cdecl;
+begin
+  Inc(Pcint(ctx)^);
+  pExpr^.iPhrase := iPhrase;
+  Result := SQLITE_OK;
+end;
+function fts3ExprPhraseCount(pExpr: PFts3Expr): cint;
+var nPhrase: cint;
+begin
+  nPhrase := 0;
+  sqlite3Fts3ExprIterate(pExpr, @fts3ExprPhraseCountCb, @nPhrase);
+  Result := nPhrase;
+end;
+
+{ fts3_snippet.c:348..365 — fts3SnippetAdvance. }
+procedure fts3SnippetAdvance(ppIter: PPChar; piIter: Psqlite3_int64; iNext: cint);
+var
+  pIter: PChar;
+  iIter: sqlite3_int64;
+begin
+  pIter := ppIter^;
+  if pIter <> nil then begin
+    iIter := piIter^;
+    while iIter < iNext do begin
+      if (Byte(pIter^) and $FE) = 0 then begin
+        iIter := -1;
+        pIter := nil;
+        break;
+      end;
+      fts3GetDeltaPosition(@pIter, @iIter);
+    end;
+    piIter^ := iIter;
+    ppIter^ := pIter;
+  end;
+end;
+
+{ fts3_snippet.c:370..411 — fts3SnippetNextCandidate. }
+function fts3SnippetNextCandidate(pIter: PSnippetIter): cint;
+var
+  i, iStart, iEnd: cint;
+  pPhrase: PSnippetPhrase;
+begin
+  if pIter^.iCurrent < 0 then begin
+    pIter^.iCurrent := 0;
+    for i := 0 to pIter^.nPhrase - 1 do begin
+      pPhrase := @pIter^.aPhrase[i];
+      fts3SnippetAdvance(@pPhrase^.pHead, @pPhrase^.iHead, pIter^.nSnippet);
+    end;
+  end else begin
+    iEnd := $7FFFFFFF;
+    for i := 0 to pIter^.nPhrase - 1 do begin
+      pPhrase := @pIter^.aPhrase[i];
+      if (pPhrase^.pHead <> nil) and (pPhrase^.iHead < iEnd) then
+        iEnd := cint(pPhrase^.iHead);
+    end;
+    if iEnd = $7FFFFFFF then Exit(1);
+
+    iStart := iEnd - pIter^.nSnippet + 1;
+    pIter^.iCurrent := iStart;
+    for i := 0 to pIter^.nPhrase - 1 do begin
+      pPhrase := @pIter^.aPhrase[i];
+      fts3SnippetAdvance(@pPhrase^.pHead, @pPhrase^.iHead, iEnd+1);
+      fts3SnippetAdvance(@pPhrase^.pTail, @pPhrase^.iTail, iStart);
+    end;
+  end;
+  Result := 0;
+end;
+
+{ fts3_snippet.c:417..465 — fts3SnippetDetails. }
+procedure fts3SnippetDetails(pIter: PSnippetIter; mCovered: u64;
+  piToken, piScore: Pcint; pmCover, pmHighlight: Pu64);
+var
+  iStart, iScore, i, j: cint;
+  mCover, mHighlight, mPhrase, mPos: u64;
+  pPhrase: PSnippetPhrase;
+  pCsr: PChar;
+  iCsr: sqlite3_int64;
+begin
+  iStart := pIter^.iCurrent;
+  iScore := 0;
+  mCover := 0;
+  mHighlight := 0;
+
+  for i := 0 to pIter^.nPhrase - 1 do begin
+    pPhrase := @pIter^.aPhrase[i];
+    if pPhrase^.pTail <> nil then begin
+      pCsr := pPhrase^.pTail;
+      iCsr := pPhrase^.iTail;
+
+      while (iCsr < (iStart+pIter^.nSnippet)) and (iCsr >= iStart) do begin
+        mPhrase := u64(1) shl (i mod 64);
+        mPos := u64(1) shl (iCsr - iStart);
+        if ((mCover or mCovered) and mPhrase) <> 0 then
+          Inc(iScore)
+        else
+          iScore := iScore + 1000;
+        mCover := mCover or mPhrase;
+
+        j := 0;
+        while (j < pPhrase^.nToken) and (j < pIter^.nSnippet) do begin
+          mHighlight := mHighlight or (mPos shr j);
+          Inc(j);
+        end;
+
+        if (Byte(pCsr^) and $0FE) = 0 then break;
+        fts3GetDeltaPosition(@pCsr, @iCsr);
+      end;
+    end;
+  end;
+
+  piToken^ := iStart;
+  piScore^ := iScore;
+  pmCover^ := mCover;
+  pmHighlight^ := mHighlight;
+end;
+
+{ fts3_snippet.c:472..500 — fts3SnippetFindPositions (ExprIterate callback). }
+function fts3SnippetFindPositions(pExpr: PFts3Expr; iPhrase: cint;
+  ctx: Pointer): cint; cdecl;
+var
+  p: PSnippetIter;
+  pPhrase: PSnippetPhrase;
+  pCsr: PChar;
+  rc: cint;
+  iFirst: sqlite3_int64;
+begin
+  p := PSnippetIter(ctx);
+  pPhrase := @p^.aPhrase[iPhrase];
+  pPhrase^.nToken := pExpr^.pPhrase^.nToken;
+  rc := sqlite3Fts3EvalPhrasePoslist(p^.pCsr, pExpr, p^.iCol, @pCsr);
+  if pCsr <> nil then begin
+    iFirst := 0;
+    pPhrase^.pList := pCsr;
+    fts3GetDeltaPosition(@pCsr, @iFirst);
+    if iFirst < 0 then
+      rc := FTS_CORRUPT_VTAB
+    else begin
+      pPhrase^.pHead := pCsr;
+      pPhrase^.pTail := pCsr;
+      pPhrase^.iHead := iFirst;
+      pPhrase^.iTail := iFirst;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:517..595 — fts3BestSnippet. }
+function fts3BestSnippet(nSnippet: cint; pCsr: PFts3Cursor; iCol: cint;
+  mCovered: u64; pmSeen: Pu64; pFragment: PSnippetFragment;
+  piScore: Pcint): cint;
+var
+  rc, nList, iBestScore, i: cint;
+  sIter: TSnippetIter;
+  nByte: sqlite3_int64;
+  iPos, iScore: cint;
+  mCover, mHighlite: u64;
+begin
+  libc_memset(@sIter, 0, SizeOf(sIter));
+  iBestScore := -1;
+
+  rc := fts3ExprLoadDoclists(pCsr, @nList, nil);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  nByte := SizeOf(TSnippetPhrase) * nList;
+  sIter.aPhrase := PSnippetPhrase(sqlite3Fts3MallocZero(nByte));
+  if sIter.aPhrase = nil then Exit(SQLITE_NOMEM);
+
+  sIter.pCsr := pCsr;
+  sIter.iCol := iCol;
+  sIter.nSnippet := nSnippet;
+  sIter.nPhrase := nList;
+  sIter.iCurrent := -1;
+  rc := sqlite3Fts3ExprIterate(pCsr^.pExpr, @fts3SnippetFindPositions, @sIter);
+  if rc = SQLITE_OK then begin
+
+    for i := 0 to nList - 1 do
+      if sIter.aPhrase[i].pHead <> nil then
+        pmSeen^ := pmSeen^ or (u64(1) shl (i mod 64));
+
+    pFragment^.iCol := iCol;
+    while fts3SnippetNextCandidate(@sIter) = 0 do begin
+      fts3SnippetDetails(@sIter, mCovered, @iPos, @iScore, @mCover, @mHighlite);
+      if iScore > iBestScore then begin
+        pFragment^.iPos := iPos;
+        pFragment^.hlmask := mHighlite;
+        pFragment^.covered := mCover;
+        iBestScore := iScore;
+      end;
+    end;
+
+    piScore^ := iBestScore;
+  end;
+  sqlite3_free(sIter.aPhrase);
+  Result := rc;
+end;
+
+{ fts3_snippet.c:604..634 — fts3StringAppend. }
+function fts3StringAppend(pStr: PStrBuffer; const zAppend: PChar;
+  nAppend: cint): cint;
+var
+  nAlloc: sqlite3_int64;
+  zNew: PChar;
+begin
+  if nAppend < 0 then nAppend := cint(libc_strlen(zAppend));
+
+  if (pStr^.n + nAppend + 1) >= pStr^.nAlloc then begin
+    nAlloc := pStr^.nAlloc + sqlite3_int64(nAppend) + 100;
+    zNew := PChar(sqlite3_realloc64(pStr^.z, u64(nAlloc)));
+    if zNew = nil then Exit(SQLITE_NOMEM);
+    pStr^.z := zNew;
+    pStr^.nAlloc := cint(nAlloc);
+  end;
+
+  libc_memcpy(@pStr^.z[pStr^.n], zAppend, NativeUInt(nAppend));
+  pStr^.n := pStr^.n + nAppend;
+  pStr^.z[pStr^.n] := #0;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_snippet.c:656..715 — fts3SnippetShift. }
+function fts3SnippetShift(pTab: PFts3Table; iLangid, nSnippet: cint;
+  const zDoc: PChar; nDoc: cint; piPos: Pcint; pHlmask: Pu64): cint;
+var
+  hlmask: u64;
+  nLeft, nRight, nDesired, nShift, iCurrent, rc, n: cint;
+  pMod: Psqlite3_tokenizer_module;
+  pC: Psqlite3_tokenizer_cursor;
+  ZDUMMY: PChar;
+  D1, D2, D3: cint;
+begin
+  hlmask := pHlmask^;
+
+  if hlmask <> 0 then begin
+    nLeft := 0;
+    while (hlmask and (u64(1) shl nLeft)) = 0 do Inc(nLeft);
+    nRight := 0;
+    while (hlmask and (u64(1) shl (nSnippet-1-nRight))) = 0 do Inc(nRight);
+    nDesired := (nLeft-nRight) div 2;
+
+    if nDesired > 0 then begin
+      iCurrent := 0;
+      pMod := pTab^.pTokenizer^.pModule;
+
+      rc := sqlite3Fts3OpenTokenizer(pTab^.pTokenizer, iLangid, zDoc, nDoc, @pC);
+      if rc <> SQLITE_OK then Exit(rc);
+      while (rc = SQLITE_OK) and (iCurrent < (nSnippet+nDesired)) do begin
+        D1 := 0; D2 := 0; D3 := 0;
+        rc := pMod^.xNext(pC, @ZDUMMY, @D1, @D2, @D3, @iCurrent);
+      end;
+      pMod^.xClose(pC);
+      if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then Exit(rc);
+
+      nShift := Ord(rc = SQLITE_DONE) + iCurrent - nSnippet;
+      if nShift > 0 then begin
+        piPos^ := piPos^ + nShift;
+        pHlmask^ := hlmask shr nShift;
+      end;
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_snippet.c:721..833 — fts3SnippetText. }
+function fts3SnippetText(pCsr: PFts3Cursor; pFragment: PSnippetFragment;
+  iFragment, isLast, nSnippet: cint;
+  const zOpen, zClose, zEllipsis: PChar; pOut: PStrBuffer): cint;
+var
+  pTab: PFts3Table;
+  rc: cint;
+  zDoc: PChar;
+  nDoc, iCurrent, iEnd, isShiftDone, iPos, iCol, n: cint;
+  hlmask: u64;
+  pMod: Psqlite3_tokenizer_module;
+  pC: Psqlite3_tokenizer_cursor;
+  ZDUMMY: PChar;
+  D1, iBegin, iFin, isHighlight: cint;
+begin
+  pTab := PFts3Table(pCsr^.base.pVtab);
+  iCurrent := 0;
+  iEnd := 0;
+  isShiftDone := 0;
+  iPos := pFragment^.iPos;
+  hlmask := pFragment^.hlmask;
+  iCol := pFragment^.iCol+1;
+
+  zDoc := sqlite3_column_text(pCsr^.pStmt, iCol);
+  if zDoc = nil then begin
+    if sqlite3_column_type(pCsr^.pStmt, iCol) <> SQLITE_NULL then
+      Exit(SQLITE_NOMEM);
+    Exit(SQLITE_OK);
+  end;
+  nDoc := sqlite3_column_bytes(pCsr^.pStmt, iCol);
+
+  pMod := pTab^.pTokenizer^.pModule;
+  rc := sqlite3Fts3OpenTokenizer(pTab^.pTokenizer, pCsr^.iLangid, zDoc, nDoc, @pC);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  while rc = SQLITE_OK do begin
+    D1 := -1; iBegin := 0; iFin := 0; isHighlight := 0;
+
+    rc := pMod^.xNext(pC, @ZDUMMY, @D1, @iBegin, @iFin, @iCurrent);
+    if rc <> SQLITE_OK then begin
+      if rc = SQLITE_DONE then
+        rc := fts3StringAppend(pOut, @zDoc[iEnd], -1);
+      break;
+    end;
+    if iCurrent < iPos then continue;
+
+    if isShiftDone = 0 then begin
+      n := nDoc - iBegin;
+      rc := fts3SnippetShift(pTab, pCsr^.iLangid, nSnippet, @zDoc[iBegin], n,
+              @iPos, @hlmask);
+      isShiftDone := 1;
+
+      if rc = SQLITE_OK then begin
+        if (iPos > 0) or (iFragment > 0) then
+          rc := fts3StringAppend(pOut, zEllipsis, -1)
+        else if iBegin <> 0 then
+          rc := fts3StringAppend(pOut, zDoc, iBegin);
+      end;
+      if (rc <> SQLITE_OK) or (iCurrent < iPos) then continue;
+    end;
+
+    if iCurrent >= (iPos+nSnippet) then begin
+      if isLast <> 0 then
+        rc := fts3StringAppend(pOut, zEllipsis, -1);
+      break;
+    end;
+
+    isHighlight := Ord((hlmask and (u64(1) shl (iCurrent-iPos))) <> 0);
+
+    if iCurrent > iPos then
+      rc := fts3StringAppend(pOut, @zDoc[iEnd], iBegin-iEnd);
+    if (rc = SQLITE_OK) and (isHighlight <> 0) then
+      rc := fts3StringAppend(pOut, zOpen, -1);
+    if rc = SQLITE_OK then
+      rc := fts3StringAppend(pOut, @zDoc[iBegin], iFin-iBegin);
+    if (rc = SQLITE_OK) and (isHighlight <> 0) then
+      rc := fts3StringAppend(pOut, zClose, -1);
+
+    iEnd := iFin;
+  end;
+
+  pMod^.xClose(pC);
+  Result := rc;
+end;
+
+{ fts3_snippet.c:849..862 — fts3ColumnlistCount. }
+function fts3ColumnlistCount(ppCollist: PPChar): cint;
+var
+  pEnd: PChar;
+  c: Byte;
+  nEntry: cint;
+begin
+  pEnd := ppCollist^;
+  c := 0;
+  nEntry := 0;
+  while ($FE and (Byte(pEnd^) or c)) <> 0 do begin
+    c := Byte(pEnd^) and $80; Inc(pEnd);
+    if c = 0 then Inc(nEntry);
+  end;
+  ppCollist^ := pEnd;
+  Result := nEntry;
+end;
+
+{ fts3_snippet.c:867..900 — fts3ExprLHits. }
+function fts3ExprLHits(pExpr: PFts3Expr; p: PMatchInfo): cint;
+var
+  pTab: PFts3Table;
+  iStart, iCol, nHit: cint;
+  pPhrase: PFts3Phrase;
+  pIter: PChar;
+begin
+  pTab := PFts3Table(p^.pCursor^.base.pVtab);
+  pPhrase := pExpr^.pPhrase;
+  pIter := pPhrase^.doclist.pList;
+  iCol := 0;
+
+  if p^.flag = FTS3_MATCHINFO_LHITS then
+    iStart := pExpr^.iPhrase * p^.nCol
+  else
+    iStart := pExpr^.iPhrase * ((p^.nCol + 31) div 32);
+
+  if pIter <> nil then
+    while True do begin
+      nHit := fts3ColumnlistCount(@pIter);
+      if (pPhrase^.iColumn >= pTab^.nColumn) or (pPhrase^.iColumn = iCol) then begin
+        if p^.flag = FTS3_MATCHINFO_LHITS then
+          Pu32(p^.aMatchinfo)[iStart + iCol] := u32(nHit)
+        else if nHit <> 0 then
+          Pu32(p^.aMatchinfo)[iStart + (iCol+1) div 32] :=
+            Pu32(p^.aMatchinfo)[iStart + (iCol+1) div 32] or (u32(1) shl (iCol and $1F));
+      end;
+      Assert((Byte(pIter^) = $00) or (Byte(pIter^) = $01));
+      if Byte(pIter^) <> $01 then break;
+      Inc(pIter);
+      pIter := @pIter[fts3GetVarint32(pIter, @iCol)];
+      if iCol >= p^.nCol then Exit(FTS_CORRUPT_VTAB);
+    end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_snippet.c:905..920 — fts3ExprLHitGather. }
+function fts3ExprLHitGather(pExpr: PFts3Expr; p: PMatchInfo): cint;
+var rc: cint;
+begin
+  rc := SQLITE_OK;
+  Assert((pExpr^.pLeft = nil) = (pExpr^.pRight = nil));
+  if (pExpr^.bEof = 0) and (pExpr^.iDocid = p^.pCursor^.iPrevId) then begin
+    if pExpr^.pLeft <> nil then begin
+      rc := fts3ExprLHitGather(pExpr^.pLeft, p);
+      if rc = SQLITE_OK then rc := fts3ExprLHitGather(pExpr^.pRight, p);
+    end else
+      rc := fts3ExprLHits(pExpr, p);
+  end;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:949..958 — fts3ExprGlobalHitsCb. }
+function fts3ExprGlobalHitsCb(pExpr: PFts3Expr; iPhrase: cint;
+  pCtx: Pointer): cint; cdecl;
+var p: PMatchInfo;
+begin
+  p := PMatchInfo(pCtx);
+  Result := sqlite3Fts3EvalPhraseStats(p^.pCursor, pExpr,
+              Pcuint(@Pu32(p^.aMatchinfo)[3*iPhrase*p^.nCol]));
+end;
+
+{ fts3_snippet.c:965..986 — fts3ExprLocalHitsCb. }
+function fts3ExprLocalHitsCb(pExpr: PFts3Expr; iPhrase: cint;
+  pCtx: Pointer): cint; cdecl;
+var
+  rc, iStart, i: cint;
+  p: PMatchInfo;
+  pCsr: PChar;
+begin
+  rc := SQLITE_OK;
+  p := PMatchInfo(pCtx);
+  iStart := iPhrase * p^.nCol * 3;
+
+  i := 0;
+  while (i < p^.nCol) and (rc = SQLITE_OK) do begin
+    rc := sqlite3Fts3EvalPhrasePoslist(p^.pCursor, pExpr, i, @pCsr);
+    if pCsr <> nil then
+      Pu32(p^.aMatchinfo)[iStart+i*3] := u32(fts3ColumnlistCount(@pCsr))
+    else
+      Pu32(p^.aMatchinfo)[iStart+i*3] := 0;
+    Inc(i);
+  end;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:988..1007 — fts3MatchinfoCheck. }
+function fts3MatchinfoCheck(pTab: PFts3Table; cArg: AnsiChar;
+  pzErr: PPChar): cint;
+begin
+  if (cArg = FTS3_MATCHINFO_NPHRASE)
+   or (cArg = FTS3_MATCHINFO_NCOL)
+   or ((cArg = FTS3_MATCHINFO_NDOC) and (pTab^.bFts4 <> 0))
+   or ((cArg = FTS3_MATCHINFO_AVGLENGTH) and (pTab^.bFts4 <> 0))
+   or ((cArg = FTS3_MATCHINFO_LENGTH) and (pTab^.bHasDocsize <> 0))
+   or (cArg = FTS3_MATCHINFO_LCS)
+   or (cArg = FTS3_MATCHINFO_HITS)
+   or (cArg = FTS3_MATCHINFO_LHITS)
+   or (cArg = FTS3_MATCHINFO_LHITS_BM) then
+    Exit(SQLITE_OK);
+  fts3ErrMsg(pzErr, 'unrecognized matchinfo request: %c', [cArg]);
+  Result := SQLITE_ERROR;
+end;
+
+{ fts3_snippet.c:1009..1040 — fts3MatchinfoSize. }
+function fts3MatchinfoSize(pInfo: PMatchInfo; cArg: AnsiChar): NativeUInt;
+var nVal: NativeUInt;
+begin
+  case cArg of
+    FTS3_MATCHINFO_NDOC, FTS3_MATCHINFO_NPHRASE, FTS3_MATCHINFO_NCOL:
+      nVal := 1;
+    FTS3_MATCHINFO_AVGLENGTH, FTS3_MATCHINFO_LENGTH, FTS3_MATCHINFO_LCS:
+      nVal := pInfo^.nCol;
+    FTS3_MATCHINFO_LHITS:
+      nVal := NativeUInt(pInfo^.nCol) * pInfo^.nPhrase;
+    FTS3_MATCHINFO_LHITS_BM:
+      nVal := NativeUInt(pInfo^.nPhrase) * ((pInfo^.nCol + 31) div 32);
+  else
+    { FTS3_MATCHINFO_HITS }
+    nVal := NativeUInt(pInfo^.nCol) * pInfo^.nPhrase * 3;
+  end;
+  Result := nVal;
+end;
+
+{ fts3_snippet.c:1042..1078 — fts3MatchinfoSelectDoctotal. }
+function fts3MatchinfoSelectDoctotal(pTab: PFts3Table; ppStmt: PPVdbe;
+  pnDoc: Psqlite3_int64; paLen, ppEnd: PPChar): cint;
+var
+  pStmt: PVdbe;
+  a, pEnd: PChar;
+  nDoc: sqlite3_int64;
+  n, rc: cint;
+begin
+  if ppStmt^ = nil then begin
+    rc := sqlite3Fts3SelectDoctotal(pTab, ppStmt);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+  pStmt := ppStmt^;
+  Assert(sqlite3_data_count(pStmt) = 1);
+
+  n := sqlite3_column_bytes(pStmt, 0);
+  a := sqlite3_column_blob(pStmt, 0);
+  if a = nil then Exit(FTS_CORRUPT_VTAB);
+  pEnd := @a[n];
+  a := @a[sqlite3Fts3GetVarintBounded(a, pEnd, @nDoc)];
+  if (nDoc <= 0) or (PtrUInt(a) > PtrUInt(pEnd)) then Exit(FTS_CORRUPT_VTAB);
+  pnDoc^ := nDoc;
+
+  if paLen <> nil then paLen^ := a;
+  if ppEnd <> nil then ppEnd^ := pEnd;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_snippet.c:1100..1108 — fts3MatchinfoLcsCb. }
+function fts3MatchinfoLcsCb(pExpr: PFts3Expr; iPhrase: cint;
+  pCtx: Pointer): cint; cdecl;
+var aIter: PLcsIterator;
+begin
+  aIter := PLcsIterator(pCtx);
+  aIter[iPhrase].pExpr := pExpr;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_snippet.c:1115..1132 — fts3LcsIteratorAdvance. }
+function fts3LcsIteratorAdvance(pIter: PLcsIterator): cint;
+var
+  pRead: PChar;
+  iRead: sqlite3_int64;
+  rc: cint;
+begin
+  rc := 0;
+  pRead := pIter^.pRead;
+  pRead := @pRead[sqlite3Fts3GetVarint(pRead, @iRead)];
+  if (iRead = 0) or (iRead = 1) then begin
+    pRead := nil;
+    rc := 1;
+  end else
+    pIter^.iPos := pIter^.iPos + cint(iRead-2);
+
+  pIter^.pRead := pRead;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:1145..1214 — fts3MatchinfoLcs. }
+function fts3MatchinfoLcs(pCsr: PFts3Cursor; pInfo: PMatchInfo): cint;
+label matchinfo_lcs_out;
+var
+  aIter: PLcsIterator;
+  i, iCol, nToken, rc, nLcs, nLive, nThisLcs: cint;
+  pIter, pIt, pAdv: PLcsIterator;
+begin
+  nToken := 0;
+  rc := SQLITE_OK;
+
+  aIter := PLcsIterator(sqlite3Fts3MallocZero(SizeOf(TLcsIterator) * pCsr^.nPhrase));
+  if aIter = nil then Exit(SQLITE_NOMEM);
+  sqlite3Fts3ExprIterate(pCsr^.pExpr, @fts3MatchinfoLcsCb, aIter);
+
+  for i := 0 to pInfo^.nPhrase - 1 do begin
+    pIter := @aIter[i];
+    nToken := nToken - pIter^.pExpr^.pPhrase^.nToken;
+    pIter^.iPosOffset := nToken;
+  end;
+
+  for iCol := 0 to pInfo^.nCol - 1 do begin
+    nLcs := 0;
+    nLive := 0;
+
+    for i := 0 to pInfo^.nPhrase - 1 do begin
+      pIt := @aIter[i];
+      rc := sqlite3Fts3EvalPhrasePoslist(pCsr, pIt^.pExpr, iCol, @pIt^.pRead);
+      if rc <> SQLITE_OK then goto matchinfo_lcs_out;
+      if pIt^.pRead <> nil then begin
+        pIt^.iPos := pIt^.iPosOffset;
+        fts3LcsIteratorAdvance(pIt);
+        if pIt^.pRead = nil then begin
+          rc := FTS_CORRUPT_VTAB;
+          goto matchinfo_lcs_out;
+        end;
+        Inc(nLive);
+      end;
+    end;
+
+    while nLive > 0 do begin
+      pAdv := nil;
+      nThisLcs := 0;
+
+      for i := 0 to pInfo^.nPhrase - 1 do begin
+        pIter := @aIter[i];
+        if pIter^.pRead = nil then
+          nThisLcs := 0
+        else begin
+          if (pAdv = nil) or (pIter^.iPos < pAdv^.iPos) then
+            pAdv := pIter;
+          { pIter[-1] = @aIter[i-1] }
+          if (nThisLcs = 0) or (pIter^.iPos = PLcsIterator(@aIter[i-1])^.iPos) then
+            Inc(nThisLcs)
+          else
+            nThisLcs := 1;
+          if nThisLcs > nLcs then nLcs := nThisLcs;
+        end;
+      end;
+      if fts3LcsIteratorAdvance(pAdv) <> 0 then Dec(nLive);
+    end;
+
+    Pu32(pInfo^.aMatchinfo)[iCol] := u32(nLcs);
+  end;
+
+  matchinfo_lcs_out:
+  sqlite3_free(aIter);
+  Result := rc;
+end;
+
+{ fts3_snippet.c:1233..1348 — fts3MatchinfoValues. }
+function fts3MatchinfoValues(pCsr: PFts3Cursor; bGlobal: cint;
+  pInfo: PMatchInfo; const zArg: PChar): cint;
+var
+  rc, i, iCol: cint;
+  pTab: PFts3Table;
+  pSelect: PVdbe;
+  nDoc: sqlite3_int64;
+  a, pEnd: PChar;
+  iVal: u32;
+  nToken: sqlite3_int64;
+  pSelectDocsize: PVdbe;
+  nZero: NativeUInt;
+  pExpr: PFts3Expr;
+begin
+  rc := SQLITE_OK;
+  pTab := PFts3Table(pCsr^.base.pVtab);
+  pSelect := nil;
+
+  i := 0;
+  while (rc = SQLITE_OK) and (zArg[i] <> #0) do begin
+    pInfo^.flag := zArg[i];
+    case zArg[i] of
+      FTS3_MATCHINFO_NPHRASE:
+        if bGlobal <> 0 then Pu32(pInfo^.aMatchinfo)[0] := u32(pInfo^.nPhrase);
+
+      FTS3_MATCHINFO_NCOL:
+        if bGlobal <> 0 then Pu32(pInfo^.aMatchinfo)[0] := u32(pInfo^.nCol);
+
+      FTS3_MATCHINFO_NDOC:
+        if bGlobal <> 0 then begin
+          nDoc := 0;
+          rc := fts3MatchinfoSelectDoctotal(pTab, @pSelect, @nDoc, nil, nil);
+          Pu32(pInfo^.aMatchinfo)[0] := u32(nDoc);
+        end;
+
+      FTS3_MATCHINFO_AVGLENGTH:
+        if bGlobal <> 0 then begin
+          rc := fts3MatchinfoSelectDoctotal(pTab, @pSelect, @nDoc, @a, @pEnd);
+          if rc = SQLITE_OK then begin
+            for iCol := 0 to pInfo^.nCol - 1 do begin
+              a := @a[sqlite3Fts3GetVarint(a, @nToken)];
+              if PtrUInt(a) > PtrUInt(pEnd) then begin
+                rc := SQLITE_CORRUPT_VTAB;
+                break;
+              end;
+              iVal := u32((u32(nToken and $ffffffff) + nDoc div 2) div nDoc);
+              Pu32(pInfo^.aMatchinfo)[iCol] := iVal;
+            end;
+          end;
+        end;
+
+      FTS3_MATCHINFO_LENGTH:
+        begin
+          pSelectDocsize := nil;
+          rc := sqlite3Fts3SelectDocsize(pTab, pCsr^.iPrevId, @pSelectDocsize);
+          if rc = SQLITE_OK then begin
+            a := sqlite3_column_blob(pSelectDocsize, 0);
+            pEnd := @a[sqlite3_column_bytes(pSelectDocsize, 0)];
+            for iCol := 0 to pInfo^.nCol - 1 do begin
+              a := @a[sqlite3Fts3GetVarintBounded(a, pEnd, @nToken)];
+              if PtrUInt(a) > PtrUInt(pEnd) then begin
+                rc := SQLITE_CORRUPT_VTAB;
+                break;
+              end;
+              Pu32(pInfo^.aMatchinfo)[iCol] := u32(nToken);
+            end;
+          end;
+          sqlite3_reset(pSelectDocsize);
+        end;
+
+      FTS3_MATCHINFO_LCS:
+        begin
+          rc := fts3ExprLoadDoclists(pCsr, nil, nil);
+          if rc = SQLITE_OK then rc := fts3MatchinfoLcs(pCsr, pInfo);
+        end;
+
+      FTS3_MATCHINFO_LHITS_BM, FTS3_MATCHINFO_LHITS:
+        begin
+          nZero := fts3MatchinfoSize(pInfo, zArg[i]) * SizeOf(u32);
+          libc_memset(pInfo^.aMatchinfo, 0, nZero);
+          rc := fts3ExprLHitGather(pCsr^.pExpr, pInfo);
+        end;
+
+    else
+      begin
+        { FTS3_MATCHINFO_HITS }
+        pExpr := pCsr^.pExpr;
+        rc := fts3ExprLoadDoclists(pCsr, nil, nil);
+        if rc <> SQLITE_OK then break;
+        if bGlobal <> 0 then begin
+          if pCsr^.pDeferred <> nil then begin
+            rc := fts3MatchinfoSelectDoctotal(pTab, @pSelect, @pInfo^.nDoc, nil, nil);
+            if rc <> SQLITE_OK then break;
+          end;
+          rc := sqlite3Fts3ExprIterate(pExpr, @fts3ExprGlobalHitsCb, pInfo);
+          sqlite3Fts3EvalTestDeferred(pCsr, @rc);
+          if rc <> SQLITE_OK then break;
+        end;
+        sqlite3Fts3ExprIterate(pExpr, @fts3ExprLocalHitsCb, pInfo);
+      end;
+    end;
+
+    pInfo^.aMatchinfo := Pcuint(@Pu32(pInfo^.aMatchinfo)[fts3MatchinfoSize(pInfo, zArg[i])]);
+    Inc(i);
+  end;
+
+  sqlite3_reset(pSelect);
+  Result := rc;
+end;
+
+{ fts3_snippet.c:1355..1435 — fts3GetMatchinfo. }
+procedure fts3GetMatchinfo(pCtx: Psqlite3_context; pCsr: PFts3Cursor;
+  const zArg: PChar);
+var
+  sInfo: TMatchInfo;
+  pTab: PFts3Table;
+  rc, bGlobal, n, i: cint;
+  aOut: Pcuint;
+  xDestroyOut: TxDelProc;
+  nMatchinfo: NativeUInt;
+  zErr: PChar;
+begin
+  pTab := PFts3Table(pCsr^.base.pVtab);
+  rc := SQLITE_OK;
+  bGlobal := 0;
+  aOut := nil;
+  xDestroyOut := nil;
+
+  libc_memset(@sInfo, 0, SizeOf(TMatchInfo));
+  sInfo.pCursor := pCsr;
+  sInfo.nCol := pTab^.nColumn;
+
+  if (pCsr^.pMIBuffer <> nil)
+    and (libc_strcmp(PMatchinfoBufferR(pCsr^.pMIBuffer)^.zMatchinfo, zArg) <> 0) then begin
+    sqlite3Fts3MIBufferFree(PMatchinfoBufferR(pCsr^.pMIBuffer));
+    pCsr^.pMIBuffer := nil;
+  end;
+
+  if pCsr^.pMIBuffer = nil then begin
+    nMatchinfo := 0;
+
+    pCsr^.nPhrase := fts3ExprPhraseCount(pCsr^.pExpr);
+    sInfo.nPhrase := pCsr^.nPhrase;
+
+    i := 0;
+    while zArg[i] <> #0 do begin
+      zErr := nil;
+      if fts3MatchinfoCheck(pTab, zArg[i], @zErr) <> 0 then begin
+        sqlite3_result_error(pCtx, PAnsiChar(zErr), -1);
+        sqlite3_free(zErr);
+        Exit;
+      end;
+      nMatchinfo := nMatchinfo + fts3MatchinfoSize(@sInfo, zArg[i]);
+      Inc(i);
+    end;
+
+    pCsr^.pMIBuffer := fts3MIBufferNew(nMatchinfo, zArg);
+    if pCsr^.pMIBuffer = nil then rc := SQLITE_NOMEM;
+
+    pCsr^.isMatchinfoNeeded := 1;
+    bGlobal := 1;
+  end;
+
+  if rc = SQLITE_OK then begin
+    xDestroyOut := fts3MIBufferAlloc(PMatchinfoBufferR(pCsr^.pMIBuffer), @aOut);
+    if @xDestroyOut = nil then rc := SQLITE_NOMEM;
+  end;
+
+  if rc = SQLITE_OK then begin
+    sInfo.aMatchinfo := aOut;
+    sInfo.nPhrase := pCsr^.nPhrase;
+    rc := fts3MatchinfoValues(pCsr, bGlobal, @sInfo, zArg);
+    if bGlobal <> 0 then
+      fts3MIBufferSetGlobal(PMatchinfoBufferR(pCsr^.pMIBuffer));
+  end;
+
+  if rc <> SQLITE_OK then begin
+    sqlite3_result_error_code(pCtx, rc);
+    if @xDestroyOut <> nil then xDestroyOut(aOut);
+  end else begin
+    n := PMatchinfoBufferR(pCsr^.pMIBuffer)^.nElem * SizeOf(u32);
+    sqlite3_result_blob(pCtx, aOut, n, xDestroyOut);
+  end;
+end;
+
+{ fts3_snippet.c:1440..1540 — sqlite3Fts3Snippet. }
+procedure sqlite3Fts3Snippet(pCtx: Psqlite3_context; pCsr: PFts3Cursor;
+  const zStart, zEnd, zEllipsis: PChar; iCol, nToken: cint);
+var
+  pTab: PFts3Table;
+  rc, i, nSnippet, nFToken, iSnip, iBestScore, iRead, iScoreCol: cint;
+  res: TStrBuffer;
+  aSnippet: array[0..3] of TSnippetFragment;
+  mCovered, mSeen: u64;
+  pFragment: PSnippetFragment;
+  sF: TSnippetFragment;
+  bDone: Boolean;
+label snippet_out;
+begin
+  pTab := PFts3Table(pCsr^.base.pVtab);
+  rc := SQLITE_OK;
+  res.z := nil; res.n := 0; res.nAlloc := 0;
+  nFToken := -1;
+
+  if pCsr^.pExpr = nil then begin
+    sqlite3_result_text(pCtx, PAnsiChar(''), 0, SQLITE_STATIC);
+    Exit;
+  end;
+
+  if nToken < -64 then nToken := -64;
+  if nToken > +64 then nToken := +64;
+
+  nSnippet := 1;
+  while True do begin
+    mCovered := 0;
+    mSeen := 0;
+
+    if nToken >= 0 then
+      nFToken := (nToken+nSnippet-1) div nSnippet
+    else
+      nFToken := -1 * nToken;
+
+    for iSnip := 0 to nSnippet - 1 do begin
+      iBestScore := -1;
+      pFragment := @aSnippet[iSnip];
+
+      libc_memset(pFragment, 0, SizeOf(TSnippetFragment));
+
+      for iRead := 0 to pTab^.nColumn - 1 do begin
+        libc_memset(@sF, 0, SizeOf(sF));
+        iScoreCol := 0;
+        if (iCol >= 0) and (iRead <> iCol) then continue;
+
+        rc := fts3BestSnippet(nFToken, pCsr, iRead, mCovered, @mSeen, @sF, @iScoreCol);
+        if rc <> SQLITE_OK then goto snippet_out;
+        if iScoreCol > iBestScore then begin
+          pFragment^ := sF;
+          iBestScore := iScoreCol;
+        end;
+      end;
+
+      mCovered := mCovered or pFragment^.covered;
+    end;
+
+    bDone := (mSeen = mCovered) or (nSnippet = Length(aSnippet));
+    if bDone then break;
+    Inc(nSnippet);
+  end;
+
+  i := 0;
+  while (i < nSnippet) and (rc = SQLITE_OK) do begin
+    rc := fts3SnippetText(pCsr, @aSnippet[i], i, Ord(i = nSnippet-1), nFToken,
+            zStart, zEnd, zEllipsis, @res);
+    Inc(i);
+  end;
+
+snippet_out:
+  sqlite3Fts3SegmentsClose(pTab);
+  if rc <> SQLITE_OK then begin
+    sqlite3_result_error_code(pCtx, rc);
+    sqlite3_free(res.z);
+  end else
+    sqlite3_result_text(pCtx, PAnsiChar(res.z), -1, @sqlite3_free);
+end;
+
+{ fts3_snippet.c:1563..1587 — fts3ExprTermOffsetInit (ExprIterate callback). }
+function fts3ExprTermOffsetInit(pExpr: PFts3Expr; iPhrase: cint;
+  ctx: Pointer): cint; cdecl;
+var
+  p: PTermOffsetCtx;
+  nTerm, iTerm, rc: cint;
+  pList: PChar;
+  iPos: sqlite3_int64;
+  pT: PTermOffset;
+begin
+  p := PTermOffsetCtx(ctx);
+  iPos := 0;
+  rc := sqlite3Fts3EvalPhrasePoslist(p^.pCsr, pExpr, p^.iCol, @pList);
+  nTerm := pExpr^.pPhrase^.nToken;
+  if pList <> nil then
+    fts3GetDeltaPosition(@pList, @iPos);
+
+  for iTerm := 0 to nTerm - 1 do begin
+    pT := @p^.aTerm[p^.iTerm];
+    Inc(p^.iTerm);
+    pT^.iOff := nTerm-iTerm-1;
+    pT^.pList := pList;
+    pT^.iPos := iPos;
+  end;
+
+  Result := rc;
+end;
+
+{ fts3_snippet.c:1594..1603 — fts3ExprRestartIfCb (ExprIterate callback). }
+function fts3ExprRestartIfCb(pExpr: PFts3Expr; iPhrase: cint;
+  ctx: Pointer): cint; cdecl;
+var
+  p: PTermOffsetCtx;
+  rc: cint;
+begin
+  p := PTermOffsetCtx(ctx);
+  rc := SQLITE_OK;
+  if (pExpr^.pPhrase <> nil) and (pExpr^.pPhrase^.bIncr <> 0) then begin
+    rc := sqlite3Fts3MsrCancel(p^.pCsr, pExpr);
+    pExpr^.pPhrase^.bIncr := 0;
+  end;
+  Result := rc;
+end;
+
+{ fts3_snippet.c:1608..1749 — sqlite3Fts3Offsets. }
+procedure sqlite3Fts3Offsets(pCtx: Psqlite3_context; pCsr: PFts3Cursor);
+var
+  pTab: PFts3Table;
+  pMod: Psqlite3_tokenizer_module;
+  rc, nToken, iCol: cint;
+  res: TStrBuffer;
+  sCtx: TTermOffsetCtx;
+  pC: Psqlite3_tokenizer_cursor;
+  ZDUMMY: PChar;
+  NDUMMY, iStart, iEnd, iCurrent: cint;
+  zDoc: PChar;
+  nDoc, i, iMinPos: cint;
+  pTerm, pT: PTermOffset;
+  aBuffer: PChar;
+label offsets_out;
+begin
+  pTab := PFts3Table(pCsr^.base.pVtab);
+  pMod := pTab^.pTokenizer^.pModule;
+  res.z := nil; res.n := 0; res.nAlloc := 0;
+
+  if pCsr^.pExpr = nil then begin
+    sqlite3_result_text(pCtx, PAnsiChar(''), 0, SQLITE_STATIC);
+    Exit;
+  end;
+
+  libc_memset(@sCtx, 0, SizeOf(sCtx));
+
+  rc := fts3ExprLoadDoclists(pCsr, nil, @nToken);
+  if rc <> SQLITE_OK then goto offsets_out;
+
+  sCtx.aTerm := PTermOffset(sqlite3Fts3MallocZero(SizeOf(TTermOffset)*nToken));
+  if sCtx.aTerm = nil then begin
+    rc := SQLITE_NOMEM;
+    goto offsets_out;
+  end;
+  sCtx.iDocid := pCsr^.iPrevId;
+  sCtx.pCsr := pCsr;
+
+  rc := sqlite3Fts3ExprIterate(pCsr^.pExpr, @fts3ExprRestartIfCb, @sCtx);
+  if rc <> SQLITE_OK then goto offsets_out;
+
+  for iCol := 0 to pTab^.nColumn - 1 do begin
+    NDUMMY := 0; iStart := 0; iEnd := 0; iCurrent := 0;
+
+    sCtx.iCol := iCol;
+    sCtx.iTerm := 0;
+    rc := sqlite3Fts3ExprIterate(pCsr^.pExpr, @fts3ExprTermOffsetInit, @sCtx);
+    if rc <> SQLITE_OK then goto offsets_out;
+
+    zDoc := sqlite3_column_text(pCsr^.pStmt, iCol+1);
+    nDoc := sqlite3_column_bytes(pCsr^.pStmt, iCol+1);
+    if zDoc = nil then begin
+      if sqlite3_column_type(pCsr^.pStmt, iCol+1) = SQLITE_NULL then continue;
+      rc := SQLITE_NOMEM;
+      goto offsets_out;
+    end;
+
+    rc := sqlite3Fts3OpenTokenizer(pTab^.pTokenizer, pCsr^.iLangid, zDoc, nDoc, @pC);
+    if rc <> SQLITE_OK then goto offsets_out;
+
+    rc := pMod^.xNext(pC, @ZDUMMY, @NDUMMY, @iStart, @iEnd, @iCurrent);
+    while rc = SQLITE_OK do begin
+      iMinPos := $7FFFFFFF;
+      pTerm := nil;
+
+      for i := 0 to nToken - 1 do begin
+        pT := @sCtx.aTerm[i];
+        if (pT^.pList <> nil) and ((pT^.iPos-pT^.iOff) < iMinPos) then begin
+          iMinPos := cint(pT^.iPos-pT^.iOff);
+          pTerm := pT;
+        end;
+      end;
+
+      if pTerm = nil then
+        rc := SQLITE_DONE
+      else begin
+        if (0 = ($FE and Byte(pTerm^.pList^))) then
+          pTerm^.pList := nil
+        else
+          fts3GetDeltaPosition(@pTerm^.pList, @pTerm^.iPos);
+        while (rc = SQLITE_OK) and (iCurrent < iMinPos) do
+          rc := pMod^.xNext(pC, @ZDUMMY, @NDUMMY, @iStart, @iEnd, @iCurrent);
+        if rc = SQLITE_OK then begin
+          aBuffer := PChar(sqlite3PfMprintf(PAnsiChar('%d %d %d %d '),
+            [iCol, cint(PtrUInt(pTerm) - PtrUInt(sCtx.aTerm)) div cint(SizeOf(TTermOffset)),
+             iStart, iEnd-iStart]));
+          if aBuffer = nil then rc := SQLITE_NOMEM
+          else begin
+            rc := fts3StringAppend(@res, aBuffer, -1);
+            sqlite3_free(aBuffer);
+          end;
+        end else if (rc = SQLITE_DONE) and (pTab^.zContentTbl = nil) then
+          rc := FTS_CORRUPT_VTAB;
+      end;
+    end;
+    if rc = SQLITE_DONE then rc := SQLITE_OK;
+
+    pMod^.xClose(pC);
+    if rc <> SQLITE_OK then goto offsets_out;
+  end;
+
+offsets_out:
+  sqlite3_free(sCtx.aTerm);
+  Assert(rc <> SQLITE_DONE);
+  sqlite3Fts3SegmentsClose(pTab);
+  if rc <> SQLITE_OK then begin
+    sqlite3_result_error_code(pCtx, rc);
+    sqlite3_free(res.z);
+  end else
+    sqlite3_result_text(pCtx, PAnsiChar(res.z), res.n-1, @sqlite3_free);
+end;
+
+{ fts3_snippet.c:1754..1776 — sqlite3Fts3Matchinfo. }
+procedure sqlite3Fts3Matchinfo(pContext: Psqlite3_context; pCsr: PFts3Cursor;
+  const zArg: PChar);
+var
+  pTab: PFts3Table;
+  zFormat: PChar;
+begin
+  pTab := PFts3Table(pCsr^.base.pVtab);
+
+  if zArg <> nil then
+    zFormat := zArg
+  else
+    zFormat := PChar(FTS3_MATCHINFO_DEFAULT);
+
+  if pCsr^.pExpr = nil then begin
+    sqlite3_result_blob(pContext, PChar(''), 0, SQLITE_STATIC);
+    Exit;
+  end else begin
+    fts3GetMatchinfo(pContext, pCsr, zFormat);
+    sqlite3Fts3SegmentsClose(pTab);
+  end;
+end;
+
+{ fts3.c:3702 — fts3SnippetFunc SQL function. }
 procedure fts3SnippetFunc(pContext: Psqlite3_context; nVal: cint;
   apVal: PPsqlite3_value); cdecl;
-var pCsr: PFts3Cursor;
+var
+  pCsr: PFts3Cursor;
+  zStart, zEnd, zEllipsis: PChar;
+  iCol, nToken: cint;
 begin
+  zStart := PChar('<b>');
+  zEnd := PChar('</b>');
+  zEllipsis := PChar('<b>...</b>');
+  iCol := -1;
+  nToken := 15;
+
+  if nVal > 6 then begin
+    sqlite3_result_error(pContext,
+      PAnsiChar('wrong number of arguments to function snippet()'), -1);
+    Exit;
+  end;
   if fts3FunctionArg(pContext, PChar('snippet'), apVal[0], @pCsr) <> 0 then Exit;
-  sqlite3_result_error(pContext, PAnsiChar('snippet() not yet implemented (6.40.1.l)'), -1);
+
+  case nVal of
+    6: begin nToken := sqlite3_value_int(apVal[5]);
+             iCol := sqlite3_value_int(apVal[4]);
+             zEllipsis := sqlite3_value_text(apVal[3]);
+             zEnd := sqlite3_value_text(apVal[2]);
+             zStart := sqlite3_value_text(apVal[1]); end;
+    5: begin iCol := sqlite3_value_int(apVal[4]);
+             zEllipsis := sqlite3_value_text(apVal[3]);
+             zEnd := sqlite3_value_text(apVal[2]);
+             zStart := sqlite3_value_text(apVal[1]); end;
+    4: begin zEllipsis := sqlite3_value_text(apVal[3]);
+             zEnd := sqlite3_value_text(apVal[2]);
+             zStart := sqlite3_value_text(apVal[1]); end;
+    3: begin zEnd := sqlite3_value_text(apVal[2]);
+             zStart := sqlite3_value_text(apVal[1]); end;
+    2: zStart := sqlite3_value_text(apVal[1]);
+  end;
+  if (zEllipsis = nil) or (zEnd = nil) or (zStart = nil) then
+    sqlite3_result_error_nomem(pContext)
+  else if nToken = 0 then
+    sqlite3_result_text(pContext, PAnsiChar(''), -1, SQLITE_STATIC)
+  else if SQLITE_OK = fts3CursorSeek(pContext, pCsr) then
+    sqlite3Fts3Snippet(pContext, pCsr, zStart, zEnd, zEllipsis, iCol, nToken);
 end;
+
+{ fts3.c:3749 — fts3OffsetsFunc SQL function. }
 procedure fts3OffsetsFunc(pContext: Psqlite3_context; nVal: cint;
   apVal: PPsqlite3_value); cdecl;
 var pCsr: PFts3Cursor;
 begin
   if fts3FunctionArg(pContext, PChar('offsets'), apVal[0], @pCsr) <> 0 then Exit;
-  sqlite3_result_error(pContext, PAnsiChar('offsets() not yet implemented (6.40.1.l)'), -1);
+  if SQLITE_OK = fts3CursorSeek(pContext, pCsr) then
+    sqlite3Fts3Offsets(pContext, pCsr);
 end;
+
+{ fts3.c:3809 — fts3MatchinfoFunc SQL function. }
 procedure fts3MatchinfoFunc(pContext: Psqlite3_context; nVal: cint;
   apVal: PPsqlite3_value); cdecl;
-var pCsr: PFts3Cursor;
+var
+  pCsr: PFts3Cursor;
+  zArg: PChar;
 begin
-  if fts3FunctionArg(pContext, PChar('matchinfo'), apVal[0], @pCsr) <> 0 then Exit;
-  sqlite3_result_error(pContext, PAnsiChar('matchinfo() not yet implemented (6.40.1.l)'), -1);
+  if SQLITE_OK = fts3FunctionArg(pContext, PChar('matchinfo'), apVal[0], @pCsr) then begin
+    zArg := nil;
+    if nVal > 1 then zArg := sqlite3_value_text(apVal[1]);
+    sqlite3Fts3Matchinfo(pContext, pCsr, zArg);
+  end;
 end;
 
 { fts3.c:3775 — fts3OptimizeFunc. }
