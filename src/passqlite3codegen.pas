@@ -43096,14 +43096,37 @@ generic_coro_done:
       single-row implementation for the (a)/(b)/(c) breakdown.
 
       Virtual-table arm (insert.c:1502..1537): emit OP_Null at regIns to
-      mark argv[0] as "no row to delete" for the OP_VUpdate, then emit
-      OP_Null at regRowid to leave argv[1] (new rowid) unset.  IPK-from-
-      IDLIST rebinding is not yet honoured here (rare on vtabs); the
-      regular VALUES path therefore yields a vtab-allocated rowid. }
+      mark argv[0] as "no row to delete" for the OP_VUpdate, then honour any
+      user-supplied rowid/docid alias (ipkColumn>=0) by loading it into
+      regRowid (argv[1]); a NULL value is left unset so the module allocates
+      one. }
     if isVirtual then
     begin
+      { Virtual-table arm (insert.c:1502..1537).  First mark argv[0]
+        (regIns) NULL to tell OP_VUpdate there is no row to delete.  Then,
+        when the user named a rowid/docid alias in the IDLIST (ipkColumn>=0),
+        load that value into regRowid so the vtab receives an explicit
+        rowid; a NULL value is left in place so the module allocates one.
+        A vtab uses OP_IsNull (not OP_NewRowid) to skip OP_MustBeInt when
+        the supplied rowid is NULL — see insert.c:1531..1534. }
       sqlite3VdbeAddOp2(v, OP_Null, 0, regIns);
-      sqlite3VdbeAddOp2(v, OP_Null, 0, regRowid);
+      if ipkColumn >= 0 then
+      begin
+        if useTempTable then
+          sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid)
+        else if useCoroutine then
+        begin
+          { Rowid already copied into regRowid in the coroutine arm. }
+        end
+        else
+          sqlite3ExprCode(pParse, pListItems[ipkColumn].pExpr, regRowid);
+        { addr1+2: skip the following OP_MustBeInt when regRowid is NULL. }
+        sqlite3VdbeAddOp2(v, OP_IsNull, regRowid,
+          sqlite3VdbeCurrentAddr(v) + 2);
+        sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
+      end
+      else
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regRowid);
     end
     else if not (isView <> 0) then
     begin

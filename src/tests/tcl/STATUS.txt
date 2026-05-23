@@ -321,7 +321,7 @@ pas-strict	../sqlite3/test/format4.test	-
 pas-strict	../sqlite3/test/fpconv1.test	-
 pas-strict	../sqlite3/test/fts-9fd058691.test	-
 pas-strict	../sqlite3/test/fts3.test	-
-pas-soft	../sqlite3/test/fts3aa.test	6.40.1.o.1 fixed order=desc (8.x green); residual 6.1/6.3/6.4 zero/negative rowid content-table read + 10.1 errmsg
+pas-soft	../sqlite3/test/fts3aa.test	6.40.1.o.1 fixed order=desc (8.x) + explicit-rowid vtab INSERT (6.1/6.3/6.4 green); sole residual 10.1: recursive shadow-table-trigger reentrancy returns SQLITE_MISUSE (errStr "bad parameter...") where C returns SQLITE_ERROR ("SQL logic error"). VDBE error-code propagation corner (fts3SqlExec rebinds the busy %_content DELETE stmt inside an AFTER-DELETE trigger sub-frame), not an FTS3 query bug.
 pas-strict	../sqlite3/test/fts3ab.test	-
 pas-strict	../sqlite3/test/fts3ac.test	-
 pas-strict	../sqlite3/test/fts3ad.test	-
@@ -637,7 +637,7 @@ pas-strict	../sqlite3/test/orderby3.test	-
 pas-strict	../sqlite3/test/orderby4.test	-
 pas-soft	../sqlite3/test/orderby5.test	9.4.divbug.87
 pas-strict	../sqlite3/test/orderby6.test	-
-pas-soft	../sqlite3/test/orderby7.test	6.40.1.o residual: MATCH 'that twice' AND-phrase merge returns wrong docids (6/7 vs 11/12); not the order=desc path
+pas-strict	../sqlite3/test/orderby7.test	-
 pas-strict	../sqlite3/test/orderby8.test	-
 pas-strict	../sqlite3/test/orderby9.test	-
 pas-soft	../sqlite3/test/orderbyA.test	9.4.divbug.87
