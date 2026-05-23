@@ -60,8 +60,11 @@ uses
   passqlite3printf,  { sqlite3PfMprintf — Pascal-side varargs formatter }
   passqlite3vdbe,    { sqlite3_value_* / sqlite3_result_* / sqlite3_user_data /
                        sqlite3_context_db_handle and the statement APIs }
-  passqlite3main;    { sqlite3_create_function(_v2) / sqlite3_db_config_int /
-                       sqlite3_prepare_v2 / sqlite3_errmsg }
+  passqlite3vtab,    { Tsqlite3_module + vtab/cursor base records + index_info,
+                       sqlite3_declare_vtab (6.40.1.h fts3tokenize module) }
+  passqlite3main;    { sqlite3_create_function(_v2) / sqlite3_create_module_v2 /
+                       sqlite3_db_config_int / sqlite3_prepare_v2 /
+                       sqlite3_errmsg }
 
 const
   { fts3_hash.h:68..69 — key-class modes. }
@@ -252,11 +255,20 @@ function sqlite3Fts3InitHashTable(db: PTsqlite3; pHash: PFts3Hash;
   const zName: PChar): cint;
 
 { --------------------------------------------------------------------- }
+{ 6.40.1.h — fts3_tokenize_vtab.c:423 — register the "fts3tokenize"        }
+{ virtual-table module on db.  pHash is the tokenizer hash (passed as the  }
+{ module's pAux); xDestroy is the nRef-guarded hashDestroy.                }
+{ --------------------------------------------------------------------- }
+function sqlite3Fts3InitTok(db: PTsqlite3; pHash: PFts3Hash;
+  xDestroy: TxModuleDestroy): cint;
+
+{ --------------------------------------------------------------------- }
 { 6.40.1.g (down-payment on 6.40.1.o) — minimal sqlite3Fts3Init: alloc    }
 { the tokenizer-hash wrapper, load simple/porter/unicode61, and install   }
-{ the fts3_tokenizer SQL function(s) via sqlite3Fts3InitHashTable.  Does   }
-{ NOT register the fts3/fts4/fts3tokenize VTAB modules — those land in     }
-{ 6.40.1.h/.k/.o.  fts3.c:4102 (partial port).                            }
+{ the fts3_tokenizer SQL function(s) via sqlite3Fts3InitHashTable AND, as   }
+{ of 6.40.1.h, the fts3tokenize VTAB module via sqlite3Fts3InitTok.  Does   }
+{ NOT register the fts3/fts4 VTAB modules — those land in 6.40.1.k/.o.      }
+{ fts3.c:4102 (partial port).                                             }
 { --------------------------------------------------------------------- }
 function sqlite3Fts3Init(db: PTsqlite3): cint;
 
@@ -2619,6 +2631,391 @@ begin
 end;
 
 { ===================================================================== }
+{ 6.40.1.h — fts3_tokenize_vtab.c — the "fts3tokenize" virtual table.    }
+{ ===================================================================== }
+
+type
+  { fts3_tokenize_vtab.c:53..57 — struct Fts3tokTable.  base MUST be the
+    first field for the sqlite3_vtab* <-> Fts3tokTable* pointer-casts. }
+  PFts3tokTable = ^TFts3tokTable;
+  TFts3tokTable = record
+    base : Tsqlite3_vtab;                    { Base class used by SQLite core }
+    pMod : Psqlite3_tokenizer_module;
+    pTok : Psqlite3_tokenizer;
+  end;
+
+  { fts3_tokenize_vtab.c:62..72 — struct Fts3tokCursor.  base MUST be the
+    first field for the sqlite3_vtab_cursor* <-> Fts3tokCursor* casts. }
+  PFts3tokCursor = ^TFts3tokCursor;
+  TFts3tokCursor = record
+    base   : Tsqlite3_vtab_cursor;           { Base class used by SQLite core }
+    zInput : PChar;                          { Input string }
+    pCsr   : Psqlite3_tokenizer_cursor;      { Cursor to iterate through zInput }
+    iRowid : cint;                           { Current 'rowid' value }
+    zToken : PChar;                          { Current 'token' value }
+    nToken : cint;                           { Size of zToken in bytes }
+    iStart : cint;                           { Current 'start' value }
+    iEnd   : cint;                           { Current 'end' value }
+    iPos   : cint;                           { Current 'pos' value }
+  end;
+
+{ fts3_tokenize_vtab.c:77..94 — fts3tokQueryTokenizer.  Query FTS for the
+  tokenizer implementation named zName. }
+function fts3tokQueryTokenizer(pHash: PFts3Hash; const zName: PChar;
+  pp: PPsqlite3_tokenizer_module; pzErr: PPChar): cint;
+var
+  p: Psqlite3_tokenizer_module;
+  nName: cint;
+begin
+  nName := cint(libc_strlen(zName));
+
+  p := Psqlite3_tokenizer_module(
+         sqlite3Fts3HashFind(pHash, zName, nName + 1));
+  if p = nil then begin
+    fts3ErrMsg(pzErr, 'unknown tokenizer: %s', [zName]);
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
+
+  pp^ := p;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:108..141 — fts3tokDequoteArray.  Copy argv[] into a
+  single block, then dequote each string.  *pazDequote is sqlite3_free'd by
+  the caller.  Keys/strings stay raw PChar (no managed-string ref-count). }
+function fts3tokDequoteArray(argc: cint; const argv: PPChar;
+  pazDequote: PPPAnsiChar): cint;
+var
+  rc: cint;
+  i: cint;
+  nByte: cint;
+  azDequote: PPChar;
+  pSpace: PChar;
+  n: cint;
+begin
+  rc := SQLITE_OK;
+  if argc = 0 then
+    pazDequote^ := nil
+  else begin
+    nByte := 0;
+    for i := 0 to argc - 1 do
+      nByte := nByte + cint(libc_strlen(argv[i]) + 1);
+
+    azDequote := PPChar(sqlite3_malloc64(
+                   u64(SizeOf(PChar) * argc + nByte)));
+    pazDequote^ := azDequote;
+    if azDequote = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      { C: pSpace = (char *)&azDequote[argc]; }
+      pSpace := PChar(@azDequote[argc]);
+      for i := 0 to argc - 1 do begin
+        n := cint(libc_strlen(argv[i]));
+        azDequote[i] := pSpace;
+        libc_memcpy(pSpace, argv[i], NativeUInt(n + 1));
+        fts3Dequote(pSpace);
+        Inc(pSpace, n + 1);
+      end;
+    end;
+  end;
+
+  Result := rc;
+end;
+
+{ fts3_tokenize_vtab.c:146 — schema of the tokenizer table. }
+const
+  FTS3_TOK_SCHEMA = 'CREATE TABLE x(input, token, start, end, position)';
+
+{ fts3_tokenize_vtab.c:158..216 — fts3tokConnectMethod.  Does all the work
+  for both xConnect and xCreate (identical: these tables have no persistent
+  representation).  pHash is the module pAux (the tokenizer hash). }
+function fts3tokConnectMethod(db: PTsqlite3; pHash: Pointer;
+  argc: cint; const argv: PPChar; ppVtab: PPSqlite3Vtab;
+  pzErr: PPChar): cint; cdecl;
+var
+  pTab: PFts3tokTable;
+  pMod: Psqlite3_tokenizer_module;
+  pTok: Psqlite3_tokenizer;
+  rc: cint;
+  azDequote: PPChar;
+  nDequote: cint;
+  zModule: PChar;
+  azArg: PPChar;
+  nArg: cint;
+begin
+  pTab := nil;
+  pMod := nil;
+  pTok := nil;
+  azDequote := nil;
+
+  rc := sqlite3_declare_vtab(db, PAnsiChar(FTS3_TOK_SCHEMA));
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  nDequote := argc - 3;
+  rc := fts3tokDequoteArray(nDequote, PPChar(@argv[3]), @azDequote);
+
+  if rc = SQLITE_OK then begin
+    if nDequote < 1 then
+      zModule := 'simple'
+    else
+      zModule := azDequote[0];
+    rc := fts3tokQueryTokenizer(PFts3Hash(pHash), zModule, @pMod, pzErr);
+  end;
+
+  Assert((rc = SQLITE_OK) = (pMod <> nil));
+  if rc = SQLITE_OK then begin
+    azArg := nil;
+    if nDequote > 1 then azArg := PPChar(@azDequote[1]);
+    if nDequote > 1 then nArg := nDequote - 1 else nArg := 0;
+    rc := pMod^.xCreate(nArg, azArg, @pTok);
+  end;
+
+  if rc = SQLITE_OK then begin
+    pTab := PFts3tokTable(sqlite3_malloc(i32(SizeOf(TFts3tokTable))));
+    if pTab = nil then
+      rc := SQLITE_NOMEM;
+  end;
+
+  if rc = SQLITE_OK then begin
+    libc_memset(pTab, 0, SizeOf(TFts3tokTable));
+    pTab^.pMod := pMod;
+    pTab^.pTok := pTok;
+    ppVtab^ := @pTab^.base;
+  end else begin
+    if pTok <> nil then
+      pMod^.xDestroy(pTok);
+  end;
+
+  sqlite3_free(azDequote);
+  Result := rc;
+end;
+
+{ fts3_tokenize_vtab.c:223..229 — fts3tokDisconnectMethod.  Does the work
+  for both xDisconnect and xDestroy (identical). }
+function fts3tokDisconnectMethod(pVtab: PSqlite3Vtab): cint; cdecl;
+var
+  pTab: PFts3tokTable;
+begin
+  pTab := PFts3tokTable(pVtab);
+  pTab^.pMod^.xDestroy(pTab^.pTok);
+  sqlite3_free(pTab);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:234..258 — fts3tokBestIndexMethod. }
+function fts3tokBestIndexMethod(pVTab: PSqlite3Vtab;
+  pInfo: PSqlite3IndexInfo): cint; cdecl;
+var
+  i: cint;
+  pC: PSqlite3IndexConstraint;
+  pUse: PSqlite3IndexConstraintUsage;
+begin
+  for i := 0 to pInfo^.nConstraint - 1 do begin
+    pC := pInfo^.aConstraint;
+    Inc(pC, i);
+    if (pC^.usable <> 0)
+    and (pC^.iColumn = 0)
+    and (pC^.op = SQLITE_INDEX_CONSTRAINT_EQ) then begin
+      pInfo^.idxNum := 1;
+      pUse := pInfo^.aConstraintUsage;
+      Inc(pUse, i);
+      pUse^.argvIndex := 1;
+      pUse^.omit := 1;
+      pInfo^.estimatedCost := 1;
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
+  pInfo^.idxNum := 0;
+  Assert(pInfo^.estimatedCost > 1000000.0);
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:263..275 — fts3tokOpenMethod. }
+function fts3tokOpenMethod(pVTab: PSqlite3Vtab;
+  ppCsr: PPSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3tokCursor;
+begin
+  pCsr := PFts3tokCursor(sqlite3_malloc(i32(SizeOf(TFts3tokCursor))));
+  if pCsr = nil then begin
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  libc_memset(pCsr, 0, SizeOf(TFts3tokCursor));
+
+  ppCsr^ := PSqlite3VtabCursor(@pCsr^.base);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:281..295 — fts3tokResetCursor.  Reset the cursor as
+  if just returned by fts3tokOpenMethod(). }
+procedure fts3tokResetCursor(pCsr: PFts3tokCursor);
+var
+  pTab: PFts3tokTable;
+begin
+  if pCsr^.pCsr <> nil then begin
+    pTab := PFts3tokTable(pCsr^.base.pVtab);
+    pTab^.pMod^.xClose(pCsr^.pCsr);
+    pCsr^.pCsr := nil;
+  end;
+  sqlite3_free(pCsr^.zInput);
+  pCsr^.zInput := nil;
+  pCsr^.zToken := nil;
+  pCsr^.nToken := 0;
+  pCsr^.iStart := 0;
+  pCsr^.iEnd := 0;
+  pCsr^.iPos := 0;
+  pCsr^.iRowid := 0;
+end;
+
+{ fts3_tokenize_vtab.c:300..306 — fts3tokCloseMethod. }
+function fts3tokCloseMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3tokCursor;
+begin
+  pCsr := PFts3tokCursor(pCursor);
+  fts3tokResetCursor(pCsr);
+  sqlite3_free(pCsr);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:311..328 — fts3tokNextMethod. }
+function fts3tokNextMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3tokCursor;
+  pTab: PFts3tokTable;
+  rc: cint;
+begin
+  pCsr := PFts3tokCursor(pCursor);
+  pTab := PFts3tokTable(pCursor^.pVtab);
+
+  Inc(pCsr^.iRowid);
+  rc := pTab^.pMod^.xNext(pCsr^.pCsr,
+      @pCsr^.zToken, @pCsr^.nToken,
+      @pCsr^.iStart, @pCsr^.iEnd, @pCsr^.iPos);
+
+  if rc <> SQLITE_OK then begin
+    fts3tokResetCursor(pCsr);
+    if rc = SQLITE_DONE then rc := SQLITE_OK;
+  end;
+
+  Result := rc;
+end;
+
+{ fts3_tokenize_vtab.c:333..365 — fts3tokFilterMethod. }
+function fts3tokFilterMethod(pCursor: PSqlite3VtabCursor;
+  idxNum: cint; idxStr: PChar;
+  nVal: cint; apVal: PPsqlite3_value): cint; cdecl;
+var
+  rc: cint;
+  pCsr: PFts3tokCursor;
+  pTab: PFts3tokTable;
+  zByte: PChar;
+  nByte: sqlite3_int64;
+begin
+  rc := SQLITE_ERROR;
+  pCsr := PFts3tokCursor(pCursor);
+  pTab := PFts3tokTable(pCursor^.pVtab);
+
+  fts3tokResetCursor(pCsr);
+  if idxNum = 1 then begin
+    zByte := PChar(sqlite3_value_text(apVal[0]));
+    nByte := sqlite3_value_bytes(apVal[0]);
+    pCsr^.zInput := PChar(sqlite3_malloc64(u64(nByte + 1)));
+    if pCsr^.zInput = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      if nByte > 0 then libc_memcpy(pCsr^.zInput, zByte, NativeUInt(nByte));
+      pCsr^.zInput[nByte] := #0;
+      rc := pTab^.pMod^.xOpen(pTab^.pTok, pCsr^.zInput, cint(nByte),
+              @pCsr^.pCsr);
+      if rc = SQLITE_OK then
+        pCsr^.pCsr^.pTokenizer := pTab^.pTok;
+    end;
+  end;
+
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  Result := fts3tokNextMethod(pCursor);
+end;
+
+{ fts3_tokenize_vtab.c:370..373 — fts3tokEofMethod. }
+function fts3tokEofMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3tokCursor;
+begin
+  pCsr := PFts3tokCursor(pCursor);
+  if pCsr^.zToken = nil then Result := 1 else Result := 0;
+end;
+
+{ fts3_tokenize_vtab.c:378..405 — fts3tokColumnMethod.
+  CREATE TABLE x(input, token, start, end, position) }
+function fts3tokColumnMethod(pCursor: PSqlite3VtabCursor;
+  pCtx: Psqlite3_context; iCol: cint): cint; cdecl;
+var
+  pCsr: PFts3tokCursor;
+begin
+  pCsr := PFts3tokCursor(pCursor);
+  case iCol of
+    0: sqlite3_result_text(pCtx, PAnsiChar(pCsr^.zInput), -1, SQLITE_TRANSIENT);
+    1: sqlite3_result_text(pCtx, PAnsiChar(pCsr^.zToken), pCsr^.nToken,
+         SQLITE_TRANSIENT);
+    2: sqlite3_result_int(pCtx, pCsr^.iStart);
+    3: sqlite3_result_int(pCtx, pCsr^.iEnd);
+  else
+    Assert(iCol = 4);
+    sqlite3_result_int(pCtx, pCsr^.iPos);
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:410..417 — fts3tokRowidMethod. }
+function fts3tokRowidMethod(pCursor: PSqlite3VtabCursor;
+  pRowid: Pi64): cint; cdecl;
+var
+  pCsr: PFts3tokCursor;
+begin
+  pCsr := PFts3tokCursor(pCursor);
+  pRowid^ := sqlite3_int64(pCsr^.iRowid);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenize_vtab.c:424..450 — the static fts3tok_module record. }
+var
+  fts3tok_module: Tsqlite3_module;
+
+procedure initFts3TokModule;
+begin
+  FillChar(fts3tok_module, SizeOf(fts3tok_module), 0);
+  fts3tok_module.iVersion    := 0;
+  fts3tok_module.xCreate     := @fts3tokConnectMethod;
+  fts3tok_module.xConnect    := @fts3tokConnectMethod;
+  fts3tok_module.xBestIndex  := @fts3tokBestIndexMethod;
+  fts3tok_module.xDisconnect := @fts3tokDisconnectMethod;
+  fts3tok_module.xDestroy    := @fts3tokDisconnectMethod;
+  fts3tok_module.xOpen       := @fts3tokOpenMethod;
+  fts3tok_module.xClose      := @fts3tokCloseMethod;
+  fts3tok_module.xFilter     := @fts3tokFilterMethod;
+  fts3tok_module.xNext       := @fts3tokNextMethod;
+  fts3tok_module.xEof        := @fts3tokEofMethod;
+  fts3tok_module.xColumn     := @fts3tokColumnMethod;
+  fts3tok_module.xRowid      := @fts3tokRowidMethod;
+end;
+
+{ fts3_tokenize_vtab.c:423..457 — sqlite3Fts3InitTok. }
+function sqlite3Fts3InitTok(db: PTsqlite3; pHash: PFts3Hash;
+  xDestroy: TxModuleDestroy): cint;
+begin
+  initFts3TokModule;
+  Result := sqlite3_create_module_v2(
+      db, PAnsiChar('fts3tokenize'), @fts3tok_module, Pointer(pHash),
+      Pointer(xDestroy));
+end;
+
+{ ===================================================================== }
 { 6.40.1.g down-payment on 6.40.1.o — minimal sqlite3Fts3Init.           }
 { ===================================================================== }
 
@@ -2683,15 +3080,18 @@ begin
       rc := SQLITE_NOMEM;
   end;
 
-  { Install the fts3_tokenizer SQL function(s).  Unlike C (fts3.c:4167) we
-    DO NOT register the fts3/fts4/fts3tokenize modules here (6.40.1.h/.k/.o),
-    so the module destructors that would own the wrapper do not yet exist.
-    To keep the wrapper's lifetime correct and per-connection (no leak, no
-    process-global state), attach the nRef-guarded hashDestroy to the two
-    fts3_tokenizer FuncDefs via create_function_v2: each FuncDef receives
-    &hash as user-data (== the wrapper pointer) and calls hashDestroy once
-    on db close; nRef (=2) makes the last call free.  TODO(6.40.1.o): move
-    ownership to the sqlite3_create_module_v2 destructors per fts3.c:4174. }
+  { Install the fts3_tokenizer SQL function(s) and the fts3tokenize VTAB
+    module (6.40.1.h).  Unlike C (fts3.c:4167) we DO NOT register the
+    fts3/fts4 modules here (6.40.1.k/.o), so two of C's three module
+    destructors (which would own the wrapper) do not yet exist.  To keep
+    the wrapper's lifetime correct and per-connection while fts3/fts4 are
+    absent, attach the nRef-guarded hashDestroy to the two fts3_tokenizer
+    FuncDefs as stand-in owners (each FuncDef gets &hash == the wrapper
+    pointer and calls hashDestroy once on db close), then add the
+    fts3tokenize module via sqlite3Fts3InitTok as a real owner (matching
+    fts3.c:4185..4187).  nRef = 2 (funcs) + 1 (fts3tokenize) = 3; only the
+    last hashDestroy call frees.  TODO(6.40.1.o): drop the FuncDef-
+    destructor stand-in once the fts3/fts4 module owners land. }
   if rc = SQLITE_OK then begin
     pHash^.nRef := 2;
     rc := sqlite3_create_function_v2(db, PAnsiChar('fts3_tokenizer'), 1,
@@ -2714,6 +3114,11 @@ begin
               0, SQLITE_UTF8 or SQLITE_DIRECTONLY, Pointer(db),
               @intTestFunc, nil, nil);
 {$ENDIF}
+    { fts3.c:4185..4187 — register the fts3tokenize module as an nRef owner. }
+    if rc = SQLITE_OK then begin
+      Inc(pHash^.nRef);
+      rc := sqlite3Fts3InitTok(db, @pHash^.hash, @hashDestroy);
+    end;
   end else if pHash <> nil then begin
     { Allocation/insert failed before any FuncDef adopted the wrapper. }
     sqlite3Fts3HashClear(@pHash^.hash);

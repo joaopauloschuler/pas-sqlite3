@@ -204,6 +204,7 @@ compile_test TestFts3Hash
 compile_test TestFts3Tok
 compile_test TestFts3Unicode
 compile_test TestFts3TokRegistry
+compile_test TestFts3TokVtab
 compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable
