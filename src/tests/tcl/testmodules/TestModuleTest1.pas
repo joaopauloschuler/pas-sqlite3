@@ -73,6 +73,7 @@ uses
   passqlite3btree,
   passqlite3pager,
   passqlite3pcache,
+  passqlite3vtab,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -6981,6 +6982,9 @@ begin
     SQLITE_CONSTRAINT_TRIGGER:    Result := PChar('SQLITE_CONSTRAINT_TRIGGER');
     SQLITE_CONSTRAINT_UNIQUE:     Result := PChar('SQLITE_CONSTRAINT_UNIQUE');
     SQLITE_ERROR_MISSING_COLLSEQ: Result := PChar('SQLITE_ERROR_MISSING_COLLSEQ');
+    SQLITE_CORRUPT_VTAB:          Result := PChar('SQLITE_CORRUPT_VTAB');
+    SQLITE_CORRUPT_SEQUENCE:      Result := PChar('SQLITE_CORRUPT_SEQUENCE');
+    SQLITE_CORRUPT_INDEX:         Result := PChar('SQLITE_CORRUPT_INDEX');
   else
     Result := t1ErrName(rc);
   end;
@@ -7037,6 +7041,107 @@ begin
   end;
   rc := sqlite3_errcode(db);
   Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:1229..1251 — test_drop_modules.
+  Usage: sqlite3_drop_modules DB ?NAME ...?  Drop every registered vtab
+  module on DB except those named.  No NAME args → drop all.  Engine entry:
+  passqlite3vtab.sqlite3_drop_modules (vtab.c:140).  Needed by
+  fts3dropmod.test. }
+function test_drop_modules(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  az: array of PAnsiChar;
+  i: cint;
+begin
+  if objc < 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB ?NAME ...?'));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if objc > 2 then
+  begin
+    SetLength(az, objc - 2 + 1);
+    for i := 2 to objc - 1 do az[i - 2] := Tcl_GetString(objv[i]);
+    az[objc - 2] := nil;  { NULL-terminated keep-list }
+    sqlite3_drop_modules(db, @az[0]);
+  end
+  else
+    sqlite3_drop_modules(db, nil);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_func.c:846..909 — rankfunc + install_fts3_rank_function.
+  A worked-example scalar fts3 rank() over a matchinfo() blob; used by
+  fts3rank.test (install_fts3_rank_function db). }
+procedure rankfunc(pCtx: Psqlite3_context; nVal: cint;
+  apVal: PPsqlite3_value); cdecl;
+var
+  aMatchinfo: PInteger;
+  nMatchinfo, nCol, nPhrase, iPhrase, iCol: cint;
+  score, weight: Double;
+  aPhraseinfo: PInteger;
+  nHitCount, nGlobalHitCount: cint;
+begin
+  nCol := 0; nPhrase := 0; score := 0.0;
+  if nVal < 1 then begin
+    sqlite3_result_error(pCtx,
+      PChar('wrong number of arguments to function rank()'), -1);
+    Exit;
+  end;
+  aMatchinfo := PInteger(sqlite3_value_blob(PPsqlite3_value(apVal)[0]));
+  nMatchinfo := sqlite3_value_bytes(PPsqlite3_value(apVal)[0]) div cint(SizeOf(cint));
+  if nMatchinfo >= 2 then begin
+    nPhrase := aMatchinfo[0];
+    nCol    := aMatchinfo[1];
+  end;
+  if nMatchinfo <> (2 + 3*nCol*nPhrase) then begin
+    sqlite3_result_error(pCtx,
+      PChar('invalid matchinfo blob passed to function rank()'), -1);
+    Exit;
+  end;
+  if nVal <> (1 + nCol) then begin
+    sqlite3_result_error(pCtx,
+      PChar('wrong number of arguments to function rank()'), -1);
+    Exit;
+  end;
+  for iPhrase := 0 to nPhrase - 1 do begin
+    aPhraseinfo := @aMatchinfo[2 + iPhrase*nCol*3];
+    for iCol := 0 to nCol - 1 do begin
+      nHitCount       := aPhraseinfo[3*iCol];
+      nGlobalHitCount := aPhraseinfo[3*iCol+1];
+      weight := sqlite3_value_double(PPsqlite3_value(apVal)[iCol+1]);
+      if nHitCount > 0 then
+        score := score + (Double(nHitCount) / Double(nGlobalHitCount)) * weight;
+    end;
+  end;
+  sqlite3_result_double(pCtx, score);
+end;
+
+function install_fts3_rank_function(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_create_function(db, PChar('rank'), -1, SQLITE_UTF8, nil,
+    @rankfunc, nil, nil);
   Result := TCL_OK;
   if clientData = nil then ;
 end;
@@ -8138,6 +8243,10 @@ begin
     corrupt2-10.2 diverges from {SQLITE_CORRUPT}. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_errcode'),
     @test_errcode, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_drop_modules'),
+    @test_drop_modules, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('install_fts3_rank_function'),
+    @install_fts3_rank_function, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
   { 9.4.divbug.88.047 — sqlite3_exec_printf DB FORMAT STRING.

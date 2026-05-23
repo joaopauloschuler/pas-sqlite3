@@ -1127,6 +1127,42 @@ proc do_select_tests {prefix args} {
 
 }
 
+# do_select_test / do_restart_select_test / do_error_test —
+# upstream malloc_common.tcl:561..571.  In a non-malloc-fault build
+# (::DO_MALLOC_TEST==0, our default) doPassiveTest collapses to a single
+# do_test of [catchsql $sql] against {0 result} (or {1 error}).  We don't
+# port the full memdebug fault loop (SKIP-cited), only the passive form
+# fts3snippet / other eval tests actually exercise.
+proc doPassiveTest {isRestart name sql catchres} {
+  if {[info exists ::testprefix]
+   && [string is integer [string range $name 0 0]]
+  } {
+    set name $::testprefix.$name
+  }
+  if {$isRestart} { catch { db close }; sqlite3 db test.db }
+  do_test $name [list set {} [uplevel [list catchsql $sql]]] $catchres
+}
+proc do_select_test {name sql result} {
+  uplevel [list doPassiveTest 0 $name $sql [list 0 [list {*}$result]]]
+}
+proc do_restart_select_test {name sql result} {
+  uplevel [list doPassiveTest 1 $name $sql [list 0 $result]]
+}
+proc do_error_test {name sql error} {
+  uplevel [list doPassiveTest 0 $name $sql [list 1 $error]]
+}
+
+# sql_uses_stmt — upstream tester.tcl:1690..1695.  Reports whether the
+# prepared form of $sql would use a statement journal (uses_stmt_journal,
+# already provided by the test1 harness module).  Needed by
+# fts4onepass / fts3conf.
+proc sql_uses_stmt {db sql} {
+  set stmt [sqlite3_prepare $db $sql -1 dummy]
+  set uses [uses_stmt_journal $stmt]
+  sqlite3_finalize $stmt
+  return $uses
+}
+
 # drop_all_tables — upstream tester.tcl:2253..2275.  Drops all tables
 # and views from every attached database on connection [db].
 proc drop_all_tables {{db db}} {

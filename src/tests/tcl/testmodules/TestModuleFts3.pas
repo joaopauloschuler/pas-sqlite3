@@ -542,6 +542,33 @@ begin
   Result := TCL_OK;
 end;
 
+{ test_hexio.c:363..389 — read_fts3varint BLOB VARNAME.
+  Decode a single fts3 varint from the front of BLOB, store the value into
+  Tcl variable VARNAME, and return the number of bytes consumed.  Used by
+  fts3_common.tcl (fts3c.test / fts3d.test / fts3cov.test). }
+function read_fts3varint_cmd(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zBlob: PChar;
+  nBlob: cint;
+  iVal: Int64;
+  nVal: cint;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BLOB VARNAME'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  nBlob := 0;
+  zBlob := Tcl_GetByteArrayFromObj(ObjElem(objv, 1), @nBlob);
+  iVal := 0;
+  nVal := sqlite3Fts3GetVarint(zBlob, @iVal);
+  Tcl_ObjSetVar2(interp, ObjElem(objv, 2), nil, Tcl_NewWideIntObj(iVal), 0);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(nVal));
+  Result := TCL_OK;
+  if (clientData = nil) and (nBlob = 0) then ;
+end;
+
 { fts3_test.c:574..601 — sqlite3_fts3_may_be_corrupt.
   This port (and the oracle's autosetup build) is non-DEBUG, so the C body
   compiles away to a bare `return TCL_OK` with an empty result. }
@@ -565,6 +592,8 @@ begin
     @fts3_test_varint_cmd, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_fts3_may_be_corrupt'),
     @fts3_may_be_corrupt_cmd, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('read_fts3varint'),
+    @read_fts3varint_cmd, nil, nil);
   { test1.c:9447..9449 — link the query-syntax toggle so the gated fts3*.test
     files can flip between legacy and parenthesised grammar. }
   Tcl_LinkVar(interp, PChar('sqlite_fts3_enable_parentheses'),

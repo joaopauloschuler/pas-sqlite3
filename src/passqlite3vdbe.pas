@@ -6174,11 +6174,19 @@ end;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 begin
+  { vdbeapi.c:1383 — bind by value MUST honour the value's own text encoding
+    (pValue->enc), not assume UTF-8.  The C TEXT arm calls
+    bindText(...,pValue->enc); our sqlite3_bind_text64 is that bindText.  The
+    previous port routed through sqlite3_bind_text (UTF-8 only), so a UTF-16
+    sqlite3_value bound into e.g. an FTS3 content-insert statement in a
+    PRAGMA encoding=utf-16 db was treated as UTF-8 and truncated at the first
+    embedded NUL byte (fts3snippet utf16 / fts4umlaut). }
   case sqlite3_value_type(pValue) of
     SQLITE_INTEGER: Result := sqlite3_bind_int64(pStmt, i, pValue^.u.i);
     SQLITE_FLOAT:   Result := sqlite3_bind_double(pStmt, i, pValue^.u.r);
-    SQLITE_TEXT:    Result := sqlite3_bind_text(pStmt, i,
-                                pValue^.z, pValue^.n, SQLITE_TRANSIENT);
+    SQLITE_TEXT:    Result := sqlite3_bind_text64(pStmt, i,
+                                pValue^.z, u64(pValue^.n), SQLITE_TRANSIENT,
+                                pValue^.enc);
     SQLITE_BLOB:    Result := sqlite3_bind_blob(pStmt, i,
                                 pValue^.z, pValue^.n, SQLITE_TRANSIENT);
     else            Result := sqlite3_bind_null(pStmt, i);

@@ -29561,10 +29561,16 @@ begin
         codegen treats `FROM v` as `FROM (SELECT ...)`.  Walks the just-
         attached subquery to recursively expand. }
       pTab := pItem^.pSTab;
-      if (pTab <> nil) and (pTab^.eTabType = TABTYP_VIEW) then
+      { select.c:6040 — `!IsOrdinaryTable(pTab)` covers VIEW *and* VIRTUAL.
+        sqlite3ViewGetColumnNames must run for both: for a vtab it routes to
+        xConnect (which declares the columns), so an FTS3/FTS4 (or any) vtab
+        loaded from a reopened schema gets connected lazily on first
+        reference.  Only a VIEW attaches its stored SELECT as a subquery. }
+      if (pTab <> nil) and
+         ((pTab^.eTabType = TABTYP_VIEW) or (pTab^.eTabType = TABTYP_VTAB)) then
       begin
         if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then Exit;
-        if pTab^.u.view_pSelect <> nil then
+        if (pTab^.eTabType = TABTYP_VIEW) and (pTab^.u.view_pSelect <> nil) then
           sqlite3SrcItemAttachSubquery(pParse, pItem,
                                        pTab^.u.view_pSelect, 1);
         if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
