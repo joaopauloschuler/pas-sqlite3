@@ -34,6 +34,7 @@ interface
 
 uses
   ctypes,
+  Strings,           { StrLen — FPC RTL, replaces libc strlen (6.40.1.p) }
   PasTclBridge,
   passqlite3types,
   passqlite3os,      { sqlite3_malloc / sqlite3_malloc64 / sqlite3_free }
@@ -46,13 +47,10 @@ function Sqlitetestfts3_Init(interp: PTclInterp): cint; cdecl;
 implementation
 
 { libc bindings (mirrors the implementation-private set in passqlite3fts3.pas;
-  re-declared here because those are not exported from the unit's interface). }
-function libc_strlen(s: PChar): NativeUInt; cdecl; external 'c' name 'strlen';
-procedure libc_memset(dst: Pointer; c: cint; n: NativeUInt); cdecl;
-  external 'c' name 'memset';
+  re-declared here because those are not exported from the unit's interface).
+  6.40.1.p — strlen/memset/memcmp now use FPC RTL (StrLen/FillChar/CompareByte);
+  strcmp retained. }
 function libc_strcmp(a, b: PChar): cint; cdecl; external 'c' name 'strcmp';
-function libc_memcmp(a, b: Pointer; n: NativeUInt): cint; cdecl;
-  external 'c' name 'memcmp';
 
 const
   NM_MAX_TOKEN = 12;
@@ -100,12 +98,12 @@ begin
     pToken := @p^.aToken[ii];
     if (pToken^.n > 0) and (pToken^.z[pToken^.n-1] = '*') then begin
       if aToken^[ii].n < (pToken^.n-1) then begin Result := 0; Exit; end;
-      if libc_memcmp(aToken^[ii].z, pToken^.z, pToken^.n-1) <> 0 then begin
+      if CompareByte((aToken^[ii].z)^, (pToken^.z)^, pToken^.n-1) <> 0 then begin
         Result := 0; Exit;
       end;
     end else begin
       if aToken^[ii].n <> pToken^.n then begin Result := 0; Exit; end;
-      if libc_memcmp(aToken^[ii].z, pToken^.z, pToken^.n) <> 0 then begin
+      if CompareByte((aToken^[ii].z)^, (pToken^.z)^, pToken^.n) <> 0 then begin
         Result := 0; Exit;
       end;
     end;
@@ -240,7 +238,7 @@ begin
 
   nPhrase := (nExprToken + 1) div 2;
   aPhrase := PNearPhraseArray(Tcl_Alloc(cuint(nPhrase*SizeOf(TNearPhrase))));
-  libc_memset(aPhrase, 0, NativeUInt(nPhrase*SizeOf(TNearPhrase)));
+  FillChar((aPhrase)^, NativeUInt(nPhrase*SizeOf(TNearPhrase)), Byte(0));
   for ii := 0 to nPhrase-1 do begin
     pPhrase := ObjElem(apExprToken, ii*2);
     rc := Tcl_ListObjGetElements(interp, pPhrase, @nToken, @apToken);
@@ -350,7 +348,7 @@ var
 begin
   pNew := PTestTokenizer(sqlite3_malloc(cint(SizeOf(TTestTokenizer))));
   if pNew = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  libc_memset(pNew, 0, SizeOf(TTestTokenizer));
+  FillChar((pNew)^, SizeOf(TTestTokenizer), Byte(0));
   ppTokenizer^ := Psqlite3_tokenizer(pNew);
   Result := SQLITE_OK;
 end;
@@ -373,10 +371,10 @@ begin
   if pCsr = nil then
     rc := SQLITE_NOMEM
   else begin
-    libc_memset(pCsr, 0, SizeOf(TTestTokenizerCursor));
+    FillChar((pCsr)^, SizeOf(TTestTokenizerCursor), Byte(0));
     pCsr^.aInput := pInput;
     if nBytes < 0 then
-      pCsr^.nInput := cint(libc_strlen(pInput))
+      pCsr^.nInput := cint(StrLen(pInput))
     else
       pCsr^.nInput := nBytes;
   end;

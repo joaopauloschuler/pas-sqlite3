@@ -54,6 +54,7 @@ interface
 
 uses
   ctypes,
+  Strings,           { StrLen — FPC RTL PChar length, replaces libc strlen }
   passqlite3types,
   passqlite3os,
   passqlite3util,    { sqlite3_mprintf / sqlite3_free wrappers }
@@ -785,17 +786,10 @@ function fts3GetVarint32(const p: PChar; piVal: Pcint): cint; inline;
 implementation
 
 { libc bindings (match the amatch/fuzzer pattern; avoids depending on a
-  csize_t alias from elsewhere). }
-function libc_strlen(s: PChar): NativeUInt; cdecl; external 'c' name 'strlen';
-function libc_memcpy(dst, src: Pointer; n: NativeUInt): Pointer; cdecl;
-  external 'c' name 'memcpy';
-procedure libc_memset(dst: Pointer; c: cint; n: NativeUInt); cdecl;
-  external 'c' name 'memset';
-function libc_strncmp(a, b: PChar; n: NativeUInt): cint; cdecl;
-  external 'c' name 'strncmp';
+  csize_t alias from elsewhere).
+  6.40.1.p — strlen/memcpy/memset/strncmp/memcmp replaced with FPC RTL
+  primitives (StrLen / Move / FillChar / CompareByte). strcmp + atoi remain. }
 function libc_strcmp(a, b: PChar): cint; cdecl; external 'c' name 'strcmp';
-function libc_memcmp(a, b: Pointer; n: NativeUInt): cint; cdecl;
-  external 'c' name 'memcmp';
 function libc_atoi(s: PChar): cint; cdecl; external 'c' name 'atoi';
 
 { Function-pointer types for the key-class-selected hash/compare fns. }
@@ -811,7 +805,7 @@ function fts3HashMalloc(n: sqlite3_int64): Pointer;
 begin
   Result := sqlite3_malloc64(u64(n));
   if Result <> nil then
-    libc_memset(Result, 0, NativeUInt(n));
+    FillChar((Result)^, NativeUInt(n), Byte(0));
 end;
 
 procedure fts3HashFree(p: Pointer);
@@ -868,7 +862,7 @@ var
 begin
   z := PByte(pKey);
   h := 0;
-  if nKey <= 0 then nKey := cint(libc_strlen(PChar(pKey)));
+  if nKey <= 0 then nKey := cint(StrLen(PChar(pKey)));
   while nKey > 0 do begin
     h := (h shl 3) xor h xor cuint(z^);
     Inc(z);
@@ -882,7 +876,7 @@ function fts3StrCompare(const pKey1: Pointer; n1: cint;
   const pKey2: Pointer; n2: cint): cint;
 begin
   if n1 <> n2 then Exit(1);
-  Result := libc_strncmp(PChar(pKey1), PChar(pKey2), NativeUInt(n1));
+  Result := CompareByte((PChar(pKey1))^, (PChar(pKey2))^, NativeUInt(n1));
 end;
 
 { --------------------------------------------------------------------- }
@@ -908,7 +902,7 @@ function fts3BinCompare(const pKey1: Pointer; n1: cint;
   const pKey2: Pointer; n2: cint): cint;
 begin
   if n1 <> n2 then Exit(1);
-  Result := libc_memcmp(pKey1, pKey2, NativeUInt(n1));
+  Result := CompareByte((pKey1)^, (pKey2)^, NativeUInt(n1));
 end;
 
 { --------------------------------------------------------------------- }
@@ -1125,7 +1119,7 @@ begin
       fts3HashFree(new_elem);
       Exit(data);
     end;
-    libc_memcpy(new_elem^.pKey, pKey, NativeUInt(nKey));
+    Move((pKey)^, (new_elem^.pKey)^, NativeUInt(nKey));
   end else
     new_elem^.pKey := pKey;
   new_elem^.nKey := nKey;
@@ -1228,13 +1222,13 @@ var
 begin
   t := Psimple_tokenizer(sqlite3_malloc(i32(SizeOf(Tsimple_tokenizer))));
   if t = nil then Exit(SQLITE_NOMEM);
-  libc_memset(t, 0, NativeUInt(SizeOf(Tsimple_tokenizer)));
+  FillChar((t)^, NativeUInt(SizeOf(Tsimple_tokenizer)), Byte(0));
 
   { TODO(shess) Delimiters need to remain the same from run to run, else
     we need to reindex. }
   if argc > 1 then begin
     pArg := PPChar(argv)[1];
-    n := cint(libc_strlen(pArg));
+    n := cint(StrLen(pArg));
     i := 0;
     while i < n do begin
       ch := Byte(pArg[i]);
@@ -1283,7 +1277,7 @@ begin
   if pInput = nil then
     c^.nBytes := 0
   else if nBytes < 0 then
-    c^.nBytes := cint(libc_strlen(pInput))
+    c^.nBytes := cint(StrLen(pInput))
   else
     c^.nBytes := nBytes;
   c^.iOffset := 0;                 { start tokenizing at the beginning }
@@ -1410,7 +1404,7 @@ begin
   { UNUSED_PARAMETER(argc); UNUSED_PARAMETER(argv) }
   t := Pporter_tokenizer(sqlite3_malloc(i32(SizeOf(Tporter_tokenizer))));
   if t = nil then Exit(SQLITE_NOMEM);
-  libc_memset(t, 0, NativeUInt(SizeOf(Tporter_tokenizer)));
+  FillChar((t)^, NativeUInt(SizeOf(Tporter_tokenizer)), Byte(0));
   ppTokenizer^ := @t^.base;
   Result := SQLITE_OK;
 end;
@@ -1436,7 +1430,7 @@ begin
   if zInput = nil then
     c^.nInput := 0
   else if nInput < 0 then
-    c^.nInput := cint(libc_strlen(zInput))
+    c^.nInput := cint(StrLen(zInput))
   else
     c^.nInput := nInput;
   c^.iOffset := 0;                 { start tokenizing at the beginning }
@@ -1669,7 +1663,7 @@ begin
     Inc(i);
     Dec(j);
   end;
-  libc_memset(@zReverse[SizeOf(zReverse) - 5], 0, 5);
+  FillChar((@zReverse[SizeOf(zReverse) - 5])^, 5, Byte(0));
   z := @zReverse[j + 1];
 
   { Step 1a }
@@ -1815,7 +1809,7 @@ begin
     Inc(z);
 
   { z[] is now the stemmed word in reverse order.  Flip it back. }
-  i := cint(libc_strlen(z));
+  i := cint(StrLen(z));
   pnOut^ := i;
   zOut[i] := #0;
   while z^ <> #0 do begin
@@ -2456,23 +2450,23 @@ begin
   rc := SQLITE_OK;
   pNew := Punicode_tokenizer(sqlite3_malloc(i32(SizeOf(Tunicode_tokenizer))));
   if pNew = nil then Exit(SQLITE_NOMEM);
-  libc_memset(pNew, 0, NativeUInt(SizeOf(Tunicode_tokenizer)));
+  FillChar((pNew)^, NativeUInt(SizeOf(Tunicode_tokenizer)), Byte(0));
   pNew^.eRemoveDiacritic := 1;
 
   i := 0;
   while (rc = SQLITE_OK) and (i < nArg) do begin
     z := PPChar(azArg)[i];
-    n := cint(libc_strlen(z));
+    n := cint(StrLen(z));
 
-    if (n = 19) and (libc_memcmp(PChar('remove_diacritics=1'), z, 19) = 0) then
+    if (n = 19) and (CompareByte((PChar('remove_diacritics=1'))^, (z)^, 19) = 0) then
       pNew^.eRemoveDiacritic := 1
-    else if (n = 19) and (libc_memcmp(PChar('remove_diacritics=0'), z, 19) = 0) then
+    else if (n = 19) and (CompareByte((PChar('remove_diacritics=0'))^, (z)^, 19) = 0) then
       pNew^.eRemoveDiacritic := 0
-    else if (n = 19) and (libc_memcmp(PChar('remove_diacritics=2'), z, 19) = 0) then
+    else if (n = 19) and (CompareByte((PChar('remove_diacritics=2'))^, (z)^, 19) = 0) then
       pNew^.eRemoveDiacritic := 2
-    else if (n >= 11) and (libc_memcmp(PChar('tokenchars='), z, 11) = 0) then
+    else if (n >= 11) and (CompareByte((PChar('tokenchars='))^, (z)^, 11) = 0) then
       rc := unicodeAddExceptions(pNew, 1, @z[11], n - 11)
-    else if (n >= 11) and (libc_memcmp(PChar('separators='), z, 11) = 0) then
+    else if (n >= 11) and (CompareByte((PChar('separators='))^, (z)^, 11) = 0) then
       rc := unicodeAddExceptions(pNew, 0, @z[11], n - 11)
     else
       rc := SQLITE_ERROR;   { Unrecognized argument }
@@ -2498,14 +2492,14 @@ var
 begin
   pCsr := Punicode_cursor(sqlite3_malloc(i32(SizeOf(Tunicode_cursor))));
   if pCsr = nil then Exit(SQLITE_NOMEM);
-  libc_memset(pCsr, 0, NativeUInt(SizeOf(Tunicode_cursor)));
+  FillChar((pCsr)^, NativeUInt(SizeOf(Tunicode_cursor)), Byte(0));
 
   pCsr^.aInput := PByte(aInput);
   if aInput = nil then begin
     pCsr^.nInput := 0;
     pCsr^.aInput := @unicodeEmptyInput;
   end else if nInput < 0 then
-    pCsr^.nInput := cint(libc_strlen(aInput))
+    pCsr^.nInput := cint(StrLen(aInput))
   else
     pCsr^.nInput := nInput;
 
@@ -2747,7 +2741,7 @@ begin
     freed by sqlite3_free — the same allocator as C's sqlite3_mprintf). }
   zCopy := PChar(sqlite3PfMprintf(PAnsiChar('%s'), [zArg]));
   if zCopy = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  zEnd := @zCopy[libc_strlen(zCopy)];
+  zEnd := @zCopy[StrLen(zCopy)];
 
   z := sqlite3Fts3NextToken(zCopy, @n);
   if z = nil then begin
@@ -2758,7 +2752,7 @@ begin
   fts3Dequote(z);
 
   m := Psqlite3_tokenizer_module(
-         sqlite3Fts3HashFind(pHash, z, cint(libc_strlen(z)) + 1));
+         sqlite3Fts3HashFind(pHash, z, cint(StrLen(z)) + 1));
   if m = nil then begin
     fts3ErrMsg(pzErr, 'unknown tokenizer: %s', [z]);
     rc := SQLITE_ERROR;
@@ -3050,7 +3044,7 @@ begin
   if SQLITE_ROW = sqlite3_step(pStmt) then begin
     if (sqlite3_column_type(pStmt, 0) = SQLITE_BLOB)
     and (sqlite3_column_bytes(pStmt, 0) = cint(SizeOf(pp^))) then
-      libc_memcpy(pp, sqlite3_column_blob(pStmt, 0), NativeUInt(SizeOf(pp^)));
+      Move((sqlite3_column_blob(pStmt, 0))^, (pp)^, NativeUInt(SizeOf(pp^)));
   end;
 
   Result := sqlite3_finalize(pStmt);
@@ -3178,7 +3172,7 @@ var
   p: Psqlite3_tokenizer_module;
   nName: cint;
 begin
-  nName := cint(libc_strlen(zName));
+  nName := cint(StrLen(zName));
 
   p := Psqlite3_tokenizer_module(
          sqlite3Fts3HashFind(pHash, zName, nName + 1));
@@ -3211,7 +3205,7 @@ begin
   else begin
     nByte := 0;
     for i := 0 to argc - 1 do
-      nByte := nByte + cint(libc_strlen(argv[i]) + 1);
+      nByte := nByte + cint(StrLen(argv[i]) + 1);
 
     azDequote := PPChar(sqlite3_malloc64(
                    u64(SizeOf(PChar) * argc + nByte)));
@@ -3222,9 +3216,9 @@ begin
       { C: pSpace = (char *)&azDequote[argc]; }
       pSpace := PChar(@azDequote[argc]);
       for i := 0 to argc - 1 do begin
-        n := cint(libc_strlen(argv[i]));
+        n := cint(StrLen(argv[i]));
         azDequote[i] := pSpace;
-        libc_memcpy(pSpace, argv[i], NativeUInt(n + 1));
+        Move((argv[i])^, (pSpace)^, NativeUInt(n + 1));
         fts3Dequote(pSpace);
         Inc(pSpace, n + 1);
       end;
@@ -3289,7 +3283,7 @@ begin
   end;
 
   if rc = SQLITE_OK then begin
-    libc_memset(pTab, 0, SizeOf(TFts3tokTable));
+    FillChar((pTab)^, SizeOf(TFts3tokTable), Byte(0));
     pTab^.pMod := pMod;
     pTab^.pTok := pTok;
     ppVtab^ := @pTab^.base;
@@ -3356,7 +3350,7 @@ begin
     Result := SQLITE_NOMEM;
     Exit;
   end;
-  libc_memset(pCsr, 0, SizeOf(TFts3tokCursor));
+  FillChar((pCsr)^, SizeOf(TFts3tokCursor), Byte(0));
 
   ppCsr^ := PSqlite3VtabCursor(@pCsr^.base);
   Result := SQLITE_OK;
@@ -3440,7 +3434,7 @@ begin
     if pCsr^.zInput = nil then
       rc := SQLITE_NOMEM
     else begin
-      if nByte > 0 then libc_memcpy(pCsr^.zInput, zByte, NativeUInt(nByte));
+      if nByte > 0 then Move((zByte)^, (pCsr^.zInput)^, NativeUInt(nByte));
       pCsr^.zInput[nByte] := #0;
       rc := pTab^.pMod^.xOpen(pTab^.pTok, pCsr^.zInput, cint(nByte),
               @pCsr^.pCsr);
@@ -3573,7 +3567,7 @@ end;
 function sqlite3Fts3MallocZero(nByte: sqlite3_int64): Pointer;
 begin
   Result := sqlite3_malloc64(u64(nByte));
-  if Result <> nil then libc_memset(Result, 0, NativeUInt(nByte));
+  if Result <> nil then FillChar((Result)^, NativeUInt(nByte), Byte(0));
 end;
 
 { ---------------------------------------------------------------------
@@ -3619,7 +3613,7 @@ begin
   if pPhrase <> nil then begin
     sqlite3_free(pPhrase^.doclist.aAll);
     fts3EvalInvalidatePoslist(pPhrase);
-    libc_memset(@pPhrase^.doclist, 0, NativeUInt(SizeOf(TFts3Doclist)));
+    FillChar((@pPhrase^.doclist)^, NativeUInt(SizeOf(TFts3Doclist)), Byte(0));
     for i := 0 to pPhrase^.nToken - 1 do begin
       fts3SegReaderCursorFree(PFts3MultiSegReader(pPhrase^.aToken[i].pSegcsr));
       pPhrase^.aToken[i].pSegcsr := nil;
@@ -3722,7 +3716,7 @@ begin
         { aToken[0].z = (char*)&aToken[1] — token text follows the 1-elem
           flexible array. }
         pTok0^.z := PChar(@PFts3PhraseToken(@pRet^.pPhrase^.aToken[0])[1]);
-        libc_memcpy(pTok0^.z, zToken, NativeUInt(nToken));
+        Move((zToken)^, (pTok0^.z)^, NativeUInt(nToken));
 
         if (iEnd < n) and (z[iEnd] = '*') then begin
           pTok0^.isPrefix := 1;
@@ -3820,9 +3814,9 @@ begin
         { pToken = &((Fts3Phrase *)(&p[1]))->aToken[ii]; }
         pPhrase := PFts3Phrase(@PFts3Expr(p)[1]);
         pToken := fts3PhraseTokenAt(pPhrase, ii);
-        libc_memset(pToken, 0, NativeUInt(SizeOf(TFts3PhraseToken)));
+        FillChar((pToken)^, NativeUInt(SizeOf(TFts3PhraseToken)), Byte(0));
 
-        libc_memcpy(@zTemp[nTemp], zByte, NativeUInt(nByte));
+        Move((zByte)^, (@zTemp[nTemp])^, NativeUInt(nByte));
         nTemp := nTemp + nByte;
 
         pToken^.n := nByte;
@@ -3846,8 +3840,7 @@ begin
     end;
     pPhrase := PFts3Phrase(@PFts3Expr(p)[1]);
     { memset(p, 0, (char *)&(((Fts3Phrase *)&p[1])->aToken[0]) - (char *)p); }
-    libc_memset(p, 0,
-      NativeUInt(PtrUInt(@pPhrase^.aToken[0]) - PtrUInt(p)));
+    FillChar((p)^, NativeUInt(PtrUInt(@pPhrase^.aToken[0]) - PtrUInt(p)), Byte(0));
     p^.eType := FTSQUERY_PHRASE;
     p^.pPhrase := pPhrase;
     p^.pPhrase^.iColumn := pParse^.iDefaultCol;
@@ -3857,7 +3850,7 @@ begin
     zBuf := PChar(@PFts3PhraseToken(@p^.pPhrase^.aToken[0])[nToken]);
     Assert((nTemp = 0) or (zTemp <> nil));
     if zTemp <> nil then
-      libc_memcpy(zBuf, zTemp, NativeUInt(nTemp));
+      Move((zTemp)^, (zBuf)^, NativeUInt(nTemp));
 
     for jj := 0 to p^.pPhrase^.nToken - 1 do begin
       pToken := fts3PhraseTokenAt(p^.pPhrase, jj);
@@ -3940,7 +3933,7 @@ begin
       continue;
 
     if (nInput >= cint(pKey^.n))
-    and (libc_memcmp(zInput, pKey^.z, NativeUInt(pKey^.n)) = 0) then begin
+    and (CompareByte((zInput)^, (pKey^.z)^, NativeUInt(pKey^.n)) = 0) then begin
       nNear := SQLITE_FTS3_DEFAULT_NEAR_PARAM;
       nKey := pKey^.n;
 
@@ -4002,7 +3995,7 @@ begin
   iColLen := 0;
   for ii := 0 to pParse^.nCol - 1 do begin
     zStr := PPChar(pParse^.azCol)[ii];
-    nStr := cint(libc_strlen(zStr));
+    nStr := cint(StrLen(zStr));
     if (nInput > nStr) and (zInput[nStr] = ':')
     and (sqlite3_strnicmp(zStr, zInput, nStr) = 0) then begin
       iCol := ii;
@@ -4243,7 +4236,7 @@ begin
       if apLeaf = nil then
         rc := SQLITE_NOMEM
       else
-        libc_memset(apLeaf, 0, NativeUInt(SizeOf(PFts3Expr) * nMaxDepth));
+        FillChar((apLeaf)^, NativeUInt(SizeOf(PFts3Expr) * nMaxDepth), Byte(0));
 
       if rc = SQLITE_OK then begin
         { Set p to the left-most leaf in the tree of eType nodes. }
@@ -4396,7 +4389,7 @@ var
   sParse: TParseContext;
   nn: cint;
 begin
-  libc_memset(@sParse, 0, NativeUInt(SizeOf(TParseContext)));
+  FillChar((@sParse)^, NativeUInt(SizeOf(TParseContext)), Byte(0));
   sParse.pTokenizer := pTokenizer;
   sParse.iLangid := iLangid;
   sParse.azCol := azCol;
@@ -4408,7 +4401,7 @@ begin
     Exit(SQLITE_OK);
   end;
   nn := n;
-  if nn < 0 then nn := cint(libc_strlen(z));
+  if nn < 0 then nn := cint(StrLen(z));
   rc := fts3ExprParse(@sParse, z, nn, ppExpr, @nParsed);
   Assert((rc = SQLITE_OK) or (ppExpr^ = nil));
 
@@ -5686,7 +5679,7 @@ begin
           pnLoad^ := nByte;
         end;
         rc := sqlite3_blob_read(p^.pSegments, aByte, nByte, 0);
-        libc_memset(@aByte[nByte], 0, FTS3_NODE_PADDING);
+        FillChar((@aByte[nByte])^, FTS3_NODE_PADDING, Byte(0));
         if rc <> SQLITE_OK then begin
           sqlite3_free(aByte);
           aByte := nil;
@@ -5723,7 +5716,7 @@ begin
           nRead, pReader^.nPopulate);
   if rc = SQLITE_OK then begin
     pReader^.nPopulate := pReader^.nPopulate + nRead;
-    libc_memset(@pReader^.aNode[pReader^.nPopulate], 0, FTS3_NODE_PADDING);
+    FillChar((@pReader^.aNode[pReader^.nPopulate])^, FTS3_NODE_PADDING, Byte(0));
     if pReader^.nPopulate = pReader^.nNode then begin
       sqlite3_blob_close(pReader^.pBlob);
       pReader^.pBlob := nil;
@@ -5793,13 +5786,13 @@ begin
           if pReader^.zTerm = nil then Exit(SQLITE_NOMEM);
           pReader^.nTermAlloc := (nTerm+1)*2;
         end;
-        libc_memcpy(pReader^.zTerm, fts3HashKey(pElem), NativeUInt(nTerm));
+        Move((fts3HashKey(pElem))^, (pReader^.zTerm)^, NativeUInt(nTerm));
         pReader^.zTerm[nTerm] := #0;
         pReader^.nTerm := nTerm;
 
         aCopy := PChar(sqlite3_malloc64(u64(nCopy)));
         if aCopy = nil then Exit(SQLITE_NOMEM);
-        libc_memcpy(aCopy, pList^.aData, NativeUInt(nCopy));
+        Move((pList^.aData)^, (aCopy)^, NativeUInt(nCopy));
         pReader^.nNode := nCopy; pReader^.nDoclist := nCopy;
         pReader^.aNode := aCopy; pReader^.aDoclist := aCopy;
         Inc(pReader^.ppNextElem);
@@ -5847,7 +5840,7 @@ begin
   rc := fts3SegReaderRequire(pReader, pNext, nSuffix+FTS3_VARINT_MAX);
   if rc <> SQLITE_OK then Exit(rc);
 
-  libc_memcpy(@pReader^.zTerm[nPrefix], pNext, NativeUInt(nSuffix));
+  Move((pNext)^, (@pReader^.zTerm[nPrefix])^, NativeUInt(nSuffix));
   pReader^.nTerm := nPrefix+nSuffix;
   pNext := pNext + nSuffix;
   pNext := pNext + fts3GetVarint32(pNext, @pReader^.nDoclist);
@@ -6011,7 +6004,7 @@ begin
   end;
   pReader := PFts3SegReader(sqlite3_malloc64(u64(SizeOf(TFts3SegReader)) + u64(nExtra)));
   if pReader = nil then Exit(SQLITE_NOMEM);
-  libc_memset(pReader, 0, SizeOf(TFts3SegReader));
+  FillChar((pReader)^, SizeOf(TFts3SegReader), Byte(0));
   pReader^.iIdx := iAge;
   if bLookup <> 0 then pReader^.bLookup := 1 else pReader^.bLookup := 0;
   pReader^.iStartBlock := iStartLeaf;
@@ -6021,8 +6014,8 @@ begin
     pReader^.aNode := PChar(PtrUInt(pReader) + SizeOf(TFts3SegReader));
     pReader^.rootOnly := 1;
     pReader^.nNode := nRoot;
-    if nRoot <> 0 then libc_memcpy(pReader^.aNode, zRoot, NativeUInt(nRoot));
-    libc_memset(@pReader^.aNode[nRoot], 0, FTS3_NODE_PADDING);
+    if nRoot <> 0 then Move((zRoot)^, (pReader^.aNode)^, NativeUInt(nRoot));
+    FillChar((@pReader^.aNode[nRoot])^, FTS3_NODE_PADDING, Byte(0));
   end else
     pReader^.iCurrentBlock := iStartLeaf-1;
   ppReader^ := pReader;
@@ -6043,7 +6036,7 @@ begin
   n1 := fts3HashKeysize(e1);
   n2 := fts3HashKeysize(e2);
   if n1 < n2 then n := n1 else n := n2;
-  c := libc_memcmp(z1, z2, NativeUInt(n));
+  c := CompareByte((z1)^, (z2)^, NativeUInt(n));
   if c = 0 then c := n1 - n2;
   Result := c;
 end;
@@ -6076,7 +6069,7 @@ begin
       zKey := PChar(fts3HashKey(pE));
       nKey := fts3HashKeysize(pE);
       if (nTerm = 0)
-       or ((nKey >= nTerm) and (libc_memcmp(zKey, zTerm, NativeUInt(nTerm)) = 0)) then
+       or ((nKey >= nTerm) and (CompareByte((zKey)^, (zTerm)^, NativeUInt(nTerm)) = 0)) then
       begin
         if nElem = nAlloc then begin
           nAlloc := nAlloc + 16;
@@ -6111,10 +6104,10 @@ begin
     if pReader = nil then
       rc := SQLITE_NOMEM
     else begin
-      libc_memset(pReader, 0, NativeUInt(nByte));
+      FillChar((pReader)^, NativeUInt(nByte), Byte(0));
       pReader^.iIdx := $7FFFFFFF;
       pReader^.ppNextElem := PPFts3HashElem(PtrUInt(pReader) + SizeOf(TFts3SegReader));
-      libc_memcpy(pReader^.ppNextElem, aElem, NativeUInt(nElem*SizeOf(PFts3HashElem)));
+      Move((aElem)^, (pReader^.ppNextElem)^, NativeUInt(nElem*SizeOf(PFts3HashElem)));
     end;
   end;
 
@@ -6131,9 +6124,9 @@ begin
   if (pLhs^.aNode <> nil) and (pRhs^.aNode <> nil) then begin
     rc2 := pLhs^.nTerm - pRhs^.nTerm;
     if rc2 < 0 then
-      rc := libc_memcmp(pLhs^.zTerm, pRhs^.zTerm, NativeUInt(pLhs^.nTerm))
+      rc := CompareByte((pLhs^.zTerm)^, (pRhs^.zTerm)^, NativeUInt(pLhs^.nTerm))
     else
-      rc := libc_memcmp(pLhs^.zTerm, pRhs^.zTerm, NativeUInt(pRhs^.nTerm));
+      rc := CompareByte((pLhs^.zTerm)^, (pRhs^.zTerm)^, NativeUInt(pRhs^.nTerm));
     if rc = 0 then rc := rc2;
   end else
     rc := cint(Ord(pLhs^.aNode = nil)) - cint(Ord(pRhs^.aNode = nil));
@@ -6176,9 +6169,9 @@ begin
   res := 0;
   if pSeg^.aNode <> nil then begin
     if pSeg^.nTerm > nTerm then
-      res := libc_memcmp(pSeg^.zTerm, zTerm, NativeUInt(nTerm))
+      res := CompareByte((pSeg^.zTerm)^, (zTerm)^, NativeUInt(nTerm))
     else
-      res := libc_memcmp(pSeg^.zTerm, zTerm, NativeUInt(pSeg^.nTerm));
+      res := CompareByte((pSeg^.zTerm)^, (zTerm)^, NativeUInt(pSeg^.nTerm));
     if res = 0 then res := pSeg^.nTerm-nTerm;
   end;
   Result := res;
@@ -6321,7 +6314,7 @@ begin
       if pTree^.zTerm <> nil then
         nData := nData + sqlite3Fts3PutVarint(@pTree^.aData[nData], nPrefix);
       nData := nData + sqlite3Fts3PutVarint(@pTree^.aData[nData], nSuffix);
-      libc_memcpy(@pTree^.aData[nData], @zTerm[nPrefix], NativeUInt(nSuffix));
+      Move((@zTerm[nPrefix])^, (@pTree^.aData[nData])^, NativeUInt(nSuffix));
       pTree^.nData := nData + nSuffix;
       Inc(pTree^.nEntry);
       if isCopyTerm <> 0 then begin
@@ -6332,7 +6325,7 @@ begin
           pTree^.zMalloc := zNew;
         end;
         pTree^.zTerm := pTree^.zMalloc;
-        libc_memcpy(pTree^.zTerm, zTerm, NativeUInt(nTerm));
+        Move((zTerm)^, (pTree^.zTerm)^, NativeUInt(nTerm));
         pTree^.nTerm := nTerm;
       end else begin
         pTree^.zTerm := PChar(zTerm);
@@ -6344,7 +6337,7 @@ begin
 
   pNew := PSegmentNode(sqlite3_malloc64(u64(SizeOf(TSegmentNode)) + u64(p^.nNodeSize)));
   if pNew = nil then Exit(SQLITE_NOMEM);
-  libc_memset(pNew, 0, SizeOf(TSegmentNode));
+  FillChar((pNew)^, SizeOf(TSegmentNode), Byte(0));
   pNew^.nData := 1 + FTS3_VARINT_MAX;
   pNew^.aData := PChar(PtrUInt(pNew) + SizeOf(TSegmentNode));
 
@@ -6451,7 +6444,7 @@ begin
   if pWriter = nil then begin
     pWriter := PSegmentWriter(sqlite3_malloc64(u64(SizeOf(TSegmentWriter))));
     if pWriter = nil then Exit(SQLITE_NOMEM);
-    libc_memset(pWriter, 0, SizeOf(TSegmentWriter));
+    FillChar((pWriter)^, SizeOf(TSegmentWriter), Byte(0));
     ppWriter^ := pWriter;
     pWriter^.aData := PChar(sqlite3_malloc64(u64(p^.nNodeSize)));
     if pWriter^.aData = nil then Exit(SQLITE_NOMEM);
@@ -6503,10 +6496,10 @@ begin
 
   nData := nData + sqlite3Fts3PutVarint(@pWriter^.aData[nData], nPrefix);
   nData := nData + sqlite3Fts3PutVarint(@pWriter^.aData[nData], nSuffix);
-  libc_memcpy(@pWriter^.aData[nData], @zTerm[nPrefix], NativeUInt(nSuffix));
+  Move((@zTerm[nPrefix])^, (@pWriter^.aData[nData])^, NativeUInt(nSuffix));
   nData := nData + nSuffix;
   nData := nData + sqlite3Fts3PutVarint(@pWriter^.aData[nData], nDoclist);
-  libc_memcpy(@pWriter^.aData[nData], aDoclist, NativeUInt(nDoclist));
+  Move((aDoclist)^, (@pWriter^.aData[nData])^, NativeUInt(nDoclist));
   pWriter^.nData := nData + nDoclist;
 
   if isCopyTerm <> 0 then begin
@@ -6518,7 +6511,7 @@ begin
       pWriter^.zTerm := zNew;
     end;
     Assert(pWriter^.zTerm = pWriter^.zMalloc);
-    libc_memcpy(pWriter^.zTerm, zTerm, NativeUInt(nTerm));
+    Move((zTerm)^, (pWriter^.zTerm)^, NativeUInt(nTerm));
   end else
     pWriter^.zTerm := PChar(zTerm);
   pWriter^.nTerm := nTerm;
@@ -6711,7 +6704,7 @@ begin
     p := p + fts3GetVarint32(p, @iCurrent);
   end;
   if (bZero <> 0) and ((PtrInt(pEnd) - PtrInt(@pList[nList])) > 0) then
-    libc_memset(@pList[nList], 0, NativeUInt(PtrInt(pEnd) - PtrInt(@pList[nList])));
+    FillChar((@pList[nList])^, NativeUInt(PtrInt(pEnd) - PtrInt(@pList[nList])), Byte(0));
   ppList^ := pList;
   pnList^ := nList;
 end;
@@ -6730,8 +6723,8 @@ begin
     pMsr^.aBuffer := pNew;
     pMsr^.nBuffer := nNew;
   end;
-  libc_memcpy(pMsr^.aBuffer, pList, NativeUInt(nList));
-  libc_memset(@pMsr^.aBuffer[nList], 0, FTS3_NODE_PADDING);
+  Move((pList)^, (pMsr^.aBuffer)^, NativeUInt(nList));
+  FillChar((@pMsr^.aBuffer[nList])^, FTS3_NODE_PADDING, Byte(0));
   Result := SQLITE_OK;
 end;
 
@@ -6952,7 +6945,7 @@ begin
     if (pFilter^.zTerm <> nil) and (isScan = 0) then begin
       if (pCsr^.nTerm < pFilter^.nTerm)
        or ((isPrefix = 0) and (pCsr^.nTerm > pFilter^.nTerm))
-       or (libc_memcmp(pCsr^.zTerm, pFilter^.zTerm, NativeUInt(pFilter^.nTerm)) <> 0)
+       or (CompareByte((pCsr^.zTerm)^, (pFilter^.zTerm)^, NativeUInt(pFilter^.nTerm)) <> 0)
       then break;
     end;
 
@@ -6960,8 +6953,7 @@ begin
     while (nMerge < nSegment)
       and (PPFts3SegReader(apSegment)[nMerge]^.aNode <> nil)
       and (PPFts3SegReader(apSegment)[nMerge]^.nTerm = pCsr^.nTerm)
-      and (libc_memcmp(pCsr^.zTerm, PPFts3SegReader(apSegment)[nMerge]^.zTerm,
-             NativeUInt(pCsr^.nTerm)) = 0) do
+      and (CompareByte((pCsr^.zTerm)^, (PPFts3SegReader(apSegment)[nMerge]^.zTerm)^, NativeUInt(pCsr^.nTerm)) = 0) do
       Inc(nMerge);
 
     if (nMerge = 1) and (isIgnoreEmpty = 0) and (isFirst = 0)
@@ -7021,7 +7013,7 @@ begin
                 sqlite3Fts3PutVarint(@pCsr^.aBuffer[nDoclist], iDelta);
             iPrev := iDocid;
             if isRequirePos <> 0 then begin
-              libc_memcpy(@pCsr^.aBuffer[nDoclist], pList, NativeUInt(nList));
+              Move((pList)^, (@pCsr^.aBuffer[nDoclist])^, NativeUInt(nList));
               nDoclist := nDoclist + nList;
               pCsr^.aBuffer[nDoclist] := #0;
               Inc(nDoclist);
@@ -7033,7 +7025,7 @@ begin
       if nDoclist > 0 then begin
         rc := fts3GrowSegReaderBuffer(pCsr, sqlite3_int64(nDoclist)+FTS3_NODE_PADDING);
         if rc <> 0 then Exit(rc);
-        libc_memset(@pCsr^.aBuffer[nDoclist], 0, FTS3_NODE_PADDING);
+        FillChar((@pCsr^.aBuffer[nDoclist])^, FTS3_NODE_PADDING, Byte(0));
         pCsr^.aDoclist := pCsr^.aBuffer;
         pCsr^.nDoclist := nDoclist;
         rc := SQLITE_ROW;
@@ -7195,7 +7187,7 @@ begin
   if rc <> SQLITE_OK then goto finished;
 
   Assert(csr.nSegment > 0);
-  libc_memset(@filter, 0, SizeOf(TFts3SegFilter));
+  FillChar((@filter)^, SizeOf(TFts3SegFilter), Byte(0));
   filter.flags := FTS3_SEGMENT_REQUIRE_POS;
   if bIgnoreEmpty <> 0 then filter.flags := filter.flags or FTS3_SEGMENT_IGNORE_EMPTY;
 
@@ -7336,7 +7328,7 @@ begin
     fts3DecodeIntArray(nStat, a, sqlite3_column_blob(pStmt, 0),
                        sqlite3_column_bytes(pStmt, 0))
   else
-    libc_memset(a, 0, NativeUInt(SizeOf(cuint)*nStat));
+    FillChar((a)^, NativeUInt(SizeOf(cuint)*nStat), Byte(0));
   rc := sqlite3_reset(pStmt);
   if rc <> SQLITE_OK then begin sqlite3_free(a); pRC^ := rc; Exit; end;
   if (nChng < 0) and (Pcuint(a)[0] < cuint(-nChng)) then
@@ -7423,7 +7415,7 @@ begin
       if aSz = nil then
         rc := SQLITE_NOMEM
       else begin
-        libc_memset(aSz, 0, NativeUInt(nByte));
+        FillChar((aSz)^, NativeUInt(nByte), Byte(0));
         aSzIns := @Pcuint(aSz)[p^.nColumn+1];
         aSzDel := @Pcuint(aSzIns)[p^.nColumn+1];
       end;
@@ -7432,7 +7424,7 @@ begin
     while (rc = SQLITE_OK) and (SQLITE_ROW = sqlite3_step(pStmt)) do begin
       iLangid := langidFromSelect(p, pStmt);
       rc := fts3PendingTermsDocid(p, 0, iLangid, sqlite3_column_int64(pStmt, 0));
-      libc_memset(aSz, 0, NativeUInt(SizeOf(cuint) * (p^.nColumn+1)));
+      FillChar((aSz)^, NativeUInt(SizeOf(cuint) * (p^.nColumn+1)), Byte(0));
       iCol := 0;
       while (rc = SQLITE_OK) and (iCol < p^.nColumn) do begin
         if PByte(p^.abNotindexed)[iCol] = 0 then begin
@@ -7477,13 +7469,13 @@ var
   nByte: sqlite3_int64;
 begin
   pStmt := nil;
-  libc_memset(pCsr, 0, SizeOf(TFts3MultiSegReader));
+  FillChar((pCsr)^, SizeOf(TFts3MultiSegReader), Byte(0));
   nByte := SizeOf(PFts3SegReader) * nSeg;
   pCsr^.apSegment := PPFts3SegReader(sqlite3_malloc64(u64(nByte)));
   if pCsr^.apSegment = nil then
     rc := SQLITE_NOMEM
   else begin
-    libc_memset(pCsr^.apSegment, 0, NativeUInt(nByte));
+    FillChar((pCsr^.apSegment)^, NativeUInt(nByte), Byte(0));
     rc := fts3SqlStmt(p, SQL_SELECT_LEVEL, @pStmt, nil);
   end;
   if rc = SQLITE_OK then begin
@@ -7546,7 +7538,7 @@ begin
       Exit(FTS_CORRUPT_VTAB);
     blobGrowBuffer(@p^.term, nPrefix+nSuffix, @rc);
     if (rc = SQLITE_OK) and (p^.term.a <> nil) then begin
-      libc_memcpy(@p^.term.a[nPrefix], @p^.aNode[p^.iOff], NativeUInt(nSuffix));
+      Move((@p^.aNode[p^.iOff])^, (@p^.term.a[nPrefix])^, NativeUInt(nSuffix));
       p^.term.n := nPrefix+nSuffix;
       p^.iOff := p^.iOff + nSuffix;
       if p^.iChild = 0 then begin
@@ -7569,7 +7561,7 @@ end;
 { fts3_write.c:3856..3870 — nodeReaderInit. }
 function nodeReaderInit(p: PNodeReader; const aNode: PChar; nNode: cint): cint;
 begin
-  libc_memset(p, 0, SizeOf(TNodeReader));
+  FillChar((p)^, SizeOf(TNodeReader), Byte(0));
   p^.aNode := aNode;
   p^.nNode := nNode;
   if (aNode <> nil) and (aNode[0] <> #0) then
@@ -7618,9 +7610,9 @@ begin
         if pNode^.key.n <> 0 then
           pBlk^.n := pBlk^.n + sqlite3Fts3PutVarint(@pBlk^.a[pBlk^.n], nPrefix);
         pBlk^.n := pBlk^.n + sqlite3Fts3PutVarint(@pBlk^.a[pBlk^.n], nSuffix);
-        libc_memcpy(@pBlk^.a[pBlk^.n], @zTerm[nPrefix], NativeUInt(nSuffix));
+        Move((@zTerm[nPrefix])^, (@pBlk^.a[pBlk^.n])^, NativeUInt(nSuffix));
         pBlk^.n := pBlk^.n + nSuffix;
-        libc_memcpy(pNode^.key.a, zTerm, NativeUInt(nTerm));
+        Move((zTerm)^, (pNode^.key.a)^, NativeUInt(nTerm));
         pNode^.key.n := nTerm;
       end;
     end else begin
@@ -7654,16 +7646,16 @@ begin
   nPrefix := fts3PrefixCompress(pPrev^.a, pPrev^.n, zTerm, nTerm);
   nSuffix := nTerm - nPrefix;
   if nSuffix <= 0 then Exit(FTS_CORRUPT_VTAB);
-  libc_memcpy(pPrev^.a, zTerm, NativeUInt(nTerm));
+  Move((zTerm)^, (pPrev^.a)^, NativeUInt(nTerm));
   pPrev^.n := nTerm;
   if bFirst = 0 then
     pNode^.n := pNode^.n + sqlite3Fts3PutVarint(@pNode^.a[pNode^.n], nPrefix);
   pNode^.n := pNode^.n + sqlite3Fts3PutVarint(@pNode^.a[pNode^.n], nSuffix);
-  libc_memcpy(@pNode^.a[pNode^.n], @zTerm[nPrefix], NativeUInt(nSuffix));
+  Move((@zTerm[nPrefix])^, (@pNode^.a[pNode^.n])^, NativeUInt(nSuffix));
   pNode^.n := pNode^.n + nSuffix;
   if aDoclist <> nil then begin
     pNode^.n := pNode^.n + sqlite3Fts3PutVarint(@pNode^.a[pNode^.n], nDoclist);
-    libc_memcpy(@pNode^.a[pNode^.n], aDoclist, NativeUInt(nDoclist));
+    Move((aDoclist)^, (@pNode^.a[pNode^.n])^, NativeUInt(nDoclist));
     pNode^.n := pNode^.n + nDoclist;
   end;
   Assert(pNode^.n <= pNode^.nAlloc);
@@ -7782,7 +7774,7 @@ var
 begin
   if nLhs < nRhs then nCmp := nLhs else nCmp := nRhs;
   if (nCmp <> 0) and (zLhs <> nil) and (zRhs <> nil) then
-    res := libc_memcmp(zLhs, zRhs, NativeUInt(nCmp))
+    res := CompareByte((zLhs)^, (zRhs)^, NativeUInt(nCmp))
   else
     res := 0;
   if res = 0 then res := nLhs - nRhs;
@@ -7875,14 +7867,14 @@ begin
       blobGrowBuffer(@pNode^.block,
           cint(Fts3_MAX(nRoot, p^.nNodeSize))+FTS3_NODE_PADDING, @rc);
       if rc = SQLITE_OK then begin
-        libc_memcpy(pNode^.block.a, aRoot, NativeUInt(nRoot));
+        Move((aRoot)^, (pNode^.block.a)^, NativeUInt(nRoot));
         pNode^.block.n := nRoot;
-        libc_memset(@pNode^.block.a[nRoot], 0, FTS3_NODE_PADDING);
+        FillChar((@pNode^.block.a[nRoot])^, FTS3_NODE_PADDING, Byte(0));
       end;
 
       i := nHeight;
       while (i >= 0) and (rc = SQLITE_OK) do begin
-        libc_memset(@reader, 0, SizeOf(reader));
+        FillChar((@reader)^, SizeOf(reader), Byte(0));
         pNode := @pWriter^.aNodeWriter[i];
         if pNode^.block.a <> nil then begin
           rc := nodeReaderInit(@reader, pNode^.block.a, pNode^.block.n);
@@ -7891,7 +7883,7 @@ begin
           blobGrowBuffer(@pNode^.key, reader.term.n, @rc);
           if rc = SQLITE_OK then begin
             if reader.term.n > 0 then
-              libc_memcpy(pNode^.key.a, reader.term.a, NativeUInt(reader.term.n));
+              Move((reader.term.a)^, (pNode^.key.a)^, NativeUInt(reader.term.n));
             pNode^.key.n := reader.term.n;
             if i > 0 then begin
               aBlock := nil; nBlock := 0;
@@ -7901,9 +7893,9 @@ begin
               blobGrowBuffer(@pNode^.block,
                   cint(Fts3_MAX(nBlock, p^.nNodeSize))+FTS3_NODE_PADDING, @rc);
               if rc = SQLITE_OK then begin
-                libc_memcpy(pNode^.block.a, aBlock, NativeUInt(nBlock));
+                Move((aBlock)^, (pNode^.block.a)^, NativeUInt(nBlock));
                 pNode^.block.n := nBlock;
-                libc_memset(@pNode^.block.a[nBlock], 0, FTS3_NODE_PADDING);
+                FillChar((@pNode^.block.a[nBlock])^, FTS3_NODE_PADDING, Byte(0));
               end;
               sqlite3_free(aBlock);
             end;
@@ -8230,7 +8222,7 @@ begin
       if aHint <> nil then begin
         blobGrowBuffer(pHint, nHint, @rc);
         if rc = SQLITE_OK then begin
-          if pHint^.a <> nil then libc_memcpy(pHint^.a, aHint, NativeUInt(nHint));
+          if pHint^.a <> nil then Move((aHint)^, (pHint^.a)^, NativeUInt(nHint));
           pHint^.n := nHint;
         end;
       end;
@@ -8339,7 +8331,7 @@ begin
       break;
     end;
 
-    libc_memset(pWriter, 0, NativeUInt(nAlloc));
+    FillChar((pWriter)^, NativeUInt(nAlloc), Byte(0));
     pFilter^.flags := FTS3_SEGMENT_REQUIRE_POS;
 
     if rc = SQLITE_OK then begin
@@ -8505,8 +8497,8 @@ var
 begin
   cksum := 0;
   if pRc^ <> 0 then Exit(0);
-  libc_memset(@filter, 0, SizeOf(filter));
-  libc_memset(@csr, 0, SizeOf(csr));
+  FillChar((@filter)^, SizeOf(filter), Byte(0));
+  FillChar((@csr)^, SizeOf(csr), Byte(0));
   filter.flags := FTS3_SEGMENT_REQUIRE_POS or FTS3_SEGMENT_IGNORE_EMPTY;
   filter.flags := filter.flags or FTS3_SEGMENT_SCAN;
 
@@ -8760,7 +8752,7 @@ begin
             if ((pDef^.iCol >= p^.nColumn) or (pDef^.iCol = i))
               and ((pPT^.bFirst = 0) or (iPos = 0))
               and ((pPT^.n = nToken) or ((pPT^.isPrefix <> 0) and (pPT^.n < nToken)))
-              and (libc_memcmp(zToken, pPT^.z, NativeUInt(pPT^.n)) = 0) then
+              and (CompareByte((zToken)^, (pPT^.z)^, NativeUInt(pPT^.n)) = 0) then
               fts3PendingListAppend(@pDef^.pList, iDocid, i, iPos, @rc);
             pDef := pDef^.pNext;
           end;
@@ -8797,7 +8789,7 @@ begin
   nSkip := sqlite3Fts3GetVarint(p^.pList^.aData, @dummy);
   pnData^ := cint(p^.pList^.nData) - nSkip;
   ppData^ := pRet;
-  libc_memcpy(pRet, @p^.pList^.aData[nSkip], NativeUInt(pnData^));
+  Move((@p^.pList^.aData[nSkip])^, (pRet)^, NativeUInt(pnData^));
   Result := SQLITE_OK;
 end;
 
@@ -8809,7 +8801,7 @@ var
 begin
   pDeferred := PFts3DeferredTokenR(sqlite3_malloc64(u64(SizeOf(TFts3DeferredToken))));
   if pDeferred = nil then Exit(SQLITE_NOMEM);
-  libc_memset(pDeferred, 0, SizeOf(TFts3DeferredToken));
+  FillChar((pDeferred)^, SizeOf(TFts3DeferredToken), Byte(0));
   pDeferred^.pToken := pToken;
   pDeferred^.pNext := pCsr^.pDeferred;
   pDeferred^.iCol := iCol;
@@ -8835,7 +8827,7 @@ begin
       if isEmpty <> 0 then begin
         rc := fts3DeleteAll(p, 1);
         pnChng^ := 0;
-        libc_memset(aSzDel, 0, NativeUInt(SizeOf(cuint) * (p^.nColumn+1) * 2));
+        FillChar((aSzDel)^, NativeUInt(SizeOf(cuint) * (p^.nColumn+1) * 2), Byte(0));
       end else begin
         pnChng^ := pnChng^ - 1;
         if p^.zContentTbl = nil then fts3SqlExec(@rc, p, SQL_DELETE_CONTENT, @pRowid);
@@ -8882,7 +8874,7 @@ begin
     goto update_out;
   end;
   aSzIns := @Pcuint(aSzDel)[p^.nColumn+1];
-  libc_memset(aSzDel, 0, NativeUInt(SizeOf(cuint)*(p^.nColumn+1)*2));
+  FillChar((aSzDel)^, NativeUInt(SizeOf(cuint)*(p^.nColumn+1)*2), Byte(0));
 
   rc := fts3Writelock(p);
   if rc <> SQLITE_OK then goto update_out;
@@ -9269,7 +9261,7 @@ var
   zRet, z: PChar;
   i: cint;
 begin
-  nRet := 2 + sqlite3_int64(libc_strlen(zInput)) * 2 + 1;
+  nRet := 2 + sqlite3_int64(StrLen(zInput)) * 2 + 1;
   zRet := PChar(sqlite3_malloc64(u64(nRet)));
   if zRet <> nil then begin
     z := zRet;
@@ -9402,7 +9394,7 @@ begin
   aIndex := PFts3Index(sqlite3_malloc64(u64(SizeOf(TFts3Index)) * u64(nIndex)));
   apIndex^ := aIndex;
   if aIndex = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  libc_memset(aIndex, 0, NativeUInt(SizeOf(TFts3Index)) * NativeUInt(nIndex));
+  FillChar((aIndex)^, NativeUInt(SizeOf(TFts3Index)) * NativeUInt(nIndex), Byte(0));
 
   if zParam <> nil then begin
     pp := zParam;
@@ -9453,7 +9445,7 @@ begin
     nCol := sqlite3_column_count(pStmt);
     for i := 0 to nCol - 1 do begin
       zCol := sqlite3_column_name(pStmt, i);
-      nStr := nStr + sqlite3_int64(libc_strlen(zCol)) + 1;
+      nStr := nStr + sqlite3_int64(StrLen(zCol)) + 1;
     end;
     azCol := PPChar(sqlite3_malloc64(u64(SizeOf(PChar)) * u64(nCol) + u64(nStr)));
     if azCol = nil then
@@ -9462,8 +9454,8 @@ begin
       pdst := PChar(@azCol[nCol]);
       for i := 0 to nCol - 1 do begin
         zCol := sqlite3_column_name(pStmt, i);
-        n := cint(libc_strlen(zCol)) + 1;
-        libc_memcpy(pdst, zCol, NativeUInt(n));
+        n := cint(StrLen(zCol)) + 1;
+        Move((zCol)^, (pdst)^, NativeUInt(n));
         azCol[i] := pdst;
         pdst := @pdst[n];
       end;
@@ -9521,17 +9513,17 @@ begin
   zContent := nil; zLanguageid := nil;
   azNotindexed := nil; nNotindexed := 0;
 
-  nDb := cint(libc_strlen(argv[1])) + 1;
-  nName := cint(libc_strlen(argv[2])) + 1;
+  nDb := cint(StrLen(argv[1])) + 1;
+  nName := cint(StrLen(argv[2])) + 1;
 
   nByte := sqlite3_int64(SizeOf(PChar)) * (argc - 2);
   aCol := PPChar(sqlite3_malloc64(u64(nByte)));
   if aCol <> nil then begin
-    libc_memset(aCol, 0, NativeUInt(nByte));
+    FillChar((aCol)^, NativeUInt(nByte), Byte(0));
     azNotindexed := PPChar(sqlite3_malloc64(u64(nByte)));
   end;
   if azNotindexed <> nil then
-    libc_memset(azNotindexed, 0, NativeUInt(nByte));
+    FillChar((azNotindexed)^, NativeUInt(nByte), Byte(0));
   if (aCol = nil) or (azNotindexed = nil) then begin
     rc := SQLITE_NOMEM; goto fts3_init_out;
   end;
@@ -9540,7 +9532,7 @@ begin
   while (rc = SQLITE_OK) and (i < argc) do begin
     z := argv[i];
     if (pTokenizer = nil)
-     and (libc_strlen(z) > 8)
+     and (StrLen(z) > 8)
      and (sqlite3_strnicmp(z, PChar('tokenize'), 8) = 0)
      and (sqlite3Fts3IsIdChar(cchar(z[8])) = 0) then begin
       rc := sqlite3Fts3InitTokenizer(pHash, @z[9], @pTokenizer, pzErr);
@@ -9558,7 +9550,7 @@ begin
         end;
         case iOpt of
           0: begin   { MATCHINFO }
-            if (libc_strlen(zVal) <> 4) or (sqlite3_strnicmp(zVal, PChar('fts3'), 4) <> 0) then begin
+            if (StrLen(zVal) <> 4) or (sqlite3_strnicmp(zVal, PChar('fts3'), 4) <> 0) then begin
               fts3ErrMsg(pzErr, PChar('unrecognized matchinfo: %s'), [zVal]);
               rc := SQLITE_ERROR;
             end;
@@ -9568,8 +9560,8 @@ begin
           2: begin sqlite3_free(zCompress); zCompress := zVal; zVal := nil; end;
           3: begin sqlite3_free(zUncompress); zUncompress := zVal; zVal := nil; end;
           4: begin   { ORDER }
-            if ((libc_strlen(zVal) <> 3) or (sqlite3_strnicmp(zVal, PChar('asc'), 3) <> 0))
-             and ((libc_strlen(zVal) <> 4) or (sqlite3_strnicmp(zVal, PChar('desc'), 4) <> 0)) then begin
+            if ((StrLen(zVal) <> 3) or (sqlite3_strnicmp(zVal, PChar('asc'), 3) <> 0))
+             and ((StrLen(zVal) <> 4) or (sqlite3_strnicmp(zVal, PChar('desc'), 4) <> 0)) then begin
               fts3ErrMsg(pzErr, PChar('unrecognized order: %s'), [zVal]);
               rc := SQLITE_ERROR;
             end;
@@ -9586,7 +9578,7 @@ begin
       end;
     end
     else begin
-      nString := nString + cint(libc_strlen(z)) + 1;
+      nString := nString + cint(StrLen(z)) + 1;
       aCol[nCol] := z; Inc(nCol);
     end;
     Inc(i);
@@ -9633,7 +9625,7 @@ begin
          + nName + nDb + nString;
   p := PFts3Table(sqlite3_malloc64(u64(nByte)));
   if p = nil then begin rc := SQLITE_NOMEM; goto fts3_init_out; end;
-  libc_memset(p, 0, NativeUInt(nByte));
+  FillChar((p)^, NativeUInt(nByte), Byte(0));
   p^.db := db;
   p^.nColumn := nCol;
   p^.nPendingData := 0;
@@ -9652,7 +9644,7 @@ begin
   p^.mxSavepoint := -1;
 
   p^.aIndex := PFts3Index(@p^.azColumn[nCol]);
-  libc_memcpy(p^.aIndex, aIndex, NativeUInt(SizeOf(TFts3Index)) * NativeUInt(nIndex));
+  Move((aIndex)^, (p^.aIndex)^, NativeUInt(SizeOf(TFts3Index)) * NativeUInt(nIndex));
   p^.nIndex := nIndex;
   for i := 0 to nIndex - 1 do
     sqlite3Fts3HashInit(@PFts3Index(@p^.aIndex[i])^.hPending, FTS3_HASH_STRING, 1);
@@ -9660,16 +9652,16 @@ begin
 
   zCsr := PChar(@p^.abNotindexed[nCol]);
   p^.zName := zCsr;
-  libc_memcpy(zCsr, argv[2], NativeUInt(nName));
+  Move((argv[2])^, (zCsr)^, NativeUInt(nName));
   zCsr := @zCsr[nName];
   p^.zDb := zCsr;
-  libc_memcpy(zCsr, argv[1], NativeUInt(nDb));
+  Move((argv[1])^, (zCsr)^, NativeUInt(nDb));
   zCsr := @zCsr[nDb];
 
   for iCol := 0 to nCol - 1 do begin
     n := 0;
     z := sqlite3Fts3NextToken(aCol[iCol], @n);
-    if n > 0 then libc_memcpy(zCsr, z, NativeUInt(n));
+    if n > 0 then Move((z)^, (zCsr)^, NativeUInt(n));
     zCsr[n] := #0;
     fts3Dequote(zCsr);
     p^.azColumn[iCol] := zCsr;
@@ -9677,10 +9669,10 @@ begin
   end;
 
   for iCol := 0 to nCol - 1 do begin
-    n := cint(libc_strlen(p^.azColumn[iCol]));
+    n := cint(StrLen(p^.azColumn[iCol]));
     for i := 0 to nNotindexed - 1 do begin
       zNot := azNotindexed[i];
-      if (zNot <> nil) and (n = cint(libc_strlen(zNot)))
+      if (zNot <> nil) and (n = cint(StrLen(zNot)))
        and (sqlite3_strnicmp(p^.azColumn[iCol], zNot, n) = 0) then begin
         p^.abNotindexed[iCol] := 1;
         sqlite3_free(zNot);
@@ -9863,7 +9855,7 @@ begin
   pCsr := PFts3Cursor(sqlite3_malloc(i32(SizeOf(TFts3Cursor))));
   ppCsr^ := PSqlite3VtabCursor(pCsr);
   if pCsr = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  libc_memset(pCsr, 0, NativeUInt(SizeOf(TFts3Cursor)));
+  FillChar((pCsr)^, NativeUInt(SizeOf(TFts3Cursor)), Byte(0));
   Result := SQLITE_OK;
 end;
 
@@ -9893,8 +9885,7 @@ begin
   sqlite3Fts3MIBufferFree(pCsr^.pMIBuffer);
   pCsr^.pMIBuffer := nil;
   sqlite3Fts3ExprFree(pCsr^.pExpr);
-  libc_memset(PByte(@pCsr^.base) + SizeOf(Tsqlite3_vtab_cursor), 0,
-      NativeUInt(SizeOf(TFts3Cursor) - SizeOf(Tsqlite3_vtab_cursor)));
+  FillChar((PByte(@pCsr^.base) + SizeOf(Tsqlite3_vtab_cursor))^, NativeUInt(SizeOf(TFts3Cursor) - SizeOf(Tsqlite3_vtab_cursor)), Byte(0));
 end;
 
 { fts3.c:1789 — fts3CloseMethod. }
@@ -10031,12 +10022,12 @@ begin
       if zNew = nil then begin rc := SQLITE_NOMEM; break; end;
       zBuffer := zNew;
     end;
-    libc_memcpy(@zBuffer[nPrefix], zCsr, NativeUInt(nSuffix));
+    Move((zCsr)^, (@zBuffer[nPrefix])^, NativeUInt(nSuffix));
     nBuffer := nPrefix + nSuffix;
     zCsr := @zCsr[nSuffix];
 
-    if nBuffer > nTerm then cmp := libc_memcmp(zTerm, zBuffer, NativeUInt(nTerm))
-    else cmp := libc_memcmp(zTerm, zBuffer, NativeUInt(nBuffer));
+    if nBuffer > nTerm then cmp := CompareByte((zTerm)^, (zBuffer)^, NativeUInt(nTerm))
+    else cmp := CompareByte((zTerm)^, (zBuffer)^, NativeUInt(nBuffer));
     if (pFirst <> nil) and ((cmp < 0) or ((cmp = 0) and (nBuffer > nTerm))) then begin
       pFirst^ := sqlite3_int64(iChild); pFirst := nil;
     end;
@@ -10120,7 +10111,7 @@ begin
   if pp <> nil then begin
     n := cint(PtrInt(pEnd) - PtrInt(ppPoslist^));
     pdst := pp^;
-    libc_memcpy(pdst, ppPoslist^, NativeUInt(n));
+    Move((ppPoslist^)^, (pdst)^, NativeUInt(n));
     pdst := @pdst[n];
     pp^ := pdst;
   end;
@@ -10143,7 +10134,7 @@ begin
   if pp <> nil then begin
     n := cint(PtrInt(pEnd) - PtrInt(ppPoslist^));
     pdst := pp^;
-    libc_memcpy(pdst, ppPoslist^, NativeUInt(n));
+    Move((ppPoslist^)^, (pdst)^, NativeUInt(n));
     pdst := @pdst[n];
     pp^ := pdst;
   end;
@@ -10427,7 +10418,7 @@ begin
   if rc <> SQLITE_OK then begin
     sqlite3_free(aOut); p := nil; aOut := nil;
   end else
-    libc_memset(@aOut[PtrInt(p) - PtrInt(aOut)], 0, FTS3_BUFFER_PADDING);
+    FillChar((@aOut[PtrInt(p) - PtrInt(aOut)])^, FTS3_BUFFER_PADDING, Byte(0));
   paOut^ := aOut;
   pnOut^ := cint(PtrInt(p) - PtrInt(aOut));
   Result := rc;
@@ -10562,8 +10553,8 @@ begin
     pTS^.aaOutput[0] := PChar(sqlite3_malloc64(u64(sqlite3_int64(nDoclist) + FTS3_VARINT_MAX + 1)));
     pTS^.anOutput[0] := nDoclist;
     if pTS^.aaOutput[0] <> nil then begin
-      libc_memcpy(pTS^.aaOutput[0], aDoclist, NativeUInt(nDoclist));
-      libc_memset(@pTS^.aaOutput[0][nDoclist], 0, FTS3_VARINT_MAX);
+      Move((aDoclist)^, (pTS^.aaOutput[0])^, NativeUInt(nDoclist));
+      FillChar((@pTS^.aaOutput[0][nDoclist])^, FTS3_VARINT_MAX, Byte(0));
     end else begin Result := SQLITE_NOMEM; Exit; end;
   end else begin
     aMerge := aDoclist; nMerge := nDoclist;
@@ -10675,7 +10666,7 @@ function sqlite3Fts3SegReaderCursor(p: PFts3Table; iLangid, iIndex,
   iLevel: cint; const zTerm: PChar; nTerm, isPrefix, isScan: cint;
   pCsr: PFts3MultiSegReader): cint;
 begin
-  libc_memset(pCsr, 0, NativeUInt(SizeOf(TFts3MultiSegReader)));
+  FillChar((pCsr)^, NativeUInt(SizeOf(TFts3MultiSegReader)), Byte(0));
   Result := fts3SegReaderCursorWorker(p, iLangid, iIndex, iLevel,
       zTerm, nTerm, isPrefix, isScan, pCsr);
 end;
@@ -10753,7 +10744,7 @@ var
   filter: TFts3SegFilter;
 begin
   pSegcsr := PFts3MultiSegReader(pTok^.pSegcsr);
-  libc_memset(@tsc, 0, NativeUInt(SizeOf(TTermSelect)));
+  FillChar((@tsc)^, NativeUInt(SizeOf(TTermSelect)), Byte(0));
 
   filter.flags := FTS3_SEGMENT_IGNORE_EMPTY or FTS3_SEGMENT_REQUIRE_POS;
   if pTok^.isPrefix <> 0 then filter.flags := filter.flags or FTS3_SEGMENT_PREFIX;
@@ -11100,7 +11091,7 @@ begin
     if pDL^.pList = nil then bEof := 1;
   end else begin
     bDescDoclist := pCsr^.bDesc;
-    libc_memset(@a, 0, NativeUInt(SizeOf(a)));
+    FillChar((@a)^, NativeUInt(SizeOf(a)), Byte(0));
 
     while bEof = 0 do begin
       bMaxSet := 0; iMax := 0;
@@ -11130,8 +11121,8 @@ begin
         nByte := a[p^.nToken-1].nList;
         aDoclist := PChar(sqlite3_malloc64(u64(sqlite3_int64(nByte) + FTS3_BUFFER_PADDING)));
         if aDoclist = nil then begin Result := SQLITE_NOMEM; Exit; end;
-        libc_memcpy(aDoclist, a[p^.nToken-1].pList, NativeUInt(nByte + 1));
-        libc_memset(@aDoclist[nByte], 0, FTS3_BUFFER_PADDING);
+        Move((a[p^.nToken-1].pList)^, (aDoclist)^, NativeUInt(nByte + 1));
+        FillChar((@aDoclist[nByte])^, FTS3_BUFFER_PADDING, Byte(0));
 
         i := 0;
         while i < (p^.nToken - 1) do begin
@@ -11251,7 +11242,7 @@ begin
   if res <> 0 then begin
     nNew := cint(PtrInt(pOut) - PtrInt(pPhrase^.doclist.pList)) - 1;
     if (nNew >= 0) and (nNew <= pPhrase^.doclist.nList) then begin
-      libc_memset(@pPhrase^.doclist.pList[nNew], 0, NativeUInt(pPhrase^.doclist.nList - nNew));
+      FillChar((@pPhrase^.doclist.pList[nNew])^, NativeUInt(pPhrase^.doclist.nList - nNew), Byte(0));
       pPhrase^.doclist.nList := nNew;
     end;
     paPoslist^ := pPhrase^.doclist.pList;
@@ -11298,14 +11289,14 @@ begin
             if pRight^.pPhrase^.doclist.aAll <> nil then begin
               pDl := @pRight^.pPhrase^.doclist;
               while (pRc^ = SQLITE_OK) and (pRight^.bEof = 0) do begin
-                libc_memset(pDl^.pList, 0, NativeUInt(pDl^.nList));
+                FillChar((pDl^.pList)^, NativeUInt(pDl^.nList), Byte(0));
                 fts3EvalNextRow(pCsr, pRight, pRc);
               end;
             end;
             if (pLeft^.pPhrase <> nil) and (pLeft^.pPhrase^.doclist.aAll <> nil) then begin
               pDl := @pLeft^.pPhrase^.doclist;
               while (pRc^ = SQLITE_OK) and (pLeft^.bEof = 0) do begin
-                libc_memset(pDl^.pList, 0, NativeUInt(pDl^.nList));
+                FillChar((pDl^.pList)^, NativeUInt(pDl^.nList), Byte(0));
                 fts3EvalNextRow(pCsr, pLeft, pRc);
               end;
             end;
@@ -11877,7 +11868,7 @@ begin
     pExpr^.aMI := Pcuint(sqlite3_malloc64(u64(pTab^.nColumn * 3 * SizeOf(u32))));
     if pExpr^.aMI = nil then Exit(SQLITE_NOMEM);
   end;
-  libc_memset(pExpr^.aMI, 0, NativeUInt(pTab^.nColumn * 3 * SizeOf(u32)));
+  FillChar((pExpr^.aMI)^, NativeUInt(pTab^.nColumn * 3 * SizeOf(u32)), Byte(0));
   Result := SQLITE_OK;
 end;
 
@@ -12279,7 +12270,7 @@ var
   nByte, nStr: sqlite3_int64;
 begin
   nByte := SizeOf(u32) * (2*sqlite3_int64(nElem) + 1) + SZ_MATCHINFOBUFFER(1);
-  nStr := sqlite3_int64(libc_strlen(zMatchinfo));
+  nStr := sqlite3_int64(StrLen(zMatchinfo));
 
   pRet := PMatchinfoBufferR(sqlite3Fts3MallocZero(nByte + nStr + 1));
   if pRet <> nil then begin
@@ -12287,7 +12278,7 @@ begin
     MIBufAMI(pRet)[1+nElem] := MIBufAMI(pRet)[0] + SizeOf(u32)*(cint(nElem)+1);
     pRet^.nElem := cint(nElem);
     pRet^.zMatchinfo := @(PChar(pRet))[nByte];
-    libc_memcpy(pRet^.zMatchinfo, zMatchinfo, NativeUInt(nStr+1));
+    Move((zMatchinfo)^, (pRet^.zMatchinfo)^, NativeUInt(nStr+1));
     pRet^.aRef[0] := 1;
   end;
   Result := pRet;
@@ -12332,7 +12323,7 @@ begin
     if aOut <> nil then begin
       xRet := @sqlite3_free;
       if p^.bGlobal <> 0 then
-        libc_memcpy(aOut, @MIBufAMI(p)[1], NativeUInt(p^.nElem)*SizeOf(u32));
+        Move((@MIBufAMI(p)[1])^, (aOut)^, NativeUInt(p^.nElem)*SizeOf(u32));
     end;
   end;
 
@@ -12344,8 +12335,7 @@ end;
 procedure fts3MIBufferSetGlobal(p: PMatchinfoBufferR);
 begin
   p^.bGlobal := 1;
-  libc_memcpy(@MIBufAMI(p)[2+p^.nElem], @MIBufAMI(p)[1],
-    NativeUInt(p^.nElem)*SizeOf(u32));
+  Move((@MIBufAMI(p)[1])^, (@MIBufAMI(p)[2+p^.nElem])^, NativeUInt(p^.nElem)*SizeOf(u32));
 end;
 
 { fts3_snippet.c:205..213 — sqlite3Fts3MIBufferFree.  Param typed Pointer to
@@ -12582,7 +12572,7 @@ var
   iPos, iScore: cint;
   mCover, mHighlite: u64;
 begin
-  libc_memset(@sIter, 0, SizeOf(sIter));
+  FillChar((@sIter)^, SizeOf(sIter), Byte(0));
   iBestScore := -1;
 
   rc := fts3ExprLoadDoclists(pCsr, @nList, nil);
@@ -12628,7 +12618,7 @@ var
   nAlloc: sqlite3_int64;
   zNew: PChar;
 begin
-  if nAppend < 0 then nAppend := cint(libc_strlen(zAppend));
+  if nAppend < 0 then nAppend := cint(StrLen(zAppend));
 
   if (pStr^.n + nAppend + 1) >= pStr^.nAlloc then begin
     nAlloc := pStr^.nAlloc + sqlite3_int64(nAppend) + 100;
@@ -12638,7 +12628,7 @@ begin
     pStr^.nAlloc := cint(nAlloc);
   end;
 
-  libc_memcpy(@pStr^.z[pStr^.n], zAppend, NativeUInt(nAppend));
+  Move((zAppend)^, (@pStr^.z[pStr^.n])^, NativeUInt(nAppend));
   pStr^.n := pStr^.n + nAppend;
   pStr^.z[pStr^.n] := #0;
   Result := SQLITE_OK;
@@ -13124,7 +13114,7 @@ begin
       FTS3_MATCHINFO_LHITS_BM, FTS3_MATCHINFO_LHITS:
         begin
           nZero := fts3MatchinfoSize(pInfo, zArg[i]) * SizeOf(u32);
-          libc_memset(pInfo^.aMatchinfo, 0, nZero);
+          FillChar((pInfo^.aMatchinfo)^, nZero, Byte(0));
           rc := fts3ExprLHitGather(pCsr^.pExpr, pInfo);
         end;
 
@@ -13173,7 +13163,7 @@ begin
   aOut := nil;
   xDestroyOut := nil;
 
-  libc_memset(@sInfo, 0, SizeOf(TMatchInfo));
+  FillChar((@sInfo)^, SizeOf(TMatchInfo), Byte(0));
   sInfo.pCursor := pCsr;
   sInfo.nCol := pTab^.nColumn;
 
@@ -13271,10 +13261,10 @@ begin
       iBestScore := -1;
       pFragment := @aSnippet[iSnip];
 
-      libc_memset(pFragment, 0, SizeOf(TSnippetFragment));
+      FillChar((pFragment)^, SizeOf(TSnippetFragment), Byte(0));
 
       for iRead := 0 to pTab^.nColumn - 1 do begin
-        libc_memset(@sF, 0, SizeOf(sF));
+        FillChar((@sF)^, SizeOf(sF), Byte(0));
         iScoreCol := 0;
         if (iCol >= 0) and (iRead <> iCol) then continue;
 
@@ -13380,7 +13370,7 @@ begin
     Exit;
   end;
 
-  libc_memset(@sCtx, 0, SizeOf(sCtx));
+  FillChar((@sCtx)^, SizeOf(sCtx), Byte(0));
 
   rc := fts3ExprLoadDoclists(pCsr, nil, @nToken);
   if rc <> SQLITE_OK then goto offsets_out;
@@ -13840,17 +13830,17 @@ begin
   if (argc <> 4) and (argc <> 5) then goto bad_args;
 
   zDb := argv[1];
-  nDb := cint(libc_strlen(zDb));
+  nDb := cint(StrLen(zDb));
   if argc = 5 then begin
     if (nDb = 4) and (sqlite3_strnicmp(PChar('temp'), zDb, 4) = 0) then begin
       zDb := argv[3];
-      nDb := cint(libc_strlen(zDb));
+      nDb := cint(StrLen(zDb));
       zFts3 := argv[4];
     end else
       goto bad_args;
   end else
     zFts3 := argv[3];
-  nFts3 := cint(libc_strlen(zFts3));
+  nFts3 := cint(StrLen(zFts3));
 
   rc := sqlite3_declare_vtab(db, PAnsiChar(FTS3_AUX_SCHEMA));
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
@@ -13858,7 +13848,7 @@ begin
   nByte := SizeOf(TFts3auxTable) + SizeOf(TFts3Table) + nDb + nFts3 + 2;
   p := PFts3auxTable(sqlite3_malloc64(u64(nByte)));
   if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  libc_memset(p, 0, NativeUInt(nByte));
+  FillChar((p)^, NativeUInt(nByte), Byte(0));
 
   { C: p->pFts3Tab = (Fts3Table *)&p[1]; }
   p^.pFts3Tab := PFts3Table(p + 1);
@@ -13869,8 +13859,8 @@ begin
   p^.pFts3Tab^.db := db;
   p^.pFts3Tab^.nIndex := 1;
 
-  libc_memcpy(p^.pFts3Tab^.zDb, zDb, NativeUInt(nDb));
-  libc_memcpy(p^.pFts3Tab^.zName, zFts3, NativeUInt(nFts3));
+  Move((zDb)^, (p^.pFts3Tab^.zDb)^, NativeUInt(nDb));
+  Move((zFts3)^, (p^.pFts3Tab^.zName)^, NativeUInt(nFts3));
   fts3Dequote(p^.pFts3Tab^.zName);
 
   ppVtab^ := PSqlite3Vtab(@p^.base);
@@ -13992,7 +13982,7 @@ var
 begin
   pCsr := PFts3auxCursor(sqlite3_malloc(i32(SizeOf(TFts3auxCursor))));
   if pCsr = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  libc_memset(pCsr, 0, SizeOf(TFts3auxCursor));
+  FillChar((pCsr)^, SizeOf(TFts3auxCursor), Byte(0));
 
   ppCsr^ := PSqlite3VtabCursor(@pCsr^.base);
   Result := SQLITE_OK;
@@ -14025,8 +14015,7 @@ begin
     aNew := PFts3auxColstatsArray(sqlite3_realloc64(pCsr^.aStat,
         u64(SizeOf(TFts3auxColstats) * sqlite3_int64(nSize))));
     if aNew = nil then begin Result := SQLITE_NOMEM; Exit; end;
-    libc_memset(@aNew^[pCsr^.nStat], 0,
-        NativeUInt(SizeOf(TFts3auxColstats) * (nSize - pCsr^.nStat)));
+    FillChar((@aNew^[pCsr^.nStat])^, NativeUInt(SizeOf(TFts3auxColstats) * (nSize - pCsr^.nStat)), Byte(0));
     pCsr^.aStat := aNew;
     pCsr^.nStat := nSize;
   end;
@@ -14071,7 +14060,7 @@ begin
     if pCsr^.zStop <> nil then begin
       if pCsr^.nStop < pCsr^.csr.nTerm then n := pCsr^.nStop
       else n := pCsr^.csr.nTerm;
-      mc := cint(libc_memcmp(pCsr^.zStop, pCsr^.csr.zTerm, NativeUInt(n)));
+      mc := cint(CompareByte((pCsr^.zStop)^, (pCsr^.csr.zTerm)^, NativeUInt(n)));
       if (mc < 0) or ((mc = 0) and (pCsr^.csr.nTerm > pCsr^.nStop)) then begin
         pCsr^.isEof := 1;
         Result := SQLITE_OK;
@@ -14080,8 +14069,7 @@ begin
     end;
 
     if fts3auxGrowStatArray(pCsr, 2) <> 0 then begin Result := SQLITE_NOMEM; Exit; end;
-    libc_memset(pCsr^.aStat, 0,
-        NativeUInt(SizeOf(TFts3auxColstats) * pCsr^.nStat));
+    FillChar((pCsr^.aStat)^, NativeUInt(SizeOf(TFts3auxColstats) * pCsr^.nStat), Byte(0));
     iCol := 0;
     rc := SQLITE_OK;
 
@@ -14209,8 +14197,7 @@ begin
   sqlite3_free(pCsr^.aStat);
   sqlite3_free(pCsr^.zStop);
   { C: memset(&pCsr->csr, 0, ((u8*)&pCsr[1]) - (u8*)&pCsr->csr); }
-  libc_memset(@pCsr^.csr, 0,
-      SizeOf(TFts3auxCursor) - SizeOf(Tsqlite3_vtab_cursor));
+  FillChar((@pCsr^.csr)^, SizeOf(TFts3auxCursor) - SizeOf(Tsqlite3_vtab_cursor), Byte(0));
 
   pCsr^.filter.flags := FTS3_SEGMENT_REQUIRE_POS or FTS3_SEGMENT_IGNORE_EMPTY;
   if isScan <> 0 then
@@ -14222,7 +14209,7 @@ begin
     if zStr <> nil then begin
       pCsr^.filter.zTerm := PChar(sqlite3PfMprintf(PAnsiChar('%s'), [zStr]));
       if pCsr^.filter.zTerm = nil then begin Result := SQLITE_NOMEM; Exit; end;
-      pCsr^.filter.nTerm := cint(libc_strlen(pCsr^.filter.zTerm));
+      pCsr^.filter.nTerm := cint(StrLen(pCsr^.filter.zTerm));
     end;
   end;
 
@@ -14230,7 +14217,7 @@ begin
     pCsr^.zStop := PChar(sqlite3PfMprintf(PAnsiChar('%s'),
         [PChar(sqlite3_value_text(PPsqlite3_value(apVal)[iLe]))]));
     if pCsr^.zStop = nil then begin Result := SQLITE_NOMEM; Exit; end;
-    pCsr^.nStop := cint(libc_strlen(pCsr^.zStop));
+    pCsr^.nStop := cint(StrLen(pCsr^.zStop));
   end;
 
   if iLangid >= 0 then begin
@@ -14400,9 +14387,9 @@ begin
   end;
 
   zDb := argv[1];
-  nDb := cint(libc_strlen(zDb));
+  nDb := cint(StrLen(zDb));
   zFts3 := argv[3];
-  nFts3 := cint(libc_strlen(zFts3));
+  nFts3 := cint(StrLen(zFts3));
 
   rc := sqlite3_declare_vtab(db, PAnsiChar(FTS3_TERMS_SCHEMA));
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
@@ -14424,8 +14411,8 @@ begin
   p^.pFts3Tab^.nIndex := iIndex + 1;
   p^.iIndex := iIndex;
 
-  libc_memcpy(p^.pFts3Tab^.zDb, zDb, NativeUInt(nDb));
-  libc_memcpy(p^.pFts3Tab^.zName, zFts3, NativeUInt(nFts3));
+  Move((zDb)^, (p^.pFts3Tab^.zDb)^, NativeUInt(nDb));
+  Move((zFts3)^, (p^.pFts3Tab^.zName)^, NativeUInt(nFts3));
   fts3Dequote(p^.pFts3Tab^.zName);
 
   ppVtab^ := PSqlite3Vtab(@p^.base);
@@ -14482,7 +14469,7 @@ var
 begin
   pCsr := PFts3termCursor(sqlite3_malloc(i32(SizeOf(TFts3termCursor))));
   if pCsr = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  libc_memset(pCsr, 0, SizeOf(TFts3termCursor));
+  FillChar((pCsr)^, SizeOf(TFts3termCursor), Byte(0));
 
   ppCsr^ := PSqlite3VtabCursor(@pCsr^.base);
   Result := SQLITE_OK;
@@ -14577,8 +14564,7 @@ begin
   { In case this cursor is being reused, close and zero it. }
   sqlite3Fts3SegReaderFinish(@pCsr^.csr);
   { C: memset(&pCsr->csr, 0, ((u8*)&pCsr[1]) - (u8*)&pCsr->csr); }
-  libc_memset(@pCsr^.csr, 0,
-      SizeOf(TFts3termCursor) - SizeOf(Tsqlite3_vtab_cursor));
+  FillChar((@pCsr^.csr)^, SizeOf(TFts3termCursor) - SizeOf(Tsqlite3_vtab_cursor), Byte(0));
 
   pCsr^.filter.flags := FTS3_SEGMENT_REQUIRE_POS or FTS3_SEGMENT_IGNORE_EMPTY;
   pCsr^.filter.flags := pCsr^.filter.flags or FTS3_SEGMENT_SCAN;

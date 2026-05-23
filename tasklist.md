@@ -180,14 +180,7 @@ FPC porting traps that recur often enough to call out up-front:
         - [X] **6.40.1.o.3.6** conflict/upsert + misc: all demoted with cause (conflict-clause divergence; UPDATE FROM; MATCH-in-join; heavy-sort crash; large int64 docid; count()+MATCH-in-agg; compress= round-trip).
         - [X] **6.40.1.o.3.7** fts3 acceptance-suite chunks: fts3ai/fts3ao/fts3c/fts3d PASS (read_fts3varint + lazy-connect); fts3aj/fts3ak/fts3an/fts3aux1/fts3b demoted with cause.
         - [X] **6.40.1.o.3.8** fts3shared — demoted with the shared-cache deferral cite (SQLITE_OMIT_SHARED_CACHE entirely omitted; see memory `project_uri_shared_cache_lock_stub`). Not attempted, per DoD.
-    - [ ] **6.40.1.p** Replace the following by pascal equivalents - search in the existing code if anything similar has already been done:
-    ```
-function libc_strlen(s: PChar): NativeUInt; cdecl; external 'c' name 'strlen';
-function libc_memcpy(dst, src: Pointer; n: NativeUInt): Pointer; cdecl; external 'c' name 'memcpy';
-procedure libc_memset(dst: Pointer; c: cint; n: NativeUInt); cdecl; external 'c' name 'memset';
-function libc_strncmp(a, b: PChar; n: NativeUInt): cint; cdecl; external 'c' name 'strncmp';
-function libc_memcmp(a, b: Pointer; n: NativeUInt): cint; cdecl; external 'c' name 'memcmp';
-    ```
+    - [X] **6.40.1.p** Replaced 5 libc externals in passqlite3fts3.pas with FPC RTL: strlen→StrLen (34), memcpy→Move w/ arg-flip (49), memset→FillChar (52), memcmp+strncmp→CompareByte (19). Same in TestModuleFts3.pas (strlen/memset/memcmp). strcmp/atoi/qsort kept (out of scope). ExplainParity 1026/0, all TestFts3* PASS, fts3snippet/fts3rank/fts3c PASS.
   - **NOTE:** `fts3_icu.c` (262L) stays unported — oracle lacks `SQLITE_ENABLE_ICU` (see 6.40.2); the `icu` tokenizer arm in `sqlite3Fts3Init` is `#ifdef SQLITE_ENABLE_ICU` and must be omitted to match.
 - [X] **6.40.2** ICU extension — oracle lacks SQLITE_ENABLE_ICU (no icu in pragma_compile_options), so pinned `sqlite_options(icu)=0` + `icu_collations=0` in tester_min.tcl:364; icu.test now skips via its `ifcapable !icu&&!icu_collations` gate (PASS 0/22, no pas-strict regression).
 - [X] **6.40.3** preupdate_hook — HARNESS, not engine: oracle build LACKS `SQLITE_ENABLE_PREUPDATE_HOOK` (verified `pragma_compile_options`), so implementing+enabling it would diverge from the oracle. Faithful fix = skip cleanly to match oracle: bind2/sessionfault already do via upstream `ifcapable !preupdate` (cap pinned 0 in tester_min.tcl); local port preupdate.test had no guard → fixed with a runtime probe `if {[catch {db preupdate count}]} {finish_test;return}` (skips on default lib, runs full 52-subtest assertions on a PREUPDATE=1 lib). preupdate.test FAIL→PASS, promoted pas-soft→pas-strict in STATUS.txt; no pas-strict regression (src/tests/tcl/preupdate.test:55-65).
