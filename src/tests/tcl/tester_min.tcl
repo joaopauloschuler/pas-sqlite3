@@ -878,6 +878,25 @@ proc working_64bit_int {} {
   return 1
 }
 
+# expand_all_sql — upstream tester.tcl:2601..2606.  A diagnostic helper that
+# walks every open prepared statement on $db (via sqlite3_next_stmt) and
+# evaluates sqlite3_expanded_sql on it.  Its result is discarded; call sites
+# (fts3aa.test:264 `expand_all_sql db`) invoke it purely to exercise the
+# expand path after all do_test assertions have run.  The pas-sqlite3 Tcl
+# bridge does not yet register sqlite3_next_stmt / sqlite3_expanded_sql, so
+# the verbatim body would raise "invalid command name".  Mirror the C proc
+# but guard the per-statement work with `catch` so the helper degrades to a
+# no-op on this build while staying forward-compatible once those commands
+# are bridged.  C ref: test/tester.tcl:2601.
+proc expand_all_sql {db} {
+  catch {
+    set stmt ""
+    while {[set stmt [sqlite3_next_stmt $db $stmt]]!=""} {
+      sqlite3_expanded_sql $stmt
+    }
+  }
+}
+
 # permutation — upstream tester.tcl:2329..2333.  Returns the name of the
 # active permutation, or "" for the baseline run.  The full permutation
 # matrix (permutations.test re-runs every test under ~30 build-flag

@@ -5326,6 +5326,23 @@ var
   rc: cint;
 begin
   if pRC^ <> 0 then Exit;
+  { fts3.c:1616/3318 recursive-content protection. The cached maintenance
+    statements in p^.aStmt[] are shared by every operation on this FTS3
+    table.  If a trigger on one of the shadow tables (e.g. AFTER DELETE ON
+    %_content) re-enters FTS3 and reaches fts3SqlExec while the requested
+    statement is still mid-step on an outer frame, that statement is in
+    VDBE_RUN_STATE.  Re-binding/re-stepping it would trip the vdbeUnbind
+    "bind on a busy prepared statement" armor and surface SQLITE_MISUSE.
+    C never reaches that point for this recursive-content class: it rejects
+    recursive use of the table with SQLITE_ERROR ("SQL logic error") via the
+    bLock guard in fts3BestIndexMethod/fts3FilterMethod.  Match C's result
+    code by reporting SQLITE_ERROR for the reentrant-busy statement rather
+    than letting raw SQLITE_MISUSE escape (fts3aa-10.1). }
+  pStmt := p^.aStmt[eStmt];
+  if (pStmt <> nil) and (pStmt^.eVdbeState = VDBE_RUN_STATE) then begin
+    pRC^ := SQLITE_ERROR;
+    Exit;
+  end;
   rc := fts3SqlStmt(p, eStmt, @pStmt, apVal);
   if rc = SQLITE_OK then begin
     sqlite3_step(pStmt);
