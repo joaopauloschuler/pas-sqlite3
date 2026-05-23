@@ -11779,7 +11779,10 @@ begin
   end;
   if (PtrUInt(p) > PtrUInt(pStart)) or ((c = 0) and (PtrUInt(ppPoslist^) > PtrUInt(@p[2]))) then
     p := @p[2];
+  { C: while( *p++ & 0x80 ); — read THEN advance unconditionally; loop ends
+    one byte PAST the first byte without the 0x80 continuation bit set. }
   while (Byte(p^) and $80) <> 0 do Inc(p);
+  Inc(p);
   ppPoslist^ := p;
 end;
 

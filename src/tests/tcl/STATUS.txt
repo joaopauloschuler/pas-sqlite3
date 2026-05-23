@@ -321,7 +321,7 @@ pas-strict	../sqlite3/test/format4.test	-
 pas-strict	../sqlite3/test/fpconv1.test	-
 pas-strict	../sqlite3/test/fts-9fd058691.test	-
 pas-strict	../sqlite3/test/fts3.test	-
-pas-soft	../sqlite3/test/fts3aa.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-soft	../sqlite3/test/fts3aa.test	6.40.1.o.1 fixed order=desc (8.x green); residual 6.1/6.3/6.4 zero/negative rowid content-table read + 10.1 errmsg
 pas-strict	../sqlite3/test/fts3ab.test	-
 pas-strict	../sqlite3/test/fts3ac.test	-
 pas-strict	../sqlite3/test/fts3ad.test	-
@@ -394,7 +394,7 @@ pas-strict	../sqlite3/test/fts3varint.test	-
 pas-strict	../sqlite3/test/fts4aa.test	-
 pas-soft	../sqlite3/test/fts4check.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
 pas-soft	../sqlite3/test/fts4content.test	6.40.1.o residual: FTS3/4 port edge-case fails (segment-engine/eval); see tasklist 6.40.1.o.*
-pas-soft	../sqlite3/test/fts4docid.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-strict	../sqlite3/test/fts4docid.test	-
 pas-soft	../sqlite3/test/fts4growth.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
 pas-soft	../sqlite3/test/fts4growth2.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
 pas-soft	../sqlite3/test/fts4incr.test	6.40.1.o residual: FTS3/4 port edge-case fails (segment-engine/eval); see tasklist 6.40.1.o.*
@@ -637,7 +637,7 @@ pas-strict	../sqlite3/test/orderby3.test	-
 pas-strict	../sqlite3/test/orderby4.test	-
 pas-soft	../sqlite3/test/orderby5.test	9.4.divbug.87
 pas-strict	../sqlite3/test/orderby6.test	-
-pas-soft	../sqlite3/test/orderby7.test	6.40.1.o: fts3 cap flip runs real fts3 MATCH/order arms with port residuals; see 6.40.1.o.1
+pas-soft	../sqlite3/test/orderby7.test	6.40.1.o residual: MATCH 'that twice' AND-phrase merge returns wrong docids (6/7 vs 11/12); not the order=desc path
 pas-strict	../sqlite3/test/orderby8.test	-
 pas-strict	../sqlite3/test/orderby9.test	-
 pas-soft	../sqlite3/test/orderbyA.test	9.4.divbug.87
@@ -906,7 +906,7 @@ pas-strict	../sqlite3/test/tkt-b72787b1.test	-
 pas-soft	../sqlite3/test/tkt-b75a9ca6b0.test	9.4.divbug.62
 pas-strict	../sqlite3/test/tkt-ba7cbfaedc.test	-
 pas-skip	../sqlite3/test/tkt-bd484a090c.test	unswept
-pas-soft	../sqlite3/test/tkt-bdc6bbbb38.test	6.40.1.o: fts3 cap flip exercises order=desc fts4; hits the order=desc doclist residual 6.40.1.o.1
+pas-strict	../sqlite3/test/tkt-bdc6bbbb38.test	-
 pas-strict	../sqlite3/test/tkt-c48d99d690.test	-
 pas-strict	../sqlite3/test/tkt-c694113d5.test	-
 pas-strict	../sqlite3/test/tkt-cbd054fa6b.test	-
