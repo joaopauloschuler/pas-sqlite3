@@ -636,7 +636,8 @@ implementation
 uses
   passqlite3printf,  { Phase 6.9-bis step 11g.1 — sqlite3MPrintf in OP_ParseSchema worker }
   passqlite3dbpage,  { sqlite3DbpageRegister — built-in extension (main.c:3614) }
-  passqlite3dbstat;  { sqlite3DbstatRegister — built-in extension (main.c:3614) }
+  passqlite3dbstat,  { sqlite3DbstatRegister — built-in extension (main.c:3614) }
+  passqlite3fts3;    { sqlite3Fts3Init — minimal tokenizer registry (6.40.1.g) }
 
 { ----------------------------------------------------------------------
   aHardLimit — default per-connection limits (mirrors main.c aHardLimit).
@@ -990,6 +991,17 @@ begin
     sqlite3DbpageRegister(db);
   if db^.mallocFailed = 0 then
     sqlite3DbstatRegister(db);
+  { 6.40.1.g — minimal FTS3 tokenizer registry (down-payment on 6.40.1.o).
+    Installs the `fts3_tokenizer` SQL function(s) — and, under SQLITE_TEST,
+    `fts3_tokenizer_test` / `fts3_tokenizer_internal_test` — backed by a
+    per-connection tokenizer hash preloaded with simple/porter/unicode61.
+    Does NOT register the fts3/fts4/fts3tokenize VTAB modules (those land
+    in 6.40.1.h/.k/.o).  sqlite3Fts3Init returns SQLITE_NOMEM on alloc
+    failure; surface it via mallocFailed so the shared OOM path below
+    handles it like the dbpage/dbstat registrations. }
+  if db^.mallocFailed = 0 then
+    if sqlite3Fts3Init(db) = SQLITE_NOMEM then
+      sqlite3OomFault(db);
   if db^.mallocFailed <> 0 then begin
     sqlite3OomFault(db);
     rc := SQLITE_NOMEM;
