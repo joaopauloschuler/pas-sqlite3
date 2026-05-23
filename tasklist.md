@@ -165,6 +165,14 @@ FPC porting traps that recur often enough to call out up-front:
     - [ ] **6.40.1.m** `fts3_aux.c` (557L) — the `fts4aux` module (`sqlite3Fts3InitAux`); reads segments via `Fts3MultiSegReader`, so depends on 6.40.1.j. Flips `fts4aux` (26). MED.
     - [ ] **6.40.1.n** `fts3_term.c` (383L) — `SQLITE_TEST`-only `fts4term` module (`sqlite3Fts3InitTerm`); also a SegReader consumer. MED.
     - [ ] **6.40.1.o** Wiring: implement `sqlite3Fts3Init` (fts3.c:4102) — alloc the tokenizer-hash wrapper, load simple/porter/unicode61, init term(TEST)/aux/tokenizer-hashtable, `sqlite3_overload_function` snippet/offsets/matchinfo/optimize, `sqlite3_create_module_v2` fts3+fts4+fts3tokenize — and call it from `openDatabase` alongside the existing dbpage/dbstat registration (passqlite3main.pas:990). Re-run build_tcl_lib.sh so the bridge picks it up. Flips the remaining `fts3*`/`fts4*` module-load tests.
+    - [ ] **6.40.1.p** Replace the following by pascal equivalents - search in the existing code if anything similar has already been done:
+    ```
+function libc_strlen(s: PChar): NativeUInt; cdecl; external 'c' name 'strlen';
+function libc_memcpy(dst, src: Pointer; n: NativeUInt): Pointer; cdecl; external 'c' name 'memcpy';
+procedure libc_memset(dst: Pointer; c: cint; n: NativeUInt); cdecl; external 'c' name 'memset';
+function libc_strncmp(a, b: PChar; n: NativeUInt): cint; cdecl; external 'c' name 'strncmp';
+function libc_memcmp(a, b: Pointer; n: NativeUInt): cint; cdecl; external 'c' name 'memcmp';
+  ```
   - **NOTE:** `fts3_icu.c` (262L) stays unported — oracle lacks `SQLITE_ENABLE_ICU` (see 6.40.2); the `icu` tokenizer arm in `sqlite3Fts3Init` is `#ifdef SQLITE_ENABLE_ICU` and must be omitted to match.
 - [X] **6.40.2** ICU extension — oracle lacks SQLITE_ENABLE_ICU (no icu in pragma_compile_options), so pinned `sqlite_options(icu)=0` + `icu_collations=0` in tester_min.tcl:364; icu.test now skips via its `ifcapable !icu&&!icu_collations` gate (PASS 0/22, no pas-strict regression).
 - [X] **6.40.3** preupdate_hook — HARNESS, not engine: oracle build LACKS `SQLITE_ENABLE_PREUPDATE_HOOK` (verified `pragma_compile_options`), so implementing+enabling it would diverge from the oracle. Faithful fix = skip cleanly to match oracle: bind2/sessionfault already do via upstream `ifcapable !preupdate` (cap pinned 0 in tester_min.tcl); local port preupdate.test had no guard → fixed with a runtime probe `if {[catch {db preupdate count}]} {finish_test;return}` (skips on default lib, runs full 52-subtest assertions on a PREUPDATE=1 lib). preupdate.test FAIL→PASS, promoted pas-soft→pas-strict in STATUS.txt; no pas-strict regression (src/tests/tcl/preupdate.test:55-65).
