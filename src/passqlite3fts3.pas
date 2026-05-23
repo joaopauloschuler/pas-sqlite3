@@ -210,6 +210,19 @@ procedure sqlite3Fts3SimpleTokenizerModule(ppModule: PPsqlite3_tokenizer_module)
 { --------------------------------------------------------------------- }
 procedure sqlite3Fts3PorterTokenizerModule(ppModule: PPsqlite3_tokenizer_module);
 
+{ --------------------------------------------------------------------- }
+{ 6.40.1.e — fts3_unicode2.c — Unicode codepoint classification.         }
+{ --------------------------------------------------------------------- }
+function sqlite3FtsUnicodeIsalnum(c: cint): cint;
+function sqlite3FtsUnicodeIsdiacritic(c: cint): cint;
+function sqlite3FtsUnicodeFold(c: cint; eRemoveDiacritic: cint): cint;
+
+{ --------------------------------------------------------------------- }
+{ 6.40.1.f — fts3_unicode.c:383..394 — the "unicode61" tokenizer module  }
+{ entry point.                                                           }
+{ --------------------------------------------------------------------- }
+procedure sqlite3Fts3UnicodeTokenizer(ppModule: PPsqlite3_tokenizer_module);
+
 implementation
 
 { libc bindings (match the amatch/fuzzer pattern; avoids depending on a
@@ -1329,6 +1342,708 @@ const
 procedure sqlite3Fts3PorterTokenizerModule(ppModule: PPsqlite3_tokenizer_module);
 begin
   ppModule^ := @porterTokenizerModule;
+end;
+
+{ ===================================================================== }
+{ 6.40.1.e — fts3_unicode2.c — auto-generated Unicode category data.     }
+{ DO NOT EDIT the tables: ported verbatim from the machine-generated C.  }
+{ ===================================================================== }
+
+{ fts3_unicode2.c:30..151 — sqlite3FtsUnicodeIsalnum.
+  Return true if the argument corresponds to a unicode codepoint
+  classified as either a letter or a number; otherwise false. }
+function sqlite3FtsUnicodeIsalnum(c: cint): cint;
+const
+  { fts3_unicode2.c:42..125 — aEntry[].  Each value ((C<<22)+N) represents a
+    range of N codepoints (that are NOT letters/numbers) starting at C. }
+  aEntry: array[0..405] of cuint = (
+    $00000030, $0000E807, $00016C06, $0001EC2F, $0002AC07,
+    $0002D001, $0002D803, $0002EC01, $0002FC01, $00035C01,
+    $0003DC01, $000B0804, $000B480E, $000B9407, $000BB401,
+    $000BBC81, $000DD401, $000DF801, $000E1002, $000E1C01,
+    $000FD801, $00120808, $00156806, $00162402, $00163C01,
+    $00164437, $0017CC02, $00180005, $00181816, $00187802,
+    $00192C15, $0019A804, $0019C001, $001B5001, $001B580F,
+    $001B9C07, $001BF402, $001C000E, $001C3C01, $001C4401,
+    $001CC01B, $001E980B, $001FAC09, $001FD804, $00205804,
+    $00206C09, $00209403, $0020A405, $0020C00F, $00216403,
+    $00217801, $0023901B, $00240004, $0024E803, $0024F812,
+    $00254407, $00258804, $0025C001, $00260403, $0026F001,
+    $0026F807, $00271C02, $00272C03, $00275C01, $00278802,
+    $0027C802, $0027E802, $00280403, $0028F001, $0028F805,
+    $00291C02, $00292C03, $00294401, $0029C002, $0029D401,
+    $002A0403, $002AF001, $002AF808, $002B1C03, $002B2C03,
+    $002B8802, $002BC002, $002C0403, $002CF001, $002CF807,
+    $002D1C02, $002D2C03, $002D5802, $002D8802, $002DC001,
+    $002E0801, $002EF805, $002F1803, $002F2804, $002F5C01,
+    $002FCC08, $00300403, $0030F807, $00311803, $00312804,
+    $00315402, $00318802, $0031FC01, $00320802, $0032F001,
+    $0032F807, $00331803, $00332804, $00335402, $00338802,
+    $00340802, $0034F807, $00351803, $00352804, $00355C01,
+    $00358802, $0035E401, $00360802, $00372801, $00373C06,
+    $00375801, $00376008, $0037C803, $0038C401, $0038D007,
+    $0038FC01, $00391C09, $00396802, $003AC401, $003AD006,
+    $003AEC02, $003B2006, $003C041F, $003CD00C, $003DC417,
+    $003E340B, $003E6424, $003EF80F, $003F380D, $0040AC14,
+    $00412806, $00415804, $00417803, $00418803, $00419C07,
+    $0041C404, $0042080C, $00423C01, $00426806, $0043EC01,
+    $004D740C, $004E400A, $00500001, $0059B402, $005A0001,
+    $005A6C02, $005BAC03, $005C4803, $005CC805, $005D4802,
+    $005DC802, $005ED023, $005F6004, $005F7401, $0060000F,
+    $0062A401, $0064800C, $0064C00C, $00650001, $00651002,
+    $0066C011, $00672002, $00677822, $00685C05, $00687802,
+    $0069540A, $0069801D, $0069FC01, $006A8007, $006AA006,
+    $006C0005, $006CD011, $006D6823, $006E0003, $006E840D,
+    $006F980E, $006FF004, $00709014, $0070EC05, $0071F802,
+    $00730008, $00734019, $0073B401, $0073C803, $00770027,
+    $0077F004, $007EF401, $007EFC03, $007F3403, $007F7403,
+    $007FB403, $007FF402, $00800065, $0081A806, $0081E805,
+    $00822805, $0082801A, $00834021, $00840002, $00840C04,
+    $00842002, $00845001, $00845803, $00847806, $00849401,
+    $00849C01, $0084A401, $0084B801, $0084E802, $00850005,
+    $00852804, $00853C01, $00864264, $00900027, $0091000B,
+    $0092704E, $00940200, $009C0475, $009E53B9, $00AD400A,
+    $00B39406, $00B3BC03, $00B3E404, $00B3F802, $00B5C001,
+    $00B5FC01, $00B7804F, $00B8C00C, $00BA001A, $00BA6C59,
+    $00BC00D6, $00BFC00C, $00C00005, $00C02019, $00C0A807,
+    $00C0D802, $00C0F403, $00C26404, $00C28001, $00C3EC01,
+    $00C64002, $00C6580A, $00C70024, $00C8001F, $00C8A81E,
+    $00C94001, $00C98020, $00CA2827, $00CB003F, $00CC0100,
+    $01370040, $02924037, $0293F802, $02983403, $0299BC10,
+    $029A7C01, $029BC008, $029C0017, $029C8002, $029E2402,
+    $02A00801, $02A01801, $02A02C01, $02A08C09, $02A0D804,
+    $02A1D004, $02A20002, $02A2D011, $02A33802, $02A38012,
+    $02A3E003, $02A4980A, $02A51C0D, $02A57C01, $02A60004,
+    $02A6CC1B, $02A77802, $02A8A40E, $02A90C01, $02A93002,
+    $02A97004, $02A9DC03, $02A9EC01, $02AAC001, $02AAC803,
+    $02AADC02, $02AAF802, $02AB0401, $02AB7802, $02ABAC07,
+    $02ABD402, $02AF8C0B, $03600001, $036DFC02, $036FFC02,
+    $037FFC01, $03EC7801, $03ECA401, $03EEC810, $03F4F802,
+    $03F7F002, $03F8001A, $03F88007, $03F8C023, $03F95013,
+    $03F9A004, $03FBFC01, $03FC040F, $03FC6807, $03FCEC06,
+    $03FD6C0B, $03FF8007, $03FFA007, $03FFE405, $04040003,
+    $0404DC09, $0405E411, $0406400C, $0407402E, $040E7C01,
+    $040F4001, $04215C01, $04247C01, $0424FC01, $04280403,
+    $04281402, $04283004, $0428E003, $0428FC01, $04294009,
+    $0429FC01, $042CE407, $04400003, $0440E016, $04420003,
+    $0442C012, $04440003, $04449C0E, $04450004, $04460003,
+    $0446CC0E, $04471404, $045AAC0D, $0491C004, $05BD442E,
+    $05BE3C04, $074000F6, $07440027, $0744A4B5, $07480046,
+    $074C0057, $075B0401, $075B6C01, $075BEC01, $075C5401,
+    $075CD401, $075D3C01, $075DBC01, $075E2401, $075EA401,
+    $075F0C01, $07BBC002, $07C0002C, $07C0C064, $07C2800F,
+    $07C2C40E, $07C3040F, $07C3440F, $07C4401F, $07C4C03C,
+    $07C5C02B, $07C7981D, $07C8402B, $07C90009, $07C94002,
+    $07CC0021, $07CCC006, $07CCDC46, $07CE0014, $07CE8025,
+    $07CF1805, $07CF8011, $07D0003F, $07D10001, $07D108B6,
+    $07D3E404, $07D4003E, $07D50004, $07D54018, $07D7EC46,
+    $07D9140B, $07DA0046, $07DC0074, $38000401, $38008060,
+    $380400F0
+  );
+  { fts3_unicode2.c:126..128 — aAscii[4]. }
+  aAscii: array[0..3] of cuint = (
+    $FFFFFFFF, $FC00FFFF, $F8000001, $F8000001
+  );
+var
+  key: cuint;
+  iRes, iHi, iLo, iTest: cint;
+begin
+  if cuint(c) < 128 then begin
+    if (aAscii[c shr 5] and (cuint(1) shl (c and $001F))) = 0 then
+      Result := 1
+    else
+      Result := 0;
+    Exit;
+  end else if cuint(c) < (1 shl 22) then begin
+    key := (cuint(c) shl 10) or $000003FF;
+    iRes := 0;
+    iHi := (SizeOf(aEntry) div SizeOf(aEntry[0])) - 1;
+    iLo := 0;
+    while iHi >= iLo do begin
+      iTest := (iHi + iLo) div 2;
+      if key >= aEntry[iTest] then begin
+        iRes := iTest;
+        iLo := iTest + 1;
+      end else
+        iHi := iTest - 1;
+    end;
+    Assert(aEntry[0] < key);
+    Assert(key >= aEntry[iRes]);
+    if cuint(c) >= ((aEntry[iRes] shr 10) + (aEntry[iRes] and $3FF)) then
+      Result := 1
+    else
+      Result := 0;
+    Exit;
+  end;
+  Result := 1;
+end;
+
+{ fts3_unicode2.c:162..222 — remove_diacritic. }
+function remove_diacritic(c: cint; bComplex: cint): cint;
+const
+  { fts3_unicode2.c:163..180 — aDia[].  Unsigned 16-bit. }
+  aDia: array[0..125] of cushort = (
+        0,  1797,  1848,  1859,  1891,  1928,  1940,  1995,
+     2024,  2040,  2060,  2110,  2168,  2206,  2264,  2286,
+     2344,  2383,  2472,  2488,  2516,  2596,  2668,  2732,
+     2782,  2842,  2894,  2954,  2984,  3000,  3028,  3336,
+     3456,  3696,  3712,  3728,  3744,  3766,  3832,  3896,
+     3912,  3928,  3944,  3968,  4008,  4040,  4056,  4106,
+     4138,  4170,  4202,  4234,  4266,  4296,  4312,  4344,
+     4408,  4424,  4442,  4472,  4488,  4504,  6148,  6198,
+     6264,  6280,  6360,  6429,  6505,  6529, 61448, 61468,
+    61512, 61534, 61592, 61610, 61642, 61672, 61688, 61704,
+    61726, 61784, 61800, 61816, 61836, 61880, 61896, 61914,
+    61948, 61998, 62062, 62122, 62154, 62184, 62200, 62218,
+    62252, 62302, 62364, 62410, 62442, 62478, 62536, 62554,
+    62584, 62604, 62640, 62648, 62656, 62664, 62730, 62766,
+    62830, 62890, 62924, 62974, 63032, 63050, 63082, 63118,
+    63182, 63242, 63274, 63310, 63368, 63390
+  );
+  { fts3_unicode2.c:181 — #define HIBIT ((unsigned char)0x80) }
+  HIBIT = $80;
+  { fts3_unicode2.c:182..204 — aChar[].  ASCII letter (low 7 bits) plus the
+    HIBIT "complex" flag for codepoints only folded when bComplex!=0. }
+  aChar: array[0..125] of cuchar = (
+    Ord(#0),         Ord('a'),        Ord('c'),        Ord('e'),
+    Ord('i'),        Ord('n'),
+    Ord('o'),        Ord('u'),        Ord('y'),        Ord('y'),
+    Ord('a'),        Ord('c'),
+    Ord('d'),        Ord('e'),        Ord('e'),        Ord('g'),
+    Ord('h'),        Ord('i'),
+    Ord('j'),        Ord('k'),        Ord('l'),        Ord('n'),
+    Ord('o'),        Ord('r'),
+    Ord('s'),        Ord('t'),        Ord('u'),        Ord('u'),
+    Ord('w'),        Ord('y'),
+    Ord('z'),        Ord('o'),        Ord('u'),        Ord('a'),
+    Ord('i'),        Ord('o'),
+    Ord('u'),        Ord('u') or HIBIT, Ord('a') or HIBIT, Ord('g'),
+    Ord('k'),        Ord('o'),
+    Ord('o') or HIBIT, Ord('j'),      Ord('g'),        Ord('n'),
+    Ord('a') or HIBIT, Ord('a'),
+    Ord('e'),        Ord('i'),        Ord('o'),        Ord('r'),
+    Ord('u'),        Ord('s'),
+    Ord('t'),        Ord('h'),        Ord('a'),        Ord('e'),
+    Ord('o') or HIBIT, Ord('o'),
+    Ord('o') or HIBIT, Ord('y'),      Ord(#0),         Ord(#0),
+    Ord(#0),         Ord(#0),
+    Ord(#0),         Ord(#0),         Ord(#0),         Ord(#0),
+    Ord('a'),        Ord('b'),
+    Ord('c') or HIBIT, Ord('d'),      Ord('d'),        Ord('e') or HIBIT,
+    Ord('e'),        Ord('e') or HIBIT,
+    Ord('f'),        Ord('g'),        Ord('h'),        Ord('h'),
+    Ord('i'),        Ord('i') or HIBIT,
+    Ord('k'),        Ord('l'),        Ord('l') or HIBIT, Ord('l'),
+    Ord('m'),        Ord('n'),
+    Ord('o') or HIBIT, Ord('p'),      Ord('r'),        Ord('r') or HIBIT,
+    Ord('r'),        Ord('s'),
+    Ord('s') or HIBIT, Ord('t'),      Ord('u'),        Ord('u') or HIBIT,
+    Ord('v'),        Ord('w'),
+    Ord('w'),        Ord('x'),        Ord('y'),        Ord('z'),
+    Ord('h'),        Ord('t'),
+    Ord('w'),        Ord('y'),        Ord('a'),        Ord('a') or HIBIT,
+    Ord('a') or HIBIT, Ord('a') or HIBIT,
+    Ord('e'),        Ord('e') or HIBIT, Ord('e') or HIBIT, Ord('i'),
+    Ord('o'),        Ord('o') or HIBIT,
+    Ord('o') or HIBIT, Ord('o') or HIBIT, Ord('u'),     Ord('u') or HIBIT,
+    Ord('u') or HIBIT, Ord('y')
+  );
+var
+  key: cuint;
+  iRes, iHi, iLo, iTest: cint;
+begin
+  key := (cuint(c) shl 3) or $00000007;
+  iRes := 0;
+  iHi := (SizeOf(aDia) div SizeOf(aDia[0])) - 1;
+  iLo := 0;
+  while iHi >= iLo do begin
+    iTest := (iHi + iLo) div 2;
+    if key >= aDia[iTest] then begin
+      iRes := iTest;
+      iLo := iTest + 1;
+    end else
+      iHi := iTest - 1;
+  end;
+  Assert(key >= aDia[iRes]);
+  if (bComplex = 0) and ((aChar[iRes] and $80) <> 0) then Exit(c);
+  if cuint(c) > ((aDia[iRes] shr 3) + (aDia[iRes] and $07)) then
+    Result := c
+  else
+    Result := cint(aChar[iRes]) and $7F;
+end;
+
+{ fts3_unicode2.c:229..236 — sqlite3FtsUnicodeIsdiacritic. }
+function sqlite3FtsUnicodeIsdiacritic(c: cint): cint;
+var
+  mask0, mask1: cuint;
+begin
+  mask0 := $08029FDF;
+  mask1 := $000361F8;
+  if (c < 768) or (c > 817) then Exit(0);
+  if c < 768 + 32 then
+    Result := cint(mask0 and (cuint(1) shl (c - 768)))
+  else
+    Result := cint(mask1 and (cuint(1) shl (c - 768 - 32)));
+end;
+
+type
+  { fts3_unicode2.c:266..270 — struct TableEntry. }
+  TFtsUFoldEntry = record
+    iCode  : cushort;
+    flags  : cuchar;
+    nRange : cuchar;
+  end;
+
+{ fts3_unicode2.c:248..381 — sqlite3FtsUnicodeFold. }
+function sqlite3FtsUnicodeFold(c: cint; eRemoveDiacritic: cint): cint;
+const
+  { fts3_unicode2.c:271..326 — aEntry[] (TableEntry).  Verbatim. }
+  aEntry: array[0..162] of TFtsUFoldEntry = (
+    (iCode:65;    flags:14;  nRange:26),  (iCode:181;   flags:64;  nRange:1),  (iCode:192;   flags:14;  nRange:23),
+    (iCode:216;   flags:14;  nRange:7),   (iCode:256;   flags:1;   nRange:48), (iCode:306;   flags:1;   nRange:6),
+    (iCode:313;   flags:1;   nRange:16),  (iCode:330;   flags:1;   nRange:46), (iCode:376;   flags:116; nRange:1),
+    (iCode:377;   flags:1;   nRange:6),   (iCode:383;   flags:104; nRange:1),  (iCode:385;   flags:50;  nRange:1),
+    (iCode:386;   flags:1;   nRange:4),   (iCode:390;   flags:44;  nRange:1),  (iCode:391;   flags:0;   nRange:1),
+    (iCode:393;   flags:42;  nRange:2),   (iCode:395;   flags:0;   nRange:1),  (iCode:398;   flags:32;  nRange:1),
+    (iCode:399;   flags:38;  nRange:1),   (iCode:400;   flags:40;  nRange:1),  (iCode:401;   flags:0;   nRange:1),
+    (iCode:403;   flags:42;  nRange:1),   (iCode:404;   flags:46;  nRange:1),  (iCode:406;   flags:52;  nRange:1),
+    (iCode:407;   flags:48;  nRange:1),   (iCode:408;   flags:0;   nRange:1),  (iCode:412;   flags:52;  nRange:1),
+    (iCode:413;   flags:54;  nRange:1),   (iCode:415;   flags:56;  nRange:1),  (iCode:416;   flags:1;   nRange:6),
+    (iCode:422;   flags:60;  nRange:1),   (iCode:423;   flags:0;   nRange:1),  (iCode:425;   flags:60;  nRange:1),
+    (iCode:428;   flags:0;   nRange:1),   (iCode:430;   flags:60;  nRange:1),  (iCode:431;   flags:0;   nRange:1),
+    (iCode:433;   flags:58;  nRange:2),   (iCode:435;   flags:1;   nRange:4),  (iCode:439;   flags:62;  nRange:1),
+    (iCode:440;   flags:0;   nRange:1),   (iCode:444;   flags:0;   nRange:1),  (iCode:452;   flags:2;   nRange:1),
+    (iCode:453;   flags:0;   nRange:1),   (iCode:455;   flags:2;   nRange:1),  (iCode:456;   flags:0;   nRange:1),
+    (iCode:458;   flags:2;   nRange:1),   (iCode:459;   flags:1;   nRange:18), (iCode:478;   flags:1;   nRange:18),
+    (iCode:497;   flags:2;   nRange:1),   (iCode:498;   flags:1;   nRange:4),  (iCode:502;   flags:122; nRange:1),
+    (iCode:503;   flags:134; nRange:1),   (iCode:504;   flags:1;   nRange:40), (iCode:544;   flags:110; nRange:1),
+    (iCode:546;   flags:1;   nRange:18),  (iCode:570;   flags:70;  nRange:1),  (iCode:571;   flags:0;   nRange:1),
+    (iCode:573;   flags:108; nRange:1),   (iCode:574;   flags:68;  nRange:1),  (iCode:577;   flags:0;   nRange:1),
+    (iCode:579;   flags:106; nRange:1),   (iCode:580;   flags:28;  nRange:1),  (iCode:581;   flags:30;  nRange:1),
+    (iCode:582;   flags:1;   nRange:10),  (iCode:837;   flags:36;  nRange:1),  (iCode:880;   flags:1;   nRange:4),
+    (iCode:886;   flags:0;   nRange:1),   (iCode:902;   flags:18;  nRange:1),  (iCode:904;   flags:16;  nRange:3),
+    (iCode:908;   flags:26;  nRange:1),   (iCode:910;   flags:24;  nRange:2),  (iCode:913;   flags:14;  nRange:17),
+    (iCode:931;   flags:14;  nRange:9),   (iCode:962;   flags:0;   nRange:1),  (iCode:975;   flags:4;   nRange:1),
+    (iCode:976;   flags:140; nRange:1),   (iCode:977;   flags:142; nRange:1),  (iCode:981;   flags:146; nRange:1),
+    (iCode:982;   flags:144; nRange:1),   (iCode:984;   flags:1;   nRange:24), (iCode:1008;  flags:136; nRange:1),
+    (iCode:1009;  flags:138; nRange:1),   (iCode:1012;  flags:130; nRange:1),  (iCode:1013;  flags:128; nRange:1),
+    (iCode:1015;  flags:0;   nRange:1),   (iCode:1017;  flags:152; nRange:1),  (iCode:1018;  flags:0;   nRange:1),
+    (iCode:1021;  flags:110; nRange:3),   (iCode:1024;  flags:34;  nRange:16), (iCode:1040;  flags:14;  nRange:32),
+    (iCode:1120;  flags:1;   nRange:34),  (iCode:1162;  flags:1;   nRange:54), (iCode:1216;  flags:6;   nRange:1),
+    (iCode:1217;  flags:1;   nRange:14),  (iCode:1232;  flags:1;   nRange:88), (iCode:1329;  flags:22;  nRange:38),
+    (iCode:4256;  flags:66;  nRange:38),  (iCode:4295;  flags:66;  nRange:1),  (iCode:4301;  flags:66;  nRange:1),
+    (iCode:7680;  flags:1;   nRange:150), (iCode:7835;  flags:132; nRange:1),  (iCode:7838;  flags:96;  nRange:1),
+    (iCode:7840;  flags:1;   nRange:96),  (iCode:7944;  flags:150; nRange:8),  (iCode:7960;  flags:150; nRange:6),
+    (iCode:7976;  flags:150; nRange:8),   (iCode:7992;  flags:150; nRange:8),  (iCode:8008;  flags:150; nRange:6),
+    (iCode:8025;  flags:151; nRange:8),   (iCode:8040;  flags:150; nRange:8),  (iCode:8072;  flags:150; nRange:8),
+    (iCode:8088;  flags:150; nRange:8),   (iCode:8104;  flags:150; nRange:8),  (iCode:8120;  flags:150; nRange:2),
+    (iCode:8122;  flags:126; nRange:2),   (iCode:8124;  flags:148; nRange:1),  (iCode:8126;  flags:100; nRange:1),
+    (iCode:8136;  flags:124; nRange:4),   (iCode:8140;  flags:148; nRange:1),  (iCode:8152;  flags:150; nRange:2),
+    (iCode:8154;  flags:120; nRange:2),   (iCode:8168;  flags:150; nRange:2),  (iCode:8170;  flags:118; nRange:2),
+    (iCode:8172;  flags:152; nRange:1),   (iCode:8184;  flags:112; nRange:2),  (iCode:8186;  flags:114; nRange:2),
+    (iCode:8188;  flags:148; nRange:1),   (iCode:8486;  flags:98;  nRange:1),  (iCode:8490;  flags:92;  nRange:1),
+    (iCode:8491;  flags:94;  nRange:1),   (iCode:8498;  flags:12;  nRange:1),  (iCode:8544;  flags:8;   nRange:16),
+    (iCode:8579;  flags:0;   nRange:1),   (iCode:9398;  flags:10;  nRange:26), (iCode:11264; flags:22;  nRange:47),
+    (iCode:11360; flags:0;   nRange:1),   (iCode:11362; flags:88;  nRange:1),  (iCode:11363; flags:102; nRange:1),
+    (iCode:11364; flags:90;  nRange:1),   (iCode:11367; flags:1;   nRange:6),  (iCode:11373; flags:84;  nRange:1),
+    (iCode:11374; flags:86;  nRange:1),   (iCode:11375; flags:80;  nRange:1),  (iCode:11376; flags:82;  nRange:1),
+    (iCode:11378; flags:0;   nRange:1),   (iCode:11381; flags:0;   nRange:1),  (iCode:11390; flags:78;  nRange:2),
+    (iCode:11392; flags:1;   nRange:100), (iCode:11499; flags:1;   nRange:4),  (iCode:11506; flags:0;   nRange:1),
+    (iCode:42560; flags:1;   nRange:46),  (iCode:42624; flags:1;   nRange:24), (iCode:42786; flags:1;   nRange:14),
+    (iCode:42802; flags:1;   nRange:62),  (iCode:42873; flags:1;   nRange:4),  (iCode:42877; flags:76;  nRange:1),
+    (iCode:42878; flags:1;   nRange:10),  (iCode:42891; flags:0;   nRange:1),  (iCode:42893; flags:74;  nRange:1),
+    (iCode:42896; flags:1;   nRange:4),   (iCode:42912; flags:1;   nRange:10), (iCode:42922; flags:72;  nRange:1),
+    (iCode:65313; flags:14;  nRange:26)
+  );
+  { fts3_unicode2.c:327..338 — aiOff[].  Unsigned 16-bit. }
+  aiOff: array[0..76] of cushort = (
+    1,     2,     8,     15,    16,    26,    28,    32,
+    37,    38,    40,    48,    63,    64,    69,    71,
+    79,    80,    116,   202,   203,   205,   206,   207,
+    209,   210,   211,   213,   214,   217,   218,   219,
+    775,   7264,  10792, 10795, 23228, 23256, 30204, 54721,
+    54753, 54754, 54756, 54787, 54793, 54809, 57153, 57274,
+    57921, 58019, 58363, 61722, 65268, 65341, 65373, 65406,
+    65408, 65410, 65415, 65424, 65436, 65439, 65450, 65462,
+    65472, 65476, 65478, 65480, 65482, 65488, 65506, 65511,
+    65514, 65521, 65527, 65528, 65529
+  );
+var
+  ret: cint;
+  p: ^TFtsUFoldEntry;
+  iHi, iLo, iRes, iTest, cmp: cint;
+begin
+  ret := c;
+  if c < 128 then begin
+    if (c >= Ord('A')) and (c <= Ord('Z')) then
+      ret := c + (Ord('a') - Ord('A'));
+  end else if c < 65536 then begin
+    iHi := (SizeOf(aEntry) div SizeOf(aEntry[0])) - 1;
+    iLo := 0;
+    iRes := -1;
+    Assert(c > aEntry[0].iCode);
+    while iHi >= iLo do begin
+      iTest := (iHi + iLo) div 2;
+      cmp := c - aEntry[iTest].iCode;
+      if cmp >= 0 then begin
+        iRes := iTest;
+        iLo := iTest + 1;
+      end else
+        iHi := iTest - 1;
+    end;
+    Assert((iRes >= 0) and (c >= aEntry[iRes].iCode));
+    p := @aEntry[iRes];
+    if (c < (p^.iCode + p^.nRange))
+    and ((($01 and p^.flags) and (cint(p^.iCode) xor c)) = 0) then begin
+      ret := (c + cint(aiOff[p^.flags shr 1])) and $0000FFFF;
+      Assert(ret > 0);
+    end;
+    if eRemoveDiacritic <> 0 then begin
+      if eRemoveDiacritic = 2 then
+        ret := remove_diacritic(ret, 1)
+      else
+        ret := remove_diacritic(ret, 0);
+    end;
+  end
+  else if (c >= 66560) and (c < 66600) then
+    ret := c + 40;
+  Result := ret;
+end;
+
+{ ===================================================================== }
+{ 6.40.1.f — fts3_unicode.c — the "unicode61" tokenizer.                 }
+{ ===================================================================== }
+
+type
+  { fts3_unicode.c:83..88 — struct unicode_tokenizer. }
+  Punicode_tokenizer = ^Tunicode_tokenizer;
+  Tunicode_tokenizer = record
+    base            : Tsqlite3_tokenizer;
+    eRemoveDiacritic : cint;
+    nException       : cint;
+    aiException       : Pcint;
+  end;
+
+  { fts3_unicode.c:90..98 — struct unicode_cursor. }
+  Punicode_cursor = ^Tunicode_cursor;
+  Tunicode_cursor = record
+    base   : Tsqlite3_tokenizer_cursor;
+    aInput : PByte;        { Input text being tokenized }
+    nInput : cint;         { Size of aInput[] in bytes }
+    iOff   : cint;         { Current offset within aInput[] }
+    iToken : cint;         { Index of next token to be returned }
+    zToken : PChar;        { storage for current token }
+    nAlloc : cint;         { space allocated at zToken }
+  end;
+
+const
+  { fts3_unicode.c:35..44 — sqlite3Utf8Trans1[] (lead-byte offset table). }
+  sqlite3Utf8Trans1: array[0..63] of cuchar = (
+    $00, $01, $02, $03, $04, $05, $06, $07,
+    $08, $09, $0a, $0b, $0c, $0d, $0e, $0f,
+    $10, $11, $12, $13, $14, $15, $16, $17,
+    $18, $19, $1a, $1b, $1c, $1d, $1e, $1f,
+    $00, $01, $02, $03, $04, $05, $06, $07,
+    $08, $09, $0a, $0b, $0c, $0d, $0e, $0f,
+    $00, $01, $02, $03, $04, $05, $06, $07,
+    $00, $01, $02, $03, $00, $01, $00, $00
+  );
+
+{ fts3_unicode.c:46..56 — READ_UTF8 macro, ported as a procedure.
+  Reads one codepoint at z (PByte), advancing z, stopping before zTerm. }
+procedure fts3ReadUtf8(var z: PByte; const zTerm: PByte; var c: cuint); inline;
+begin
+  c := z^;            { c = *(zIn++) }
+  Inc(z);
+  if c >= $c0 then begin
+    c := sqlite3Utf8Trans1[c - $c0];
+    while (z <> zTerm) and ((z^ and $c0) = $80) do begin
+      c := (c shl 6) + (cuint($3f) and z^);   { c = (c<<6) + (0x3f & *(zIn++)) }
+      Inc(z);
+    end;
+    if (c < $80)
+    or ((c and $FFFFF800) = $D800)
+    or ((c and $FFFFFFFE) = $FFFE) then
+      c := $FFFD;
+  end;
+end;
+
+{ fts3_unicode.c:58..76 — WRITE_UTF8 macro, ported as a procedure.
+  Writes codepoint c at zOut (PByte), advancing zOut. }
+procedure fts3WriteUtf8(var zOut: PByte; c: cuint); inline;
+begin
+  if c < $00080 then begin
+    zOut^ := cuchar(c and $FF);            Inc(zOut);
+  end else if c < $00800 then begin
+    zOut^ := cuchar($C0 + ((c shr 6) and $1F));  Inc(zOut);
+    zOut^ := cuchar($80 + (c and $3F));          Inc(zOut);
+  end else if c < $10000 then begin
+    zOut^ := cuchar($E0 + ((c shr 12) and $0F)); Inc(zOut);
+    zOut^ := cuchar($80 + ((c shr 6) and $3F));  Inc(zOut);
+    zOut^ := cuchar($80 + (c and $3F));          Inc(zOut);
+  end else begin
+    zOut^ := cuchar($F0 + ((c shr 18) and $07)); Inc(zOut);
+    zOut^ := cuchar($80 + ((c shr 12) and $3F)); Inc(zOut);
+    zOut^ := cuchar($80 + ((c shr 6) and $3F));  Inc(zOut);
+    zOut^ := cuchar($80 + (c and $3F));          Inc(zOut);
+  end;
+end;
+
+{ fts3_unicode.c:104..111 — unicodeDestroy. }
+function unicodeDestroy(pTokenizer: Psqlite3_tokenizer): cint; cdecl;
+var
+  p: Punicode_tokenizer;
+begin
+  if pTokenizer <> nil then begin
+    p := Punicode_tokenizer(pTokenizer);
+    sqlite3_free(p^.aiException);
+    sqlite3_free(p);
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_unicode.c:131..180 — unicodeAddExceptions. }
+function unicodeAddExceptions(p: Punicode_tokenizer; bAlnum: cint;
+  const zIn: PChar; nIn: cint): cint;
+var
+  z, zTerm: PByte;
+  iCode: cuint;
+  nEntry: cint;
+  aNew: Pcint;
+  nNew, i, j: cint;
+begin
+  z := PByte(zIn);
+  zTerm := @z[nIn];
+  nEntry := 0;
+  Assert((bAlnum = 0) or (bAlnum = 1));
+
+  while PtrUInt(z) < PtrUInt(zTerm) do begin
+    fts3ReadUtf8(z, zTerm, iCode);
+    Assert((sqlite3FtsUnicodeIsalnum(cint(iCode)) and $FFFFFFFE) = 0);
+    if (sqlite3FtsUnicodeIsalnum(cint(iCode)) <> bAlnum)
+    and (sqlite3FtsUnicodeIsdiacritic(cint(iCode)) = 0) then
+      Inc(nEntry);
+  end;
+
+  if nEntry <> 0 then begin
+    aNew := Pcint(sqlite3_realloc64(p^.aiException,
+      u64((p^.nException + nEntry) * cint(SizeOf(cint)))));
+    if aNew = nil then Exit(SQLITE_NOMEM);
+    nNew := p^.nException;
+
+    z := PByte(zIn);
+    while PtrUInt(z) < PtrUInt(zTerm) do begin
+      fts3ReadUtf8(z, zTerm, iCode);
+      if (sqlite3FtsUnicodeIsalnum(cint(iCode)) <> bAlnum)
+      and (sqlite3FtsUnicodeIsdiacritic(cint(iCode)) = 0) then begin
+        i := 0;
+        while (i < nNew) and (aNew[i] < cint(iCode)) do Inc(i);
+        j := nNew;
+        while j > i do begin
+          aNew[j] := aNew[j - 1];
+          Dec(j);
+        end;
+        aNew[i] := cint(iCode);
+        Inc(nNew);
+      end;
+    end;
+    p^.aiException := aNew;
+    p^.nException := nNew;
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_unicode.c:185..204 — unicodeIsException. }
+function unicodeIsException(p: Punicode_tokenizer; iCode: cint): cint;
+var
+  a: Pcint;
+  iLo, iHi, iTest: cint;
+begin
+  if p^.nException > 0 then begin
+    a := p^.aiException;
+    iLo := 0;
+    iHi := p^.nException - 1;
+    while iHi >= iLo do begin
+      iTest := (iHi + iLo) div 2;
+      if iCode = a[iTest] then
+        Exit(1)
+      else if iCode > a[iTest] then
+        iLo := iTest + 1
+      else
+        iHi := iTest - 1;
+    end;
+  end;
+  Result := 0;
+end;
+
+{ fts3_unicode.c:210..213 — unicodeIsAlnum. }
+function unicodeIsAlnum(p: Punicode_tokenizer; iCode: cint): cint;
+begin
+  Assert((sqlite3FtsUnicodeIsalnum(iCode) and $FFFFFFFE) = 0);
+  Result := sqlite3FtsUnicodeIsalnum(iCode) xor unicodeIsException(p, iCode);
+end;
+
+{ fts3_unicode.c:218..263 — unicodeCreate. }
+function unicodeCreate(nArg: cint; const azArg: PPChar;
+  pp: PPsqlite3_tokenizer): cint; cdecl;
+var
+  pNew: Punicode_tokenizer;
+  i, n, rc: cint;
+  z: PChar;
+begin
+  rc := SQLITE_OK;
+  pNew := Punicode_tokenizer(sqlite3_malloc(i32(SizeOf(Tunicode_tokenizer))));
+  if pNew = nil then Exit(SQLITE_NOMEM);
+  libc_memset(pNew, 0, NativeUInt(SizeOf(Tunicode_tokenizer)));
+  pNew^.eRemoveDiacritic := 1;
+
+  i := 0;
+  while (rc = SQLITE_OK) and (i < nArg) do begin
+    z := PPChar(azArg)[i];
+    n := cint(libc_strlen(z));
+
+    if (n = 19) and (libc_memcmp(PChar('remove_diacritics=1'), z, 19) = 0) then
+      pNew^.eRemoveDiacritic := 1
+    else if (n = 19) and (libc_memcmp(PChar('remove_diacritics=0'), z, 19) = 0) then
+      pNew^.eRemoveDiacritic := 0
+    else if (n = 19) and (libc_memcmp(PChar('remove_diacritics=2'), z, 19) = 0) then
+      pNew^.eRemoveDiacritic := 2
+    else if (n >= 11) and (libc_memcmp(PChar('tokenchars='), z, 11) = 0) then
+      rc := unicodeAddExceptions(pNew, 1, @z[11], n - 11)
+    else if (n >= 11) and (libc_memcmp(PChar('separators='), z, 11) = 0) then
+      rc := unicodeAddExceptions(pNew, 0, @z[11], n - 11)
+    else
+      rc := SQLITE_ERROR;   { Unrecognized argument }
+    Inc(i);
+  end;
+
+  if rc <> SQLITE_OK then begin
+    unicodeDestroy(Psqlite3_tokenizer(pNew));
+    pNew := nil;
+  end;
+  pp^ := Psqlite3_tokenizer(pNew);
+  Result := rc;
+end;
+
+{ fts3_unicode.c:271..298 — unicodeOpen. }
+const
+  unicodeEmptyInput: cuchar = 0;   { stands in for C's (const u8*)"" }
+
+function unicodeOpen(p: Psqlite3_tokenizer; const aInput: PChar;
+  nInput: cint; pp: PPsqlite3_tokenizer_cursor): cint; cdecl;
+var
+  pCsr: Punicode_cursor;
+begin
+  pCsr := Punicode_cursor(sqlite3_malloc(i32(SizeOf(Tunicode_cursor))));
+  if pCsr = nil then Exit(SQLITE_NOMEM);
+  libc_memset(pCsr, 0, NativeUInt(SizeOf(Tunicode_cursor)));
+
+  pCsr^.aInput := PByte(aInput);
+  if aInput = nil then begin
+    pCsr^.nInput := 0;
+    pCsr^.aInput := @unicodeEmptyInput;
+  end else if nInput < 0 then
+    pCsr^.nInput := cint(libc_strlen(aInput))
+  else
+    pCsr^.nInput := nInput;
+
+  pp^ := @pCsr^.base;
+  { UNUSED_PARAMETER(p) }
+  if p = nil then ;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_unicode.c:304..309 — unicodeClose. }
+function unicodeClose(pCursor: Psqlite3_tokenizer_cursor): cint; cdecl;
+var
+  pCsr: Punicode_cursor;
+begin
+  pCsr := Punicode_cursor(pCursor);
+  sqlite3_free(pCsr^.zToken);
+  sqlite3_free(pCsr);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_unicode.c:315..377 — unicodeNext. }
+function unicodeNext(pC: Psqlite3_tokenizer_cursor;
+  paToken: PPChar; pnToken: Pcint;
+  piStart: Pcint; piEnd: Pcint; piPos: Pcint): cint; cdecl;
+var
+  pCsr: Punicode_cursor;
+  p: Punicode_tokenizer;
+  iCode: cuint;
+  zOut: PByte;
+  z, zStart, zEnd, zTerm: PByte;
+  iOut: cint;
+  zNew: PChar;
+begin
+  pCsr := Punicode_cursor(pC);
+  p := Punicode_tokenizer(pCsr^.base.pTokenizer);
+  iCode := 0;
+  z := @pCsr^.aInput[pCsr^.iOff];
+  zStart := z;
+  zEnd := z;
+  zTerm := @pCsr^.aInput[pCsr^.nInput];
+
+  { Scan past any delimiter characters before the start of the next token. }
+  while PtrUInt(z) < PtrUInt(zTerm) do begin
+    fts3ReadUtf8(z, zTerm, iCode);
+    if unicodeIsAlnum(p, cint(iCode)) <> 0 then Break;
+    zStart := z;
+  end;
+  if PtrUInt(zStart) >= PtrUInt(zTerm) then Exit(SQLITE_DONE);
+
+  zOut := PByte(pCsr^.zToken);
+  repeat
+    { Grow the output buffer if required. }
+    if (PtrInt(zOut) - PtrInt(pCsr^.zToken)) >= (pCsr^.nAlloc - 4) then begin
+      zNew := PChar(sqlite3_realloc64(pCsr^.zToken, u64(pCsr^.nAlloc + 64)));
+      if zNew = nil then Exit(SQLITE_NOMEM);
+      zOut := @PByte(zNew)[PtrInt(zOut) - PtrInt(pCsr^.zToken)];
+      pCsr^.zToken := zNew;
+      Inc(pCsr^.nAlloc, 64);
+    end;
+
+    { Write the folded case of the last character read to the output }
+    zEnd := z;
+    iOut := sqlite3FtsUnicodeFold(cint(iCode), p^.eRemoveDiacritic);
+    if iOut <> 0 then
+      fts3WriteUtf8(zOut, cuint(iOut));
+
+    { If the cursor is not at EOF, read the next character }
+    if PtrUInt(z) >= PtrUInt(zTerm) then Break;
+    fts3ReadUtf8(z, zTerm, iCode);
+  until not ((unicodeIsAlnum(p, cint(iCode)) <> 0)
+          or (sqlite3FtsUnicodeIsdiacritic(cint(iCode)) <> 0));
+
+  { Set the output variables and return. }
+  pCsr^.iOff := cint(PtrInt(z) - PtrInt(pCsr^.aInput));
+  paToken^ := pCsr^.zToken;
+  pnToken^ := cint(PtrInt(zOut) - PtrInt(pCsr^.zToken));
+  piStart^ := cint(PtrInt(zStart) - PtrInt(pCsr^.aInput));
+  piEnd^ := cint(PtrInt(zEnd) - PtrInt(pCsr^.aInput));
+  piPos^ := pCsr^.iToken;
+  Inc(pCsr^.iToken);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_unicode.c:384..392 — the static unicode tokenizer module record. }
+const
+  unicodeTokenizerModule: Tsqlite3_tokenizer_module = (
+    iVersion    : 0;
+    xCreate     : @unicodeCreate;
+    xDestroy    : @unicodeDestroy;
+    xOpen       : @unicodeOpen;
+    xClose      : @unicodeClose;
+    xNext       : @unicodeNext;
+    xLanguageid : nil;
+  );
+
+{ fts3_unicode.c:383..394 — sqlite3Fts3UnicodeTokenizer. }
+procedure sqlite3Fts3UnicodeTokenizer(ppModule: PPsqlite3_tokenizer_module);
+begin
+  ppModule^ := @unicodeTokenizerModule;
 end;
 
 end.
