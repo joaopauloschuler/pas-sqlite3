@@ -636,6 +636,21 @@ function sqlite3Fts3InitTok(db: PTsqlite3; pHash: PFts3Hash;
   xDestroy: TxModuleDestroy): cint;
 
 { --------------------------------------------------------------------- }
+{ 6.40.1.m — fts3_aux.c:523 — register the "fts4aux" virtual-table module }
+{ on db.  This vtab exposes the term-statistics of a target fts3/fts4     }
+{ table read directly from its %_segments/%_segdir shadow tables.         }
+{ --------------------------------------------------------------------- }
+function sqlite3Fts3InitAux(db: PTsqlite3): cint;
+
+{$IFDEF SQLITE_TEST}
+{ --------------------------------------------------------------------- }
+{ 6.40.1.n — fts3_term.c:348 — register the SQLITE_TEST-only "fts4term"   }
+{ virtual-table module (direct access to the full-text index).           }
+{ --------------------------------------------------------------------- }
+function sqlite3Fts3InitTerm(db: PTsqlite3): cint;
+{$ENDIF}
+
+{ --------------------------------------------------------------------- }
 { 6.40.1.g (down-payment on 6.40.1.o) — minimal sqlite3Fts3Init: alloc    }
 { the tokenizer-hash wrapper, load simple/porter/unicode61, and install   }
 { the fts3_tokenizer SQL function(s) via sqlite3Fts3InitHashTable AND, as   }
@@ -13727,6 +13742,900 @@ begin
 end;
 
 
+{ ===================================================================== }
+{ 6.40.1.m — fts3_aux.c — the "fts4aux" virtual table.                   }
+{ ===================================================================== }
+
+type
+  { fts3_aux.c:40..43 — struct Fts3auxColstats. }
+  PFts3auxColstats = ^TFts3auxColstats;
+  TFts3auxColstats = record
+    nDoc : sqlite3_int64;        { 'documents' values for current csr row }
+    nOcc : sqlite3_int64;        { 'occurrences' values for current csr row }
+  end;
+  TFts3auxColstatsArray = array[0..((MaxInt div SizeOf(TFts3auxColstats)) - 1)]
+                          of TFts3auxColstats;
+  PFts3auxColstatsArray = ^TFts3auxColstatsArray;
+
+  { fts3_aux.c:23..26 — struct Fts3auxTable. }
+  PFts3auxTable = ^TFts3auxTable;
+  TFts3auxTable = record
+    base     : Tsqlite3_vtab;          { Base class used by SQLite core }
+    pFts3Tab : PFts3Table;
+  end;
+
+  { fts3_aux.c:28..44 — struct Fts3auxCursor.  csr MUST be right after base. }
+  PFts3auxCursor = ^TFts3auxCursor;
+  TFts3auxCursor = record
+    base    : Tsqlite3_vtab_cursor;    { Base class used by SQLite core }
+    csr     : TFts3MultiSegReader;     { Must be right after "base" }
+    filter  : TFts3SegFilter;
+    zStop   : PChar;
+    nStop   : cint;                    { Byte-length of string zStop }
+    iLangid : cint;                    { Language id to query }
+    isEof   : cint;                    { True if cursor is at EOF }
+    iRowid  : sqlite3_int64;           { Current rowid }
+
+    iCol    : cint;                    { Current value of 'col' column }
+    nStat   : cint;                    { Size of aStat[] array }
+    aStat   : PFts3auxColstatsArray;
+  end;
+
+const
+  { fts3_aux.c:49..50 — schema of the terms table. }
+  FTS3_AUX_SCHEMA =
+    'CREATE TABLE x(term, col, documents, occurrences, languageid HIDDEN)';
+
+  { fts3_aux.c:142..144 — fts4aux idxNum constraint-flag bits. }
+  FTS4AUX_EQ_CONSTRAINT = 1;
+  FTS4AUX_GE_CONSTRAINT = 2;
+  FTS4AUX_LE_CONSTRAINT = 4;
+
+{ fts3_aux.c:57..121 — fts3auxConnectMethod.  Does the work for both
+  xConnect and xCreate (identical: these tables have no persistent
+  representation). }
+function fts3auxConnectMethod(db: PTsqlite3; pUnused: Pointer; argc: cint;
+  const argv: PPChar; ppVtab: PPSqlite3Vtab; pzErr: PPChar): cint; cdecl;
+label
+  bad_args;
+var
+  zDb   : PChar;                       { Name of database (e.g. "main") }
+  zFts3 : PChar;                       { Name of fts3 table }
+  nDb   : cint;                        { Result of strlen(zDb) }
+  nFts3 : cint;                        { Result of strlen(zFts3) }
+  nByte : sqlite3_int64;               { Bytes of space to allocate here }
+  rc    : cint;                        { value returned by declare_vtab() }
+  p     : PFts3auxTable;               { Virtual table object to return }
+begin
+  { The user should invoke this in one of two forms:
+  **
+  **     CREATE VIRTUAL TABLE xxx USING fts4aux(fts4-table);
+  **     CREATE VIRTUAL TABLE xxx USING fts4aux(fts4-table-db, fts4-table); }
+  if (argc <> 4) and (argc <> 5) then goto bad_args;
+
+  zDb := argv[1];
+  nDb := cint(libc_strlen(zDb));
+  if argc = 5 then begin
+    if (nDb = 4) and (sqlite3_strnicmp(PChar('temp'), zDb, 4) = 0) then begin
+      zDb := argv[3];
+      nDb := cint(libc_strlen(zDb));
+      zFts3 := argv[4];
+    end else
+      goto bad_args;
+  end else
+    zFts3 := argv[3];
+  nFts3 := cint(libc_strlen(zFts3));
+
+  rc := sqlite3_declare_vtab(db, PAnsiChar(FTS3_AUX_SCHEMA));
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  nByte := SizeOf(TFts3auxTable) + SizeOf(TFts3Table) + nDb + nFts3 + 2;
+  p := PFts3auxTable(sqlite3_malloc64(u64(nByte)));
+  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  libc_memset(p, 0, NativeUInt(nByte));
+
+  { C: p->pFts3Tab = (Fts3Table *)&p[1]; }
+  p^.pFts3Tab := PFts3Table(p + 1);
+  { C: p->pFts3Tab->zDb = (char *)&p->pFts3Tab[1]; }
+  p^.pFts3Tab^.zDb := PChar(p^.pFts3Tab + 1);
+  { C: p->pFts3Tab->zName = &p->pFts3Tab->zDb[nDb+1]; }
+  p^.pFts3Tab^.zName := @p^.pFts3Tab^.zDb[nDb + 1];
+  p^.pFts3Tab^.db := db;
+  p^.pFts3Tab^.nIndex := 1;
+
+  libc_memcpy(p^.pFts3Tab^.zDb, zDb, NativeUInt(nDb));
+  libc_memcpy(p^.pFts3Tab^.zName, zFts3, NativeUInt(nFts3));
+  fts3Dequote(p^.pFts3Tab^.zName);
+
+  ppVtab^ := PSqlite3Vtab(@p^.base);
+  Result := SQLITE_OK;
+  Exit;
+
+ bad_args:
+  fts3ErrMsg(pzErr, 'invalid arguments to fts4aux constructor', []);
+  Result := SQLITE_ERROR;
+end;
+
+{ fts3_aux.c:128..140 — fts3auxDisconnectMethod.  Does the work for both
+  xDisconnect and xDestroy (identical). }
+function fts3auxDisconnectMethod(pVtab: PSqlite3Vtab): cint; cdecl;
+var
+  p     : PFts3auxTable;
+  pFts3 : PFts3Table;
+  i     : cint;
+begin
+  p := PFts3auxTable(pVtab);
+  pFts3 := p^.pFts3Tab;
+
+  { Free any prepared statements held }
+  for i := 0 to High(pFts3^.aStmt) do
+    sqlite3_finalize(pFts3^.aStmt[i]);
+  sqlite3_free(pFts3^.zSegmentsTbl);
+  sqlite3_free(p);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:149..214 — fts3auxBestIndexMethod.  Analyze a WHERE and
+  ORDER BY clause. }
+function fts3auxBestIndexMethod(pVTab: PSqlite3Vtab;
+  pInfo: PSqlite3IndexInfo): cint; cdecl;
+var
+  i       : cint;
+  iEq     : cint;
+  iGe     : cint;
+  iLe     : cint;
+  iLangid : cint;
+  iNext   : cint;                      { Next free argvIndex value }
+  pC      : PSqlite3IndexConstraint;
+  pOb     : PSqlite3IndexOrderBy;
+  pUse    : PSqlite3IndexConstraintUsage;
+  op      : cint;
+  iCol    : cint;
+begin
+  iEq := -1;
+  iGe := -1;
+  iLe := -1;
+  iLangid := -1;
+  iNext := 1;
+
+  { This vtab delivers always results in "ORDER BY term ASC" order. }
+  pOb := pInfo^.aOrderBy;
+  if (pInfo^.nOrderBy = 1)
+   and (pOb^.iColumn = 0)
+   and (pOb^.desc = 0)
+  then
+    pInfo^.orderByConsumed := 1;
+
+  { Search for equality and range constraints on the "term" column.
+  ** And equality constraints on the hidden "languageid" column. }
+  for i := 0 to pInfo^.nConstraint - 1 do begin
+    pC := pInfo^.aConstraint;
+    Inc(pC, i);
+    if pC^.usable <> 0 then begin
+      op := pC^.op;
+      iCol := pC^.iColumn;
+
+      if iCol = 0 then begin
+        if op = SQLITE_INDEX_CONSTRAINT_EQ then iEq := i;
+        if op = SQLITE_INDEX_CONSTRAINT_LT then iLe := i;
+        if op = SQLITE_INDEX_CONSTRAINT_LE then iLe := i;
+        if op = SQLITE_INDEX_CONSTRAINT_GT then iGe := i;
+        if op = SQLITE_INDEX_CONSTRAINT_GE then iGe := i;
+      end;
+      if iCol = 4 then begin
+        if op = SQLITE_INDEX_CONSTRAINT_EQ then iLangid := i;
+      end;
+    end;
+  end;
+
+  if iEq >= 0 then begin
+    pInfo^.idxNum := FTS4AUX_EQ_CONSTRAINT;
+    pUse := pInfo^.aConstraintUsage; Inc(pUse, iEq);
+    pUse^.argvIndex := iNext; Inc(iNext);
+    pInfo^.estimatedCost := 5;
+  end else begin
+    pInfo^.idxNum := 0;
+    pInfo^.estimatedCost := 20000;
+    if iGe >= 0 then begin
+      pInfo^.idxNum := pInfo^.idxNum + FTS4AUX_GE_CONSTRAINT;
+      pUse := pInfo^.aConstraintUsage; Inc(pUse, iGe);
+      pUse^.argvIndex := iNext; Inc(iNext);
+      pInfo^.estimatedCost := pInfo^.estimatedCost / 2;
+    end;
+    if iLe >= 0 then begin
+      pInfo^.idxNum := pInfo^.idxNum + FTS4AUX_LE_CONSTRAINT;
+      pUse := pInfo^.aConstraintUsage; Inc(pUse, iLe);
+      pUse^.argvIndex := iNext; Inc(iNext);
+      pInfo^.estimatedCost := pInfo^.estimatedCost / 2;
+    end;
+  end;
+  if iLangid >= 0 then begin
+    pUse := pInfo^.aConstraintUsage; Inc(pUse, iLangid);
+    pUse^.argvIndex := iNext; Inc(iNext);
+    pInfo^.estimatedCost := pInfo^.estimatedCost - 1;
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:219..230 — fts3auxOpenMethod.  Open a cursor. }
+function fts3auxOpenMethod(pVTab: PSqlite3Vtab;
+  ppCsr: PPSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3auxCursor;
+begin
+  pCsr := PFts3auxCursor(sqlite3_malloc(i32(SizeOf(TFts3auxCursor))));
+  if pCsr = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  libc_memset(pCsr, 0, SizeOf(TFts3auxCursor));
+
+  ppCsr^ := PSqlite3VtabCursor(@pCsr^.base);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:235..246 — fts3auxCloseMethod.  Close a cursor. }
+function fts3auxCloseMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pFts3 : PFts3Table;
+  pCsr  : PFts3auxCursor;
+begin
+  pFts3 := PFts3auxTable(pCursor^.pVtab)^.pFts3Tab;
+  pCsr := PFts3auxCursor(pCursor);
+
+  sqlite3Fts3SegmentsClose(pFts3);
+  sqlite3Fts3SegReaderFinish(@pCsr^.csr);
+  sqlite3_free(pCsr^.filter.zTerm);
+  sqlite3_free(pCsr^.zStop);
+  sqlite3_free(pCsr^.aStat);
+  sqlite3_free(pCsr);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:248..262 — fts3auxGrowStatArray. }
+function fts3auxGrowStatArray(pCsr: PFts3auxCursor; nSize: cint): cint;
+var
+  aNew: PFts3auxColstatsArray;
+begin
+  if nSize > pCsr^.nStat then begin
+    aNew := PFts3auxColstatsArray(sqlite3_realloc64(pCsr^.aStat,
+        u64(SizeOf(TFts3auxColstats) * sqlite3_int64(nSize))));
+    if aNew = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    libc_memset(@aNew^[pCsr^.nStat], 0,
+        NativeUInt(SizeOf(TFts3auxColstats) * (nSize - pCsr^.nStat)));
+    pCsr^.aStat := aNew;
+    pCsr^.nStat := nSize;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:267..360 — fts3auxNextMethod.  Advance the cursor. }
+function fts3auxNextMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr     : PFts3auxCursor;
+  pFts3    : PFts3Table;
+  rc       : cint;
+  i        : cint;
+  nDoclist : cint;
+  aDoclist : PChar;
+  iCol     : cint;
+  eState   : cint;
+  v        : sqlite3_int64;
+  n        : cint;
+  mc       : cint;
+begin
+  pCsr := PFts3auxCursor(pCursor);
+  pFts3 := PFts3auxTable(pCursor^.pVtab)^.pFts3Tab;
+
+  { Increment our pretend rowid value. }
+  Inc(pCsr^.iRowid);
+
+  Inc(pCsr^.iCol);
+  while pCsr^.iCol < pCsr^.nStat do begin
+    if pCsr^.aStat^[pCsr^.iCol].nDoc > 0 then begin Result := SQLITE_OK; Exit; end;
+    Inc(pCsr^.iCol);
+  end;
+
+  rc := sqlite3Fts3SegReaderStep(pFts3, @pCsr^.csr);
+  if rc = SQLITE_ROW then begin
+    i := 0;
+    nDoclist := pCsr^.csr.nDoclist;
+    aDoclist := pCsr^.csr.aDoclist;
+
+    eState := 0;
+
+    if pCsr^.zStop <> nil then begin
+      if pCsr^.nStop < pCsr^.csr.nTerm then n := pCsr^.nStop
+      else n := pCsr^.csr.nTerm;
+      mc := cint(libc_memcmp(pCsr^.zStop, pCsr^.csr.zTerm, NativeUInt(n)));
+      if (mc < 0) or ((mc = 0) and (pCsr^.csr.nTerm > pCsr^.nStop)) then begin
+        pCsr^.isEof := 1;
+        Result := SQLITE_OK;
+        Exit;
+      end;
+    end;
+
+    if fts3auxGrowStatArray(pCsr, 2) <> 0 then begin Result := SQLITE_NOMEM; Exit; end;
+    libc_memset(pCsr^.aStat, 0,
+        NativeUInt(SizeOf(TFts3auxColstats) * pCsr^.nStat));
+    iCol := 0;
+    rc := SQLITE_OK;
+
+    while i < nDoclist do begin
+      v := 0;
+
+      i := i + sqlite3Fts3GetVarint(@aDoclist[i], @v);
+      case eState of
+        { State 0. In this state the integer just read was a docid. }
+        0: begin
+          Inc(pCsr^.aStat^[0].nDoc);
+          eState := 1;
+          iCol := 0;
+        end;
+
+        { State 1. In this state we are expecting either a 1, indicating
+        ** that the following integer will be a column number, or the
+        ** start of a position list for column 0.
+        **
+        ** The only difference between state 1 and state 2 is that if the
+        ** integer encountered in state 1 is not 0 or 1, then we need to
+        ** increment the column 0 "nDoc" count for this term. }
+        1: begin
+          Assert(iCol = 0);
+          if v > 1 then
+            Inc(pCsr^.aStat^[1].nDoc);
+          eState := 2;
+          { no break — deliberate fall-through to state 2 }
+          if v = 0 then            { 0x00. Next integer will be a docid. }
+            eState := 0
+          else if v = 1 then       { 0x01. Next integer will be a column number. }
+            eState := 3
+          else begin               { 2 or greater. A position. }
+            Inc(pCsr^.aStat^[iCol + 1].nOcc);
+            Inc(pCsr^.aStat^[0].nOcc);
+          end;
+        end;
+
+        2: begin
+          if v = 0 then            { 0x00. Next integer will be a docid. }
+            eState := 0
+          else if v = 1 then       { 0x01. Next integer will be a column number. }
+            eState := 3
+          else begin               { 2 or greater. A position. }
+            Inc(pCsr^.aStat^[iCol + 1].nOcc);
+            Inc(pCsr^.aStat^[0].nOcc);
+          end;
+        end;
+
+        { State 3. The integer just read is a column number. }
+        else begin
+          Assert(eState = 3);
+          iCol := cint(v);
+          if iCol < 1 then begin
+            rc := SQLITE_CORRUPT_VTAB;
+            { break out of the while loop (matches C's break inside switch) }
+            break;
+          end;
+          if fts3auxGrowStatArray(pCsr, iCol + 2) <> 0 then begin
+            Result := SQLITE_NOMEM; Exit;
+          end;
+          Inc(pCsr^.aStat^[iCol + 1].nDoc);
+          eState := 2;
+        end;
+      end;
+    end;
+
+    pCsr^.iCol := 0;
+  end else
+    pCsr^.isEof := 1;
+
+  Result := rc;
+end;
+
+{ fts3_aux.c:365..456 — fts3auxFilterMethod. }
+function fts3auxFilterMethod(pCursor: PSqlite3VtabCursor;
+  idxNum: cint; idxStr: PChar; nVal: cint;
+  apVal: PPsqlite3_value): cint; cdecl;
+var
+  pCsr     : PFts3auxCursor;
+  pFts3    : PFts3Table;
+  rc       : cint;
+  isScan   : cint;
+  iLangVal : cint;                     { Language id to query }
+  iEq      : cint;
+  iGe      : cint;
+  iLe      : cint;
+  iLangid  : cint;
+  iNext    : cint;
+  zStr     : PChar;
+begin
+  pCsr := PFts3auxCursor(pCursor);
+  pFts3 := PFts3auxTable(pCursor^.pVtab)^.pFts3Tab;
+  isScan := 0;
+  iLangVal := 0;
+  iEq := -1;
+  iGe := -1;
+  iLe := -1;
+  iLangid := -1;
+  iNext := 0;
+
+  Assert(idxStr = nil);
+  Assert((idxNum = FTS4AUX_EQ_CONSTRAINT) or (idxNum = 0)
+      or (idxNum = FTS4AUX_LE_CONSTRAINT) or (idxNum = FTS4AUX_GE_CONSTRAINT)
+      or (idxNum = (FTS4AUX_LE_CONSTRAINT or FTS4AUX_GE_CONSTRAINT)));
+
+  if idxNum = FTS4AUX_EQ_CONSTRAINT then begin
+    iEq := iNext; Inc(iNext);
+  end else begin
+    isScan := 1;
+    if (idxNum and FTS4AUX_GE_CONSTRAINT) <> 0 then begin
+      iGe := iNext; Inc(iNext);
+    end;
+    if (idxNum and FTS4AUX_LE_CONSTRAINT) <> 0 then begin
+      iLe := iNext; Inc(iNext);
+    end;
+  end;
+  if iNext < nVal then begin
+    iLangid := iNext; Inc(iNext);
+  end;
+
+  { In case this cursor is being reused, close and zero it. }
+  sqlite3Fts3SegReaderFinish(@pCsr^.csr);
+  sqlite3_free(pCsr^.filter.zTerm);
+  sqlite3_free(pCsr^.aStat);
+  sqlite3_free(pCsr^.zStop);
+  { C: memset(&pCsr->csr, 0, ((u8*)&pCsr[1]) - (u8*)&pCsr->csr); }
+  libc_memset(@pCsr^.csr, 0,
+      SizeOf(TFts3auxCursor) - SizeOf(Tsqlite3_vtab_cursor));
+
+  pCsr^.filter.flags := FTS3_SEGMENT_REQUIRE_POS or FTS3_SEGMENT_IGNORE_EMPTY;
+  if isScan <> 0 then
+    pCsr^.filter.flags := pCsr^.filter.flags or FTS3_SEGMENT_SCAN;
+
+  if (iEq >= 0) or (iGe >= 0) then begin
+    zStr := PChar(sqlite3_value_text(PPsqlite3_value(apVal)[0]));
+    Assert(((iEq = 0) and (iGe = -1)) or ((iEq = -1) and (iGe = 0)));
+    if zStr <> nil then begin
+      pCsr^.filter.zTerm := PChar(sqlite3PfMprintf(PAnsiChar('%s'), [zStr]));
+      if pCsr^.filter.zTerm = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      pCsr^.filter.nTerm := cint(libc_strlen(pCsr^.filter.zTerm));
+    end;
+  end;
+
+  if iLe >= 0 then begin
+    pCsr^.zStop := PChar(sqlite3PfMprintf(PAnsiChar('%s'),
+        [PChar(sqlite3_value_text(PPsqlite3_value(apVal)[iLe]))]));
+    if pCsr^.zStop = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    pCsr^.nStop := cint(libc_strlen(pCsr^.zStop));
+  end;
+
+  if iLangid >= 0 then begin
+    iLangVal := sqlite3_value_int(PPsqlite3_value(apVal)[iLangid]);
+
+    { If the user specified a negative value for the languageid, use zero
+    ** instead. }
+    if iLangVal < 0 then iLangVal := 0;
+  end;
+  pCsr^.iLangid := iLangVal;
+
+  rc := sqlite3Fts3SegReaderCursor(pFts3, iLangVal, 0, FTS3_SEGCURSOR_ALL,
+      pCsr^.filter.zTerm, pCsr^.filter.nTerm, 0, isScan, @pCsr^.csr);
+  if rc = SQLITE_OK then
+    rc := sqlite3Fts3SegReaderStart(pFts3, @pCsr^.csr, @pCsr^.filter);
+
+  if rc = SQLITE_OK then rc := fts3auxNextMethod(pCursor);
+  Result := rc;
+end;
+
+{ fts3_aux.c:461..464 — fts3auxEofMethod. }
+function fts3auxEofMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3auxCursor;
+begin
+  pCsr := PFts3auxCursor(pCursor);
+  Result := pCsr^.isEof;
+end;
+
+{ fts3_aux.c:469..505 — fts3auxColumnMethod. }
+function fts3auxColumnMethod(pCursor: PSqlite3VtabCursor;
+  pCtx: Psqlite3_context; iCol: cint): cint; cdecl;
+var
+  p: PFts3auxCursor;
+begin
+  p := PFts3auxCursor(pCursor);
+
+  Assert(p^.isEof = 0);
+  case iCol of
+    0: { term }
+      sqlite3_result_text(pCtx, p^.csr.zTerm, p^.csr.nTerm, SQLITE_TRANSIENT);
+
+    1: begin { col }
+      if p^.iCol <> 0 then
+        sqlite3_result_int(pCtx, p^.iCol - 1)
+      else
+        sqlite3_result_text(pCtx, PAnsiChar('*'), -1, SQLITE_STATIC);
+    end;
+
+    2: { documents }
+      sqlite3_result_int64(pCtx, p^.aStat^[p^.iCol].nDoc);
+
+    3: { occurrences }
+      sqlite3_result_int64(pCtx, p^.aStat^[p^.iCol].nOcc);
+
+  else begin { languageid }
+      Assert(iCol = 4);
+      sqlite3_result_int(pCtx, p^.iLangid);
+    end;
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:510..517 — fts3auxRowidMethod. }
+function fts3auxRowidMethod(pCursor: PSqlite3VtabCursor;
+  pRowid: Pi64): cint; cdecl;
+var
+  pCsr: PFts3auxCursor;
+begin
+  pCsr := PFts3auxCursor(pCursor);
+  pRowid^ := pCsr^.iRowid;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_aux.c:524..550 — the static fts3aux_module record. }
+var
+  fts3aux_module: Tsqlite3_module;
+
+procedure initFts3AuxModule;
+begin
+  FillChar(fts3aux_module, SizeOf(fts3aux_module), 0);
+  fts3aux_module.iVersion    := 0;
+  fts3aux_module.xCreate     := @fts3auxConnectMethod;
+  fts3aux_module.xConnect    := @fts3auxConnectMethod;
+  fts3aux_module.xBestIndex  := @fts3auxBestIndexMethod;
+  fts3aux_module.xDisconnect := @fts3auxDisconnectMethod;
+  fts3aux_module.xDestroy    := @fts3auxDisconnectMethod;
+  fts3aux_module.xOpen       := @fts3auxOpenMethod;
+  fts3aux_module.xClose      := @fts3auxCloseMethod;
+  fts3aux_module.xFilter     := @fts3auxFilterMethod;
+  fts3aux_module.xNext       := @fts3auxNextMethod;
+  fts3aux_module.xEof        := @fts3auxEofMethod;
+  fts3aux_module.xColumn     := @fts3auxColumnMethod;
+  fts3aux_module.xRowid      := @fts3auxRowidMethod;
+end;
+
+{ fts3_aux.c:523..555 — sqlite3Fts3InitAux. }
+function sqlite3Fts3InitAux(db: PTsqlite3): cint;
+begin
+  initFts3AuxModule;
+  Result := sqlite3_create_module(db, PAnsiChar('fts4aux'), @fts3aux_module, nil);
+end;
+
+{$IFDEF SQLITE_TEST}
+{ ===================================================================== }
+{ 6.40.1.n — fts3_term.c — the SQLITE_TEST-only "fts4term" virtual table. }
+{ ===================================================================== }
+
+type
+  { fts3_term.c:29..33 — struct Fts3termTable. }
+  PFts3termTable = ^TFts3termTable;
+  TFts3termTable = record
+    base     : Tsqlite3_vtab;          { Base class used by SQLite core }
+    iIndex   : cint;                   { Index for Fts3Table.aIndex[] }
+    pFts3Tab : PFts3Table;
+  end;
+
+  { fts3_term.c:35..47 — struct Fts3termCursor.  csr MUST be right after base. }
+  PFts3termCursor = ^TFts3termCursor;
+  TFts3termCursor = record
+    base   : Tsqlite3_vtab_cursor;     { Base class used by SQLite core }
+    csr    : TFts3MultiSegReader;      { Must be right after "base" }
+    filter : TFts3SegFilter;
+
+    isEof  : cint;                     { True if cursor is at EOF }
+    pNext  : PChar;
+
+    iRowid : sqlite3_int64;            { Current 'rowid' value }
+    iDocid : sqlite3_int64;            { Current 'docid' value }
+    iCol   : cint;                     { Current 'col' value }
+    iPos   : cint;                     { Current 'pos' value }
+  end;
+
+const
+  { fts3_term.c:52 — schema of the terms table. }
+  FTS3_TERMS_SCHEMA = 'CREATE TABLE x(term, docid, col, pos)';
+
+{ fts3_term.c:59..123 — fts3termConnectMethod (xConnect == xCreate). }
+function fts3termConnectMethod(db: PTsqlite3; pCtx: Pointer; argc: cint;
+  const argv: PPChar; ppVtab: PPSqlite3Vtab; pzErr: PPChar): cint; cdecl;
+var
+  zDb    : PChar;
+  zFts3  : PChar;
+  nDb    : cint;
+  nFts3  : cint;
+  nByte  : sqlite3_int64;
+  rc     : cint;
+  p      : PFts3termTable;
+  iIndex : cint;
+  nArgc  : cint;
+begin
+  iIndex := 0;
+  nArgc := argc;
+  if nArgc = 5 then begin
+    iIndex := cint(libc_atoi(argv[4]));
+    Dec(nArgc);
+  end;
+
+  ppVtab^ := nil;
+
+  { The user should specify a single argument - the name of an fts3 table. }
+  if nArgc <> 4 then begin
+    fts3ErrMsg(pzErr, 'wrong number of arguments to fts4term constructor', []);
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
+
+  zDb := argv[1];
+  nDb := cint(libc_strlen(zDb));
+  zFts3 := argv[3];
+  nFts3 := cint(libc_strlen(zFts3));
+
+  rc := sqlite3_declare_vtab(db, PAnsiChar(FTS3_TERMS_SCHEMA));
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  nByte := SizeOf(TFts3termTable);
+  p := PFts3termTable(sqlite3Fts3MallocZero(nByte));
+  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+  p^.pFts3Tab := PFts3Table(sqlite3Fts3MallocZero(
+      SizeOf(TFts3Table) + nDb + nFts3 + 2));
+  if p^.pFts3Tab = nil then begin
+    sqlite3_free(p);
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  p^.pFts3Tab^.zDb := PChar(p^.pFts3Tab + 1);
+  p^.pFts3Tab^.zName := @p^.pFts3Tab^.zDb[nDb + 1];
+  p^.pFts3Tab^.db := db;
+  p^.pFts3Tab^.nIndex := iIndex + 1;
+  p^.iIndex := iIndex;
+
+  libc_memcpy(p^.pFts3Tab^.zDb, zDb, NativeUInt(nDb));
+  libc_memcpy(p^.pFts3Tab^.zName, zFts3, NativeUInt(nFts3));
+  fts3Dequote(p^.pFts3Tab^.zName);
+
+  ppVtab^ := PSqlite3Vtab(@p^.base);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:130..143 — fts3termDisconnectMethod (xDisconnect == xDestroy). }
+function fts3termDisconnectMethod(pVtab: PSqlite3Vtab): cint; cdecl;
+var
+  p     : PFts3termTable;
+  pFts3 : PFts3Table;
+  i     : cint;
+begin
+  p := PFts3termTable(pVtab);
+  pFts3 := p^.pFts3Tab;
+
+  { Free any prepared statements held }
+  for i := 0 to High(pFts3^.aStmt) do
+    sqlite3_finalize(pFts3^.aStmt[i]);
+  sqlite3_free(pFts3^.zSegmentsTbl);
+  sqlite3_free(pFts3);
+  sqlite3_free(p);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:152..170 — fts3termBestIndexMethod. }
+function fts3termBestIndexMethod(pVTab: PSqlite3Vtab;
+  pInfo: PSqlite3IndexInfo): cint; cdecl;
+var
+  i  : cint;
+  pOb: PSqlite3IndexOrderBy;
+begin
+  { This vtab naturally does "ORDER BY term, docid, col, pos". }
+  if pInfo^.nOrderBy <> 0 then begin
+    i := 0;
+    while i < pInfo^.nOrderBy do begin
+      pOb := pInfo^.aOrderBy;
+      Inc(pOb, i);
+      if (pOb^.iColumn <> i) or (pOb^.desc <> 0) then break;
+      Inc(i);
+    end;
+    if i = pInfo^.nOrderBy then
+      pInfo^.orderByConsumed := 1;
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:175..186 — fts3termOpenMethod. }
+function fts3termOpenMethod(pVTab: PSqlite3Vtab;
+  ppCsr: PPSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3termCursor;
+begin
+  pCsr := PFts3termCursor(sqlite3_malloc(i32(SizeOf(TFts3termCursor))));
+  if pCsr = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  libc_memset(pCsr, 0, SizeOf(TFts3termCursor));
+
+  ppCsr^ := PSqlite3VtabCursor(@pCsr^.base);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:191..199 — fts3termCloseMethod. }
+function fts3termCloseMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pFts3 : PFts3Table;
+  pCsr  : PFts3termCursor;
+begin
+  pFts3 := PFts3termTable(pCursor^.pVtab)^.pFts3Tab;
+  pCsr := PFts3termCursor(pCursor);
+
+  sqlite3Fts3SegmentsClose(pFts3);
+  sqlite3Fts3SegReaderFinish(@pCsr^.csr);
+  sqlite3_free(pCsr);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:204..251 — fts3termNextMethod. }
+function fts3termNextMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr  : PFts3termCursor;
+  pFts3 : PFts3Table;
+  rc    : cint;
+  v     : sqlite3_int64;
+begin
+  pCsr := PFts3termCursor(pCursor);
+  pFts3 := PFts3termTable(pCursor^.pVtab)^.pFts3Tab;
+
+  { Increment our pretend rowid value. }
+  Inc(pCsr^.iRowid);
+
+  { Advance to the next term in the full-text index. }
+  if (pCsr^.csr.aDoclist = nil)
+   or (PtrUInt(pCsr^.pNext) >= PtrUInt(@pCsr^.csr.aDoclist[pCsr^.csr.nDoclist - 1]))
+  then begin
+    rc := sqlite3Fts3SegReaderStep(pFts3, @pCsr^.csr);
+    if rc <> SQLITE_ROW then begin
+      pCsr^.isEof := 1;
+      Result := rc;
+      Exit;
+    end;
+
+    pCsr^.iCol := 0;
+    pCsr^.iPos := 0;
+    pCsr^.iDocid := 0;
+    pCsr^.pNext := pCsr^.csr.aDoclist;
+
+    { Read docid }
+    Inc(pCsr^.pNext, sqlite3Fts3GetVarint(pCsr^.pNext, @pCsr^.iDocid));
+  end;
+
+  Inc(pCsr^.pNext, sqlite3Fts3GetVarint(pCsr^.pNext, @v));
+  if v = 0 then begin
+    Inc(pCsr^.pNext, sqlite3Fts3GetVarint(pCsr^.pNext, @v));
+    pCsr^.iDocid := pCsr^.iDocid + v;
+    Inc(pCsr^.pNext, sqlite3Fts3GetVarint(pCsr^.pNext, @v));
+    pCsr^.iCol := 0;
+    pCsr^.iPos := 0;
+  end;
+
+  if v = 1 then begin
+    Inc(pCsr^.pNext, sqlite3Fts3GetVarint(pCsr^.pNext, @v));
+    pCsr^.iCol := pCsr^.iCol + cint(v);
+    pCsr^.iPos := 0;
+    Inc(pCsr^.pNext, sqlite3Fts3GetVarint(pCsr^.pNext, @v));
+  end;
+
+  pCsr^.iPos := pCsr^.iPos + cint(v - 2);
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:256..293 — fts3termFilterMethod. }
+function fts3termFilterMethod(pCursor: PSqlite3VtabCursor;
+  idxNum: cint; idxStr: PChar; nVal: cint;
+  apVal: PPsqlite3_value): cint; cdecl;
+var
+  pCsr  : PFts3termCursor;
+  p     : PFts3termTable;
+  pFts3 : PFts3Table;
+  rc    : cint;
+begin
+  pCsr := PFts3termCursor(pCursor);
+  p := PFts3termTable(pCursor^.pVtab);
+  pFts3 := p^.pFts3Tab;
+
+  Assert((idxStr = nil) and (idxNum = 0));
+
+  { In case this cursor is being reused, close and zero it. }
+  sqlite3Fts3SegReaderFinish(@pCsr^.csr);
+  { C: memset(&pCsr->csr, 0, ((u8*)&pCsr[1]) - (u8*)&pCsr->csr); }
+  libc_memset(@pCsr^.csr, 0,
+      SizeOf(TFts3termCursor) - SizeOf(Tsqlite3_vtab_cursor));
+
+  pCsr^.filter.flags := FTS3_SEGMENT_REQUIRE_POS or FTS3_SEGMENT_IGNORE_EMPTY;
+  pCsr^.filter.flags := pCsr^.filter.flags or FTS3_SEGMENT_SCAN;
+
+  rc := sqlite3Fts3SegReaderCursor(pFts3, 0, p^.iIndex, FTS3_SEGCURSOR_ALL,
+      pCsr^.filter.zTerm, pCsr^.filter.nTerm, 0, 1, @pCsr^.csr);
+  if rc = SQLITE_OK then
+    rc := sqlite3Fts3SegReaderStart(pFts3, @pCsr^.csr, @pCsr^.filter);
+  if rc = SQLITE_OK then
+    rc := fts3termNextMethod(pCursor);
+  Result := rc;
+end;
+
+{ fts3_term.c:298..301 — fts3termEofMethod. }
+function fts3termEofMethod(pCursor: PSqlite3VtabCursor): cint; cdecl;
+var
+  pCsr: PFts3termCursor;
+begin
+  pCsr := PFts3termCursor(pCursor);
+  Result := pCsr^.isEof;
+end;
+
+{ fts3_term.c:306..330 — fts3termColumnMethod.  x(term, docid, col, pos) }
+function fts3termColumnMethod(pCursor: PSqlite3VtabCursor;
+  pCtx: Psqlite3_context; iCol: cint): cint; cdecl;
+var
+  p: PFts3termCursor;
+begin
+  p := PFts3termCursor(pCursor);
+
+  Assert((iCol >= 0) and (iCol <= 3));
+  case iCol of
+    0: sqlite3_result_text(pCtx, p^.csr.zTerm, p^.csr.nTerm, SQLITE_TRANSIENT);
+    1: sqlite3_result_int64(pCtx, p^.iDocid);
+    2: sqlite3_result_int64(pCtx, p^.iCol);
+  else
+    sqlite3_result_int64(pCtx, p^.iPos);
+  end;
+
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:335..342 — fts3termRowidMethod. }
+function fts3termRowidMethod(pCursor: PSqlite3VtabCursor;
+  pRowid: Pi64): cint; cdecl;
+var
+  pCsr: PFts3termCursor;
+begin
+  pCsr := PFts3termCursor(pCursor);
+  pRowid^ := pCsr^.iRowid;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_term.c:349..375 — the static fts3term_module record. }
+var
+  fts3term_module: Tsqlite3_module;
+
+procedure initFts3TermModule;
+begin
+  FillChar(fts3term_module, SizeOf(fts3term_module), 0);
+  fts3term_module.iVersion    := 0;
+  fts3term_module.xCreate     := @fts3termConnectMethod;
+  fts3term_module.xConnect    := @fts3termConnectMethod;
+  fts3term_module.xBestIndex  := @fts3termBestIndexMethod;
+  fts3term_module.xDisconnect := @fts3termDisconnectMethod;
+  fts3term_module.xDestroy    := @fts3termDisconnectMethod;
+  fts3term_module.xOpen       := @fts3termOpenMethod;
+  fts3term_module.xClose      := @fts3termCloseMethod;
+  fts3term_module.xFilter     := @fts3termFilterMethod;
+  fts3term_module.xNext       := @fts3termNextMethod;
+  fts3term_module.xEof        := @fts3termEofMethod;
+  fts3term_module.xColumn     := @fts3termColumnMethod;
+  fts3term_module.xRowid      := @fts3termRowidMethod;
+end;
+
+{ fts3_term.c:348..379 — sqlite3Fts3InitTerm. }
+function sqlite3Fts3InitTerm(db: PTsqlite3): cint;
+begin
+  initFts3TermModule;
+  Result := sqlite3_create_module(db, PAnsiChar('fts4term'), @fts3term_module, nil);
+end;
+{$ENDIF}
+
 { fts3.c:4068..4075 — hashDestroy.  nRef-guarded so it is safe to attach to
   more than one FuncDef sharing the same user-data (each FuncDef teardown
   calls it once; only the last frees).  TODO(6.40.1.o): when the fts3/fts4/
@@ -13756,6 +14665,17 @@ begin
   pSimple := nil; pPorter := nil; pUnicode := nil;
 
   sqlite3Fts3UnicodeTokenizer(@pUnicode);
+
+{$IFDEF SQLITE_TEST}
+  { fts3.c:4120..4123 — register the SQLITE_TEST-only fts4term module. }
+  rc := sqlite3Fts3InitTerm(db);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+{$ENDIF}
+
+  { fts3.c:4125..4126 — register the fts4aux module. }
+  rc := sqlite3Fts3InitAux(db);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
   sqlite3Fts3SimpleTokenizerModule(@pSimple);
   sqlite3Fts3PorterTokenizerModule(@pPorter);
 
