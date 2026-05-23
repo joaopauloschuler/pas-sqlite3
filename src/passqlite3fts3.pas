@@ -651,12 +651,11 @@ function sqlite3Fts3InitTerm(db: PTsqlite3): cint;
 {$ENDIF}
 
 { --------------------------------------------------------------------- }
-{ 6.40.1.g (down-payment on 6.40.1.o) — minimal sqlite3Fts3Init: alloc    }
-{ the tokenizer-hash wrapper, load simple/porter/unicode61, and install   }
-{ the fts3_tokenizer SQL function(s) via sqlite3Fts3InitHashTable AND, as   }
-{ of 6.40.1.h, the fts3tokenize VTAB module via sqlite3Fts3InitTok.  Does   }
-{ NOT register the fts3/fts4 VTAB modules — those land in 6.40.1.k/.o.      }
-{ fts3.c:4102 (partial port).                                             }
+{ 6.40.1.o — sqlite3Fts3Init (fts3.c:4102), full port: InitTerm(TEST) →    }
+{ InitAux → load simple/porter/unicode61 into the tokenizer hash →         }
+{ ExprInitTestInterface(TEST) → InitHashTable("fts3_tokenizer") →          }
+{ overload snippet/offsets/matchinfo/optimize → create_module fts3 + fts4  }
+{ → InitTok.  nRef-guarded: each create_module + the hashtable owns a ref. }
 { --------------------------------------------------------------------- }
 function sqlite3Fts3Init(db: PTsqlite3): cint;
 
@@ -701,6 +700,27 @@ function sqlite3Fts3GetVarintBounded(const pBuf, pEnd: PChar;
   v: Psqlite3_int64): cint;
 function sqlite3Fts3GetVarint32(const p: PChar; pi: Pcint): cint;
 function sqlite3Fts3VarintLen(v: u64): cint;
+
+{ fts3_expr.c:66..74 — runtime-settable query-syntax flag.  Declared in the
+  INTERFACE under SQLITE_TEST so the Tcl harness (Sqlitetestfts3_Init,
+  fts3_test.c) can Tcl_LinkVar `sqlite_fts3_enable_parentheses` to its
+  address (6.40.1.o).  Under the engine (non-TEST) build the oracle defines
+  SQLITE_ENABLE_FTS3_PARENTHESIS, so it is a const 1. }
+{$IFDEF SQLITE_TEST}
+var
+  sqlite3_fts3_enable_parentheses: cint = 0;
+{ fts3_write.c:60..61 — incremental-load chunk size/threshold, mutable under
+  SQLITE_TEST so the `fts3_configure_incr_load` Tcl command (fts3_test.c) can
+  read/override them.  FTS3_NODE_CHUNKSIZE / FTS3_NODE_CHUNK_THRESHOLD resolve
+  to these via the inline accessors below (fts3_write.c:62..63). }
+  test_fts3_node_chunksize: cint = (4*1024);
+  test_fts3_node_chunk_threshold: cint = (4*1024)*4;
+function FTS3_NODE_CHUNKSIZE: cint; inline;
+function FTS3_NODE_CHUNK_THRESHOLD: cint; inline;
+{$ELSE}
+const
+  sqlite3_fts3_enable_parentheses = 1;
+{$ENDIF}
 
 { fts3_write.c:280..292 — sqlite3Fts3PrepareStmt. }
 function sqlite3Fts3PrepareStmt(p: PFts3Table; const zSql: PChar;
@@ -3528,15 +3548,16 @@ end;
 { the new-syntax path under the Tcl bridge.                               }
 { ===================================================================== }
 
+{ sqlite3_fts3_enable_parentheses now lives in the INTERFACE section (so the
+  Tcl harness can Tcl_LinkVar it); see fts3_expr.c:66..74. }
+
 {$IFDEF SQLITE_TEST}
-{ fts3_expr.c:67 — exported, runtime-settable so both syntaxes test from
-  one build.  Default 0 (legacy), matching tester.tcl:2614. }
-var
-  sqlite3_fts3_enable_parentheses: cint = 0;
-{$ELSE}
-{ fts3_expr.c:69..70 — the oracle build defines SQLITE_ENABLE_FTS3_PARENTHESIS. }
-const
-  sqlite3_fts3_enable_parentheses = 1;
+{ fts3_write.c:62..63 — FTS3_NODE_CHUNKSIZE / FTS3_NODE_CHUNK_THRESHOLD macros
+  alias the mutable test globals under SQLITE_TEST. }
+function FTS3_NODE_CHUNKSIZE: cint; inline;
+begin Result := test_fts3_node_chunksize; end;
+function FTS3_NODE_CHUNK_THRESHOLD: cint; inline;
+begin Result := test_fts3_node_chunk_threshold; end;
 {$ENDIF}
 
 { fts3_expr.c:116..118 — fts3isspace.  Accepts a char and returns 0 for any
@@ -4720,9 +4741,11 @@ const
   FTS_MAX_APPENDABLE_HEIGHT = 16;
   { fts3_write.c:40 — node padding so two varints can always be read safely. }
   FTS3_NODE_PADDING = FTS3_VARINT_MAX*2;
+{$IFNDEF SQLITE_TEST}
   { fts3_write.c:65..66 — incremental-load chunk size/threshold (non-TEST). }
   FTS3_NODE_CHUNKSIZE = (4*1024);
   FTS3_NODE_CHUNK_THRESHOLD = FTS3_NODE_CHUNKSIZE*4;
+{$ENDIF}
   { fts3Int.h:203..204 }
   LARGEST_INT64  = sqlite3_int64($7fffffffffffffff);
   SMALLEST_INT64 = sqlite3_int64($8000000000000000);

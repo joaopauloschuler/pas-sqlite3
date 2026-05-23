@@ -296,10 +296,17 @@ proc finalize_testing {} {
 # the BODY and `ifcapable foo` runs ELSEBODY.
 array set ::sqlite_options {}
 set ::sqlite_options(allow_rowid_in_view) 0
-# pas-sqlite3 does not ship FTS3/4/5 — mirror test_config.c when
-# SQLITE_OMIT_FTS3 / SQLITE_OMIT_FTS5 are defined.
-set ::sqlite_options(fts3) 0
+# 6.40.1.o — pas-sqlite3 now ships FTS3/FTS4 (passqlite3fts3.pas, registered
+# by sqlite3Fts3Init at openDatabase).  Mirror test_config.c:437..453: this
+# build defines SQLITE_ENABLE_FTS3 and does NOT define SQLITE_DISABLE_FTS3_UNICODE
+# (the unicode61 tokenizer is ported), so fts3=1 and fts3_unicode=1.  FTS5 is
+# not ported (fts5=0).  The port uses the no-deferred-token subset of
+# fts3_write.c, equivalent to building with SQLITE_DISABLE_FTS4_DEFERRED, so
+# fts4_deferred=0 (test_config.c:455..459).  (icu is already pinned 0 below.)
+set ::sqlite_options(fts3) 1
+set ::sqlite_options(fts3_unicode) 1
 set ::sqlite_options(fts5) 0
+set ::sqlite_options(fts4_deferred) 0
 # 9.4.divbug.87.066 — this build defines neither SQLITE_SECURE_DELETE nor
 # SQLITE_FAST_SECURE_DELETE (btree.c:2695..2699 / test_config.c:751..759),
 # so both caps must read 0.  Without these, `ifcapable fast_secure_delete`

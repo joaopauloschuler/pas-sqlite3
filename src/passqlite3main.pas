@@ -991,14 +991,13 @@ begin
     sqlite3DbpageRegister(db);
   if db^.mallocFailed = 0 then
     sqlite3DbstatRegister(db);
-  { 6.40.1.g — minimal FTS3 tokenizer registry (down-payment on 6.40.1.o).
-    Installs the `fts3_tokenizer` SQL function(s) — and, under SQLITE_TEST,
-    `fts3_tokenizer_test` / `fts3_tokenizer_internal_test` — backed by a
-    per-connection tokenizer hash preloaded with simple/porter/unicode61.
-    Does NOT register the fts3/fts4/fts3tokenize VTAB modules (those land
-    in 6.40.1.h/.k/.o).  sqlite3Fts3Init returns SQLITE_NOMEM on alloc
-    failure; surface it via mallocFailed so the shared OOM path below
-    handles it like the dbpage/dbstat registrations. }
+  { 6.40.1.o — full FTS3/FTS4 registration (fts3.c:4102 sqlite3Fts3Init):
+    the fts3/fts4/fts4aux/fts3tokenize(+fts4term under SQLITE_TEST) VTAB
+    modules, the `fts3_tokenizer`(_test) SQL funcs, and the
+    snippet/offsets/matchinfo/optimize overloads, backed by a per-connection
+    tokenizer hash preloaded with simple/porter/unicode61.  sqlite3Fts3Init
+    returns SQLITE_NOMEM on alloc failure; surface it via mallocFailed so the
+    shared OOM path below handles it like the dbpage/dbstat registrations. }
   if db^.mallocFailed = 0 then
     if sqlite3Fts3Init(db) = SQLITE_NOMEM then
       sqlite3OomFault(db);
@@ -6318,6 +6317,12 @@ initialization
     whereexpr.c:449) can query a vtab module's xFindFunction overload. }
   passqlite3codegen.gVtabFindFunctionOp :=
     passqlite3codegen.TVtabFindFunctionOpFn(@passqlite3vtab.sqlite3VtabFindFunctionOp);
+  { Wire sqlite3VtabCallConnect so viewGetColumnNames (codegen.pas,
+    build.c:3101..3108) can xConnect a virtual table whose column names are
+    not yet known (FTS reopen / UPDATE-after-reopen).  Lives in passqlite3vtab
+    (circular codegen->vtab uses). }
+  passqlite3codegen.gVtabCallConnect :=
+    passqlite3codegen.TVtabCallConnectFn(@passqlite3vtab.sqlite3VtabCallConnect);
   { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
     dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA. }
   passqlite3codegen.gFileControl :=

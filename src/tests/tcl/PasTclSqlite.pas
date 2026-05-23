@@ -37,7 +37,7 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleMd5, TestModuleTclvar, TestModuleBestindex,
      TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
-     TestModuleVfs;
+     TestModuleVfs, TestModuleFts3;
 
 const
   { tclsqlite.c:121..122 — default and hard cap on the LRU statement cache. }
@@ -4818,6 +4818,11 @@ begin
     Tcl command (wrapper VFS with filter/script callbacks) used by
     interrupt2.test, mjournal.test, e_wal.test, nolock.test, etc. }
   Sqlitetestvfs_Init(interp);
+  { 6.40.1.o — fts3_test.c: register fts3_near_match / fts3_configure_incr_load
+    / fts3_test_tokenizer / fts3_test_varint / sqlite3_fts3_may_be_corrupt and
+    Tcl_LinkVar `sqlite_fts3_enable_parentheses` (test1.c:9447..9449) so the
+    gated fts3*/fts4* .test files can drive the new-syntax query path. }
+  Sqlitetestfts3_Init(interp);
   { 9.4.divbug.73 — test1.c:9366..9371 Tcl_LinkVar the optimiser/B-tree
     visit counters so regression tests (rowid-4.5/.5.1, where*/in*/minmax,
     between's `queryplan`) can read them.  Without this, $sqlite_search_count

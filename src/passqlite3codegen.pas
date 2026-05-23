@@ -3066,6 +3066,11 @@ type
     passqlite3vtab (circular uses); wired from passqlite3main at startup. }
   TVtabFindFunctionOpFn = function(db: PTsqlite3; pTab: Pointer;
                                    zName: PAnsiChar; nArg: i32): i32;
+  { Trampoline for the IsVirtual arm of viewGetColumnNames (build.c:3101..3108):
+    a vtab whose column names are not yet known (e.g. an FTS table after a
+    db reopen, nCol==0) must be xConnect'd here.  Lives in passqlite3vtab
+    (circular uses); wired from passqlite3main at startup. }
+  TVtabCallConnectFn = function(pParse: PParse; pTab: PTable2): i32;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
@@ -3077,6 +3082,7 @@ var
   gOverloadFunction: TOverloadFunctionFn;
   gVtabOverloadFunction: TVtabOverloadFunctionFn;
   gVtabFindFunctionOp: TVtabFindFunctionOpFn;
+  gVtabCallConnect: TVtabCallConnectFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -47814,6 +47820,19 @@ begin
   nErr := 0;
   db := pParse^.db;
   AssertH(pTable <> nil, 'viewGetColumnNames: pTable');
+
+  { build.c:3101..3108 — a virtual table whose column names are not yet known
+    (nCol<=0, e.g. an FTS3/FTS4 table after a db reopen) must be xConnect'd,
+    not treated as a view.  Reached via the gVtabCallConnect trampoline
+    (circular codegen<->vtab uses).  Without this the view path below would
+    sqlite3SelectDup(nil pSelect) and SIGSEGV. }
+  if (pTable^.eTabType = TABTYP_VTAB) and (@gVtabCallConnect <> nil) then begin
+    Inc(db^.nSchemaLock);
+    Result := gVtabCallConnect(pParse, pTable);
+    Dec(db^.nSchemaLock);
+    Exit;
+  end;
+
   if pTable^.nCol < 0 then begin
     sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
       PAnsiChar('view %s is circularly defined'),
@@ -47877,8 +47896,12 @@ end;
 function sqlite3ViewGetColumnNames(pParse: PParse; pTable: PTable2): i32;
 begin
   AssertH(pTable <> nil, 'sqlite3ViewGetColumnNames: pTable');
-  { Skip if columns are already known.  Mirrors build.c:3211. }
-  if pTable^.nCol > 0 then begin Result := 0; Exit; end;
+  { build.c:3212 — skip only if columns are already known AND this is not a
+    virtual table; a virtual table always re-enters viewGetColumnNames (which
+    routes to xConnect via the gVtabCallConnect trampoline). }
+  if (pTable^.eTabType <> TABTYP_VTAB) and (pTable^.nCol > 0) then begin
+    Result := 0; Exit;
+  end;
   Result := viewGetColumnNamesImpl(pParse, pTable);
 end;
 
