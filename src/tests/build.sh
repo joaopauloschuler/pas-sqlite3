@@ -200,6 +200,7 @@ compile_test TestVtab
 compile_test TestCarray
 compile_test TestDbpage
 compile_test TestDbstat
+compile_test TestFts3Hash
 compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable
