@@ -4769,11 +4769,110 @@ const
   { fts3.c:4461 — max tokens for the incremental doclist strategy. }
   MAX_INCR_PHRASE_TOKENS = 4;
 
-{ qsort from libc, used by sqlite3Fts3SegReaderPending (fts3_write.c:1771). }
+{ 6.40.1.p.2.6 — replaces the libc qsort used by sqlite3Fts3SegReaderPending
+  (fts3_write.c:1771).  Same signature as C qsort; the comparator is the
+  existing TFts3QSortCmp.  Implemented as an in-place comparison sort over a
+  raw byte array of `nmemb` elements each `size` bytes.  Ordering is fully
+  determined by the comparator (FTS3's tie-break n1-n2 only ties on identical
+  unique hash keys), so any correct comparison sort matches libc's output. }
 type
   TFts3QSortCmp = function(const a, b: Pointer): cint; cdecl;
-procedure libc_qsort(base: Pointer; nmemb, size: NativeUInt;
-  compar: TFts3QSortCmp); cdecl; external 'c' name 'qsort';
+
+procedure fts3Qsort(base: Pointer; nmemb, size: NativeUInt;
+  compar: TFts3QSortCmp);
+var
+  pBase: PByte;
+  tmp: PByte;
+
+  function ElemAt(i: NativeUInt): Pointer; inline;
+  begin
+    Result := pBase + i * size;
+  end;
+
+  procedure SwapElem(i, j: NativeUInt);
+  begin
+    if i = j then Exit;
+    Move(ElemAt(i)^, tmp^, size);
+    Move(ElemAt(j)^, ElemAt(i)^, size);
+    Move(tmp^, ElemAt(j)^, size);
+  end;
+
+  { Iterative quicksort with an explicit bounds stack (no recursion); insertion
+    sort for small partitions.  lo/hi are inclusive element indices.  Pivot is
+    median-of-three moved to hi, then a Lomuto partition.  The comparator gives
+    a total order over the (unique) keys, so the final arrangement is the same
+    one libc qsort produces. }
+  procedure QSort(lo, hi: NativeInt);
+  var
+    stack: array of record l, h: NativeInt; end;
+    sp: NativeInt;
+    i, j, mid, store: NativeInt;
+  begin
+    if hi <= lo then Exit;
+    SetLength(stack, 64);
+    sp := 0;
+    stack[sp].l := lo; stack[sp].h := hi; Inc(sp);
+    while sp > 0 do begin
+      Dec(sp);
+      lo := stack[sp].l; hi := stack[sp].h;
+      while lo < hi do begin
+        { Small partition: insertion sort and stop. }
+        if (hi - lo) < 8 then begin
+          for i := lo + 1 to hi do begin
+            j := i;
+            while (j > lo)
+              and (compar(ElemAt(NativeUInt(j-1)), ElemAt(NativeUInt(j))) > 0) do
+            begin
+              SwapElem(NativeUInt(j-1), NativeUInt(j));
+              Dec(j);
+            end;
+          end;
+          Break;
+        end;
+        { Median-of-three: order lo, mid, hi then park the median at hi. }
+        mid := lo + (hi - lo) div 2;
+        if compar(ElemAt(NativeUInt(lo)), ElemAt(NativeUInt(mid))) > 0 then
+          SwapElem(NativeUInt(lo), NativeUInt(mid));
+        if compar(ElemAt(NativeUInt(lo)), ElemAt(NativeUInt(hi))) > 0 then
+          SwapElem(NativeUInt(lo), NativeUInt(hi));
+        if compar(ElemAt(NativeUInt(mid)), ElemAt(NativeUInt(hi))) > 0 then
+          SwapElem(NativeUInt(mid), NativeUInt(hi));
+        { Median now sits at hi (pivot); lo already <= pivot. }
+        store := lo;
+        for i := lo to hi - 1 do begin
+          if compar(ElemAt(NativeUInt(i)), ElemAt(NativeUInt(hi))) < 0 then begin
+            SwapElem(NativeUInt(i), NativeUInt(store));
+            Inc(store);
+          end;
+        end;
+        SwapElem(NativeUInt(store), NativeUInt(hi));
+        { Recurse on the smaller side via the stack, loop on the larger. }
+        if (store - 1 - lo) < (hi - store - 1) then begin
+          if (store + 1) < hi then begin
+            stack[sp].l := store + 1; stack[sp].h := hi; Inc(sp);
+          end;
+          hi := store - 1;
+        end else begin
+          if lo < (store - 1) then begin
+            stack[sp].l := lo; stack[sp].h := store - 1; Inc(sp);
+          end;
+          lo := store + 1;
+        end;
+        if sp >= Length(stack) then SetLength(stack, Length(stack) * 2);
+      end;
+    end;
+  end;
+
+begin
+  if (nmemb < 2) or (size = 0) then Exit;
+  pBase := PByte(base);
+  GetMem(tmp, size);
+  try
+    QSort(0, NativeInt(nmemb) - 1);
+  finally
+    FreeMem(tmp);
+  end;
+end;
 
 type
   { fts3_write.c:217..228 — struct SegmentNode (interior tree node). }
@@ -6110,7 +6209,7 @@ begin
       pE := fts3HashNext(pE);
     end;
     if nElem > 1 then
-      libc_qsort(aElem, NativeUInt(nElem), SizeOf(PFts3HashElem),
+      fts3Qsort(aElem, NativeUInt(nElem), SizeOf(PFts3HashElem),
         @fts3CompareElemByTerm);
   end else begin
     pE := sqlite3Fts3HashFindElem(pHash, zTerm, nTerm);
