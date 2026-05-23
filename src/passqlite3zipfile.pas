@@ -33,6 +33,7 @@ interface
 
 uses
   SysUtils,
+  Strings,
   passqlite3types,
   passqlite3util,
   passqlite3os,
@@ -231,7 +232,7 @@ function fwriteC(buf: Pointer; sz, n: NativeUInt; f: Pointer): NativeUInt;
 function fseekC(f: Pointer; off: clong; whence: cint): cint;
   cdecl; external 'c' name 'fseek';
 function ftellC(f: Pointer): clong; cdecl; external 'c' name 'ftell';
-function strlenC(s: PAnsiChar): NativeUInt; cdecl; external 'c' name 'strlen';
+{ 6.40.1.p.2.5 — strlen external replaced with FPC RTL StrLen. }
 
 const
   SEEK_SET = 0;
@@ -779,7 +780,7 @@ begin
 
   if argc > 3 then begin
     zFile := argv3;
-    nFile := i32(strlenC(zFile)) + 1;
+    nFile := i32(StrLen(zFile)) + 1;
   end;
 
   rc := sqlite3_declare_vtab(db, ZIPFILE_SCHEMA);
@@ -1341,7 +1342,7 @@ begin
   end else if (z[0] >= '0') and (z[0] <= '9') then begin
     mode := u32(sqlite3_value_int(pVal));
   end else begin
-    if strlenC(z) <> 10 then goto parse_error;
+    if StrLen(z) <> 10 then goto parse_error;
     case z[0] of
       '-': mode := mode or S_IFREG;
       'd': mode := mode or S_IFDIR;
@@ -1373,7 +1374,7 @@ end;
 function zipfileComparePath(zA, zB: PAnsiChar; nB: i32): i32;
 var nA: i32;
 begin
-  nA := i32(strlenC(zA));
+  nA := i32(StrLen(zA));
   if (nA > 0) and (zA[nA - 1] = '/') then Dec(nA);
   if (nB > 0) and (zB[nB - 1] = '/') then Dec(nB);
   if (nA = nB) and (CompareByte(zA^, zB^, nA) = 0) then
@@ -1497,7 +1498,7 @@ begin
 
   if sqlite3_value_type(apVal[0]) <> SQLITE_NULL then begin
     zDelete := PAnsiChar(sqlite3_value_text(apVal[0]));
-    nDelete := i32(strlenC(zDelete));
+    nDelete := i32(StrLen(zDelete));
     if nVal > 1 then begin
       zUpdate := PAnsiChar(sqlite3_value_text(apVal[1]));
       if (zUpdate <> nil) and
@@ -1558,7 +1559,7 @@ begin
     if rc = SQLITE_OK then begin
       zPath := PAnsiChar(sqlite3_value_text(apVal[2]));
       if zPath = nil then zPath := '';
-      nPath := i32(strlenC(zPath));
+      nPath := i32(StrLen(zPath));
       if nPath > ZIPFILE_MX_NAME then begin
         zipfileTableErr(pTab, 'filename too long; max: %d bytes',
           [ZIPFILE_MX_NAME]);
@@ -1576,7 +1577,7 @@ begin
           rc := SQLITE_NOMEM;
           nPath := 0;
         end else
-          nPath := i32(strlenC(zPath));
+          nPath := i32(StrLen(zPath));
       end;
     end;
 
@@ -1930,7 +1931,7 @@ begin
         rc := SQLITE_NOMEM;
         goto zipfile_step_out;
       end;
-      nName := i32(strlenC(zName));
+      nName := i32(StrLen(zName));
     end else begin
       while (nName > 1) and (zName[nName - 2] = '/') do Dec(nName);
     end;

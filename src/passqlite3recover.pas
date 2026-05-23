@@ -66,6 +66,7 @@ interface
 
 uses
   ctypes,
+  Strings,
   passqlite3types,
   passqlite3util,
   passqlite3printf,
@@ -509,12 +510,31 @@ begin
   end;
 end;
 
-{ ASCII strstr (libc).  Returned pointer is into the haystack. }
+{ 6.40.1.p.2.5 — strstr/strlen externals replaced with FPC RTL.
+  ASCII strstr: returns a pointer into haystack at the first occurrence of
+  needle, or nil; an empty needle returns haystack (matches C strstr). }
 function recoverStrStr(haystack, needle: PAnsiChar): PAnsiChar;
-  cdecl; external 'c' name 'strstr';
+var
+  h, n: PAnsiChar;
+begin
+  if needle^ = #0 then Exit(haystack);
+  while haystack^ <> #0 do begin
+    h := haystack;
+    n := needle;
+    while (n^ <> #0) and (h^ = n^) do begin
+      Inc(h);
+      Inc(n);
+    end;
+    if n^ = #0 then Exit(haystack);
+    Inc(haystack);
+  end;
+  Result := nil;
+end;
 
 function recoverStrLen(s: PAnsiChar): NativeUInt;
-  cdecl; external 'c' name 'strlen';
+begin
+  Result := StrLen(s);
+end;
 
 function recoverUnusedString(z, zA, zB, zBuf: PAnsiChar): PAnsiChar;
 var
