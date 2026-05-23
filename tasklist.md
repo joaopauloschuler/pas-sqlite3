@@ -1172,6 +1172,8 @@ ports: bare table-valued or MATCH-style invocations are blocked by bug 6.13
 
 - [X] **3.B.regbug.1** TestPagerReadOnly — fixed 2026-05-10 (test-fixture path-resolution defect).
 - [X] **6.regbug.1** TestWhereExpr — fixed 2026-05-10 (test-fixture: `pTab^.iPKey` left at 0, must stamp `-1` after `sqlite3DbMallocZero`).
+- [X] **trigger1.regbug.1** trigger1 same-name trigger 13→1 fail — sqlite3InitCallback "already-published" skip-guard cross-checked the schema-row name across tblHash/idxHash/trigHash; a trigger named like its table matched the table → reparse skipped → trigger never linked into trigHash. Made the guard type-aware off argv[0] (prepare.c:116 has no such guard; it is a port-local workaround for the dropped schema-SELECT WHERE filter). main.pas ~3202.
+- [ ] **trigger1.regbug.2** trigger1-22.10 (residual, separate bug): in a multi-row INSERT (VALUES/SELECT) that fires a BEFORE/AFTER trigger reading the destination table, writes from earlier loop iterations are invisible to a freshly-opened cursor in later iterations (count/max/scan see only the first row); single-row INSERT is correct. Codegen + OP_Program + btree cursor-sharing all verified faithful — divergence is deeper (page-cache/cursor coherency within one multi-row statement). Not the same-name class the prior triage assumed.
 
 ---
 

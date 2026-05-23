@@ -3146,9 +3146,10 @@ var
   rc        : i32;
   saved_iDb : u8;
   pStmt     : Pointer;
-  zArg1, zArg3, zArg4 : PAnsiChar;
+  zArg0, zArg1, zArg3, zArg4 : PAnsiChar;
   c0, c1    : u8;
   pIndex    : PIndex2;
+  alreadyPublished : Boolean;
 begin
   pData := PInitData(pInit);
   db    := pData^.db;
@@ -3165,6 +3166,7 @@ begin
   end;
   Assert((iDb >= 0) and (iDb < db^.nDb));
 
+  zArg0 := (argv + 0)^;
   zArg1 := (argv + 1)^;
   zArg3 := (argv + 3)^;
   zArg4 := (argv + 4)^;
@@ -3199,15 +3201,38 @@ begin
         next btree-allocating statement after any prior CREATE INDEX.
         sqlite3FindTable handles tables and views (both live in
         tblHash); sqlite3FindIndex handles indexes. }
-      if (zArg1 <> nil)
-         and ((sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)
-              or (sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)
-              or ((db^.aDb[iDb].pSchema <> nil)
-                  and (sqlite3HashFind(
-                         @passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.trigHash,
-                         PChar(zArg1)) <> nil))) then
-      begin
-        Result := 0; Exit;
+      { The "already published" check MUST be scoped to the namespace that
+        re-preparing THIS row's CREATE statement would publish into — i.e.
+        keyed on argv[0] (the schema row type) — not a blanket lookup across
+        tblHash/idxHash/trigHash.  A trigger and a table can legally share a
+        name (CREATE TRIGGER t2 ... ON t2): an unscoped check found the
+        existing TABLE t2 in tblHash, treated the trigger row as already
+        published, and skipped its re-prepare so the trigger was never linked
+        into trigHash / pTab->pTrg — DELETE never fired and DROP TRIGGER said
+        "no such trigger" (trigger1-6.x/8.x/22.10).  C (prepare.c:116) has no
+        such guard at all; it is a port-local workaround for the dropped WHERE
+        filter on the schema SELECT (see execParseSchemaImpl banner), so it
+        must skip a row only when an object of the SAME type already exists. }
+      if zArg1 <> nil then begin
+        alreadyPublished := False;
+        if (zArg0 <> nil)
+           and (sqlite3StrICmp(zArg0, PAnsiChar('trigger')) = 0) then begin
+          alreadyPublished := (db^.aDb[iDb].pSchema <> nil)
+            and (sqlite3HashFind(
+                   @passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.trigHash,
+                   PChar(zArg1)) <> nil);
+        end else if (zArg0 <> nil)
+           and (sqlite3StrICmp(zArg0, PAnsiChar('index')) = 0) then begin
+          alreadyPublished :=
+            sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName) <> nil;
+        end else begin
+          { 'table' / 'view' — both live in tblHash. }
+          alreadyPublished :=
+            sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil;
+        end;
+        if alreadyPublished then begin
+          Result := 0; Exit;
+        end;
       end;
       { Branch (b) — re-prepare a CREATE statement to publish into
         pSchema^.tblHash.  init.busy is already 1 (set by the
