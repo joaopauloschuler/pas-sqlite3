@@ -206,6 +206,7 @@ compile_test TestFts3Unicode
 compile_test TestFts3TokRegistry
 compile_test TestFts3TokVtab
 compile_test TestFts3Expr
+compile_test TestFts3Write
 compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable

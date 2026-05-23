@@ -272,6 +272,284 @@ type
     aMI     : Pcuint;            { See fts3Int.h }
   end;
 
+  { ===================================================================== }
+  { 6.40.1.j — shared structs from fts3Int.h.  These are populated/used by }
+  { the segment engine (fts3_write.c) and are also referenced by the       }
+  { fts3/fts4 vtab module (.k), fts3_snippet.c (.l), fts3_aux.c (.m) and    }
+  { fts3_term.c (.n).  Declared here so all those tasks can reuse them.     }
+  { ===================================================================== }
+
+  Psqlite3_int64      = Pi64;          { fts3_write.c sqlite3_int64* params }
+
+  PFts3Table          = ^TFts3Table;
+  PFts3Cursor         = ^TFts3Cursor;
+  PFts3SegReader      = ^TFts3SegReader;
+  PPFts3SegReader     = ^PFts3SegReader;
+  PFts3MultiSegReader = ^TFts3MultiSegReader;
+  PFts3SegFilter      = ^TFts3SegFilter;
+  PFts3DeferredTokenR = ^TFts3DeferredToken;
+  PMatchinfoBuffer    = Pointer;       { fts3_snippet.c (6.40.1.l) — opaque here }
+
+  { fts3Int.h:313..316 — struct Fts3Index (one per term/prefix index). }
+  PFts3Index = ^TFts3Index;
+  TFts3Index = record
+    nPrefix  : cint;             { Prefix length (0 for main terms index) }
+    hPending : TFts3Hash;        { Pending terms table for this index }
+  end;
+
+  { fts3Int.h:260..341 — struct Fts3Table.  Populated by fts3.c xConnect (.k);
+    here we port the struct + the functions that read/write through it.
+    Debug-only fields (inTransaction/mxSavepoint, bNoIncrDoclist/nMergeCount)
+    are kept unconditionally for a stable ABI layout shared with .k. }
+  TFts3Table = record
+    base          : Tsqlite3_vtab;     { Base class used by SQLite core }
+    db            : PTsqlite3;          { The database connection }
+    zDb           : PChar;             { logical database name }
+    zName         : PChar;             { virtual table name }
+    nColumn       : cint;              { number of named columns in vtab }
+    azColumn      : PPChar;            { column names.  malloced }
+    abNotindexed  : PByte;             { True for 'notindexed' columns }
+    pTokenizer    : Psqlite3_tokenizer;{ tokenizer for inserts and queries }
+    zContentTbl   : PChar;             { content=xxx option, or NULL }
+    zLanguageid   : PChar;             { languageid=xxx option, or NULL }
+    nAutoincrmerge: cint;              { Value configured by 'automerge' }
+    nLeafAdd      : cuint;             { Number of leaf blocks added this trans }
+    bLock         : cint;              { prevent recursive content= tbls }
+
+    aStmt         : array[0..39] of PVdbe;  { Precompiled statements }
+    pSeekStmt     : PVdbe;             { Cache for fts3CursorSeekStmt() }
+
+    zReadExprlist : PChar;
+    zWriteExprlist: PChar;
+
+    nNodeSize     : cint;              { Soft limit for node size }
+    bFts4         : cuchar;            { True for FTS4, false for FTS3 }
+    bHasStat      : cuchar;            { True if %_stat exists (2==unknown) }
+    bHasDocsize   : cuchar;            { True if %_docsize table exists }
+    bDescIdx      : cuchar;            { True if doclists are in reverse order }
+    bIgnoreSavepoint: cuchar;          { True to ignore xSavepoint invocations }
+    nPgsz         : cint;              { Page size for host database }
+    zSegmentsTbl  : PChar;             { Name of %_segments table }
+    pSegments     : Psqlite3_blob;     { Blob handle open on %_segments table }
+    iSavepoint    : cint;
+
+    nIndex        : cint;              { Size of aIndex[] }
+    aIndex        : PFts3Index;        { Array of term/prefix indexes }
+    nMaxPendingData: cint;             { Max pending data before flush to disk }
+    nPendingData  : cint;              { Current bytes of pending data }
+    iPrevDocid    : sqlite3_int64;     { Docid of most recently inserted doc }
+    iPrevLangid   : cint;              { Langid of recently inserted document }
+    bPrevDelete   : cint;              { True if last operation was a delete }
+
+    { SQLITE_DEBUG || SQLITE_COVERAGE_TEST }
+    inTransaction : cint;              { True after xBegin before xCommit }
+    mxSavepoint   : cint;              { Largest valid xSavepoint integer }
+
+    { SQLITE_DEBUG || SQLITE_TEST }
+    bNoIncrDoclist: cint;              { test-no-incr-doclist special insert }
+    nMergeCount   : cint;              { Number of segments in a level }
+  end;
+
+  { fts3Int.h:355..378 — struct Fts3Cursor.  Owned by fts3.c (.k); declared
+    here because the deferred-token machinery in fts3_write.c reads/writes
+    pCsr->pDeferred, pStmt, iLangid and base.pVtab. }
+  TFts3Cursor = record
+    base          : Tsqlite3_vtab_cursor; { Base class used by SQLite core }
+    eSearch       : cshort;            { Search strategy }
+    isEof         : cuchar;            { True if at End Of Results }
+    isRequireSeek : cuchar;            { True if must seek pStmt to %_content }
+    bSeekStmt     : cuchar;            { True if pStmt is a seek }
+    pStmt         : PVdbe;             { Prepared statement in use by cursor }
+    pExpr         : PFts3Expr;         { Parsed MATCH query string }
+    iLangid       : cint;              { Language being queried for }
+    nPhrase       : cint;              { Number of matchable phrases in query }
+    pDeferred     : PFts3DeferredTokenR;{ Deferred search tokens, if any }
+    iPrevId       : sqlite3_int64;     { Previous id read from aDoclist }
+    pNextId       : PChar;             { Pointer into the body of aDoclist }
+    aDoclist      : PChar;             { List of docids for full-text queries }
+    nDoclist      : cint;              { Size of buffer at aDoclist }
+    bDesc         : cuchar;            { True to sort in descending order }
+    eEvalmode     : cint;              { An FTS3_EVAL_XX constant }
+    nRowAvg       : cint;              { Average size of database rows, in pages }
+    nDoc          : sqlite3_int64;     { Documents in table }
+    iMinDocid     : sqlite3_int64;     { Minimum docid to return }
+    iMaxDocid     : sqlite3_int64;     { Maximum docid to return }
+    isMatchinfoNeeded: cint;           { True when aMatchinfo[] needs filling }
+    pMIBuffer     : PMatchinfoBuffer;  { Buffer for matchinfo data }
+  end;
+
+  { fts3Int.h:137..171 — struct Fts3SegReader.  Internal to fts3_write.c, but
+    handled opaquely by fts3.c. }
+  TFts3SegReader = record
+    iIdx          : cint;              { Index within level, or 0x7FFFFFFF for PT }
+    bLookup       : cuchar;            { True for a lookup only }
+    rootOnly      : cuchar;            { True for a root-only reader }
+
+    iStartBlock   : sqlite3_int64;     { Rowid of first leaf block to traverse }
+    iLeafEndBlock : sqlite3_int64;     { Rowid of final leaf block to traverse }
+    iEndBlock     : sqlite3_int64;     { Rowid of final block in segment (or 0) }
+    iCurrentBlock : sqlite3_int64;     { Current leaf block (or 0) }
+
+    aNode         : PChar;             { Pointer to node data (or NULL) }
+    nNode         : cint;              { Size of buffer at aNode (or 0) }
+    nPopulate     : cint;              { If >0, bytes of buffer aNode[] loaded }
+    pBlob         : Psqlite3_blob;     { If not NULL, blob handle to read node }
+
+    ppNextElem    : PPFts3HashElem;
+
+    { Variables set by fts3SegReaderNext(). }
+    nTerm         : cint;              { Number of bytes in current term }
+    zTerm         : PChar;             { Pointer to current term }
+    nTermAlloc    : cint;              { Allocated size of zTerm buffer }
+    aDoclist      : PChar;             { Pointer to doclist of current entry }
+    nDoclist      : cint;              { Size of doclist in current entry }
+
+    { Used by fts3SegReaderNextDocid() }
+    pOffsetList   : PChar;
+    nOffsetList   : cint;              { For descending pending seg-readers only }
+    iDocid        : sqlite3_int64;
+  end;
+
+  { fts3Int.h:577..582 — struct Fts3SegFilter. }
+  TFts3SegFilter = record
+    zTerm : PChar;
+    nTerm : cint;
+    iCol  : cint;
+    flags : cint;
+  end;
+
+  { fts3Int.h:584..605 — struct Fts3MultiSegReader. }
+  TFts3MultiSegReader = record
+    apSegment : PPFts3SegReader;       { Array of Fts3SegReader objects }
+    nSegment  : cint;                  { Size of apSegment array }
+    nAdvance  : cint;                  { How many seg-readers to advance }
+    pFilter   : PFts3SegFilter;        { Pointer to filter object }
+    aBuffer   : PChar;                 { Buffer to merge doclists in }
+    nBuffer   : sqlite3_int64;         { Allocated size of aBuffer[] in bytes }
+
+    iColFilter: cint;                  { If >=0, filter for this column }
+    bRestart  : cint;
+
+    { Used by fts3.c only. }
+    nCost     : cint;                  { Cost of running iterator }
+    bLookup   : cint;                  { True if a lookup of a single entry. }
+
+    { Output values. Valid only after Step() returns SQLITE_ROW. }
+    zTerm     : PChar;                 { Pointer to term buffer }
+    nTerm     : cint;                  { Size of zTerm in bytes }
+    aDoclist  : PChar;                 { Pointer to doclist buffer }
+    nDoclist  : cint;                  { Size of aDoclist[] in bytes }
+  end;
+
+  { fts3_write.c:100..107 — struct PendingList. }
+  PPendingList = ^TPendingList;
+  PPPendingList = ^PPendingList;
+  TPendingList = record
+    nData     : sqlite3_int64;
+    aData     : PChar;
+    nSpace    : sqlite3_int64;
+    iLastDocid: sqlite3_int64;
+    iLastCol  : sqlite3_int64;
+    iLastPos  : sqlite3_int64;
+  end;
+
+  { fts3_write.c:113..118 — struct Fts3DeferredToken. }
+  TFts3DeferredToken = record
+    pToken : PFts3PhraseToken;         { Pointer to corresponding expr token }
+    iCol   : cint;                     { Column token must occur in }
+    pNext  : PFts3DeferredTokenR;      { Next in list of deferred tokens }
+    pList  : PPendingList;             { Doclist is assembled here }
+  end;
+
+const
+  { fts3Int.h:75 — segments-per-level merge threshold. }
+  FTS3_MERGE_COUNT = 16;
+  { fts3Int.h:85 — max pending-data bytes before mid-transaction flush. }
+  FTS3_MAX_PENDING_DATA = (1*1024*1024);
+  { fts3Int.h:106 — FTS3 varint max length (10, not 9 as in the core). }
+  FTS3_VARINT_MAX = 10;
+  { fts3Int.h:108 }
+  FTS3_BUFFER_PADDING = 8;
+  { fts3Int.h:125..126 }
+  FTS3_SEGDIR_MAXLEVEL = 1024;
+  { fts3Int.h:139..140 — position/column-list terminators. }
+  POS_COLUMN = 1;
+  POS_END    = 0;
+
+  { fts3Int.h:380..382 — Fts3Cursor.eEvalmode values. }
+  FTS3_EVAL_FILTER    = 0;
+  FTS3_EVAL_NEXT      = 1;
+  FTS3_EVAL_MATCHINFO = 2;
+
+  { fts3Int.h:399..401 — Fts3Cursor.eSearch base values. }
+  FTS3_FULLSCAN_SEARCH = 0;
+  FTS3_DOCID_SEARCH    = 1;
+  FTS3_FULLTEXT_SEARCH = 2;
+
+  { fts3Int.h:409..411 — idxNum high-bit constraint flags. }
+  FTS3_HAVE_LANGID   = $00010000;
+  FTS3_HAVE_DOCID_GE = $00020000;
+  FTS3_HAVE_DOCID_LE = $00040000;
+
+  { fts3Int.h:558..559 — special iLevel values for sqlite3Fts3SegReaderCursor. }
+  FTS3_SEGCURSOR_PENDING = -1;
+  FTS3_SEGCURSOR_ALL     = -2;
+
+  { fts3Int.h:569..574 — SegmentReaderIterate() 4th-argument flags. }
+  FTS3_SEGMENT_REQUIRE_POS   = $00000001;
+  FTS3_SEGMENT_IGNORE_EMPTY  = $00000002;
+  FTS3_SEGMENT_COLUMN_FILTER = $00000004;
+  FTS3_SEGMENT_PREFIX        = $00000008;
+  FTS3_SEGMENT_SCAN          = $00000010;
+  FTS3_SEGMENT_FIRST         = $00000020;
+
+  { fts3_write.c:233..274 — fts3SqlStmt() statement-id constants. }
+  SQL_DELETE_CONTENT            = 0;
+  SQL_IS_EMPTY                  = 1;
+  SQL_DELETE_ALL_CONTENT        = 2;
+  SQL_DELETE_ALL_SEGMENTS       = 3;
+  SQL_DELETE_ALL_SEGDIR         = 4;
+  SQL_DELETE_ALL_DOCSIZE        = 5;
+  SQL_DELETE_ALL_STAT           = 6;
+  SQL_SELECT_CONTENT_BY_ROWID   = 7;
+  SQL_NEXT_SEGMENT_INDEX        = 8;
+  SQL_INSERT_SEGMENTS           = 9;
+  SQL_NEXT_SEGMENTS_ID          = 10;
+  SQL_INSERT_SEGDIR             = 11;
+  SQL_SELECT_LEVEL              = 12;
+  SQL_SELECT_LEVEL_RANGE        = 13;
+  SQL_SELECT_LEVEL_COUNT        = 14;
+  SQL_SELECT_SEGDIR_MAX_LEVEL   = 15;
+  SQL_DELETE_SEGDIR_LEVEL       = 16;
+  SQL_DELETE_SEGMENTS_RANGE     = 17;
+  SQL_CONTENT_INSERT            = 18;
+  SQL_DELETE_DOCSIZE            = 19;
+  SQL_REPLACE_DOCSIZE           = 20;
+  SQL_SELECT_DOCSIZE            = 21;
+  SQL_SELECT_STAT               = 22;
+  SQL_REPLACE_STAT              = 23;
+  SQL_SELECT_ALL_PREFIX_LEVEL   = 24;
+  SQL_DELETE_ALL_TERMS_SEGDIR   = 25;
+  SQL_DELETE_SEGDIR_RANGE       = 26;
+  SQL_SELECT_ALL_LANGID         = 27;
+  SQL_FIND_MERGE_LEVEL          = 28;
+  SQL_MAX_LEAF_NODE_ESTIMATE    = 29;
+  SQL_DELETE_SEGDIR_ENTRY       = 30;
+  SQL_SHIFT_SEGDIR_ENTRY        = 31;
+  SQL_SELECT_SEGDIR             = 32;
+  SQL_CHOMP_SEGDIR              = 33;
+  SQL_SEGMENT_IS_APPENDABLE     = 34;
+  SQL_SELECT_INDEXES            = 35;
+  SQL_SELECT_MXLEVEL            = 36;
+  SQL_SELECT_LEVEL_RANGE2       = 37;
+  SQL_UPDATE_LEVEL_IDX          = 38;
+  SQL_UPDATE_LEVEL              = 39;
+
+  { fts3_write.c:73..75 — %_stat row-ids bound to :1 of REPLACE/SELECT_STAT. }
+  FTS_STAT_DOCTOTAL      = 0;
+  FTS_STAT_INCRMERGEHINT = 1;
+  FTS_STAT_AUTOINCRMERGE = 2;
+
 { --------------------------------------------------------------------- }
 { fts3.h:22 — declares the FTS3 library entry point.  Implemented in    }
 { task 6.40.1.o; here only as the public signature the cluster targets. }
@@ -387,6 +665,84 @@ function sqlite3Fts3ExprParse(pTokenizer: Psqlite3_tokenizer; iLangid: cint;
   tree cannot overflow the stack). }
 procedure sqlite3Fts3ExprFree(pDel: PFts3Expr);
 
+{ --------------------------------------------------------------------- }
+{ 6.40.1.j — fts3_write.c — segment writer/reader/merge core + xUpdate.   }
+{ Public surface (fts3Int.h:524..695).  Functions whose primary caller is  }
+{ fts3.c (.k) / fts3_snippet.c (.l) / fts3_aux.c (.m) are declared here so   }
+{ those tasks can call them once landed.                                   }
+{ --------------------------------------------------------------------- }
+
+{ fts3.c:331..442 — FTS3 varint codecs (defined in fts3.c in C; ported here
+  since fts3_write.c depends on them — owner of these is fts3.c/6.40.1.k,
+  but they live here and .k must NOT duplicate them). }
+function sqlite3Fts3PutVarint(p: PChar; v: sqlite3_int64): cint;
+function sqlite3Fts3GetVarintU(const pBuf: PChar; v: Pu64): cint;
+function sqlite3Fts3GetVarint(const pBuf: PChar; v: Psqlite3_int64): cint;
+function sqlite3Fts3GetVarintBounded(const pBuf, pEnd: PChar;
+  v: Psqlite3_int64): cint;
+function sqlite3Fts3GetVarint32(const p: PChar; pi: Pcint): cint;
+function sqlite3Fts3VarintLen(v: u64): cint;
+
+{ fts3_write.c:280..292 — sqlite3Fts3PrepareStmt. }
+function sqlite3Fts3PrepareStmt(p: PFts3Table; const zSql: PChar;
+  bPersist: cint; bAllowVtab: cint; pp: PPVdbe): cint;
+
+{ fts3_write.c — pending-terms + flush write path. }
+function sqlite3Fts3PendingTermsFlush(p: PFts3Table): cint;
+procedure sqlite3Fts3PendingTermsClear(p: PFts3Table);
+
+{ fts3_write.c — %_segments / %_segdir helpers used by fts3.c / fts3_aux.c. }
+function sqlite3Fts3ReadBlock(p: PFts3Table; iBlockid: sqlite3_int64;
+  paBlob: PPChar; pnBlob: Pcint; pnLoad: Pcint): cint;
+procedure sqlite3Fts3SegmentsClose(p: PFts3Table);
+function sqlite3Fts3AllSegdirs(p: PFts3Table; iLangid, iIndex, iLevel: cint;
+  ppStmt: PPVdbe): cint;
+function sqlite3Fts3MaxLevel(p: PFts3Table; pnMax: Pcint): cint;
+function sqlite3Fts3SelectDoctotal(pTab: PFts3Table; ppStmt: PPVdbe): cint;
+function sqlite3Fts3SelectDocsize(pTab: PFts3Table; iDocid: sqlite3_int64;
+  ppStmt: PPVdbe): cint;
+
+{ fts3_write.c — segment-reader (multi-way merge) public API. }
+function sqlite3Fts3SegReaderNew(iAge, bLookup: cint; iStartLeaf, iEndLeaf,
+  iEndBlock: sqlite3_int64; const zRoot: PChar; nRoot: cint;
+  ppReader: PPFts3SegReader): cint;
+function sqlite3Fts3SegReaderPending(p: PFts3Table; iIndex: cint;
+  const zTerm: PChar; nTerm: cint; bPrefix: cint;
+  ppReader: PPFts3SegReader): cint;
+procedure sqlite3Fts3SegReaderFree(pReader: PFts3SegReader);
+function sqlite3Fts3SegReaderStart(p: PFts3Table; pCsr: PFts3MultiSegReader;
+  pFilter: PFts3SegFilter): cint;
+function sqlite3Fts3SegReaderStep(p: PFts3Table; pCsr: PFts3MultiSegReader): cint;
+procedure sqlite3Fts3SegReaderFinish(pCsr: PFts3MultiSegReader);
+
+function sqlite3Fts3MsrIncrStart(p: PFts3Table; pCsr: PFts3MultiSegReader;
+  iCol: cint; const zTerm: PChar; nTerm: cint): cint;
+function sqlite3Fts3MsrIncrNext(p: PFts3Table; pMsr: PFts3MultiSegReader;
+  piDocid: Psqlite3_int64; paPoslist: PPChar; pnPoslist: Pcint): cint;
+function sqlite3Fts3MsrIncrRestart(pCsr: PFts3MultiSegReader): cint;
+function sqlite3Fts3MsrOvfl(pCsr: PFts3Cursor; pMsr: PFts3MultiSegReader;
+  pnOvfl: Pcint): cint;
+
+{ fts3_write.c — xUpdate + maintenance. }
+function sqlite3Fts3UpdateMethod(pVtab: PSqlite3Vtab; nArg: cint;
+  apVal: PPsqlite3_value; pRowid: Psqlite3_int64): cint;
+function sqlite3Fts3Optimize(p: PFts3Table): cint;
+function sqlite3Fts3Incrmerge(p: PFts3Table; nMerge, nMin: cint): cint;
+function sqlite3Fts3IntegrityCheck(p: PFts3Table; pbOk: Pcint): cint;
+
+{ fts3_write.c — deferred-token machinery (SQLITE_DISABLE_FTS4_DEFERRED off). }
+procedure sqlite3Fts3FreeDeferredDoclists(pCsr: PFts3Cursor);
+procedure sqlite3Fts3FreeDeferredTokens(pCsr: PFts3Cursor);
+function sqlite3Fts3CacheDeferredDoclists(pCsr: PFts3Cursor): cint;
+function sqlite3Fts3DeferredTokenList(p: PFts3DeferredTokenR;
+  ppData: PPChar; pnData: Pcint): cint;
+function sqlite3Fts3DeferToken(pCsr: PFts3Cursor; pToken: PFts3PhraseToken;
+  iCol: cint): cint;
+
+{ fts3_write.c:609..611 — fts3GetVarint32 macro: if high bit set use the slow
+  path, else inline single-byte read. }
+function fts3GetVarint32(const p: PChar; piVal: Pcint): cint; inline;
+
 implementation
 
 { libc bindings (match the amatch/fuzzer pattern; avoids depending on a
@@ -401,6 +757,7 @@ function libc_strncmp(a, b: PChar; n: NativeUInt): cint; cdecl;
 function libc_strcmp(a, b: PChar): cint; cdecl; external 'c' name 'strcmp';
 function libc_memcmp(a, b: Pointer; n: NativeUInt): cint; cdecl;
   external 'c' name 'memcmp';
+function libc_atoi(s: PChar): cint; cdecl; external 'c' name 'atoi';
 
 { Function-pointer types for the key-class-selected hash/compare fns. }
 type
@@ -4310,6 +4667,4292 @@ begin
   Result := rc;
 end;
 {$ENDIF}
+
+{ ===================================================================== }
+{ 6.40.1.j — fts3_write.c — segment writer/reader/merge core + xUpdate.   }
+{                                                                        }
+{ Sub-sections (in dependency order, matching the C file):               }
+{   1. FTS3 varint codecs (fts3.c:331..442 — depended on here)           }
+{   2. SQL statement registry (fts3SqlStmt + aStmt + fts3SqlExec)        }
+{   3. pending-terms hash + accumulation                                 }
+{   4. segment WRITER (node building, prefix compression, write)         }
+{   5. segment READER (multi-way merge, doclist merge, column filter)    }
+{   6. xUpdate path (delete/insert, %_docsize/%_stat FTS4 maintenance)    }
+{   7. maintenance (optimize, incr-merge, integrity-check, deferred)     }
+{                                                                        }
+{ CROSS-BOUNDARY STUBS for 6.40.1.k (fts3.c — the fts3/fts4 vtab module): }
+{   sqlite3Fts3SegReaderCursor  (fts3.c:3038)                            }
+{   sqlite3Fts3DoclistPrev      (fts3.c)                                 }
+{   sqlite3Fts3FirstFilter      (fts3.c:2760)                            }
+{   sqlite3Fts3CreateStatTable  (fts3.c:665)                             }
+{ These four are CALLED by this file but DEFINED in fts3.c.  Local        }
+{ forward-declared stubs are provided below (clearly marked) so .j        }
+{ compiles standalone; .k must replace them with the real ports and       }
+{ delete the stubs.                                                       }
+{ ===================================================================== }
+
+{ FTS_MAX_APPENDABLE_HEIGHT (fts3_write.c:28). }
+const
+  { sqlite3.h public SQLITE_PREPARE_* flag bits (not exported by main). }
+  FTS3_SQLITE_PREPARE_PERSISTENT = $01;
+  FTS3_SQLITE_PREPARE_NO_VTAB    = $04;
+  FTS3_SQLITE_PREPARE_FROM_DDL   = $20;  { sqlite3.h:4486 public value }
+  { sqlite3.h conflict-resolution code returned by sqlite3_vtab_on_conflict. }
+  FTS3_SQLITE_REPLACE = 5;
+
+  FTS_MAX_APPENDABLE_HEIGHT = 16;
+  { fts3_write.c:40 — node padding so two varints can always be read safely. }
+  FTS3_NODE_PADDING = FTS3_VARINT_MAX*2;
+  { fts3_write.c:65..66 — incremental-load chunk size/threshold (non-TEST). }
+  FTS3_NODE_CHUNKSIZE = (4*1024);
+  FTS3_NODE_CHUNK_THRESHOLD = FTS3_NODE_CHUNKSIZE*4;
+  { fts3Int.h:203..204 }
+  LARGEST_INT64  = sqlite3_int64($7fffffffffffffff);
+
+{ qsort from libc, used by sqlite3Fts3SegReaderPending (fts3_write.c:1771). }
+type
+  TFts3QSortCmp = function(const a, b: Pointer): cint; cdecl;
+procedure libc_qsort(base: Pointer; nmemb, size: NativeUInt;
+  compar: TFts3QSortCmp); cdecl; external 'c' name 'qsort';
+
+type
+  { fts3_write.c:217..228 — struct SegmentNode (interior tree node). }
+  PSegmentNode  = ^TSegmentNode;
+  PPSegmentNode = ^PSegmentNode;
+  TSegmentNode = record
+    pParent  : PSegmentNode;     { Parent node (or NULL for root node) }
+    pRight   : PSegmentNode;     { Pointer to right-sibling }
+    pLeftmost: PSegmentNode;     { Pointer to left-most node of this depth }
+    nEntry   : cint;             { Number of terms written to node so far }
+    zTerm    : PChar;            { Pointer to previous term buffer }
+    nTerm    : cint;             { Number of bytes in zTerm }
+    nMalloc  : cint;             { Size of malloc'd buffer at zMalloc }
+    zMalloc  : PChar;            { Malloc'd space (possibly) used for zTerm }
+    nData    : cint;             { Bytes of valid data so far }
+    aData    : PChar;            { Node data }
+  end;
+
+  { fts3_write.c:185..197 — struct SegmentWriter. }
+  PSegmentWriter  = ^TSegmentWriter;
+  PPSegmentWriter = ^PSegmentWriter;
+  TSegmentWriter = record
+    pTree    : PSegmentNode;     { Pointer to interior tree structure }
+    iFirst   : sqlite3_int64;    { First slot in %_segments written }
+    iFree    : sqlite3_int64;    { Next free slot in %_segments }
+    zTerm    : PChar;            { Pointer to previous term buffer }
+    nTerm    : cint;             { Number of bytes in zTerm }
+    nMalloc  : cint;             { Size of malloc'd buffer at zMalloc }
+    zMalloc  : PChar;            { Malloc'd space (possibly) used for zTerm }
+    nSize    : cint;             { Size of allocation at aData }
+    nData    : cint;             { Bytes of data in aData }
+    aData    : PChar;            { Pointer to block from malloc() }
+    nLeafData: sqlite3_int64;    { Number of bytes of leaf data written }
+  end;
+
+  { fts3_write.c:3718..3722 — struct Blob (dynamic buffer). }
+  PFtsBlob = ^TFtsBlob;
+  TFtsBlob = record
+    a     : PChar;               { Pointer to allocation }
+    n     : cint;                { Number of valid bytes of data in a[] }
+    nAlloc: cint;                { Allocated size of a[] (nAlloc>=n) }
+  end;
+
+  { fts3_write.c:3728..3732 — struct NodeWriter. }
+  PNodeWriter = ^TNodeWriter;
+  TNodeWriter = record
+    iBlock: sqlite3_int64;       { Current block id }
+    key   : TFtsBlob;            { Last key written to the current block }
+    block : TFtsBlob;            { Current block image }
+  end;
+
+  { fts3_write.c:3738..3748 — struct IncrmergeWriter. }
+  PIncrmergeWriter = ^TIncrmergeWriter;
+  TIncrmergeWriter = record
+    nLeafEst   : sqlite3_int64;  { Space allocated for leaf blocks }
+    nWork      : sqlite3_int64;  { Number of leaf pages flushed }
+    iAbsLevel  : sqlite3_int64;  { Absolute level of input segments }
+    iIdx       : cint;           { Index of *output* segment in iAbsLevel+1 }
+    iStart     : sqlite3_int64;  { Block number of first allocated block }
+    iEnd       : sqlite3_int64;  { Block number of last allocated block }
+    nLeafData  : sqlite3_int64;  { Bytes of leaf page data so far }
+    bNoLeafData: cuchar;         { If true, store 0 for segment size }
+    aNodeWriter: array[0..FTS_MAX_APPENDABLE_HEIGHT-1] of TNodeWriter;
+  end;
+
+  { fts3_write.c:3758..3768 — struct NodeReader. }
+  PNodeReader = ^TNodeReader;
+  TNodeReader = record
+    aNode   : PChar;
+    nNode   : cint;
+    iOff    : cint;              { Current offset within aNode[] }
+    { Output variables. Containing the current node entry. }
+    iChild  : sqlite3_int64;     { Pointer to child node }
+    term    : TFtsBlob;          { Current term }
+    aDoclist: PChar;             { Pointer to doclist }
+    nDoclist: cint;              { Size of doclist in bytes }
+  end;
+
+{ MergeCount(P): in the engine build this is the constant FTS3_MERGE_COUNT;
+  under SQLITE_TEST it is p->nMergeCount (fts3Int.h:344..348).  We keep the
+  field unconditionally but read it only when non-zero to match TEST. }
+function MergeCount(p: PFts3Table): cint; inline;
+begin
+{$IFDEF SQLITE_TEST}
+  Result := p^.nMergeCount;
+{$ELSE}
+  if p = nil then ;  { unused-param silence }
+  Result := FTS3_MERGE_COUNT;
+{$ENDIF}
+end;
+
+{ FTS_CORRUPT_VTAB (fts3Int.h:236 non-DEBUG). }
+function FTS_CORRUPT_VTAB: cint; inline;
+begin
+  Result := SQLITE_CORRUPT_VTAB;
+end;
+
+function Fts3_MIN(x, y: sqlite3_int64): sqlite3_int64; inline;
+begin if x < y then Result := x else Result := y; end;
+function Fts3_MAX(x, y: sqlite3_int64): sqlite3_int64; inline;
+begin if x > y then Result := x else Result := y; end;
+
+{ ===================================================================== }
+{ Section 1 — FTS3 varint codecs (fts3.c:331..442).                      }
+{ NB: the FTS3 varint differs from the engine's core varint (max 10 not  }
+{ 9 bytes); ported faithfully here.  Owner = fts3.c (6.40.1.k); .k reuses }
+{ these and must NOT re-port them.                                       }
+{ ===================================================================== }
+
+{ fts3.c:331..341 — sqlite3Fts3PutVarint. }
+function sqlite3Fts3PutVarint(p: PChar; v: sqlite3_int64): cint;
+var
+  q: PByte;
+  vu: u64;
+  pStart: PByte;
+begin
+  q := PByte(p);
+  pStart := q;
+  vu := u64(v);
+  repeat
+    q^ := Byte((vu and $7f) or $80);
+    Inc(q);
+    vu := vu shr 7;
+  until vu = 0;
+  PByte(PtrUInt(q) - 1)^ := PByte(PtrUInt(q) - 1)^ and $7f; { turn off high bit }
+  Result := cint(PtrUInt(q) - PtrUInt(pStart));
+end;
+
+{ fts3.c:350..370 — sqlite3Fts3GetVarintU.  Hand-unrolled GETVARINT macros. }
+function sqlite3Fts3GetVarintU(const pBuf: PChar; v: Pu64): cint;
+var
+  p, pStart: PByte;
+  a: u32;
+  b, c: u64;
+  shift: cint;
+begin
+  p := PByte(pBuf);
+  pStart := p;
+
+  { GETVARINT_INIT(a,p,0, 0x00, 0x80, *v, 1) }
+  a := p^; Inc(p);
+  if (a and $80) = 0 then begin v^ := a; Exit(1); end;
+  { GETVARINT_STEP(a,p,7, 0x7F, 0x4000, *v, 2) }
+  a := (a and $7F) or (u32(p^) shl 7); Inc(p);
+  if (a and $4000) = 0 then begin v^ := a; Exit(2); end;
+  { GETVARINT_STEP(a,p,14, 0x3FFF, 0x200000, *v, 3) }
+  a := (a and $3FFF) or (u32(p^) shl 14); Inc(p);
+  if (a and $200000) = 0 then begin v^ := a; Exit(3); end;
+  { GETVARINT_STEP(a,p,21, 0x1FFFFF, 0x10000000, *v, 4) }
+  a := (a and $1FFFFF) or (u32(p^) shl 21); Inc(p);
+  if (a and $10000000) = 0 then begin v^ := a; Exit(4); end;
+
+  b := (a and $0FFFFFFF);
+  shift := 28;
+  while shift <= 63 do begin
+    c := p^; Inc(p);
+    b := b + ((c and $7F) shl shift);
+    if (c and $80) = 0 then break;
+    Inc(shift, 7);
+  end;
+  v^ := b;
+  Result := cint(PtrUInt(p) - PtrUInt(pStart));
+end;
+
+{ fts3.c:377..379 — sqlite3Fts3GetVarint. }
+function sqlite3Fts3GetVarint(const pBuf: PChar; v: Psqlite3_int64): cint;
+begin
+  Result := sqlite3Fts3GetVarintU(pBuf, Pu64(v));
+end;
+
+{ fts3.c:387..405 — sqlite3Fts3GetVarintBounded. }
+function sqlite3Fts3GetVarintBounded(const pBuf, pEnd: PChar;
+  v: Psqlite3_int64): cint;
+var
+  p, pStart, pX: PByte;
+  b, c: u64;
+  shift: cint;
+begin
+  p := PByte(pBuf);
+  pStart := p;
+  pX := PByte(pEnd);
+  b := 0;
+  shift := 0;
+  while shift <= 63 do begin
+    if PtrUInt(p) < PtrUInt(pX) then c := p^ else c := 0;
+    Inc(p);
+    b := b + ((c and $7F) shl shift);
+    if (c and $80) = 0 then break;
+    Inc(shift, 7);
+  end;
+  v^ := sqlite3_int64(b);
+  Result := cint(PtrUInt(p) - PtrUInt(pStart));
+end;
+
+{ fts3.c:411..430 — sqlite3Fts3GetVarint32 (truncate to non-negative i32). }
+function sqlite3Fts3GetVarint32(const p: PChar; pi: Pcint): cint;
+var
+  ptr: PByte;
+  a: u32;
+begin
+  ptr := PByte(p);
+  { GETVARINT_INIT(a,ptr,0, 0x00, 0x80, *pi, 1) }
+  a := ptr^; Inc(ptr);
+  if (a and $80) = 0 then begin pi^ := cint(a); Exit(1); end;
+  { GETVARINT_STEP(a,ptr,7, 0x7F, 0x4000, *pi, 2) }
+  a := (a and $7F) or (u32(ptr^) shl 7); Inc(ptr);
+  if (a and $4000) = 0 then begin pi^ := cint(a); Exit(2); end;
+  { GETVARINT_STEP(a,ptr,14, 0x3FFF, 0x200000, *pi, 3) }
+  a := (a and $3FFF) or (u32(ptr^) shl 14); Inc(ptr);
+  if (a and $200000) = 0 then begin pi^ := cint(a); Exit(3); end;
+  { GETVARINT_STEP(a,ptr,21, 0x1FFFFF, 0x10000000, *pi, 4) }
+  a := (a and $1FFFFF) or (u32(ptr^) shl 21); Inc(ptr);
+  if (a and $10000000) = 0 then begin pi^ := cint(a); Exit(4); end;
+  a := (a and $0FFFFFFF);
+  pi^ := cint(a or ((u32(ptr^ and $07)) shl 28));
+  Result := 5;
+end;
+
+{ fts3.c:435..442 — sqlite3Fts3VarintLen. }
+function sqlite3Fts3VarintLen(v: u64): cint;
+var
+  i: cint;
+begin
+  i := 0;
+  repeat
+    Inc(i);
+    v := v shr 7;
+  until v = 0;
+  Result := i;
+end;
+
+{ fts3Int.h:609..611 — fts3GetVarint32 macro. }
+function fts3GetVarint32(const p: PChar; piVal: Pcint): cint;
+begin
+  if (Byte(p[0]) and $80) <> 0 then
+    Result := sqlite3Fts3GetVarint32(p, piVal)
+  else begin
+    piVal^ := cint(Byte(p[0]));
+    Result := 1;
+  end;
+end;
+
+{ ===================================================================== }
+{ CROSS-BOUNDARY STUBS for 6.40.1.k (fts3.c).  See header note above.    }
+{ Each is forward-declared and given a minimal local body that returns    }
+{ an error / no-op so that .j compiles + links standalone.  TODO(.k):     }
+{ port the real fts3.c bodies and delete these.                          }
+{ ===================================================================== }
+
+{ fts3.c:3038 — sqlite3Fts3SegReaderCursor.  TODO(6.40.1.k). }
+function sqlite3Fts3SegReaderCursor(p: PFts3Table; iLangid, iIndex,
+  iLevel: cint; const zTerm: PChar; nTerm, isPrefix, isScan: cint;
+  pCsr: PFts3MultiSegReader): cint; forward;
+
+{ fts3.c — sqlite3Fts3DoclistPrev.  TODO(6.40.1.k). }
+procedure sqlite3Fts3DoclistPrev(bDescIdx: cint; aDoclist: PChar;
+  nDoclist: cint; ppIter: PPChar; piDocid: Psqlite3_int64;
+  pnList: Pcint; pbEof: PByte); forward;
+
+{ fts3.c:2760 — sqlite3Fts3FirstFilter.  TODO(6.40.1.k). }
+function sqlite3Fts3FirstFilter(iDelta: sqlite3_int64; pList: PChar;
+  nList: cint; pOut: PChar): cint; forward;
+
+{ fts3.c:665 — sqlite3Fts3CreateStatTable.  TODO(6.40.1.k). }
+procedure sqlite3Fts3CreateStatTable(pRc: Pcint; p: PFts3Table); forward;
+
+{ Forward declarations for the internal mutual recursion. }
+function fts3SegmentMerge(p: PFts3Table; iLangid, iIndex, iLevel: cint): cint;
+  forward;
+function fts3NodeAddTerm(p: PFts3Table; ppTree: PPSegmentNode;
+  isCopyTerm: cint; const zTerm: PChar; nTerm: cint): cint; forward;
+
+{ ===================================================================== }
+{ Section 2 — SQL statement registry (fts3_write.c:305..527).            }
+{ ===================================================================== }
+
+{ fts3_write.c:280..292 — sqlite3Fts3PrepareStmt. }
+function sqlite3Fts3PrepareStmt(p: PFts3Table; const zSql: PChar;
+  bPersist: cint; bAllowVtab: cint; pp: PPVdbe): cint;
+var
+  f: u32;
+begin
+  f := FTS3_SQLITE_PREPARE_FROM_DDL;
+  if bAllowVtab = 0 then f := f or FTS3_SQLITE_PREPARE_NO_VTAB;
+  if bPersist <> 0 then f := f or FTS3_SQLITE_PREPARE_PERSISTENT;
+  Result := sqlite3_prepare_v3(p^.db, PAnsiChar(zSql), -1, f, PPointer(pp), nil);
+end;
+
+const
+  { fts3_write.c:311..409 — the aStmt[] SQL templates. }
+  fts3AzSql: array[0..39] of PChar = (
+{ 0  } 'DELETE FROM %Q.''%q_content'' WHERE rowid = ?',
+{ 1  } 'SELECT NOT EXISTS(SELECT docid FROM %Q.''%q_content'' WHERE rowid!=?)',
+{ 2  } 'DELETE FROM %Q.''%q_content''',
+{ 3  } 'DELETE FROM %Q.''%q_segments''',
+{ 4  } 'DELETE FROM %Q.''%q_segdir''',
+{ 5  } 'DELETE FROM %Q.''%q_docsize''',
+{ 6  } 'DELETE FROM %Q.''%q_stat''',
+{ 7  } 'SELECT %s WHERE rowid=?',
+{ 8  } 'SELECT (SELECT max(idx) FROM %Q.''%q_segdir'' WHERE level = ?) + 1',
+{ 9  } 'REPLACE INTO %Q.''%q_segments''(blockid, block) VALUES(?, ?)',
+{ 10 } 'SELECT coalesce((SELECT max(blockid) FROM %Q.''%q_segments'') + 1, 1)',
+{ 11 } 'REPLACE INTO %Q.''%q_segdir'' VALUES(?,?,?,?,?,?)',
+{ 12 } 'SELECT idx, start_block, leaves_end_block, end_block, root '
+         + 'FROM %Q.''%q_segdir'' WHERE level = ? ORDER BY idx ASC',
+{ 13 } 'SELECT idx, start_block, leaves_end_block, end_block, root '
+         + 'FROM %Q.''%q_segdir'' WHERE level BETWEEN ? AND ?'
+         + 'ORDER BY level DESC, idx ASC',
+{ 14 } 'SELECT count(*) FROM %Q.''%q_segdir'' WHERE level = ?',
+{ 15 } 'SELECT max(level) FROM %Q.''%q_segdir'' WHERE level BETWEEN ? AND ?',
+{ 16 } 'DELETE FROM %Q.''%q_segdir'' WHERE level = ?',
+{ 17 } 'DELETE FROM %Q.''%q_segments'' WHERE blockid BETWEEN ? AND ?',
+{ 18 } 'INSERT INTO %Q.''%q_content'' VALUES(%s)',
+{ 19 } 'DELETE FROM %Q.''%q_docsize'' WHERE docid = ?',
+{ 20 } 'REPLACE INTO %Q.''%q_docsize'' VALUES(?,?)',
+{ 21 } 'SELECT size FROM %Q.''%q_docsize'' WHERE docid=?',
+{ 22 } 'SELECT value FROM %Q.''%q_stat'' WHERE id=?',
+{ 23 } 'REPLACE INTO %Q.''%q_stat'' VALUES(?,?)',
+{ 24 } '',
+{ 25 } '',
+{ 26 } 'DELETE FROM %Q.''%q_segdir'' WHERE level BETWEEN ? AND ?',
+{ 27 } 'SELECT ? UNION SELECT level / (1024 * ?) FROM %Q.''%q_segdir''',
+{ 28 } 'SELECT level, count(*) AS cnt FROM %Q.''%q_segdir'' '
+         + '  GROUP BY level HAVING cnt>=?'
+         + '  ORDER BY (level %% 1024) ASC, 2 DESC LIMIT 1',
+{ 29 } 'SELECT 2 * total(1 + leaves_end_block - start_block) '
+         + '  FROM (SELECT * FROM %Q.''%q_segdir'' '
+         + '        WHERE level = ? ORDER BY idx ASC LIMIT ?'
+         + '  )',
+{ 30 } 'DELETE FROM %Q.''%q_segdir'' WHERE level = ? AND idx = ?',
+{ 31 } 'UPDATE %Q.''%q_segdir'' SET idx = ? WHERE level=? AND idx=?',
+{ 32 } 'SELECT idx, start_block, leaves_end_block, end_block, root '
+         + 'FROM %Q.''%q_segdir'' WHERE level = ? AND idx = ?',
+{ 33 } 'UPDATE %Q.''%q_segdir'' SET start_block = ?, root = ?'
+         + 'WHERE level = ? AND idx = ?',
+{ 34 } 'SELECT 1 FROM %Q.''%q_segments'' WHERE blockid=? AND block IS NULL',
+{ 35 } 'SELECT idx FROM %Q.''%q_segdir'' WHERE level=? ORDER BY 1 ASC',
+{ 36 } 'SELECT max( level %% 1024 ) FROM %Q.''%q_segdir''',
+{ 37 } 'SELECT level, idx, end_block '
+         + 'FROM %Q.''%q_segdir'' WHERE level BETWEEN ? AND ? '
+         + 'ORDER BY level DESC, idx ASC',
+{ 38 } 'UPDATE OR FAIL %Q.''%q_segdir'' SET level=-1,idx=? '
+         + 'WHERE level=? AND idx=?',
+{ 39 } 'UPDATE OR FAIL %Q.''%q_segdir'' SET level=? WHERE level=-1'
+  );
+
+{ fts3_write.c:305..447 — fts3SqlStmt. }
+function fts3SqlStmt(p: PFts3Table; eStmt: cint; pp: PPVdbe;
+  apVal: PPsqlite3_value): cint;
+var
+  rc: cint;
+  pStmt: PVdbe;
+  bAllowVtab: cint;
+  zSql: PChar;
+  i, nParam: cint;
+begin
+  rc := SQLITE_OK;
+  Assert((eStmt < Length(fts3AzSql)) and (eStmt >= 0));
+
+  pStmt := p^.aStmt[eStmt];
+  if pStmt = nil then begin
+    bAllowVtab := 0;
+    if eStmt = SQL_CONTENT_INSERT then
+      zSql := PChar(sqlite3PfMprintf(PAnsiChar(fts3AzSql[eStmt]),
+                [p^.zDb, p^.zName, p^.zWriteExprlist]))
+    else if eStmt = SQL_SELECT_CONTENT_BY_ROWID then begin
+      bAllowVtab := 1;
+      zSql := PChar(sqlite3PfMprintf(PAnsiChar(fts3AzSql[eStmt]),
+                [p^.zReadExprlist]));
+    end else
+      zSql := PChar(sqlite3PfMprintf(PAnsiChar(fts3AzSql[eStmt]),
+                [p^.zDb, p^.zName]));
+    if zSql = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      rc := sqlite3Fts3PrepareStmt(p, zSql, 1, bAllowVtab, @pStmt);
+      sqlite3_free(zSql);
+      Assert((rc = SQLITE_OK) or (pStmt = nil));
+      p^.aStmt[eStmt] := pStmt;
+    end;
+  end;
+  if apVal <> nil then begin
+    nParam := sqlite3_bind_parameter_count(pStmt);
+    i := 0;
+    while (rc = SQLITE_OK) and (i < nParam) do begin
+      rc := sqlite3_bind_value(pStmt, i+1, PPsqlite3_value(apVal)[i]);
+      Inc(i);
+    end;
+  end;
+  pp^ := pStmt;
+  Result := rc;
+end;
+
+{ fts3_write.c:450..473 — fts3SelectDocsize. }
+function fts3SelectDocsize(pTab: PFts3Table; iDocid: sqlite3_int64;
+  ppStmt: PPVdbe): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  pStmt := nil;
+  rc := fts3SqlStmt(pTab, SQL_SELECT_DOCSIZE, @pStmt, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pStmt, 1, iDocid);
+    rc := sqlite3_step(pStmt);
+    if (rc <> SQLITE_ROW) or (sqlite3_column_type(pStmt, 0) <> SQLITE_BLOB) then
+    begin
+      rc := sqlite3_reset(pStmt);
+      if rc = SQLITE_OK then rc := FTS_CORRUPT_VTAB;
+      pStmt := nil;
+    end else
+      rc := SQLITE_OK;
+  end;
+  ppStmt^ := pStmt;
+  Result := rc;
+end;
+
+{ fts3_write.c:475..494 — sqlite3Fts3SelectDoctotal. }
+function sqlite3Fts3SelectDoctotal(pTab: PFts3Table; ppStmt: PPVdbe): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  pStmt := nil;
+  rc := fts3SqlStmt(pTab, SQL_SELECT_STAT, @pStmt, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int(pStmt, 1, FTS_STAT_DOCTOTAL);
+    if (sqlite3_step(pStmt) <> SQLITE_ROW)
+    or (sqlite3_column_type(pStmt, 0) <> SQLITE_BLOB) then begin
+      rc := sqlite3_reset(pStmt);
+      if rc = SQLITE_OK then rc := FTS_CORRUPT_VTAB;
+      pStmt := nil;
+    end;
+  end;
+  ppStmt^ := pStmt;
+  Result := rc;
+end;
+
+{ fts3_write.c:496..502 — sqlite3Fts3SelectDocsize. }
+function sqlite3Fts3SelectDocsize(pTab: PFts3Table; iDocid: sqlite3_int64;
+  ppStmt: PPVdbe): cint;
+begin
+  Result := fts3SelectDocsize(pTab, iDocid, ppStmt);
+end;
+
+{ fts3_write.c:512..527 — fts3SqlExec. }
+procedure fts3SqlExec(pRC: Pcint; p: PFts3Table; eStmt: cint;
+  apVal: PPsqlite3_value);
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  if pRC^ <> 0 then Exit;
+  rc := fts3SqlStmt(p, eStmt, @pStmt, apVal);
+  if rc = SQLITE_OK then begin
+    sqlite3_step(pStmt);
+    rc := sqlite3_reset(pStmt);
+  end;
+  pRC^ := rc;
+end;
+
+{ fts3_write.c:544..558 — fts3Writelock. }
+function fts3Writelock(p: PFts3Table): cint;
+var
+  rc: cint;
+  pStmt: PVdbe;
+begin
+  rc := SQLITE_OK;
+  if p^.nPendingData = 0 then begin
+    rc := fts3SqlStmt(p, SQL_DELETE_SEGDIR_LEVEL, @pStmt, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_null(pStmt, 1);
+      sqlite3_step(pStmt);
+      rc := sqlite3_reset(pStmt);
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:583..596 — getAbsoluteLevel. }
+function getAbsoluteLevel(p: PFts3Table; iLangid, iIndex, iLevel: cint):
+  sqlite3_int64;
+var
+  iBase: sqlite3_int64;
+begin
+  Assert(p^.nIndex > 0);
+  Assert((iIndex >= 0) and (iIndex < p^.nIndex));
+  iBase := (sqlite3_int64(iLangid) * p^.nIndex + iIndex) * FTS3_SEGDIR_MAXLEVEL;
+  Result := iBase + iLevel;
+end;
+
+{ fts3_write.c:615..647 — sqlite3Fts3AllSegdirs. }
+function sqlite3Fts3AllSegdirs(p: PFts3Table; iLangid, iIndex, iLevel: cint;
+  ppStmt: PPVdbe): cint;
+var
+  rc: cint;
+  pStmt: PVdbe;
+begin
+  pStmt := nil;
+  Assert((iLevel = FTS3_SEGCURSOR_ALL) or (iLevel >= 0));
+  Assert(iLevel < FTS3_SEGDIR_MAXLEVEL);
+  Assert((iIndex >= 0) and (iIndex < p^.nIndex));
+
+  if iLevel < 0 then begin
+    rc := fts3SqlStmt(p, SQL_SELECT_LEVEL_RANGE, @pStmt, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_int64(pStmt, 1, getAbsoluteLevel(p, iLangid, iIndex, 0));
+      sqlite3_bind_int64(pStmt, 2,
+          getAbsoluteLevel(p, iLangid, iIndex, FTS3_SEGDIR_MAXLEVEL-1));
+    end;
+  end else begin
+    rc := fts3SqlStmt(p, SQL_SELECT_LEVEL, @pStmt, nil);
+    if rc = SQLITE_OK then
+      sqlite3_bind_int64(pStmt, 1, getAbsoluteLevel(p, iLangid, iIndex, iLevel));
+  end;
+  ppStmt^ := pStmt;
+  Result := rc;
+end;
+
+{ ===================================================================== }
+{ Section 3 — pending-terms hash + doclist accumulation                  }
+{ (fts3_write.c:662..932).                                               }
+{ ===================================================================== }
+
+{ fts3_write.c:662..695 — fts3PendingListAppendVarint. }
+function fts3PendingListAppendVarint(pp: PPPendingList; i: sqlite3_int64): cint;
+var
+  p: PPendingList;
+  nNew: sqlite3_int64;
+begin
+  p := pp^;
+  if p = nil then begin
+    p := PPendingList(sqlite3_malloc64(u64(SizeOf(TPendingList)) + 100));
+    if p = nil then Exit(SQLITE_NOMEM);
+    p^.nSpace := 100;
+    p^.aData := PChar(PtrUInt(p) + SizeOf(TPendingList));
+    p^.nData := 0;
+  end else if p^.nData + FTS3_VARINT_MAX + 1 > p^.nSpace then begin
+    nNew := p^.nSpace * 2;
+    p := PPendingList(sqlite3_realloc64(p, u64(SizeOf(TPendingList)) + u64(nNew)));
+    if p = nil then begin
+      sqlite3_free(pp^);
+      pp^ := nil;
+      Exit(SQLITE_NOMEM);
+    end;
+    p^.nSpace := cint(nNew);
+    p^.aData := PChar(PtrUInt(p) + SizeOf(TPendingList));
+  end;
+  p^.nData := p^.nData + sqlite3Fts3PutVarint(@p^.aData[p^.nData], i);
+  p^.aData[p^.nData] := #0;
+  pp^ := p;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:706..756 — fts3PendingListAppend. }
+function fts3PendingListAppend(pp: PPPendingList; iDocid, iCol, iPos:
+  sqlite3_int64; pRc: Pcint): cint;
+var
+  p: PPendingList;
+  rc: cint;
+  iDelta: u64;
+label pendinglistappend_out;
+begin
+  p := pp^;
+  rc := SQLITE_OK;
+  Assert((p = nil) or (p^.iLastDocid <= iDocid));
+
+  if (p = nil) or (p^.iLastDocid <> iDocid) then begin
+    if p <> nil then iDelta := u64(iDocid) - u64(p^.iLastDocid)
+                else iDelta := u64(iDocid);
+    if p <> nil then begin
+      Assert(p^.nData < p^.nSpace);
+      Assert(p^.aData[p^.nData] = #0);
+      Inc(p^.nData);
+    end;
+    rc := fts3PendingListAppendVarint(@p, sqlite3_int64(iDelta));
+    if rc <> SQLITE_OK then goto pendinglistappend_out;
+    p^.iLastCol := -1;
+    p^.iLastPos := 0;
+    p^.iLastDocid := iDocid;
+  end;
+  if (iCol > 0) and (p^.iLastCol <> iCol) then begin
+    rc := fts3PendingListAppendVarint(@p, 1);
+    if rc = SQLITE_OK then rc := fts3PendingListAppendVarint(@p, iCol);
+    if rc <> SQLITE_OK then goto pendinglistappend_out;
+    p^.iLastCol := iCol;
+    p^.iLastPos := 0;
+  end;
+  if iCol >= 0 then begin
+    Assert((iPos > p^.iLastPos) or ((iPos = 0) and (p^.iLastPos = 0)));
+    rc := fts3PendingListAppendVarint(@p, 2 + iPos - p^.iLastPos);
+    if rc = SQLITE_OK then p^.iLastPos := iPos;
+  end;
+
+pendinglistappend_out:
+  pRc^ := rc;
+  if p <> pp^ then begin
+    pp^ := p;
+    Exit(1);
+  end;
+  Result := 0;
+end;
+
+{ fts3_write.c:761..763 — fts3PendingListDelete. }
+procedure fts3PendingListDelete(pList: PPendingList);
+begin
+  sqlite3_free(pList);
+end;
+
+{ fts3_write.c:768..801 — fts3PendingTermsAddOne. }
+function fts3PendingTermsAddOne(p: PFts3Table; iCol, iPos: cint;
+  pHash: PFts3Hash; const zToken: PChar; nToken: cint): cint;
+var
+  pList: PPendingList;
+  rc: cint;
+begin
+  rc := SQLITE_OK;
+  pList := PPendingList(sqlite3Fts3HashFind(pHash, zToken, nToken));
+  if pList <> nil then
+    p^.nPendingData := p^.nPendingData -
+        cint(pList^.nData + nToken + sqlite3_int64(SizeOf(TFts3HashElem)));
+  if fts3PendingListAppend(@pList, p^.iPrevDocid, iCol, iPos, @rc) <> 0 then begin
+    if pList = PPendingList(sqlite3Fts3HashInsert(pHash, zToken, nToken, pList))
+    then begin
+      Assert(sqlite3Fts3HashFind(pHash, zToken, nToken) = nil);
+      sqlite3_free(pList);
+      rc := SQLITE_NOMEM;
+    end;
+  end;
+  if rc = SQLITE_OK then
+    p^.nPendingData := p^.nPendingData +
+        cint(pList^.nData + nToken + sqlite3_int64(SizeOf(TFts3HashElem)));
+  Result := rc;
+end;
+
+{ fts3_write.c:810..881 — fts3PendingTermsAdd. }
+function fts3PendingTermsAdd(p: PFts3Table; iLangid: cint; const zText: PChar;
+  iCol: cint; pnWord: Pcuint): cint;
+var
+  rc: cint;
+  iStart, iEnd, iPos, nWord: cint;
+  zToken: PChar;
+  nToken: cint;
+  pTokenizer: Psqlite3_tokenizer;
+  pModule: Psqlite3_tokenizer_module;
+  pCsr: Psqlite3_tokenizer_cursor;
+  xNext: TFts3TokXNext;
+  i: cint;
+  pIndex: PFts3Index;
+begin
+  iStart := 0; iEnd := 0; iPos := 0; nWord := 0;
+  nToken := 0;
+  pTokenizer := p^.pTokenizer;
+  pModule := pTokenizer^.pModule;
+  Assert((pTokenizer <> nil) and (pModule <> nil));
+
+  if zText = nil then begin
+    pnWord^ := 0;
+    Exit(SQLITE_OK);
+  end;
+
+  rc := sqlite3Fts3OpenTokenizer(pTokenizer, iLangid, zText, -1, @pCsr);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  xNext := pModule^.xNext;
+  while (rc = SQLITE_OK)
+    and (rc = xNext(pCsr, @zToken, @nToken, @iStart, @iEnd, @iPos)) do
+  begin
+    if iPos >= nWord then nWord := iPos + 1;
+    if (iPos < 0) or (zToken = nil) or (nToken <= 0) then begin
+      rc := SQLITE_ERROR;
+      break;
+    end;
+    rc := fts3PendingTermsAddOne(p, iCol, iPos, @p^.aIndex[0].hPending,
+            zToken, nToken);
+    i := 1;
+    while (rc = SQLITE_OK) and (i < p^.nIndex) do begin
+      pIndex := @PFts3Index(p^.aIndex)[i];
+      if nToken >= pIndex^.nPrefix then
+        rc := fts3PendingTermsAddOne(p, iCol, iPos, @pIndex^.hPending,
+                zToken, pIndex^.nPrefix);
+      Inc(i);
+    end;
+  end;
+
+  pModule^.xClose(pCsr);
+  pnWord^ := pnWord^ + cuint(nWord);
+  if rc = SQLITE_DONE then Result := SQLITE_OK else Result := rc;
+end;
+
+{ fts3_write.c:888..915 — fts3PendingTermsDocid. }
+function fts3PendingTermsDocid(p: PFts3Table; bDelete, iLangid: cint;
+  iDocid: sqlite3_int64): cint;
+var
+  rc: cint;
+begin
+  Assert(iLangid >= 0);
+  Assert((bDelete = 1) or (bDelete = 0));
+  if (iDocid < p^.iPrevDocid)
+   or ((iDocid = p^.iPrevDocid) and (p^.bPrevDelete = 0))
+   or (p^.iPrevLangid <> iLangid)
+   or (p^.nPendingData > p^.nMaxPendingData) then begin
+    rc := sqlite3Fts3PendingTermsFlush(p);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+  p^.iPrevDocid := iDocid;
+  p^.iPrevLangid := iLangid;
+  p^.bPrevDelete := bDelete;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:920..932 — sqlite3Fts3PendingTermsClear. }
+procedure sqlite3Fts3PendingTermsClear(p: PFts3Table);
+var
+  i: cint;
+  pElem: PFts3HashElem;
+  pHash: PFts3Hash;
+  pList: PPendingList;
+begin
+  for i := 0 to p^.nIndex - 1 do begin
+    pHash := @PFts3Index(p^.aIndex)[i].hPending;
+    pElem := fts3HashFirst(pHash);
+    while pElem <> nil do begin
+      pList := PPendingList(fts3HashData(pElem));
+      fts3PendingListDelete(pList);
+      pElem := fts3HashNext(pElem);
+    end;
+    sqlite3Fts3HashClear(pHash);
+  end;
+  p^.nPendingData := 0;
+end;
+
+{ fts3_write.c:942..961 — fts3InsertTerms. }
+function fts3InsertTerms(p: PFts3Table; iLangid: cint; apVal: PPsqlite3_value;
+  aSz: Pcuint): cint;
+var
+  i, iCol, rc: cint;
+  zText: PChar;
+begin
+  for i := 2 to p^.nColumn + 1 do begin
+    iCol := i - 2;
+    if PByte(p^.abNotindexed)[iCol] = 0 then begin
+      zText := PChar(sqlite3_value_text(PPsqlite3_value(apVal)[i]));
+      rc := fts3PendingTermsAdd(p, iLangid, zText, iCol, @Pcuint(aSz)[iCol]);
+      if rc <> SQLITE_OK then Exit(rc);
+      Pcuint(aSz)[p^.nColumn] := Pcuint(aSz)[p^.nColumn] +
+          cuint(sqlite3_value_bytes(PPsqlite3_value(apVal)[i]));
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:977..1043 — fts3InsertData. }
+function fts3InsertData(p: PFts3Table; apVal: PPsqlite3_value;
+  piDocid: Psqlite3_int64): cint;
+var
+  rc: cint;
+  pContentInsert: PVdbe;
+  pRowid: Psqlite3_value;
+begin
+  if p^.zContentTbl <> nil then begin
+    pRowid := PPsqlite3_value(apVal)[p^.nColumn+3];
+    if sqlite3_value_type(pRowid) = SQLITE_NULL then
+      pRowid := PPsqlite3_value(apVal)[1];
+    if sqlite3_value_type(pRowid) <> SQLITE_INTEGER then
+      Exit(SQLITE_CONSTRAINT);
+    piDocid^ := sqlite3_value_int64(pRowid);
+    Exit(SQLITE_OK);
+  end;
+
+  rc := fts3SqlStmt(p, SQL_CONTENT_INSERT, @pContentInsert,
+          @PPsqlite3_value(apVal)[1]);
+  if (rc = SQLITE_OK) and (p^.zLanguageid <> nil) then
+    rc := sqlite3_bind_int(pContentInsert, p^.nColumn+2,
+            sqlite3_value_int(PPsqlite3_value(apVal)[p^.nColumn+4]));
+  if rc <> SQLITE_OK then Exit(rc);
+
+  if SQLITE_NULL <> sqlite3_value_type(PPsqlite3_value(apVal)[3+p^.nColumn]) then
+  begin
+    if (SQLITE_NULL = sqlite3_value_type(PPsqlite3_value(apVal)[0]))
+     and (SQLITE_NULL <> sqlite3_value_type(PPsqlite3_value(apVal)[1])) then
+      Exit(SQLITE_ERROR);
+    rc := sqlite3_bind_value(pContentInsert, 1,
+            PPsqlite3_value(apVal)[3+p^.nColumn]);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+
+  sqlite3_step(pContentInsert);
+  rc := sqlite3_reset(pContentInsert);
+  piDocid^ := sqlite3_last_insert_rowid(p^.db);
+  Result := rc;
+end;
+
+{ fts3_write.c:1051..1070 — fts3DeleteAll. }
+function fts3DeleteAll(p: PFts3Table; bContent: cint): cint;
+var
+  rc: cint;
+begin
+  rc := SQLITE_OK;
+  sqlite3Fts3PendingTermsClear(p);
+  Assert((p^.zContentTbl = nil) or (bContent = 0));
+  if bContent <> 0 then fts3SqlExec(@rc, p, SQL_DELETE_ALL_CONTENT, nil);
+  fts3SqlExec(@rc, p, SQL_DELETE_ALL_SEGMENTS, nil);
+  fts3SqlExec(@rc, p, SQL_DELETE_ALL_SEGDIR, nil);
+  if p^.bHasDocsize <> 0 then fts3SqlExec(@rc, p, SQL_DELETE_ALL_DOCSIZE, nil);
+  if p^.bHasStat <> 0 then fts3SqlExec(@rc, p, SQL_DELETE_ALL_STAT, nil);
+  Result := rc;
+end;
+
+{ fts3_write.c:1075..1079 — langidFromSelect. }
+function langidFromSelect(p: PFts3Table; pSelect: PVdbe): cint;
+begin
+  if p^.zLanguageid <> nil then
+    Result := sqlite3_column_int(pSelect, p^.nColumn+1)
+  else
+    Result := 0;
+end;
+
+{ fts3_write.c:1086..1125 — fts3DeleteTerms. }
+procedure fts3DeleteTerms(pRC: Pcint; p: PFts3Table; pRowid: Psqlite3_value;
+  aSz: Pcuint; pbFound: Pcint);
+var
+  rc, i, iLangid, iCol: cint;
+  pSelect: PVdbe;
+  iDocid: sqlite3_int64;
+  zText: PChar;
+begin
+  Assert(pbFound^ = 0);
+  if pRC^ <> 0 then Exit;
+  rc := fts3SqlStmt(p, SQL_SELECT_CONTENT_BY_ROWID, @pSelect, @pRowid);
+  if rc = SQLITE_OK then begin
+    if SQLITE_ROW = sqlite3_step(pSelect) then begin
+      iLangid := langidFromSelect(p, pSelect);
+      iDocid := sqlite3_column_int64(pSelect, 0);
+      rc := fts3PendingTermsDocid(p, 1, iLangid, iDocid);
+      i := 1;
+      while (rc = SQLITE_OK) and (i <= p^.nColumn) do begin
+        iCol := i - 1;
+        if PByte(p^.abNotindexed)[iCol] = 0 then begin
+          zText := PChar(sqlite3_column_text(pSelect, i));
+          rc := fts3PendingTermsAdd(p, iLangid, zText, -1, @Pcuint(aSz)[iCol]);
+          Pcuint(aSz)[p^.nColumn] := Pcuint(aSz)[p^.nColumn] +
+              cuint(sqlite3_column_bytes(pSelect, i));
+        end;
+        Inc(i);
+      end;
+      if rc <> SQLITE_OK then begin
+        sqlite3_reset(pSelect);
+        pRC^ := rc;
+        Exit;
+      end;
+      pbFound^ := 1;
+    end;
+    rc := sqlite3_reset(pSelect);
+  end else
+    sqlite3_reset(pSelect);
+  pRC^ := rc;
+end;
+
+{ fts3_write.c:1148..1190 — fts3AllocateSegdirIdx. }
+function fts3AllocateSegdirIdx(p: PFts3Table; iLangid, iIndex, iLevel: cint;
+  piIdx: Pcint): cint;
+var
+  rc: cint;
+  pNextIdx: PVdbe;
+  iNext: cint;
+begin
+  iNext := 0;
+  Assert(iLangid >= 0);
+  Assert(p^.nIndex >= 1);
+  rc := fts3SqlStmt(p, SQL_NEXT_SEGMENT_INDEX, @pNextIdx, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pNextIdx, 1, getAbsoluteLevel(p, iLangid, iIndex, iLevel));
+    if SQLITE_ROW = sqlite3_step(pNextIdx) then
+      iNext := sqlite3_column_int(pNextIdx, 0);
+    rc := sqlite3_reset(pNextIdx);
+  end;
+  if rc = SQLITE_OK then begin
+    if iNext >= MergeCount(p) then begin
+      rc := fts3SegmentMerge(p, iLangid, iIndex, iLevel);
+      piIdx^ := 0;
+    end else
+      piIdx^ := iNext;
+  end;
+  Result := rc;
+end;
+
+{ ===================================================================== }
+{ Section 5 (read path) — %_segments block reads + Fts3SegReader.         }
+{ (fts3_write.c:1219..1581).                                             }
+{ ===================================================================== }
+
+{ fts3_write.c:1219..1269 — sqlite3Fts3ReadBlock. }
+function sqlite3Fts3ReadBlock(p: PFts3Table; iBlockid: sqlite3_int64;
+  paBlob: PPChar; pnBlob: Pcint; pnLoad: Pcint): cint;
+var
+  rc, nByte: cint;
+  aByte: PChar;
+begin
+  Assert(pnBlob <> nil);
+  if p^.pSegments <> nil then
+    rc := sqlite3_blob_reopen(p^.pSegments, iBlockid)
+  else begin
+    if p^.zSegmentsTbl = nil then begin
+      p^.zSegmentsTbl := PChar(sqlite3PfMprintf(PAnsiChar('%s_segments'),
+                            [p^.zName]));
+      if p^.zSegmentsTbl = nil then Exit(SQLITE_NOMEM);
+    end;
+    rc := sqlite3_blob_open(p^.db, PAnsiChar(p^.zDb),
+            PAnsiChar(p^.zSegmentsTbl), PAnsiChar('block'), iBlockid, 0,
+            p^.pSegments);
+  end;
+
+  if rc = SQLITE_OK then begin
+    nByte := sqlite3_blob_bytes(p^.pSegments);
+    pnBlob^ := nByte;
+    if paBlob <> nil then begin
+      aByte := PChar(sqlite3_malloc64(u64(sqlite3_int64(nByte) +
+                                          FTS3_NODE_PADDING)));
+      if aByte = nil then
+        rc := SQLITE_NOMEM
+      else begin
+        if (pnLoad <> nil) and (nByte > FTS3_NODE_CHUNK_THRESHOLD) then begin
+          nByte := FTS3_NODE_CHUNKSIZE;
+          pnLoad^ := nByte;
+        end;
+        rc := sqlite3_blob_read(p^.pSegments, aByte, nByte, 0);
+        libc_memset(@aByte[nByte], 0, FTS3_NODE_PADDING);
+        if rc <> SQLITE_OK then begin
+          sqlite3_free(aByte);
+          aByte := nil;
+        end;
+      end;
+      paBlob^ := aByte;
+    end;
+  end else if rc = SQLITE_ERROR then
+    rc := FTS_CORRUPT_VTAB;
+
+  Result := rc;
+end;
+
+{ fts3_write.c:1275..1278 — sqlite3Fts3SegmentsClose. }
+procedure sqlite3Fts3SegmentsClose(p: PFts3Table);
+begin
+  sqlite3_blob_close(p^.pSegments);
+  p^.pSegments := nil;
+end;
+
+{ fts3_write.c:173..174 — pending/root-only seg-reader predicates. }
+function fts3SegReaderIsPending(p: PFts3SegReader): Boolean; inline;
+begin Result := p^.ppNextElem <> nil; end;
+function fts3SegReaderIsRootOnly(p: PFts3SegReader): Boolean; inline;
+begin Result := p^.rootOnly <> 0; end;
+
+{ fts3_write.c:1280..1302 — fts3SegReaderIncrRead. }
+function fts3SegReaderIncrRead(pReader: PFts3SegReader): cint;
+var
+  nRead, rc: cint;
+begin
+  nRead := cint(Fts3_MIN(pReader^.nNode - pReader^.nPopulate, FTS3_NODE_CHUNKSIZE));
+  rc := sqlite3_blob_read(pReader^.pBlob, @pReader^.aNode[pReader^.nPopulate],
+          nRead, pReader^.nPopulate);
+  if rc = SQLITE_OK then begin
+    pReader^.nPopulate := pReader^.nPopulate + nRead;
+    libc_memset(@pReader^.aNode[pReader^.nPopulate], 0, FTS3_NODE_PADDING);
+    if pReader^.nPopulate = pReader^.nNode then begin
+      sqlite3_blob_close(pReader^.pBlob);
+      pReader^.pBlob := nil;
+      pReader^.nPopulate := 0;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:1304..1315 — fts3SegReaderRequire. }
+function fts3SegReaderRequire(pReader: PFts3SegReader; pFrom: PChar;
+  nByte: cint): cint;
+var
+  rc: cint;
+begin
+  rc := SQLITE_OK;
+  while (pReader^.pBlob <> nil) and (rc = SQLITE_OK)
+    and ((PtrUInt(pFrom) - PtrUInt(pReader^.aNode) + nByte) > PtrUInt(pReader^.nPopulate)) do
+    rc := fts3SegReaderIncrRead(pReader);
+  Result := rc;
+end;
+
+{ fts3_write.c:1320..1327 — fts3SegReaderSetEof. }
+procedure fts3SegReaderSetEof(pSeg: PFts3SegReader);
+begin
+  if not fts3SegReaderIsRootOnly(pSeg) then begin
+    sqlite3_free(pSeg^.aNode);
+    sqlite3_blob_close(pSeg^.pBlob);
+    pSeg^.pBlob := nil;
+  end;
+  pSeg^.aNode := nil;
+end;
+
+{ fts3_write.c:1334..1457 — fts3SegReaderNext. }
+function fts3SegReaderNext(p: PFts3Table; pReader: PFts3SegReader;
+  bIncr: cint): cint;
+var
+  rc: cint;
+  pNext: PChar;
+  nPrefix, nSuffix: cint;
+  pElem: PFts3HashElem;
+  aCopy: PChar;
+  pList: PPendingList;
+  nCopy, nTerm: cint;
+  nNew: sqlite3_int64;
+  zNew: PChar;
+  pnPop: Pcint;
+begin
+  if pReader^.aDoclist = nil then
+    pNext := pReader^.aNode
+  else
+    pNext := @pReader^.aDoclist[pReader^.nDoclist];
+
+  if (pNext = nil) or (PtrUInt(pNext) >= PtrUInt(@pReader^.aNode[pReader^.nNode])) then
+  begin
+    if fts3SegReaderIsPending(pReader) then begin
+      pElem := pReader^.ppNextElem^;
+      sqlite3_free(pReader^.aNode);
+      pReader^.aNode := nil;
+      if pElem <> nil then begin
+        pList := PPendingList(fts3HashData(pElem));
+        nCopy := cint(pList^.nData) + 1;
+        nTerm := fts3HashKeysize(pElem);
+        if (nTerm+1) > pReader^.nTermAlloc then begin
+          sqlite3_free(pReader^.zTerm);
+          pReader^.zTerm := PChar(sqlite3_malloc64(u64((sqlite3_int64(nTerm)+1)*2)));
+          if pReader^.zTerm = nil then Exit(SQLITE_NOMEM);
+          pReader^.nTermAlloc := (nTerm+1)*2;
+        end;
+        libc_memcpy(pReader^.zTerm, fts3HashKey(pElem), NativeUInt(nTerm));
+        pReader^.zTerm[nTerm] := #0;
+        pReader^.nTerm := nTerm;
+
+        aCopy := PChar(sqlite3_malloc64(u64(nCopy)));
+        if aCopy = nil then Exit(SQLITE_NOMEM);
+        libc_memcpy(aCopy, pList^.aData, NativeUInt(nCopy));
+        pReader^.nNode := nCopy; pReader^.nDoclist := nCopy;
+        pReader^.aNode := aCopy; pReader^.aDoclist := aCopy;
+        Inc(pReader^.ppNextElem);
+        Assert(pReader^.aNode <> nil);
+      end;
+      Exit(SQLITE_OK);
+    end;
+
+    fts3SegReaderSetEof(pReader);
+    if pReader^.iCurrentBlock >= pReader^.iLeafEndBlock then Exit(SQLITE_OK);
+
+    Inc(pReader^.iCurrentBlock);
+    if bIncr <> 0 then pnPop := @pReader^.nPopulate else pnPop := nil;
+    rc := sqlite3Fts3ReadBlock(p, pReader^.iCurrentBlock, @pReader^.aNode,
+            @pReader^.nNode, pnPop);
+    if rc <> SQLITE_OK then Exit(rc);
+    Assert(pReader^.pBlob = nil);
+    if (bIncr <> 0) and (pReader^.nPopulate < pReader^.nNode) then begin
+      pReader^.pBlob := p^.pSegments;
+      p^.pSegments := nil;
+    end;
+    pNext := pReader^.aNode;
+  end;
+
+  Assert(not fts3SegReaderIsPending(pReader));
+
+  rc := fts3SegReaderRequire(pReader, pNext, FTS3_VARINT_MAX*2);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  pNext := pNext + fts3GetVarint32(pNext, @nPrefix);
+  pNext := pNext + fts3GetVarint32(pNext, @nSuffix);
+  if (nSuffix <= 0)
+   or ((PtrInt(@pReader^.aNode[pReader^.nNode]) - PtrInt(pNext)) < nSuffix)
+   or (nPrefix > pReader^.nTerm) then
+    Exit(FTS_CORRUPT_VTAB);
+
+  if sqlite3_int64(nPrefix)+nSuffix > sqlite3_int64(pReader^.nTermAlloc) then begin
+    nNew := (sqlite3_int64(nPrefix)+nSuffix)*2;
+    zNew := PChar(sqlite3_realloc64(pReader^.zTerm, u64(nNew)));
+    if zNew = nil then Exit(SQLITE_NOMEM);
+    pReader^.zTerm := zNew;
+    pReader^.nTermAlloc := cint(nNew);
+  end;
+
+  rc := fts3SegReaderRequire(pReader, pNext, nSuffix+FTS3_VARINT_MAX);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  libc_memcpy(@pReader^.zTerm[nPrefix], pNext, NativeUInt(nSuffix));
+  pReader^.nTerm := nPrefix+nSuffix;
+  pNext := pNext + nSuffix;
+  pNext := pNext + fts3GetVarint32(pNext, @pReader^.nDoclist);
+  pReader^.aDoclist := pNext;
+  pReader^.pOffsetList := nil;
+
+  if (pReader^.nDoclist > pReader^.nNode-(PtrInt(pReader^.aDoclist)-PtrInt(pReader^.aNode)))
+   or ((pReader^.nPopulate = 0) and (pReader^.aDoclist[pReader^.nDoclist-1] <> #0))
+   or (pReader^.nDoclist = 0) then
+    Exit(FTS_CORRUPT_VTAB);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:1463..1483 — fts3SegReaderFirstDocid. }
+function fts3SegReaderFirstDocid(pTab: PFts3Table; pReader: PFts3SegReader): cint;
+var
+  rc, n: cint;
+  bEof: Byte;
+begin
+  rc := SQLITE_OK;
+  Assert(pReader^.aDoclist <> nil);
+  Assert(pReader^.pOffsetList = nil);
+  if (pTab^.bDescIdx <> 0) and fts3SegReaderIsPending(pReader) then begin
+    bEof := 0;
+    pReader^.iDocid := 0;
+    pReader^.nOffsetList := 0;
+    sqlite3Fts3DoclistPrev(0, pReader^.aDoclist, pReader^.nDoclist,
+        @pReader^.pOffsetList, @pReader^.iDocid, @pReader^.nOffsetList, @bEof);
+  end else begin
+    rc := fts3SegReaderRequire(pReader, pReader^.aDoclist, FTS3_VARINT_MAX);
+    if rc = SQLITE_OK then begin
+      n := sqlite3Fts3GetVarint(pReader^.aDoclist, @pReader^.iDocid);
+      pReader^.pOffsetList := @pReader^.aDoclist[n];
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:1495..1581 — fts3SegReaderNextDocid. }
+function fts3SegReaderNextDocid(pTab: PFts3Table; pReader: PFts3SegReader;
+  ppOffsetList: PPChar; pnOffsetList: Pcint): cint;
+var
+  rc: cint;
+  p, pEnd: PChar;
+  c: Byte;
+  bEof: Byte;
+  iDelta: u64;
+begin
+  rc := SQLITE_OK;
+  p := pReader^.pOffsetList;
+  c := 0;
+  Assert(p <> nil);
+
+  if (pTab^.bDescIdx <> 0) and fts3SegReaderIsPending(pReader) then begin
+    bEof := 0;
+    if ppOffsetList <> nil then begin
+      ppOffsetList^ := pReader^.pOffsetList;
+      pnOffsetList^ := pReader^.nOffsetList - 1;
+    end;
+    sqlite3Fts3DoclistPrev(0, pReader^.aDoclist, pReader^.nDoclist, @p,
+        @pReader^.iDocid, @pReader^.nOffsetList, @bEof);
+    if bEof <> 0 then pReader^.pOffsetList := nil
+                 else pReader^.pOffsetList := p;
+  end else begin
+    pEnd := @pReader^.aDoclist[pReader^.nDoclist];
+    while True do begin
+      { C: while( *p | c ) c = *p++ & 0x80; — read THEN advance. }
+      while (Byte(p^) or c) <> 0 do begin c := Byte(p^) and $80; Inc(p); end;
+      Assert(p^ = #0);
+      if (pReader^.pBlob = nil)
+       or (PtrUInt(p) < PtrUInt(@pReader^.aNode[pReader^.nPopulate])) then break;
+      rc := fts3SegReaderIncrRead(pReader);
+      if rc <> SQLITE_OK then Exit(rc);
+    end;
+    Inc(p);
+
+    if ppOffsetList <> nil then begin
+      ppOffsetList^ := pReader^.pOffsetList;
+      pnOffsetList^ := cint(PtrInt(p) - PtrInt(pReader^.pOffsetList) - 1);
+    end;
+
+    { List may have been edited in place by fts3EvalNearTrim() }
+    while (PtrUInt(p) < PtrUInt(pEnd)) and (p^ = #0) do Inc(p);
+
+    if PtrUInt(p) >= PtrUInt(pEnd) then
+      pReader^.pOffsetList := nil
+    else begin
+      rc := fts3SegReaderRequire(pReader, p, FTS3_VARINT_MAX);
+      if rc = SQLITE_OK then begin
+        pReader^.pOffsetList := p + sqlite3Fts3GetVarintU(p, @iDelta);
+        if pTab^.bDescIdx <> 0 then
+          pReader^.iDocid := sqlite3_int64(u64(pReader^.iDocid) - iDelta)
+        else
+          pReader^.iDocid := sqlite3_int64(u64(pReader^.iDocid) + iDelta);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:1584..1616 — sqlite3Fts3MsrOvfl. }
+function sqlite3Fts3MsrOvfl(pCsr: PFts3Cursor; pMsr: PFts3MultiSegReader;
+  pnOvfl: Pcint): cint;
+var
+  p: PFts3Table;
+  nOvfl, ii, rc, pgsz, nBlob: cint;
+  pReader: PFts3SegReader;
+  jj: sqlite3_int64;
+begin
+  p := PFts3Table(pCsr^.base.pVtab);
+  nOvfl := 0;
+  rc := SQLITE_OK;
+  pgsz := p^.nPgsz;
+  Assert(p^.bFts4 <> 0);
+  Assert(pgsz > 0);
+
+  ii := 0;
+  while (rc = SQLITE_OK) and (ii < pMsr^.nSegment) do begin
+    pReader := PPFts3SegReader(pMsr^.apSegment)[ii];
+    if (not fts3SegReaderIsPending(pReader))
+     and (not fts3SegReaderIsRootOnly(pReader)) then begin
+      jj := pReader^.iStartBlock;
+      while jj <= pReader^.iLeafEndBlock do begin
+        rc := sqlite3Fts3ReadBlock(p, jj, nil, @nBlob, nil);
+        if rc <> SQLITE_OK then break;
+        if (nBlob+35) > pgsz then nOvfl := nOvfl + (nBlob + 34) div pgsz;
+        Inc(jj);
+      end;
+    end;
+    Inc(ii);
+  end;
+  pnOvfl^ := nOvfl;
+  Result := rc;
+end;
+
+{ fts3_write.c:1622..1631 — sqlite3Fts3SegReaderFree. }
+procedure sqlite3Fts3SegReaderFree(pReader: PFts3SegReader);
+begin
+  if pReader <> nil then begin
+    sqlite3_free(pReader^.zTerm);
+    if not fts3SegReaderIsRootOnly(pReader) then
+      sqlite3_free(pReader^.aNode);
+    sqlite3_blob_close(pReader^.pBlob);
+  end;
+  sqlite3_free(pReader);
+end;
+
+{ fts3_write.c:1636..1682 — sqlite3Fts3SegReaderNew. }
+function sqlite3Fts3SegReaderNew(iAge, bLookup: cint; iStartLeaf, iEndLeaf,
+  iEndBlock: sqlite3_int64; const zRoot: PChar; nRoot: cint;
+  ppReader: PPFts3SegReader): cint;
+var
+  pReader: PFts3SegReader;
+  nExtra: cint;
+begin
+  nExtra := 0;
+  Assert((zRoot <> nil) or (nRoot = 0));
+  if iStartLeaf = 0 then begin
+    if iEndLeaf <> 0 then Exit(FTS_CORRUPT_VTAB);
+    nExtra := nRoot + FTS3_NODE_PADDING;
+  end;
+  pReader := PFts3SegReader(sqlite3_malloc64(u64(SizeOf(TFts3SegReader)) + u64(nExtra)));
+  if pReader = nil then Exit(SQLITE_NOMEM);
+  libc_memset(pReader, 0, SizeOf(TFts3SegReader));
+  pReader^.iIdx := iAge;
+  if bLookup <> 0 then pReader^.bLookup := 1 else pReader^.bLookup := 0;
+  pReader^.iStartBlock := iStartLeaf;
+  pReader^.iLeafEndBlock := iEndLeaf;
+  pReader^.iEndBlock := iEndBlock;
+  if nExtra <> 0 then begin
+    pReader^.aNode := PChar(PtrUInt(pReader) + SizeOf(TFts3SegReader));
+    pReader^.rootOnly := 1;
+    pReader^.nNode := nRoot;
+    if nRoot <> 0 then libc_memcpy(pReader^.aNode, zRoot, NativeUInt(nRoot));
+    libc_memset(@pReader^.aNode[nRoot], 0, FTS3_NODE_PADDING);
+  end else
+    pReader^.iCurrentBlock := iStartLeaf-1;
+  ppReader^ := pReader;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:1689..1704 — fts3CompareElemByTerm (qsort callback). }
+function fts3CompareElemByTerm(const lhs, rhs: Pointer): cint; cdecl;
+var
+  e1, e2: PFts3HashElem;
+  z1, z2: PChar;
+  n1, n2, n, c: cint;
+begin
+  e1 := PPFts3HashElem(lhs)^;
+  e2 := PPFts3HashElem(rhs)^;
+  z1 := PChar(fts3HashKey(e1));
+  z2 := PChar(fts3HashKey(e2));
+  n1 := fts3HashKeysize(e1);
+  n2 := fts3HashKeysize(e2);
+  if n1 < n2 then n := n1 else n := n2;
+  c := libc_memcmp(z1, z2, NativeUInt(n));
+  if c = 0 then c := n1 - n2;
+  Result := c;
+end;
+
+{ fts3_write.c:1725..1808 — sqlite3Fts3SegReaderPending. }
+function sqlite3Fts3SegReaderPending(p: PFts3Table; iIndex: cint;
+  const zTerm: PChar; nTerm: cint; bPrefix: cint;
+  ppReader: PPFts3SegReader): cint;
+var
+  pReader: PFts3SegReader;
+  pE: PFts3HashElem;
+  aElem: PPFts3HashElem;
+  nElem, rc, nAlloc: cint;
+  pHash: PFts3Hash;
+  zKey: PChar;
+  nKey: cint;
+  aElem2: PPFts3HashElem;
+  nByte: sqlite3_int64;
+begin
+  pReader := nil;
+  aElem := nil;
+  nElem := 0;
+  rc := SQLITE_OK;
+  pHash := @PFts3Index(p^.aIndex)[iIndex].hPending;
+
+  if bPrefix <> 0 then begin
+    nAlloc := 0;
+    pE := fts3HashFirst(pHash);
+    while pE <> nil do begin
+      zKey := PChar(fts3HashKey(pE));
+      nKey := fts3HashKeysize(pE);
+      if (nTerm = 0)
+       or ((nKey >= nTerm) and (libc_memcmp(zKey, zTerm, NativeUInt(nTerm)) = 0)) then
+      begin
+        if nElem = nAlloc then begin
+          nAlloc := nAlloc + 16;
+          aElem2 := PPFts3HashElem(sqlite3_realloc64(aElem,
+                      u64(nAlloc*SizeOf(PFts3HashElem))));
+          if aElem2 = nil then begin
+            rc := SQLITE_NOMEM;
+            nElem := 0;
+            break;
+          end;
+          aElem := aElem2;
+        end;
+        PPFts3HashElem(aElem)[nElem] := pE;
+        Inc(nElem);
+      end;
+      pE := fts3HashNext(pE);
+    end;
+    if nElem > 1 then
+      libc_qsort(aElem, NativeUInt(nElem), SizeOf(PFts3HashElem),
+        @fts3CompareElemByTerm);
+  end else begin
+    pE := sqlite3Fts3HashFindElem(pHash, zTerm, nTerm);
+    if pE <> nil then begin
+      aElem := @pE;
+      nElem := 1;
+    end;
+  end;
+
+  if nElem > 0 then begin
+    nByte := SizeOf(TFts3SegReader) + (sqlite3_int64(nElem)+1)*SizeOf(PFts3HashElem);
+    pReader := PFts3SegReader(sqlite3_malloc64(u64(nByte)));
+    if pReader = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      libc_memset(pReader, 0, NativeUInt(nByte));
+      pReader^.iIdx := $7FFFFFFF;
+      pReader^.ppNextElem := PPFts3HashElem(PtrUInt(pReader) + SizeOf(TFts3SegReader));
+      libc_memcpy(pReader^.ppNextElem, aElem, NativeUInt(nElem*SizeOf(PFts3HashElem)));
+    end;
+  end;
+
+  if bPrefix <> 0 then sqlite3_free(aElem);
+  ppReader^ := pReader;
+  Result := rc;
+end;
+
+{ fts3_write.c:1822..1842 — fts3SegReaderCmp. }
+function fts3SegReaderCmp(pLhs, pRhs: PFts3SegReader): cint;
+var
+  rc, rc2: cint;
+begin
+  if (pLhs^.aNode <> nil) and (pRhs^.aNode <> nil) then begin
+    rc2 := pLhs^.nTerm - pRhs^.nTerm;
+    if rc2 < 0 then
+      rc := libc_memcmp(pLhs^.zTerm, pRhs^.zTerm, NativeUInt(pLhs^.nTerm))
+    else
+      rc := libc_memcmp(pLhs^.zTerm, pRhs^.zTerm, NativeUInt(pRhs^.nTerm));
+    if rc = 0 then rc := rc2;
+  end else
+    rc := cint(Ord(pLhs^.aNode = nil)) - cint(Ord(pRhs^.aNode = nil));
+  if rc = 0 then rc := pRhs^.iIdx - pLhs^.iIdx;
+  Result := rc;
+end;
+
+{ fts3_write.c:1855..1866 — fts3SegReaderDoclistCmp. }
+function fts3SegReaderDoclistCmp(pLhs, pRhs: PFts3SegReader): cint;
+var
+  rc: cint;
+begin
+  rc := cint(Ord(pLhs^.pOffsetList = nil)) - cint(Ord(pRhs^.pOffsetList = nil));
+  if rc = 0 then begin
+    if pLhs^.iDocid = pRhs^.iDocid then rc := pRhs^.iIdx - pLhs^.iIdx
+    else if pLhs^.iDocid > pRhs^.iDocid then rc := 1 else rc := -1;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:1867..1878 — fts3SegReaderDoclistCmpRev. }
+function fts3SegReaderDoclistCmpRev(pLhs, pRhs: PFts3SegReader): cint;
+var
+  rc: cint;
+begin
+  rc := cint(Ord(pLhs^.pOffsetList = nil)) - cint(Ord(pRhs^.pOffsetList = nil));
+  if rc = 0 then begin
+    if pLhs^.iDocid = pRhs^.iDocid then rc := pRhs^.iIdx - pLhs^.iIdx
+    else if pLhs^.iDocid < pRhs^.iDocid then rc := 1 else rc := -1;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:1888..1905 — fts3SegReaderTermCmp. }
+function fts3SegReaderTermCmp(pSeg: PFts3SegReader; const zTerm: PChar;
+  nTerm: cint): cint;
+var
+  res: cint;
+begin
+  res := 0;
+  if pSeg^.aNode <> nil then begin
+    if pSeg^.nTerm > nTerm then
+      res := libc_memcmp(pSeg^.zTerm, zTerm, NativeUInt(nTerm))
+    else
+      res := libc_memcmp(pSeg^.zTerm, zTerm, NativeUInt(pSeg^.nTerm));
+    if res = 0 then res := pSeg^.nTerm-nTerm;
+  end;
+  Result := res;
+end;
+
+type
+  TSegReaderCmpFn = function(pLhs, pRhs: PFts3SegReader): cint;
+
+{ fts3_write.c:1913..1941 — fts3SegReaderSort. }
+procedure fts3SegReaderSort(apSegment: PPFts3SegReader; nSegment, nSuspect: cint;
+  xCmp: TSegReaderCmpFn);
+var
+  i, j: cint;
+  pTmp: PFts3SegReader;
+  a: PPFts3SegReader;
+begin
+  a := apSegment;
+  Assert(nSuspect <= nSegment);
+  if nSuspect = nSegment then Dec(nSuspect);
+  for i := nSuspect-1 downto 0 do begin
+    j := i;
+    while j < (nSegment-1) do begin
+      if xCmp(a[j], a[j+1]) < 0 then break;
+      pTmp := a[j+1];
+      a[j+1] := a[j];
+      a[j] := pTmp;
+      Inc(j);
+    end;
+  end;
+end;
+
+{ ===================================================================== }
+{ Section 4 — segment WRITER: node building, prefix compression, writes.  }
+{ (fts3_write.c:1946..2450).                                             }
+{ ===================================================================== }
+
+{ fts3_write.c:1946..1962 — fts3WriteSegment. }
+function fts3WriteSegment(p: PFts3Table; iBlock: sqlite3_int64; z: PChar;
+  n: cint): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  rc := fts3SqlStmt(p, SQL_INSERT_SEGMENTS, @pStmt, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pStmt, 1, iBlock);
+    sqlite3_bind_blob(pStmt, 2, z, n, SQLITE_STATIC);
+    sqlite3_step(pStmt);
+    rc := sqlite3_reset(pStmt);
+    sqlite3_bind_null(pStmt, 2);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:1969..1983 — sqlite3Fts3MaxLevel. }
+function sqlite3Fts3MaxLevel(p: PFts3Table; pnMax: Pcint): cint;
+var
+  rc, mxLevel: cint;
+  pStmt: PVdbe;
+begin
+  mxLevel := 0;
+  pStmt := nil;
+  rc := fts3SqlStmt(p, SQL_SELECT_MXLEVEL, @pStmt, nil);
+  if rc = SQLITE_OK then begin
+    if SQLITE_ROW = sqlite3_step(pStmt) then
+      mxLevel := sqlite3_column_int(pStmt, 0);
+    rc := sqlite3_reset(pStmt);
+  end;
+  pnMax^ := mxLevel;
+  Result := rc;
+end;
+
+{ fts3_write.c:1988..2019 — fts3WriteSegdir. }
+function fts3WriteSegdir(p: PFts3Table; iLevel: sqlite3_int64; iIdx: cint;
+  iStartBlock, iLeafEndBlock, iEndBlock, nLeafData: sqlite3_int64;
+  zRoot: PChar; nRoot: cint): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+  zEnd: PChar;
+begin
+  rc := fts3SqlStmt(p, SQL_INSERT_SEGDIR, @pStmt, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pStmt, 1, iLevel);
+    sqlite3_bind_int(pStmt, 2, iIdx);
+    sqlite3_bind_int64(pStmt, 3, iStartBlock);
+    sqlite3_bind_int64(pStmt, 4, iLeafEndBlock);
+    if nLeafData = 0 then
+      sqlite3_bind_int64(pStmt, 5, iEndBlock)
+    else begin
+      zEnd := PChar(sqlite3PfMprintf(PAnsiChar('%lld %lld'),
+                [iEndBlock, nLeafData]));
+      if zEnd = nil then Exit(SQLITE_NOMEM);
+      sqlite3_bind_text(pStmt, 5, zEnd, -1, TxDelProc(@sqlite3_free));
+    end;
+    sqlite3_bind_blob(pStmt, 6, zRoot, nRoot, SQLITE_STATIC);
+    sqlite3_step(pStmt);
+    rc := sqlite3_reset(pStmt);
+    sqlite3_bind_null(pStmt, 6);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:2029..2039 — fts3PrefixCompress. }
+function fts3PrefixCompress(const zPrev: PChar; nPrev: cint; const zNext: PChar;
+  nNext: cint): cint;
+var
+  n: cint;
+begin
+  n := 0;
+  while (n < nPrev) and (n < nNext) and (zPrev[n] = zNext[n]) do Inc(n);
+  Result := n;
+end;
+
+{ fts3_write.c:2045..2156 — fts3NodeAddTerm (mutually recursive). }
+function fts3NodeAddTerm(p: PFts3Table; ppTree: PPSegmentNode;
+  isCopyTerm: cint; const zTerm: PChar; nTerm: cint): cint;
+var
+  pTree, pNew, pParent: PSegmentNode;
+  rc: cint;
+  nData, nReq, nPrefix, nSuffix: cint;
+  zNew: PChar;
+begin
+  pTree := ppTree^;
+
+  if pTree <> nil then begin
+    nData := pTree^.nData;
+    nReq := nData;
+    nPrefix := fts3PrefixCompress(pTree^.zTerm, pTree^.nTerm, zTerm, nTerm);
+    nSuffix := nTerm-nPrefix;
+    if nSuffix <= 0 then Exit(FTS_CORRUPT_VTAB);
+    nReq := nReq + sqlite3Fts3VarintLen(nPrefix) + sqlite3Fts3VarintLen(nSuffix)
+              + nSuffix;
+    if (nReq <= p^.nNodeSize) or (pTree^.zTerm = nil) then begin
+      if nReq > p^.nNodeSize then begin
+        Assert(pTree^.aData = PChar(PtrUInt(pTree) + SizeOf(TSegmentNode)));
+        pTree^.aData := PChar(sqlite3_malloc64(u64(nReq)));
+        if pTree^.aData = nil then Exit(SQLITE_NOMEM);
+      end;
+      if pTree^.zTerm <> nil then
+        nData := nData + sqlite3Fts3PutVarint(@pTree^.aData[nData], nPrefix);
+      nData := nData + sqlite3Fts3PutVarint(@pTree^.aData[nData], nSuffix);
+      libc_memcpy(@pTree^.aData[nData], @zTerm[nPrefix], NativeUInt(nSuffix));
+      pTree^.nData := nData + nSuffix;
+      Inc(pTree^.nEntry);
+      if isCopyTerm <> 0 then begin
+        if pTree^.nMalloc < nTerm then begin
+          zNew := PChar(sqlite3_realloc64(pTree^.zMalloc, u64(sqlite3_int64(nTerm)*2)));
+          if zNew = nil then Exit(SQLITE_NOMEM);
+          pTree^.nMalloc := nTerm*2;
+          pTree^.zMalloc := zNew;
+        end;
+        pTree^.zTerm := pTree^.zMalloc;
+        libc_memcpy(pTree^.zTerm, zTerm, NativeUInt(nTerm));
+        pTree^.nTerm := nTerm;
+      end else begin
+        pTree^.zTerm := PChar(zTerm);
+        pTree^.nTerm := nTerm;
+      end;
+      Exit(SQLITE_OK);
+    end;
+  end;
+
+  pNew := PSegmentNode(sqlite3_malloc64(u64(SizeOf(TSegmentNode)) + u64(p^.nNodeSize)));
+  if pNew = nil then Exit(SQLITE_NOMEM);
+  libc_memset(pNew, 0, SizeOf(TSegmentNode));
+  pNew^.nData := 1 + FTS3_VARINT_MAX;
+  pNew^.aData := PChar(PtrUInt(pNew) + SizeOf(TSegmentNode));
+
+  if pTree <> nil then begin
+    pParent := pTree^.pParent;
+    rc := fts3NodeAddTerm(p, @pParent, isCopyTerm, zTerm, nTerm);
+    if pTree^.pParent = nil then pTree^.pParent := pParent;
+    pTree^.pRight := pNew;
+    pNew^.pLeftmost := pTree^.pLeftmost;
+    pNew^.pParent := pParent;
+    pNew^.zMalloc := pTree^.zMalloc;
+    pNew^.nMalloc := pTree^.nMalloc;
+    pTree^.zMalloc := nil;
+  end else begin
+    pNew^.pLeftmost := pNew;
+    rc := fts3NodeAddTerm(p, @pNew, isCopyTerm, zTerm, nTerm);
+  end;
+
+  ppTree^ := pNew;
+  Result := rc;
+end;
+
+{ fts3_write.c:2161..2172 — fts3TreeFinishNode. }
+function fts3TreeFinishNode(pTree: PSegmentNode; iHeight: cint;
+  iLeftChild: sqlite3_int64): cint;
+var
+  nStart: cint;
+begin
+  Assert((iHeight >= 1) and (iHeight < 128));
+  nStart := FTS3_VARINT_MAX - sqlite3Fts3VarintLen(iLeftChild);
+  pTree^.aData[nStart] := Chr(iHeight);
+  sqlite3Fts3PutVarint(@pTree^.aData[nStart+1], iLeftChild);
+  Result := nStart;
+end;
+
+{ fts3_write.c:2187..2226 — fts3NodeWrite. }
+function fts3NodeWrite(p: PFts3Table; pTree: PSegmentNode; iHeight: cint;
+  iLeaf, iFree: sqlite3_int64; piLast: Psqlite3_int64; paRoot: PPChar;
+  pnRoot: Pcint): cint;
+var
+  rc: cint;
+  pIter: PSegmentNode;
+  iNextFree, iNextLeaf: sqlite3_int64;
+  nStart, nWrite: cint;
+begin
+  rc := SQLITE_OK;
+  if pTree^.pParent = nil then begin
+    nStart := fts3TreeFinishNode(pTree, iHeight, iLeaf);
+    piLast^ := iFree-1;
+    pnRoot^ := pTree^.nData - nStart;
+    paRoot^ := @pTree^.aData[nStart];
+  end else begin
+    iNextFree := iFree;
+    iNextLeaf := iLeaf;
+    pIter := pTree^.pLeftmost;
+    while (pIter <> nil) and (rc = SQLITE_OK) do begin
+      nStart := fts3TreeFinishNode(pIter, iHeight, iNextLeaf);
+      nWrite := pIter^.nData - nStart;
+      rc := fts3WriteSegment(p, iNextFree, @pIter^.aData[nStart], nWrite);
+      Inc(iNextFree);
+      iNextLeaf := iNextLeaf + (pIter^.nEntry+1);
+      pIter := pIter^.pRight;
+    end;
+    if rc = SQLITE_OK then begin
+      Assert(iNextLeaf = iFree);
+      rc := fts3NodeWrite(p, pTree^.pParent, iHeight+1, iFree, iNextFree,
+              piLast, paRoot, pnRoot);
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:2231..2246 — fts3NodeFree. }
+procedure fts3NodeFree(pTree: PSegmentNode);
+var
+  p, pRight: PSegmentNode;
+begin
+  if pTree <> nil then begin
+    p := pTree^.pLeftmost;
+    fts3NodeFree(p^.pParent);
+    while p <> nil do begin
+      pRight := p^.pRight;
+      if p^.aData <> PChar(PtrUInt(p) + SizeOf(TSegmentNode)) then
+        sqlite3_free(p^.aData);
+      sqlite3_free(p^.zMalloc);
+      sqlite3_free(p);
+      p := pRight;
+    end;
+  end;
+end;
+
+{ fts3_write.c:2256..2399 — fts3SegWriterAdd. }
+function fts3SegWriterAdd(p: PFts3Table; ppWriter: PPSegmentWriter;
+  isCopyTerm: cint; const zTerm: PChar; nTerm: cint; const aDoclist: PChar;
+  nDoclist: cint): cint;
+var
+  nPrefix, nSuffix, nData, rc: cint;
+  nReq: sqlite3_int64;
+  pWriter: PSegmentWriter;
+  pStmt: PVdbe;
+  aNew, zNew: PChar;
+begin
+  pWriter := ppWriter^;
+  if pWriter = nil then begin
+    pWriter := PSegmentWriter(sqlite3_malloc64(u64(SizeOf(TSegmentWriter))));
+    if pWriter = nil then Exit(SQLITE_NOMEM);
+    libc_memset(pWriter, 0, SizeOf(TSegmentWriter));
+    ppWriter^ := pWriter;
+    pWriter^.aData := PChar(sqlite3_malloc64(u64(p^.nNodeSize)));
+    if pWriter^.aData = nil then Exit(SQLITE_NOMEM);
+    pWriter^.nSize := p^.nNodeSize;
+    rc := fts3SqlStmt(p, SQL_NEXT_SEGMENTS_ID, @pStmt, nil);
+    if rc <> SQLITE_OK then Exit(rc);
+    if SQLITE_ROW = sqlite3_step(pStmt) then begin
+      pWriter^.iFree := sqlite3_column_int64(pStmt, 0);
+      pWriter^.iFirst := pWriter^.iFree;
+    end;
+    rc := sqlite3_reset(pStmt);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+  nData := pWriter^.nData;
+
+  nPrefix := fts3PrefixCompress(pWriter^.zTerm, pWriter^.nTerm, zTerm, nTerm);
+  nSuffix := nTerm-nPrefix;
+  if nSuffix <= 0 then Exit(FTS_CORRUPT_VTAB);
+
+  nReq := sqlite3Fts3VarintLen(nPrefix) + sqlite3Fts3VarintLen(nSuffix)
+            + nSuffix + sqlite3Fts3VarintLen(nDoclist) + nDoclist;
+
+  if (nData > 0) and (nData+nReq > p^.nNodeSize) then begin
+    if pWriter^.iFree = LARGEST_INT64 then Exit(FTS_CORRUPT_VTAB);
+    rc := fts3WriteSegment(p, pWriter^.iFree, pWriter^.aData, nData);
+    Inc(pWriter^.iFree);
+    if rc <> SQLITE_OK then Exit(rc);
+    Inc(p^.nLeafAdd);
+    Assert(nPrefix < nTerm);
+    rc := fts3NodeAddTerm(p, @pWriter^.pTree, isCopyTerm, zTerm, nPrefix+1);
+    if rc <> SQLITE_OK then Exit(rc);
+    nData := 0;
+    pWriter^.nTerm := 0;
+    nPrefix := 0;
+    nSuffix := nTerm;
+    nReq := 1 + sqlite3Fts3VarintLen(nTerm) + nTerm
+              + sqlite3Fts3VarintLen(nDoclist) + nDoclist;
+  end;
+
+  pWriter^.nLeafData := pWriter^.nLeafData + nReq;
+
+  if nReq > pWriter^.nSize then begin
+    aNew := PChar(sqlite3_realloc64(pWriter^.aData, u64(nReq)));
+    if aNew = nil then Exit(SQLITE_NOMEM);
+    pWriter^.aData := aNew;
+    pWriter^.nSize := cint(nReq);
+  end;
+  Assert(nData+nReq <= pWriter^.nSize);
+
+  nData := nData + sqlite3Fts3PutVarint(@pWriter^.aData[nData], nPrefix);
+  nData := nData + sqlite3Fts3PutVarint(@pWriter^.aData[nData], nSuffix);
+  libc_memcpy(@pWriter^.aData[nData], @zTerm[nPrefix], NativeUInt(nSuffix));
+  nData := nData + nSuffix;
+  nData := nData + sqlite3Fts3PutVarint(@pWriter^.aData[nData], nDoclist);
+  libc_memcpy(@pWriter^.aData[nData], aDoclist, NativeUInt(nDoclist));
+  pWriter^.nData := nData + nDoclist;
+
+  if isCopyTerm <> 0 then begin
+    if nTerm > pWriter^.nMalloc then begin
+      zNew := PChar(sqlite3_realloc64(pWriter^.zMalloc, u64(sqlite3_int64(nTerm)*2)));
+      if zNew = nil then Exit(SQLITE_NOMEM);
+      pWriter^.nMalloc := nTerm*2;
+      pWriter^.zMalloc := zNew;
+      pWriter^.zTerm := zNew;
+    end;
+    Assert(pWriter^.zTerm = pWriter^.zMalloc);
+    libc_memcpy(pWriter^.zTerm, zTerm, NativeUInt(nTerm));
+  end else
+    pWriter^.zTerm := PChar(zTerm);
+  pWriter^.nTerm := nTerm;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2407..2437 — fts3SegWriterFlush. }
+function fts3SegWriterFlush(p: PFts3Table; pWriter: PSegmentWriter;
+  iLevel: sqlite3_int64; iIdx: cint): cint;
+var
+  rc: cint;
+  iLast, iLastLeaf: sqlite3_int64;
+  zRoot: PChar;
+  nRoot: cint;
+begin
+  if pWriter^.pTree <> nil then begin
+    iLast := 0;
+    zRoot := nil;
+    nRoot := 0;
+    iLastLeaf := pWriter^.iFree;
+    rc := fts3WriteSegment(p, pWriter^.iFree, pWriter^.aData, pWriter^.nData);
+    Inc(pWriter^.iFree);
+    if rc = SQLITE_OK then
+      rc := fts3NodeWrite(p, pWriter^.pTree, 1, pWriter^.iFirst, pWriter^.iFree,
+              @iLast, @zRoot, @nRoot);
+    if rc = SQLITE_OK then
+      rc := fts3WriteSegdir(p, iLevel, iIdx, pWriter^.iFirst, iLastLeaf, iLast,
+              pWriter^.nLeafData, zRoot, nRoot);
+  end else
+    rc := fts3WriteSegdir(p, iLevel, iIdx, 0, 0, 0, pWriter^.nLeafData,
+            pWriter^.aData, pWriter^.nData);
+  Inc(p^.nLeafAdd);
+  Result := rc;
+end;
+
+{ fts3_write.c:2443..2450 — fts3SegWriterFree. }
+procedure fts3SegWriterFree(pWriter: PSegmentWriter);
+begin
+  if pWriter <> nil then begin
+    sqlite3_free(pWriter^.aData);
+    sqlite3_free(pWriter^.zMalloc);
+    fts3NodeFree(pWriter^.pTree);
+    sqlite3_free(pWriter);
+  end;
+end;
+
+{ ===================================================================== }
+{ Section 5b — merge driver + multi-way reader step.                     }
+{ (fts3_write.c:2462..3096, 3108..3376).                                 }
+{ ===================================================================== }
+
+{ fts3_write.c:2462..2479 — fts3IsEmpty. }
+function fts3IsEmpty(p: PFts3Table; pRowid: Psqlite3_value; pisEmpty: Pcint): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  if p^.zContentTbl <> nil then begin
+    pisEmpty^ := 0;
+    rc := SQLITE_OK;
+  end else begin
+    rc := fts3SqlStmt(p, SQL_IS_EMPTY, @pStmt, @pRowid);
+    if rc = SQLITE_OK then begin
+      if SQLITE_ROW = sqlite3_step(pStmt) then
+        pisEmpty^ := sqlite3_column_int(pStmt, 0);
+      rc := sqlite3_reset(pStmt);
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:2489..2515 — fts3SegmentMaxLevel. }
+function fts3SegmentMaxLevel(p: PFts3Table; iLangid, iIndex: cint;
+  pnMax: Psqlite3_int64): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  Assert((iIndex >= 0) and (iIndex < p^.nIndex));
+  rc := fts3SqlStmt(p, SQL_SELECT_SEGDIR_MAX_LEVEL, @pStmt, nil);
+  if rc <> SQLITE_OK then Exit(rc);
+  sqlite3_bind_int64(pStmt, 1, getAbsoluteLevel(p, iLangid, iIndex, 0));
+  sqlite3_bind_int64(pStmt, 2,
+      getAbsoluteLevel(p, iLangid, iIndex, FTS3_SEGDIR_MAXLEVEL-1));
+  if SQLITE_ROW = sqlite3_step(pStmt) then
+    pnMax^ := sqlite3_column_int64(pStmt, 0);
+  Result := sqlite3_reset(pStmt);
+end;
+
+{ fts3_write.c:2525..2546 — fts3SegmentIsMaxLevel. }
+function fts3SegmentIsMaxLevel(p: PFts3Table; iAbsLevel: sqlite3_int64;
+  pbMax: Pcint): cint;
+var
+  pStmt: PVdbe;
+  rc: cint;
+begin
+  rc := fts3SqlStmt(p, SQL_SELECT_SEGDIR_MAX_LEVEL, @pStmt, nil);
+  if rc <> SQLITE_OK then Exit(rc);
+  sqlite3_bind_int64(pStmt, 1, iAbsLevel+1);
+  sqlite3_bind_int64(pStmt, 2,
+      sqlite3_int64(((u64(iAbsLevel) div FTS3_SEGDIR_MAXLEVEL)+1) * FTS3_SEGDIR_MAXLEVEL));
+  pbMax^ := 0;
+  if SQLITE_ROW = sqlite3_step(pStmt) then
+    pbMax^ := cint(Ord(sqlite3_column_type(pStmt, 0) = SQLITE_NULL));
+  Result := sqlite3_reset(pStmt);
+end;
+
+{ fts3_write.c:2553..2569 — fts3DeleteSegment. }
+function fts3DeleteSegment(p: PFts3Table; pSeg: PFts3SegReader): cint;
+var
+  rc: cint;
+  pDelete: PVdbe;
+begin
+  rc := SQLITE_OK;
+  if pSeg^.iStartBlock <> 0 then begin
+    rc := fts3SqlStmt(p, SQL_DELETE_SEGMENTS_RANGE, @pDelete, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_int64(pDelete, 1, pSeg^.iStartBlock);
+      sqlite3_bind_int64(pDelete, 2, pSeg^.iEndBlock);
+      sqlite3_step(pDelete);
+      rc := sqlite3_reset(pDelete);
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:2585..2628 — fts3DeleteSegdir. }
+function fts3DeleteSegdir(p: PFts3Table; iLangid, iIndex, iLevel: cint;
+  apSegment: PPFts3SegReader; nReader: cint): cint;
+var
+  rc, i: cint;
+  pDelete: PVdbe;
+begin
+  rc := SQLITE_OK;
+  pDelete := nil;
+  i := 0;
+  while (rc = SQLITE_OK) and (i < nReader) do begin
+    rc := fts3DeleteSegment(p, PPFts3SegReader(apSegment)[i]);
+    Inc(i);
+  end;
+  if rc <> SQLITE_OK then Exit(rc);
+
+  Assert((iLevel >= 0) or (iLevel = FTS3_SEGCURSOR_ALL));
+  if iLevel = FTS3_SEGCURSOR_ALL then begin
+    rc := fts3SqlStmt(p, SQL_DELETE_SEGDIR_RANGE, @pDelete, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_int64(pDelete, 1, getAbsoluteLevel(p, iLangid, iIndex, 0));
+      sqlite3_bind_int64(pDelete, 2,
+          getAbsoluteLevel(p, iLangid, iIndex, FTS3_SEGDIR_MAXLEVEL-1));
+    end;
+  end else begin
+    rc := fts3SqlStmt(p, SQL_DELETE_SEGDIR_LEVEL, @pDelete, nil);
+    if rc = SQLITE_OK then
+      sqlite3_bind_int64(pDelete, 1,
+          getAbsoluteLevel(p, iLangid, iIndex, iLevel));
+  end;
+  if rc = SQLITE_OK then begin
+    sqlite3_step(pDelete);
+    rc := sqlite3_reset(pDelete);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:2642..2678 — fts3ColumnFilter. }
+procedure fts3ColumnFilter(iCol, bZero: cint; ppList: PPChar; pnList: Pcint);
+var
+  pList, pEnd, p: PChar;
+  nList, iCurrent: cint;
+  c: Byte;
+begin
+  pList := ppList^;
+  nList := pnList^;
+  pEnd := @pList[nList];
+  iCurrent := 0;
+  p := pList;
+  Assert(iCol >= 0);
+  while True do begin
+    c := 0;
+    { C: while( p<pEnd && (c | *p)&0xFE ) c = *p++ & 0x80; }
+    while (PtrUInt(p) < PtrUInt(pEnd)) and (((c or Byte(p^)) and $FE) <> 0) do
+      begin c := Byte(p^) and $80; Inc(p); end;
+    if iCol = iCurrent then begin
+      nList := cint(PtrInt(p) - PtrInt(pList));
+      break;
+    end;
+    nList := nList - cint(PtrInt(p) - PtrInt(pList));
+    pList := p;
+    if nList <= 0 then break;
+    p := @pList[1];
+    p := p + fts3GetVarint32(p, @iCurrent);
+  end;
+  if (bZero <> 0) and ((PtrInt(pEnd) - PtrInt(@pList[nList])) > 0) then
+    libc_memset(@pList[nList], 0, NativeUInt(PtrInt(pEnd) - PtrInt(@pList[nList])));
+  ppList^ := pList;
+  pnList^ := nList;
+end;
+
+{ fts3_write.c:2687..2705 — fts3MsrBufferData. }
+function fts3MsrBufferData(pMsr: PFts3MultiSegReader; pList: PChar;
+  nList: sqlite3_int64): cint;
+var
+  pNew: PChar;
+  nNew: cint;
+begin
+  if (nList+FTS3_NODE_PADDING) > pMsr^.nBuffer then begin
+    nNew := cint(nList*2 + FTS3_NODE_PADDING);
+    pNew := PChar(sqlite3_realloc64(pMsr^.aBuffer, u64(nNew)));
+    if pNew = nil then Exit(SQLITE_NOMEM);
+    pMsr^.aBuffer := pNew;
+    pMsr^.nBuffer := nNew;
+  end;
+  libc_memcpy(pMsr^.aBuffer, pList, NativeUInt(nList));
+  libc_memset(@pMsr^.aBuffer[nList], 0, FTS3_NODE_PADDING);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2707..2773 — sqlite3Fts3MsrIncrNext. }
+function sqlite3Fts3MsrIncrNext(p: PFts3Table; pMsr: PFts3MultiSegReader;
+  piDocid: Psqlite3_int64; paPoslist: PPChar; pnPoslist: Pcint): cint;
+var
+  nMerge: cint;
+  apSegment: PPFts3SegReader;
+  xCmp: TSegReaderCmpFn;
+  pSeg: PFts3SegReader;
+  rc, nList, j: cint;
+  pList: PChar;
+  iDocid: sqlite3_int64;
+begin
+  nMerge := pMsr^.nAdvance;
+  apSegment := pMsr^.apSegment;
+  if p^.bDescIdx <> 0 then xCmp := @fts3SegReaderDoclistCmpRev
+                       else xCmp := @fts3SegReaderDoclistCmp;
+  if nMerge = 0 then begin
+    paPoslist^ := nil;
+    Exit(SQLITE_OK);
+  end;
+
+  while True do begin
+    pSeg := PPFts3SegReader(pMsr^.apSegment)[0];
+    if pSeg^.pOffsetList = nil then begin
+      paPoslist^ := nil;
+      break;
+    end else begin
+      iDocid := PPFts3SegReader(apSegment)[0]^.iDocid;
+      rc := fts3SegReaderNextDocid(p, PPFts3SegReader(apSegment)[0], @pList, @nList);
+      j := 1;
+      while (rc = SQLITE_OK) and (j < nMerge)
+        and (PPFts3SegReader(apSegment)[j]^.pOffsetList <> nil)
+        and (PPFts3SegReader(apSegment)[j]^.iDocid = iDocid) do begin
+        rc := fts3SegReaderNextDocid(p, PPFts3SegReader(apSegment)[j], nil, nil);
+        Inc(j);
+      end;
+      if rc <> SQLITE_OK then Exit(rc);
+      fts3SegReaderSort(pMsr^.apSegment, nMerge, j, xCmp);
+
+      if (nList > 0) and fts3SegReaderIsPending(PPFts3SegReader(apSegment)[0]) then
+      begin
+        rc := fts3MsrBufferData(pMsr, pList, sqlite3_int64(nList)+1);
+        if rc <> SQLITE_OK then Exit(rc);
+        pList := pMsr^.aBuffer;
+      end;
+      if pMsr^.iColFilter >= 0 then
+        fts3ColumnFilter(pMsr^.iColFilter, 1, @pList, @nList);
+      if nList > 0 then begin
+        paPoslist^ := pList;
+        piDocid^ := iDocid;
+        pnPoslist^ := nList;
+        break;
+      end;
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2775..2805 — fts3SegReaderStart. }
+function fts3SegReaderStart(p: PFts3Table; pCsr: PFts3MultiSegReader;
+  const zTerm: PChar; nTerm: cint): cint;
+var
+  i, nSeg, res, rc: cint;
+  pSeg: PFts3SegReader;
+begin
+  nSeg := pCsr^.nSegment;
+  i := 0;
+  while (pCsr^.bRestart = 0) and (i < pCsr^.nSegment) do begin
+    res := 0;
+    pSeg := PPFts3SegReader(pCsr^.apSegment)[i];
+    repeat
+      rc := fts3SegReaderNext(p, pSeg, 0);
+      if rc <> SQLITE_OK then Exit(rc);
+      if zTerm = nil then break;
+      res := fts3SegReaderTermCmp(pSeg, zTerm, nTerm);
+    until res >= 0;
+    if (pSeg^.bLookup <> 0) and (res <> 0) then
+      fts3SegReaderSetEof(pSeg);
+    Inc(i);
+  end;
+  fts3SegReaderSort(pCsr^.apSegment, nSeg, nSeg, @fts3SegReaderCmp);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2807..2814 — sqlite3Fts3SegReaderStart. }
+function sqlite3Fts3SegReaderStart(p: PFts3Table; pCsr: PFts3MultiSegReader;
+  pFilter: PFts3SegFilter): cint;
+begin
+  pCsr^.pFilter := pFilter;
+  Result := fts3SegReaderStart(p, pCsr, pFilter^.zTerm, pFilter^.nTerm);
+end;
+
+{ fts3_write.c:2816..2857 — sqlite3Fts3MsrIncrStart. }
+function sqlite3Fts3MsrIncrStart(p: PFts3Table; pCsr: PFts3MultiSegReader;
+  iCol: cint; const zTerm: PChar; nTerm: cint): cint;
+var
+  i, rc, nSegment: cint;
+  xCmp: TSegReaderCmpFn;
+  pSeg: PFts3SegReader;
+begin
+  nSegment := pCsr^.nSegment;
+  if p^.bDescIdx <> 0 then xCmp := @fts3SegReaderDoclistCmpRev
+                       else xCmp := @fts3SegReaderDoclistCmp;
+  Assert(pCsr^.pFilter = nil);
+  Assert((zTerm <> nil) and (nTerm > 0));
+
+  rc := fts3SegReaderStart(p, pCsr, zTerm, nTerm);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  i := 0;
+  while i < nSegment do begin
+    pSeg := PPFts3SegReader(pCsr^.apSegment)[i];
+    if (pSeg^.aNode = nil) or (fts3SegReaderTermCmp(pSeg, zTerm, nTerm) <> 0) then
+      break;
+    Inc(i);
+  end;
+  pCsr^.nAdvance := i;
+
+  i := 0;
+  while i < pCsr^.nAdvance do begin
+    rc := fts3SegReaderFirstDocid(p, PPFts3SegReader(pCsr^.apSegment)[i]);
+    if rc <> SQLITE_OK then Exit(rc);
+    Inc(i);
+  end;
+  fts3SegReaderSort(pCsr^.apSegment, i, i, xCmp);
+  Assert((iCol < 0) or (iCol < p^.nColumn));
+  pCsr^.iColFilter := iCol;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2871..2888 — sqlite3Fts3MsrIncrRestart. }
+function sqlite3Fts3MsrIncrRestart(pCsr: PFts3MultiSegReader): cint;
+var
+  i: cint;
+begin
+  Assert(pCsr^.zTerm = nil);
+  Assert(pCsr^.nTerm = 0);
+  Assert(pCsr^.aDoclist = nil);
+  Assert(pCsr^.nDoclist = 0);
+  pCsr^.nAdvance := 0;
+  pCsr^.bRestart := 1;
+  for i := 0 to pCsr^.nSegment - 1 do begin
+    PPFts3SegReader(pCsr^.apSegment)[i]^.pOffsetList := nil;
+    PPFts3SegReader(pCsr^.apSegment)[i]^.nOffsetList := 0;
+    PPFts3SegReader(pCsr^.apSegment)[i]^.iDocid := 0;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2890..2901 — fts3GrowSegReaderBuffer. }
+function fts3GrowSegReaderBuffer(pCsr: PFts3MultiSegReader;
+  nReq: sqlite3_int64): cint;
+var
+  aNew: PChar;
+begin
+  if nReq > pCsr^.nBuffer then begin
+    pCsr^.nBuffer := nReq*2;
+    aNew := PChar(sqlite3_realloc64(pCsr^.aBuffer, u64(pCsr^.nBuffer)));
+    if aNew = nil then Exit(SQLITE_NOMEM);
+    pCsr^.aBuffer := aNew;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:2904..3078 — sqlite3Fts3SegReaderStep. }
+function sqlite3Fts3SegReaderStep(p: PFts3Table; pCsr: PFts3MultiSegReader): cint;
+var
+  rc: cint;
+  isIgnoreEmpty, isRequirePos, isColFilter, isPrefix, isScan, isFirst: cint;
+  apSegment: PPFts3SegReader;
+  nSegment: cint;
+  pFilter: PFts3SegFilter;
+  xCmp: TSegReaderCmpFn;
+  nMerge, i, j, nByte: cint;
+  pSeg: PFts3SegReader;
+  nDoclist: cint;
+  iPrev, iDocid, iDelta: sqlite3_int64;
+  pList: PChar;
+  nList, nWrite: cint;
+  a: PChar;
+begin
+  rc := SQLITE_OK;
+  isIgnoreEmpty := pCsr^.pFilter^.flags and FTS3_SEGMENT_IGNORE_EMPTY;
+  isRequirePos  := pCsr^.pFilter^.flags and FTS3_SEGMENT_REQUIRE_POS;
+  isColFilter   := pCsr^.pFilter^.flags and FTS3_SEGMENT_COLUMN_FILTER;
+  isPrefix      := pCsr^.pFilter^.flags and FTS3_SEGMENT_PREFIX;
+  isScan        := pCsr^.pFilter^.flags and FTS3_SEGMENT_SCAN;
+  isFirst       := pCsr^.pFilter^.flags and FTS3_SEGMENT_FIRST;
+
+  apSegment := pCsr^.apSegment;
+  nSegment := pCsr^.nSegment;
+  pFilter := pCsr^.pFilter;
+  if p^.bDescIdx <> 0 then xCmp := @fts3SegReaderDoclistCmpRev
+                       else xCmp := @fts3SegReaderDoclistCmp;
+
+  if pCsr^.nSegment = 0 then Exit(SQLITE_OK);
+
+  repeat
+    for i := 0 to pCsr^.nAdvance - 1 do begin
+      pSeg := PPFts3SegReader(apSegment)[i];
+      if pSeg^.bLookup <> 0 then
+        fts3SegReaderSetEof(pSeg)
+      else
+        rc := fts3SegReaderNext(p, pSeg, 0);
+      if rc <> SQLITE_OK then Exit(rc);
+    end;
+    fts3SegReaderSort(apSegment, nSegment, pCsr^.nAdvance, @fts3SegReaderCmp);
+    pCsr^.nAdvance := 0;
+
+    if PPFts3SegReader(apSegment)[0]^.aNode = nil then break;
+
+    pCsr^.nTerm := PPFts3SegReader(apSegment)[0]^.nTerm;
+    pCsr^.zTerm := PPFts3SegReader(apSegment)[0]^.zTerm;
+
+    if (pFilter^.zTerm <> nil) and (isScan = 0) then begin
+      if (pCsr^.nTerm < pFilter^.nTerm)
+       or ((isPrefix = 0) and (pCsr^.nTerm > pFilter^.nTerm))
+       or (libc_memcmp(pCsr^.zTerm, pFilter^.zTerm, NativeUInt(pFilter^.nTerm)) <> 0)
+      then break;
+    end;
+
+    nMerge := 1;
+    while (nMerge < nSegment)
+      and (PPFts3SegReader(apSegment)[nMerge]^.aNode <> nil)
+      and (PPFts3SegReader(apSegment)[nMerge]^.nTerm = pCsr^.nTerm)
+      and (libc_memcmp(pCsr^.zTerm, PPFts3SegReader(apSegment)[nMerge]^.zTerm,
+             NativeUInt(pCsr^.nTerm)) = 0) do
+      Inc(nMerge);
+
+    if (nMerge = 1) and (isIgnoreEmpty = 0) and (isFirst = 0)
+     and ((p^.bDescIdx = 0)
+          or (not fts3SegReaderIsPending(PPFts3SegReader(apSegment)[0]))) then
+    begin
+      pCsr^.nDoclist := PPFts3SegReader(apSegment)[0]^.nDoclist;
+      if fts3SegReaderIsPending(PPFts3SegReader(apSegment)[0]) then begin
+        rc := fts3MsrBufferData(pCsr, PPFts3SegReader(apSegment)[0]^.aDoclist,
+                sqlite3_int64(pCsr^.nDoclist));
+        pCsr^.aDoclist := pCsr^.aBuffer;
+      end else
+        pCsr^.aDoclist := PPFts3SegReader(apSegment)[0]^.aDoclist;
+      if rc = SQLITE_OK then rc := SQLITE_ROW;
+    end else begin
+      nDoclist := 0;
+      iPrev := 0;
+      for i := 0 to nMerge - 1 do
+        fts3SegReaderFirstDocid(p, PPFts3SegReader(apSegment)[i]);
+      fts3SegReaderSort(apSegment, nMerge, nMerge, xCmp);
+      while PPFts3SegReader(apSegment)[0]^.pOffsetList <> nil do begin
+        pList := nil;
+        nList := 0;
+        iDocid := PPFts3SegReader(apSegment)[0]^.iDocid;
+        fts3SegReaderNextDocid(p, PPFts3SegReader(apSegment)[0], @pList, @nList);
+        j := 1;
+        while (j < nMerge)
+          and (PPFts3SegReader(apSegment)[j]^.pOffsetList <> nil)
+          and (PPFts3SegReader(apSegment)[j]^.iDocid = iDocid) do begin
+          fts3SegReaderNextDocid(p, PPFts3SegReader(apSegment)[j], nil, nil);
+          Inc(j);
+        end;
+        if isColFilter <> 0 then
+          fts3ColumnFilter(pFilter^.iCol, 0, @pList, @nList);
+        if (isIgnoreEmpty = 0) or (nList > 0) then begin
+          if (p^.bDescIdx <> 0) and (nDoclist > 0) then begin
+            if iPrev <= iDocid then Exit(FTS_CORRUPT_VTAB);
+            iDelta := sqlite3_int64(u64(iPrev) - u64(iDocid));
+          end else begin
+            if (nDoclist > 0) and (iPrev >= iDocid) then Exit(FTS_CORRUPT_VTAB);
+            iDelta := sqlite3_int64(u64(iDocid) - u64(iPrev));
+          end;
+          if isRequirePos <> 0 then nByte := sqlite3Fts3VarintLen(u64(iDelta)) + nList + 1
+                               else nByte := sqlite3Fts3VarintLen(u64(iDelta));
+          rc := fts3GrowSegReaderBuffer(pCsr,
+                  sqlite3_int64(nByte)+nDoclist+FTS3_NODE_PADDING);
+          if rc <> 0 then Exit(rc);
+          if isFirst <> 0 then begin
+            a := @pCsr^.aBuffer[nDoclist];
+            nWrite := sqlite3Fts3FirstFilter(iDelta, pList, nList, a);
+            if nWrite <> 0 then begin
+              iPrev := iDocid;
+              nDoclist := nDoclist + nWrite;
+            end;
+          end else begin
+            nDoclist := nDoclist +
+                sqlite3Fts3PutVarint(@pCsr^.aBuffer[nDoclist], iDelta);
+            iPrev := iDocid;
+            if isRequirePos <> 0 then begin
+              libc_memcpy(@pCsr^.aBuffer[nDoclist], pList, NativeUInt(nList));
+              nDoclist := nDoclist + nList;
+              pCsr^.aBuffer[nDoclist] := #0;
+              Inc(nDoclist);
+            end;
+          end;
+        end;
+        fts3SegReaderSort(apSegment, nMerge, j, xCmp);
+      end;
+      if nDoclist > 0 then begin
+        rc := fts3GrowSegReaderBuffer(pCsr, sqlite3_int64(nDoclist)+FTS3_NODE_PADDING);
+        if rc <> 0 then Exit(rc);
+        libc_memset(@pCsr^.aBuffer[nDoclist], 0, FTS3_NODE_PADDING);
+        pCsr^.aDoclist := pCsr^.aBuffer;
+        pCsr^.nDoclist := nDoclist;
+        rc := SQLITE_ROW;
+      end;
+    end;
+    pCsr^.nAdvance := nMerge;
+  until rc <> SQLITE_OK;
+  Result := rc;
+end;
+
+{ fts3_write.c:3081..3096 — sqlite3Fts3SegReaderFinish. }
+procedure sqlite3Fts3SegReaderFinish(pCsr: PFts3MultiSegReader);
+var
+  i: cint;
+begin
+  if pCsr <> nil then begin
+    for i := 0 to pCsr^.nSegment - 1 do
+      sqlite3Fts3SegReaderFree(PPFts3SegReader(pCsr^.apSegment)[i]);
+    sqlite3_free(pCsr^.apSegment);
+    sqlite3_free(pCsr^.aBuffer);
+    pCsr^.nSegment := 0;
+    pCsr^.apSegment := nil;
+    pCsr^.aBuffer := nil;
+  end;
+end;
+
+{ fts3_write.c:3108..3134 — fts3ReadEndBlockField. }
+procedure fts3ReadEndBlockField(pStmt: PVdbe; iCol: cint;
+  piEndBlock, pnByte: Psqlite3_int64);
+var
+  zText: PByte;
+  i, iMul: cint;
+  iVal: u64;
+begin
+  zText := PByte(sqlite3_column_text(pStmt, iCol));
+  if zText <> nil then begin
+    iMul := 1;
+    iVal := 0;
+    i := 0;
+    while (zText[i] >= Ord('0')) and (zText[i] <= Ord('9')) do begin
+      iVal := iVal*10 + (zText[i] - Ord('0'));
+      Inc(i);
+    end;
+    piEndBlock^ := sqlite3_int64(iVal);
+    while zText[i] = Ord(' ') do Inc(i);
+    iVal := 0;
+    if zText[i] = Ord('-') then begin Inc(i); iMul := -1; end;
+    while (zText[i] >= Ord('0')) and (zText[i] <= Ord('9')) do begin
+      iVal := iVal*10 + (zText[i] - Ord('0'));
+      Inc(i);
+    end;
+    pnByte^ := sqlite3_int64(iVal) * sqlite3_int64(iMul);
+  end;
+end;
+
+{ fts3_write.c:3141..3230 — fts3PromoteSegments. }
+function fts3PromoteSegments(p: PFts3Table; iAbsLevel, nByte: sqlite3_int64): cint;
+var
+  rc: cint;
+  pRange: PVdbe;
+  bOk, iIdx: cint;
+  iLast, nLimit, nSize, dummy: sqlite3_int64;
+  pUpdate1, pUpdate2: PVdbe;
+begin
+  rc := fts3SqlStmt(p, SQL_SELECT_LEVEL_RANGE2, @pRange, nil);
+  if rc = SQLITE_OK then begin
+    bOk := 0;
+    iLast := (iAbsLevel div FTS3_SEGDIR_MAXLEVEL + 1) * FTS3_SEGDIR_MAXLEVEL - 1;
+    nLimit := (nByte*3) div 2;
+    sqlite3_bind_int64(pRange, 1, iAbsLevel+1);
+    sqlite3_bind_int64(pRange, 2, iLast);
+    while SQLITE_ROW = sqlite3_step(pRange) do begin
+      nSize := 0; dummy := 0;
+      fts3ReadEndBlockField(pRange, 2, @dummy, @nSize);
+      if (nSize <= 0) or (nSize > nLimit) then begin
+        bOk := 0;
+        break;
+      end;
+      bOk := 1;
+    end;
+    rc := sqlite3_reset(pRange);
+
+    if bOk <> 0 then begin
+      iIdx := 0;
+      pUpdate1 := nil;
+      pUpdate2 := nil;
+      if rc = SQLITE_OK then rc := fts3SqlStmt(p, SQL_UPDATE_LEVEL_IDX, @pUpdate1, nil);
+      if rc = SQLITE_OK then rc := fts3SqlStmt(p, SQL_UPDATE_LEVEL, @pUpdate2, nil);
+      if rc = SQLITE_OK then begin
+        sqlite3_bind_int64(pRange, 1, iAbsLevel);
+        while SQLITE_ROW = sqlite3_step(pRange) do begin
+          sqlite3_bind_int(pUpdate1, 1, iIdx); Inc(iIdx);
+          sqlite3_bind_int(pUpdate1, 2, sqlite3_column_int(pRange, 0));
+          sqlite3_bind_int(pUpdate1, 3, sqlite3_column_int(pRange, 1));
+          sqlite3_step(pUpdate1);
+          rc := sqlite3_reset(pUpdate1);
+          if rc <> SQLITE_OK then begin
+            sqlite3_reset(pRange);
+            break;
+          end;
+        end;
+      end;
+      if rc = SQLITE_OK then rc := sqlite3_reset(pRange);
+      if rc = SQLITE_OK then begin
+        sqlite3_bind_int64(pUpdate2, 1, iAbsLevel);
+        sqlite3_step(pUpdate2);
+        rc := sqlite3_reset(pUpdate2);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:3243..3336 — fts3SegmentMerge. }
+function fts3SegmentMerge(p: PFts3Table; iLangid, iIndex, iLevel: cint): cint;
+var
+  rc, iIdx: cint;
+  iNewLevel: sqlite3_int64;
+  pWriter: PSegmentWriter;
+  filter: TFts3SegFilter;
+  csr: TFts3MultiSegReader;
+  bIgnoreEmpty: cint;
+  iMaxLevel: sqlite3_int64;
+label finished;
+begin
+  iIdx := 0;
+  iNewLevel := 0;
+  pWriter := nil;
+  bIgnoreEmpty := 0;
+  iMaxLevel := 0;
+  Assert((iLevel = FTS3_SEGCURSOR_ALL) or (iLevel = FTS3_SEGCURSOR_PENDING)
+         or (iLevel >= 0));
+  Assert(iLevel < FTS3_SEGDIR_MAXLEVEL);
+  Assert((iIndex >= 0) and (iIndex < p^.nIndex));
+
+  rc := sqlite3Fts3SegReaderCursor(p, iLangid, iIndex, iLevel, nil, 0, 1, 0, @csr);
+  if (rc <> SQLITE_OK) or (csr.nSegment = 0) then goto finished;
+
+  if iLevel <> FTS3_SEGCURSOR_PENDING then begin
+    rc := fts3SegmentMaxLevel(p, iLangid, iIndex, @iMaxLevel);
+    if rc <> SQLITE_OK then goto finished;
+  end;
+
+  if iLevel = FTS3_SEGCURSOR_ALL then begin
+    if (csr.nSegment = 1)
+     and (not fts3SegReaderIsPending(PPFts3SegReader(csr.apSegment)[0])) then begin
+      rc := SQLITE_DONE;
+      goto finished;
+    end;
+    iNewLevel := iMaxLevel;
+    bIgnoreEmpty := 1;
+  end else begin
+    Assert(FTS3_SEGCURSOR_PENDING = -1);
+    iNewLevel := getAbsoluteLevel(p, iLangid, iIndex, iLevel+1);
+    rc := fts3AllocateSegdirIdx(p, iLangid, iIndex, iLevel+1, @iIdx);
+    bIgnoreEmpty := cint(Ord((iLevel <> FTS3_SEGCURSOR_PENDING)
+                              and (iNewLevel > iMaxLevel)));
+  end;
+  if rc <> SQLITE_OK then goto finished;
+
+  Assert(csr.nSegment > 0);
+  libc_memset(@filter, 0, SizeOf(TFts3SegFilter));
+  filter.flags := FTS3_SEGMENT_REQUIRE_POS;
+  if bIgnoreEmpty <> 0 then filter.flags := filter.flags or FTS3_SEGMENT_IGNORE_EMPTY;
+
+  rc := sqlite3Fts3SegReaderStart(p, @csr, @filter);
+  while SQLITE_OK = rc do begin
+    rc := sqlite3Fts3SegReaderStep(p, @csr);
+    if rc <> SQLITE_ROW then break;
+    rc := fts3SegWriterAdd(p, @pWriter, 1, csr.zTerm, csr.nTerm,
+            csr.aDoclist, csr.nDoclist);
+  end;
+  if rc <> SQLITE_OK then goto finished;
+
+  if iLevel <> FTS3_SEGCURSOR_PENDING then begin
+    rc := fts3DeleteSegdir(p, iLangid, iIndex, iLevel, csr.apSegment, csr.nSegment);
+    if rc <> SQLITE_OK then goto finished;
+  end;
+  if pWriter <> nil then begin
+    rc := fts3SegWriterFlush(p, pWriter, iNewLevel, iIdx);
+    if rc = SQLITE_OK then begin
+      if (iLevel = FTS3_SEGCURSOR_PENDING) or (iNewLevel < iMaxLevel) then
+        rc := fts3PromoteSegments(p, iNewLevel, pWriter^.nLeafData);
+    end;
+  end;
+
+finished:
+  fts3SegWriterFree(pWriter);
+  sqlite3Fts3SegReaderFinish(@csr);
+  Result := rc;
+end;
+
+{ fts3_write.c:3342..3376 — sqlite3Fts3PendingTermsFlush. }
+function sqlite3Fts3PendingTermsFlush(p: PFts3Table): cint;
+var
+  rc, i: cint;
+  pStmt: PVdbe;
+begin
+  rc := SQLITE_OK;
+  i := 0;
+  while (rc = SQLITE_OK) and (i < p^.nIndex) do begin
+    rc := fts3SegmentMerge(p, p^.iPrevLangid, i, FTS3_SEGCURSOR_PENDING);
+    if rc = SQLITE_DONE then rc := SQLITE_OK;
+    Inc(i);
+  end;
+
+  if (rc = SQLITE_OK) and (p^.bHasStat <> 0)
+   and (p^.nAutoincrmerge = $ff) and (p^.nLeafAdd > 0) then begin
+    pStmt := nil;
+    rc := fts3SqlStmt(p, SQL_SELECT_STAT, @pStmt, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_int(pStmt, 1, FTS_STAT_AUTOINCRMERGE);
+      rc := sqlite3_step(pStmt);
+      if rc = SQLITE_ROW then begin
+        p^.nAutoincrmerge := sqlite3_column_int(pStmt, 0);
+        if p^.nAutoincrmerge = 1 then p^.nAutoincrmerge := 8;
+      end else if rc = SQLITE_DONE then
+        p^.nAutoincrmerge := 0;
+      rc := sqlite3_reset(pStmt);
+    end;
+  end;
+
+  if rc = SQLITE_OK then sqlite3Fts3PendingTermsClear(p);
+  Result := rc;
+end;
+
+{ ===================================================================== }
+{ Section 6 — %_docsize / %_stat FTS4 maintenance + optimize/rebuild.     }
+{ (fts3_write.c:3381..3654).                                             }
+{ ===================================================================== }
+
+{ fts3_write.c:3381..3392 — fts3EncodeIntArray. }
+procedure fts3EncodeIntArray(N: cint; a: Pcuint; zBuf: PChar; pNBuf: Pcint);
+var
+  i, j: cint;
+begin
+  j := 0;
+  for i := 0 to N - 1 do
+    j := j + sqlite3Fts3PutVarint(@zBuf[j], sqlite3_int64(Pcuint(a)[i]));
+  pNBuf^ := j;
+end;
+
+{ fts3_write.c:3397..3413 — fts3DecodeIntArray. }
+procedure fts3DecodeIntArray(N: cint; a: Pcuint; const zBuf: PChar; nBuf: cint);
+var
+  i, j: cint;
+  x: sqlite3_int64;
+begin
+  i := 0;
+  if (nBuf <> 0) and ((Byte(zBuf[nBuf-1]) and $80) = 0) then begin
+    j := 0;
+    while (i < N) and (j < nBuf) do begin
+      j := j + sqlite3Fts3GetVarint(@zBuf[j], @x);
+      Pcuint(a)[i] := cuint(x and $ffffffff);
+      Inc(i);
+    end;
+  end;
+  while i < N do begin Pcuint(a)[i] := 0; Inc(i); end;
+end;
+
+{ fts3_write.c:3420..3447 — fts3InsertDocsize. }
+procedure fts3InsertDocsize(pRC: Pcint; p: PFts3Table; aSz: Pcuint);
+var
+  pBlob: PChar;
+  nBlob, rc: cint;
+  pStmt: PVdbe;
+begin
+  if pRC^ <> 0 then Exit;
+  pBlob := PChar(sqlite3_malloc64(u64(10*sqlite3_int64(p^.nColumn))));
+  if pBlob = nil then begin pRC^ := SQLITE_NOMEM; Exit; end;
+  fts3EncodeIntArray(p^.nColumn, aSz, pBlob, @nBlob);
+  rc := fts3SqlStmt(p, SQL_REPLACE_DOCSIZE, @pStmt, nil);
+  if rc <> 0 then begin sqlite3_free(pBlob); pRC^ := rc; Exit; end;
+  sqlite3_bind_int64(pStmt, 1, p^.iPrevDocid);
+  sqlite3_bind_blob(pStmt, 2, pBlob, nBlob, TxDelProc(@sqlite3_free));
+  sqlite3_step(pStmt);
+  pRC^ := sqlite3_reset(pStmt);
+end;
+
+{ fts3_write.c:3464..3534 — fts3UpdateDocTotals. }
+procedure fts3UpdateDocTotals(pRC: Pcint; p: PFts3Table;
+  aSzIns, aSzDel: Pcuint; nChng: cint);
+var
+  pBlob: PChar;
+  nBlob, i, rc: cint;
+  a: Pcuint;
+  pStmt: PVdbe;
+  nStat: cint;
+  x: cuint;
+begin
+  nStat := p^.nColumn+2;
+  if pRC^ <> 0 then Exit;
+  a := Pcuint(sqlite3_malloc64(u64((SizeOf(cuint)+10)*sqlite3_int64(nStat))));
+  if a = nil then begin pRC^ := SQLITE_NOMEM; Exit; end;
+  pBlob := PChar(@Pcuint(a)[nStat]);
+  rc := fts3SqlStmt(p, SQL_SELECT_STAT, @pStmt, nil);
+  if rc <> 0 then begin sqlite3_free(a); pRC^ := rc; Exit; end;
+  sqlite3_bind_int(pStmt, 1, FTS_STAT_DOCTOTAL);
+  if sqlite3_step(pStmt) = SQLITE_ROW then
+    fts3DecodeIntArray(nStat, a, sqlite3_column_blob(pStmt, 0),
+                       sqlite3_column_bytes(pStmt, 0))
+  else
+    libc_memset(a, 0, NativeUInt(SizeOf(cuint)*nStat));
+  rc := sqlite3_reset(pStmt);
+  if rc <> SQLITE_OK then begin sqlite3_free(a); pRC^ := rc; Exit; end;
+  if (nChng < 0) and (Pcuint(a)[0] < cuint(-nChng)) then
+    Pcuint(a)[0] := 0
+  else
+    Pcuint(a)[0] := Pcuint(a)[0] + cuint(nChng);
+  for i := 0 to p^.nColumn do begin
+    x := Pcuint(a)[i+1];
+    if (x + Pcuint(aSzIns)[i]) < Pcuint(aSzDel)[i] then
+      x := 0
+    else
+      x := x + Pcuint(aSzIns)[i] - Pcuint(aSzDel)[i];
+    Pcuint(a)[i+1] := x;
+  end;
+  fts3EncodeIntArray(nStat, a, pBlob, @nBlob);
+  rc := fts3SqlStmt(p, SQL_REPLACE_STAT, @pStmt, nil);
+  if rc <> 0 then begin sqlite3_free(a); pRC^ := rc; Exit; end;
+  sqlite3_bind_int(pStmt, 1, FTS_STAT_DOCTOTAL);
+  sqlite3_bind_blob(pStmt, 2, pBlob, nBlob, SQLITE_STATIC);
+  sqlite3_step(pStmt);
+  pRC^ := sqlite3_reset(pStmt);
+  sqlite3_bind_null(pStmt, 2);
+  sqlite3_free(a);
+end;
+
+{ fts3_write.c:3540..3571 — fts3DoOptimize. }
+function fts3DoOptimize(p: PFts3Table; bReturnDone: cint): cint;
+var
+  bSeenDone, rc, rc2, i, iLangid: cint;
+  pAllLangid: PVdbe;
+begin
+  bSeenDone := 0;
+  pAllLangid := nil;
+  rc := sqlite3Fts3PendingTermsFlush(p);
+  if rc = SQLITE_OK then rc := fts3SqlStmt(p, SQL_SELECT_ALL_LANGID, @pAllLangid, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int(pAllLangid, 1, p^.iPrevLangid);
+    sqlite3_bind_int(pAllLangid, 2, p^.nIndex);
+    while sqlite3_step(pAllLangid) = SQLITE_ROW do begin
+      iLangid := sqlite3_column_int(pAllLangid, 0);
+      i := 0;
+      while (rc = SQLITE_OK) and (i < p^.nIndex) do begin
+        rc := fts3SegmentMerge(p, iLangid, i, FTS3_SEGCURSOR_ALL);
+        if rc = SQLITE_DONE then begin
+          bSeenDone := 1;
+          rc := SQLITE_OK;
+        end;
+        Inc(i);
+      end;
+    end;
+    rc2 := sqlite3_reset(pAllLangid);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+  sqlite3Fts3SegmentsClose(p);
+  if (rc = SQLITE_OK) and (bReturnDone <> 0) and (bSeenDone <> 0) then
+    Result := SQLITE_DONE
+  else
+    Result := rc;
+end;
+
+{ fts3_write.c:3583..3654 — fts3DoRebuild. }
+function fts3DoRebuild(p: PFts3Table): cint;
+var
+  rc, rc2, nEntry, iCol, iLangid: cint;
+  aSz, aSzIns, aSzDel: Pcuint;
+  pStmt: PVdbe;
+  zSql, z: PChar;
+  nByte: sqlite3_int64;
+begin
+  aSz := nil; aSzIns := nil; aSzDel := nil; pStmt := nil; nEntry := 0;
+  rc := fts3DeleteAll(p, 0);
+  if rc = SQLITE_OK then begin
+    zSql := PChar(sqlite3PfMprintf(PAnsiChar('SELECT %s'), [p^.zReadExprlist]));
+    if zSql = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      rc := sqlite3Fts3PrepareStmt(p, zSql, 0, 1, @pStmt);
+      sqlite3_free(zSql);
+    end;
+
+    if rc = SQLITE_OK then begin
+      nByte := SizeOf(cuint) * (sqlite3_int64(p^.nColumn)+1)*3;
+      aSz := Pcuint(sqlite3_malloc64(u64(nByte)));
+      if aSz = nil then
+        rc := SQLITE_NOMEM
+      else begin
+        libc_memset(aSz, 0, NativeUInt(nByte));
+        aSzIns := @Pcuint(aSz)[p^.nColumn+1];
+        aSzDel := @Pcuint(aSzIns)[p^.nColumn+1];
+      end;
+    end;
+
+    while (rc = SQLITE_OK) and (SQLITE_ROW = sqlite3_step(pStmt)) do begin
+      iLangid := langidFromSelect(p, pStmt);
+      rc := fts3PendingTermsDocid(p, 0, iLangid, sqlite3_column_int64(pStmt, 0));
+      libc_memset(aSz, 0, NativeUInt(SizeOf(cuint) * (p^.nColumn+1)));
+      iCol := 0;
+      while (rc = SQLITE_OK) and (iCol < p^.nColumn) do begin
+        if PByte(p^.abNotindexed)[iCol] = 0 then begin
+          z := PChar(sqlite3_column_text(pStmt, iCol+1));
+          rc := fts3PendingTermsAdd(p, iLangid, z, iCol, @Pcuint(aSz)[iCol]);
+          Pcuint(aSz)[p^.nColumn] := Pcuint(aSz)[p^.nColumn] +
+              cuint(sqlite3_column_bytes(pStmt, iCol+1));
+        end;
+        Inc(iCol);
+      end;
+      if p^.bHasDocsize <> 0 then fts3InsertDocsize(@rc, p, aSz);
+      if rc <> SQLITE_OK then begin
+        sqlite3_finalize(pStmt);
+        pStmt := nil;
+      end else begin
+        Inc(nEntry);
+        for iCol := 0 to p^.nColumn do
+          Pcuint(aSzIns)[iCol] := Pcuint(aSzIns)[iCol] + Pcuint(aSz)[iCol];
+      end;
+    end;
+    if p^.bFts4 <> 0 then fts3UpdateDocTotals(@rc, p, aSzIns, aSzDel, nEntry);
+    sqlite3_free(aSz);
+
+    if pStmt <> nil then begin
+      rc2 := sqlite3_finalize(pStmt);
+      if rc = SQLITE_OK then rc := rc2;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ ===================================================================== }
+{ Section 7 — incremental merge machinery (fts3_write.c:3663..5113).      }
+{ ===================================================================== }
+
+{ fts3_write.c:3663..3705 — fts3IncrmergeCsr. }
+function fts3IncrmergeCsr(p: PFts3Table; iAbsLevel: sqlite3_int64; nSeg: cint;
+  pCsr: PFts3MultiSegReader): cint;
+var
+  rc, i, rc2: cint;
+  pStmt: PVdbe;
+  nByte: sqlite3_int64;
+begin
+  pStmt := nil;
+  libc_memset(pCsr, 0, SizeOf(TFts3MultiSegReader));
+  nByte := SizeOf(PFts3SegReader) * nSeg;
+  pCsr^.apSegment := PPFts3SegReader(sqlite3_malloc64(u64(nByte)));
+  if pCsr^.apSegment = nil then
+    rc := SQLITE_NOMEM
+  else begin
+    libc_memset(pCsr^.apSegment, 0, NativeUInt(nByte));
+    rc := fts3SqlStmt(p, SQL_SELECT_LEVEL, @pStmt, nil);
+  end;
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pStmt, 1, iAbsLevel);
+    Assert(pCsr^.nSegment = 0);
+    i := 0;
+    while (rc = SQLITE_OK) and (sqlite3_step(pStmt) = SQLITE_ROW) and (i < nSeg) do
+    begin
+      rc := sqlite3Fts3SegReaderNew(i, 0,
+              sqlite3_column_int64(pStmt, 1),
+              sqlite3_column_int64(pStmt, 2),
+              sqlite3_column_int64(pStmt, 3),
+              sqlite3_column_blob(pStmt, 4),
+              sqlite3_column_bytes(pStmt, 4),
+              @PPFts3SegReader(pCsr^.apSegment)[i]);
+      Inc(pCsr^.nSegment);
+      Inc(i);
+    end;
+    rc2 := sqlite3_reset(pStmt);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:3779..3790 — blobGrowBuffer. }
+procedure blobGrowBuffer(pBlob: PFtsBlob; nMin: cint; pRc: Pcint);
+var
+  nAlloc: cint;
+  a: PChar;
+begin
+  if (pRc^ = SQLITE_OK) and (nMin > pBlob^.nAlloc) then begin
+    nAlloc := nMin;
+    a := PChar(sqlite3_realloc64(pBlob^.a, u64(nAlloc)));
+    if a <> nil then begin
+      pBlob^.nAlloc := nAlloc;
+      pBlob^.a := a;
+    end else
+      pRc^ := SQLITE_NOMEM;
+  end;
+end;
+
+{ fts3_write.c:3802..3840 — nodeReaderNext. }
+function nodeReaderNext(p: PNodeReader): cint;
+var
+  bFirst, nPrefix, nSuffix, rc: cint;
+begin
+  bFirst := cint(Ord(p^.term.n = 0));
+  nPrefix := 0;
+  nSuffix := 0;
+  rc := SQLITE_OK;
+  Assert(p^.aNode <> nil);
+  if (p^.iChild <> 0) and (bFirst = 0) then Inc(p^.iChild);
+  if p^.iOff >= p^.nNode then
+    p^.aNode := nil
+  else begin
+    if bFirst = 0 then
+      p^.iOff := p^.iOff + fts3GetVarint32(@p^.aNode[p^.iOff], @nPrefix);
+    p^.iOff := p^.iOff + fts3GetVarint32(@p^.aNode[p^.iOff], @nSuffix);
+    if (nPrefix > p^.term.n) or (nSuffix > p^.nNode-p^.iOff) or (nSuffix = 0) then
+      Exit(FTS_CORRUPT_VTAB);
+    blobGrowBuffer(@p^.term, nPrefix+nSuffix, @rc);
+    if (rc = SQLITE_OK) and (p^.term.a <> nil) then begin
+      libc_memcpy(@p^.term.a[nPrefix], @p^.aNode[p^.iOff], NativeUInt(nSuffix));
+      p^.term.n := nPrefix+nSuffix;
+      p^.iOff := p^.iOff + nSuffix;
+      if p^.iChild = 0 then begin
+        p^.iOff := p^.iOff + fts3GetVarint32(@p^.aNode[p^.iOff], @p^.nDoclist);
+        if (p^.nNode-p^.iOff) < p^.nDoclist then Exit(FTS_CORRUPT_VTAB);
+        p^.aDoclist := @p^.aNode[p^.iOff];
+        p^.iOff := p^.iOff + p^.nDoclist;
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:3845..3847 — nodeReaderRelease. }
+procedure nodeReaderRelease(p: PNodeReader);
+begin
+  sqlite3_free(p^.term.a);
+end;
+
+{ fts3_write.c:3856..3870 — nodeReaderInit. }
+function nodeReaderInit(p: PNodeReader; const aNode: PChar; nNode: cint): cint;
+begin
+  libc_memset(p, 0, SizeOf(TNodeReader));
+  p^.aNode := aNode;
+  p^.nNode := nNode;
+  if (aNode <> nil) and (aNode[0] <> #0) then
+    p^.iOff := 1 + sqlite3Fts3GetVarint(@p^.aNode[1], @p^.iChild)
+  else
+    p^.iOff := 1;
+  if aNode <> nil then Result := nodeReaderNext(p) else Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:3882..3960 — fts3IncrmergePush. }
+function fts3IncrmergePush(p: PFts3Table; pWriter: PIncrmergeWriter;
+  const zTerm: PChar; nTerm: cint): cint;
+var
+  iPtr: sqlite3_int64;
+  iLayer: cint;
+  iNextPtr: sqlite3_int64;
+  pNode: PNodeWriter;
+  rc, nPrefix, nSuffix, nSpace: cint;
+  pBlk: PFtsBlob;
+begin
+  iPtr := pWriter^.aNodeWriter[0].iBlock;
+  Assert(nTerm > 0);
+  iLayer := 1;
+  while iLayer < FTS_MAX_APPENDABLE_HEIGHT do begin
+    iNextPtr := 0;
+    pNode := @pWriter^.aNodeWriter[iLayer];
+    rc := SQLITE_OK;
+    nPrefix := fts3PrefixCompress(pNode^.key.a, pNode^.key.n, zTerm, nTerm);
+    nSuffix := nTerm - nPrefix;
+    if nSuffix <= 0 then Exit(FTS_CORRUPT_VTAB);
+    nSpace := sqlite3Fts3VarintLen(nPrefix);
+    nSpace := nSpace + sqlite3Fts3VarintLen(nSuffix) + nSuffix;
+
+    if (pNode^.key.n = 0) or ((pNode^.block.n + nSpace) <= p^.nNodeSize) then begin
+      pBlk := @pNode^.block;
+      if pBlk^.n = 0 then begin
+        blobGrowBuffer(pBlk, p^.nNodeSize, @rc);
+        if rc = SQLITE_OK then begin
+          pBlk^.a[0] := Chr(iLayer);
+          pBlk^.n := 1 + sqlite3Fts3PutVarint(@pBlk^.a[1], iPtr);
+        end;
+      end;
+      blobGrowBuffer(pBlk, pBlk^.n + nSpace, @rc);
+      blobGrowBuffer(@pNode^.key, nTerm, @rc);
+      if rc = SQLITE_OK then begin
+        if pNode^.key.n <> 0 then
+          pBlk^.n := pBlk^.n + sqlite3Fts3PutVarint(@pBlk^.a[pBlk^.n], nPrefix);
+        pBlk^.n := pBlk^.n + sqlite3Fts3PutVarint(@pBlk^.a[pBlk^.n], nSuffix);
+        libc_memcpy(@pBlk^.a[pBlk^.n], @zTerm[nPrefix], NativeUInt(nSuffix));
+        pBlk^.n := pBlk^.n + nSuffix;
+        libc_memcpy(pNode^.key.a, zTerm, NativeUInt(nTerm));
+        pNode^.key.n := nTerm;
+      end;
+    end else begin
+      rc := fts3WriteSegment(p, pNode^.iBlock, pNode^.block.a, pNode^.block.n);
+      pNode^.block.a[0] := Chr(iLayer);
+      pNode^.block.n := 1 + sqlite3Fts3PutVarint(@pNode^.block.a[1], iPtr+1);
+      iNextPtr := pNode^.iBlock;
+      Inc(pNode^.iBlock);
+      pNode^.key.n := 0;
+    end;
+    if (rc <> SQLITE_OK) or (iNextPtr = 0) then Exit(rc);
+    iPtr := iNextPtr;
+    Inc(iLayer);
+  end;
+  Assert(False);
+  Result := 0;
+end;
+
+{ fts3_write.c:3986..4031 — fts3AppendToNode. }
+function fts3AppendToNode(pNode, pPrev: PFtsBlob; const zTerm: PChar;
+  nTerm: cint; const aDoclist: PChar; nDoclist: cint): cint;
+var
+  rc, bFirst, nPrefix, nSuffix: cint;
+begin
+  rc := SQLITE_OK;
+  bFirst := cint(Ord(pPrev^.n = 0));
+  Assert(pNode^.n > 0);
+  blobGrowBuffer(pPrev, nTerm, @rc);
+  if rc <> SQLITE_OK then Exit(rc);
+  Assert(pPrev^.a <> nil);
+  nPrefix := fts3PrefixCompress(pPrev^.a, pPrev^.n, zTerm, nTerm);
+  nSuffix := nTerm - nPrefix;
+  if nSuffix <= 0 then Exit(FTS_CORRUPT_VTAB);
+  libc_memcpy(pPrev^.a, zTerm, NativeUInt(nTerm));
+  pPrev^.n := nTerm;
+  if bFirst = 0 then
+    pNode^.n := pNode^.n + sqlite3Fts3PutVarint(@pNode^.a[pNode^.n], nPrefix);
+  pNode^.n := pNode^.n + sqlite3Fts3PutVarint(@pNode^.a[pNode^.n], nSuffix);
+  libc_memcpy(@pNode^.a[pNode^.n], @zTerm[nPrefix], NativeUInt(nSuffix));
+  pNode^.n := pNode^.n + nSuffix;
+  if aDoclist <> nil then begin
+    pNode^.n := pNode^.n + sqlite3Fts3PutVarint(@pNode^.a[pNode^.n], nDoclist);
+    libc_memcpy(@pNode^.a[pNode^.n], aDoclist, NativeUInt(nDoclist));
+    pNode^.n := pNode^.n + nDoclist;
+  end;
+  Assert(pNode^.n <= pNode^.nAlloc);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:4039..4114 — fts3IncrmergeAppend. }
+function fts3IncrmergeAppend(p: PFts3Table; pWriter: PIncrmergeWriter;
+  pCsr: PFts3MultiSegReader): cint;
+var
+  zTerm, aDoclist: PChar;
+  nTerm, nDoclist, rc, nSpace, nPrefix, nSuffix: cint;
+  pLeaf: PNodeWriter;
+begin
+  zTerm := pCsr^.zTerm;
+  nTerm := pCsr^.nTerm;
+  aDoclist := pCsr^.aDoclist;
+  nDoclist := pCsr^.nDoclist;
+  rc := SQLITE_OK;
+  pLeaf := @pWriter^.aNodeWriter[0];
+  nPrefix := fts3PrefixCompress(pLeaf^.key.a, pLeaf^.key.n, zTerm, nTerm);
+  nSuffix := nTerm - nPrefix;
+  if nSuffix <= 0 then Exit(FTS_CORRUPT_VTAB);
+
+  nSpace := sqlite3Fts3VarintLen(nPrefix);
+  nSpace := nSpace + sqlite3Fts3VarintLen(nSuffix) + nSuffix;
+  nSpace := nSpace + sqlite3Fts3VarintLen(nDoclist) + nDoclist;
+
+  if (pLeaf^.block.n > 0)
+   and ((pLeaf^.block.n + nSpace) > p^.nNodeSize)
+   and (pLeaf^.iBlock < (pWriter^.iStart + pWriter^.nLeafEst)) then begin
+    rc := fts3WriteSegment(p, pLeaf^.iBlock, pLeaf^.block.a, pLeaf^.block.n);
+    Inc(pWriter^.nWork);
+    if rc = SQLITE_OK then rc := fts3IncrmergePush(p, pWriter, zTerm, nPrefix+1);
+    Inc(pLeaf^.iBlock);
+    pLeaf^.key.n := 0;
+    pLeaf^.block.n := 0;
+    nSuffix := nTerm;
+    nSpace := 1;
+    nSpace := nSpace + sqlite3Fts3VarintLen(nSuffix) + nSuffix;
+    nSpace := nSpace + sqlite3Fts3VarintLen(nDoclist) + nDoclist;
+  end;
+
+  pWriter^.nLeafData := pWriter^.nLeafData + nSpace;
+  blobGrowBuffer(@pLeaf^.block, pLeaf^.block.n + nSpace, @rc);
+  if rc = SQLITE_OK then begin
+    if pLeaf^.block.n = 0 then begin
+      pLeaf^.block.n := 1;
+      pLeaf^.block.a[0] := #0;
+    end;
+    rc := fts3AppendToNode(@pLeaf^.block, @pLeaf^.key, zTerm, nTerm,
+            aDoclist, nDoclist);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:4129..4209 — fts3IncrmergeRelease. }
+procedure fts3IncrmergeRelease(p: PFts3Table; pWriter: PIncrmergeWriter;
+  pRc: Pcint);
+var
+  i, iRoot, rc: cint;
+  pNode, pRoot: PNodeWriter;
+  pBlock: PFtsBlob;
+begin
+  rc := pRc^;
+  iRoot := FTS_MAX_APPENDABLE_HEIGHT-1;
+  while iRoot >= 0 do begin
+    pNode := @pWriter^.aNodeWriter[iRoot];
+    if pNode^.block.n > 0 then break;
+    sqlite3_free(pNode^.block.a);
+    sqlite3_free(pNode^.key.a);
+    Dec(iRoot);
+  end;
+  if iRoot < 0 then Exit;
+
+  if iRoot = 0 then begin
+    pBlock := @pWriter^.aNodeWriter[1].block;
+    blobGrowBuffer(pBlock, 1 + FTS3_VARINT_MAX, @rc);
+    if rc = SQLITE_OK then begin
+      pBlock^.a[0] := Chr($01);
+      pBlock^.n := 1 + sqlite3Fts3PutVarint(@pBlock^.a[1],
+          pWriter^.aNodeWriter[0].iBlock);
+    end;
+    iRoot := 1;
+  end;
+  pRoot := @pWriter^.aNodeWriter[iRoot];
+
+  for i := 0 to iRoot - 1 do begin
+    pNode := @pWriter^.aNodeWriter[i];
+    if (pNode^.block.n > 0) and (rc = SQLITE_OK) then
+      rc := fts3WriteSegment(p, pNode^.iBlock, pNode^.block.a, pNode^.block.n);
+    sqlite3_free(pNode^.block.a);
+    sqlite3_free(pNode^.key.a);
+  end;
+
+  if rc = SQLITE_OK then begin
+    if pWriter^.bNoLeafData = 0 then
+      rc := fts3WriteSegdir(p, pWriter^.iAbsLevel+1, pWriter^.iIdx,
+              pWriter^.iStart, pWriter^.aNodeWriter[0].iBlock, pWriter^.iEnd,
+              pWriter^.nLeafData, pRoot^.block.a, pRoot^.block.n)
+    else
+      rc := fts3WriteSegdir(p, pWriter^.iAbsLevel+1, pWriter^.iIdx,
+              pWriter^.iStart, pWriter^.aNodeWriter[0].iBlock, pWriter^.iEnd,
+              0, pRoot^.block.a, pRoot^.block.n);
+  end;
+  sqlite3_free(pRoot^.block.a);
+  sqlite3_free(pRoot^.key.a);
+  pRc^ := rc;
+end;
+
+{ fts3_write.c:4219..4234 — fts3TermCmp. }
+function fts3TermCmp(const zLhs: PChar; nLhs: cint; const zRhs: PChar;
+  nRhs: cint): cint;
+var
+  nCmp, res: cint;
+begin
+  if nLhs < nRhs then nCmp := nLhs else nCmp := nRhs;
+  if (nCmp <> 0) and (zLhs <> nil) and (zRhs <> nil) then
+    res := libc_memcmp(zLhs, zRhs, NativeUInt(nCmp))
+  else
+    res := 0;
+  if res = 0 then res := nLhs - nRhs;
+  Result := res;
+end;
+
+{ fts3_write.c:4249..4263 — fts3IsAppendable. }
+function fts3IsAppendable(p: PFts3Table; iEnd: sqlite3_int64; pbRes: Pcint): cint;
+var
+  bRes, rc: cint;
+  pCheck: PVdbe;
+begin
+  bRes := 0;
+  rc := fts3SqlStmt(p, SQL_SEGMENT_IS_APPENDABLE, @pCheck, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pCheck, 1, iEnd);
+    if SQLITE_ROW = sqlite3_step(pCheck) then bRes := 1;
+    rc := sqlite3_reset(pCheck);
+  end;
+  pbRes^ := bRes;
+  Result := rc;
+end;
+
+{ fts3_write.c:4280..4421 — fts3IncrmergeLoad. }
+function fts3IncrmergeLoad(p: PFts3Table; iAbsLevel: sqlite3_int64; iIdx: cint;
+  const zKey: PChar; nKey: cint; pWriter: PIncrmergeWriter): cint;
+var
+  rc, rc2, bAppendable, nRoot, nLeaf, i, nHeight: cint;
+  pSelect: PVdbe;
+  iStart, iLeafEnd, iEnd: sqlite3_int64;
+  aRoot, aLeaf, aBlock: PChar;
+  nBlock: cint;
+  reader: TNodeReader;
+  pNode: PNodeWriter;
+begin
+  rc := fts3SqlStmt(p, SQL_SELECT_SEGDIR, @pSelect, nil);
+  if rc = SQLITE_OK then begin
+    iStart := 0; iLeafEnd := 0; iEnd := 0;
+    aRoot := nil; nRoot := 0; bAppendable := 0;
+    sqlite3_bind_int64(pSelect, 1, iAbsLevel+1);
+    sqlite3_bind_int(pSelect, 2, iIdx);
+    if sqlite3_step(pSelect) = SQLITE_ROW then begin
+      iStart := sqlite3_column_int64(pSelect, 1);
+      iLeafEnd := sqlite3_column_int64(pSelect, 2);
+      fts3ReadEndBlockField(pSelect, 3, @iEnd, @pWriter^.nLeafData);
+      if pWriter^.nLeafData < 0 then pWriter^.nLeafData := pWriter^.nLeafData * -1;
+      pWriter^.bNoLeafData := cuchar(Ord(pWriter^.nLeafData = 0));
+      nRoot := sqlite3_column_bytes(pSelect, 4);
+      aRoot := sqlite3_column_blob(pSelect, 4);
+      if aRoot = nil then begin
+        sqlite3_reset(pSelect);
+        if nRoot <> 0 then Exit(SQLITE_NOMEM) else Exit(FTS_CORRUPT_VTAB);
+      end;
+    end else
+      Exit(sqlite3_reset(pSelect));
+
+    rc := fts3IsAppendable(p, iEnd, @bAppendable);
+
+    if (rc = SQLITE_OK) and (bAppendable <> 0) then begin
+      aLeaf := nil; nLeaf := 0;
+      rc := sqlite3Fts3ReadBlock(p, iLeafEnd, @aLeaf, @nLeaf, nil);
+      if rc = SQLITE_OK then begin
+        rc := nodeReaderInit(@reader, aLeaf, nLeaf);
+        while (rc = SQLITE_OK) and (reader.aNode <> nil) do
+          rc := nodeReaderNext(@reader);
+        if fts3TermCmp(zKey, nKey, reader.term.a, reader.term.n) <= 0 then
+          bAppendable := 0;
+        nodeReaderRelease(@reader);
+      end;
+      sqlite3_free(aLeaf);
+    end;
+
+    if (rc = SQLITE_OK) and (bAppendable <> 0) then begin
+      nHeight := cint(Byte(aRoot[0]));
+      if (nHeight < 1) or (nHeight >= FTS_MAX_APPENDABLE_HEIGHT) then begin
+        sqlite3_reset(pSelect);
+        Exit(FTS_CORRUPT_VTAB);
+      end;
+      pWriter^.nLeafEst := ((iEnd - iStart) + 1) div FTS_MAX_APPENDABLE_HEIGHT;
+      pWriter^.iStart := iStart;
+      pWriter^.iEnd := iEnd;
+      pWriter^.iAbsLevel := iAbsLevel;
+      pWriter^.iIdx := iIdx;
+
+      for i := nHeight+1 to FTS_MAX_APPENDABLE_HEIGHT-1 do
+        pWriter^.aNodeWriter[i].iBlock := pWriter^.iStart + i*pWriter^.nLeafEst;
+
+      pNode := @pWriter^.aNodeWriter[nHeight];
+      pNode^.iBlock := pWriter^.iStart + pWriter^.nLeafEst*nHeight;
+      blobGrowBuffer(@pNode^.block,
+          cint(Fts3_MAX(nRoot, p^.nNodeSize))+FTS3_NODE_PADDING, @rc);
+      if rc = SQLITE_OK then begin
+        libc_memcpy(pNode^.block.a, aRoot, NativeUInt(nRoot));
+        pNode^.block.n := nRoot;
+        libc_memset(@pNode^.block.a[nRoot], 0, FTS3_NODE_PADDING);
+      end;
+
+      i := nHeight;
+      while (i >= 0) and (rc = SQLITE_OK) do begin
+        libc_memset(@reader, 0, SizeOf(reader));
+        pNode := @pWriter^.aNodeWriter[i];
+        if pNode^.block.a <> nil then begin
+          rc := nodeReaderInit(@reader, pNode^.block.a, pNode^.block.n);
+          while (reader.aNode <> nil) and (rc = SQLITE_OK) do
+            rc := nodeReaderNext(@reader);
+          blobGrowBuffer(@pNode^.key, reader.term.n, @rc);
+          if rc = SQLITE_OK then begin
+            if reader.term.n > 0 then
+              libc_memcpy(pNode^.key.a, reader.term.a, NativeUInt(reader.term.n));
+            pNode^.key.n := reader.term.n;
+            if i > 0 then begin
+              aBlock := nil; nBlock := 0;
+              pNode := @pWriter^.aNodeWriter[i-1];
+              pNode^.iBlock := reader.iChild;
+              rc := sqlite3Fts3ReadBlock(p, reader.iChild, @aBlock, @nBlock, nil);
+              blobGrowBuffer(@pNode^.block,
+                  cint(Fts3_MAX(nBlock, p^.nNodeSize))+FTS3_NODE_PADDING, @rc);
+              if rc = SQLITE_OK then begin
+                libc_memcpy(pNode^.block.a, aBlock, NativeUInt(nBlock));
+                pNode^.block.n := nBlock;
+                libc_memset(@pNode^.block.a[nBlock], 0, FTS3_NODE_PADDING);
+              end;
+              sqlite3_free(aBlock);
+            end;
+          end;
+        end;
+        nodeReaderRelease(@reader);
+        Dec(i);
+      end;
+    end;
+
+    rc2 := sqlite3_reset(pSelect);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:4432..4449 — fts3IncrmergeOutputIdx. }
+function fts3IncrmergeOutputIdx(p: PFts3Table; iAbsLevel: sqlite3_int64;
+  piIdx: Pcint): cint;
+var
+  rc: cint;
+  pOutputIdx: PVdbe;
+begin
+  rc := fts3SqlStmt(p, SQL_NEXT_SEGMENT_INDEX, @pOutputIdx, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pOutputIdx, 1, iAbsLevel+1);
+    sqlite3_step(pOutputIdx);
+    piIdx^ := sqlite3_column_int(pOutputIdx, 0);
+    rc := sqlite3_reset(pOutputIdx);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:4477..4529 — fts3IncrmergeWriter. }
+function fts3IncrmergeWriter(p: PFts3Table; iAbsLevel: sqlite3_int64; iIdx: cint;
+  pCsr: PFts3MultiSegReader; pWriter: PIncrmergeWriter): cint;
+var
+  rc, i: cint;
+  nLeafEst: sqlite3_int64;
+  pLeafEst, pFirstBlock: PVdbe;
+begin
+  nLeafEst := 0;
+  rc := fts3SqlStmt(p, SQL_MAX_LEAF_NODE_ESTIMATE, @pLeafEst, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pLeafEst, 1, iAbsLevel);
+    sqlite3_bind_int64(pLeafEst, 2, pCsr^.nSegment);
+    if SQLITE_ROW = sqlite3_step(pLeafEst) then
+      nLeafEst := sqlite3_column_int64(pLeafEst, 0);
+    rc := sqlite3_reset(pLeafEst);
+  end;
+  if rc <> SQLITE_OK then Exit(rc);
+
+  rc := fts3SqlStmt(p, SQL_NEXT_SEGMENTS_ID, @pFirstBlock, nil);
+  if rc = SQLITE_OK then begin
+    if SQLITE_ROW = sqlite3_step(pFirstBlock) then begin
+      pWriter^.iStart := sqlite3_column_int64(pFirstBlock, 0);
+      pWriter^.iEnd := pWriter^.iStart - 1;
+      pWriter^.iEnd := pWriter^.iEnd + nLeafEst * FTS_MAX_APPENDABLE_HEIGHT;
+    end;
+    rc := sqlite3_reset(pFirstBlock);
+  end;
+  if rc <> SQLITE_OK then Exit(rc);
+
+  rc := fts3WriteSegment(p, pWriter^.iEnd, nil, 0);
+  if rc <> SQLITE_OK then Exit(rc);
+
+  pWriter^.iAbsLevel := iAbsLevel;
+  pWriter^.nLeafEst := nLeafEst;
+  pWriter^.iIdx := iIdx;
+  for i := 0 to FTS_MAX_APPENDABLE_HEIGHT-1 do
+    pWriter^.aNodeWriter[i].iBlock := pWriter^.iStart + i*pWriter^.nLeafEst;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:4542..4559 — fts3RemoveSegdirEntry. }
+function fts3RemoveSegdirEntry(p: PFts3Table; iAbsLevel: sqlite3_int64;
+  iIdx: cint): cint;
+var
+  rc: cint;
+  pDelete: PVdbe;
+begin
+  rc := fts3SqlStmt(p, SQL_DELETE_SEGDIR_ENTRY, @pDelete, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pDelete, 1, iAbsLevel);
+    sqlite3_bind_int(pDelete, 2, iIdx);
+    sqlite3_step(pDelete);
+    rc := sqlite3_reset(pDelete);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:4566..4620 — fts3RepackSegdirLevel. }
+function fts3RepackSegdirLevel(p: PFts3Table; iAbsLevel: sqlite3_int64): cint;
+var
+  rc, rc2, nIdx, nAlloc, i: cint;
+  aIdx, aNew: Pcint;
+  pSelect, pUpdate: PVdbe;
+begin
+  aIdx := nil; nIdx := 0; nAlloc := 0;
+  rc := fts3SqlStmt(p, SQL_SELECT_INDEXES, @pSelect, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pSelect, 1, iAbsLevel);
+    while SQLITE_ROW = sqlite3_step(pSelect) do begin
+      if nIdx >= nAlloc then begin
+        nAlloc := nAlloc + 16;
+        aNew := Pcint(sqlite3_realloc64(aIdx, u64(nAlloc*SizeOf(cint))));
+        if aNew = nil then begin rc := SQLITE_NOMEM; break; end;
+        aIdx := aNew;
+      end;
+      Pcint(aIdx)[nIdx] := sqlite3_column_int(pSelect, 0);
+      Inc(nIdx);
+    end;
+    rc2 := sqlite3_reset(pSelect);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+
+  if rc = SQLITE_OK then rc := fts3SqlStmt(p, SQL_SHIFT_SEGDIR_ENTRY, @pUpdate, nil);
+  if rc = SQLITE_OK then sqlite3_bind_int64(pUpdate, 2, iAbsLevel);
+
+  Assert(p^.bIgnoreSavepoint = 0);
+  p^.bIgnoreSavepoint := 1;
+  i := 0;
+  while (rc = SQLITE_OK) and (i < nIdx) do begin
+    if Pcint(aIdx)[i] <> i then begin
+      sqlite3_bind_int(pUpdate, 3, Pcint(aIdx)[i]);
+      sqlite3_bind_int(pUpdate, 1, i);
+      sqlite3_step(pUpdate);
+      rc := sqlite3_reset(pUpdate);
+    end;
+    Inc(i);
+  end;
+  p^.bIgnoreSavepoint := 0;
+  sqlite3_free(aIdx);
+  Result := rc;
+end;
+
+{ fts3_write.c:4622..4631 — fts3StartNode. }
+procedure fts3StartNode(pNode: PFtsBlob; iHeight: cint; iChild: sqlite3_int64);
+begin
+  pNode^.a[0] := Chr(iHeight);
+  if iChild <> 0 then
+    pNode^.n := 1 + sqlite3Fts3PutVarint(@pNode^.a[1], iChild)
+  else
+    pNode^.n := 1;
+end;
+
+{ fts3_write.c:4641..4688 — fts3TruncateNode. }
+function fts3TruncateNode(const aNode: PChar; nNode: cint; pNew: PFtsBlob;
+  const zTerm: PChar; nTerm: cint; piBlock: Psqlite3_int64): cint;
+var
+  reader: TNodeReader;
+  prev: TFtsBlob;
+  rc, bLeaf, res: cint;
+begin
+  prev.a := nil; prev.n := 0; prev.nAlloc := 0;
+  rc := SQLITE_OK;
+  if nNode < 1 then Exit(FTS_CORRUPT_VTAB);
+  bLeaf := cint(Ord(aNode[0] = #0));
+  blobGrowBuffer(pNew, nNode, @rc);
+  if rc <> SQLITE_OK then Exit(rc);
+  pNew^.n := 0;
+
+  rc := nodeReaderInit(@reader, aNode, nNode);
+  while (rc = SQLITE_OK) and (reader.aNode <> nil) do begin
+    if pNew^.n = 0 then begin
+      res := fts3TermCmp(reader.term.a, reader.term.n, zTerm, nTerm);
+      if (res < 0) or ((bLeaf = 0) and (res = 0)) then begin
+        rc := nodeReaderNext(@reader);
+        continue;
+      end;
+      fts3StartNode(pNew, cint(Byte(aNode[0])), reader.iChild);
+      piBlock^ := reader.iChild;
+    end;
+    rc := fts3AppendToNode(pNew, @prev, reader.term.a, reader.term.n,
+            reader.aDoclist, reader.nDoclist);
+    if rc <> SQLITE_OK then break;
+    rc := nodeReaderNext(@reader);
+  end;
+  if pNew^.n = 0 then begin
+    fts3StartNode(pNew, cint(Byte(aNode[0])), reader.iChild);
+    piBlock^ := reader.iChild;
+  end;
+  nodeReaderRelease(@reader);
+  sqlite3_free(prev.a);
+  Result := rc;
+end;
+
+{ fts3_write.c:4699..4773 — fts3TruncateSegment. }
+function fts3TruncateSegment(p: PFts3Table; iAbsLevel: sqlite3_int64; iIdx: cint;
+  const zTerm: PChar; nTerm: cint): cint;
+var
+  rc, rc2, nRoot, nBlock: cint;
+  root, block: TFtsBlob;
+  iBlock, iNewStart, iOldStart: sqlite3_int64;
+  pFetch, pDel, pChomp: PVdbe;
+  aRoot, aBlock: PChar;
+begin
+  rc := SQLITE_OK;
+  root.a := nil; root.n := 0; root.nAlloc := 0;
+  block.a := nil; block.n := 0; block.nAlloc := 0;
+  iBlock := 0; iNewStart := 0; iOldStart := 0;
+
+  rc := fts3SqlStmt(p, SQL_SELECT_SEGDIR, @pFetch, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int64(pFetch, 1, iAbsLevel);
+    sqlite3_bind_int(pFetch, 2, iIdx);
+    if SQLITE_ROW = sqlite3_step(pFetch) then begin
+      aRoot := sqlite3_column_blob(pFetch, 4);
+      nRoot := sqlite3_column_bytes(pFetch, 4);
+      iOldStart := sqlite3_column_int64(pFetch, 1);
+      rc := fts3TruncateNode(aRoot, nRoot, @root, zTerm, nTerm, @iBlock);
+    end;
+    rc2 := sqlite3_reset(pFetch);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+
+  while (rc = SQLITE_OK) and (iBlock <> 0) do begin
+    aBlock := nil; nBlock := 0;
+    iNewStart := iBlock;
+    rc := sqlite3Fts3ReadBlock(p, iBlock, @aBlock, @nBlock, nil);
+    if rc = SQLITE_OK then
+      rc := fts3TruncateNode(aBlock, nBlock, @block, zTerm, nTerm, @iBlock);
+    if rc = SQLITE_OK then rc := fts3WriteSegment(p, iNewStart, block.a, block.n);
+    sqlite3_free(aBlock);
+  end;
+
+  if (rc = SQLITE_OK) and (iNewStart <> 0) then begin
+    rc := fts3SqlStmt(p, SQL_DELETE_SEGMENTS_RANGE, @pDel, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_int64(pDel, 1, iOldStart);
+      sqlite3_bind_int64(pDel, 2, iNewStart-1);
+      sqlite3_step(pDel);
+      rc := sqlite3_reset(pDel);
+    end;
+  end;
+
+  if rc = SQLITE_OK then begin
+    rc := fts3SqlStmt(p, SQL_CHOMP_SEGDIR, @pChomp, nil);
+    if rc = SQLITE_OK then begin
+      sqlite3_bind_int64(pChomp, 1, iNewStart);
+      sqlite3_bind_blob(pChomp, 2, root.a, root.n, SQLITE_STATIC);
+      sqlite3_bind_int64(pChomp, 3, iAbsLevel);
+      sqlite3_bind_int(pChomp, 4, iIdx);
+      sqlite3_step(pChomp);
+      rc := sqlite3_reset(pChomp);
+      sqlite3_bind_null(pChomp, 2);
+    end;
+  end;
+  sqlite3_free(root.a);
+  sqlite3_free(block.a);
+  Result := rc;
+end;
+
+{ fts3_write.c:4785..4831 — fts3IncrmergeChomp. }
+function fts3IncrmergeChomp(p: PFts3Table; iAbsLevel: sqlite3_int64;
+  pCsr: PFts3MultiSegReader; pnRem: Pcint): cint;
+var
+  i, j, nRem, rc: cint;
+  pSeg: PFts3SegReader;
+  zTerm: PChar;
+  nTerm: cint;
+begin
+  nRem := 0;
+  rc := SQLITE_OK;
+  i := pCsr^.nSegment-1;
+  while (i >= 0) and (rc = SQLITE_OK) do begin
+    pSeg := nil;
+    j := 0;
+    while j < pCsr^.nSegment do begin
+      pSeg := PPFts3SegReader(pCsr^.apSegment)[j];
+      if pSeg^.iIdx = i then break;
+      Inc(j);
+    end;
+    Assert((j < pCsr^.nSegment) and (pSeg^.iIdx = i));
+    if pSeg^.aNode = nil then begin
+      rc := fts3DeleteSegment(p, pSeg);
+      if rc = SQLITE_OK then rc := fts3RemoveSegdirEntry(p, iAbsLevel, pSeg^.iIdx);
+      pnRem^ := 0;
+    end else begin
+      zTerm := pSeg^.zTerm;
+      nTerm := pSeg^.nTerm;
+      rc := fts3TruncateSegment(p, iAbsLevel, pSeg^.iIdx, zTerm, nTerm);
+      Inc(nRem);
+    end;
+    Dec(i);
+  end;
+  if (rc = SQLITE_OK) and (nRem <> pCsr^.nSegment) then
+    rc := fts3RepackSegdirLevel(p, iAbsLevel);
+  pnRem^ := nRem;
+  Result := rc;
+end;
+
+{ fts3_write.c:4836..4850 — fts3IncrmergeHintStore. }
+function fts3IncrmergeHintStore(p: PFts3Table; pHint: PFtsBlob): cint;
+var
+  pReplace: PVdbe;
+  rc: cint;
+begin
+  rc := fts3SqlStmt(p, SQL_REPLACE_STAT, @pReplace, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int(pReplace, 1, FTS_STAT_INCRMERGEHINT);
+    sqlite3_bind_blob(pReplace, 2, pHint^.a, pHint^.n, SQLITE_STATIC);
+    sqlite3_step(pReplace);
+    rc := sqlite3_reset(pReplace);
+    sqlite3_bind_null(pReplace, 2);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:4860..4885 — fts3IncrmergeHintLoad. }
+function fts3IncrmergeHintLoad(p: PFts3Table; pHint: PFtsBlob): cint;
+var
+  pSelect: PVdbe;
+  rc, rc2, nHint: cint;
+  aHint: PChar;
+begin
+  pHint^.n := 0;
+  rc := fts3SqlStmt(p, SQL_SELECT_STAT, @pSelect, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int(pSelect, 1, FTS_STAT_INCRMERGEHINT);
+    if SQLITE_ROW = sqlite3_step(pSelect) then begin
+      aHint := sqlite3_column_blob(pSelect, 0);
+      nHint := sqlite3_column_bytes(pSelect, 0);
+      if aHint <> nil then begin
+        blobGrowBuffer(pHint, nHint, @rc);
+        if rc = SQLITE_OK then begin
+          if pHint^.a <> nil then libc_memcpy(pHint^.a, aHint, NativeUInt(nHint));
+          pHint^.n := nHint;
+        end;
+      end;
+    end;
+    rc2 := sqlite3_reset(pSelect);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:4896..4907 — fts3IncrmergeHintPush. }
+procedure fts3IncrmergeHintPush(pHint: PFtsBlob; iAbsLevel: sqlite3_int64;
+  nInput: cint; pRc: Pcint);
+begin
+  blobGrowBuffer(pHint, pHint^.n + 2*FTS3_VARINT_MAX, pRc);
+  if pRc^ = SQLITE_OK then begin
+    pHint^.n := pHint^.n + sqlite3Fts3PutVarint(@pHint^.a[pHint^.n], iAbsLevel);
+    pHint^.n := pHint^.n + sqlite3Fts3PutVarint(@pHint^.a[pHint^.n], sqlite3_int64(nInput));
+  end;
+end;
+
+{ fts3_write.c:4917..4935 — fts3IncrmergeHintPop. }
+function fts3IncrmergeHintPop(pHint: PFtsBlob; piAbsLevel: Psqlite3_int64;
+  pnInput: Pcint): cint;
+var
+  nHint, i: cint;
+begin
+  nHint := pHint^.n;
+  i := pHint^.n-1;
+  if (Byte(pHint^.a[i]) and $80) <> 0 then Exit(FTS_CORRUPT_VTAB);
+  while (i > 0) and ((Byte(pHint^.a[i-1]) and $80) <> 0) do Dec(i);
+  if i = 0 then Exit(FTS_CORRUPT_VTAB);
+  Dec(i);
+  while (i > 0) and ((Byte(pHint^.a[i-1]) and $80) <> 0) do Dec(i);
+  pHint^.n := i;
+  i := i + sqlite3Fts3GetVarint(@pHint^.a[i], piAbsLevel);
+  i := i + fts3GetVarint32(@pHint^.a[i], pnInput);
+  if i <> nHint then Exit(FTS_CORRUPT_VTAB);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:4947..5113 — sqlite3Fts3Incrmerge. }
+function sqlite3Fts3Incrmerge(p: PFts3Table; nMerge, nMin: cint): cint;
+var
+  rc, nRem, nSeg, bUseHint, iIdx, bDirtyHint, bEmpty, bIgnore: cint;
+  pCsr: PFts3MultiSegReader;
+  pFilter: PFts3SegFilter;
+  pWriter: PIncrmergeWriter;
+  iAbsLevel: sqlite3_int64;
+  hint: TFtsBlob;
+  nAlloc: cint;
+  nMod: sqlite3_int64;
+  pFindLevel: PVdbe;
+  nHint, nHintSeg: cint;
+  iHintAbsLevel: sqlite3_int64;
+  zKey: PChar;
+  nKey: cint;
+begin
+  nRem := nMerge;
+  nSeg := 0;
+  iAbsLevel := 0;
+  bDirtyHint := 0;
+  hint.a := nil; hint.n := 0; hint.nAlloc := 0;
+
+  nAlloc := SizeOf(TFts3MultiSegReader) + SizeOf(TFts3SegFilter)
+              + SizeOf(TIncrmergeWriter);
+  pWriter := PIncrmergeWriter(sqlite3_malloc64(u64(nAlloc)));
+  if pWriter = nil then Exit(SQLITE_NOMEM);
+  pFilter := PFts3SegFilter(PtrUInt(pWriter) + SizeOf(TIncrmergeWriter));
+  pCsr := PFts3MultiSegReader(PtrUInt(pFilter) + SizeOf(TFts3SegFilter));
+
+  rc := fts3IncrmergeHintLoad(p, @hint);
+  while (rc = SQLITE_OK) and (nRem > 0) do begin
+    nMod := FTS3_SEGDIR_MAXLEVEL * sqlite3_int64(p^.nIndex);
+    bUseHint := 0;
+    iIdx := 0;
+
+    rc := fts3SqlStmt(p, SQL_FIND_MERGE_LEVEL, @pFindLevel, nil);
+    sqlite3_bind_int(pFindLevel, 1, cint(Fts3_MAX(2, nMin)));
+    if sqlite3_step(pFindLevel) = SQLITE_ROW then begin
+      iAbsLevel := sqlite3_column_int64(pFindLevel, 0);
+      nSeg := sqlite3_column_int(pFindLevel, 1);
+      Assert(nSeg >= 2);
+    end else
+      nSeg := -1;
+    rc := sqlite3_reset(pFindLevel);
+
+    if (rc = SQLITE_OK) and (hint.n <> 0) then begin
+      nHint := hint.n;
+      iHintAbsLevel := 0;
+      nHintSeg := 0;
+      rc := fts3IncrmergeHintPop(@hint, @iHintAbsLevel, @nHintSeg);
+      if (nSeg < 0) or ((iAbsLevel mod nMod) >= (iHintAbsLevel mod nMod)) then begin
+        iAbsLevel := iHintAbsLevel;
+        nSeg := cint(Fts3_MIN(Fts3_MAX(nMin, nSeg), nHintSeg));
+        bUseHint := 1;
+        bDirtyHint := 1;
+      end else
+        hint.n := nHint;
+    end;
+
+    if nSeg <= 0 then break;
+    Assert(nMod <= $7FFFFFFF);
+    if (iAbsLevel < 0) or (iAbsLevel > (nMod shl 32)) then begin
+      rc := FTS_CORRUPT_VTAB;
+      break;
+    end;
+
+    libc_memset(pWriter, 0, NativeUInt(nAlloc));
+    pFilter^.flags := FTS3_SEGMENT_REQUIRE_POS;
+
+    if rc = SQLITE_OK then begin
+      rc := fts3IncrmergeOutputIdx(p, iAbsLevel, @iIdx);
+      if (iIdx = 0) or ((bUseHint <> 0) and (iIdx = 1)) then begin
+        bIgnore := 0;
+        rc := fts3SegmentIsMaxLevel(p, iAbsLevel+1, @bIgnore);
+        if bIgnore <> 0 then
+          pFilter^.flags := pFilter^.flags or FTS3_SEGMENT_IGNORE_EMPTY;
+      end;
+    end;
+
+    if rc = SQLITE_OK then rc := fts3IncrmergeCsr(p, iAbsLevel, nSeg, pCsr);
+    if (rc = SQLITE_OK) and (pCsr^.nSegment = nSeg) then begin
+      rc := sqlite3Fts3SegReaderStart(p, pCsr, pFilter);
+      if rc = SQLITE_OK then begin
+        bEmpty := 0;
+        rc := sqlite3Fts3SegReaderStep(p, pCsr);
+        if rc = SQLITE_OK then bEmpty := 1
+        else if rc <> SQLITE_ROW then begin
+          sqlite3Fts3SegReaderFinish(pCsr);
+          break;
+        end;
+        if (bUseHint <> 0) and (iIdx > 0) then begin
+          zKey := pCsr^.zTerm;
+          nKey := pCsr^.nTerm;
+          rc := fts3IncrmergeLoad(p, iAbsLevel, iIdx-1, zKey, nKey, pWriter);
+        end else
+          rc := fts3IncrmergeWriter(p, iAbsLevel, iIdx, pCsr, pWriter);
+
+        if (rc = SQLITE_OK) and (pWriter^.nLeafEst <> 0) then begin
+          if bEmpty = 0 then begin
+            repeat
+              rc := fts3IncrmergeAppend(p, pWriter, pCsr);
+              if rc = SQLITE_OK then rc := sqlite3Fts3SegReaderStep(p, pCsr);
+              if (pWriter^.nWork >= nRem) and (rc = SQLITE_ROW) then rc := SQLITE_OK;
+            until rc <> SQLITE_ROW;
+          end;
+          if rc = SQLITE_OK then begin
+            nRem := nRem - cint(1 + pWriter^.nWork);
+            rc := fts3IncrmergeChomp(p, iAbsLevel, pCsr, @nSeg);
+            if nSeg <> 0 then begin
+              bDirtyHint := 1;
+              fts3IncrmergeHintPush(@hint, iAbsLevel, nSeg, @rc);
+            end;
+          end;
+        end;
+
+        if nSeg <> 0 then pWriter^.nLeafData := pWriter^.nLeafData * -1;
+        fts3IncrmergeRelease(p, pWriter, @rc);
+        if (nSeg = 0) and (pWriter^.bNoLeafData = 0) then
+          fts3PromoteSegments(p, iAbsLevel+1, pWriter^.nLeafData);
+      end;
+    end;
+    sqlite3Fts3SegReaderFinish(pCsr);
+  end;
+
+  if (bDirtyHint <> 0) and (rc = SQLITE_OK) then
+    rc := fts3IncrmergeHintStore(p, @hint);
+
+  sqlite3_free(pWriter);
+  sqlite3_free(hint.a);
+  Result := rc;
+end;
+
+{ fts3_write.c:5123..5129 — fts3Getint. }
+function fts3Getint(pz: PPChar): cint;
+var
+  z: PChar;
+  i: cint;
+begin
+  z := pz^;
+  i := 0;
+  while (z^ >= '0') and (z^ <= '9') and (i < 214748363) do begin
+    i := 10*i + (Ord(z^) - Ord('0'));
+    Inc(z);
+  end;
+  pz^ := z;
+  Result := i;
+end;
+
+{ fts3_write.c:5140..5173 — fts3DoIncrmerge. }
+function fts3DoIncrmerge(p: PFts3Table; const zParam: PChar): cint;
+var
+  rc, nMin, nMerge: cint;
+  z: PChar;
+begin
+  nMin := MergeCount(p) div 2;
+  nMerge := 0;
+  z := zParam;
+  nMerge := fts3Getint(@z);
+  if (z[0] = ',') and (z[1] <> #0) then begin
+    Inc(z);
+    nMin := fts3Getint(@z);
+  end;
+  if (z[0] <> #0) or (nMin < 2) then
+    rc := SQLITE_ERROR
+  else begin
+    rc := SQLITE_OK;
+    if p^.bHasStat = 0 then begin
+      Assert(p^.bFts4 = 0);
+      sqlite3Fts3CreateStatTable(@rc, p);
+    end;
+    if rc = SQLITE_OK then rc := sqlite3Fts3Incrmerge(p, nMerge, nMin);
+    sqlite3Fts3SegmentsClose(p);
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:5183..5205 — fts3DoAutoincrmerge. }
+function fts3DoAutoincrmerge(p: PFts3Table; zParam: PChar): cint;
+var
+  rc: cint;
+  pStmt: PVdbe;
+  zP: PChar;
+begin
+  rc := SQLITE_OK;
+  zP := zParam;
+  p^.nAutoincrmerge := fts3Getint(@zP);
+  if (p^.nAutoincrmerge = 1) or (p^.nAutoincrmerge > MergeCount(p)) then
+    p^.nAutoincrmerge := 8;
+  if p^.bHasStat = 0 then begin
+    Assert(p^.bFts4 = 0);
+    sqlite3Fts3CreateStatTable(@rc, p);
+    if rc <> 0 then Exit(rc);
+  end;
+  rc := fts3SqlStmt(p, SQL_REPLACE_STAT, @pStmt, nil);
+  if rc <> 0 then Exit(rc);
+  sqlite3_bind_int(pStmt, 1, FTS_STAT_AUTOINCRMERGE);
+  sqlite3_bind_int(pStmt, 2, p^.nAutoincrmerge);
+  sqlite3_step(pStmt);
+  rc := sqlite3_reset(pStmt);
+  Result := rc;
+end;
+
+{ fts3_write.c:5211..5230 — fts3ChecksumEntry. }
+function fts3ChecksumEntry(const zTerm: PChar; nTerm, iLangid, iIndex: cint;
+  iDocid: sqlite3_int64; iCol, iPos: cint): u64;
+var
+  i: cint;
+  ret: u64;
+begin
+  ret := u64(iDocid);
+  ret := ret + (ret shl 3) + u64(iLangid);
+  ret := ret + (ret shl 3) + u64(iIndex);
+  ret := ret + (ret shl 3) + u64(iCol);
+  ret := ret + (ret shl 3) + u64(iPos);
+  for i := 0 to nTerm - 1 do
+    ret := ret + (ret shl 3) + u64(ShortInt(zTerm[i]));
+  Result := ret;
+end;
+
+{ fts3_write.c:5241..5308 — fts3ChecksumIndex. }
+function fts3ChecksumIndex(p: PFts3Table; iLangid, iIndex: cint; pRc: Pcint): u64;
+var
+  filter: TFts3SegFilter;
+  csr: TFts3MultiSegReader;
+  rc: cint;
+  cksum: u64;
+  pCsr, pEnd: PChar;
+  iDocid, iCol: sqlite3_int64;
+  iPos, iVal: u64;
+begin
+  cksum := 0;
+  if pRc^ <> 0 then Exit(0);
+  libc_memset(@filter, 0, SizeOf(filter));
+  libc_memset(@csr, 0, SizeOf(csr));
+  filter.flags := FTS3_SEGMENT_REQUIRE_POS or FTS3_SEGMENT_IGNORE_EMPTY;
+  filter.flags := filter.flags or FTS3_SEGMENT_SCAN;
+
+  rc := sqlite3Fts3SegReaderCursor(p, iLangid, iIndex, FTS3_SEGCURSOR_ALL,
+          nil, 0, 0, 1, @csr);
+  if rc = SQLITE_OK then rc := sqlite3Fts3SegReaderStart(p, @csr, @filter);
+
+  if rc = SQLITE_OK then begin
+    rc := sqlite3Fts3SegReaderStep(p, @csr);
+    while rc = SQLITE_ROW do begin
+      pCsr := csr.aDoclist;
+      pEnd := @pCsr[csr.nDoclist];
+      iDocid := 0; iCol := 0; iPos := 0;
+      pCsr := pCsr + sqlite3Fts3GetVarint(pCsr, @iDocid);
+      while PtrUInt(pCsr) < PtrUInt(pEnd) do begin
+        iVal := 0;
+        pCsr := pCsr + sqlite3Fts3GetVarintU(pCsr, @iVal);
+        if PtrUInt(pCsr) < PtrUInt(pEnd) then begin
+          if (iVal = 0) or (iVal = 1) then begin
+            iCol := 0; iPos := 0;
+            if iVal <> 0 then
+              pCsr := pCsr + sqlite3Fts3GetVarint(pCsr, @iCol)
+            else begin
+              pCsr := pCsr + sqlite3Fts3GetVarintU(pCsr, @iVal);
+              if p^.bDescIdx <> 0 then
+                iDocid := sqlite3_int64(u64(iDocid) - iVal)
+              else
+                iDocid := sqlite3_int64(u64(iDocid) + iVal);
+            end;
+          end else begin
+            iPos := iPos + (iVal - 2);
+            cksum := cksum xor fts3ChecksumEntry(csr.zTerm, csr.nTerm, iLangid,
+                iIndex, iDocid, cint(iCol), cint(iPos));
+          end;
+        end;
+      end;
+      rc := sqlite3Fts3SegReaderStep(p, @csr);
+    end;
+  end;
+  sqlite3Fts3SegReaderFinish(@csr);
+  pRc^ := rc;
+  Result := cksum;
+end;
+
+{ fts3_write.c:5319..5404 — sqlite3Fts3IntegrityCheck. }
+function sqlite3Fts3IntegrityCheck(p: PFts3Table; pbOk: Pcint): cint;
+var
+  rc, rc2, i, iLangid, iCol, iLang, nToken, iDum1, iDum2, iPos: cint;
+  cksum1, cksum2: u64;
+  pAllLangid, pStmt: PVdbe;
+  pModule: Psqlite3_tokenizer_module;
+  zSql, zText, zToken: PChar;
+  iDocid: sqlite3_int64;
+  pT: Psqlite3_tokenizer_cursor;
+begin
+  rc := SQLITE_OK;
+  cksum1 := 0; cksum2 := 0;
+  pAllLangid := nil;
+
+  rc := fts3SqlStmt(p, SQL_SELECT_ALL_LANGID, @pAllLangid, nil);
+  if rc = SQLITE_OK then begin
+    sqlite3_bind_int(pAllLangid, 1, p^.iPrevLangid);
+    sqlite3_bind_int(pAllLangid, 2, p^.nIndex);
+    while (rc = SQLITE_OK) and (sqlite3_step(pAllLangid) = SQLITE_ROW) do begin
+      iLangid := sqlite3_column_int(pAllLangid, 0);
+      for i := 0 to p^.nIndex - 1 do
+        cksum1 := cksum1 xor fts3ChecksumIndex(p, iLangid, i, @rc);
+    end;
+    rc2 := sqlite3_reset(pAllLangid);
+    if rc = SQLITE_OK then rc := rc2;
+  end;
+
+  if rc = SQLITE_OK then begin
+    pModule := p^.pTokenizer^.pModule;
+    pStmt := nil;
+    zSql := PChar(sqlite3PfMprintf(PAnsiChar('SELECT %s'), [p^.zReadExprlist]));
+    if zSql = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      rc := sqlite3Fts3PrepareStmt(p, zSql, 0, 1, @pStmt);
+      sqlite3_free(zSql);
+    end;
+
+    while (rc = SQLITE_OK) and (SQLITE_ROW = sqlite3_step(pStmt)) do begin
+      iDocid := sqlite3_column_int64(pStmt, 0);
+      iLang := langidFromSelect(p, pStmt);
+      iCol := 0;
+      while (rc = SQLITE_OK) and (iCol < p^.nColumn) do begin
+        if PByte(p^.abNotindexed)[iCol] = 0 then begin
+          zText := PChar(sqlite3_column_text(pStmt, iCol+1));
+          pT := nil;
+          rc := sqlite3Fts3OpenTokenizer(p^.pTokenizer, iLang, zText, -1, @pT);
+          while rc = SQLITE_OK do begin
+            nToken := 0; iDum1 := 0; iDum2 := 0; iPos := 0;
+            rc := pModule^.xNext(pT, @zToken, @nToken, @iDum1, @iDum2, @iPos);
+            if rc = SQLITE_OK then begin
+              cksum2 := cksum2 xor fts3ChecksumEntry(zToken, nToken, iLang, 0,
+                  iDocid, iCol, iPos);
+              for i := 1 to p^.nIndex - 1 do begin
+                if PFts3Index(p^.aIndex)[i].nPrefix <= nToken then
+                  cksum2 := cksum2 xor fts3ChecksumEntry(zToken,
+                      PFts3Index(p^.aIndex)[i].nPrefix, iLang, i, iDocid, iCol, iPos);
+              end;
+            end;
+          end;
+          if pT <> nil then pModule^.xClose(pT);
+          if rc = SQLITE_DONE then rc := SQLITE_OK;
+        end;
+        Inc(iCol);
+      end;
+    end;
+    sqlite3_finalize(pStmt);
+  end;
+
+  if rc = SQLITE_CORRUPT_VTAB then begin
+    rc := SQLITE_OK;
+    pbOk^ := 0;
+  end else
+    pbOk^ := cint(Ord((rc = SQLITE_OK) and (cksum1 = cksum2)));
+  Result := rc;
+end;
+
+{ fts3_write.c:5437..5445 — fts3DoIntegrityCheck. }
+function fts3DoIntegrityCheck(p: PFts3Table): cint;
+var
+  rc, bOk: cint;
+begin
+  bOk := 0;
+  rc := sqlite3Fts3IntegrityCheck(p, @bOk);
+  if (rc = SQLITE_OK) and (bOk = 0) then rc := FTS_CORRUPT_VTAB;
+  Result := rc;
+end;
+
+{ fts3_write.c:5455..5497 — fts3SpecialInsert. }
+function fts3SpecialInsert(p: PFts3Table; pVal: Psqlite3_value): cint;
+var
+  rc, nVal, v: cint;
+  zVal: PChar;
+begin
+  rc := SQLITE_ERROR;
+  zVal := PChar(sqlite3_value_text(pVal));
+  nVal := sqlite3_value_bytes(pVal);
+  if zVal = nil then
+    Exit(SQLITE_NOMEM)
+  else if (nVal = 8) and (sqlite3_strnicmp(zVal, 'optimize', 8) = 0) then
+    rc := fts3DoOptimize(p, 0)
+  else if (nVal = 7) and (sqlite3_strnicmp(zVal, 'rebuild', 7) = 0) then
+    rc := fts3DoRebuild(p)
+  else if (nVal = 15) and (sqlite3_strnicmp(zVal, 'integrity-check', 15) = 0) then
+    rc := fts3DoIntegrityCheck(p)
+  else if (nVal > 6) and (sqlite3_strnicmp(zVal, 'merge=', 6) = 0) then
+    rc := fts3DoIncrmerge(p, @zVal[6])
+  else if (nVal > 10) and (sqlite3_strnicmp(zVal, 'automerge=', 10) = 0) then
+    rc := fts3DoAutoincrmerge(p, @zVal[10])
+  else if (nVal = 5) and (sqlite3_strnicmp(zVal, 'flush', 5) = 0) then
+    rc := sqlite3Fts3PendingTermsFlush(p)
+{$IFDEF SQLITE_TEST}
+  else begin
+    if (nVal > 9) and (sqlite3_strnicmp(zVal, 'nodesize=', 9) = 0) then begin
+      v := libc_atoi(@zVal[9]);
+      if (v >= 24) and (v <= p^.nPgsz-35) then p^.nNodeSize := v;
+      rc := SQLITE_OK;
+    end else if (nVal > 11) and (sqlite3_strnicmp(zVal, 'maxpending=', 11) = 0) then
+    begin
+      v := libc_atoi(@zVal[11]);
+      if (v >= 64) and (v <= FTS3_MAX_PENDING_DATA) then p^.nMaxPendingData := v;
+      rc := SQLITE_OK;
+    end else if (nVal > 21)
+      and (sqlite3_strnicmp(zVal, 'test-no-incr-doclist=', 21) = 0) then begin
+      p^.bNoIncrDoclist := libc_atoi(@zVal[21]);
+      rc := SQLITE_OK;
+    end else if (nVal > 11) and (sqlite3_strnicmp(zVal, 'mergecount=', 11) = 0) then
+    begin
+      v := libc_atoi(@zVal[11]);
+      if (v >= 4) and (v <= FTS3_MERGE_COUNT) and ((v and 1) = 0) then
+        p^.nMergeCount := v;
+      rc := SQLITE_OK;
+    end;
+  end
+{$ENDIF}
+  ;
+  Result := rc;
+end;
+
+{ ===================================================================== }
+{ Deferred-token machinery (fts3_write.c:5504..5638).                    }
+{ SQLITE_DISABLE_FTS4_DEFERRED is NOT defined in the oracle build.        }
+{ ===================================================================== }
+
+{ fts3_write.c:5504..5510 — sqlite3Fts3FreeDeferredDoclists. }
+procedure sqlite3Fts3FreeDeferredDoclists(pCsr: PFts3Cursor);
+var
+  pDef: PFts3DeferredTokenR;
+begin
+  pDef := pCsr^.pDeferred;
+  while pDef <> nil do begin
+    fts3PendingListDelete(pDef^.pList);
+    pDef^.pList := nil;
+    pDef := pDef^.pNext;
+  end;
+end;
+
+{ fts3_write.c:5516..5525 — sqlite3Fts3FreeDeferredTokens. }
+procedure sqlite3Fts3FreeDeferredTokens(pCsr: PFts3Cursor);
+var
+  pDef, pNext: PFts3DeferredTokenR;
+begin
+  pDef := pCsr^.pDeferred;
+  while pDef <> nil do begin
+    pNext := pDef^.pNext;
+    fts3PendingListDelete(pDef^.pList);
+    sqlite3_free(pDef);
+    pDef := pNext;
+  end;
+  pCsr^.pDeferred := nil;
+end;
+
+{ fts3_write.c:5535..5586 — sqlite3Fts3CacheDeferredDoclists. }
+function sqlite3Fts3CacheDeferredDoclists(pCsr: PFts3Cursor): cint;
+var
+  rc, i, nToken, iDum1, iDum2, iPos: cint;
+  iDocid: sqlite3_int64;
+  pDef: PFts3DeferredTokenR;
+  p: PFts3Table;
+  pT: Psqlite3_tokenizer;
+  pModule: Psqlite3_tokenizer_module;
+  zText, zToken: PChar;
+  pTC: Psqlite3_tokenizer_cursor;
+  pPT: PFts3PhraseToken;
+begin
+  rc := SQLITE_OK;
+  if pCsr^.pDeferred <> nil then begin
+    p := PFts3Table(pCsr^.base.pVtab);
+    pT := p^.pTokenizer;
+    pModule := pT^.pModule;
+    Assert(pCsr^.isRequireSeek = 0);
+    iDocid := sqlite3_column_int64(pCsr^.pStmt, 0);
+
+    i := 0;
+    while (i < p^.nColumn) and (rc = SQLITE_OK) do begin
+      if PByte(p^.abNotindexed)[i] = 0 then begin
+        zText := PChar(sqlite3_column_text(pCsr^.pStmt, i+1));
+        pTC := nil;
+        rc := sqlite3Fts3OpenTokenizer(pT, pCsr^.iLangid, zText, -1, @pTC);
+        while rc = SQLITE_OK do begin
+          nToken := 0; iDum1 := 0; iDum2 := 0; iPos := 0;
+          rc := pModule^.xNext(pTC, @zToken, @nToken, @iDum1, @iDum2, @iPos);
+          pDef := pCsr^.pDeferred;
+          while (pDef <> nil) and (rc = SQLITE_OK) do begin
+            pPT := pDef^.pToken;
+            if ((pDef^.iCol >= p^.nColumn) or (pDef^.iCol = i))
+              and ((pPT^.bFirst = 0) or (iPos = 0))
+              and ((pPT^.n = nToken) or ((pPT^.isPrefix <> 0) and (pPT^.n < nToken)))
+              and (libc_memcmp(zToken, pPT^.z, NativeUInt(pPT^.n)) = 0) then
+              fts3PendingListAppend(@pDef^.pList, iDocid, i, iPos, @rc);
+            pDef := pDef^.pNext;
+          end;
+        end;
+        if pTC <> nil then pModule^.xClose(pTC);
+        if rc = SQLITE_DONE then rc := SQLITE_OK;
+      end;
+      Inc(i);
+    end;
+
+    pDef := pCsr^.pDeferred;
+    while (pDef <> nil) and (rc = SQLITE_OK) do begin
+      if pDef^.pList <> nil then
+        rc := fts3PendingListAppendVarint(@pDef^.pList, 0);
+      pDef := pDef^.pNext;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:5588..5613 — sqlite3Fts3DeferredTokenList. }
+function sqlite3Fts3DeferredTokenList(p: PFts3DeferredTokenR;
+  ppData: PPChar; pnData: Pcint): cint;
+var
+  pRet: PChar;
+  nSkip: cint;
+  dummy: sqlite3_int64;
+begin
+  ppData^ := nil;
+  pnData^ := 0;
+  if p^.pList = nil then Exit(SQLITE_OK);
+  pRet := PChar(sqlite3_malloc64(u64(p^.pList^.nData)));
+  if pRet = nil then Exit(SQLITE_NOMEM);
+  nSkip := sqlite3Fts3GetVarint(p^.pList^.aData, @dummy);
+  pnData^ := cint(p^.pList^.nData) - nSkip;
+  ppData^ := pRet;
+  libc_memcpy(pRet, @p^.pList^.aData[nSkip], NativeUInt(pnData^));
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:5618..5638 — sqlite3Fts3DeferToken. }
+function sqlite3Fts3DeferToken(pCsr: PFts3Cursor; pToken: PFts3PhraseToken;
+  iCol: cint): cint;
+var
+  pDeferred: PFts3DeferredTokenR;
+begin
+  pDeferred := PFts3DeferredTokenR(sqlite3_malloc64(u64(SizeOf(TFts3DeferredToken))));
+  if pDeferred = nil then Exit(SQLITE_NOMEM);
+  libc_memset(pDeferred, 0, SizeOf(TFts3DeferredToken));
+  pDeferred^.pToken := pToken;
+  pDeferred^.pNext := pCsr^.pDeferred;
+  pDeferred^.iCol := iCol;
+  pCsr^.pDeferred := pDeferred;
+  Assert(pToken^.pDeferred = nil);
+  pToken^.pDeferred := pDeferred;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_write.c:5646..5680 — fts3DeleteByRowid. }
+function fts3DeleteByRowid(p: PFts3Table; pRowid: Psqlite3_value;
+  pnChng: Pcint; aSzDel: Pcuint): cint;
+var
+  rc, bFound, isEmpty: cint;
+begin
+  rc := SQLITE_OK;
+  bFound := 0;
+  fts3DeleteTerms(@rc, p, pRowid, aSzDel, @bFound);
+  if (bFound <> 0) and (rc = SQLITE_OK) then begin
+    isEmpty := 0;
+    rc := fts3IsEmpty(p, pRowid, @isEmpty);
+    if rc = SQLITE_OK then begin
+      if isEmpty <> 0 then begin
+        rc := fts3DeleteAll(p, 1);
+        pnChng^ := 0;
+        libc_memset(aSzDel, 0, NativeUInt(SizeOf(cuint) * (p^.nColumn+1) * 2));
+      end else begin
+        pnChng^ := pnChng^ - 1;
+        if p^.zContentTbl = nil then fts3SqlExec(@rc, p, SQL_DELETE_CONTENT, @pRowid);
+        if p^.bHasDocsize <> 0 then fts3SqlExec(@rc, p, SQL_DELETE_DOCSIZE, @pRowid);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ fts3_write.c:5695..5832 — sqlite3Fts3UpdateMethod. }
+function sqlite3Fts3UpdateMethod(pVtab: PSqlite3Vtab; nArg: cint;
+  apVal: PPsqlite3_value; pRowid: Psqlite3_int64): cint;
+var
+  p: PFts3Table;
+  rc, nChng, bInsertDone, iLangid: cint;
+  aSzIns, aSzDel: Pcuint;
+  pNewRowid: Psqlite3_value;
+label update_out;
+begin
+  p := PFts3Table(pVtab);
+  rc := SQLITE_OK;
+  aSzIns := nil; aSzDel := nil; nChng := 0; bInsertDone := 0;
+  Assert((p^.bHasStat = 0) or (p^.bHasStat = 1));
+  Assert(p^.pSegments = nil);
+
+  if (nArg > 1)
+   and (sqlite3_value_type(PPsqlite3_value(apVal)[0]) = SQLITE_NULL)
+   and (sqlite3_value_type(PPsqlite3_value(apVal)[p^.nColumn+2]) <> SQLITE_NULL) then
+  begin
+    rc := fts3SpecialInsert(p, PPsqlite3_value(apVal)[p^.nColumn+2]);
+    goto update_out;
+  end;
+
+  if (nArg > 1)
+   and (sqlite3_value_int(PPsqlite3_value(apVal)[2 + p^.nColumn + 2]) < 0) then begin
+    rc := SQLITE_CONSTRAINT;
+    goto update_out;
+  end;
+
+  aSzDel := Pcuint(sqlite3_malloc64(u64(SizeOf(cuint)*(sqlite3_int64(p^.nColumn)+1)*2)));
+  if aSzDel = nil then begin
+    rc := SQLITE_NOMEM;
+    goto update_out;
+  end;
+  aSzIns := @Pcuint(aSzDel)[p^.nColumn+1];
+  libc_memset(aSzDel, 0, NativeUInt(SizeOf(cuint)*(p^.nColumn+1)*2));
+
+  rc := fts3Writelock(p);
+  if rc <> SQLITE_OK then goto update_out;
+
+  if (nArg > 1) and (p^.zContentTbl = nil) then begin
+    pNewRowid := PPsqlite3_value(apVal)[3+p^.nColumn];
+    if sqlite3_value_type(pNewRowid) = SQLITE_NULL then
+      pNewRowid := PPsqlite3_value(apVal)[1];
+    if (sqlite3_value_type(pNewRowid) <> SQLITE_NULL)
+     and ((sqlite3_value_type(PPsqlite3_value(apVal)[0]) = SQLITE_NULL)
+          or (sqlite3_value_int64(PPsqlite3_value(apVal)[0])
+               <> sqlite3_value_int64(pNewRowid))) then begin
+      if sqlite3_vtab_on_conflict(p^.db) = FTS3_SQLITE_REPLACE then
+        rc := fts3DeleteByRowid(p, pNewRowid, @nChng, aSzDel)
+      else begin
+        rc := fts3InsertData(p, apVal, pRowid);
+        bInsertDone := 1;
+      end;
+    end;
+  end;
+  if rc <> SQLITE_OK then goto update_out;
+
+  if sqlite3_value_type(PPsqlite3_value(apVal)[0]) <> SQLITE_NULL then begin
+    Assert(sqlite3_value_type(PPsqlite3_value(apVal)[0]) = SQLITE_INTEGER);
+    rc := fts3DeleteByRowid(p, PPsqlite3_value(apVal)[0], @nChng, aSzDel);
+  end;
+
+  if (nArg > 1) and (rc = SQLITE_OK) then begin
+    iLangid := sqlite3_value_int(PPsqlite3_value(apVal)[2 + p^.nColumn + 2]);
+    if bInsertDone = 0 then begin
+      rc := fts3InsertData(p, apVal, pRowid);
+      if (rc = SQLITE_CONSTRAINT) and (p^.zContentTbl = nil) then
+        rc := FTS_CORRUPT_VTAB;
+    end;
+    if rc = SQLITE_OK then rc := fts3PendingTermsDocid(p, 0, iLangid, pRowid^);
+    if rc = SQLITE_OK then begin
+      Assert(p^.iPrevDocid = pRowid^);
+      rc := fts3InsertTerms(p, iLangid, apVal, aSzIns);
+    end;
+    if p^.bHasDocsize <> 0 then fts3InsertDocsize(@rc, p, aSzIns);
+    Inc(nChng);
+  end;
+
+  if p^.bFts4 <> 0 then fts3UpdateDocTotals(@rc, p, aSzIns, aSzDel, nChng);
+
+update_out:
+  sqlite3_free(aSzDel);
+  sqlite3Fts3SegmentsClose(p);
+  Result := rc;
+end;
+
+{ fts3_write.c:5839..5854 — sqlite3Fts3Optimize. }
+function sqlite3Fts3Optimize(p: PFts3Table): cint;
+var
+  rc, rc2: cint;
+begin
+  rc := sqlite3_exec(p^.db, PAnsiChar('SAVEPOINT fts3'), nil, nil, nil);
+  if rc = SQLITE_OK then begin
+    rc := fts3DoOptimize(p, 1);
+    if (rc = SQLITE_OK) or (rc = SQLITE_DONE) then begin
+      rc2 := sqlite3_exec(p^.db, PAnsiChar('RELEASE fts3'), nil, nil, nil);
+      if rc2 <> SQLITE_OK then rc := rc2;
+    end else begin
+      sqlite3_exec(p^.db, PAnsiChar('ROLLBACK TO fts3'), nil, nil, nil);
+      sqlite3_exec(p^.db, PAnsiChar('RELEASE fts3'), nil, nil, nil);
+    end;
+  end;
+  sqlite3Fts3SegmentsClose(p);
+  Result := rc;
+end;
+
+{ ===================================================================== }
+{ CROSS-BOUNDARY STUB BODIES for 6.40.1.k (fts3.c).  These satisfy the    }
+{ forward declarations above so .j links standalone.  TODO(6.40.1.k):     }
+{ replace each with the faithful fts3.c port and delete the stub.         }
+{ ===================================================================== }
+
+function sqlite3Fts3SegReaderCursor(p: PFts3Table; iLangid, iIndex,
+  iLevel: cint; const zTerm: PChar; nTerm, isPrefix, isScan: cint;
+  pCsr: PFts3MultiSegReader): cint;
+begin
+  { TODO(6.40.1.k): fts3.c:3038 fts3SegReaderCursor — opens seg-readers over
+    pending + on-disk segdir rows.  Returns ERROR until .k lands. }
+  if (p = nil) or (iLangid = 0) or (iIndex = 0) or (iLevel = 0)
+   or (zTerm = nil) or (nTerm = 0) or (isPrefix = 0) or (isScan = 0)
+   or (pCsr = nil) then ;  { unused-param silence }
+  Result := SQLITE_ERROR;
+end;
+
+procedure sqlite3Fts3DoclistPrev(bDescIdx: cint; aDoclist: PChar;
+  nDoclist: cint; ppIter: PPChar; piDocid: Psqlite3_int64;
+  pnList: Pcint; pbEof: PByte);
+begin
+  { TODO(6.40.1.k): fts3.c sqlite3Fts3DoclistPrev — reverse-iterate a doclist. }
+  if (bDescIdx = 0) or (aDoclist = nil) or (nDoclist = 0) or (ppIter = nil)
+   or (piDocid = nil) or (pnList = nil) then ;
+  pbEof^ := 1;
+end;
+
+function sqlite3Fts3FirstFilter(iDelta: sqlite3_int64; pList: PChar;
+  nList: cint; pOut: PChar): cint;
+begin
+  { TODO(6.40.1.k): fts3.c:2760 sqlite3Fts3FirstFilter — keep only position-0
+    entries of a doclist (FTS3_SEGMENT_FIRST). }
+  if (iDelta = 0) or (pList = nil) or (nList = 0) or (pOut = nil) then ;
+  Result := 0;
+end;
+
+procedure sqlite3Fts3CreateStatTable(pRc: Pcint; p: PFts3Table);
+begin
+  { TODO(6.40.1.k): fts3.c:665 sqlite3Fts3CreateStatTable — CREATE the %_stat
+    shadow table on demand and set p->bHasStat. }
+  if p = nil then ;
+  if pRc^ = SQLITE_OK then pRc^ := SQLITE_ERROR;
+end;
 
 { ===================================================================== }
 { 6.40.1.g down-payment on 6.40.1.o — minimal sqlite3Fts3Init.           }
