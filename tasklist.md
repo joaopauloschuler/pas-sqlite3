@@ -172,7 +172,7 @@ function libc_memcpy(dst, src: Pointer; n: NativeUInt): Pointer; cdecl; external
 procedure libc_memset(dst: Pointer; c: cint; n: NativeUInt); cdecl; external 'c' name 'memset';
 function libc_strncmp(a, b: PChar; n: NativeUInt): cint; cdecl; external 'c' name 'strncmp';
 function libc_memcmp(a, b: Pointer; n: NativeUInt): cint; cdecl; external 'c' name 'memcmp';
-  ```
+    ```
   - **NOTE:** `fts3_icu.c` (262L) stays unported — oracle lacks `SQLITE_ENABLE_ICU` (see 6.40.2); the `icu` tokenizer arm in `sqlite3Fts3Init` is `#ifdef SQLITE_ENABLE_ICU` and must be omitted to match.
 - [X] **6.40.2** ICU extension — oracle lacks SQLITE_ENABLE_ICU (no icu in pragma_compile_options), so pinned `sqlite_options(icu)=0` + `icu_collations=0` in tester_min.tcl:364; icu.test now skips via its `ifcapable !icu&&!icu_collations` gate (PASS 0/22, no pas-strict regression).
 - [X] **6.40.3** preupdate_hook — HARNESS, not engine: oracle build LACKS `SQLITE_ENABLE_PREUPDATE_HOOK` (verified `pragma_compile_options`), so implementing+enabling it would diverge from the oracle. Faithful fix = skip cleanly to match oracle: bind2/sessionfault already do via upstream `ifcapable !preupdate` (cap pinned 0 in tester_min.tcl); local port preupdate.test had no guard → fixed with a runtime probe `if {[catch {db preupdate count}]} {finish_test;return}` (skips on default lib, runs full 52-subtest assertions on a PREUPDATE=1 lib). preupdate.test FAIL→PASS, promoted pas-soft→pas-strict in STATUS.txt; no pas-strict regression (src/tests/tcl/preupdate.test:55-65).
