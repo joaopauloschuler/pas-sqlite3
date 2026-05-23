@@ -78,6 +78,7 @@ type
 
   PPsqlite3_tokenizer        = ^Psqlite3_tokenizer;
   PPsqlite3_tokenizer_cursor = ^Psqlite3_tokenizer_cursor;
+  PPsqlite3_tokenizer_module = ^Psqlite3_tokenizer_module;
 
   { fts3_tokenizer.h:76..80 — xCreate.
     int (*xCreate)(int argc, const char *const*argv,
@@ -196,6 +197,18 @@ function fts3HashData(const E: PFts3HashElem): Pointer; inline;
 function fts3HashKey(const E: PFts3HashElem): Pointer; inline;
 function fts3HashKeysize(const E: PFts3HashElem): cint; inline;
 function fts3HashCount(const H: PFts3Hash): cint; inline;
+
+{ --------------------------------------------------------------------- }
+{ 6.40.1.c — fts3_tokenizer1.c:228..232 — the built-in "simple"         }
+{ tokenizer module entry point.                                          }
+{ --------------------------------------------------------------------- }
+procedure sqlite3Fts3SimpleTokenizerModule(ppModule: PPsqlite3_tokenizer_module);
+
+{ --------------------------------------------------------------------- }
+{ 6.40.1.d — fts3_porter.c:656..660 — the "porter" stemmer tokenizer    }
+{ module entry point.                                                    }
+{ --------------------------------------------------------------------- }
+procedure sqlite3Fts3PorterTokenizerModule(ppModule: PPsqlite3_tokenizer_module);
 
 implementation
 
@@ -582,6 +595,740 @@ end;
 function fts3HashCount(const H: PFts3Hash): cint;
 begin
   Result := H^.count;
+end;
+
+{ ===================================================================== }
+{ 6.40.1.c — fts3_tokenizer1.c — the built-in "simple" tokenizer.        }
+{ ===================================================================== }
+
+type
+  { fts3_tokenizer1.c:35..38 — struct simple_tokenizer.
+    Derives from sqlite3_tokenizer; appends a 128-byte ASCII delimiter
+    flag array.  delim[c] is non-zero when c is a delimiter. }
+  Psimple_tokenizer = ^Tsimple_tokenizer;
+  Tsimple_tokenizer = record
+    base  : Tsqlite3_tokenizer;
+    delim : array[0..127] of cchar;   { flag ASCII delimiters }
+  end;
+
+  { fts3_tokenizer1.c:40..48 — struct simple_tokenizer_cursor. }
+  Psimple_tokenizer_cursor = ^Tsimple_tokenizer_cursor;
+  Tsimple_tokenizer_cursor = record
+    base            : Tsqlite3_tokenizer_cursor;
+    pInput          : PChar;  { input we are tokenizing }
+    nBytes          : cint;   { size of the input }
+    iOffset         : cint;   { current position in pInput }
+    iToken          : cint;   { index of next token to be returned }
+    pToken          : PChar;  { storage for current token }
+    nTokenAllocated : cint;   { space allocated to zToken buffer }
+  end;
+
+{ fts3_tokenizer1.c:51..53 — simpleDelim. }
+function simpleDelim(t: Psimple_tokenizer; c: Byte): cint;
+begin
+  if (c < $80) and (t^.delim[c] <> 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ fts3_tokenizer1.c:54..56 — fts3_isalnum. }
+function fts3_isalnum(x: cint): cint;
+begin
+  if ((x >= Ord('0')) and (x <= Ord('9')))
+  or ((x >= Ord('A')) and (x <= Ord('Z')))
+  or ((x >= Ord('a')) and (x <= Ord('z'))) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ fts3_tokenizer1.c:61..97 — simpleCreate. }
+function simpleCreate(argc: cint; const argv: PPChar;
+  ppTokenizer: PPsqlite3_tokenizer): cint; cdecl;
+var
+  t  : Psimple_tokenizer;
+  i, n : cint;
+  ch : Byte;
+  pArg : PChar;
+begin
+  t := Psimple_tokenizer(sqlite3_malloc(i32(SizeOf(Tsimple_tokenizer))));
+  if t = nil then Exit(SQLITE_NOMEM);
+  libc_memset(t, 0, NativeUInt(SizeOf(Tsimple_tokenizer)));
+
+  { TODO(shess) Delimiters need to remain the same from run to run, else
+    we need to reindex. }
+  if argc > 1 then begin
+    pArg := PPChar(argv)[1];
+    n := cint(libc_strlen(pArg));
+    i := 0;
+    while i < n do begin
+      ch := Byte(pArg[i]);
+      { We explicitly don't support UTF-8 delimiters for now. }
+      if ch >= $80 then begin
+        sqlite3_free(t);
+        Exit(SQLITE_ERROR);
+      end;
+      t^.delim[ch] := 1;
+      Inc(i);
+    end;
+  end else begin
+    { Mark non-alphanumeric ASCII characters as delimiters }
+    i := 1;
+    while i < $80 do begin
+      if fts3_isalnum(i) = 0 then
+        t^.delim[i] := cchar(-1)
+      else
+        t^.delim[i] := 0;
+      Inc(i);
+    end;
+  end;
+
+  ppTokenizer^ := @t^.base;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenizer1.c:102..105 — simpleDestroy. }
+function simpleDestroy(pTokenizer: Psqlite3_tokenizer): cint; cdecl;
+begin
+  sqlite3_free(pTokenizer);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenizer1.c:113..140 — simpleOpen. }
+function simpleOpen(pTokenizer: Psqlite3_tokenizer; const pInput: PChar;
+  nBytes: cint; ppCursor: PPsqlite3_tokenizer_cursor): cint; cdecl;
+var
+  c: Psimple_tokenizer_cursor;
+begin
+  { UNUSED_PARAMETER(pTokenizer) }
+  c := Psimple_tokenizer_cursor(sqlite3_malloc(i32(SizeOf(Tsimple_tokenizer_cursor))));
+  if c = nil then Exit(SQLITE_NOMEM);
+
+  c^.pInput := pInput;
+  if pInput = nil then
+    c^.nBytes := 0
+  else if nBytes < 0 then
+    c^.nBytes := cint(libc_strlen(pInput))
+  else
+    c^.nBytes := nBytes;
+  c^.iOffset := 0;                 { start tokenizing at the beginning }
+  c^.iToken := 0;
+  c^.pToken := nil;                { no space allocated, yet. }
+  c^.nTokenAllocated := 0;
+
+  ppCursor^ := @c^.base;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenizer1.c:146..151 — simpleClose. }
+function simpleClose(pCursor: Psqlite3_tokenizer_cursor): cint; cdecl;
+var
+  c: Psimple_tokenizer_cursor;
+begin
+  c := Psimple_tokenizer_cursor(pCursor);
+  sqlite3_free(c^.pToken);
+  sqlite3_free(c);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_tokenizer1.c:157..209 — simpleNext. }
+function simpleNext(pCursor: Psqlite3_tokenizer_cursor;
+  ppToken: PPChar; pnBytes: Pcint;
+  piStartOffset: Pcint; piEndOffset: Pcint; piPosition: Pcint): cint; cdecl;
+var
+  c: Psimple_tokenizer_cursor;
+  t: Psimple_tokenizer;
+  p: PByte;
+  iStartOffset, i, n: cint;
+  pNew: PChar;
+  ch: Byte;
+begin
+  c := Psimple_tokenizer_cursor(pCursor);
+  t := Psimple_tokenizer(pCursor^.pTokenizer);
+  p := PByte(c^.pInput);
+
+  while c^.iOffset < c^.nBytes do begin
+    { Scan past delimiter characters }
+    while (c^.iOffset < c^.nBytes) and (simpleDelim(t, p[c^.iOffset]) <> 0) do
+      Inc(c^.iOffset);
+
+    { Count non-delimiter characters. }
+    iStartOffset := c^.iOffset;
+    while (c^.iOffset < c^.nBytes) and (simpleDelim(t, p[c^.iOffset]) = 0) do
+      Inc(c^.iOffset);
+
+    if c^.iOffset > iStartOffset then begin
+      n := c^.iOffset - iStartOffset;
+      if n > c^.nTokenAllocated then begin
+        c^.nTokenAllocated := n + 20;
+        pNew := PChar(sqlite3_realloc64(c^.pToken, u64(c^.nTokenAllocated)));
+        if pNew = nil then Exit(SQLITE_NOMEM);
+        c^.pToken := pNew;
+      end;
+      for i := 0 to n - 1 do begin
+        { TODO(shess) UTF-8 case-insensitivity. }
+        ch := p[iStartOffset + i];
+        if (ch >= Ord('A')) and (ch <= Ord('Z')) then
+          c^.pToken[i] := Chr(ch - Ord('A') + Ord('a'))
+        else
+          c^.pToken[i] := Chr(ch);
+      end;
+      ppToken^ := c^.pToken;
+      pnBytes^ := n;
+      piStartOffset^ := iStartOffset;
+      piEndOffset^ := c^.iOffset;
+      piPosition^ := c^.iToken;
+      Inc(c^.iToken);
+      Exit(SQLITE_OK);
+    end;
+  end;
+  Result := SQLITE_DONE;
+end;
+
+{ fts3_tokenizer1.c:214..222 — the static simpleTokenizerModule record. }
+const
+  simpleTokenizerModule: Tsqlite3_tokenizer_module = (
+    iVersion    : 0;
+    xCreate     : @simpleCreate;
+    xDestroy    : @simpleDestroy;
+    xOpen       : @simpleOpen;
+    xClose      : @simpleClose;
+    xNext       : @simpleNext;
+    xLanguageid : nil;
+  );
+
+{ fts3_tokenizer1.c:228..232 — sqlite3Fts3SimpleTokenizerModule. }
+procedure sqlite3Fts3SimpleTokenizerModule(ppModule: PPsqlite3_tokenizer_module);
+begin
+  ppModule^ := @simpleTokenizerModule;
+end;
+
+{ ===================================================================== }
+{ 6.40.1.d — fts3_porter.c — the "porter" stemmer tokenizer.            }
+{ ===================================================================== }
+
+type
+  { fts3_porter.c:38..40 — struct porter_tokenizer. }
+  Pporter_tokenizer = ^Tporter_tokenizer;
+  Tporter_tokenizer = record
+    base : Tsqlite3_tokenizer;   { Base class }
+  end;
+
+  { fts3_porter.c:45..53 — struct porter_tokenizer_cursor. }
+  Pporter_tokenizer_cursor = ^Tporter_tokenizer_cursor;
+  Tporter_tokenizer_cursor = record
+    base       : Tsqlite3_tokenizer_cursor;
+    zInput     : PChar;   { input we are tokenizing }
+    nInput     : cint;    { size of the input }
+    iOffset    : cint;    { current position in zInput }
+    iToken     : cint;    { index of next token to be returned }
+    zToken     : PChar;   { storage for current token }
+    nAllocated : cint;    { space allocated to zToken buffer }
+  end;
+
+{ fts3_porter.c:59..73 — porterCreate. }
+function porterCreate(argc: cint; const argv: PPChar;
+  ppTokenizer: PPsqlite3_tokenizer): cint; cdecl;
+var
+  t: Pporter_tokenizer;
+begin
+  { UNUSED_PARAMETER(argc); UNUSED_PARAMETER(argv) }
+  t := Pporter_tokenizer(sqlite3_malloc(i32(SizeOf(Tporter_tokenizer))));
+  if t = nil then Exit(SQLITE_NOMEM);
+  libc_memset(t, 0, NativeUInt(SizeOf(Tporter_tokenizer)));
+  ppTokenizer^ := @t^.base;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_porter.c:78..81 — porterDestroy. }
+function porterDestroy(pTokenizer: Psqlite3_tokenizer): cint; cdecl;
+begin
+  sqlite3_free(pTokenizer);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_porter.c:89..116 — porterOpen. }
+function porterOpen(pTokenizer: Psqlite3_tokenizer; const zInput: PChar;
+  nInput: cint; ppCursor: PPsqlite3_tokenizer_cursor): cint; cdecl;
+var
+  c: Pporter_tokenizer_cursor;
+begin
+  { UNUSED_PARAMETER(pTokenizer) }
+  c := Pporter_tokenizer_cursor(sqlite3_malloc(i32(SizeOf(Tporter_tokenizer_cursor))));
+  if c = nil then Exit(SQLITE_NOMEM);
+
+  c^.zInput := zInput;
+  if zInput = nil then
+    c^.nInput := 0
+  else if nInput < 0 then
+    c^.nInput := cint(libc_strlen(zInput))
+  else
+    c^.nInput := nInput;
+  c^.iOffset := 0;                 { start tokenizing at the beginning }
+  c^.iToken := 0;
+  c^.zToken := nil;                { no space allocated, yet. }
+  c^.nAllocated := 0;
+
+  ppCursor^ := @c^.base;
+  Result := SQLITE_OK;
+end;
+
+{ fts3_porter.c:122..127 — porterClose. }
+function porterClose(pCursor: Psqlite3_tokenizer_cursor): cint; cdecl;
+var
+  c: Pporter_tokenizer_cursor;
+begin
+  c := Pporter_tokenizer_cursor(pCursor);
+  sqlite3_free(c^.zToken);
+  sqlite3_free(c);
+  Result := SQLITE_OK;
+end;
+
+{ fts3_porter.c:131..134 — Vowel or consonant table.
+  Indexed by letter-'a' (0..25); value 0=vowel,1=consonant,2='y'. }
+const
+  cType: array[0..25] of cint = (
+     0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0,
+     1, 1, 1, 2, 1
+  );
+
+{ Forward declaration (fts3_porter.c:149: static int isVowel(const char*)). }
+function isVowel(const z: PChar): cint; forward;
+
+{ fts3_porter.c:150..158 — isConsonant.  z[] is in reverse order. }
+function isConsonant(const z: PChar): cint;
+var
+  j: cint;
+  x: Char;
+begin
+  x := z^;
+  if x = #0 then Exit(0);
+  Assert((x >= 'a') and (x <= 'z'));
+  j := cType[Ord(x) - Ord('a')];
+  if j < 2 then Exit(j);
+  if (z[1] = #0) or (isVowel(z + 1) <> 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ fts3_porter.c:159..167 — isVowel. }
+function isVowel(const z: PChar): cint;
+var
+  j: cint;
+  x: Char;
+begin
+  x := z^;
+  if x = #0 then Exit(0);
+  Assert((x >= 'a') and (x <= 'z'));
+  j := cType[Ord(x) - Ord('a')];
+  if j < 2 then Exit(1 - j);
+  Result := isConsonant(z + 1);
+end;
+
+{ fts3_porter.c:188..193 — m_gt_0: true if m-value is 1 or more. }
+function m_gt_0(const z: PChar): cint;
+var
+  p: PChar;
+begin
+  p := z;
+  while isVowel(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(0);
+  while isConsonant(p) <> 0 do Inc(p);
+  if p^ <> #0 then Result := 1 else Result := 0;
+end;
+
+{ fts3_porter.c:198..207 — m_eq_1: true if m-value is exactly 1. }
+function m_eq_1(const z: PChar): cint;
+var
+  p: PChar;
+begin
+  p := z;
+  while isVowel(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(0);
+  while isConsonant(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(0);
+  while isVowel(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(1);
+  while isConsonant(p) <> 0 do Inc(p);
+  if p^ = #0 then Result := 1 else Result := 0;
+end;
+
+{ fts3_porter.c:212..221 — m_gt_1: true if m-value is greater than 1. }
+function m_gt_1(const z: PChar): cint;
+var
+  p: PChar;
+begin
+  p := z;
+  while isVowel(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(0);
+  while isConsonant(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(0);
+  while isVowel(p) <> 0 do Inc(p);
+  if p^ = #0 then Exit(0);
+  while isConsonant(p) <> 0 do Inc(p);
+  if p^ <> #0 then Result := 1 else Result := 0;
+end;
+
+{ fts3_porter.c:226..229 — hasVowel. }
+function hasVowel(const z: PChar): cint;
+var
+  p: PChar;
+begin
+  p := z;
+  while isConsonant(p) <> 0 do Inc(p);
+  if p^ <> #0 then Result := 1 else Result := 0;
+end;
+
+{ fts3_porter.c:237..239 — doubleConsonant.  Text is reversed. }
+function doubleConsonant(const z: PChar): cint;
+begin
+  if (isConsonant(z) <> 0) and (z[0] = z[1]) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ fts3_porter.c:249..255 — star_oh.  Word is reversed. }
+function star_oh(const z: PChar): cint;
+begin
+  if (isConsonant(z) <> 0)
+  and (z[0] <> 'w') and (z[0] <> 'x') and (z[0] <> 'y')
+  and (isVowel(z + 1) <> 0)
+  and (isConsonant(z + 2) <> 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+type
+  { fts3_porter.c:273 — int (*xCond)(const char*). }
+  TPorterCond = function(const z: PChar): cint;
+
+{ fts3_porter.c:269..284 — stem.  *pz and zFrom are reversed; zTo is normal.
+  Returns TRUE if zFrom matches (even when xCond fails and no substitution
+  occurs). }
+function stem(pz: PPChar; const zFrom: PChar; const zTo: PChar;
+  xCond: TPorterCond): cint;
+var
+  z, pF, pT: PChar;
+begin
+  z := pz^;
+  pF := zFrom;
+  while (pF^ <> #0) and (pF^ = z^) do begin
+    Inc(z);
+    Inc(pF);
+  end;
+  if pF^ <> #0 then Exit(0);
+  if (xCond <> nil) and (xCond(z) = 0) then Exit(1);
+  pT := zTo;
+  while pT^ <> #0 do begin
+    Dec(z);
+    z^ := pT^;
+    Inc(pT);
+  end;
+  pz^ := z;
+  Result := 1;
+end;
+
+{ fts3_porter.c:294..315 — copy_stemmer.  Fallback US-ASCII case-fold copy
+  with long-word truncation. }
+procedure copy_stemmer(const zIn: PChar; nIn: cint; zOut: PChar; pnOut: Pcint);
+var
+  i, mx, j: cint;
+  hasDigit: cint;
+  c: Char;
+begin
+  hasDigit := 0;
+  for i := 0 to nIn - 1 do begin
+    c := zIn[i];
+    if (c >= 'A') and (c <= 'Z') then
+      zOut[i] := Chr(Ord(c) - Ord('A') + Ord('a'))
+    else begin
+      if (c >= '0') and (c <= '9') then hasDigit := 1;
+      zOut[i] := c;
+    end;
+  end;
+  if hasDigit <> 0 then mx := 3 else mx := 10;
+  i := nIn;
+  if nIn > mx * 2 then begin
+    j := mx;
+    i := nIn - mx;
+    while i < nIn do begin
+      zOut[j] := zOut[i];
+      Inc(i);
+      Inc(j);
+    end;
+    i := j;
+  end;
+  zOut[i] := #0;
+  pnOut^ := i;
+end;
+
+{ fts3_porter.c:341..572 — porter_stemmer. }
+procedure porter_stemmer(const zIn: PChar; nIn: cint; zOut: PChar; pnOut: Pcint);
+var
+  i, j: cint;
+  zReverse: array[0..27] of Char;
+  z, z2: PChar;
+  c: Char;
+begin
+  if (nIn < 3) or (nIn >= cint(SizeOf(zReverse)) - 7) then begin
+    { Too big or too small for the porter stemmer; fall back to copy. }
+    copy_stemmer(zIn, nIn, zOut, pnOut);
+    Exit;
+  end;
+  i := 0;
+  j := cint(SizeOf(zReverse)) - 6;
+  while i < nIn do begin
+    c := zIn[i];
+    if (c >= 'A') and (c <= 'Z') then
+      zReverse[j] := Chr(Ord(c) + Ord('a') - Ord('A'))
+    else if (c >= 'a') and (c <= 'z') then
+      zReverse[j] := c
+    else begin
+      { A character not in [a-zA-Z] → fall back to the copy stemmer. }
+      copy_stemmer(zIn, nIn, zOut, pnOut);
+      Exit;
+    end;
+    Inc(i);
+    Dec(j);
+  end;
+  libc_memset(@zReverse[SizeOf(zReverse) - 5], 0, 5);
+  z := @zReverse[j + 1];
+
+  { Step 1a }
+  if z[0] = 's' then begin
+    if (stem(@z, 'sess', 'ss', nil) = 0)
+    and (stem(@z, 'sei', 'i', nil) = 0)
+    and (stem(@z, 'ss', 'ss', nil) = 0) then
+      Inc(z);
+  end;
+
+  { Step 1b }
+  z2 := z;
+  if stem(@z, 'dee', 'ee', @m_gt_0) <> 0 then begin
+    { Do nothing.  The work was all in the test }
+  end else if ((stem(@z, 'gni', '', @hasVowel) <> 0)
+            or (stem(@z, 'de', '', @hasVowel) <> 0))
+           and (z <> z2) then begin
+    if (stem(@z, 'ta', 'ate', nil) <> 0)
+    or (stem(@z, 'lb', 'ble', nil) <> 0)
+    or (stem(@z, 'zi', 'ize', nil) <> 0) then begin
+      { Do nothing.  The work was all in the test }
+    end else if (doubleConsonant(z) <> 0)
+            and ((z^ <> 'l') and (z^ <> 's') and (z^ <> 'z')) then
+      Inc(z)
+    else if (m_eq_1(z) <> 0) and (star_oh(z) <> 0) then begin
+      Dec(z);
+      z^ := 'e';
+    end;
+  end;
+
+  { Step 1c }
+  if (z[0] = 'y') and (hasVowel(z + 1) <> 0) then
+    z[0] := 'i';
+
+  { Step 2 }
+  case z[1] of
+   'a':
+     if stem(@z, 'lanoita', 'ate', @m_gt_0) = 0 then
+       stem(@z, 'lanoit', 'tion', @m_gt_0);
+   'c':
+     if stem(@z, 'icne', 'ence', @m_gt_0) = 0 then
+       stem(@z, 'icna', 'ance', @m_gt_0);
+   'e':
+     stem(@z, 'rezi', 'ize', @m_gt_0);
+   'g':
+     stem(@z, 'igol', 'log', @m_gt_0);
+   'l':
+     if (stem(@z, 'ilb', 'ble', @m_gt_0) = 0)
+     and (stem(@z, 'illa', 'al', @m_gt_0) = 0)
+     and (stem(@z, 'iltne', 'ent', @m_gt_0) = 0)
+     and (stem(@z, 'ile', 'e', @m_gt_0) = 0) then
+       stem(@z, 'ilsuo', 'ous', @m_gt_0);
+   'o':
+     if (stem(@z, 'noitazi', 'ize', @m_gt_0) = 0)
+     and (stem(@z, 'noita', 'ate', @m_gt_0) = 0) then
+       stem(@z, 'rota', 'ate', @m_gt_0);
+   's':
+     if (stem(@z, 'msila', 'al', @m_gt_0) = 0)
+     and (stem(@z, 'ssenevi', 'ive', @m_gt_0) = 0)
+     and (stem(@z, 'ssenluf', 'ful', @m_gt_0) = 0) then
+       stem(@z, 'ssensuo', 'ous', @m_gt_0);
+   't':
+     if (stem(@z, 'itila', 'al', @m_gt_0) = 0)
+     and (stem(@z, 'itivi', 'ive', @m_gt_0) = 0) then
+       stem(@z, 'itilib', 'ble', @m_gt_0);
+  end;
+
+  { Step 3 }
+  case z[0] of
+   'e':
+     if (stem(@z, 'etaci', 'ic', @m_gt_0) = 0)
+     and (stem(@z, 'evita', '', @m_gt_0) = 0) then
+       stem(@z, 'ezila', 'al', @m_gt_0);
+   'i':
+     stem(@z, 'itici', 'ic', @m_gt_0);
+   'l':
+     if stem(@z, 'laci', 'ic', @m_gt_0) = 0 then
+       stem(@z, 'luf', '', @m_gt_0);
+   's':
+     stem(@z, 'ssen', '', @m_gt_0);
+  end;
+
+  { Step 4 }
+  case z[1] of
+   'a':
+     if (z[0] = 'l') and (m_gt_1(z + 2) <> 0) then
+       Inc(z, 2);
+   'c':
+     if (z[0] = 'e') and (z[2] = 'n')
+     and ((z[3] = 'a') or (z[3] = 'e')) and (m_gt_1(z + 4) <> 0) then
+       Inc(z, 4);
+   'e':
+     if (z[0] = 'r') and (m_gt_1(z + 2) <> 0) then
+       Inc(z, 2);
+   'i':
+     if (z[0] = 'c') and (m_gt_1(z + 2) <> 0) then
+       Inc(z, 2);
+   'l':
+     if (z[0] = 'e') and (z[2] = 'b')
+     and ((z[3] = 'a') or (z[3] = 'i')) and (m_gt_1(z + 4) <> 0) then
+       Inc(z, 4);
+   'n':
+     if z[0] = 't' then begin
+       if z[2] = 'a' then begin
+         if m_gt_1(z + 3) <> 0 then
+           Inc(z, 3);
+       end else if z[2] = 'e' then begin
+         if (stem(@z, 'tneme', '', @m_gt_1) = 0)
+         and (stem(@z, 'tnem', '', @m_gt_1) = 0) then
+           stem(@z, 'tne', '', @m_gt_1);
+       end;
+     end;
+   'o':
+     if z[0] = 'u' then begin
+       if m_gt_1(z + 2) <> 0 then
+         Inc(z, 2);
+     end else if (z[3] = 's') or (z[3] = 't') then
+       stem(@z, 'noi', '', @m_gt_1);
+   's':
+     if (z[0] = 'm') and (z[2] = 'i') and (m_gt_1(z + 3) <> 0) then
+       Inc(z, 3);
+   't':
+     if stem(@z, 'eta', '', @m_gt_1) = 0 then
+       stem(@z, 'iti', '', @m_gt_1);
+   'u':
+     if (z[0] = 's') and (z[2] = 'o') and (m_gt_1(z + 3) <> 0) then
+       Inc(z, 3);
+   'v', 'z':
+     if (z[0] = 'e') and (z[2] = 'i') and (m_gt_1(z + 3) <> 0) then
+       Inc(z, 3);
+  end;
+
+  { Step 5a }
+  if z[0] = 'e' then begin
+    if m_gt_1(z + 1) <> 0 then
+      Inc(z)
+    else if (m_eq_1(z + 1) <> 0) and (star_oh(z + 1) = 0) then
+      Inc(z);
+  end;
+
+  { Step 5b }
+  if (m_gt_1(z) <> 0) and (z[0] = 'l') and (z[1] = 'l') then
+    Inc(z);
+
+  { z[] is now the stemmed word in reverse order.  Flip it back. }
+  i := cint(libc_strlen(z));
+  pnOut^ := i;
+  zOut[i] := #0;
+  while z^ <> #0 do begin
+    Dec(i);
+    zOut[i] := z^;
+    Inc(z);
+  end;
+end;
+
+{ fts3_porter.c:580..587 — porterIdChar table (indexed by ch-0x30). }
+const
+  porterIdChar: array[0..79] of cchar = (
+{ x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 xA xB xC xD xE xF }
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,  { 3x }
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  { 4x }
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1,  { 5x }
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  { 6x }
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0   { 7x }
+  );
+
+{ fts3_porter.c:588 — #define isDelim(C).  Ported as a helper taking the
+  raw byte; C: ((ch=C)&0x80)==0 && (ch<0x30 || !porterIdChar[ch-0x30]). }
+function porterIsDelim(ch: Byte): Boolean; inline;
+begin
+  Result := ((ch and $80) = 0)
+        and ((ch < $30) or (porterIdChar[ch - $30] = 0));
+end;
+
+{ fts3_porter.c:594..637 — porterNext. }
+function porterNext(pCursor: Psqlite3_tokenizer_cursor;
+  pzToken: PPChar; pnBytes: Pcint;
+  piStartOffset: Pcint; piEndOffset: Pcint; piPosition: Pcint): cint; cdecl;
+var
+  c: Pporter_tokenizer_cursor;
+  z: PChar;
+  iStartOffset, n: cint;
+  pNew: PChar;
+begin
+  c := Pporter_tokenizer_cursor(pCursor);
+  z := c^.zInput;
+
+  while c^.iOffset < c^.nInput do begin
+    { Scan past delimiter characters }
+    while (c^.iOffset < c^.nInput) and porterIsDelim(Byte(z[c^.iOffset])) do
+      Inc(c^.iOffset);
+
+    { Count non-delimiter characters. }
+    iStartOffset := c^.iOffset;
+    while (c^.iOffset < c^.nInput) and (not porterIsDelim(Byte(z[c^.iOffset]))) do
+      Inc(c^.iOffset);
+
+    if c^.iOffset > iStartOffset then begin
+      n := c^.iOffset - iStartOffset;
+      if n > c^.nAllocated then begin
+        c^.nAllocated := n + 20;
+        pNew := PChar(sqlite3_realloc64(c^.zToken, u64(c^.nAllocated)));
+        if pNew = nil then Exit(SQLITE_NOMEM);
+        c^.zToken := pNew;
+      end;
+      porter_stemmer(@z[iStartOffset], n, c^.zToken, pnBytes);
+      pzToken^ := c^.zToken;
+      piStartOffset^ := iStartOffset;
+      piEndOffset^ := c^.iOffset;
+      piPosition^ := c^.iToken;
+      Inc(c^.iToken);
+      Exit(SQLITE_OK);
+    end;
+  end;
+  Result := SQLITE_DONE;
+end;
+
+{ fts3_porter.c:642..650 — the static porterTokenizerModule record. }
+const
+  porterTokenizerModule: Tsqlite3_tokenizer_module = (
+    iVersion    : 0;
+    xCreate     : @porterCreate;
+    xDestroy    : @porterDestroy;
+    xOpen       : @porterOpen;
+    xClose      : @porterClose;
+    xNext       : @porterNext;
+    xLanguageid : nil;
+  );
+
+{ fts3_porter.c:656..660 — sqlite3Fts3PorterTokenizerModule. }
+procedure sqlite3Fts3PorterTokenizerModule(ppModule: PPsqlite3_tokenizer_module);
+begin
+  ppModule^ := @porterTokenizerModule;
 end;
 
 end.
