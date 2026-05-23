@@ -788,9 +788,31 @@ implementation
 { libc bindings (match the amatch/fuzzer pattern; avoids depending on a
   csize_t alias from elsewhere).
   6.40.1.p — strlen/memcpy/memset/strncmp/memcmp replaced with FPC RTL
-  primitives (StrLen / Move / FillChar / CompareByte). strcmp + atoi remain. }
-function libc_strcmp(a, b: PChar): cint; cdecl; external 'c' name 'strcmp';
-function libc_atoi(s: PChar): cint; cdecl; external 'c' name 'atoi';
+  primitives (StrLen / Move / FillChar / CompareByte).
+  6.40.1.p.2.2 — strcmp→StrComp (Strings RTL); atoi→fts3Atoi (C-exact). }
+
+{ C-exact atoi: skip leading whitespace, optional sign, decimal digits,
+  stop at first non-digit.  Matches libc atoi() semantics. }
+function fts3Atoi(s: PChar): cint;
+var
+  neg: Boolean;
+  v: cint;
+begin
+  v := 0;
+  neg := False;
+  if s <> nil then begin
+    while (s^ = ' ') or (s^ = #9) or (s^ = #10) or (s^ = #11)
+       or (s^ = #12) or (s^ = #13) do Inc(s);
+    if s^ = '-' then begin neg := True; Inc(s); end
+    else if s^ = '+' then Inc(s);
+    while (s^ >= '0') and (s^ <= '9') do begin
+      v := v * 10 + (Ord(s^) - Ord('0'));
+      Inc(s);
+    end;
+  end;
+  if neg then v := -v;
+  Result := v;
+end;
 
 { Function-pointer types for the key-class-selected hash/compare fns. }
 type
@@ -3070,7 +3092,7 @@ begin
   rc := queryTokenizer(db, 'nosuchtokenizer', @p2);
   Assert(rc = SQLITE_ERROR);
   Assert(p2 = nil);
-  Assert(libc_strcmp(sqlite3_errmsg(db),
+  Assert(StrComp(sqlite3_errmsg(db),
     'unknown tokenizer: nosuchtokenizer') = 0);
 
   { Test the storage function. }
@@ -8658,21 +8680,21 @@ begin
 {$IFDEF SQLITE_TEST}
   else begin
     if (nVal > 9) and (sqlite3_strnicmp(zVal, 'nodesize=', 9) = 0) then begin
-      v := libc_atoi(@zVal[9]);
+      v := fts3Atoi(@zVal[9]);
       if (v >= 24) and (v <= p^.nPgsz-35) then p^.nNodeSize := v;
       rc := SQLITE_OK;
     end else if (nVal > 11) and (sqlite3_strnicmp(zVal, 'maxpending=', 11) = 0) then
     begin
-      v := libc_atoi(@zVal[11]);
+      v := fts3Atoi(@zVal[11]);
       if (v >= 64) and (v <= FTS3_MAX_PENDING_DATA) then p^.nMaxPendingData := v;
       rc := SQLITE_OK;
     end else if (nVal > 21)
       and (sqlite3_strnicmp(zVal, 'test-no-incr-doclist=', 21) = 0) then begin
-      p^.bNoIncrDoclist := libc_atoi(@zVal[21]);
+      p^.bNoIncrDoclist := fts3Atoi(@zVal[21]);
       rc := SQLITE_OK;
     end else if (nVal > 11) and (sqlite3_strnicmp(zVal, 'mergecount=', 11) = 0) then
     begin
-      v := libc_atoi(@zVal[11]);
+      v := fts3Atoi(@zVal[11]);
       if (v >= 4) and (v <= FTS3_MERGE_COUNT) and ((v and 1) = 0) then
         p^.nMergeCount := v;
       rc := SQLITE_OK;
@@ -13168,7 +13190,7 @@ begin
   sInfo.nCol := pTab^.nColumn;
 
   if (pCsr^.pMIBuffer <> nil)
-    and (libc_strcmp(PMatchinfoBufferR(pCsr^.pMIBuffer)^.zMatchinfo, zArg) <> 0) then begin
+    and (StrComp(PMatchinfoBufferR(pCsr^.pMIBuffer)^.zMatchinfo, zArg) <> 0) then begin
     sqlite3Fts3MIBufferFree(PMatchinfoBufferR(pCsr^.pMIBuffer));
     pCsr^.pMIBuffer := nil;
   end;
@@ -13588,7 +13610,7 @@ var
   i: cint;
 begin
   for i := 0 to High(aOverload) do begin
-    if libc_strcmp(zName, aOverload[i].zName) = 0 then begin
+    if StrComp(zName, aOverload[i].zName) = 0 then begin
       case i of
         0: PPFtsScalarFn(pxFunc)^ := @fts3SnippetFunc;
         1: PPFtsScalarFn(pxFunc)^ := @fts3OffsetsFunc;
@@ -14373,7 +14395,7 @@ begin
   iIndex := 0;
   nArgc := argc;
   if nArgc = 5 then begin
-    iIndex := cint(libc_atoi(argv[4]));
+    iIndex := cint(fts3Atoi(argv[4]));
     Dec(nArgc);
   end;
 

@@ -46,11 +46,8 @@ function Sqlitetestfts3_Init(interp: PTclInterp): cint; cdecl;
 
 implementation
 
-{ libc bindings (mirrors the implementation-private set in passqlite3fts3.pas;
-  re-declared here because those are not exported from the unit's interface).
-  6.40.1.p — strlen/memset/memcmp now use FPC RTL (StrLen/FillChar/CompareByte);
-  strcmp retained. }
-function libc_strcmp(a, b: PChar): cint; cdecl; external 'c' name 'strcmp';
+{ 6.40.1.p — strlen/memset/memcmp use FPC RTL (StrLen/FillChar/CompareByte).
+  6.40.1.p.2.2 — strcmp→StrComp (Strings RTL). No libc string externals remain. }
 
 const
   NM_MAX_TOKEN = 12;
@@ -212,7 +209,7 @@ begin
   ii := 3;
   while ii < objc do begin
     zOpt := Tcl_GetStringFromObj(ObjElem(objv, ii), nil);
-    if libc_strcmp(zOpt, PChar('-phrasecountvar')) = 0 then
+    if StrComp(zOpt, PChar('-phrasecountvar')) = 0 then
       pPhrasecount := ObjElem(objv, ii+1)
     else begin
       Tcl_ResetResult(interp);
