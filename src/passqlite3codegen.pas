@@ -43048,6 +43048,16 @@ begin
         begin rowsOk := False; Break; end;
       if (pTmp^.pPrior <> nil) and (pTmp^.op <> TK_ALL) then
         begin rowsOk := False; Break; end;
+      { insert2-6.1 — a compound carrying an explicit ORDER BY (or
+        LIMIT/OFFSET) must NOT be flattened into a multi-row VALUES insert:
+        that drain emits each leaf's row straight into the INSERT in chain
+        order, dropping the sort.  C has no such fast path — every non-VALUES
+        SELECT source runs through the generic SRT_Coroutine arm
+        (insert.c:1139..1156 → sqlite3Select → multiSelectByMerge), which
+        accumulates rows into the ORDER BY sorter and drains them sorted to
+        the coroutine.  Reject the rows-chain so we fall through to that arm. }
+      if (pTmp^.pOrderBy <> nil) or (pTmp^.pLimit <> nil) then
+        begin rowsOk := False; Break; end;
       Inc(nRows);
       pTmp := pTmp^.pPrior;
     end;
