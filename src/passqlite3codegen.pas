@@ -49503,7 +49503,8 @@ begin
     pTab := sqlite3LocateTableItem(pParse, 0, SrcListItems(pTblName));
     if pTab = nil then goto exit_create_index;
     if (iDb = 1) and (db^.aDb[iDb].pSchema <> pTab^.pSchema) then begin
-      sqlite3ErrorMsg(pParse, 'cannot create a TEMP index on non-TEMP table');
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot create a TEMP index on non-TEMP table "%s"', [pTab^.zName]));
       goto exit_create_index;
     end;
     if (pTab^.tabFlags and TF_WithoutRowid) <> 0 then
