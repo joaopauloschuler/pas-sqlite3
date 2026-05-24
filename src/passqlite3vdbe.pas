@@ -13074,11 +13074,7 @@ begin
           pFrame^.aOp         := v^.aOp;
           pFrame^.nOp         := v^.nOp;
           pFrame^.token       := pProgSub^.token;
-          { aOnce flags are stored just after the TVdbeFrame header in the alloc }
           pMemEnd := PMem(Pu8(pFrame) + ROUND8(SizeOf(TVdbeFrame)));
-          pFrame^.aOnce := Pu8(pMemEnd) + nProgMem * SizeOf(TMem)
-                         + u64(pProgSub^.nCsr) * SizeOf(PVdbeCursor);
-          FillChar(pFrame^.aOnce^, (pProgSub^.nOp + 7) div 8, 0);
           i := 0;
           while i < nProgMem do begin
             pMemEnd^.flags := MEM_Undefined;
@@ -13103,6 +13099,14 @@ begin
         v^.nMem            := pFrame^.nChildMem;
         v^.nCursor         := u16(pFrame^.nChildCsr);
         v^.apCsr           := @v^.aMem[v^.nMem];
+        { OP_Once flags live just past apCsr[nCsr]; per vdbe.c:7581..7582 they
+          must be (re)computed and zeroed on EVERY OP_Program invocation — not
+          only on the first (allocating) pass — else a cached frame reused for a
+          later row of a multi-row DML keeps the prior row's OP_Once bits set,
+          so cacheable scalar subqueries in the trigger body skip re-execution
+          and return stale results (trigger2 1.x.x). }
+        pFrame^.aOnce      := Pu8(@v^.apCsr[pProgSub^.nCsr]);
+        FillChar(pFrame^.aOnce^, (pProgSub^.nOp + 7) div 8, 0);
         aOp                := pProgSub^.aOp;
         v^.aOp             := aOp;
         v^.nOp             := pProgSub^.nOp;
