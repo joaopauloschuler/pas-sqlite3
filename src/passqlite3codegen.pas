@@ -54593,6 +54593,13 @@ begin
                             i32(db^.dfltLockMode));
     sqlite3BtreeSecureDelete(PBtree(pSlot^.pBt),
       sqlite3BtreeSecureDelete(PBtree(db^.aDb[0].pBt), -1));
+    { attach.c:210 — the freshly attached pager inherits the connection-wide
+      PAGER_FLAGS_MASK bits (PAGER_FULLFSYNC | PAGER_CKPT_FULLFSYNC |
+      PAGER_CACHESPILL) so e.g. PRAGMA cache_spill=OFF (which clears
+      SQLITE_CacheSpill==PAGER_CACHESPILL in db->flags) keeps spilling
+      disabled on the new aux pager (pragma2-4.6). }
+    sqlite3BtreeSetPagerFlags(PBtree(pSlot^.pBt),
+      u32(PAGER_SYNCHRONOUS_FULL) or u32(db^.flags and PAGER_FLAGS_MASK));
   end;
   pSlot^.safety_level := 3;  { PAGER_SYNCHRONOUS_FULL+1 — matches main.c openDatabase }
   if (rc = SQLITE_OK) and (pSlot^.zDbSName = nil) then rc := SQLITE_NOMEM;
@@ -54604,8 +54611,8 @@ begin
     statements.  Without this, SELECT against `aux.t` errors with
     SQLITE_READONLY (planner falls into a write-cookie path because the
     schema looks empty / dirty).  pager-flag plumbing
-    (sqlite3PagerLockingMode + sqlite3BtreeSetPagerFlags) lives in
-    passqlite3pager which codegen doesn't import — still deferred. }
+    (sqlite3PagerLockingMode + sqlite3BtreeSecureDelete +
+    sqlite3BtreeSetPagerFlags) is ported above (attach.c:205..210). }
   if rc = SQLITE_OK then
   begin
     sqlite3BtreeEnterAll(db);
