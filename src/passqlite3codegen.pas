@@ -29875,6 +29875,18 @@ begin
         pTab := sqlite3LocateTableItem(pParse, 0, pItem);
         if pTab = nil then Exit;
         pItem^.pSTab := pTab;
+        { select.c:6029..6034 — Table.nTabRef overflow guard (ticket
+          d58ccbb3f1b).  Exponentially self-referencing views (v2 = v1
+          UNION v1, v4 = v2 UNION v2, ...) would otherwise recurse
+          unboundedly through sqlite3ViewGetColumnNames → stack overflow.
+          Abort with a parse error once a table accumulates 0xffff refs. }
+        if pTab^.nTabRef >= $FFFF then
+        begin
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+            'too many references to "%s": max 65535', [pTab^.zName]));
+          pItem^.pSTab := nil;
+          Exit;
+        end;
         Inc(pTab^.nTabRef);
         { fg.notCte = bit 2 of fgBits2. }
         pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $04;
