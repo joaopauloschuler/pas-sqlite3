@@ -975,6 +975,39 @@ begin
   Result := rc;
 end;
 
+{ Store an ALREADY-FORMATTED error message onto pParse, mirroring the
+  store-tail of build.c sqlite3ErrorMsg (db->suppressErr / mallocFailed /
+  errByteOffset / nErr / rc / zErrMsg handling) WITHOUT re-running the text
+  through sqlite3MPrintf.  Needed because our sqlite3ErrorMsg() takes only a
+  format string and re-printf's it; for "no such module: %s" and the zErr
+  passthrough the message is built here so any '%' in zMod/zErr is preserved
+  verbatim, matching C's sqlite3ErrorMsg(pParse,"no such module: %s",zMod) and
+  sqlite3ErrorMsg(pParse,"%s",zErr) exactly. zMsg is consumed (owned by db). }
+procedure vtabSetPreformattedErr(pParse: PParse; zMsg: PAnsiChar);
+var
+  db: PTsqlite3;
+begin
+  if pParse = nil then begin
+    if zMsg <> nil then sqlite3DbFree(nil, zMsg);
+    Exit;
+  end;
+  db := pParse^.db;
+  if (db <> nil) and (db^.suppressErr <> 0) then begin
+    if zMsg <> nil then sqlite3DbFree(Psqlite3db(db), zMsg);
+    if (db <> nil) and (db^.mallocFailed <> 0) then begin
+      Inc(pParse^.nErr);
+      pParse^.rc := SQLITE_NOMEM;
+    end;
+    Exit;
+  end;
+  Inc(pParse^.nErr);
+  pParse^.rc := SQLITE_ERROR;
+  if zMsg = nil then Exit;
+  if pParse^.zErrMsg <> nil then
+    sqlite3DbFree(Psqlite3db(db), pParse^.zErrMsg);
+  pParse^.zErrMsg := zMsg;
+end;
+
 function sqlite3VtabCallConnect(pParse: PParse;
   pTab: passqlite3codegen.PTable2): i32;
 var
@@ -998,14 +1031,18 @@ begin
   pMod  := PVtabModule(sqlite3HashFind(@db^.aModule, PChar(zMod)));
 
   if pMod = nil then begin
-    sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString('no such module')));
+    { vtab.c:715 — sqlite3ErrorMsg(pParse, "no such module: %s", zModule) }
+    vtabSetPreformattedErr(pParse,
+      sqlite3MPrintf(Psqlite3db(db), 'no such module: %s', [zMod]));
     rc := SQLITE_ERROR;
   end else begin
     zErr := nil;
     rc := vtabCallConstructor(db, pTab, pMod,
             Tsqlite3_vtab_construct(pMod^.pModule^.xConnect), @zErr);
     if rc <> SQLITE_OK then begin
-      sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString('vtable connect failed')));
+      { vtab.c:721 — sqlite3ErrorMsg(pParse, "%s", zErr) }
+      vtabSetPreformattedErr(pParse,
+        sqlite3MPrintf(Psqlite3db(db), '%s', [zErr]));
       pParse^.rc := rc;
     end;
     sqlite3DbFree(Psqlite3db(db), zErr);
