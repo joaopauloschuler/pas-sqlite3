@@ -32728,12 +32728,26 @@ begin
       to gate the right recursion via OP_IfNot (+ OP_OffsetLimit when
       OFFSET is present).  Each leaf carries SF_Compound; clear it
       during the recursion so the no-FROM / regular-FROM fast paths
-      inside sqlite3Select fire normally. }
+      inside sqlite3Select fire normally.
+
+      with5: a multi-arm recursive CTE (two or more recursive UNION/UNION ALL
+      terms) is coded by generateWithRecursiveQuery, which detaches the anchor
+      (pFirstRec^.pPrior := nil) and re-enters sqlite3Select on the still-compound
+      recursive arms (all marked TK_ALL) targeting the Queue dest.  C
+      (select.c:2976) gates the recursive special-case on
+      `SF_Recursive && hasAnchor(p)`; once the anchor is detached hasAnchor=0 and
+      C falls through to this plain UNION ALL arm regardless of SF_Recursive.
+      So this arm must NOT exclude SF_Recursive (the recursive-CTE gate above
+      already Exited when there is an anchor) and must accept the Queue
+      destinations (SRT_Fifo / SRT_DistFifo / SRT_Queue / SRT_DistQueue), exactly
+      as C's `&dest` does unconditionally.  Excluding them previously dropped the
+      whole RECURSIVE STEP, leaving only the setup row. }
     if (p^.op = TK_ALL) and (p^.pOrderBy = nil)
-       and ((p^.selFlags and SF_Recursive) = 0)
        and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
             or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Mem)
-            or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Exists)) then
+            or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Exists)
+            or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
+            or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue)) then
     begin
       pPriorSel    := p^.pPrior;
       Assert(pPriorSel^.pLimit = nil);
