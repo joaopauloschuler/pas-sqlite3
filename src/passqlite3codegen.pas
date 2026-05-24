@@ -28785,6 +28785,68 @@ end;
       stub for those rows, same surface as before this change).
     * Fails fast on missing-table — sqlite3LocateTableItem already
       raises sqlite3ErrorMsg, so we just propagate via pParse^.nErr. }
+{ NestedFromColMatchesTable — does column j of an SF_NestedFrom wrapper's
+  result pEList originate from a leaf table whose alias-or-name matches
+  zTab_?  Mirrors the table-side of sqlite3MatchEName (resolve.c:125) +
+  the cursor-reverse walk used by FindWrapperEListIdx.
+
+  C carries this via pNestedFrom->a[j].zEName = "schema.tab.col" (ENAME_TAB)
+  and tests it with sqlite3MatchEName(&pNestedFrom->a[j],0,zTName,0,0).  This
+  port's nested-from result pEList holds pre-bound TK_COLUMN entries (inner
+  cursor + col) with zEName = the plain column name, so we instead locate the
+  inner (cursor->SrcItem) the column reads from and compare its alias/name to
+  zTab_.  Recurses when the inner source is itself a nested-from wrapper. }
+function NestedFromColMatchesTable(pWrap: PSrcItem; j: i32;
+  zTab_: PAnsiChar): Boolean;
+var
+  pSel:    PSelect;
+  pELst:   PExprList;
+  pInnerS: PSrcList;
+  items_:  PExprListItem;
+  pE2:     PExpr;
+  pInnerB: PSrcItem;
+  pRef:    PSrcItem;
+  k:       i32;
+  subIdx:  i32;
+begin
+  Result := False;
+  if (pWrap = nil) or (zTab_ = nil) then Exit;
+  if pWrap^.u4.pSubq = nil then Exit;
+  pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+  if pSel = nil then Exit;
+  pELst   := pSel^.pEList;
+  pInnerS := pSel^.pSrc;
+  if (pELst = nil) or (pInnerS = nil) then Exit;
+  if (j < 0) or (j >= pELst^.nExpr) then Exit;
+  items_ := ExprListItems(pELst);
+  pE2 := items_[j].pExpr;
+  if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Exit;
+  { Locate the inner SrcItem this column reads from. }
+  pRef := nil;
+  for k := 0 to pInnerS^.nSrc - 1 do
+  begin
+    pInnerB := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+    if pInnerB^.iCursor = pE2^.iTable then begin pRef := pInnerB; Break; end;
+  end;
+  if pRef = nil then Exit;
+  if ((pRef^.fg.fgBits2 and $40) = 0)            { not isNestedFrom }
+     or ((pRef^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
+  begin
+    if pRef^.pSTab = nil then Exit;
+    if pRef^.zAlias <> nil then
+      Result := sqlite3StrICmp(pRef^.zAlias, zTab_) = 0
+    else
+      Result := sqlite3StrICmp(pRef^.pSTab^.zName, zTab_) = 0;
+  end
+  else
+  begin
+    { Inner item is itself a nested-from wrapper — recurse on the inner
+      pEList index that this column maps to (= pE2^.iColumn). }
+    subIdx := pE2^.iColumn;
+    Result := NestedFromColMatchesTable(pRef, subIdx, zTab_);
+  end;
+end;
+
 { expandStar — minimum-viable port of the TK_ASTERISK expansion arm
   inside selectExpander (select.c:830..980 / 6090..6326).  Builds a
   fresh pEList by replacing each top-level `*` (plain or `T.*`) with
@@ -28830,6 +28892,8 @@ var
   zEName:    PAnsiChar;
   bMarkNoExpand: Boolean;
   pNxt:      PSrcItem;
+  isNestedWrap:    Boolean;
+  anyNestedMatch:  Boolean;
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
@@ -28907,7 +28971,14 @@ begin
       pTab  := pItem^.pSTab;
       if pTab = nil then Continue;
       if pTab^.aCol = nil then Continue;
-      if zTName <> nil then
+      { select.c:6168..6182 — an SF_NestedFrom wrapper is never matched by
+        its (synthetic) name; T.* must instead match against the inner
+        result columns' originating tables (handled per-column below). }
+      isNestedWrap := ((pItem^.fg.fgBits2 and $40) <> 0)        { isNestedFrom }
+                      and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+                      and (pItem^.u4.pSubq <> nil)
+                      and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil);
+      if (zTName <> nil) and (not isNestedWrap) then
       begin
         if pItem^.zAlias <> nil then
           zItemName := pItem^.zAlias
@@ -28915,6 +28986,18 @@ begin
           zItemName := pTab^.zName;
         if (zItemName = nil) or
            (sqlite3StrICmp(zTName, zItemName) <> 0) then Continue;
+      end;
+      { For a nested-from wrapper under T.*, only contribute if at least one
+        of its result columns originates from table zTName; otherwise skip
+        without marking tableSeen (so an unmatched wrapper does not suppress
+        the "no such table" error). }
+      if (zTName <> nil) and isNestedWrap then
+      begin
+        anyNestedMatch := False;
+        for j := 0 to pTab^.nCol - 1 do
+          if NestedFromColMatchesTable(pItem, j, zTName) then
+          begin anyNestedMatch := True; Break; end;
+        if not anyNestedMatch then Continue;
       end;
       tableSeen := True;
 
@@ -28962,6 +29045,11 @@ begin
       for j := 0 to pTab^.nCol - 1 do
       begin
         pCol := PColumn(PByte(pTab^.aCol) + j * SizeOf(TColumn));
+        { select.c:6225..6230 — for T.* over a nested-from wrapper, only
+          emit the wrapper columns that originate from table zTName
+          (sqlite3MatchEName test against pNestedFrom->a[j]). }
+        if (zTName <> nil) and isNestedWrap then
+          if not NestedFromColMatchesTable(pItem, j, zTName) then Continue;
         { select.c:6232 — only hidden columns are omitted from `*`.
           VIRTUAL generated columns must still appear. }
         if (pCol^.colFlags and COLFLAG_HIDDEN) <> 0 then Continue;
