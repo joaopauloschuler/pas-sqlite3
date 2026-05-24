@@ -23820,6 +23820,9 @@ var
   notReady:      Bitmask;
   colUsedB:      Bitmask;
   nP4Cols:       i32;
+  bFordelete:    u8;            { OPFLAG_FORDELETE or zero (where.c:6851) }
+  pJ:            PIndex2;       { walks the index list to locate seek cursor }
+  iIdxOp:        i32;           { OP_OpenRead/OpenWrite/ReopenIdx or 0 }
   rc:            i32;
   pStart, pEnd: PWhereTerm;
   pX:          PExpr;
@@ -23918,6 +23921,7 @@ begin
 
   { Variable initialization (where.c:6863..6864) }
   db := pParse^.db;
+  bFordelete := 0;
   FillChar(sWLB, SizeOf(sWLB), 0);
 
   { An ORDER/GROUP BY clause of more than 63 terms cannot be optimised
@@ -24316,7 +24320,17 @@ begin
         else
           pWInfo^.eOnePass := ONEPASS_MULTI;
         if HasRowid(pTab) and ((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0) then
+        begin
+          { where.c:7231..7233 — a multi-row ONEPASS DELETE/UPDATE that went
+            index-only on a rowid table opens the table cursor with
+            OPFLAG_FORDELETE: the btree is being scanned-and-cleared, so the
+            individual table-cell deletes can skip rebalancing.  Gate on the
+            CALLER's WHERE_ONEPASS_MULTIROW flag, not eOnePass — a SINGLE-row
+            delete invoked under a MULTIROW-capable caller still stamps it. }
+          if (wctrlFlags and WHERE_ONEPASS_MULTIROW) <> 0 then
+            bFordelete := OPFLAG_FORDELETE;
           pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
+        end;
       end;
     end;
 
@@ -24405,7 +24419,10 @@ begin
             end;
             sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
           end;
-          sqlite3VdbeChangeP5(v, 0);
+          { where.c:7303..7305 — stamp OPFLAG_FORDELETE on the table-cursor
+            open for an index-only ONEPASS_MULTI rowid DELETE/UPDATE (the
+            SQLITE_ENABLE_CURSOR_HINTS SEEKEQ branch is not compiled here). }
+          sqlite3VdbeChangeP5(v, bFordelete);
           { where.c:7310..7316 — for inner-join tables at level >= 2 whose
             addrHalt matches the outermost level, emit OP_IfEmpty so an
             empty fromExists subquery short-circuits the whole query.
@@ -24426,56 +24443,82 @@ begin
           regFilter / filterPullDown decoration deferred. }
         if (pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0 then
         begin
-          { where.c:7320..7357 — pick the index cursor.  When invoked under
-            WHERE_OR_SUBCLAUSE with a positive iAuxArg, reuse that cursor
-            number and emit OP_ReopenIdx so every OR-disjunct shares the
-            covering-index cursor (bug 6.17.A). }
-          if (iAuxArg <> 0)
-             and ((wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0)
-             and (pLoop^.u.btree.pIndex <> nil) then
+          { where.c:7320..7389 — pick the index cursor and the open opcode,
+            then emit the single OP_Open*/Reopen and its SEEKEQ stamp.
+            Faithful 4-way port of the C decision tree:
+              (1) WITHOUT ROWID PK under an OR-subclause reuses the table
+                  cursor with no separate open (op := 0);
+              (2) a ONEPASS DELETE/UPDATE reuses the write index cursor
+                  allocated by sqlite3OpenTableAndIndices — walk the index
+                  list from iAuxArg to the matching index and OP_OpenWrite
+                  it, recording aiCurOnePass[1] so sqlite3DeleteFrom skips
+                  re-opening it and feeds it to OP_Delete as iIdxNoSeek;
+              (3) an OR-subclause with a positive iAuxArg reuses that cursor
+                  via OP_ReopenIdx (bug 6.17.A);
+              (4) otherwise allocate a fresh cursor and OP_OpenRead it. }
+          if (pLoop^.u.btree.pIndex <> nil) then
           begin
-            pLevel^.iIdxCur := iAuxArg;
-            sqlite3VdbeAddOp3(v, OP_ReopenIdx, pLevel^.iIdxCur,
-                              i32(pLoop^.u.btree.pIndex^.tnum), iDb);
-            sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pLoop^.u.btree.pIndex));
-            if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
-               and ((pLoop^.wsFlags
-                     and (WHERE_COLUMN_RANGE or WHERE_SKIPSCAN
-                          or WHERE_BIGNULL_SORT or WHERE_IN_SEEKSCAN)) = 0)
-               and ((pWInfo^.wctrlFlags and WHERE_ORDERBY_MIN) = 0)
-               and (pWInfo^.eDistinct <> WHERE_DISTINCT_ORDERED) then
-              sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
-          end
-          else
-          begin
-            pLevel^.iIdxCur := pParse^.nTab;
-            Inc(pParse^.nTab);
-            { where.c:7348..7350 — register IndexedExpr entries so the
-              expression code generator can substitute index reads for
-              CREATE INDEX ... ON <expr>() match-sites (9.4.divbug.87.031). }
-            if (pLoop^.u.btree.pIndex <> nil)
-               and (((pLoop^.u.btree.pIndex^.idxFlags shr 11) and 1) <> 0)
-               and OptimizationEnabled(db, SQLITE_IndexedExpr) then
-              whereAddIndexedExpr(pParse, pLoop^.u.btree.pIndex,
-                                  pLevel^.iIdxCur, pTabItem);
-            { where.c:7351..7355 — for a partial index that is NOT the inner
-              of a RIGHT JOIN, register IndexedExpr entries for each column
-              the partial-index WHERE clause pins to a constant, so the
-              expression code generator (exprPartidxExprLookup) emits the
-              constant instead of an OP_Column against the (possibly never
-              opened) table cursor.  Without this, a covering partial-index
-              plan whose result set references the pinned column crashes:
-              the WhereEnd Index→table rewrite leaves an OP_Column on an
-              unopened table cursor (9.4.divbug.87.029, indexA-1.2). }
-            if (pLoop^.u.btree.pIndex <> nil)
-               and (pLoop^.u.btree.pIndex^.pPartIdxWhere <> nil)
-               and ((pTabItem^.fg.jointype and JT_RIGHT) = 0) then
-              wherePartIdxExpr(pParse, pLoop^.u.btree.pIndex,
-                               pLoop^.u.btree.pIndex^.pPartIdxWhere,
-                               nil, pLevel^.iIdxCur, pTabItem);
-            if pLoop^.u.btree.pIndex <> nil then
+            iIdxOp := OP_OpenRead;
+            if (not HasRowid(pTab))
+               and ((pLoop^.u.btree.pIndex^.idxFlags and 3)
+                    = SQLITE_IDXTYPE_PRIMARYKEY)
+               and ((wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0) then
             begin
-              sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
+              { (1) One term of an OR-optimisation using the PRIMARY KEY of a
+                WITHOUT ROWID table — no separate index cursor. }
+              pLevel^.iIdxCur := pLevel^.iTabCur;
+              iIdxOp := 0;
+            end
+            else if pWInfo^.eOnePass <> ONEPASS_OFF then
+            begin
+              { (2) ONEPASS DELETE/UPDATE — reuse the OP_OpenWrite index
+                cursor.  Walk pTab's index list from iAuxArg to pIndex. }
+              pJ := pTabItem^.pSTab^.pIndex;
+              pLevel^.iIdxCur := iAuxArg;
+              while (pJ <> nil) and (pJ <> pLoop^.u.btree.pIndex) do
+              begin
+                Inc(pLevel^.iIdxCur);
+                pJ := pJ^.pNext;
+              end;
+              iIdxOp := OP_OpenWrite;
+              pWInfo^.aiCurOnePass[1] := pLevel^.iIdxCur;
+            end
+            else if (iAuxArg <> 0)
+                 and ((wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0) then
+            begin
+              { (3) OR-subclause covering-index cursor reuse. }
+              pLevel^.iIdxCur := iAuxArg;
+              iIdxOp := OP_ReopenIdx;
+            end
+            else
+            begin
+              { (4) Fresh index cursor. }
+              pLevel^.iIdxCur := pParse^.nTab;
+              Inc(pParse^.nTab);
+              { where.c:7348..7350 — register IndexedExpr entries so the
+                expression code generator can substitute index reads for
+                CREATE INDEX ... ON <expr>() match-sites (9.4.divbug.87.031). }
+              if (((pLoop^.u.btree.pIndex^.idxFlags shr 11) and 1) <> 0)
+                 and OptimizationEnabled(db, SQLITE_IndexedExpr) then
+                whereAddIndexedExpr(pParse, pLoop^.u.btree.pIndex,
+                                    pLevel^.iIdxCur, pTabItem);
+              { where.c:7351..7355 — for a partial index that is NOT the inner
+                of a RIGHT JOIN, register IndexedExpr entries for each column
+                the partial-index WHERE clause pins to a constant, so the
+                expression code generator (exprPartidxExprLookup) emits the
+                constant instead of an OP_Column against the (possibly never
+                opened) table cursor (9.4.divbug.87.029, indexA-1.2). }
+              if (pLoop^.u.btree.pIndex^.pPartIdxWhere <> nil)
+                 and ((pTabItem^.fg.jointype and JT_RIGHT) = 0) then
+                wherePartIdxExpr(pParse, pLoop^.u.btree.pIndex,
+                                 pLoop^.u.btree.pIndex^.pPartIdxWhere,
+                                 nil, pLevel^.iIdxCur, pTabItem);
+            end;
+            { where.c:7361..7389 — emit the open opcode (unless op=0) and the
+              optional SEEKEQ P5 stamp. }
+            if iIdxOp <> 0 then
+            begin
+              sqlite3VdbeAddOp3(v, iIdxOp, pLevel^.iIdxCur,
                                 i32(pLoop^.u.btree.pIndex^.tnum), iDb);
               sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pLoop^.u.btree.pIndex));
               if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
