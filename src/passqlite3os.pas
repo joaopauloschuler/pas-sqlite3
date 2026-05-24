@@ -87,6 +87,33 @@ function  libc_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'reallo
 procedure libc_free(p: Pointer); external 'c' name 'free';
 function  libc_calloc(nmemb, size: csize_t): Pointer; external 'c' name 'calloc';
 
+{ ============================================================
+  Section 0b: C stdio (FILE*) bindings — shared by extensions
+  ============================================================
+  Consolidated here (2026-05-23) so the csv / fileio / zipfile /
+  vfslog / tmstmpvfs extensions and the shell share ONE faithful
+  set of libc stdio bindings instead of re-declaring them per unit
+  (those copies had drifted across NativeInt/NativeUInt/i32).
+  Canonical C-ABI types: csize_t (size_t), clong (long), cint (int).
+  NOTE: SQLite core itself never uses stdio — it goes through the
+  VFS (open/pread/pwrite).  These exist only for the extension and
+  shell consumers listed above. }
+type
+  PFILE = Pointer;
+
+function  libc_fopen(path, mode: PAnsiChar): PFILE; cdecl; external 'c' name 'fopen';
+function  libc_fclose(stream: PFILE): cint; cdecl; external 'c' name 'fclose';
+function  libc_fread(buf: Pointer; size, nmemb: csize_t; stream: PFILE): csize_t; cdecl; external 'c' name 'fread';
+function  libc_fwrite(buf: Pointer; size, nmemb: csize_t; stream: PFILE): csize_t; cdecl; external 'c' name 'fwrite';
+function  libc_fseek(stream: PFILE; offset: clong; whence: cint): cint; cdecl; external 'c' name 'fseek';
+function  libc_ftell(stream: PFILE): clong; cdecl; external 'c' name 'ftell';
+function  libc_fflush(stream: PFILE): cint; cdecl; external 'c' name 'fflush';
+procedure libc_rewind(stream: PFILE); cdecl; external 'c' name 'rewind';
+function  libc_fprintf(stream: PFILE; fmt: PAnsiChar): cint; cdecl; varargs; external 'c' name 'fprintf';
+
+var
+  libc_stdout: PFILE; external 'c' name 'stdout';
+
 { Public API entry points — forwarded to the util.pas implementations
   that dispatch through sqlite3GlobalConfig.m.  Declared here so the
   many existing call sites (~835 in the tree) continue to compile.    }

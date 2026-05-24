@@ -39,20 +39,6 @@ const
   CSV_EOF      = -1;
   SEEK_SET     = 0;
 
-type
-  PFILE = Pointer;
-
-function csvFopen(path, mode: PAnsiChar): PFILE; cdecl;
-  external 'c' name 'fopen';
-function csvFclose(stream: PFILE): i32; cdecl;
-  external 'c' name 'fclose';
-function csvFread(buf: Pointer; sz, n: NativeUInt; stream: PFILE): NativeUInt; cdecl;
-  external 'c' name 'fread';
-function csvFseek(stream: PFILE; offset: NativeInt; whence: i32): i32; cdecl;
-  external 'c' name 'fseek';
-function csvFtell(stream: PFILE): NativeInt; cdecl;
-  external 'c' name 'ftell';
-
 { -------- CsvReader --------------------------------------------------- }
 
 type
@@ -79,7 +65,7 @@ end;
 procedure csvReaderReset(p: PCsvReader);
 begin
   if p^.inF <> nil then begin
-    csvFclose(p^.inF);
+    libc_fclose(p^.inF);
     sqlite3_free(p^.zIn);
   end;
   sqlite3_free(p^.z);
@@ -108,7 +94,7 @@ begin
       csvErrmsg(p, 'out of memory');
       Result := 1; Exit;
     end;
-    p^.inF := csvFopen(zFilename, 'rb');
+    p^.inF := libc_fopen(zFilename, 'rb');
     if p^.inF = nil then begin
       sqlite3_free(p^.zIn);
       p^.zIn := nil;
@@ -128,7 +114,7 @@ end;
 function csvGetcRefill(p: PCsvReader): i32;
 var got: NativeUInt;
 begin
-  got := csvFread(p^.zIn, 1, CSV_INBUFSZ, p^.inF);
+  got := libc_fread(p^.zIn, 1, CSV_INBUFSZ, p^.inF);
   if got = 0 then begin Result := CSV_EOF; Exit; end;
   p^.nIn := got;
   p^.iIn := 1;
@@ -596,7 +582,7 @@ begin
   else if pNew^.zData <> nil then
     pNew^.iStart := NativeInt(sRdr.iIn)
   else
-    pNew^.iStart := csvFtell(sRdr.inF) - NativeInt(sRdr.nIn) +
+    pNew^.iStart := libc_ftell(sRdr.inF) - NativeInt(sRdr.nIn) +
                     NativeInt(sRdr.iIn);
 
   csvReaderReset(@sRdr);
@@ -791,7 +777,7 @@ begin
   if pCur^.rdr.inF = nil then
     pCur^.rdr.iIn := NativeUInt(pTab^.iStart)
   else begin
-    csvFseek(pCur^.rdr.inF, pTab^.iStart, SEEK_SET);
+    libc_fseek(pCur^.rdr.inF, pTab^.iStart, SEEK_SET);
     pCur^.rdr.iIn := 0;
     pCur^.rdr.nIn := 0;
   end;

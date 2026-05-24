@@ -223,15 +223,8 @@ type
 
 { ----- libc bindings ---------------------------------------------- }
 
-function fopenC(path, mode: PAnsiChar): Pointer; cdecl; external 'c' name 'fopen';
-function fcloseC(f: Pointer): cint; cdecl; external 'c' name 'fclose';
-function freadC(buf: Pointer; sz, n: NativeUInt; f: Pointer): NativeUInt;
-  cdecl; external 'c' name 'fread';
-function fwriteC(buf: Pointer; sz, n: NativeUInt; f: Pointer): NativeUInt;
-  cdecl; external 'c' name 'fwrite';
-function fseekC(f: Pointer; off: clong; whence: cint): cint;
-  cdecl; external 'c' name 'fseek';
-function ftellC(f: Pointer): clong; cdecl; external 'c' name 'ftell';
+{ stdio bindings (fopen/fclose/fread/fwrite/fseek/ftell) now come from
+  passqlite3os: libc_fopen/libc_fclose/libc_fread/libc_fwrite/libc_fseek/libc_ftell. }
 { 6.40.1.p.2.5 — strlen external replaced with FPC RTL StrLen. }
 
 const
@@ -398,8 +391,8 @@ var
   n: NativeUInt;
   s: AnsiString;
 begin
-  fseekC(pFile, clong(iOff), SEEK_SET);
-  n := freadC(aRead, 1, NativeUInt(nRead), pFile);
+  libc_fseek(pFile, clong(iOff), SEEK_SET);
+  n := libc_fread(aRead, 1, NativeUInt(nRead), pFile);
   if i64(n) <> nRead then begin
     if pzErrmsg^ <> nil then sqlite3_free(pzErrmsg^);
     s := 'error in fread()';
@@ -414,8 +407,8 @@ function zipfileAppendData(pTab: PZipfileTab; aWrite: PByte; nWrite: i32): i32;
 var n: NativeUInt;
 begin
   if nWrite > 0 then begin
-    fseekC(pTab^.pWriteFd, clong(pTab^.szCurrent), SEEK_SET);
-    n := fwriteC(aWrite, 1, NativeUInt(nWrite), pTab^.pWriteFd);
+    libc_fseek(pTab^.pWriteFd, clong(pTab^.szCurrent), SEEK_SET);
+    n := libc_fwrite(aWrite, 1, NativeUInt(nWrite), pTab^.pWriteFd);
     if i32(n) <> nWrite then begin
       zipfileTableErr(pTab, 'error in fwrite()', []);
       Result := SQLITE_ERROR;
@@ -734,7 +727,7 @@ procedure zipfileCleanupTransaction(pTab: PZipfileTab);
 var pEntry, pNxt: PZipfileEntry;
 begin
   if pTab^.pWriteFd <> nil then begin
-    fcloseC(pTab^.pWriteFd);
+    libc_fclose(pTab^.pWriteFd);
     pTab^.pWriteFd := nil;
   end;
   pEntry := pTab^.pFirstEntry;
@@ -833,7 +826,7 @@ var p, pNxt: PZipfileEntry;
 begin
   pCsr^.bEof := 0;
   if pCsr^.pFile <> nil then begin
-    fcloseC(pCsr^.pFile);
+    libc_fclose(pCsr^.pFile);
     pCsr^.pFile := nil;
     zipfileEntryFree(pCsr^.pCurrent);
     pCsr^.pCurrent := nil;
@@ -1065,8 +1058,8 @@ begin
   rc := SQLITE_OK;
   FillChar(pEOCD^, SizeOf(pEOCD^), 0);
   if aBlob = nil then begin
-    fseekC(pFile, 0, SEEK_END);
-    szFile := i64(ftellC(pFile));
+    libc_fseek(pFile, 0, SEEK_END);
+    szFile := i64(libc_ftell(pFile));
     if szFile = 0 then begin Result := SQLITE_OK; Exit; end;
     if szFile < ZIPFILE_BUFFER_SIZE then nRead := szFile
     else nRead := ZIPFILE_BUFFER_SIZE;
@@ -1199,7 +1192,7 @@ begin
 
   if (pTab^.pWriteFd = nil) and (bInMemory = 0) then begin
     if zFile <> nil then
-      pCsr^.pFile := fopenC(zFile, 'rb');
+      pCsr^.pFile := libc_fopen(zFile, 'rb');
     if pCsr^.pFile = nil then begin
       zipfileCursorErr(pCsr, 'cannot open file: %s', [zFile]);
       rc := SQLITE_ERROR;
@@ -1396,14 +1389,14 @@ begin
     Result := SQLITE_ERROR;
     Exit;
   end;
-  pTab^.pWriteFd := fopenC(pTab^.zFile, 'ab+');
+  pTab^.pWriteFd := libc_fopen(pTab^.zFile, 'ab+');
   if pTab^.pWriteFd = nil then begin
     zipfileTableErr(pTab,
       'zipfile: failed to open file %s for writing', [StrPas(pTab^.zFile)]);
     rc := SQLITE_ERROR;
   end else begin
-    fseekC(pTab^.pWriteFd, 0, SEEK_END);
-    pTab^.szCurrent := i64(ftellC(pTab^.pWriteFd));
+    libc_fseek(pTab^.pWriteFd, 0, SEEK_END);
+    pTab^.szCurrent := i64(libc_ftell(pTab^.pWriteFd));
     pTab^.szOrig := pTab^.szCurrent;
     rc := zipfileLoadDirectory(pTab, nil, 0);
   end;

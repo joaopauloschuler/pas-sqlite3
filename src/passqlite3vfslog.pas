@@ -65,15 +65,6 @@ uses
 
 { -------- libc bindings ----------------------------------------------- }
 
-type
-  PFILE = Pointer;
-
-function vlogLibcFopen(path, mode: PAnsiChar): PFILE; cdecl;
-  external 'c' name 'fopen';
-function vlogLibcFclose(stream: PFILE): cint; cdecl;
-  external 'c' name 'fclose';
-function vlogLibcFprintf(stream: PFILE; fmt: PAnsiChar): cint; cdecl; varargs;
-  external 'c' name 'fprintf';
 function vlogLibcGetpid: cint; cdecl;
   external 'c' name 'getpid';
 function vlogLibcGethostname(buf: PAnsiChar; len: csize_t): cint; cdecl;
@@ -220,7 +211,7 @@ begin
     z3Use := @z3[0];
   end;
   if pLog^.zFilename = nil then isJ := 1 else isJ := 0;
-  vlogLibcFprintf(pLog^.outF,
+  libc_fprintf(pLog^.outF,
     PAnsiChar('%lld,%lld,%s,%d,%s,%s,%s,%d'#10),
     tStart, tElapse, zOp, isJ,
     PAnsiChar(@z1[0]),
@@ -244,7 +235,7 @@ begin
   p^.ppPrev^ := p^.pNext;
   if p^.pNext <> nil then p^.pNext^.ppPrev := p^.ppPrev;
   sqlite3_mutex_leave(pMutex);
-  vlogLibcFclose(p^.outF);
+  libc_fclose(p^.outF);
   sqlite3_free(p);
 end;
 
@@ -334,7 +325,7 @@ begin
     Move(zNameBuf^, pBuf^, StrLen(zNameBuf) + 1);
     sqlite3_free(zNameBuf);
 
-    pLog^.outF := vlogLibcFopen(pBuf, PAnsiChar('a'));
+    pLog^.outF := libc_fopen(pBuf, PAnsiChar('a'));
     if pLog^.outF = nil then begin
       sqlite3_mutex_leave(pMutex);
       sqlite3_free(pLog);

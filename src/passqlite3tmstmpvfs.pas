@@ -37,17 +37,6 @@ uses
 
 { -------- libc bindings ----------------------------------------------- }
 
-type
-  PFILE = Pointer;
-
-function tsLibcFopen(path, mode: PAnsiChar): PFILE; cdecl;
-  external 'c' name 'fopen';
-function tsLibcFclose(stream: PFILE): cint; cdecl;
-  external 'c' name 'fclose';
-function tsLibcFwrite(buf: Pointer; sz, n: csize_t; stream: PFILE): csize_t;
-  cdecl; external 'c' name 'fwrite';
-function tsLibcFflush(stream: PFILE): cint; cdecl;
-  external 'c' name 'fflush';
 function tsLibcGetpid: cint; cdecl;
   external 'c' name 'getpid';
 
@@ -220,7 +209,7 @@ end;
 procedure tmstmpLogFree(pLog: PTmstmpLog);
 begin
   if pLog = nil then Exit;
-  if pLog^.log <> nil then tsLibcFclose(pLog^.log);
+  if pLog^.log <> nil then libc_fclose(pLog^.log);
   sqlite3_free(pLog^.zLogname);
   sqlite3_free(pLog);
 end;
@@ -234,15 +223,15 @@ begin
   pLog := p^.pLog;
   Assert(pLog <> nil);
   if pLog^.log = nil then begin
-    pLog^.log := tsLibcFopen(pLog^.zLogname, PAnsiChar('wb'));
+    pLog^.log := libc_fopen(pLog^.zLogname, PAnsiChar('wb'));
     if pLog^.log = nil then begin
       tmstmpLogFree(pLog);
       p^.pLog := nil;
       Exit(1);
     end;
   end;
-  tsLibcFwrite(@pLog^.a[0], pLog^.n, 1, pLog^.log);
-  tsLibcFflush(pLog^.log);
+  libc_fwrite(@pLog^.a[0], pLog^.n, 1, pLog^.log);
+  libc_fflush(pLog^.log);
   pLog^.n := 0;
   Result := 0;
 end;

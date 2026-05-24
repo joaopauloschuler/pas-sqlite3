@@ -238,10 +238,6 @@ const
   ---------------------------------------------------------------------- }
 
 type
-  PFILE = Pointer;   { we treat C FILE* as opaque; only nil-checks are
-                       meaningful in this initial cut.  When the per-mode
-                       renderers land, this gets re-typed against
-                       BaseUnix's libc bindings. }
 
   { sqlite3_qrf_spec — port of ext/qrf/qrf.h:27..61.  We carry the layout
     so that future 10.1.8/9 renderers can populate it without re-deriving
@@ -4773,20 +4769,9 @@ function shellLibcPOpen(cmd, mode: PAnsiChar): Pointer;
   cdecl; external 'c' name 'popen';
 function shellLibcPClose(stream: Pointer): cint;
   cdecl; external 'c' name 'pclose';
-function shellLibcFRead(buf: Pointer; size, n: PtrUInt; stream: Pointer): PtrUInt;
-  cdecl; external 'c' name 'fread';
-function shellLibcFClose(stream: Pointer): cint;
-  cdecl; external 'c' name 'fclose';
-{ 10.1.36 — libc fopen + stdout + fprintf for SQLITE_CONFIG_LOG plumbing.
-  Mirrors output_file_open / cli_printf in shell.c.in:1754. }
-function shellLibcFOpen(path, mode: PAnsiChar): Pointer;
-  cdecl; external 'c' name 'fopen';
-function shellLibcFFlush(stream: Pointer): cint;
-  cdecl; external 'c' name 'fflush';
-function shellLibcFPrintf(stream: Pointer; const fmt: PAnsiChar): cint; cdecl; varargs;
-  external 'c' name 'fprintf';
+{ 10.1.36 — libc fread/fclose/fopen/fflush/fprintf + stdout now come from
+  passqlite3os.pas (shared libc stdio bindings); local externals removed. }
 var
-  shellLibcStdout: Pointer; external 'c' name 'stdout';
   { 10.1.36 — pLog FILE* installed via SQLITE_CONFIG_LOG.  nil ⇒ logging
     disabled.  Mirrors shell_state.pLog in shell.c.in:403. }
   gLogFile: Pointer = nil;
@@ -4797,8 +4782,8 @@ procedure shellLog(pArg: Pointer; iErrCode: i32; zMsg: PAnsiChar); cdecl;
 begin
   if pArg = nil then ;
   if gLogFile = nil then Exit;
-  shellLibcFPrintf(gLogFile, '(%d) %s'#10, iErrCode, zMsg);
-  shellLibcFFlush(gLogFile);
+  libc_fprintf(gLogFile, '(%d) %s'#10, iErrCode, zMsg);
+  libc_fflush(gLogFile);
 end;
 
 var
@@ -4991,23 +4976,23 @@ begin
     are libc globals and must not be fclose()d (matches output_file_close
     in shell.c.in). }
   if (gLogFile <> nil)
-     and (gLogFile <> shellLibcStdout)
+     and (gLogFile <> libc_stdout)
      and (gLogFile <> shellLibcStderr) then
-    shellLibcFClose(gLogFile);
+    libc_fclose(gLogFile);
   gLogFile := nil;
   if zFile = 'on' then begin
-    gLogFile := shellLibcStdout;
+    gLogFile := libc_stdout;
     zLogFile := 'stdout';
   end else if (zFile = 'off') or (zFile = '') then begin
     zLogFile := 'off';
   end else if zFile = 'stdout' then begin
-    gLogFile := shellLibcStdout;
+    gLogFile := libc_stdout;
     zLogFile := zFile;
   end else if zFile = 'stderr' then begin
     gLogFile := shellLibcStderr;
     zLogFile := zFile;
   end else begin
-    gLogFile := shellLibcFOpen(PAnsiChar(zFile), 'wb');
+    gLogFile := libc_fopen(PAnsiChar(zFile), 'wb');
     if gLogFile = nil then begin
       shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
       Result := 1;
@@ -8803,7 +8788,7 @@ begin
     { 10.1.24.b — pipe arm reads via libc fread() against the popen'd
       FILE*; everything else still uses the FpRead/inHandle path. }
     if p.pipeOpen then
-      n := SizeInt(shellLibcFRead(@p.buf[0], 1, PtrUInt(SizeOf(p.buf)),
+      n := SizeInt(libc_fread(@p.buf[0], 1, csize_t(SizeOf(p.buf)),
                                   p.pipeFile))
     else
       n := FpRead(p.inHandle, p.buf, SizeOf(p.buf));
