@@ -10079,9 +10079,18 @@ begin
       covers sqlite3ResolveSelfReference's empty SrcList (nSrc=0) used by
       VACUUM INTO <expr>, CHECK constraints, etc. (vacuum-into-320/330/
       340/420: bad column/qualified-column/function must error at prepare
-      time, not code to NULL and trip the runtime "non-text filename"). }
-    if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil)
-       and ((pNC^.pSrcList^.nSrc > 0) or (pNC^.pNext = nil)) then
+      time, not code to NULL and trip the runtime "non-text filename").
+
+      tkt3841 — a NameContext with NO pSrcList at all (e.g. an INSERT
+      single-row VALUES list, insert.c:1203..1212 builds an empty sNC)
+      is equally self-contained: C's resolveExprStep walker still reaches
+      lookupName for every TK_ID, so a double-quoted token must be demoted
+      to TK_STRING under DQS_DML (and a genuinely-unresolved bare id must
+      raise "no such column").  Treat pSrcList=nil with no outer pNext the
+      same as the nSrc=0 self-reference case above. }
+    if (pNC^.pParse <> nil)
+       and (((pNC^.pSrcList <> nil) and (pNC^.pSrcList^.nSrc > 0))
+            or (pNC^.pNext = nil)) then
     begin
       flagUnresolvedTKID(pNC^.pParse, pExpr,
         (pNC^.ncFlags and NC_IsDDL) <> 0);
