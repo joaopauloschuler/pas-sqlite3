@@ -62465,6 +62465,9 @@ var
   eAction: i32;
   pFromTab: PTable2;
   nFkCol: i32;
+  rcauth: i32;
+  zCol: PAnsiChar;
+  colIdx: i32;
 begin
   db := pParse^.db;
   if (pParse^.parseFlags and PARSEFLAG_DisableTriggers) <> 0 then
@@ -62545,7 +62548,19 @@ begin
         (aiCol + i)^ := -1;
       AssertH((pIdx = nil) or (pIdx^.aiColumn[i] >= 0),
               'sqlite3FkCheck: pIdx->aiColumn[i] negative');
-      { SQLITE_OMIT_AUTHORIZATION: db^.xAuth check skipped — bIgnore stays 0. }
+      { Request permission to read the parent key columns. If the
+        authorization callback returns SQLITE_IGNORE, behave as if any
+        values read from the parent table are NULL. }
+      if db^.xAuth <> nil then
+      begin
+        if pIdx <> nil then
+          colIdx := pIdx^.aiColumn[i]
+        else
+          colIdx := pTo^.iPKey;
+        zCol := pTo^.aCol[colIdx].zCnName;
+        rcauth := sqlite3AuthReadCol(pParse, pTo^.zName, zCol, iDb);
+        bIgnore := Ord(rcauth = SQLITE_IGNORE);
+      end;
     end;
 
     { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
