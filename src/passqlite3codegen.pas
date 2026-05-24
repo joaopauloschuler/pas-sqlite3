@@ -16791,8 +16791,25 @@ begin
 end;
 
 function sqlite3WhereOrderByLimitOptLabel(pWInfo: PWhereInfo): i32;
+var
+  pInner: PWhereLevel;
+  pLevels: PWhereLevel;
 begin
-  Result := pWInfo^.iBreak;
+  { where.c:101..111.  When bOrderedInnerLoop is not set the ORDER BY LIMIT
+    optimisation does not apply; jump to the continuation of the inner-most
+    loop.  Otherwise jump to the inner-most level's addrNxt (the IN-value
+    advance / loop-bottom) so a full sorter can short-circuit the rest of
+    the scan — except for a right-join inner level, which must stay on the
+    plain continuation. }
+  if ((pWInfo^.bitwiseFlags shr 2) and 1) = 0 then  { !bOrderedInnerLoop }
+    Exit(pWInfo^.iContinue);
+  pLevels := whereInfoLevels(pWInfo);
+  pInner := @pLevels[i32(pWInfo^.nLevel) - 1];
+  Assert(pInner^.addrNxt <> 0);
+  if pInner^.pRJ <> nil then
+    Result := pWInfo^.iContinue
+  else
+    Result := pInner^.addrNxt;
 end;
 
 { sqlite3WhereMinMaxOptEarlyOut — port of where.c:124..137.
@@ -31756,6 +31773,10 @@ var
   addrSortContinue: i32;
   iLimitTopN:   i32;
   iSkipTopN:    i32;
+  labelOBLopt:  i32;            { select.c SortCtx.labelOBLopt — jump target
+                                  for the Top-N IdxLE when the sorter is full
+                                  and the planner delivers rows in ORDER BY
+                                  order (sqlite3WhereOrderByLimitOptLabel). }
   regSeq:       i32;
   { OMITREF / nPrefixReg locals (select.c:1216..1265) — when every
     pEList result column appears verbatim in pOrderBy (with the resolver
@@ -36203,6 +36224,15 @@ begin
       iTabTnct := -1;
     end;
   end;
+  { select.c:8295..8297 — capture the ORDER BY LIMIT early-out label now
+    that the planner has decided its loop order.  When the inner-most loop
+    delivers rows in ORDER BY order, a full Top-N sorter can short-circuit
+    the rest of the scan by jumping to this label (used in the pushOntoSorter
+    Top-N IdxLE retarget below).  9.4.divbug.87.023/024 (limit2/in6/in7). }
+  labelOBLopt := 0;
+  if bSort <> 0 then
+    labelOBLopt := sqlite3WhereOrderByLimitOptLabel(pWInfo);
+
   {$IFDEF SQLITE_DEBUG}
   TreeTraceLine($2, 'WhereBegin returns');  { select.c:8302 }
   {$ENDIF}
@@ -36445,7 +36475,16 @@ begin
                              regSortBase,
                              sortNKey + bSeqExtra + nResultCol);
       if iSkipTopN > 0 then
-        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      begin
+        { select.c:867..869 — retarget the Top-N IdxLE to labelOBLopt (the
+          ORDER BY LIMIT early-out) when set, else fall through to the next
+          instruction.  This lets a full sorter abandon the rest of an
+          ordered inner scan. }
+        if labelOBLopt <> 0 then
+          sqlite3VdbeChangeP2(v, iSkipTopN, labelOBLopt)
+        else
+          sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      end;
     end
     else if (bSort <> 0) and (pDest^.eDest = SRT_Mem) then
     begin
@@ -36503,7 +36542,16 @@ begin
                              regSortBase,
                              sortNKey + bSeqExtra + nResultCol);
       if iSkipTopN > 0 then
-        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      begin
+        { select.c:867..869 — retarget the Top-N IdxLE to labelOBLopt (the
+          ORDER BY LIMIT early-out) when set, else fall through to the next
+          instruction.  This lets a full sorter abandon the rest of an
+          ordered inner scan. }
+        if labelOBLopt <> 0 then
+          sqlite3VdbeChangeP2(v, iSkipTopN, labelOBLopt)
+        else
+          sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      end;
       { selectInnerLoop SRT_Mem + sort (select.c:1427) — `pDest->iSDParm =
         regResult`.  The result columns were coded into pDest^.iSdst (==
         regResult here) and re-read into the same registers by the sort
@@ -36571,7 +36619,16 @@ begin
                              regSortBase,
                              sortNKey + bSeqExtra + nResultCol);
       if iSkipTopN > 0 then
-        sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      begin
+        { select.c:867..869 — retarget the Top-N IdxLE to labelOBLopt (the
+          ORDER BY LIMIT early-out) when set, else fall through to the next
+          instruction.  This lets a full sorter abandon the rest of an
+          ordered inner scan. }
+        if labelOBLopt <> 0 then
+          sqlite3VdbeChangeP2(v, iSkipTopN, labelOBLopt)
+        else
+          sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+      end;
       pDest^.iSDParm2 := 0;
     end
     else if (pDest^.eDest = SRT_Output)
@@ -36670,7 +36727,13 @@ begin
                                  regSortBase,
                                  sortNKey + bSeqExtra + nResultCol);
           if iSkipTopN > 0 then
-            sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+          begin
+            { select.c:867..869 — retarget to labelOBLopt when set. }
+            if labelOBLopt <> 0 then
+              sqlite3VdbeChangeP2(v, iSkipTopN, labelOBLopt)
+            else
+              sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
+          end;
         end;
       end
       else
