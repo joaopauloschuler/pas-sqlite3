@@ -48100,49 +48100,6 @@ begin
       pTab^.tabFlags := pTab^.tabFlags or TF_Readonly;
   end;
 
-  { CHECK resolve loop — port of build.c:2738..2751.  Resolve names
-    in all CHECK constraint expressions against the new table itself
-    (NC_IsCheck); on error, drop the CHECK list so writable_schema=ON
-    cannot try to use partially-resolved nodes. }
-  if pTab^.pCheck <> nil then
-  begin
-    sqlite3ResolveSelfReference(pParse, pTab, NC_IsCheck, nil, pTab^.pCheck);
-    if pParse^.nErr <> 0 then begin
-      sqlite3ExprListDelete(db, pTab^.pCheck);
-      pTab^.pCheck := nil;
-    end;
-  end;
-
-  { GENERATED-column resolve loop — port of build.c:2753..2781.
-    Each AS expression is resolved against the new table itself
-    (NC_GenCol).  On resolve error, replace the bound expression with
-    TK_NULL so downstream codegen never sees lookaside-allocated nodes
-    on a schema record.  Tables with TF_HasGenerated must also have at
-    least one non-generated column. }
-  if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
-  begin
-    nNG := 0;
-    for ii := 0 to pTab^.nCol - 1 do
-    begin
-      colFlg := pTab^.aCol[ii].colFlags;
-      if (colFlg and COLFLAG_GENERATED) <> 0 then
-      begin
-        pX := sqlite3ColumnExpr(pTab, @pTab^.aCol[ii]);
-        if sqlite3ResolveSelfReference(pParse, pTab, NC_GenCol, pX, nil) <> 0 then
-          sqlite3ColumnSetExpr(pParse, pTab, @pTab^.aCol[ii],
-            sqlite3ExprAlloc(db, TK_NULL, nil, 0));
-      end
-      else
-        Inc(nNG);
-    end;
-    if nNG = 0 then
-    begin
-      sqlite3ErrorMsg(pParse,
-        PAnsiChar('must have at least one non-generated column'));
-      Exit;
-    end;
-  end;
-
   { STRICT-table arm — port of build.c:2686..2713 (9.4.divbug.71).
     Without this, TF_Strict never reaches pTab^.tabFlags, so
     sqlite3TableAffinity skips its OP_TypeCheck branch and INSERTs of
@@ -48391,6 +48348,53 @@ begin
   end;
 
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+
+  { CHECK resolve loop — port of build.c:2738..2751.  Resolve names
+    in all CHECK constraint expressions against the new table itself
+    (NC_IsCheck); on error, drop the CHECK list so writable_schema=ON
+    cannot try to use partially-resolved nodes.  MUST run AFTER the
+    WITHOUT ROWID block above so TF_NoVisibleRowid is already set — else
+    a `rowid` reference in a CHECK on a WITHOUT ROWID table would resolve
+    against a (no-longer-)visible rowid instead of being rejected with
+    "no such column: rowid" (without_rowid1-7.3). }
+  if pTab^.pCheck <> nil then
+  begin
+    sqlite3ResolveSelfReference(pParse, pTab, NC_IsCheck, nil, pTab^.pCheck);
+    if pParse^.nErr <> 0 then begin
+      sqlite3ExprListDelete(db, pTab^.pCheck);
+      pTab^.pCheck := nil;
+    end;
+  end;
+
+  { GENERATED-column resolve loop — port of build.c:2753..2781.
+    Each AS expression is resolved against the new table itself
+    (NC_GenCol).  On resolve error, replace the bound expression with
+    TK_NULL so downstream codegen never sees lookaside-allocated nodes
+    on a schema record.  Tables with TF_HasGenerated must also have at
+    least one non-generated column. }
+  if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+  begin
+    nNG := 0;
+    for ii := 0 to pTab^.nCol - 1 do
+    begin
+      colFlg := pTab^.aCol[ii].colFlags;
+      if (colFlg and COLFLAG_GENERATED) <> 0 then
+      begin
+        pX := sqlite3ColumnExpr(pTab, @pTab^.aCol[ii]);
+        if sqlite3ResolveSelfReference(pParse, pTab, NC_GenCol, pX, nil) <> 0 then
+          sqlite3ColumnSetExpr(pParse, pTab, @pTab^.aCol[ii],
+            sqlite3ExprAlloc(db, TK_NULL, nil, 0));
+      end
+      else
+        Inc(nNG);
+    end;
+    if nNG = 0 then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('must have at least one non-generated column'));
+      Exit;
+    end;
+  end;
 
   { Row-width estimate — port of estimateTableWidth (build.c:2613).
     Sets pTab^.szTabRow to LogEst(sum_of_szEst*4 + (no IPK ? 1 : 0)).
