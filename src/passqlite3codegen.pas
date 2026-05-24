@@ -31986,6 +31986,14 @@ var
   pKeyInfoCnt:  PKeyInfo2;
   bCoverCnt:    Boolean;
   zAuthDb:      PAnsiChar;   { tag-select-0410 — zDb for unreferenced-table READ auth }
+  { with3-5.1 — CTE materialise-once locals (select.c:8063..8128 tag-select-
+    0484 / tag-select-0488).  A CTE referenced more than once (nUse>=2,
+    eM10d<>M10d_No) is materialised into a once-run subroutine on the first
+    reference; later references reuse the result via OP_Gosub + OP_OpenDup. }
+  pCteUseLoc:   PCteUse;
+  ctTopAddr:    i32;
+  ctOnceAddr:   i32;
+  ctAddrExplain: i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   { select.c:7608 — top-of-sqlite3Select authorizer check.  Fires
@@ -32812,7 +32820,14 @@ begin
         ExplainQueryPlan(("SCAN CONSTANT ROW")) at where.c:6954.  The
         Pascal no-FROM fast path bypasses WhereBegin entirely, so we
         emit the p4 narrator inline. }
-      sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0,
+      { p2 = pParse^.addrExplain — the parent EQP node so this SCAN nests
+        under the enclosing SETUP / MATERIALIZE / CO-ROUTINE narrator
+        (matches ExplainQueryPlan's use of Parse.addrExplain, vdbeaux.c:534).
+        Hardcoding 0 here forced the row to the top level, e.g. under a
+        recursive-CTE SETUP node it appeared as a sibling (with3-5.1 /
+        with3-3.x). }
+      sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v),
+                        pParse^.addrExplain, 0,
                         sqlite3MPrintf(pParse^.db, 'SCAN CONSTANT ROW', []),
                         P4_DYNAMIC);
     { WHERE — bypass body when pWhere is false (mirrors WhereBegin's
@@ -35992,12 +36007,104 @@ begin
             pItem^.iCursor := pParse^.nTab;
             Inc(pParse^.nTab);
           end;
-          sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
-                            pItem^.pSTab^.nCol);
-          sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
-          if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+          { with3-5.1 — CTE materialise-once.  A CTE referenced more than
+            once (pCteUse->nUse>=2) and not declared NOT MATERIALIZED is
+            materialised into a once-run subroutine on its first reference;
+            subsequent references reuse the materialisation via OP_Gosub +
+            OP_OpenDup rather than re-coding the (possibly recursive) CTE
+            body for every reference.  Faithful port of select.c tag-select-
+            0484 (reuse, 8063..8074) and tag-select-0488 (materialise into a
+            subroutine, 8088..8128).  pCteUse is shared across the SrcItems
+            that reference the same CTE (set in resolveFromTermToCte). }
+          pCteUseLoc := nil;
+          if ((pItem^.fg.fgBits2 and u8($02)) <> 0)        { isCte }
+             and (pItem^.u2.pCteUse <> nil) then
           begin
-            Result := SQLITE_ERROR; Exit;
+            pCteUseLoc := pItem^.u2.pCteUse;
+            if not ((pCteUseLoc^.nUse >= 2)
+                    and (pCteUseLoc^.eM10d <> u8(2))) then  { M10d_No }
+              pCteUseLoc := nil;   { single-use CTE → materialise inline }
+          end;
+
+          if (pCteUseLoc <> nil) and (pCteUseLoc^.addrM9e > 0) then
+          begin
+            { tag-select-0484 — materialisation subroutine already coded by
+              an earlier reference.  Invoke it, then make this item's cursor
+              an OpenDup of the shared ephemeral table holding the result. }
+            sqlite3VdbeAddOp2(v, OP_Gosub, pCteUseLoc^.regRtn,
+                              pCteUseLoc^.addrM9e);
+            if pItem^.iCursor <> pCteUseLoc^.iCur then
+              sqlite3VdbeAddOp2(v, OP_OpenDup, pItem^.iCursor,
+                                pCteUseLoc^.iCur);
+            pItem^.u4.pSubq^.pSelect^.nSelectRow := pCteUseLoc^.nRowEst;
+          end
+          else if pCteUseLoc <> nil then
+          begin
+            { tag-select-0488 — first reference of a multiply-used CTE.
+              Wrap the materialisation in a once-run subroutine:
+                OP_Goto -> (over body)
+                addrM9e: [OP_Once] OpenEphemeral; MATERIALIZE; <body> ;
+                         OP_Return regRtn, addrM9e
+                <here> ...
+              The non-correlated gate adds OP_Once so the body runs only on
+              the first OP_Gosub. }
+            Inc(pParse^.nMem);
+            pItem^.u4.pSubq^.regReturn := pParse^.nMem;
+            ctTopAddr := sqlite3VdbeAddOp0(v, OP_Goto);
+            pItem^.u4.pSubq^.addrFillSub := ctTopAddr + 1;
+            pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_MATERIALIZED;
+            ctOnceAddr := 0;
+            if (pItem^.fg.fgBits and u8($10)) = 0 then  { not isCorrelated }
+              ctOnceAddr := sqlite3VdbeAddOp0(v, OP_Once);
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
+                              pItem^.pSTab^.nCol);
+            sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
+            { ExplainQueryPlan2 (select.c:8113) — push a MATERIALIZE node so
+              the CTE body's SETUP / RECURSIVE STEP / SCAN children nest
+              underneath.  sqlite3Select does not auto-pop here, so
+              save/restore pParse^.addrExplain around the recursion. }
+            ctAddrExplain := pParse^.addrExplain;
+            sqlite3VdbeExplain(pParse, 1, 'MATERIALIZE %!S', [Pointer(pItem)]);
+            if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+            begin
+              Result := SQLITE_ERROR; Exit;
+            end;
+            pParse^.addrExplain := ctAddrExplain;
+            if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
+            sqlite3VdbeAddOp2(v, OP_Return, pItem^.u4.pSubq^.regReturn,
+                              ctTopAddr + 1);
+            sqlite3VdbeJumpHere(v, ctTopAddr);
+            { Stash the shared materialisation handles for reuse by the
+              remaining references (select.c:8122..8128). }
+            pCteUseLoc^.addrM9e := pItem^.u4.pSubq^.addrFillSub;
+            pCteUseLoc^.regRtn  := pItem^.u4.pSubq^.regReturn;
+            pCteUseLoc^.iCur    := pItem^.iCursor;
+            pCteUseLoc^.nRowEst := pItem^.u4.pSubq^.pSelect^.nSelectRow;
+
+            { Invoke the just-coded materialisation subroutine for THIS (the
+              first) reference.  In C this OP_Gosub is emitted by
+              sqlite3WhereBegin for every fg.isMaterialized source
+              (where.c:7439..7451): `[OP_Once] OP_Gosub regReturn,addrFillSub`.
+              The Pas port materialises here (before WhereBegin) instead of
+              inside the WHERE prologue, so emit the invocation at this site.
+              The non-correlated gate adds OP_Once so the Gosub is skipped on
+              re-entry of an enclosing loop. }
+            ctOnceAddr := 0;
+            if (pItem^.fg.fgBits and u8($10)) = 0 then  { not isCorrelated }
+              ctOnceAddr := sqlite3VdbeAddOp0(v, OP_Once);
+            sqlite3VdbeAddOp2(v, OP_Gosub, pItem^.u4.pSubq^.regReturn,
+                              pItem^.u4.pSubq^.addrFillSub);
+            if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
+          end
+          else
+          begin
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
+                              pItem^.pSTab^.nCol);
+            sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
+            if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+            begin
+              Result := SQLITE_ERROR; Exit;
+            end;
           end;
         end;
       end;
