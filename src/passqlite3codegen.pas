@@ -57440,10 +57440,16 @@ begin
     Exit;
   end;
 
-  { PragTyp_AUTO_VACUUM read arm (pragma.c:801).  Calls into the btree
+  { PragTyp_AUTO_VACUUM read arm (pragma.c:805..806).  Calls into the btree
     layer which reads pBt^.autoVacuum / pBt^.incrVacuum (populated from
     page-1 header meta[4]/meta[7] in lockBtree).  Returns 0=NONE,
-    1=FULL, 2=INCREMENTAL.  9.2.divbug.F. }
+    1=FULL, 2=INCREMENTAL.  9.2.divbug.F.
+    NOTE: unlike PRAGMA schema_version (which emits a runtime OP_ReadCookie),
+    this arm bakes the current mode as a constant OP_Integer, so it must NOT
+    be marked sqlite3VdbeReusable — C's returnSingleInt() does not mark it
+    reusable either.  Marking a baked-constant statement reusable lets a
+    cached prepared statement survive a VACUUM that changes auto_vacuum and
+    then report the stale pre-VACUUM mode (vacuum-7.6). }
   if SameText(zName, 'auto_vacuum') and (pValue = nil) then begin
     if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
     pBtArg := PBtree(db^.aDb[iDb].pBt);
@@ -57453,7 +57459,6 @@ begin
       iVal := 0;
     sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-    sqlite3VdbeReusable(v);
     Exit;
   end;
 
