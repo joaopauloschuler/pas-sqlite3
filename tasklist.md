@@ -1573,6 +1573,20 @@ and can be added later via a small C entry stub.
     **Rule**: always guard with `if N > 0 then` before such a loop, or rewrite
     as `i := 0; while i < N do begin ... Inc(i); end`.
 
+17. **`external 'c'` scalar params use the `ctypes` aliases, not ad-hoc Pascal
+    widths.** Map C scalar types to the canonical aliases: `cint` ← `int`,
+    `clong` ← `long`, `csize_t` ← `size_t`, `coff_t` ← `off_t`. Do NOT reach for
+    `NativeInt`/`NativeUInt`/`i32`/`Integer` — on x86_64 LP64 they happen to be
+    width-equivalent so it compiles, but it (a) silently drifts when the same C
+    function is bound in two places and (b) is a portability bug off LP64.
+    Concentrate shared libc bindings in **one** unit so there is a single source
+    of truth — the FILE* stdio family (`fopen`/`fclose`/`fread`/`fwrite`/`fseek`/
+    `ftell`/`fflush`/`rewind`/`fprintf`, plus `PFILE`/`stdout`) lives in
+    `passqlite3os.pas` (interface), shared by the csv/fileio/zipfile/vfslog/
+    tmstmpvfs extensions and the shell. `UnixType` (already used by os.pas)
+    exports `cint`/`clong`/`csize_t`; do not add `ctypes` alongside it (the two
+    units both define those names and will clash).
+
 ---
 
 ## Finding code duplication (port-introduced vs. upstream)
