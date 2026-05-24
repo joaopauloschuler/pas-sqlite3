@@ -34942,11 +34942,29 @@ begin
     { Allow single-source eponymous vtab — handled below by emitting
       VOpen/VFilter/VNext directly instead of WhereBegin.  Lifts the
       `count(*) >= N FROM <eponymous-vtab>` and similar shapes that the
-      existing fast paths only catch for the bare `count(*)` form. }
+      existing fast paths only catch for the bare `count(*)` form.
+
+      Restriction: this Pas-only arm only ever seeds xBestIndex from the
+      table-valued-function args (pItem^.u1.pFuncArg → hidden-column EQ
+      constraints); it then applies p^.pWhere purely as a post-filter
+      (OP_If after the VFilter loop).  That is correct for a TVF whose
+      xFilter yields every row regardless of idxNum (json_each, etc.).
+      It is WRONG for a CREATE-VIRTUAL-TABLE vtab whose xBestIndex must
+      receive a WHERE constraint to produce any rows at all — e.g.
+      transitive_closure requires a `root=?` EQ term; with idxNum=0 its
+      xFilter returns no rows, so the post-filter sees nothing and
+      count/min/max collapse to 0/NULL (closure01-1.10 / 2.1).  C has no
+      such arm — it always calls sqlite3WhereBegin (select.c:8872), which
+      drives whereLoopAddVirtual/allocateIndexInfo over the real WHERE
+      terms.  So: only take the fast arm for a table-valued function, or
+      when there is no WHERE clause; otherwise fall through to the general
+      WhereBegin path below, which routes the WHERE terms into xBestIndex. }
     if (p^.pSrc^.nSrc = 1)
        and (pItem^.pSTab <> nil)
        and (pItem^.pSTab^.eTabType = TABTYP_VTAB)
-       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
+       and ((p^.pWhere = nil)
+            or ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)) then
       isVtabAgg := True
     { Pas-only: aggregate-on-subquery — Phase 6.13(b)-coagg.  Single-
       source FROM (SELECT …) for an aggregate query: materialise the
@@ -34987,6 +35005,18 @@ begin
            and (pTab^.eTabType <> TABTYP_VTAB) then
           { materialisable subquery / view source — handled by the
             pre-materialise loop after this gate; do not bail. }
+        else if (p^.pSrc^.nSrc = 1)
+           and (pTab <> nil)
+           and (pTab^.eTabType = TABTYP_VTAB)
+           and ((pItem[jAgg].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
+          { Single non-subquery vtab source reached here only because the
+            isVtabAgg fast arm declined it (a CREATE-VIRTUAL-TABLE vtab
+            with a WHERE clause whose terms must drive xBestIndex — e.g.
+            transitive_closure root=?).  Do NOT bail: let the general
+            sqlite3WhereBegin arm below code the vtab scan, exactly as C
+            does (select.c:8872).  WhereBegin opens the vtab cursor and
+            drives whereLoopAddVirtual over the real WHERE terms, so the
+            mandatory constraint reaches xFilter (closure01-1.10 / 2.1). }
         else if (pTab = nil)
            or (pTab^.eTabType = TABTYP_VTAB)
            or (pTab^.eTabType = TABTYP_VIEW)
