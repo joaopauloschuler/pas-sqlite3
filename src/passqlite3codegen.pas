@@ -29833,7 +29833,45 @@ begin
           zSavedAuthCtx := pParse^.zAuthContext;
           if pItem^.zName <> nil then
             pParse^.zAuthContext := pItem^.zName;
-          sqlite3SelectPrep(pParse, pSubSel, nil);
+          { resolve.c:1898..1908 / 2021..2028 — converted compound ORDER BY
+            move.  When the parent SELECT was rewritten by
+            convertCompoundSelectToSubquery into `SELECT * FROM (compound)
+            ORDER BY .. COLLATE ..` (SF_Converted), the ORDER BY must be
+            resolved as part of the compound sub-query (so its terms can
+            match the compound arms' result columns through
+            resolveCompoundOrderBy).  C moves pOrderBy DOWN onto the
+            sub-query in resolveSelectStep, resolves, then moves it back
+            (now as integer column numbers) onto the parent.
+
+            This port resolves the FROM sub-query here inside the expander,
+            so the move is staged around the sub-query's resolution: the
+            ORDER BY stays OFF the compound during its EXPAND (so the
+            recursive convertCompoundSelectToSubquery pass, which keys on
+            pOrderBy<>0, does not wrap the compound a second time), is moved
+            DOWN before its name-resolution, then moved BACK afterwards.
+            The parent's own ORDER BY resolution (later, in
+            sqlite3ResolveSelectNames) then converts the integer terms into
+            copies of the parent result-set columns. }
+          if ((pSelect^.selFlags and SF_Converted) <> 0)
+             and (pSelect^.pOrderBy <> nil)
+             and (pSubSel^.pPrior <> nil)
+             and (pSubSel^.pOrderBy = nil)
+             and ((pSubSel^.selFlags and SF_HasTypeInfo) = 0) then
+          begin
+            sqlite3SelectExpand(pParse, pSubSel);
+            if pParse^.nErr = 0 then
+            begin
+              pSubSel^.pOrderBy := pSelect^.pOrderBy;
+              pSelect^.pOrderBy := nil;
+              sqlite3ResolveSelectNames(pParse, pSubSel, nil);
+              pSelect^.pOrderBy := pSubSel^.pOrderBy;
+              pSubSel^.pOrderBy := nil;
+              if pParse^.nErr = 0 then
+                sqlite3SelectAddTypeInfo(pParse, pSubSel);
+            end;
+          end
+          else
+            sqlite3SelectPrep(pParse, pSubSel, nil);
           pParse^.zAuthContext := zSavedAuthCtx;
           if pParse^.nErr <> 0 then Exit;
         end;
