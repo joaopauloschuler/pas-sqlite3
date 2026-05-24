@@ -11105,6 +11105,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pItem:  PSrcItem;
     base:   PSrcItem;
     pDef_:  PTFuncDef;
+    pWin_:  PWindow;
     i:      i32;
     iCol:   i32;
     nArg_:  i32;
@@ -12033,6 +12034,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               pE^.iTable := 8388608
             else
               pE^.iTable := 125829120;
+        end;
+        { resolve.c:1234..1244 (0==IN_RENAME_OBJECT, #ifndef
+          SQLITE_OMIT_WINDOWFUNC) — post-resolve validation of a function
+          call.  pWin mirrors resolve.c:1123
+            Window *pWin = (IsWindowFunc(pExpr) ? pExpr->y.pWin : 0);
+          where IsWindowFunc(p) is EP_WinFunc set AND eFrmType<>TK_FILTER
+          (sqliteInt.h:3205).  When the resolved aggregate FuncDef has no
+          xValue callback (i.e. it was registered with step+finalize only,
+          via sqlite3_create_function rather than _window_function) and the
+          call carries an OVER/window clause, it "may not be used as a window
+          function".  Without this arm a user step-only aggregate used with
+          OVER silently runs and returns NULLs (window5-3.0). }
+        if (pDef_ <> nil) and (not InRenameObject(pParse)) then
+        begin
+          pWin_ := nil;
+          if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
+             and (pE^.y.pWin^.eFrmType <> TK_FILTER) then
+            pWin_ := pE^.y.pWin;
+          if (not Assigned(pDef_^.xValue)) and (pWin_ <> nil) then
+          begin
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              '%s() may not be used as a window function', [pE^.u.zToken]));
+            sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          end;
         end;
         { divbug.14 (residual aggorderby-1.3) — resolve.c:1288..1290.  If
           the resolved FuncDef is NOT an aggregate (xFinalize nil) and the

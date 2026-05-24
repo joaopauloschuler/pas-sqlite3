@@ -24,9 +24,20 @@ uses
   passqlite3util,
   passqlite3os,
   passqlite3vdbe,
+  passqlite3codegen,
   passqlite3main;
 
 function sqlite3PercentileInit(db: PTsqlite3): i32;
+
+{ Register the percentile family (median/percentile/percentile_cont/
+  percentile_disc) into the GLOBAL builtin-function hash, mirroring the
+  way C's func.c registers them via WAGGREGATE+sqlite3InsertBuiltinFuncs
+  when compiled with SQLITE_ENABLE_PERCENTILE.  This MUST be a builtin
+  (not a per-connection sqlite3_create_function entry in db^.aFunc) so a
+  user-defined function of the same name — e.g. the window5.test
+  `sqlite3_create_window_function db median ...` — correctly overrides it
+  (sqlite3FindFunction prefers db^.aFunc matches over builtins). }
+procedure sqlite3PercentileFunctions;
 
 implementation
 
@@ -382,25 +393,56 @@ begin
   percentCompute(pCtx, 0);
 end;
 
-function sqlite3PercentileInit(db: PTsqlite3): i32;
-const
-  GFlags = SQLITE_UTF8 or SQLITE_INNOCUOUS or SQLITE_SELFORDER1;
 var
-  rc, i: i32;
+  { Module-static FuncDef storage for the four percentile builtins.  Like
+    aStatFuncs / aBuiltinFuncs (codegen.pas) the bucket-chain links live in
+    these records, so re-running sqlite3PercentileFunctions is idempotent
+    (sqlite3InsertBuiltinFuncs skips already-linked entries). }
+  aPercentileFuncs:      array[0..3] of TFuncDef;
+  percentileFuncsInited: Boolean = False;
+
+procedure sqlite3PercentileFunctions;
+const
+  { WAGGREGATE flags for the percentile family (func.c:3366..3377):
+    SQLITE_FUNC_BUILTIN|SQLITE_UTF8|SQLITE_INNOCUOUS|SQLITE_SELFORDER1.
+    Aggregate-ness comes from a non-nil xFinalize; usable as a window
+    function via xValue/xInverse. }
+  GFlags = SQLITE_FUNC_BUILTIN or SQLITE_UTF8
+        or SQLITE_INNOCUOUS or SQLITE_SELFORDER1;
+var
+  i: i32;
 begin
-  rc := SQLITE_OK;
+  if percentileFuncsInited then Exit;
+  percentileFuncsInited := True;
+  FillChar(aPercentileFuncs[0], SizeOf(aPercentileFuncs), 0);
   for i := 0 to High(aPercentFunc) do
   begin
-    rc := sqlite3_create_window_function(db,
-            aPercentFunc[i].zName,
-            aPercentFunc[i].nArg,
-            GFlags,
-            @aPercentFunc[i],
-            @percentStep, @percentFinal, @percentValue, @percentInverse,
-            nil);
-    if rc <> SQLITE_OK then Break;
+    aPercentileFuncs[i].nArg      := aPercentFunc[i].nArg;
+    aPercentileFuncs[i].funcFlags := GFlags;
+    { C passes SQLITE_INT_TO_PTR(arg) as pUserData (a mxFrac/discrete
+      bitmask), but this port reuses the ext/misc/percentile.c struct-based
+      callbacks which read pUserData as a PercentileFunc*.  Point it at the
+      matching aPercentFunc[] descriptor so percentStep can read mxFrac. }
+    aPercentileFuncs[i].pUserData := @aPercentFunc[i];
+    aPercentileFuncs[i].xSFunc    := TxSFuncProc(@percentStep);
+    aPercentileFuncs[i].xFinalize := TxFinalProc(@percentFinal);
+    aPercentileFuncs[i].xValue    := TxValueProc(@percentValue);
+    aPercentileFuncs[i].xInverse  := TxInverseProc(@percentInverse);
+    aPercentileFuncs[i].zName     := aPercentFunc[i].zName;
   end;
-  Result := rc;
+  sqlite3InsertBuiltinFuncs(@aPercentileFuncs, Length(aPercentileFuncs));
+end;
+
+{ sqlite3PercentileInit — retained for callers that wire ext/misc
+  extensions per-connection (shell.c-style _init hooks).  Now that the
+  percentile family is a global builtin, this just ensures the builtin
+  registration has run; it no longer adds per-connection db^.aFunc entries
+  (which would shadow user-defined functions of the same name). }
+function sqlite3PercentileInit(db: PTsqlite3): i32;
+begin
+  sqlite3PercentileFunctions;
+  Result := SQLITE_OK;
+  if db = nil then ;
 end;
 
 end.
