@@ -33973,7 +33973,8 @@ begin
       mechanism that makes `SELECT … w1() OVER A, w2() OVER B …` (mixed
       partitions) emit nested co-routine layers, one per distinct OVER spec
       (window.c:1332 sqlite3WindowLink chain + select.c:7686 recursion). }
-    if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab) then
+    if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab)
+       and (pDest^.eDest <> SRT_Coroutine) then
     begin Result := SQLITE_OK; Exit; end;
     { Outer ORDER BY combined with LIMIT not yet supported.  DISTINCT
       combined with ORDER BY needs OMITREF/sorter-key dedup that the
@@ -34152,6 +34153,20 @@ begin
       sqlite3ReleaseTempReg(pParse, r2);
       sqlite3ReleaseTempReg(pParse, r1);
     end
+    else if pDest^.eDest = SRT_Coroutine then
+    begin
+      { Windowed SELECT as the body of a FROM-subquery/view: the caller codes
+        it with eDest = SRT_Coroutine.  Yield each row to the consumer instead
+        of emitting ResultRow.  Mirrors selectInnerLoop's shared SRT_Coroutine
+        /SRT_Output case (select.c:1441..1451): OFFSET/LIMIT handling is the
+        same as SRT_Output, only the per-row dispatch differs (OP_Yield
+        pDest->iSDParm instead of OP_ResultRow). }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, iContW);
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
+    end
     else
     begin
       { OFFSET skip — jump to iContW (which OP_Returns to Step) without emitting
@@ -34202,6 +34217,10 @@ begin
         sqlite3ReleaseTempReg(pParse, r2);
         sqlite3ReleaseTempReg(pParse, r1);
       end
+      else if pDest^.eDest = SRT_Coroutine then
+        { Windowed coroutine subquery WITH outer ORDER BY: drain the sorter and
+          yield each row.  Mirrors selectInnerLoop SRT_Coroutine (select.c:1448). }
+        sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
       else
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
       if addrSortContW <> 0 then
