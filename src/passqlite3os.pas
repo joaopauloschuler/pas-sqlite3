@@ -110,9 +110,12 @@ function  libc_ftell(stream: PFILE): clong; cdecl; external 'c' name 'ftell';
 function  libc_fflush(stream: PFILE): cint; cdecl; external 'c' name 'fflush';
 procedure libc_rewind(stream: PFILE); cdecl; external 'c' name 'rewind';
 function  libc_fprintf(stream: PFILE; fmt: PAnsiChar): cint; cdecl; varargs; external 'c' name 'fprintf';
+function  libc_popen(command, mode: PAnsiChar): PFILE; cdecl; external 'c' name 'popen';
+function  libc_pclose(stream: PFILE): cint; cdecl; external 'c' name 'pclose';
 
 var
   libc_stdout: PFILE; external 'c' name 'stdout';
+  libc_stderr: PFILE; external 'c' name 'stderr';
 
 { Public API entry points — forwarded to the util.pas implementations
   that dispatch through sqlite3GlobalConfig.m.  Declared here so the

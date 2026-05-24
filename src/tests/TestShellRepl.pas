@@ -438,7 +438,7 @@ begin
 
   { ----- -pcachetrace stderr capture (10.1.3.c) --------------------- }
   { Same shape as memtrace.  Upstream prints PCACHE.* lines on
-    stderr; the port routes through shellLibcStderr as wired in
+    stderr; the port routes through libc_stderr as wired in
     10.1.3.c.  We test on a real on-disk DB (not :memory:) because
     the in-memory backend bypasses the page cache entirely, so
     -pcachetrace would emit nothing useful on :memory:. }

@@ -4754,21 +4754,12 @@ function shellGetTimeOfDay(tp: Pointer; tzp: Pointer): cint;
 
 { libc 'stderr' FILE* — used to wire -memtrace / -pcachetrace to the
   same sink as shell.c.in:13197 / :13199 (sqlite3{Mem,Pcache}TraceActivate
-  receive stderr).  Declared cvar/external so FPC resolves it against
-  glibc's global FILE*; on Linux this is the canonical handle, matching
-  the C shell exactly. }
-var
-  shellLibcStderr: Pointer; external 'c' name 'stderr';
-
-{ 10.1.24.b — libc popen/pclose/fread/fclose for the .import "|cmd" arm.
-  Bound directly because FPC's Unix.POpen returns a pid bound to a
-  Text/file variable, which doesn't compose with importGetc's byte-at-a-
-  time read loop.  Mirrors C shell.c.in:7593..7600 which calls
-  sqlite3_popen / pclose against a FILE*. }
-function shellLibcPOpen(cmd, mode: PAnsiChar): Pointer;
-  cdecl; external 'c' name 'popen';
-function shellLibcPClose(stream: Pointer): cint;
-  cdecl; external 'c' name 'pclose';
+  receive stderr).  libc_stderr now comes from passqlite3os.pas (shared
+  libc stdio bindings); local external removed. }
+{ 10.1.24.b — libc popen/pclose for the .import "|cmd" arm now come from
+  passqlite3os.pas (shared libc stdio bindings); local externals removed.
+  Mirrors C shell.c.in:7593..7600 which calls popen / pclose against a
+  FILE*. }
 { 10.1.36 — libc fread/fclose/fopen/fflush/fprintf + stdout now come from
   passqlite3os.pas (shared libc stdio bindings); local externals removed. }
 var
@@ -4977,7 +4968,7 @@ begin
     in shell.c.in). }
   if (gLogFile <> nil)
      and (gLogFile <> libc_stdout)
-     and (gLogFile <> shellLibcStderr) then
+     and (gLogFile <> libc_stderr) then
     libc_fclose(gLogFile);
   gLogFile := nil;
   if zFile = 'on' then begin
@@ -4989,7 +4980,7 @@ begin
     gLogFile := libc_stdout;
     zLogFile := zFile;
   end else if zFile = 'stderr' then begin
-    gLogFile := shellLibcStderr;
+    gLogFile := libc_stderr;
     zLogFile := zFile;
   end else begin
     gLogFile := libc_fopen(PAnsiChar(zFile), 'wb');
@@ -8755,7 +8746,7 @@ begin
   { 10.1.24.b — pclose() the popen()'d pipe.  Mirrors C xCloser=pclose
     invocation in import_cleanup (shell.c.in:6810..6814). }
   if p.pipeOpen then begin
-    shellLibcPClose(p.pipeFile);
+    libc_pclose(p.pipeFile);
     p.pipeOpen := False;
     p.pipeFile := nil;
   end;
@@ -9246,9 +9237,9 @@ begin
         sCtx.in     = popen(zFile+1, "r");
         sCtx.zFile  = "<pipe>";
         sCtx.xCloser = pclose;
-      We bind libc popen/pclose directly (see shellLibcPOpen) and route
+      We bind libc popen/pclose directly (see libc_popen) and route
       reads through importGetc's pipeFile branch. }
-    sCtx.pipeFile := shellLibcPOpen(PAnsiChar(Copy(zFile, 2, Length(zFile) - 1)),
+    sCtx.pipeFile := libc_popen(PAnsiChar(Copy(zFile, 2, Length(zFile) - 1)),
                                     PAnsiChar('r'));
     if sCtx.pipeFile = nil then begin
       { Mirror C dotCmdError(p, 0, 0, "cannot open \"%s\"", zFile) which
@@ -11607,10 +11598,10 @@ begin
       { accepted, no Pascal-side wiring needed }
     else if (z = '-memtrace') then
       { shell.c.in:13196 — no-arg flag; activates memtrace trampoline. }
-      sqlite3MemTraceActivate(shellLibcStderr)
+      sqlite3MemTraceActivate(libc_stderr)
     else if (z = '-pcachetrace') then
       { shell.c.in:13198 — no-arg flag; activates pcachetrace trampoline. }
-      sqlite3PcacheTraceActivate(shellLibcStderr)
+      sqlite3PcacheTraceActivate(libc_stderr)
     else if (z = '-heap') or (z = '-mmap') or (z = '-vfstrace')
          or (z = '-multiplex') or (z = '-sorterref')
          or (z = '-vfs') then begin
