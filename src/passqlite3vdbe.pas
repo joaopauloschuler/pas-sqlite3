@@ -10219,7 +10219,10 @@ begin
       while i <= n do begin
         rc := sqlite3VdbeMemCopy(pOut, pIn1);
         if rc <> SQLITE_OK then goto abort_due_to_error;
-        pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or (pOut^.flags and MEM_TypeMask);
+        { vdbe.c:1663 — when the 0x0002 bit of P5 is set, clear MEM_Subtype
+          on the destination (value crosses a coroutine/subquery boundary). }
+        if ((pOut^.flags and MEM_Subtype) <> 0) and ((pOp^.p5 and $0002) <> 0) then
+          pOut^.flags := pOut^.flags and not u16(MEM_Subtype);
         Inc(pIn1);
         Inc(pOut);
         Inc(i);
