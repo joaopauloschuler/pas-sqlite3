@@ -6667,6 +6667,17 @@ begin
             pExpr^.pAggInfo^.sortingIdxPTab,
             pExpr^.pAggInfo^.aCol[pExpr^.iAgg].iSorterColumn,
             target);
+          { expr.c:4981..4991 — when the sorter column maps to a real table
+            column with REAL affinity, the value may be stored as an integer
+            in the sorter record; coerce it back with OP_RealAffinity so a
+            REAL column (incl. a REAL VIRTUAL generated column) prints as a
+            float on the GROUP BY output path (select3-9.100). }
+          if (pExpr^.pAggInfo^.aCol[pExpr^.iAgg].pTab <> nil)
+             and (pExpr^.pAggInfo^.aCol[pExpr^.iAgg].iColumn >= 0)
+             and (pExpr^.pAggInfo^.aCol[pExpr^.iAgg].pTab^.aCol[
+                    pExpr^.pAggInfo^.aCol[pExpr^.iAgg].iColumn].affinity
+                  = AnsiChar(SQLITE_AFF_REAL)) then
+            sqlite3VdbeAddOp1(v, OP_RealAffinity, target);
           done := True;
         end
         else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
