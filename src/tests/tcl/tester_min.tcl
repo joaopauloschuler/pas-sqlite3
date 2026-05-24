@@ -265,6 +265,32 @@ proc do_execsql_test {args} {
       [list [list {*}$result]]
 }
 
+# output1 — minimal stand-in for upstream tester.tcl:649.  The full
+# upstream proc keys off [verbose]; this minimal harness has no verbosity
+# machinery (verbose is absent), so we delegate to output2 (the default
+# v==1 behaviour) which writes to stdout.  Defined only if absent so a
+# fuller harness override still wins.
+if {[llength [info commands output1]]==0} {
+  proc output1 {args} { uplevel output2 $args }
+}
+
+# execsql_timed — upstream tester.tcl:1449.  Verbatim.
+proc execsql_timed {sql {db db}} {
+  set tm [time {
+    set x [uplevel [list $db eval $sql]]
+  } 1]
+  set tm [lindex $tm 0]
+  output1 -nonewline " ([expr {$tm*0.001}]ms) "
+  set x
+}
+
+# do_timed_execsql_test — upstream tester.tcl:977.  Verbatim.
+proc do_timed_execsql_test {testname sql {result {}}} {
+  fix_testname testname
+  uplevel do_test [list $testname] [list "execsql_timed {$sql}"]\
+                                   [list [list {*}$result]]
+}
+
 # finalize_testing — upstream tester.tcl:1256.. distilled down to the
 # summary print + exit-code arm.  We deliberately skip the soft/hard
 # heap-limit, vfs_unlink_test, sqlite3_reset_auto_extension and
