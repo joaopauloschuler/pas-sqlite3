@@ -12067,7 +12067,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             with xSFunc set. }
           pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
                                        pParse^.db^.enc, 0);
-          if pParse^.db^.init.busy = 0 then
+          { resolve.c:1234 — the entire error-emission block is wrapped in
+            `if( 0==IN_RENAME_OBJECT )`.  Under ALTER ... RENAME re-parse
+            (eParseMode>=PARSE_MODE_RENAME) C leaves pDef=0 as a no-op
+            placeholder and does NOT raise "no such function" / "wrong
+            number of arguments"; the rename machinery only needs token
+            positions, not a resolvable function. }
+          if (pParse^.db^.init.busy = 0) and (not InRenameObject(pParse)) then
           begin
             if pDef_ = nil then
               sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
@@ -28045,14 +28051,19 @@ begin
   end;
 end;
 
-{ sqlite3SelectWrongNumTermsError — report compound term count mismatch }
+{ sqlite3SelectWrongNumTermsError — report compound term count mismatch
+  (select.c:3067..3075).  The non-VALUES message embeds the compound
+  operator name via sqlite3SelectOpName(p^.op); the previous port passed
+  a literal "%s" to sqlite3ErrorMsg (which performs no substitution),
+  leaving an empty operator slot. }
 procedure sqlite3SelectWrongNumTermsError(pParse: PParse; p: PSelect);
 begin
   if p^.selFlags and SF_Values <> 0 then
     sqlite3ErrorMsg(pParse, 'all VALUES must have the same number of terms')
   else
-    sqlite3ErrorMsg(pParse,
-      'SELECTs to the left and right of %s do not have the same number of result columns');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'SELECTs to the left and right of %s do not have the same number of result columns',
+      [sqlite3SelectOpName(p^.op)]));
 end;
 
 { recursiveInnerLoop — minimal selectInnerLoop equivalent for the
@@ -28976,12 +28987,34 @@ end;
 { sqlite3SelectPrep — prepare a SELECT before code generation }
 procedure sqlite3SelectPrep(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
+var
+  pArm: PSelect;
 begin
   if pParse^.db^.mallocFailed <> 0 then Exit;
   if p = nil then Exit;
   if (p^.selFlags and SF_HasTypeInfo) <> 0 then Exit;
   sqlite3SelectExpand(pParse, p);
   if pParse^.nErr <> 0 then Exit;
+  { resolve.c:2069..2074 — every arm of a compound SELECT (including a
+    multi-row VALUES, which is a compound of SF_Values arms) must have the
+    same number of result columns.  C checks this in resolveSelectStep, so
+    it fires during name resolution and is therefore reported even under
+    ALTER ... RENAME re-parse (which resolves but never codegens).  This
+    port's normal arity check lives in the multiSelect codegen path, which
+    rename mode never reaches; without this walk the VALUES-arity error is
+    silently dropped during a rename (altertab2-9.1).  Walk the pPrior chain
+    and compare each arm's pEList count with its prior arm's. }
+  pArm := p;
+  while (pArm <> nil) and (pArm^.pPrior <> nil) do
+  begin
+    if (pArm^.pEList <> nil) and (pArm^.pPrior^.pEList <> nil)
+       and (pArm^.pEList^.nExpr <> pArm^.pPrior^.pEList^.nExpr) then
+    begin
+      sqlite3SelectWrongNumTermsError(pParse, pArm);
+      Exit;
+    end;
+    pArm := pArm^.pPrior;
+  end;
   sqlite3ResolveSelectNames(pParse, p, pOuterNC);
   if pParse^.nErr <> 0 then Exit;
   sqlite3SelectAddTypeInfo(pParse, p);
@@ -29118,6 +29151,8 @@ var
   pNxt:      PSrcItem;
   isNestedWrap:    Boolean;
   anyNestedMatch:  Boolean;
+  pDotLeft:  PExpr;
+  pDotRight: PExpr;
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
@@ -29293,6 +29328,36 @@ begin
            (sqlite3IdListIndex(pItem^.u3.pUsing,
                                pCol^.zCnName) >= 0) then
           Continue;
+        { select.c:6260..6274 — under IN_RENAME_OBJECT, T.* must expand to a
+          TK_DOT(TK_ID tab, TK_ID col) node (NOT the executable TK_COLUMN
+          this port normally synthesises) and the new TK_ID `tab` left node
+          must be remapped from the original `pE^.pLeft` token via
+          sqlite3RenameTokenRemap.  Without this the `tab` prefix of a
+          `tab.*` reference is never rewritten when the table is renamed, so
+          the post-rename re-validation re-parses `t1.*` against a schema
+          where the table is now `t2` and aborts "no such table: t1"
+          (altertab3-29.x).  The expr is only walked for tokens in rename
+          mode, never executed, so the TK_DOT/TK_ID shape is sufficient. }
+        if InRenameObject(pParse) then
+        begin
+          if pItem^.zAlias <> nil then
+            zTabName := pItem^.zAlias
+          else
+            zTabName := pTab^.zName;
+          zColName  := pCol^.zCnName;
+          pDotRight := sqlite3Expr(db, TK_ID, zColName);
+          pDotLeft  := sqlite3Expr(db, TK_ID, zTabName);
+          pColExpr  := sqlite3PExpr(pParse, TK_DOT, pDotLeft, pDotRight);
+          if (pDotLeft <> nil) and (pE^.pLeft <> nil) then
+            sqlite3RenameTokenRemap(pParse, pDotLeft, pE^.pLeft);
+          if pColExpr = nil then Continue;
+          if j < BMS - 1 then
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
+          else
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+          pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
+          Continue;
+        end;
         pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
         if pColExpr = nil then Continue;
         pColExpr^.iTable  := pItem^.iCursor;
@@ -47457,6 +47522,18 @@ begin
   if (nTerm = 1) and (pCol <> nil)
      and (eCType = COLTYPE_INTEGER) and (sortOrder <> SQLITE_SO_DESC) then
   begin
+    { build.c:1873..1876 — when a table-constraint PRIMARY KEY(<col>) folds
+      into the INTEGER PRIMARY KEY (rowid alias), no separate index is built,
+      so the rename token the parser attached to the <col> expr would be lost
+      when pList is deleted at primary_key_exit.  Under IN_RENAME_OBJECT,
+      remap that token from the column expr onto &pTab^.iPKey so the rename
+      machinery still finds and rewrites the column name (altertab3-5.1). }
+    if InRenameObject(pParse) and (pList <> nil) then
+    begin
+      pItem  := ExprListItems(pList);
+      pCExpr := sqlite3ExprSkipCollate(pItem[0].pExpr);
+      sqlite3RenameTokenRemap(pParse, @pTab^.iPKey, pCExpr);
+    end;
     pTab^.iPKey   := i16(iCol);
     pTab^.keyConf := u8(onError);
     AssertH((autoInc = 0) or (autoInc = 1), 'AddPrimaryKey autoInc');
@@ -50326,6 +50403,14 @@ begin
   pItem^.zName := sqlite3DbStrNDup(db, PChar(pToken^.z), pToken^.n);
   if pItem^.zName <> nil then sqlite3Dequote(pItem^.zName);
   Inc(pNew^.nId);
+  { build.c:4727..4729 — under IN_RENAME_OBJECT, map the column-name string
+    to its source token so ALTER ... RENAME COLUMN can rewrite it.  Without
+    this, the column names in a multi-column UPDATE SET LHS list (e.g.
+    `SET (c,d)=(a,b)`, whose IdList zNames are transferred to the ExprList
+    zEName by sqlite3ExprListAppendVector) carry no rename token and are
+    left unchanged when the column is renamed (altertab2-4.3). }
+  if InRenameObject(pParse) and (pItem^.zName <> nil) then
+    sqlite3RenameTokenMap(pParse, Pointer(pItem^.zName), pToken);
   Result := pNew;
 end;
 
