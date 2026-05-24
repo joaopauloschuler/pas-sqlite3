@@ -69788,13 +69788,18 @@ begin
     sqlite3ErrorMsg(@sParse, PAnsiChar(AnsiString('cannot open view: ') + AnsiString(zTable)));
   end;
 
-  if pTab = nil then begin
-    rc := SQLITE_ERROR;
-    sqlite3BtreeLeaveAll(db);
-    goto blob_open_out;
-  end;
-  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
-  if iDb < 0 then begin
+  iDb := -1;
+  if pTab <> nil then
+    iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  if (pTab = nil) or (iDb < 0) then begin
+    { vdbeblob.c:186..190 — transfer the local sParse error message
+      (set by sqlite3ErrorMsg above) onto zErr so blob_open_out can
+      propagate it to the db via sqlite3ErrorWithMsg. }
+    if sParse.zErrMsg <> nil then begin
+      sqlite3DbFree(db, zErr);
+      zErr := sParse.zErrMsg;
+      sParse.zErrMsg := nil;
+    end;
     rc := SQLITE_ERROR;
     sqlite3BtreeLeaveAll(db);
     goto blob_open_out;
