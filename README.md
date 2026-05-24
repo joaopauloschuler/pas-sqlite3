@@ -6,7 +6,7 @@ from C to **Free Pascal (FPC 3.2.2+)** targeting x86-64 Linux.
 > **Status: Phases 0–5 complete; Phases 6–8 ported — in testing.**  The Pascal port now opens databases, parses SQL,
 > generates VDBE bytecode, and runs queries end-to-end against its own
 > pager / B-tree / VDBE.  The full `Test*` regression gate reports
-> **100 / 101 binaries passing** and **5199 / 5199 assertions passing**
+> **111 / 112 binaries passing** and **5264 / 5264 assertions passing**
 > (only `TestFuzzDiff` still red).  `TestExplainParity` reports
 > **1026 / 1026** SQL statements producing byte-identical VDBE bytecode
 > versus the C reference.  Differential probes (`DiagOps`, `DiagCast`,
