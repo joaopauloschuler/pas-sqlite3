@@ -60940,6 +60940,24 @@ begin
   pCtx^.skipFlag := 1;
 end;
 
+{ sqlite3GetFuncCollSeq — port of func.c:27..34.  Recover the collation
+  from the OP_CollSeq emitted immediately before OP_AggStep so min()/max()
+  compare with the collating sequence of their argument (NEEDCOLL).
+  Without this both step functions defaulted to binary collation and
+  ignored COLLATE NOCASE/rtrim (minmax3-4.2..4.6). }
+function getFuncCollSeq(pCtx: Psqlite3_context): Pointer; inline;
+var
+  pOp: PVdbeOp;
+begin
+  Result := nil;
+  if (pCtx^.pVdbe <> nil) and (pCtx^.iOp >= 1) then
+  begin
+    pOp := @pCtx^.pVdbe^.aOp[pCtx^.iOp - 1];
+    if (pOp^.opcode = OP_CollSeq) and (pOp^.p4type = P4_COLLSEQ) then
+      Result := pOp^.p4.pColl;
+  end;
+end;
+
 procedure minStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pAgg: PMem;
@@ -60953,7 +60971,7 @@ begin
   if pAgg^.flags = 0 then begin
     pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
-  end else if sqlite3MemCompare(argv^, pAgg, nil) < 0 then
+  end else if sqlite3MemCompare(argv^, pAgg, getFuncCollSeq(pCtx)) < 0 then
     sqlite3VdbeMemCopy(pAgg, argv^)
   else
     minmaxSkipLoad(pCtx);
@@ -60972,7 +60990,7 @@ begin
   if pAgg^.flags = 0 then begin
     pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
-  end else if sqlite3MemCompare(argv^, pAgg, nil) > 0 then
+  end else if sqlite3MemCompare(argv^, pAgg, getFuncCollSeq(pCtx)) > 0 then
     sqlite3VdbeMemCopy(pAgg, argv^)
   else
     minmaxSkipLoad(pCtx);
