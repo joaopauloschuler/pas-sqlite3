@@ -8217,9 +8217,13 @@ begin
     compRight.pLeft := pDel;
     compRight.pRight := ExprListItems(pExpr^.x.pList)[1].pExpr;
 
-    { Scalar fast-path — exprCodeVector reduces to ExprCodeTemp for
-      non-vector LHS, which is the only shape the corpus exercises. }
-    rPDel := sqlite3ExprCodeTemp(pParse, pDel, @regFree1);
+    { expr.c:6058 — code the LHS (scalar OR vector) into one or more
+      contiguous registers, then rewrite pDel as a TK_REGISTER node.
+      sqlite3ExprToRegister keeps the original op in op2, so a vector
+      LHS stays recognisable as a vector (sqlite3ExprVectorSize checks
+      op2 for TK_REGISTER) and the synthesised GE/LE terms route through
+      codeVectorCompare with their fields read from these registers. }
+    rPDel := exprCodeVector(pParse, pDel, @regFree1);
     sqlite3ExprToRegister(pDel, rPDel);
 
     case jumpKind of
