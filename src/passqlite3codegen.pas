@@ -11573,11 +11573,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         else
           pE^.iColumn := i16(matchCol);
         pE^.y.pTab  := pMatch^.pSTab;
-        if matchCol < BMS - 1 then
-          pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
+        { resolve.c:826..832 — only a real column (iColumn>=0) contributes
+          to colUsed; the rowid/IPK alias (iColumn=-1) sets rowidUsed and
+          must NOT set a colUsed bit, else the index falsely fails the
+          covering-index test (indexedby-11.10). }
+        if pE^.iColumn >= 0 then
+        begin
+          if matchCol < BMS - 1 then
+            pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
+          else
+            pMatch^.colUsed := pMatch^.colUsed or
+                               (Bitmask(1) shl (BMS - 1));
+        end
         else
-          pMatch^.colUsed := pMatch^.colUsed or
-                             (Bitmask(1) shl (BMS - 1));
+          pMatch^.fg.fgBits2 := pMatch^.fg.fgBits2 or $80;  { rowidUsed }
         if pE^.iColumn = -1 then
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
         if (pMatch^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
