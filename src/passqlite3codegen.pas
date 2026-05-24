@@ -69202,7 +69202,14 @@ begin
   p := pX^.x.pSelect;
   if p^.pPrior <> nil                    then Exit(nil); { compound SELECT }
   if (p^.selFlags and (SF_Distinct or SF_Aggregate)) <> 0 then Exit(nil);
-  Assert(p^.pGroupBy = nil);             { implied by !SF_Aggregate }
+  { C's assert(p->pGroupBy==0) relies on resolve.c:1961 having already set
+    SF_Aggregate for any GROUP BY (pGroupBy||NC_HasAgg).  The pas resolver
+    does not track NC_HasAgg; selectMarkAggregate sets SF_Aggregate only
+    when an aggregate *function* appears in the result/HAVING, NOT for a
+    bare GROUP BY.  So a `... GROUP BY a` IN-RHS still has SF_Aggregate
+    clear here and would wrongly be treated as an index-reuse candidate
+    (in3-1.9).  Reject any GROUP BY explicitly to match C's intent. }
+  if p^.pGroupBy <> nil                  then Exit(nil);
   if p^.pLimit <> nil                    then Exit(nil);
   if p^.pWhere <> nil                    then Exit(nil);
   pSrc := p^.pSrc;
