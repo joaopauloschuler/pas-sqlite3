@@ -9212,10 +9212,14 @@ begin
     end;
     if sqlite3ExprIdToTrueFalse(pE) = 0 then
     begin
-      if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+      if (pE^.u.zToken <> nil)
+         and ((pE^.u.zToken^ <> #0) or ((pE^.flags and EP_DblQuoted) <> 0)) then
       begin
         { resolve.c:789..793 — append "should this be a string literal in
-          single-quotes?" hint when the bare identifier was double-quoted. }
+          single-quotes?" hint when the bare identifier was double-quoted.
+          C (resolve.c:761) emits the error for ANY cnt!=1 unresolved name;
+          the empty-token relaxation here lets an empty double-quoted string
+          `""` under DQS-off be rejected too (select7-6.6). }
         if (pE^.flags and EP_DblQuoted) <> 0 then
           sqlite3ErrorMsg(pParse,
             PAnsiChar('no such column: "'
@@ -11668,12 +11672,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         per resolve.c:784..795 (lookupName). }
       if sqlite3ExprIdToTrueFalse(pE) = 0 then
       begin
-        if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+        if (pE^.u.zToken <> nil)
+           and ((pE^.u.zToken^ <> #0) or ((pE^.flags and EP_DblQuoted) <> 0)) then
         begin
           { resolve.c:789..793 — when the bare identifier was a
             double-quoted string literal that failed column lookup,
             append the "should this be a string literal in single-
-            quotes?" hint.  Otherwise plain "no such column: X". }
+            quotes?" hint.  Otherwise plain "no such column: X".
+            C (resolve.c:761) errors for ANY cnt!=1 name; the empty-token
+            relaxation lets an empty double-quoted `""` under DQS-off be
+            rejected too (select7-6.6, multi-row VALUES arm). }
           if (pE^.flags and EP_DblQuoted) <> 0 then
             sqlite3ErrorMsg(pParse,
               PAnsiChar('no such column: "'
@@ -11707,8 +11715,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       end;
       if sqlite3ExprIdToTrueFalse(pE) = 0 then
       begin
-        if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+        if (pE^.u.zToken <> nil)
+           and ((pE^.u.zToken^ <> #0) or ((pE^.flags and EP_DblQuoted) <> 0)) then
         begin
+          { Empty-token relaxation: an empty double-quoted `""` under
+            DQS-off must still raise "no such column" (resolve.c:761,
+            select7-6.6 no-FROM multi-row VALUES arm). }
           if (pE^.flags and EP_DblQuoted) <> 0 then
             sqlite3ErrorMsg(pParse,
               PAnsiChar('no such column: "'
