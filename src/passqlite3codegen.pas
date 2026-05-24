@@ -31852,6 +31852,7 @@ var
   addrEnd:     i32;
   addrTopOfLoop: i32;
   addrSkip:    i32;
+  addrLimitEnd: i32;
   savedAddrExplainSub: i32;
   addrSetAbort: i32;
   addr1:       i32;
@@ -34723,6 +34724,20 @@ begin
         assignAggregateRegisters(pParse, pAggI2);
         resetAccumulatorSimple(pParse, pAggI2);
 
+        { Set the limiter — select.c:8239..8245 (tag-select-0650).  The
+          single aggregate result row is emitted below straight to pDest
+          (the Pas port hand-rolls selectInnerLoop's output here); without
+          computeLimitRegisters + the codeOffset / OP_DecrJumpZero gates
+          in that output block, LIMIT / OFFSET on a no-GROUP-BY aggregate
+          (incl. the min/max single-row optimisation) is silently ignored
+          — e.g. `SELECT max(a) FROM t LIMIT 0` wrongly returned a row
+          (minmax2-6.4/6.6/6.7).  computeLimitRegisters is idempotent
+          (no-op once p^.iLimit is set) and emits OP_Goto addrLimitEnd for
+          a constant LIMIT 0, skipping the whole scan, matching C. }
+        addrLimitEnd := sqlite3VdbeMakeLabel(pParse);
+        if p^.pLimit <> nil then
+          computeLimitRegisters(pParse, p, addrLimitEnd);
+
         if isVtabAgg then
         begin
           { Eponymous-vtab agg arm — replace WhereBegin with a manual
@@ -35095,6 +35110,13 @@ begin
                              SQLITE_JUMPIFNULL);
         end;
 
+        { OFFSET gate — selectInnerLoop codeOffset (select.c:1172, reached
+          via the selectInnerLoop call at select.c:8898 with pSort=0 and
+          pDistinct=0).  When p^.iOffset is set, decrement it and skip the
+          row emission, so e.g. `LIMIT 1,100` consumes the single aggregate
+          row and outputs nothing (minmax2-6.4). }
+        codeOffset(v, p^.iOffset, addrLimitEnd);
+
         { Render the result row — sqlite3ExprCodeTarget routes
           TK_AGG_FUNCTION through the AggInfoFuncReg arm (added above)
           so result columns read directly from accumulators. }
@@ -35141,8 +35163,17 @@ begin
           sqlite3ReleaseTempReg(pParse, r2);
           sqlite3ReleaseTempReg(pParse, r1);
         end;
+        { LIMIT gate — selectInnerLoop OP_DecrJumpZero (select.c:1522).
+          Decrement the limit counter; the single aggregate row is the
+          only row, so this matters only for the constant LIMIT 0 case,
+          which computeLimitRegisters already short-circuits with OP_Goto.
+          Emitted unconditionally (only when p^.iLimit is set) to match C
+          and keep the bytecode shape faithful. }
+        if p^.iLimit <> 0 then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrLimitEnd);
         if addrSkip <> 0 then
           sqlite3VdbeResolveLabel(v, addrSkip);
+        sqlite3VdbeResolveLabel(v, addrLimitEnd);
         if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
         Exit;
       end;
