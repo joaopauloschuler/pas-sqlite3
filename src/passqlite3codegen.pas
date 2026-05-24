@@ -13937,6 +13937,42 @@ begin
   Result := 0;
 end;
 
+{ selectEListHasWinFunc — return True when any expression in pList carries a
+  window function (EP_WinFunc).  Used by pushDownWhereTerms to route a pushed
+  WHERE term to the subquery's pWhere (not pHaving) for window queries, which
+  C never tags SF_Aggregate (resolve.c sets NC_HasWin instead of NC_HasAgg). }
+function selectEListHasWinFunc(pList: PExprList): Boolean;
+
+  function exprHasWin(pE: PExpr): Boolean;
+  var
+    items: PExprListItem;
+    i: i32;
+  begin
+    Result := False;
+    if pE = nil then Exit;
+    if ExprHasProperty(pE, EP_WinFunc) then begin Result := True; Exit; end;
+    if exprHasWin(pE^.pLeft) then begin Result := True; Exit; end;
+    if exprHasWin(pE^.pRight) then begin Result := True; Exit; end;
+    if ((pE^.flags and EP_xIsSelect) = 0)
+       and ExprUseXList(pE) and (pE^.x.pList <> nil) then
+    begin
+      items := ExprListItems(pE^.x.pList);
+      for i := 0 to pE^.x.pList^.nExpr - 1 do
+        if exprHasWin(items[i].pExpr) then begin Result := True; Exit; end;
+    end;
+  end;
+
+var
+  items: PExprListItem;
+  i: i32;
+begin
+  Result := False;
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+    if exprHasWin(items[i].pExpr) then begin Result := True; Exit; end;
+end;
+
 { pushDownWhereTerms — port of select.c:5125..5286.  Try to copy constant
   WHERE-clause terms from the outer query down into the WHERE/HAVING of the
   FROM-clause subquery pSubq.  Returns the number of terms successfully
@@ -14062,7 +14098,19 @@ begin
         Assert(pWhere^.x.pSelect <> nil);
         pWhere^.x.pSelect^.selFlags := pWhere^.x.pSelect^.selFlags or SF_ClonedRhsIn;
       end;
-      if (pSubq^.selFlags and SF_Aggregate) <> 0 then
+      { windowD-1.4 / 2.6 — route the pushed-down term to HAVING only for a
+        genuine aggregate subquery, not a window-function one.  C never sets
+        SF_Aggregate on a pure window query (window funcs set NC_HasWin, not
+        NC_HasAgg — resolve.c:1314..1326/1961), so select.c:5277 always takes
+        the `pSubq->pWhere` branch for window queries.  This Pascal port's
+        selectMarkAggregate conflates window funcs into SF_Aggregate (its
+        exprNodeHasAggFunc walker keys off xFinalize and does not exclude
+        EP_WinFunc), so without this check the term would wrongly land in a
+        synthesized HAVING — raising a spurious "HAVING clause on a
+        non-aggregate query" and dropping the matching row.  Detect the
+        window case directly and fall back to the pWhere branch. }
+      if ((pSubq^.selFlags and SF_Aggregate) <> 0)
+         and not selectEListHasWinFunc(pSubq^.pEList) then
         pSubq^.pHaving := sqlite3ExprAnd(pParse, pSubq^.pHaving, pNew)
       else
         pSubq^.pWhere  := sqlite3ExprAnd(pParse, pSubq^.pWhere, pNew);
