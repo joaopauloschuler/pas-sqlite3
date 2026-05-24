@@ -8862,6 +8862,26 @@ begin
     AuthReadBound(pE);
     Exit;
   end;
+  { index7-5.0 — three-part qualifier `db.tab.col` inside a partial-index
+    WHERE clause or a CHECK constraint.  resolve.c:313..321 (lookupName):
+    when a database qualifier (zDb) is present AND the current NameContext
+    has NC_PartIdx or NC_IsCheck set, the db qualifier is SILENTLY IGNORED
+    (zDb=0) and the reference resolves against the in-scope table normally.
+    The parser builds TK_DOT(TK_ID(db), TK_DOT(TK_ID(tab), TK_ID(col))); we
+    collapse it unconditionally to the 2-part TK_DOT(TK_ID(tab), TK_ID(col))
+    shape WITHOUT requiring a db-name match (matching C's zDb=0).  Gated on
+    NC_PartIdx|NC_IsCheck so normal SELECT/DML three-part refs with a bogus
+    db name still error elsewhere (9.4.divbug.87.058 / vacuum-into-340). }
+  if (pE^.op = TK_DOT)
+     and ((ncFlags and (NC_PartIdx or NC_IsCheck)) <> 0)
+     and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+     and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_DOT)
+     and (pE^.pRight^.pLeft <> nil) and (pE^.pRight^.pLeft^.op = TK_ID)
+     and (pE^.pRight^.pRight <> nil) and (pE^.pRight^.pRight^.op = TK_ID) then
+  begin
+    pE^.pLeft  := pE^.pRight^.pLeft;
+    pE^.pRight := pE^.pRight^.pRight;
+  end;
   if (pE^.op = TK_DOT) and (pSrc <> nil)
      and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
      and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
