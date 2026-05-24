@@ -5230,7 +5230,8 @@ begin
   if pParse^.db <> nil then
     mx := pParse^.db^.aLimit[SQLITE_LIMIT_COLUMN];
   if pEList^.nExpr > mx then
-    sqlite3ErrorMsg(pParse, 'too many columns');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'too many columns in %s', [AnsiString(zObject)]));
 end;
 
 { expr.c: affinity helpers }
@@ -49603,6 +49604,9 @@ begin
     if pList = nil then goto exit_create_index;
     AssertH(pList^.nExpr = 1, 'CreateIndex synth 1-col');
     sqlite3ExprListSetSortOrder(pList, sortOrder, SQLITE_SO_UNDEFINED);
+  end else begin
+    sqlite3ExprListCheckLength(pParse, pList, 'index');
+    if pParse^.nErr <> 0 then goto exit_create_index;
   end;
   nName     := sqlite3Strlen30(zName);
   nExtraCol := 1;
