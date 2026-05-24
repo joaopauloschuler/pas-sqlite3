@@ -17,6 +17,8 @@
     * test_extract          — test_extract        (test_func.c:441)
     * test_decode           — test_decode         (test_func.c:489)
     * test_zeroblob         — test_zeroblob       (test_func.c:566)
+    * hex_to_utf16be        — testHexToUtf16be    (test_func.c:350)
+    * hex_to_utf16le        — testHexToUtf16le    (test_func.c:404)
   Aggregate:
     * test_agg_errmsg16     — test_agg_errmsg16_*  (test_func.c:154) —
       no-op step + final returning sqlite3_errmsg (UTF-8 in this port,
@@ -33,7 +35,7 @@
   engine (passqlite3vdbe / passqlite3util).
 
   Not ported (UTF-16 / FTS3 / abuse paths): test_destructor16,
-  hex_to_utf16*, test_auxdata, test_frombind, abuse_create_function,
+  test_auxdata, test_frombind, abuse_create_function,
   install_fts3_rank_function.  test_getsubtype/test_setsubtype ported
   (task 6.40.8).
   Md5_Register is registered as an auto-extension elsewhere is N/A here.
@@ -265,6 +267,74 @@ begin
   end;
 end;
 
+{ test_func.c:322 testHexChar — convert one character from hex to binary. }
+function testHexChar(c: AnsiChar): cint;
+begin
+  if (c >= '0') and (c <= '9') then
+    Result := Ord(c) - Ord('0')
+  else if (c >= 'a') and (c <= 'f') then
+    Result := Ord(c) - Ord('a') + 10
+  else if (c >= 'A') and (c <= 'F') then
+    Result := Ord(c) - Ord('A') + 10
+  else
+    Result := 0;
+end;
+
+{ test_func.c:336 testHexToBin — convert hex to binary in place. }
+procedure testHexToBin(zIn: PAnsiChar; zOut: PAnsiChar);
+begin
+  while (zIn[0] <> #0) and (zIn[1] <> #0) do
+  begin
+    zOut^ := AnsiChar((testHexChar(zIn[0]) shl 4) + testHexChar(zIn[1]));
+    Inc(zOut);
+    Inc(zIn, 2);
+  end;
+end;
+
+{ test_func.c:350 hex_to_utf16be — decode HEX into binary, return as UTF-16BE. }
+procedure testHexToUtf16be(pCtx: Psqlite3_context; nArg: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  n:    cint;
+  zIn:  PAnsiChar;
+  zOut: PAnsiChar;
+  pArg: PPsqlite3_value;
+begin
+  pArg := argv;
+  n   := sqlite3_value_bytes(pArg[0]);
+  zIn := sqlite3_value_text(pArg[0]);
+  zOut := sqlite3_malloc(n div 2);
+  if zOut = nil then
+    sqlite3_result_error_nomem(pCtx)
+  else
+  begin
+    testHexToBin(zIn, zOut);
+    sqlite3_result_text16be(pCtx, zOut, n div 2, @testFreeXDel);
+  end;
+end;
+
+{ test_func.c:404 hex_to_utf16le — decode HEX into binary, return as UTF-16LE. }
+procedure testHexToUtf16le(pCtx: Psqlite3_context; nArg: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  n:    cint;
+  zIn:  PAnsiChar;
+  zOut: PAnsiChar;
+  pArg: PPsqlite3_value;
+begin
+  pArg := argv;
+  n   := sqlite3_value_bytes(pArg[0]);
+  zIn := sqlite3_value_text(pArg[0]);
+  zOut := sqlite3_malloc(n div 2);
+  if zOut = nil then
+    sqlite3_result_error_nomem(pCtx)
+  else
+  begin
+    testHexToBin(zIn, zOut);
+    sqlite3_result_text16le(pCtx, zOut, n div 2, @testFreeXDel);
+  end;
+end;
+
 { test_func.c:399 real2hex — big-endian hex of the ieee754 encoding. }
 procedure real2hex(context: Psqlite3_context; argc: cint;
   argv: PPsqlite3_value); cdecl;
@@ -474,9 +544,13 @@ type
 function registerTestFunctions(db: PTsqlite3; pzErrMsg: PPAnsiChar;
   pThunk: Pointer): cint; cdecl;
 const
-  aFuncs: array[0..12] of TTestFuncDef = (
+  aFuncs: array[0..14] of TTestFuncDef = (
     (zName: 'randstr';               nArg: 2;
        eTextRep: SQLITE_UTF8; xFunc: @randStr),
+    (zName: 'hex_to_utf16be';         nArg: 1;
+       eTextRep: SQLITE_UTF8; xFunc: @testHexToUtf16be),
+    (zName: 'hex_to_utf16le';         nArg: 1;
+       eTextRep: SQLITE_UTF8; xFunc: @testHexToUtf16le),
     (zName: 'test_destructor';        nArg: 1;
        eTextRep: SQLITE_UTF8; xFunc: @test_destructor),
     (zName: 'test_destructor_count';  nArg: 0;
