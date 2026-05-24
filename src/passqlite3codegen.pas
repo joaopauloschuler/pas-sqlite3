@@ -36705,20 +36705,11 @@ begin
   nResultCol := pEList^.nExpr;
   pDest^.nSdst := nResultCol;
 
-  { DISTINCT — open the dedup ephemeral cursor (select.c:8253..8260).
-    Only WHERE_DISTINCT_UNORDERED is supported here; UNIQUE/ORDERED
-    optimisations require passing WHERE_WANT_DISTINCT into
-    sqlite3WhereBegin and are deferred. }
+  { DISTINCT — the dedup ephemeral cursor (select.c:8253..8260) is opened
+    AFTER the ORDER BY sorter open (tag-select-0680 follows tag-select-0600);
+    see the emission below the ORDER BY block.  Initialise the trackers here. }
   iTabTnct := -1;
   addrDistinctEph := -1;
-  if (p^.selFlags and SF_Distinct) <> 0 then
-  begin
-    iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
-    pDistKey := sqlite3KeyInfoFromExprList(pParse, pEList, 0, 0);
-    addrDistinctEph := sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
-                                         PAnsiChar(pDistKey), P4_KEYINFO);
-    sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
-  end;
 
   { SRT_Exists LIMIT setup — mirrors computeLimitRegisters (select.c:2508).
     sqlite3CodeSubselect always adds LIMIT 1 to the inner SELECT.  Emit
@@ -36854,7 +36845,7 @@ begin
       result column has a matching ORDER BY entry whose iOrderByCol points
       back to it.  When true, set bSortOmitRef=1 so the inner loop and
       sort tail emit the C-shape (no duplicate Column for the data side). }
-    if (pDest^.eDest = SRT_Output) and (iTabTnct < 0) then
+    if (pDest^.eDest = SRT_Output) and ((p^.selFlags and SF_Distinct) = 0) then
     begin
       pOBItm := ExprListItems(p^.pOrderBy);
       pELItm := items;
@@ -36902,6 +36893,22 @@ begin
       addrSorter := sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iSorterCsr,
                         sortNKey + 1 + nResultCol, 0,
                         PAnsiChar(sortKeyInfo), P4_KEYINFO);
+  end;
+
+  { DISTINCT — open the dedup ephemeral cursor (select.c:8253..8260,
+    tag-select-0680).  C emits this AFTER the ORDER BY sorter open
+    (tag-select-0600) and the limiter (tag-select-0650), so the sorter open
+    appears first in the program; do the same here.  Only
+    WHERE_DISTINCT_UNORDERED is supported here; UNIQUE/ORDERED optimisations
+    require passing WHERE_WANT_DISTINCT into sqlite3WhereBegin (forwarded
+    below). }
+  if (p^.selFlags and SF_Distinct) <> 0 then
+  begin
+    iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
+    pDistKey := sqlite3KeyInfoFromExprList(pParse, pEList, 0, 0);
+    addrDistinctEph := sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
+                                         PAnsiChar(pDistKey), P4_KEYINFO);
+    sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
   end;
 
   { Drive the WHERE machinery for the (single, no-WHERE) loop body.
