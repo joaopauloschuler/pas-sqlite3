@@ -35,11 +35,6 @@ uses
   passqlite3printf,
   passqlite3pager;   { sqlite3_database_file_object }
 
-{ -------- libc bindings ----------------------------------------------- }
-
-function tsLibcGetpid: cint; cdecl;
-  external 'c' name 'getpid';
-
 { -------- constants --------------------------------------------------- }
 
 const
@@ -606,15 +601,15 @@ begin
     Y := y_;
     if Mo <= 2 then Inc(Y);
     sqlite3_randomness(SizeOf(r2), @r2);
-    pid := u32(tsLibcGetpid);
+    pid := u32(libc_getpid);
     pLog^.zLogname := sqlite3PfMprintf(
       PAnsiChar('%s-tmstmp/%04d%02d%02dT%02d%02d%02d%03d-%08d-%08x'),
       [zName, Y, Mo, D, hh, mm, ss, f, pid, r2]);
   end;
   if p^.isWal <> 0 then
-    tmstmpEvent(p, ELOG_OPEN_WAL, 0, u32(tsLibcGetpid), 0, nil)
+    tmstmpEvent(p, ELOG_OPEN_WAL, 0, u32(libc_getpid), 0, nil)
   else
-    tmstmpEvent(p, ELOG_OPEN_DB, 0, u32(tsLibcGetpid), 0, nil);
+    tmstmpEvent(p, ELOG_OPEN_DB, 0, u32(libc_getpid), 0, nil);
 
 done_:
   if rc <> 0 then pFile^.pMethods := nil;

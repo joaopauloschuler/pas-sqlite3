@@ -4722,36 +4722,6 @@ end;
 const
   RUSAGE_SELF_PAS = 0;
 
-type
-  TTVPas = record
-    tv_sec:  clong;
-    tv_usec: clong;
-  end;
-  TRUsagePas = record
-    ru_utime:    TTVPas;
-    ru_stime:    TTVPas;
-    ru_maxrss:   clong;
-    ru_ixrss:    clong;
-    ru_idrss:    clong;
-    ru_isrss:    clong;
-    ru_minflt:   clong;
-    ru_majflt:   clong;
-    ru_nswap:    clong;
-    ru_inblock:  clong;
-    ru_oublock:  clong;
-    ru_msgsnd:   clong;
-    ru_msgrcv:   clong;
-    ru_nsignals: clong;
-    ru_nvcsw:    clong;
-    ru_nivcsw:   clong;
-  end;
-  PRUsagePas = ^TRUsagePas;
-
-function shellGetRUsage(who: cint; usage: PRUsagePas): cint;
-  cdecl; external 'c' name 'getrusage';
-function shellGetTimeOfDay(tp: Pointer; tzp: Pointer): cint;
-  cdecl; external 'c' name 'gettimeofday';
-
 { libc 'stderr' FILE* — used to wire -memtrace / -pcachetrace to the
   same sink as shell.c.in:13197 / :13199 (sqlite3{Mem,Pcache}TraceActivate
   receive stderr).  libc_stderr now comes from passqlite3os.pas (shared
@@ -4790,7 +4760,7 @@ var
 begin
   tv.tv_sec  := 0;
   tv.tv_usec := 0;
-  shellGetTimeOfDay(@tv, nil);
+  libc_gettimeofday(@tv, nil);
   Result := (i64(tv.tv_sec) * 1000000) + i64(tv.tv_usec);
 end;
 
@@ -4801,7 +4771,7 @@ begin
   if (p^.enableTimer <> 0) or ((p^.flgProgress and SHELL_PROGRESS_TMOUT) <> 0) then
   begin
     FillChar(shellTimerBeginRU, SizeOf(shellTimerBeginRU), 0);
-    shellGetRUsage(RUSAGE_SELF_PAS, @shellTimerBeginRU);
+    libc_getrusage(RUSAGE_SELF_PAS, @shellTimerBeginRU);
     shellTimerBeginNs := shellTimeOfDayUs;
   end;
 end;
@@ -4826,7 +4796,7 @@ begin
   if p^.enableTimer = 0 then Exit;
   iEndUs := shellTimeOfDayUs;
   FillChar(ruEnd, SizeOf(ruEnd), 0);
-  shellGetRUsage(RUSAGE_SELF_PAS, @ruEnd);
+  libc_getrusage(RUSAGE_SELF_PAS, @ruEnd);
   realSec := (iEndUs - shellTimerBeginNs) * 0.000001;
   p^.prevTimer := realSec;
   s := Format('Run Time: real %.6f user %.6f sys %.6f'#10,

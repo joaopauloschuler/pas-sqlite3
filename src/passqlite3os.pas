@@ -117,6 +117,62 @@ var
   libc_stdout: PFILE; external 'c' name 'stdout';
   libc_stderr: PFILE; external 'c' name 'stderr';
 
+{ ============================================================
+  Section 0c: shared OS time / process bindings
+  ============================================================
+  Consolidated here (2026-05-23) so extensions/shell share one
+  faithful binding instead of per-unit duplicates.  Canonical
+  C-ABI types: cint (int).  Note #17. }
+function libc_gettimeofday(tv: Pointer; tz: Pointer): cint; cdecl; external 'c' name 'gettimeofday';
+function libc_getpid: cint; cdecl; external 'c' name 'getpid';
+
+{ ============================================================
+  Section 0d: shared OS bindings — getrusage / utimes
+  ============================================================
+  Record layouts moved here from the shell (rusage) and fileio
+  (utimes timeval) so the bindings have a single home.  Canonical
+  C-ABI types: cint (int), clong (long).  Note #17. }
+type
+  TTVPas = record
+    tv_sec:  clong;
+    tv_usec: clong;
+  end;
+  TRUsagePas = record
+    ru_utime:    TTVPas;
+    ru_stime:    TTVPas;
+    ru_maxrss:   clong;
+    ru_ixrss:    clong;
+    ru_idrss:    clong;
+    ru_isrss:    clong;
+    ru_minflt:   clong;
+    ru_majflt:   clong;
+    ru_nswap:    clong;
+    ru_inblock:  clong;
+    ru_oublock:  clong;
+    ru_msgsnd:   clong;
+    ru_msgrcv:   clong;
+    ru_nsignals: clong;
+    ru_nvcsw:    clong;
+    ru_nivcsw:   clong;
+  end;
+  PRUsagePas = ^TRUsagePas;
+
+  TUtTimeVal = record
+    tv_sec  : clong;
+    tv_usec : clong;
+  end;
+  PUtTimeVal = ^TUtTimeVal;
+
+function libc_getrusage(who: cint; usage: PRUsagePas): cint; cdecl; external 'c' name 'getrusage';
+function libc_utimes(path: PAnsiChar; times: PUtTimeVal): cint; cdecl; external 'c' name 'utimes';
+
+{ ============================================================
+  Section 0e: shared OS bindings — realpath / time
+  ============================================================
+  Moved here from fileio so the bindings have a single home. }
+function libc_realpath(path: PAnsiChar; resolved: PAnsiChar): PAnsiChar; cdecl; external 'c' name 'realpath';
+function libc_time(t: Pi64): i64; cdecl; external 'c' name 'time';
+
 { Public API entry points — forwarded to the util.pas implementations
   that dispatch through sqlite3GlobalConfig.m.  Declared here so the
   many existing call sites (~835 in the tree) continue to compile.    }
@@ -818,8 +874,6 @@ end;
 
 function c_nanosleep(req: Pointer; rem: Pointer): cint; cdecl;
   external 'c' name 'nanosleep';
-function c_gettimeofday(tv: Pointer; tz: Pointer): cint; cdecl;
-  external 'c' name 'gettimeofday';
 function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
@@ -2669,7 +2723,7 @@ const
 var
   tv : TTimeVal;
 begin
-  c_gettimeofday(@tv, nil);
+  libc_gettimeofday(@tv, nil);
   piNow^ := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
   Result := 0;
 end;

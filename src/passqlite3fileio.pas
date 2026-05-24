@@ -71,21 +71,7 @@ type
 const
   dotPath: PAnsiChar = '.';
 
-{ ----- libc bindings (only what BaseUnix doesn't already expose) ----- }
-
-type
-  TUtTimeVal = record
-    tv_sec  : i64;
-    tv_usec : i64;
-  end;
-  PUtTimeVal = ^TUtTimeVal;
-
-function libc_utimes(path: PAnsiChar; times: PUtTimeVal): i32; cdecl;
-  external 'c' name 'utimes';
-function libc_realpath(path: PAnsiChar; resolved: PAnsiChar): PAnsiChar; cdecl;
-  external 'c' name 'realpath';
-function libc_time(t: Pi64): i64; cdecl;
-  external 'c' name 'time';
+{ ----- libc bindings: realpath / time now come from passqlite3os ----- }
 
 { Convenience helpers. }
 function isDir(m: i32): Boolean; inline;

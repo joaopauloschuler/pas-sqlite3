@@ -65,8 +65,6 @@ uses
 
 { -------- libc bindings ----------------------------------------------- }
 
-function vlogLibcGetpid: cint; cdecl;
-  external 'c' name 'getpid';
 function vlogLibcGethostname(buf: PAnsiChar; len: csize_t): cint; cdecl;
   external 'c' name 'gethostname';
 
@@ -75,9 +73,6 @@ type
     tv_sec  : clong;
     tv_usec : clong;
   end;
-
-function vlogLibcGettimeofday(tv, tz: Pointer): cint; cdecl;
-  external 'c' name 'gettimeofday';
 
 { -------- types ------------------------------------------------------- }
 
@@ -175,7 +170,7 @@ var
 begin
   tv.tv_sec  := 0;
   tv.tv_usec := 0;
-  vlogLibcGettimeofday(@tv, nil);
+  libc_gettimeofday(@tv, nil);
   Result := u64(tv.tv_usec) + u64(tv.tv_sec) * u64(1000000);
 end;
 
@@ -352,7 +347,7 @@ begin
     zHost[High(zHost)] := #0;
     vlogLogPrint(pLog, tNow, 0,
                  PAnsiChar('IDENT'),
-                 i64(vlogLibcGetpid), -1,
+                 i64(libc_getpid), -1,
                  PAnsiChar(@zHost[0]), 0);
   end;
 
