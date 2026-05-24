@@ -10363,6 +10363,26 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                 pItO^.colUsed := pItO^.colUsed or (Bitmask(1) shl iCol_)
               else
                 pItO^.colUsed := pItO^.colUsed or (Bitmask(1) shl (BMS - 1));
+            end
+            { rowvalue9-4.x — qualified rowid alias referencing an OUTER source
+              (correlated subquery), e.g. `... WHERE d2.rowid=d1.rowid` where
+              d1 is in the outer FROM.  Mirror lookupName at resolve.c:471..503:
+              no real column matched, but zCol is one of {rowid,oid,_rowid_}
+              and the outer table has a VisibleRowid → bind iColumn=-1 with
+              AFF_INTEGER, exactly as the local TK_DOT arm (9.4.divbug.19).
+              Gate on TF_NoVisibleRowid (not HasRowid) per 9.4.divbug.90.008 so
+              views / synthetic subquery tables fall through to the inner
+              resolver's "no such column", matching C. }
+            else if (sqlite3IsRowid(zCol) <> 0)
+                    and ((pItO^.pSTab^.tabFlags and TF_NoVisibleRowid) = 0) then
+            begin
+              pW^.op      := TK_COLUMN;
+              pW^.iTable  := pItO^.iCursor;
+              pW^.iColumn := i16(-1);
+              pW^.y.pTab  := pItO^.pSTab;
+              pW^.pLeft   := nil;
+              pW^.pRight  := nil;
+              pW^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
             end;
             Break;
           end;
