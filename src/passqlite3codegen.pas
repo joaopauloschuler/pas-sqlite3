@@ -6946,8 +6946,13 @@ begin
 end;
 
 function sqlite3ExprTruthValue(const pExpr: PExpr): i32;
+var p: PExpr;
 begin
-  if ExprHasProperty(pExpr, EP_IsTrue) then Result := 1
+  { expr.c:2351 — skip any COLLATE/likely() wrapper before reading the
+    TK_TRUEFALSE value, so "x IS TRUE COLLATE NOCASE" still evaluates the
+    literal truth value rather than the collate node. }
+  p := sqlite3ExprSkipCollateAndLikely(pExpr);
+  if ExprHasProperty(p, EP_IsTrue) then Result := 1
   else Result := 0;
 end;
 
@@ -9774,6 +9779,15 @@ begin
     sqlite3ExprIdToTrueFalse(pE);
     Exit;
   end;
+  { resolve.c:1073..1108 — a TK_DOT node's children are the database /
+    table / column name parts handled wholesale by lookupName; they are
+    NOT standalone boolean expressions.  C's resolveExprStep returns from
+    the TK_DOT case without recursing, so a name-part token "true"/"false"
+    stays TK_ID and resolves as an identifier ("no such column:
+    false.false", chromium bug 1094247).  Do not descend here either, or
+    the bare TK_ID children get folded to TK_TRUEFALSE and the bad
+    qualified name is silently accepted. }
+  if pE^.op = TK_DOT then Exit;
   if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
   rewriteTrueFalseAndTruth(pE^.pLeft);
   rewriteTrueFalseAndTruth(pE^.pRight);
@@ -11360,12 +11374,22 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         (which DOES see the outer pSrc via ResolveOuterRefs at
         codegen.pas:10145..10162) gets a chance to bind it.  If it remains
         unresolved at codegen time the codegen path (sqlite3ExprCodeTarget)
-        raises the same "no such column" error against the parent. }
-      if (p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0)
-         and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+        raises the same "no such column" error against the parent.
+
+        istrue-800 (chromium bug 1094247) — the deferral only holds when an
+        enclosing NameContext exists to retry the binding.  A truly top-level
+        SELECT with no FROM clause (pOuterNC=nil) is the end of the
+        NameContext chain: C's lookupName walks pNC->pNext (nil) and then
+        raises "no such column" with cnt==0.  So `SELECT 9 IN (false.false)`
+        must error here rather than silently coding the unresolved TK_DOT to
+        NULL.  Fire the error when the FROM clause has a source, OR when there
+        is no outer NameContext to defer to. }
+      if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
          and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
          and (pE^.pLeft^.u.zToken <> nil)
-         and (pE^.pRight^.u.zToken <> nil) then
+         and (pE^.pRight^.u.zToken <> nil)
+         and (((p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0))
+              or (pOuterNC = nil)) then
       begin
         { resolve.c:785..788 — a database qualifier (zDb, captured from the
           3-part `db.tab.col` form before the tree was collapsed to 2-part)
