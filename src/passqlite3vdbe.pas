@@ -10147,6 +10147,12 @@ begin
       pOut^.z     := pOp^.p4.z;
       pOut^.n     := pOp^.p1;
       pOut^.enc   := enc;
+      { vdbe.c:1466..1472 — LIKE-optimization blob pass: when P3 names a
+        counter register whose value equals P5, reinterpret the bound string
+        as a BLOB so the second range scan covers the index's blob region. }
+      if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
+         (aMem[pOp^.p3].u.i = pOp^.p5) then
+        pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
     end;
 
     OP_String: begin

@@ -15075,7 +15075,7 @@ begin
   cnt := 0;
   pVal := nil;
 
-  wc[3] := #0;  { sqlite3IsLikeFunction sets wc[0..2] only; clear wc[3] (escape). }
+  wc[3] := #0;  { defensive init; sqlite3IsLikeFunction sets wc[0..3]. }
   if sqlite3IsLikeFunction(db, pExpr, pnoCase, @wc[0]) = 0 then Exit;
   Assert(ExprUseXList(pExpr));
   pList := pExpr^.x.pList;
@@ -25539,6 +25539,17 @@ begin
       begin
         sqlite3VdbeAddOp3(v, OP_Return, pLevel^.pRJ^.regReturn, 0, 1);
       end;
+      { where.c:7685..7691 — LIKE-optimization two-pass blob loop tail.
+        When addrLikeRep is set, the loop body just coded scanned the index
+        string region; emit OP_DecrJumpZero on the counter register so the
+        first time it decrements 1->0 (and falls through to re-seek for the
+        blob pass via the OP_String fixup) and the second time (counter
+        already 0) it jumps past the re-seek to terminate the loop. }
+      if pLevel^.addrLikeRep <> 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, i32(pLevel^.iLikeRepCntr shr 1),
+                          pLevel^.addrLikeRep);
+      end;
       ljNullRowFixup(pPrs, v, pWInfo, pLevel);
     end;
     sqlite3VdbeResolveLabel(v, pWInfo^.iBreak);
@@ -26095,6 +26106,30 @@ begin
       pRangeEnd := pLoop^.aLTerm[j4]; Inc(j4);
       if i32(pLoop^.u.btree.nTop) > nExtraReg then
         nExtraReg := i32(pLoop^.u.btree.nTop);
+      { wherecode.c:1907..1923 — LIKE-optimization two-pass blob loop.
+        The range bounds for "x LIKE 'abc%'" only scan the string region of
+        the index ("x>='ABC' AND x<'abd'").  Blob values that satisfy the
+        residual LIKE sort AFTER all text in the index, so a single pass would
+        drop them.  Allocate a counter register (init to 1), record the loop
+        top (addrLikeRep), and stash the counter reg << 1 | (ASC/DESC) in
+        iLikeRepCntr.  whereLikeOptimizationStringFixup patches the bound
+        OP_String8 ops with this counter so the second pass re-interprets the
+        bound strings as blobs, and the OP_DecrJumpZero at the loop bottom
+        (where.c:7685..7691) repeats the scan over the blob region. }
+      if (pRangeEnd^.wtFlags and TERM_LIKEOPT) <> 0 then
+      begin
+        Assert(pRangeStart <> nil);
+        Assert((pRangeStart^.wtFlags and TERM_LIKEOPT) <> 0);
+        Inc(pParse^.nMem);
+        pLevel^.iLikeRepCntr := u32(pParse^.nMem);
+        sqlite3VdbeAddOp2(v, OP_Integer, 1, i32(pLevel^.iLikeRepCntr));
+        pLevel^.addrLikeRep := sqlite3VdbeCurrentAddr(v);
+        { iLikeRepCntr actually stores 2x the counter register number.  The
+          bottom bit indicates whether the search order is ASC or DESC. }
+        pLevel^.iLikeRepCntr := pLevel^.iLikeRepCntr shl 1;
+        pLevel^.iLikeRepCntr := pLevel^.iLikeRepCntr or
+          u32(bRev xor i32(pIdx4^.aSortOrder[nEq4] = SQLITE_SO_DESC));
+      end;
       if pRangeStart = nil then
       begin
         j4 := pIdx4^.aiColumn[nEq4];
@@ -62302,6 +62337,8 @@ var
   pDef: PTFuncDef;
   zName: PAnsiChar;
   nExpr: i32;
+  pEscape: PExpr;
+  zEscape: PAnsiChar;
 begin
   if pExpr^.op <> TK_FUNCTION then begin Result := 0; Exit; end;
   zName := PAnsiChar(pExpr^.u.zToken);
@@ -62331,6 +62368,27 @@ begin
     aWc[0] := '%';
     aWc[1] := '_';
     aWc[2] := '\';
+  end;
+  { func.c:2412..2424 — ESCAPE argument.  For a 2-arg LIKE/GLOB there is no
+    escape character (aWc[3]=0).  For the 3-arg "x LIKE y ESCAPE z" form the
+    escape must be a single-character string literal that is not one of the
+    wildcard characters; otherwise this is not a recognised LIKE function and
+    the optimization is disabled.  Without this arm aWc[3] stays whatever the
+    caller pre-cleared it to, so the escape char is treated as a literal
+    prefix byte and the escape-stripped numeric-prefix rejection in
+    isLikeOrGlob never fires (like3-5.120/5.122). }
+  if nExpr < 3 then
+    aWc[3] := #0
+  else
+  begin
+    pEscape := ExprListItems(pExpr^.x.pList)[2].pExpr;
+    if pEscape^.op <> TK_STRING then begin Result := 0; Exit; end;
+    zEscape := PAnsiChar(pEscape^.u.zToken);
+    if (zEscape = nil) or (zEscape[0] = #0) or (zEscape[1] <> #0) then
+    begin Result := 0; Exit; end;
+    if zEscape[0] = aWc[0] then begin Result := 0; Exit; end;
+    if zEscape[0] = aWc[1] then begin Result := 0; Exit; end;
+    aWc[3] := zEscape[0];
   end;
   if pIsNocase <> nil then begin
     if (pDef^.funcFlags and SQLITE_FUNC_CASE) <> 0 then pIsNocase^ := 0
