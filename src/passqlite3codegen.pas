@@ -29756,7 +29756,13 @@ var
   pFunc:     PExpr;
   iLtoR_LT, iLtoR_LC: i32;
   zSavedAuthCtx: PAnsiChar;  { resolve.c:1921 — saved pParse->zAuthContext }
+  pVwBody:    PSelect;       { view body SELECT being expanded }
+  pSavedWith: PWith;         { BUG-2 — saved use-site pParse->pWith }
+  pVwWith:    PWith;         { BUG-2 — view body's own bView-marked With }
+  zVwMsg:     PAnsiChar;     { BUG-1 — column-count mismatch message buffer }
+  db:         PTsqlite3;
 begin
+  db := pParse^.db;
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
   w.xExprCallback := TExprCallback(@sqlite3ExprWalkNoop);
@@ -29929,6 +29935,25 @@ begin
                                        pTab^.u.view_pSelect, 1);
         if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
         begin
+          pVwBody := pItem^.u4.pSubq^.pSelect;
+          { BUG-2 / select.c:5982..5991 — a view body is a closed scope: it
+            must NOT see CTEs defined by the WITH of the query that USES the
+            view.  C marks the view body's With with bView=1 and pushes it,
+            so searchWith() stops at the bView barrier and never reaches the
+            use-site WITH.  Here the view body (pVwBody) has pWith=nil, so
+            install a bView-marked With (allocate one if absent) before the
+            recursive prep; sqlite3SelectExpand pushes pVwBody^.pWith itself.
+            Save/restore pParse^.pWith so the outer WITH stack is intact
+            afterwards (mirrors with3 commit 4925b50's pSavedWith pattern). }
+          pSavedWith := pParse^.pWith;
+          pVwWith := pVwBody^.pWith;
+          if pVwWith = nil then
+          begin
+            pVwWith := PWith(sqlite3DbMallocZero(db, SZ_WITH_HEADER + SZ_CTE));
+            if pVwWith = nil then Exit;
+            pVwBody^.pWith := pVwWith;
+          end;
+          pVwWith^.bView := 1;
           { Recursively prepare the view's SELECT body — full expand+resolve
             so inner TK_ID nodes bind against the view's FROM cursors.  An
             earlier sqlite3SelectExpand-only call left TK_COLUMN with stale
@@ -29942,8 +29967,30 @@ begin
           zSavedAuthCtx := pParse^.zAuthContext;
           if pItem^.zName <> nil then
             pParse^.zAuthContext := pItem^.zName;
-          sqlite3SelectPrep(pParse, pItem^.u4.pSubq^.pSelect, nil);
+          sqlite3SelectPrep(pParse, pVwBody, nil);
           pParse^.zAuthContext := zSavedAuthCtx;
+          pParse^.pWith := pSavedWith;
+          if pParse^.nErr <> 0 then Exit;
+          { BUG-1 / select.c:7773..7779 — catch a mismatch between the view's
+            DECLARED column count (CREATE VIEW v(a,b) ...) and the number of
+            result columns in the view body's SELECT.  pTab^.nCol is the
+            declared count; pVwBody^.pEList^.nExpr is the body's count.  Must
+            run AFTER sqlite3SelectPrep so a `SELECT *` view body has had its
+            star expanded (otherwise pEList holds a single TK_ASTERISK).  C
+            does this in the tag-select-0400 loop after `if(pSub==0)continue`. }
+          if (pTab^.eTabType = TABTYP_VIEW)
+             and (pVwBody^.pEList <> nil)
+             and (pTab^.nCol <> pVwBody^.pEList^.nExpr) then
+          begin
+            zVwMsg := sqlite3MPrintf(db,
+              'expected %d columns for ''%s'' but got %d',
+              [pTab^.nCol, pTab^.zName, pVwBody^.pEList^.nExpr]);
+            if zVwMsg <> nil then begin
+              sqlite3ErrorMsg(pParse, zVwMsg);
+              sqlite3DbFree(db, zVwMsg);
+            end;
+            Exit;
+          end;
         end;
       end;
 
