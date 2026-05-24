@@ -95,10 +95,16 @@ const
   FAULT_INJECT_TRANSIENT  = 1;
   FAULT_INJECT_PERSISTENT = 2;
 
+  { test_vfs.c:138 — TESTVFS_MAX_PAGES. }
+  TESTVFS_MAX_PAGES = 1024;
+
 type
   PTestvfsFile     = ^TTestvfsFile;
   PTestvfsFd       = ^TTestvfsFd;
+  PPTestvfsFd      = ^PTestvfsFd;
   PTestvfs         = ^TTestvfs;
+  PTestvfsBuffer   = ^TTestvfsBuffer;
+  PPTestvfsBuffer  = ^PTestvfsBuffer;
   PTestFaultInject = ^TTestFaultInject;
 
   { test_vfs.c:66..70 — TestFaultInject. }
@@ -123,9 +129,20 @@ type
     zFilename : PChar;
     pReal     : Psqlite3_file;
     pShmId    : PTclObj;
+    pShm      : PTestvfsBuffer;  { test_vfs.c:53 — shared memory buffer }
     excllock  : cuint;
     sharedlock: cuint;
-    pNext     : PTestvfsFd;
+    pNext     : PTestvfsFd;      { next handle opened on the same file }
+  end;
+
+  { test_vfs.c:144..151 — TestvfsBuffer.  zFile lives just past the
+    record (ckalloc'd with szName+1 extra bytes). }
+  TTestvfsBuffer = record
+    zFile : PChar;
+    pgsz  : cint;
+    aPage : array[0..TESTVFS_MAX_PAGES-1] of PByte;
+    pFile : PTestvfsFd;          { list of open handles }
+    pNext : PTestvfsBuffer;      { next in linked list of all buffers }
   end;
 
   { test_vfs.c:77..104 — Testvfs.  zName lives just past the record;
@@ -137,6 +154,7 @@ type
     pVfs        : Psqlite3_vfs;
     interp      : PTclInterp;
     pScript     : PTclObj;
+    pBuffer     : PTestvfsBuffer;  { test_vfs.c:84 — list of shared buffers }
     isNoshm     : cint;
     isFullshm   : cint;
     mask        : cint;
@@ -163,6 +181,13 @@ function tvfsCheckReservedLock(pFile: Psqlite3_file; pResOut: PcInt): cint; cdec
 function tvfsFileControl(pFile: Psqlite3_file; op: cint; pArg: Pointer): cint; cdecl; forward;
 function tvfsSectorSize(pFile: Psqlite3_file): cint; cdecl; forward;
 function tvfsDeviceCharacteristics(pFile: Psqlite3_file): cint; cdecl; forward;
+function tvfsShmOpen(pFile: Psqlite3_file): cint; forward;
+function tvfsShmMap(pFile: Psqlite3_file; iPage: cint; pgsz: cint;
+  isWrite: cint; pp: PPointer): cint; cdecl; forward;
+function tvfsShmLock(pFile: Psqlite3_file; ofst: cint; n: cint;
+  flags: cint): cint; cdecl; forward;
+procedure tvfsShmBarrier(pFile: Psqlite3_file); cdecl; forward;
+function tvfsShmUnmap(pFile: Psqlite3_file; deleteFlag: cint): cint; cdecl; forward;
 
 { Forward decls for the sqlite3_vfs slot. }
 function tvfsOpen(pVfs: Psqlite3_vfs; zName: sqlite3_filename;
@@ -564,18 +589,29 @@ begin
 
   rc := sqlite3OsOpen(pParent, zName, pFd^.pReal, flags, pOutFlags);
   if (pFd^.pReal^.pMethods <> nil) then begin
+    { test_vfs.c:673..688.  For iVersion>1 copy the full methods table;
+      for iVersion 1 the shm slots stay nil (they live past the v1 layout).
+      The whole table is zero-filled first either way. }
     pMethods := Psqlite3_io_methods(ckalloc(SizeOf(sqlite3_io_methods)));
-    Move(tvfs_io_methods, pMethods^, SizeOf(sqlite3_io_methods));
+    FillChar(pMethods^, SizeOf(sqlite3_io_methods), 0);
+    if pVfs^.iVersion > 1 then
+      Move(tvfs_io_methods, pMethods^, SizeOf(sqlite3_io_methods))
+    else
+      { Only the v1 prefix (through xDeviceCharacteristics) — leave the
+        shm/fetch slots nil by copying just the leading methods. }
+      Move(tvfs_io_methods, pMethods^,
+        PtrUInt(@tvfs_io_methods.xShmMap) - PtrUInt(@tvfs_io_methods));
     pMethods^.iVersion := pFd^.pReal^.pMethods^.iVersion;
     if pMethods^.iVersion > pVfs^.iVersion then
       pMethods^.iVersion := pVfs^.iVersion;
-    { Our wrapper never delegates xShm*/xFetch — null them out so the
-      pager goes to the no-shm fallback rather than crashing on a real
-      child shm method invoked through our (no-state) wrapper. }
-    pMethods^.xShmMap := nil;
-    pMethods^.xShmLock := nil;
-    pMethods^.xShmBarrier := nil;
-    pMethods^.xShmUnmap := nil;
+    { test_vfs.c:683..688 — only suppress shm when -noshm is set. }
+    if (pVfs^.iVersion > 1) and (p^.isNoshm <> 0) then begin
+      pMethods^.xShmUnmap := nil;
+      pMethods^.xShmLock := nil;
+      pMethods^.xShmBarrier := nil;
+      pMethods^.xShmMap := nil;
+    end;
+    { xFetch/xUnfetch not wired in this port (see InitIoMethodsTable). }
     pMethods^.xFetch := nil;
     pMethods^.xUnfetch := nil;
     pFile^.pMethods := pMethods;
@@ -676,6 +712,264 @@ begin
     Result := 0;
 end;
 
+{ test_vfs.c:830..879 — tvfsShmOpen.  Search for (or create) the
+  TestvfsBuffer for this filename and connect this handle to it. }
+function tvfsShmOpen(pFile: Psqlite3_file): cint;
+var
+  p      : PTestvfs;
+  rc     : cint;
+  pBuf   : PTestvfsBuffer;
+  pFd    : PTestvfsFd;
+  szName : cint;
+  nByte  : cint;
+begin
+  rc := SQLITE_OK;
+  pFd := PTestvfsFile(pFile)^.pFd;
+  p := PTestvfs(pFd^.pVfs^.pAppData);
+  Assert(p^.isFullshm = 0);
+  Assert((pFd^.pShmId <> nil) and (pFd^.pShm = nil) and (pFd^.pNext = nil));
+
+  { Evaluate the Tcl script: SCRIPT xShmOpen FILENAME }
+  Tcl_ResetResult(p^.interp);
+  if (p^.pScript <> nil) and ((p^.mask and TESTVFS_SHMOPEN_MASK) <> 0) then begin
+    tvfsExecTcl(p, 'xShmOpen', Tcl_NewStringObj(pFd^.zFilename, -1), nil, nil, nil);
+    if tvfsResultCode(p, rc) <> 0 then
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  Assert(rc = SQLITE_OK);
+  if ((p^.mask and TESTVFS_SHMOPEN_MASK) <> 0) and (tvfsInjectIoerr(p) <> 0) then begin
+    Result := SQLITE_IOERR; Exit;
+  end;
+
+  { Search for a TestvfsBuffer.  Create a new one if required. }
+  pBuf := p^.pBuffer;
+  while pBuf <> nil do begin
+    if StrComp(pFd^.zFilename, pBuf^.zFile) = 0 then Break;
+    pBuf := pBuf^.pNext;
+  end;
+  if pBuf = nil then begin
+    szName := cint(StrLen(pFd^.zFilename));
+    nByte := SizeOf(TTestvfsBuffer) + szName + 1;
+    pBuf := PTestvfsBuffer(ckalloc(cuint(nByte)));
+    FillChar(pBuf^, nByte, 0);
+    pBuf^.zFile := PChar(PtrUInt(pBuf) + SizeOf(TTestvfsBuffer));
+    Move(pFd^.zFilename^, pBuf^.zFile^, szName + 1);
+    pBuf^.pNext := p^.pBuffer;
+    p^.pBuffer := pBuf;
+  end;
+
+  { Connect the TestvfsBuffer to the new TestvfsShm handle and return. }
+  pFd^.pNext := pBuf^.pFile;
+  pBuf^.pFile := pFd;
+  pFd^.pShm := pBuf;
+  Result := rc;
+end;
+
+{ test_vfs.c:881..888 — tvfsAllocPage. }
+procedure tvfsAllocPage(pBuf: PTestvfsBuffer; iPage: cint; pgsz: cint);
+begin
+  Assert(iPage < TESTVFS_MAX_PAGES);
+  if pBuf^.aPage[iPage] = nil then begin
+    pBuf^.aPage[iPage] := PByte(ckalloc(cuint(pgsz)));
+    FillChar(pBuf^.aPage[iPage]^, pgsz, 0);
+    pBuf^.pgsz := pgsz;
+  end;
+end;
+
+{ test_vfs.c:890..939 — tvfsShmMap. }
+function tvfsShmMap(pFile: Psqlite3_file; iPage: cint; pgsz: cint;
+  isWrite: cint; pp: PPointer): cint; cdecl;
+var
+  rc   : cint;
+  pFd  : PTestvfsFd;
+  p    : PTestvfs;
+  pReal: Psqlite3_file;
+  pArg : PTclObj;
+begin
+  rc := SQLITE_OK;
+  pFd := PTestvfsFile(pFile)^.pFd;
+  p := PTestvfs(pFd^.pVfs^.pAppData);
+
+  if p^.isFullshm <> 0 then begin
+    pReal := pFd^.pReal;
+    Result := pReal^.pMethods^.xShmMap(pReal, iPage, pgsz, isWrite, pp);
+    Exit;
+  end;
+
+  if pFd^.pShm = nil then begin
+    rc := tvfsShmOpen(pFile);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  if (p^.pScript <> nil) and ((p^.mask and TESTVFS_SHMMAP_MASK) <> 0) then begin
+    pArg := Tcl_NewObj;
+    Tcl_IncrRefCount(pArg);
+    Tcl_ListObjAppendElement(p^.interp, pArg, Tcl_NewIntObj(iPage));
+    Tcl_ListObjAppendElement(p^.interp, pArg, Tcl_NewIntObj(pgsz));
+    Tcl_ListObjAppendElement(p^.interp, pArg, Tcl_NewIntObj(isWrite));
+    tvfsExecTcl(p, 'xShmMap',
+      Tcl_NewStringObj(pFd^.pShm^.zFile, -1), pFd^.pShmId, pArg, nil);
+    tvfsResultCode(p, rc);
+    Tcl_DecrRefCount(pArg);
+  end;
+  if (rc = SQLITE_OK) and ((p^.mask and TESTVFS_SHMMAP_MASK) <> 0)
+     and (tvfsInjectIoerr(p) <> 0) then
+    rc := SQLITE_IOERR;
+
+  if (rc = SQLITE_OK) and (isWrite <> 0) and (pFd^.pShm^.aPage[iPage] = nil) then
+    tvfsAllocPage(pFd^.pShm, iPage, pgsz);
+  if (rc = SQLITE_OK) or (rc = SQLITE_READONLY) then
+    pp^ := Pointer(pFd^.pShm^.aPage[iPage]);
+
+  Result := rc;
+end;
+
+{ test_vfs.c:942..1008 — tvfsShmLock. }
+function tvfsShmLock(pFile: Psqlite3_file; ofst: cint; n: cint;
+  flags: cint): cint; cdecl;
+var
+  rc    : cint;
+  pFd   : PTestvfsFd;
+  p     : PTestvfs;
+  zLock : array[0..79] of AnsiChar;
+  s     : AnsiString;
+  isLock: cint;
+  isExcl: cint;
+  mask  : cuint;
+  p2    : PTestvfsFd;
+begin
+  rc := SQLITE_OK;
+  pFd := PTestvfsFile(pFile)^.pFd;
+  p := PTestvfs(pFd^.pVfs^.pAppData);
+
+  if p^.isFullshm <> 0 then begin
+    Result := pFd^.pReal^.pMethods^.xShmLock(pFd^.pReal, ofst, n, flags);
+    Exit;
+  end;
+
+  if (p^.pScript <> nil) and ((p^.mask and TESTVFS_SHMLOCK_MASK) <> 0) then begin
+    s := IntToStr(ofst) + ' ' + IntToStr(n);
+    if (flags and SQLITE_SHM_LOCK) <> 0 then s := s + ' lock'
+    else s := s + ' unlock';
+    if (flags and SQLITE_SHM_SHARED) <> 0 then s := s + ' shared'
+    else s := s + ' exclusive';
+    StrPLCopy(zLock, s, SizeOf(zLock) - 1);
+    tvfsExecTcl(p, 'xShmLock',
+      Tcl_NewStringObj(pFd^.pShm^.zFile, -1), pFd^.pShmId,
+      Tcl_NewStringObj(zLock, -1), nil);
+    tvfsResultCode(p, rc);
+  end;
+
+  if (rc = SQLITE_OK) and ((p^.mask and TESTVFS_SHMLOCK_MASK) <> 0)
+     and (tvfsInjectIoerr(p) <> 0) then
+    rc := SQLITE_IOERR;
+
+  if rc = SQLITE_OK then begin
+    isLock := flags and SQLITE_SHM_LOCK;
+    isExcl := flags and SQLITE_SHM_EXCLUSIVE;
+    mask := (cuint(cuint(1) shl n) - 1) shl ofst;
+    if isLock <> 0 then begin
+      p2 := pFd^.pShm^.pFile;
+      while p2 <> nil do begin
+        if p2 <> pFd then begin
+          if ((p2^.excllock and mask) <> 0)
+             or ((isExcl <> 0) and ((p2^.sharedlock and mask) <> 0)) then begin
+            rc := SQLITE_BUSY;
+            Break;
+          end;
+        end;
+        p2 := p2^.pNext;
+      end;
+      if rc = SQLITE_OK then begin
+        if isExcl <> 0 then pFd^.excllock := pFd^.excllock or mask;
+        if isExcl = 0 then pFd^.sharedlock := pFd^.sharedlock or mask;
+      end;
+    end else begin
+      if isExcl <> 0 then pFd^.excllock := pFd^.excllock and (not mask);
+      if isExcl = 0 then pFd^.sharedlock := pFd^.sharedlock and (not mask);
+    end;
+  end;
+
+  Result := rc;
+end;
+
+{ test_vfs.c:1010..1024 — tvfsShmBarrier. }
+procedure tvfsShmBarrier(pFile: Psqlite3_file); cdecl;
+var
+  pFd: PTestvfsFd;
+  p  : PTestvfs;
+  z  : PChar;
+begin
+  pFd := PTestvfsFile(pFile)^.pFd;
+  p := PTestvfs(pFd^.pVfs^.pAppData);
+
+  if (p^.pScript <> nil) and ((p^.mask and TESTVFS_SHMBARRIER_MASK) <> 0) then begin
+    if pFd^.pShm <> nil then z := pFd^.pShm^.zFile else z := '';
+    tvfsExecTcl(p, 'xShmBarrier', Tcl_NewStringObj(z, -1), pFd^.pShmId, nil, nil);
+  end;
+
+  if p^.isFullshm <> 0 then begin
+    pFd^.pReal^.pMethods^.xShmBarrier(pFd^.pReal);
+    Exit;
+  end;
+end;
+
+{ test_vfs.c:1026..1071 — tvfsShmUnmap. }
+function tvfsShmUnmap(pFile: Psqlite3_file; deleteFlag: cint): cint; cdecl;
+var
+  rc    : cint;
+  pFd   : PTestvfsFd;
+  p     : PTestvfs;
+  pBuf  : PTestvfsBuffer;
+  ppFd  : PPTestvfsFd;
+  i     : cint;
+  ppBuf : PPTestvfsBuffer;
+begin
+  rc := SQLITE_OK;
+  pFd := PTestvfsFile(pFile)^.pFd;
+  p := PTestvfs(pFd^.pVfs^.pAppData);
+  pBuf := pFd^.pShm;
+
+  if p^.isFullshm <> 0 then begin
+    Result := pFd^.pReal^.pMethods^.xShmUnmap(pFd^.pReal, deleteFlag);
+    Exit;
+  end;
+
+  if pBuf = nil then begin Result := SQLITE_OK; Exit; end;
+  Assert((pFd^.pShmId <> nil) and (pFd^.pShm <> nil));
+
+  if (p^.pScript <> nil) and ((p^.mask and TESTVFS_SHMCLOSE_MASK) <> 0) then begin
+    tvfsExecTcl(p, 'xShmUnmap',
+      Tcl_NewStringObj(pFd^.pShm^.zFile, -1), pFd^.pShmId, nil, nil);
+    tvfsResultCode(p, rc);
+  end;
+
+  { Unlink this handle from the buffer's list. }
+  ppFd := @pBuf^.pFile;
+  while ppFd^ <> pFd do
+    ppFd := @(ppFd^^.pNext);
+  Assert(ppFd^ = pFd);
+  ppFd^ := pFd^.pNext;
+  pFd^.pNext := nil;
+
+  if pBuf^.pFile = nil then begin
+    ppBuf := @p^.pBuffer;
+    while ppBuf^ <> pBuf do
+      ppBuf := @(ppBuf^^.pNext);
+    ppBuf^ := ppBuf^^.pNext;
+    i := 0;
+    while (i < TESTVFS_MAX_PAGES) and (pBuf^.aPage[i] <> nil) do begin
+      ckfree(pBuf^.aPage[i]);
+      Inc(i);
+    end;
+    ckfree(pBuf);
+  end;
+  pFd^.pShm := nil;
+
+  Result := rc;
+end;
+
 procedure InitIoMethodsTable;
 begin
   FillChar(tvfs_io_methods, SizeOf(tvfs_io_methods), 0);
@@ -692,8 +986,13 @@ begin
   tvfs_io_methods.xFileControl          := @tvfsFileControl;
   tvfs_io_methods.xSectorSize           := @tvfsSectorSize;
   tvfs_io_methods.xDeviceCharacteristics:= @tvfsDeviceCharacteristics;
-  { xShm*/xFetch nil'd per-instance in tvfsOpen so the pager goes to
-    the no-shm fallback. }
+  tvfs_io_methods.xShmMap               := @tvfsShmMap;
+  tvfs_io_methods.xShmLock              := @tvfsShmLock;
+  tvfs_io_methods.xShmBarrier           := @tvfsShmBarrier;
+  tvfs_io_methods.xShmUnmap             := @tvfsShmUnmap;
+  { xFetch/xUnfetch left nil — Pascal port does not exercise mmap I/O
+    through the wrapper (C wires tvfsFetch/tvfsUnfetch; omitted here as
+    no target test memory-maps through testvfs). }
 end;
 
 { ============================================================
