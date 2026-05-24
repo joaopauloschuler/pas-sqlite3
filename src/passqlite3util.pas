@@ -2766,9 +2766,38 @@ begin
   end;
 end;
 
-function sqlite3ApiExit(db: Psqlite3db; rc: i32): i32;
+{ malloc.c:866 apiHandleError.  On OOM (or SQLITE_IOERR_NOMEM) clear the
+  fault and report SQLITE_NOMEM; otherwise mask rc by db->errMask so the
+  primary code is returned unless extended result codes are enabled.
+  sqlite3Error here is the trivial `db->errCode := err_code` (it lives in
+  the downstream codegen unit, but its body is just that assignment). }
+function apiHandleError(db: Psqlite3db; rc: i32): i32;
+var
+  p: PTsqlite3;
 begin
-  Result := rc;
+  p := PTsqlite3(db);
+  if (p^.mallocFailed <> 0) or (rc = SQLITE_IOERR_NOMEM) then begin
+    sqlite3OomClear(db);
+    p^.errCode := SQLITE_NOMEM;   { sqlite3Error(db, SQLITE_NOMEM) }
+    Result := SQLITE_NOMEM_BKPT;
+    Exit;
+  end;
+  Result := rc and p^.errMask;
+end;
+
+{ malloc.c:887 sqlite3ApiExit.  Must be called before returning control to
+  the user from any API that may have called sqlite3_malloc/realloc. }
+function sqlite3ApiExit(db: Psqlite3db; rc: i32): i32;
+var
+  p: PTsqlite3;
+begin
+  Assert(db <> nil);
+  p := PTsqlite3(db);
+  if (p^.mallocFailed <> 0) or (rc <> 0) then begin
+    Result := apiHandleError(db, rc);
+    Exit;
+  end;
+  Result := 0;
 end;
 
 function sqlite3_memory_used: i64;

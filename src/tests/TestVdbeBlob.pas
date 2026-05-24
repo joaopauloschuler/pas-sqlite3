@@ -141,6 +141,9 @@ begin
   WriteLn('T7–T10: invalidated handle (pStmt=nil) behaviors');
   FillChar(md, SizeOf(md), 0);
   md.enc := SQLITE_UTF8;
+  { A real connection always has errMask=0xff (openDatabase); without it
+    sqlite3ApiExit would mask the returned rc with 0 → SQLITE_ABORT lost. }
+  md.errMask := i32($FF);
 
   pBlob := MakeInvalidatedHandle(@md);
   if pBlob = nil then begin

@@ -7017,6 +7017,38 @@ begin
   if clientData = nil then ;
 end;
 
+{ test1.c:1707 test_extended_result_codes.
+  Usage: sqlite3_extended_result_codes DB BOOLEAN.  Toggles db->errMask
+  between 0xff (primary codes) and 0xffffffff (extended codes) at the API
+  boundary.  Required so without_rowid7-3.5.1 sees the extended rc (257)
+  after enabling, while 3.4.1 (before enabling) sees the masked code (1).
+  Engine entry: passqlite3main.pas:3857. }
+function test_extended_result_codes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  enable: cint;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  enable := 0;
+  if Tcl_GetBooleanFromObj(interp, objv[2], @enable) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_extended_result_codes(db, enable);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.012.f — test1.c:4884..4902 test_errcode.
   Usage: sqlite3_errcode DB.  Returns the symbolic name of the most
   recent error (e.g. "SQLITE_CORRUPT"), via t1ErrName/sqlite3ErrName.
@@ -8237,6 +8269,10 @@ begin
     notnull.test).  C ref test1.c registered at 9133. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_extended_errcode'),
     @test_extended_errcode, nil, nil);
+  { test1.c:9185 sqlite3_extended_result_codes DB BOOLEAN — toggles the
+    API-boundary errMask so without_rowid7-3.5.1 sees the extended rc. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_extended_result_codes'),
+    @test_extended_result_codes, nil, nil);
   { 9.4.divbug.88.012.f — sqlite3_errcode DB returns symbolic rc
     name (test1.c:4884..4902, registered :9134). Without this the
     tester_min.tcl fallback `[$db errorcode]` returns numeric 11 and
