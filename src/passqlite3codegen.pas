@@ -29345,6 +29345,7 @@ function resolveFromTermToCte(pParse: PParse; pFrom: PSrcItem): i32;
 var
   pCt:   PCte;
   pWthC: Pointer;
+  pSavedWith: PWith;
   db:    PTsqlite3;
   pTab:  PTable2;
   pEList: PExprList;
@@ -29512,7 +29513,15 @@ begin
     if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
   end;
   pCt^.zCteErr := PAnsiChar('circular reference: %s');
+  { select.c:5794..5841 — resolve the CTE body in its DEFINITION scope, not
+    the use-site WITH.  searchWith returned pWthC = the With clause that owns
+    pCt; install it on pParse^.pWith around the body prep so nested name
+    lookups (e.g. another CTE referenced inside this CTE's body) see the
+    CTEs visible where this CTE was DEFINED, then restore the use-site With. }
+  pSavedWith := pParse^.pWith;
+  pParse^.pWith := PWith(pWthC);
   sqlite3SelectPrep(pParse, pSel, nil);
+  pParse^.pWith := pSavedWith;
   pCt^.zCteErr := nil;
   if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
 
