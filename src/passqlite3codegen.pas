@@ -33265,7 +33265,19 @@ begin
         needSortOB there.  obCandidate just records that pOrderBy must be
         aggregate-analyzed up front (harmless when orderByGrp=1 since those
         exprs equal the already-analyzed GROUP BY terms). }
-      if pDest^.eDest = SRT_Output then
+      { When the ORDER BY is not satisfied by the GROUP BY ordering the
+        per-group rows must be pushed into a secondary sorter and drained
+        afterwards (needSortOB).  C runs this for every destination via
+        generateSortTail; the Pas drain at the tail dispatches by eDest.
+        SRT_Coroutine is reached when this GROUP BY query is the LEFT/RIGHT
+        arm of a compound EXCEPT/INTERSECT/UNION coded through
+        multiSelectByMerge: multiSelectByMerge invents an ORDER BY over
+        column 1 (not structurally equal to the GROUP BY key, so
+        orderByGrp=0) and codes each arm as an SRT_Coroutine producer.
+        Without obCandidate the arm bailed here producing zero rows, so
+        `INSERT INTO t SELECT ... GROUP BY ... EXCEPT SELECT ...` inserted
+        nothing (insert2-1.2.x / 1.3.x). }
+      if (pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine) then
         obCandidate := True
       else if orderByGrp = 0 then
       begin
@@ -33956,7 +33968,15 @@ begin
         for iOB := 0 to nResultCol - 1 do
           sqlite3VdbeAddOp3(v, OP_Column, iSortPTabOB,
                             nOrderByOB + iOB, pDest^.iSdst + iOB);
-        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        { Per-row dispatch by destination — mirrors generateSortTail routing
+          each drained row through selectInnerLoop's destination arm
+          (select.c:1704 / 1349..).  SRT_Coroutine is hit when this query is
+          a compound EXCEPT/INTERSECT/UNION arm coded by multiSelectByMerge:
+          yield the row to the consumer coroutine instead of OP_ResultRow. }
+        if pDest^.eDest = SRT_Coroutine then
+          sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else
+          sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
         sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterOB, addrSortLoopOB);
         sqlite3VdbeResolveLabel(v, addrSortBrkOB);
         sqlite3ReleaseTempReg(pParse, regSortOutOB);
