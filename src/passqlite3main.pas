@@ -685,12 +685,35 @@ begin
 end;
 
 { ----------------------------------------------------------------------
+  functionDestroy — invoke the destructor function associated with FuncDef
+  p, if any.  If this is not the last copy of the function, do not invoke
+  it (multiple copies are created when create_function is called with
+  SQLITE_ANY).  main.c:1191..1203.
+  ---------------------------------------------------------------------- }
+procedure functionDestroy(db: PTsqlite3; p: PTFuncDef);
+var
+  pDestructor: PTFuncDestructor;
+begin
+  pDestructor := PTFuncDestructor(p^.u);
+  if pDestructor <> nil then begin
+    Dec(pDestructor^.nRef);
+    if pDestructor^.nRef = 0 then begin
+      pDestructor^.xDestroy(pDestructor^.pUserData);
+      sqlite3DbFree(db, pDestructor);
+    end;
+  end;
+end;
+
+{ ----------------------------------------------------------------------
   sqlite3LeaveMutexAndCloseZombie — final tear-down.
   main.c:1363  (simplified for Phase 8.1 scope)
   ---------------------------------------------------------------------- }
 procedure sqlite3LeaveMutexAndCloseZombie(db: PTsqlite3);
 var
   j: i32;
+  pElem, pNextElem: passqlite3util.PHashElem;
+  pFunc, pFuncNext: PTFuncDef;
+  pColl, pJ: PTCollSeq;
 begin
   if (db^.eOpenState <> SQLITE_STATE_ZOMBIE) or (connectionIsBusy(db) <> 0) then
     Exit;
@@ -719,9 +742,39 @@ begin
   { Collapse aDb back to the static array (no-op when nDb<=2). }
   sqlite3CollapseDatabaseArray(db);
 
-  { Clear the per-connection hash tables. }
+  { main.c:1419..1428 — fire each user-function destructor and free every
+    FuncDef in the aFunc hash before clearing it.  sqlite3HashClear frees
+    only the internal hash nodes, not the FuncDef payloads. }
+  pElem := db^.aFunc.first;
+  while pElem <> nil do begin
+    pNextElem := passqlite3util.PHashElem(pElem^.next);
+    pFunc := PTFuncDef(pElem^.data);
+    while pFunc <> nil do begin
+      functionDestroy(db, pFunc);
+      pFuncNext := PTFuncDef(pFunc^.pNext);
+      sqlite3DbFree(db, pFunc);
+      pFunc := pFuncNext;
+    end;
+    pElem := pNextElem;
+  end;
   sqlite3HashClear(@db^.aFunc);
+
+  { main.c:1429..1438 — fire each collation destructor (3 slots per name)
+    and free every CollSeq array before clearing the aCollSeq hash. }
+  pElem := db^.aCollSeq.first;
+  while pElem <> nil do begin
+    pNextElem := passqlite3util.PHashElem(pElem^.next);
+    pColl := PTCollSeq(pElem^.data);
+    for j := 0 to 2 do begin
+      pJ := PTCollSeq(PAnsiChar(pColl) + j * SizeOf(TCollSeq));
+      if Assigned(pJ^.xDel) then
+        pJ^.xDel(pJ^.pUser);
+    end;
+    sqlite3DbFree(db, pColl);
+    pElem := pNextElem;
+  end;
   sqlite3HashClear(@db^.aCollSeq);
+
   sqlite3HashClear(@db^.aModule);
 
   { Deallocate the cached error string, if any. }
