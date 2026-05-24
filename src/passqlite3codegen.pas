@@ -64447,7 +64447,7 @@ function applyModifier(pCtx: Psqlite3_context; z: PAnsiChar; idx: i32;
 var
   zMod, unit_: PAnsiChar;
   buf: array[0..31] of AnsiChar;
-  i, nUsed, nUnit, iVal, dadd: i32;
+  i, nUsed, nUnit, iVal, dadd, tzSgn: i32;
   r, rScale, msFrac: Double;
 begin
   Result := False;
@@ -64674,6 +64674,45 @@ begin
           if msFrac > 0.999 then msFrac := 0.999;
           r := r + msFrac;
         end;
+      end;
+      { date.c:parseHhMmSs tail → parseTimezone (date.c:166..198).  After the
+        HH:MM[:SS[.FFF]] the C path calls parseTimezone, which (a) requires a
+        fraction to have >=1 digit after '.' — already enforced above so a bare
+        '.' is left unconsumed here — and (b) demands the rest of the string be
+        consumed: optional whitespace, then either end-of-string, a 'Z'/'z'
+        zulu marker, or a '[+-]HH:MM' offset, then optional trailing whitespace
+        and end-of-string.  Any other leftover (e.g. trailing 'x', a stray '.')
+        is a parse error.  computeJD subtracts the tz minutes, so we fold the
+        offset into r as seconds before the sign flip. }
+      while (zMod[nUsed] <> #0) and (sqlite3Isspace(u8(zMod[nUsed])) <> 0) do
+        Inc(nUsed);
+      if zMod[nUsed] <> #0 then begin
+        if (zMod[nUsed] = 'Z') or (zMod[nUsed] = 'z') then begin
+          Inc(nUsed);
+        end else begin
+          if zMod[nUsed] = '-' then tzSgn := -1
+          else if zMod[nUsed] = '+' then tzSgn := 1
+          else Exit;
+          Inc(nUsed);
+          if (zMod[nUsed] < '0') or (zMod[nUsed] > '9') or
+             (zMod[nUsed+1] < '0') or (zMod[nUsed+1] > '9') or
+             (zMod[nUsed+2] <> ':') or
+             (zMod[nUsed+3] < '0') or (zMod[nUsed+3] > '9') or
+             (zMod[nUsed+4] < '0') or (zMod[nUsed+4] > '9') then Exit;
+          iVal := (Ord(zMod[nUsed])   - Ord('0')) * 10
+                + (Ord(zMod[nUsed+1]) - Ord('0'));    { tz HH }
+          nUnit := (Ord(zMod[nUsed+3]) - Ord('0')) * 10
+                 + (Ord(zMod[nUsed+4]) - Ord('0'));   { tz MM }
+          Inc(nUsed, 5);
+          { date.c:1029..1032 — computeJD applies the tz (iJD -= tz*60000) and
+            the day-strip keeps only a positive time-of-day in [0,86400) s.
+            Subtract the tz seconds then wrap r back into [0,86400). }
+          r := r - tzSgn * (nUnit + iVal * 60) * 60.0;
+          r := r - Math.Floor(r / 86400.0) * 86400.0;
+        end;
+        while (zMod[nUsed] <> #0) and (sqlite3Isspace(u8(zMod[nUsed])) <> 0) do
+          Inc(nUsed);
+        if zMod[nUsed] <> #0 then Exit;
       end;
       if zMod^ = '-' then r := -r;
       dt.jd := dt.jd + r / 86400.0;
