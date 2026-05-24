@@ -33,8 +33,9 @@
   engine (passqlite3vdbe / passqlite3util).
 
   Not ported (UTF-16 / FTS3 / abuse paths): test_destructor16,
-  hex_to_utf16*, test_auxdata, test_getsubtype, test_setsubtype,
-  test_frombind, abuse_create_function, install_fts3_rank_function.
+  hex_to_utf16*, test_auxdata, test_frombind, abuse_create_function,
+  install_fts3_rank_function.  test_getsubtype/test_setsubtype ported
+  (task 6.40.8).
   Md5_Register is registered as an auto-extension elsewhere is N/A here.
 
   Public entry:
@@ -435,6 +436,28 @@ begin
   sqlite3_result_zeroblob(context, sqlite3_value_int(pArg[0]));
 end;
 
+{ test_func.c:619 test_getsubtype — return the subtype for value V. }
+procedure test_getsubtype(context: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  pArg: PPsqlite3_value;
+begin
+  pArg := argv;
+  sqlite3_result_int(context, cint(sqlite3_value_subtype(pArg[0])));
+end;
+
+{ test_func.c:649 test_setsubtype — return the value V with its subtype
+  changed to T. }
+procedure test_setsubtype(context: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  pArg: PPsqlite3_value;
+begin
+  pArg := argv;
+  sqlite3_result_value(context, pArg[0]);
+  sqlite3_result_subtype(context, cuint(sqlite3_value_int(pArg[1])));
+end;
+
 { ----------------------------------------------------------------------
   test_func.c:572 registerTestFunctions — the auto-extension entry that
   registers the test scalar UDFs into a connection.  Signature matches
@@ -451,7 +474,7 @@ type
 function registerTestFunctions(db: PTsqlite3; pzErrMsg: PPAnsiChar;
   pThunk: Pointer): cint; cdecl;
 const
-  aFuncs: array[0..10] of TTestFuncDef = (
+  aFuncs: array[0..12] of TTestFuncDef = (
     (zName: 'randstr';               nArg: 2;
        eTextRep: SQLITE_UTF8; xFunc: @randStr),
     (zName: 'test_destructor';        nArg: 1;
@@ -473,7 +496,12 @@ const
     (zName: 'test_decode';            nArg: 1;
        eTextRep: SQLITE_UTF8; xFunc: @test_decode),
     (zName: 'test_extract';           nArg: 2;
-       eTextRep: SQLITE_UTF8; xFunc: @test_extract)
+       eTextRep: SQLITE_UTF8; xFunc: @test_extract),
+    (zName: 'test_getsubtype';         nArg: 1;
+       eTextRep: SQLITE_UTF8; xFunc: @test_getsubtype),
+    (zName: 'test_setsubtype';         nArg: 2;
+       eTextRep: SQLITE_UTF8 or SQLITE_RESULT_SUBTYPE;
+       xFunc: @test_setsubtype)
   );
 var
   i: cint;

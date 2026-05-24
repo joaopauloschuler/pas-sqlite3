@@ -39,6 +39,7 @@ interface
 
 uses
   SysUtils,
+  Strings,
   passqlite3types,
   passqlite3util,
   passqlite3printf,
@@ -147,10 +148,8 @@ type
 var
   amatchModule: Tsqlite3_module;
 
-function strlenC(s: PAnsiChar): NativeUInt; cdecl; external 'c' name 'strlen';
-function strcmpC(a, b: PAnsiChar): i32; cdecl; external 'c' name 'strcmp';
-function strncmpC(a, b: PAnsiChar; n: NativeUInt): i32; cdecl; external 'c' name 'strncmp';
-function memcmpC(a, b: Pointer; n: NativeUInt): i32; cdecl; external 'c' name 'memcmp';
+{ 6.40.1.p.2.3 — strlen/strcmp/strncmp/memcmp externals replaced with FPC RTL:
+  StrLen / StrComp / StrLComp / CompareByte. }
 
 procedure memmoveP(dst, src: Pointer; n: NativeUInt);
 begin
@@ -242,7 +241,7 @@ function amatchAvlSearch(p: PAmatchAvl; zKey: PAnsiChar): PAmatchAvl;
 var c: i32;
 begin
   while p <> nil do begin
-    c := strcmpC(zKey, p^.zKey);
+    c := StrComp(zKey, p^.zKey);
     if c = 0 then Break;
     if c < 0 then p := p^.pBefore
              else p := p^.pAfter;
@@ -268,7 +267,7 @@ begin
     pNew^.pUp := nil;
   end else begin
     while p <> nil do begin
-      c := strcmpC(pNew^.zKey, p^.zKey);
+      c := StrComp(pNew^.zKey, p^.zKey);
       if c < 0 then begin
         if p^.pBefore <> nil then
           p := p^.pBefore
@@ -388,11 +387,11 @@ begin
 
   if zFrom = nil then zFrom := PAnsiChar('');
   if zTo   = nil then zTo   := PAnsiChar('');
-  nFrom := i32(strlenC(zFrom));
-  nTo   := i32(strlenC(zTo));
+  nFrom := i32(StrLen(zFrom));
+  nTo   := i32(StrLen(zTo));
 
   { Silently ignore null transformations, but capture rSub for "?"="?". }
-  if strcmpC(zFrom, zTo) = 0 then begin
+  if StrComp(zFrom, zTo) = 0 then begin
     if (zFrom[0] = '?') and (zFrom[1] = #0) then begin
       if (p^.rSub = 0) or (p^.rSub > rCost) then p^.rSub := rCost;
     end;
@@ -419,10 +418,10 @@ begin
       [StrPas(p^.zClassName), AMATCH_MX_LANGID]))));
     rc := SQLITE_ERROR;
   end else
-  if (strcmpC(zFrom, '') = 0) and (strcmpC(zTo, '?') = 0) then begin
+  if (StrComp(zFrom, '') = 0) and (StrComp(zTo, '?') = 0) then begin
     if (p^.rIns = 0) or (p^.rIns > rCost) then p^.rIns := rCost;
   end else
-  if (strcmpC(zFrom, '?') = 0) and (strcmpC(zTo, '') = 0) then begin
+  if (StrComp(zFrom, '?') = 0) and (StrComp(zTo, '') = 0) then begin
     if (p^.rDel = 0) or (p^.rDel > rCost) then p^.rDel := rCost;
   end else begin
     pRule := PAmatchRule(sqlite3_malloc64(u64(SizeOf(TAmatchRule)) +
@@ -532,7 +531,7 @@ var
   q: AnsiChar;
   iIn, iOut: i32;
 begin
-  nIn := i64(strlenC(zIn));
+  nIn := i64(StrLen(zIn));
   zOut := PAnsiChar(sqlite3_malloc64(u64(nIn + 1)));
   if zOut <> nil then begin
     q := zIn[0];
@@ -593,10 +592,10 @@ function amatchValueOfKey(zKey, zStr: PAnsiChar): PAnsiChar;
 var
   nKey, nStr, i: i32;
 begin
-  nKey := i32(strlenC(zKey));
-  nStr := i32(strlenC(zStr));
+  nKey := i32(StrLen(zKey));
+  nStr := i32(StrLen(zStr));
   if nStr < nKey + 1 then begin Result := nil; Exit; end;
-  if memcmpC(zStr, zKey, nKey) <> 0 then begin Result := nil; Exit; end;
+  if CompareByte(zStr^, zKey^, nKey) <> 0 then begin Result := nil; Exit; end;
   i := nKey;
   while (i < nStr) and (zStr[i] in [' ', #9, #10, #11, #12, #13]) do Inc(i);
   if (i >= nStr) or (zStr[i] <> '=') then begin Result := nil; Exit; end;
@@ -801,8 +800,8 @@ var
   pNew: PAnsiChar;
 begin
   if rCost > pCur^.rLimit then Exit;
-  nBase := i32(strlenC(zWordBase));
-  nTail := i32(strlenC(zWordTail));
+  nBase := i32(StrLen(zWordBase));
+  nTail := i32(StrLen(zWordTail));
   if nBase + nTail + 3 > pCur^.nBuf then begin
     pCur^.nBuf := nBase + nTail + 100;
     pNew := PAnsiChar(sqlite3_realloc64(pCur^.zBuf, u64(pCur^.nBuf)));
@@ -903,7 +902,7 @@ begin
     pWord := pNode^.pWord;
     amatchAvlRemove(@pCur^.pCost, @pWord^.sCost);
 
-    nWord := i64(strlenC(@pWord^.zWord[2]));
+    nWord := i64(StrLen(@pWord^.zWord[2]));
     if nWord + 20 > nBuf then begin
       nBuf := nWord + 100;
       zBuf := PAnsiChar(sqlite3_realloc64(zBuf, u64(nBuf)));
@@ -933,7 +932,7 @@ begin
       if rc = SQLITE_ROW then begin
         zW := PAnsiChar(sqlite3_column_text(PVdbe(p^.pVCheck), 0));
         if (zW <> nil)
-           and (strncmpC(zBuf, zW, NativeUInt(nWord + nNextIn)) = 0) then
+           and (StrLComp(zBuf, zW, NativeUInt(nWord + nNextIn)) = 0) then
           amatchAddWord(pCur, pWord^.rCost, pWord^.nMatch + nNextIn, zBuf, '');
       end;
       zBuf[nWord] := #0;
@@ -948,7 +947,7 @@ begin
       zW := PAnsiChar(sqlite3_column_text(PVdbe(p^.pVCheck), 0));
       if zW = nil then Break;
       amatchStrcpy(zBuf + nWord, @zNext[0]);
-      if strncmpC(zW, zBuf, NativeUInt(nWord)) <> 0 then Break;
+      if StrLComp(zW, zBuf, NativeUInt(nWord)) <> 0 then Break;
       if ((zNextIn[0] = '*') and (zNextIn[1] = #0))
          or ((zNextIn[0] = #0) and (zW[nWord] = #0)) then begin
         isMatch := 1;
@@ -984,7 +983,7 @@ begin
     pRule := p^.pRule;
     while pRule <> nil do begin
       if pRule^.iLang = pCur^.iLang then begin
-        if strncmpC(pRule^.zFrom, pCur^.zInput + pWord^.nMatch,
+        if StrLComp(pRule^.zFrom, pCur^.zInput + pWord^.nMatch,
                     NativeUInt(pRule^.nFrom)) = 0 then
           amatchAddWord(pCur, pWord^.rCost + pRule^.rCost,
                         pWord^.nMatch + pRule^.nFrom,

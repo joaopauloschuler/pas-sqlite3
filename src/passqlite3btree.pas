@@ -689,6 +689,7 @@ const
 
 { btree.c:3236 — return the current page size of the database. }
 function  sqlite3BtreeGetPageSize(p: PBtree): i32;
+function  sqlite3TempInMemory(db: Psqlite3): i32;
 function  sqlite3BtreeSetSpillSize(p: PBtree; mxPage: i32): i32;
 procedure sqlite3BtreeSetCacheSize(p: PBtree; mxPage: i32);
 { btree.c:3185 — set page size + reserved-bytes; iFix locks pageSize. }

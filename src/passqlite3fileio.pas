@@ -66,42 +66,12 @@ const
   FSDIR_COLUMN_DIR   = 6;
 
 type
-  PFILE = Pointer;
   PPSqlite3VtabCursor = ^PSqlite3VtabCursor;
 
 const
   dotPath: PAnsiChar = '.';
 
-{ ----- libc bindings (only what BaseUnix doesn't already expose) ----- }
-
-function libc_fopen(path, mode: PAnsiChar): PFILE; cdecl;
-  external 'c' name 'fopen';
-function libc_fclose(stream: PFILE): i32; cdecl;
-  external 'c' name 'fclose';
-function libc_fread(buf: Pointer; sz, n: NativeUInt; stream: PFILE): NativeUInt; cdecl;
-  external 'c' name 'fread';
-function libc_fwrite(buf: Pointer; sz, n: NativeUInt; stream: PFILE): NativeUInt; cdecl;
-  external 'c' name 'fwrite';
-function libc_fseek(stream: PFILE; offset: NativeInt; whence: i32): i32; cdecl;
-  external 'c' name 'fseek';
-function libc_ftell(stream: PFILE): NativeInt; cdecl;
-  external 'c' name 'ftell';
-procedure libc_rewind(stream: PFILE); cdecl;
-  external 'c' name 'rewind';
-
-type
-  TUtTimeVal = record
-    tv_sec  : i64;
-    tv_usec : i64;
-  end;
-  PUtTimeVal = ^TUtTimeVal;
-
-function libc_utimes(path: PAnsiChar; times: PUtTimeVal): i32; cdecl;
-  external 'c' name 'utimes';
-function libc_realpath(path: PAnsiChar; resolved: PAnsiChar): PAnsiChar; cdecl;
-  external 'c' name 'realpath';
-function libc_time(t: Pi64): i64; cdecl;
-  external 'c' name 'time';
+{ ----- libc bindings: realpath / time now come from passqlite3os ----- }
 
 { Convenience helpers. }
 function isDir(m: i32): Boolean; inline;

@@ -200,6 +200,17 @@ compile_test TestVtab
 compile_test TestCarray
 compile_test TestDbpage
 compile_test TestDbstat
+compile_test TestFts3Hash
+compile_test TestFts3Tok
+compile_test TestFts3Unicode
+compile_test TestFts3TokRegistry
+compile_test TestFts3TokVtab
+compile_test TestFts3Expr
+compile_test TestFts3Write
+compile_test TestFts3Vtab
+compile_test TestFts3Snippet
+compile_test TestFts3Aux
+compile_test TestFts3DescUpdate
 compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable

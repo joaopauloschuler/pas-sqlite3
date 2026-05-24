@@ -666,6 +666,16 @@ type
   PVTable   = Pointer;  { VTable   — Phase 6.bis (vtab.c) }
   Psqlite3_vtab_cursor = Pointer;  { vtab cursor — Phase 6.bis }
   PVdbeSorter = ^TVdbeSorter;      { VdbeSorter  — Phase 5.7 (vdbesort.c) }
+  { vdbesort.c private objects (Phase 5.7.b.1) — forward pointer typedefs;
+    full record layouts declared in the Phase 5.7 sorter type block below. }
+  PSorterRecord = ^TSorterRecord;  { SorterRecord — vdbesort.c:447 }
+  PMergeEngine  = ^TMergeEngine;   { MergeEngine  — vdbesort.c:256 }
+  PPMergeEngine = ^PMergeEngine;   { MergeEngine** — out-param for Level0 }
+  PPmaReader    = ^TPmaReader;     { PmaReader    — vdbesort.c:354 }
+  PPmaWriter    = ^TPmaWriter;     { PmaWriter    — vdbesort.c:418 }
+  PIncrMerger   = ^TIncrMerger;    { IncrMerger   — vdbesort.c:400 }
+  PPIncrMerger  = ^PIncrMerger;    { IncrMerger** — out-param for IncrMergerNew }
+  PSortSubtask  = ^TSortSubtask;   { SortSubtask  — vdbesort.c:295 }
 
   { -----------------------------------------------------------------------
     Pointer forward declarations for VDBE types — mutual references require
@@ -1218,33 +1228,108 @@ type
   end;
 
   { -----------------------------------------------------------------------
-    Phase 5.7 — vdbesort.c external sorter types.
-    Full implementations of PmaReader, MergeEngine, SortSubtask, and
-    SorterRecord are deferred to Phase 7 (SQL compiler available).
-    We define TVdbeSorter with the fields needed by the stub public API.
+    Phase 5.7 — vdbesort.c external sorter types (C-faithful layout).
+    Ported 1:1 from ../sqlite3/src/vdbesort.c:173..461.  Single-threaded
+    subset (SQLITE_MAX_WORKER_THREADS==0): thread fields are declared for
+    layout fidelity but unused.  Function bodies for the PMA disk-spill
+    subsystem land in Phase 5.7.b.2..b.9.
     ----------------------------------------------------------------------- }
 
+  { typedef int (*SorterCompare)(SortSubtask*,int*,const void*,int,
+                                 const void*,int);  vdbesort.c:294 }
+  TSorterCompare = function(pTask: PSortSubtask; pbKey2Cached: Pi32;
+    pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
+
+  { struct SorterFile — vdbesort.c:173 }
+  PSorterFile = ^TSorterFile;
   TSorterFile = record
-    pFd:  Pointer;         { sqlite3_file* }
+    pFd:  Psqlite3_file;   { file handle }
     iEof: i64;             { bytes of data stored in pFd }
   end;
+  PPsqlite3_file = ^Psqlite3_file;  { sqlite3_file** out-param helper }
+  PPByte         = ^PByte;          { u8** out-param helper }
 
+  { struct SorterList — vdbesort.c:186 }
+  PSorterList = ^TSorterList;
   TSorterList = record
-    pList:   Pointer;      { SorterRecord* linked list }
+    pList:   PSorterRecord; { linked list of records }
     aMemory: Pu8;          { bulk memory for pList (nil if individual allocs) }
     szPMA:   i64;          { size of pList as PMA in bytes }
   end;
 
+  { struct MergeEngine — vdbesort.c:256 }
+  TMergeEngine = record
+    nTree:  i32;           { used size of aTree/aReadr (power of 2) }
+    pTask:  PSortSubtask;  { used by this thread only }
+    aTree:  Pi32;          { current state of incremental merge }
+    aReadr: PPmaReader;    { array of PmaReaders to merge data from }
+  end;
+
+  { struct PmaReader — vdbesort.c:354 }
+  TPmaReader = record
+    iReadOff: i64;         { current read offset }
+    iEof:     i64;         { 1 byte past EOF for this PmaReader }
+    nAlloc:   i32;         { bytes of space at aAlloc }
+    nKey:     i32;         { number of bytes in key }
+    pFd:      Psqlite3_file; { file handle we are reading from }
+    aAlloc:   Pu8;         { space for aKey if aBuffer/pMap wont work }
+    aKey:     Pu8;         { pointer to current key }
+    aBuffer:  Pu8;         { current read buffer }
+    nBuffer:  i32;         { size of read buffer in bytes }
+    aMap:     Pu8;         { pointer to mapping of entire file }
+    pIncr:    PIncrMerger; { incremental merger }
+  end;
+
+  { struct IncrMerger — vdbesort.c:400 (single-threaded: aFile[1] unused) }
+  TIncrMerger = record
+    pTask:      PSortSubtask;        { task that owns this merger }
+    pMerger:    PMergeEngine;        { merge engine thread reads data from }
+    iStartOff:  i64;                 { offset to start writing file at }
+    mxSz:       i32;                 { maximum bytes of data to store }
+    bEof:       i32;                 { set true when merge is finished }
+    bUseThread: i32;                 { true to use a bg thread (unused here) }
+    aFile:      array[0..1] of TSorterFile; { [0]=reading, [1]=writing }
+  end;
+
+  { struct PmaWriter — vdbesort.c:418 }
+  TPmaWriter = record
+    eFWErr:    i32;        { non-zero if in an error state }
+    aBuffer:   Pu8;        { pointer to write buffer }
+    nBuffer:   i32;        { size of write buffer in bytes }
+    iBufStart: i32;        { first byte of buffer to write }
+    iBufEnd:   i32;        { last byte of buffer to write }
+    iWriteOff: i64;        { offset of start of buffer in file }
+    pFd:       Psqlite3_file; { file handle to write to }
+    nPmaSpill: u64;        { total number of bytes written }
+  end;
+
+  { struct SortSubtask — vdbesort.c:295 }
+  TSortSubtask = record
+    pThread:   Pointer;        { SQLiteThread* — threads unused }
+    bDone:     i32;            { set if thread is finished but not joined }
+    nPMA:      i32;            { number of PMAs currently in file }
+    pSorter:   PVdbeSorter;    { sorter that owns this sub-task }
+    pUnpacked: PUnpackedRecord; { space to unpack a record }
+    list:      TSorterList;    { list for thread to write to a PMA }
+    xCompare:  TSorterCompare; { compare function to use }
+    file_:     TSorterFile;    { temp file for level-0 PMAs (C: file) }
+    file2:     TSorterFile;    { space for other PMAs }
+    nSpill:    u64;            { total bytes written by this task }
+  end;
+
+  { struct VdbeSorter — vdbesort.c:318.  C has SortSubtask aTask[FLEXARRAY]
+    as the trailing field; this port is single-threaded (nTask always 1)
+    so a single inline aTask suffices. }
   TVdbeSorter = record
     mnPmaSize:   i32;      { minimum PMA size, in bytes }
     mxPmaSize:   i32;      { maximum PMA size, in bytes; 0=no limit }
     mxKeysize:   i32;      { largest serialised key seen so far }
     pgsz:        i32;      { main database page size }
-    pReader:     Pointer;  { PmaReader* — read data after Rewind() }
-    pMerger:     Pointer;  { MergeEngine* — used when bUseThreads=0 }
+    pReader:     PPmaReader;  { read data from here after Rewind() }
+    pMerger:     PMergeEngine; { or here, if bUseThreads=0 }
     db:          PTsqlite3; { database connection }
     pKeyInfo:    PKeyInfo; { how to compare records }
-    pUnpacked:   Pointer;  { UnpackedRecord* — used by VdbeSorterCompare }
+    pUnpacked:   PUnpackedRecord; { used by VdbeSorterCompare }
     list:        TSorterList; { in-memory record list }
     iMemory:     i32;      { offset of free space in list.aMemory }
     nMemory:     i32;      { size of list.aMemory allocation }
@@ -1253,7 +1338,37 @@ type
     iPrev:       u8;       { previous thread used to flush PMA }
     nTask:       u8;       { size of aTask array }
     typeMask:    u8;       { SORTER_TYPE_INTEGER|TEXT mask }
+    aTask:       TSortSubtask; { one or more subtasks (single-threaded: 1) }
   end;
+
+  { struct SorterRecord — vdbesort.c:447.  C-faithful layout:
+      nVal:i32 @0; union{pNext:PSorterRecord|iNext:i32} @8 (8-byte ptr
+      alignment forces 4 pad bytes @4); record data follows the header so
+      SRVAL(p)=PByte(p)+SizeOf(TSorterRecord)=p+16. }
+  TSorterRecord = record
+    nVal: i32;             { size of the record in bytes (@0) }
+    u: record             { union u — vdbesort.c:449..452 (@8) }
+      case Integer of
+        0: (pNext: PSorterRecord);  { pointer to next record in list }
+        1: (iNext: i32);            { offset within aMemory of next record }
+    end;
+    { the data for the record immediately follows this header (SRVAL) }
+  end;
+
+const
+  { vdbesort.c constants (Phase 5.7.b.1) }
+  SQLITE_MAX_PMASZ       = (1 shl 29); { 512MiB — vdbesort.c:155 }
+  SORTER_TYPE_INTEGER    = $01;        { vdbesort.c:342 }
+  SORTER_TYPE_TEXT       = $02;        { vdbesort.c:343 }
+  SORTER_MAX_MERGE_COUNT = 16;         { vdbesort.c:465 }
+  INCRINIT_NORMAL        = 0;          { vdbesort.c:2115 }
+  INCRINIT_TASK          = 1;          { vdbesort.c:2116 }
+  INCRINIT_ROOT          = 2;          { vdbesort.c:2117 }
+  { sizeof(SorterRecord)=16; record data starts here — SRVAL(p)=p+16 }
+  SZ_SORTER_RECORD       = 16;
+
+{ SRVAL(p) — vdbesort.c:461 — pointer to record data after the header. }
+function SRVAL(p: PSorterRecord): Pointer; inline;
 
   { -----------------------------------------------------------------------
     Phase 5.4j — RowSet types (rowset.c).
@@ -6059,11 +6174,19 @@ end;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 begin
+  { vdbeapi.c:1383 — bind by value MUST honour the value's own text encoding
+    (pValue->enc), not assume UTF-8.  The C TEXT arm calls
+    bindText(...,pValue->enc); our sqlite3_bind_text64 is that bindText.  The
+    previous port routed through sqlite3_bind_text (UTF-8 only), so a UTF-16
+    sqlite3_value bound into e.g. an FTS3 content-insert statement in a
+    PRAGMA encoding=utf-16 db was treated as UTF-8 and truncated at the first
+    embedded NUL byte (fts3snippet utf16 / fts4umlaut). }
   case sqlite3_value_type(pValue) of
     SQLITE_INTEGER: Result := sqlite3_bind_int64(pStmt, i, pValue^.u.i);
     SQLITE_FLOAT:   Result := sqlite3_bind_double(pStmt, i, pValue^.u.r);
-    SQLITE_TEXT:    Result := sqlite3_bind_text(pStmt, i,
-                                pValue^.z, pValue^.n, SQLITE_TRANSIENT);
+    SQLITE_TEXT:    Result := sqlite3_bind_text64(pStmt, i,
+                                pValue^.z, u64(pValue^.n), SQLITE_TRANSIENT,
+                                pValue^.enc);
     SQLITE_BLOB:    Result := sqlite3_bind_blob(pStmt, i,
                                 pValue^.z, pValue^.n, SQLITE_TRANSIENT);
     else            Result := sqlite3_bind_null(pStmt, i);
@@ -6836,333 +6959,1833 @@ begin
 end;
 
 { ============================================================================
-  Phase 5.7 — vdbesort.c external sorter (in-memory port real;
-  PMA / disk-spill deferred).
+  Phase 5.7 — vdbesort.c external sorter (in-memory engine C-faithful;
+  PMA disk-spill compiled but not yet triggered — see SORTER_PMA_ENABLED).
 
-  The in-memory single-PMA mergesort path is fully ported (see
-  vdbeSorterMergeSort / vdbeSorterCompareRec / sqlite3VdbeSorterWrite /
-  Rewind / Next / Rowkey / Compare below).  KeyInfo/UnpackedRecord landed
-  with Phase 6.  What remains deferred is the PmaReader / MergeEngine /
-  SortSubtask disk-spill subsystem — ORDER BY past the in-memory cap
-  silently truncates to RAM-only sort (no PMA spill).
+  Phase 5.7.b.5 replaced the bespoke array-mergesort with C's real
+  bottom-up linked-list merge engine (vdbeSorterMerge / vdbeSorterSort /
+  vdbeSorterGetCompare / the vdbeSorterCompare* family operating on
+  SRVAL/nVal with typeMask Int/Text fast paths) and the C-exact
+  sqlite3VdbeSorterInit / Write / Rewind / Next / Rowkey / Compare.  The
+  write-side PMA path (vdbeSorterListToPMA / vdbeSorterFlushPMA) is fully
+  ported and compiled, but the spill TRIGGER in sqlite3VdbeSorterWrite is
+  GATED OFF behind the module const SORTER_PMA_ENABLED=False (see below).
+  With the gate off, every sort stays in RAM exactly as before — the
+  read-back merge machinery (MergeEngine / IncrMerger / Rewind-merge)
+  lands in 5.7.b.6..b.9, and 5.7.b.9 flips SORTER_PMA_ENABLED to True.
   ============================================================================ }
 
-function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
-                               pCsr: PVdbeCursor): i32;
-var
-  pSorter: PVdbeSorter;
+const
+  { ----------------------------------------------------------------------
+    SORTER_PMA_ENABLED — 5.7.b.5 spill-trigger gate.
+
+    C's sqlite3VdbeSorterWrite flushes the in-memory list to an on-disk
+    PMA (vdbesort.c:1849..1854) whenever memory fills.  The PMA write side
+    (vdbeSorterListToPMA / vdbeSorterFlushPMA / PmaWriter) is ported and
+    compiled, BUT the read-back side (MergeEngine / IncrMerger and the
+    PMA arms of Rewind/Next/Rowkey/Compare) does NOT exist until
+    5.7.b.6..b.9.  If we let the flush fire now, a sort that spills would
+    discard everything but the final PMA at Rewind — silent data loss.
+
+    Therefore the spill block is kept fully faithful (bFlush computation,
+    szPMA/iMemory reset) but the actual vdbeSorterFlushPMA() call is
+    guarded by this const.  With it False the behaviour is identical to
+    the pre-5.7.b in-memory sorter (no spill, no data loss, gate green).
+
+    *** 5.7.b.9 MUST flip this to True AND verify the merge read-back. ***
+    ---------------------------------------------------------------------- }
+  SORTER_PMA_ENABLED = True;   { 5.7.b.9: spill + merge read-back enabled }
+
+{ SRVAL(p) — vdbesort.c:461 — record data immediately follows the header. }
+function SRVAL(p: PSorterRecord): Pointer; inline;
 begin
-  if pCsr = nil then begin Result := SQLITE_MISUSE; Exit; end;
-  { Cannot sort without KeyInfo — Phase 6+ }
-  if pCsr^.pKeyInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
-  pSorter := PVdbeSorter(sqlite3DbMallocZero(db, SizeOf(TVdbeSorter)));
-  if pSorter = nil then begin Result := SQLITE_NOMEM; Exit; end;
-  pSorter^.db       := db;
-  pSorter^.pKeyInfo := pCsr^.pKeyInfo;
-  pSorter^.nTask    := 1;
-  pSorter^.pgsz     := 4096;
-  pCsr^.uc.pSorter  := pSorter;
+  Result := PByte(p) + SZ_SORTER_RECORD;
+end;
+
+{ ============================================================================
+  Temp-file plumbing — vdbesort.c:619..634, 1308..1352  (tasklist 5.7.b.2)
+
+  MMAP PATH: this port treats SQLITE_MAX_MMAP_SIZE as 0 (see passqlite3os.pas
+  ~line 47 — no mmap paths are ported in the OS layer).  That is exactly the
+  SQLITE_MAX_MMAP_SIZE==0 configuration of these same C functions, NOT a
+  deviation:
+    * vdbeSorterMapFile sets pp:=nil (no mapping → callers fall back to
+      buffered reads, byte-identical results).  Faithfully it still calls
+      sqlite3OsFetch, which in this port returns pp:=nil + SQLITE_OK whenever
+      the VFS exposes no xFetch (passqlite3os.pas:1250), so the mapped vs
+      unmapped behaviour is identical here.
+    * vdbeSorterExtendFile still issues the CHUNK_SIZE / SIZE_HINT hints to
+      truncate/extend the file, but skips the OsFetch pre-fault (the prefault
+      only matters when a real mmap is active).
+    * vdbeSorterOpenTempFile skips the SQLITE_FCNTL_MMAP_SIZE control (it has
+      no effect with mmap disabled).
+  ============================================================================ }
+
+{ vdbesort.c:1308..1326 — extend/truncate temp file pFd to nByte.  Gated
+  #if SQLITE_MAX_MMAP_SIZE>0 in C; here SQLITE_MAX_MMAP_SIZE==0, so we keep
+  the truncate/extend hints (db->nMaxSorterMmap is 0 by default, so this is a
+  no-op unless PRAGMA/limit raised it) and omit the OsFetch/OsUnfetch
+  pre-fault. }
+procedure vdbeSorterExtendFile(db: PTsqlite3; pFd: Psqlite3_file; nByte: i64);
+var
+  chunksize: i32;
+begin
+  if (nByte <= i64(db^.nMaxSorterMmap)) and (pFd^.pMethods^.iVersion >= 3) then
+  begin
+    chunksize := 4 * 1024;
+    sqlite3OsFileControlHint(pFd, SQLITE_FCNTL_CHUNK_SIZE, @chunksize);
+    sqlite3OsFileControlHint(pFd, SQLITE_FCNTL_SIZE_HINT, @nByte);
+    { mmap disabled (SQLITE_MAX_MMAP_SIZE==0): skip the OsFetch/OsUnfetch
+      pre-fault that the SQLITE_MAX_MMAP_SIZE>0 body performs here. }
+  end;
+end;
+
+{ vdbesort.c:1327..1352 — allocate a file-handle and open a temp file.  On
+  success set ppFd^ and return SQLITE_OK; otherwise set ppFd^:=nil and return
+  an error code.  This port lacks sqlite3OsOpenMalloc, so its faithful body
+  (os.c:308 — MallocZero(szOsFile) + OsOpen + free-on-error) is inlined. }
+function vdbeSorterOpenTempFile(db: PTsqlite3; nExtend: i64;
+                               ppFd: PPsqlite3_file): i32;
+var
+  rc: i32;
+  pFile: Psqlite3_file;
+  pVfs: Psqlite3_vfs;
+begin
+  if sqlite3FaultSim(202) <> 0 then begin Result := SQLITE_IOERR_ACCESS; Exit; end;
+
+  pVfs := Psqlite3_vfs(db^.pVfs);
+  { inlined sqlite3OsOpenMalloc (os.c:308) }
+  pFile := Psqlite3_file(sqlite3MallocZero(csize_t(pVfs^.szOsFile)));
+  if pFile = nil then begin
+    ppFd^ := nil;
+    Result := SQLITE_NOMEM_BKPT;
+    Exit;
+  end;
+  rc := sqlite3OsOpen(pVfs, nil, pFile,
+      SQLITE_OPEN_TEMP_JOURNAL or
+      SQLITE_OPEN_READWRITE    or SQLITE_OPEN_CREATE or
+      SQLITE_OPEN_EXCLUSIVE    or SQLITE_OPEN_DELETEONCLOSE, nil);
+  if rc <> SQLITE_OK then begin
+    sqlite3_free(pFile);
+    ppFd^ := nil;
+  end else
+    ppFd^ := pFile;
+
+  if rc = SQLITE_OK then begin
+    { mmap disabled (SQLITE_MAX_MMAP_SIZE==0): skip the SQLITE_FCNTL_MMAP_SIZE
+      control the C body issues here. }
+    if nExtend > 0 then
+      vdbeSorterExtendFile(db, ppFd^, nExtend);
+  end;
+  Result := rc;
+end;
+
+{ vdbesort.c:619..634 — attempt to memory-map SorterFile pFile.  If not
+  attempted (file too large, or VFS not configured for mmap) return SQLITE_OK
+  with pp^:=nil.  Here mmap is disabled, so sqlite3OsFetch returns pp^:=nil. }
+function vdbeSorterMapFile(pTask: PSortSubtask; pFile: PSorterFile;
+                          pp: PPByte): i32;
+var
+  rc: i32;
+  pFd: Psqlite3_file;
+begin
+  rc := SQLITE_OK;
+  if pFile^.iEof <= i64(pTask^.pSorter^.db^.nMaxSorterMmap) then begin
+    pFd := pFile^.pFd;
+    if pFd^.pMethods^.iVersion >= 3 then
+      rc := sqlite3OsFetch(pFd, 0, i32(pFile^.iEof), PPointer(pp));
+  end;
+  Result := rc;
+end;
+
+{ ============================================================================
+  PmaWriter — incremental, buffered, page-aligned PMA writer.
+  vdbesort.c:1479..1576  (tasklist 5.7.b.3)
+
+  Single-threaded only.  Reuses sqlite3Malloc/sqlite3_free for aBuffer (as C),
+  sqlite3OsWrite(id,pBuf,amt,offset) for flushes, sqlite3PutVarint for varints.
+  Not yet wired into production paths (that lands in 5.7.b.5).
+  ============================================================================ }
+
+{ vdbePmaWriterInit — vdbesort.c:1479..1500 }
+procedure vdbePmaWriterInit(pFd: Psqlite3_file; p: PPmaWriter;
+                            nBuf: i32; iStart: i64);
+begin
+  FillChar(p^, SizeOf(TPmaWriter), 0);
+  p^.aBuffer := Pu8(sqlite3Malloc(nBuf));
+  if p^.aBuffer = nil then begin
+    p^.eFWErr := SQLITE_NOMEM_BKPT;
+  end else begin
+    p^.iBufStart := i32(iStart mod nBuf);
+    p^.iBufEnd   := p^.iBufStart;
+    p^.iWriteOff := iStart - p^.iBufStart;
+    p^.nBuffer   := nBuf;
+    p^.pFd       := pFd;
+  end;
+end;
+
+{ vdbePmaWriteBlob — vdbesort.c:1501..1535 }
+procedure vdbePmaWriteBlob(p: PPmaWriter; pData: Pu8; nData: i32);
+var
+  nRem, nCopy: i32;
+begin
+  nRem := nData;
+  while (nRem > 0) and (p^.eFWErr = 0) do begin
+    nCopy := nRem;
+    if nCopy > (p^.nBuffer - p^.iBufEnd) then
+      nCopy := p^.nBuffer - p^.iBufEnd;
+
+    Move((pData + (nData - nRem))^, (p^.aBuffer + p^.iBufEnd)^, nCopy);
+    Inc(p^.iBufEnd, nCopy);
+    if p^.iBufEnd = p^.nBuffer then begin
+      p^.eFWErr := sqlite3OsWrite(p^.pFd,
+          p^.aBuffer + p^.iBufStart, p^.iBufEnd - p^.iBufStart,
+          p^.iWriteOff + p^.iBufStart);
+      Inc(p^.nPmaSpill, u64(p^.iBufEnd - p^.iBufStart));
+      p^.iBufStart := 0;
+      p^.iBufEnd   := 0;
+      Inc(p^.iWriteOff, p^.nBuffer);
+    end;
+    Assert(p^.iBufEnd < p^.nBuffer);
+
+    Dec(nRem, nCopy);
+  end;
+end;
+
+{ vdbePmaWriterFinish — vdbesort.c:1536..1556 }
+function vdbePmaWriterFinish(p: PPmaWriter; piEof: Pi64; pnSpill: Pu64): i32;
+var
+  rc: i32;
+begin
+  if (p^.eFWErr = 0) and (p^.aBuffer <> nil) and (p^.iBufEnd > p^.iBufStart) then
+  begin
+    p^.eFWErr := sqlite3OsWrite(p^.pFd,
+        p^.aBuffer + p^.iBufStart, p^.iBufEnd - p^.iBufStart,
+        p^.iWriteOff + p^.iBufStart);
+    Inc(p^.nPmaSpill, u64(p^.iBufEnd - p^.iBufStart));
+  end;
+  piEof^ := p^.iWriteOff + p^.iBufEnd;
+  Inc(pnSpill^, p^.nPmaSpill);
+  sqlite3_free(p^.aBuffer);
+  rc := p^.eFWErr;
+  FillChar(p^, SizeOf(TPmaWriter), 0);
+  Result := rc;
+end;
+
+{ vdbePmaWriteVarint — vdbesort.c:1557..1576 }
+procedure vdbePmaWriteVarint(p: PPmaWriter; iVal: u64);
+var
+  nByte: i32;
+  aByte: array[0..9] of u8;
+begin
+  nByte := sqlite3PutVarint(@aByte[0], iVal);
+  vdbePmaWriteBlob(p, @aByte[0], nByte);
+end;
+
+{ ============================================================================
+  PmaReader — incrementally read one PMA in sorted order.
+  vdbesort.c:474..761  (tasklist 5.7.b.4)
+
+  Single-threaded only.  Reuses sqlite3OsRead(id,pBuf,amt,offset),
+  sqlite3Realloc(p,n), sqlite3Malloc/sqlite3_free, sqlite3GetVarint and the
+  already-ported vdbeSorterMapFile.  Not yet wired into production
+  (5.7.b.6/.8/.9 do that).
+
+  IncrMerger: vdbeIncrFree/vdbeIncrSwap referenced below are forward-declared
+  here; their real single-threaded bodies (5.7.b.7) appear after the
+  PmaReader/MergeEngine helpers they depend on.
+  ============================================================================ }
+
+{ Forward declarations — real single-threaded IncrMerger bodies in 5.7.b.7. }
+procedure vdbeIncrFree(pIncr: PIncrMerger); forward;
+function  vdbeIncrSwap(pIncr: PIncrMerger): i32; forward;
+function  vdbeIncrPopulate(pIncr: PIncrMerger): i32; forward;
+procedure vdbeMergeEngineFree(pMerger: PMergeEngine); forward;
+
+{ vdbePmaReaderClear — vdbesort.c:474..480 }
+procedure vdbePmaReaderClear(pReadr: PPmaReader);
+begin
+  sqlite3_free(pReadr^.aAlloc);
+  sqlite3_free(pReadr^.aBuffer);
+  if pReadr^.aMap <> nil then sqlite3OsUnfetch(pReadr^.pFd, 0, pReadr^.aMap);
+  vdbeIncrFree(pReadr^.pIncr);
+  FillChar(pReadr^, SizeOf(TPmaReader), 0);
+end;
+
+{ vdbePmaReadBlob — vdbesort.c:491..585.  Read nByte from the PMA, set ppOut^
+  to a buffer holding the data (a pointer into aMap/aBuffer, or a copy in the
+  grown aAlloc).  The buffer is valid only until the next call. }
+function vdbePmaReadBlob(p: PPmaReader; nByte: i32; ppOut: PPByte): i32;
+var
+  iBuf:   i32;   { offset within buffer to read from }
+  nAvail: i32;   { bytes of data available in buffer }
+  nRead:  i32;   { bytes to read from disk }
+  rc:     i32;   { sqlite3OsRead() return code }
+  nRem:   i32;   { bytes remaining to copy }
+  nCopy:  i32;   { number of bytes to copy }
+  aNext:  Pu8;   { pointer to buffer to copy data from }
+  aNew:   Pu8;
+  nNew:   i64;
+begin
+  if p^.aMap <> nil then begin
+    ppOut^ := @p^.aMap[p^.iReadOff];
+    Inc(p^.iReadOff, nByte);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  Assert(p^.aBuffer <> nil);
+
+  { If there is no more data to be read from the buffer, read the next
+    p->nBuffer bytes of data from the file into it. Or, if there are less
+    than p->nBuffer bytes remaining in the PMA, read all remaining data.  }
+  iBuf := i32(p^.iReadOff mod p^.nBuffer);
+  if iBuf = 0 then begin
+    { Determine how many bytes of data to read. }
+    if (p^.iEof - p^.iReadOff) > i64(p^.nBuffer) then
+      nRead := p^.nBuffer
+    else
+      nRead := i32(p^.iEof - p^.iReadOff);
+    Assert(nRead > 0);
+
+    { Read data from the file. Return early if an error occurs. }
+    rc := sqlite3OsRead(p^.pFd, p^.aBuffer, nRead, p^.iReadOff);
+    Assert(rc <> SQLITE_IOERR_SHORT_READ);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+  nAvail := p^.nBuffer - iBuf;
+
+  if nByte <= nAvail then begin
+    { The requested data is available in the in-memory buffer.  Return a
+      pointer into the buffer rather than copying. }
+    ppOut^ := @p^.aBuffer[iBuf];
+    Inc(p^.iReadOff, nByte);
+  end else begin
+    { The requested data is not all available in the in-memory buffer.
+      Allocate space at p->aAlloc[] to copy the requested range into, then
+      return a copy of pointer p->aAlloc to the caller. }
+
+    { Extend the p->aAlloc[] allocation if required. }
+    if p^.nAlloc < nByte then begin
+      nNew := 2 * i64(p^.nAlloc);          { MAX(128, 2*nAlloc) — vdbesort.c:556 }
+      if nNew < 128 then nNew := 128;
+      while nByte > nNew do nNew := nNew * 2;
+      aNew := Pu8(sqlite3Realloc(p^.aAlloc, u64(nNew)));
+      if aNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+      p^.nAlloc := i32(nNew);
+      p^.aAlloc := aNew;
+    end;
+
+    { Copy as much data as is available in the buffer into the start of
+      p->aAlloc[]. }
+    Move(p^.aBuffer[iBuf], p^.aAlloc^, nAvail);
+    Inc(p^.iReadOff, nAvail);
+    nRem := nByte - nAvail;
+
+    { The following loop copies up to p->nBuffer bytes per iteration into
+      the p->aAlloc[] buffer. }
+    while nRem > 0 do begin
+      aNext := nil;
+      nCopy := nRem;
+      if nRem > p^.nBuffer then nCopy := p^.nBuffer;
+      rc := vdbePmaReadBlob(p, nCopy, @aNext);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      Assert(aNext <> p^.aAlloc);
+      Assert(aNext <> nil);
+      Move(aNext^, p^.aAlloc[nByte - nRem], nCopy);
+      Dec(nRem, nCopy);
+    end;
+
+    ppOut^ := p^.aAlloc;
+  end;
+
   Result := SQLITE_OK;
 end;
 
-procedure sqlite3VdbeSorterReset(db: PTsqlite3; pSorter: PVdbeSorter);
+{ vdbePmaReadVarint — vdbesort.c:586..618.  Read a varint from the stream,
+  set pnOut^ to the value. }
+function vdbePmaReadVarint(p: PPmaReader; pnOut: Pu64): i32;
 var
-  pRec, pNext: Pointer;
+  iBuf:    i32;
+  aVarint: array[0..15] of u8;
+  a:       Pu8;
+  i, rc:   i32;
+  v:       u64;
 begin
-  if pSorter = nil then Exit;
-  { Free in-memory record list if individually allocated (aMemory=nil) }
-  if pSorter^.list.aMemory = nil then begin
-    pRec := pSorter^.list.pList;
-    while pRec <> nil do begin
-      pNext := PPointer(pRec)^;  { SorterRecord.u.pNext at offset 0 }
-      sqlite3DbFree(db, pRec);
-      pRec := pNext;
-    end;
+  if p^.aMap <> nil then begin
+    Inc(p^.iReadOff, sqlite3GetVarint(@p^.aMap[p^.iReadOff], pnOut^));
   end else begin
-    sqlite3DbFree(db, pSorter^.list.aMemory);
-    pSorter^.list.aMemory := nil;
+    iBuf := i32(p^.iReadOff mod p^.nBuffer);
+    if (iBuf <> 0) and ((p^.nBuffer - iBuf) >= 9) then begin
+      Inc(p^.iReadOff, sqlite3GetVarint(@p^.aBuffer[iBuf], pnOut^));
+    end else begin
+      i := 0;
+      a := nil;
+      repeat
+        rc := vdbePmaReadBlob(p, 1, @a);
+        if rc <> 0 then begin Result := rc; Exit; end;
+        aVarint[(i) and $f] := a[0];
+        Inc(i);
+      until (a[0] and $80) = 0;
+      sqlite3GetVarint(@aVarint[0], v);
+      pnOut^ := v;
+    end;
   end;
+
+  Result := SQLITE_OK;
+end;
+
+{ vdbePmaReaderSeek — vdbesort.c:636..682.  Attach pReadr to pFile and seek it
+  to offset iOff. }
+function vdbePmaReaderSeek(pTask: PSortSubtask; pReadr: PPmaReader;
+                          pFile: PSorterFile; iOff: i64): i32;
+var
+  rc:    i32;
+  pgsz:  i32;
+  iBuf:  i32;
+  nRead: i32;
+begin
+  rc := SQLITE_OK;
+
+  Assert((pReadr^.pIncr = nil) or (pReadr^.pIncr^.bEof = 0));
+
+  if sqlite3FaultSim(201) <> 0 then begin Result := SQLITE_IOERR_READ; Exit; end;
+  if pReadr^.aMap <> nil then begin
+    sqlite3OsUnfetch(pReadr^.pFd, 0, pReadr^.aMap);
+    pReadr^.aMap := nil;
+  end;
+  pReadr^.iReadOff := iOff;
+  pReadr^.iEof     := pFile^.iEof;
+  pReadr^.pFd      := pFile^.pFd;
+
+  rc := vdbeSorterMapFile(pTask, pFile, @pReadr^.aMap);
+  if (rc = SQLITE_OK) and (pReadr^.aMap = nil) then begin
+    pgsz := pTask^.pSorter^.pgsz;
+    iBuf := i32(pReadr^.iReadOff mod pgsz);
+    if pReadr^.aBuffer = nil then begin
+      pReadr^.aBuffer := Pu8(sqlite3Malloc(pgsz));
+      if pReadr^.aBuffer = nil then rc := SQLITE_NOMEM_BKPT;
+      pReadr^.nBuffer := pgsz;
+    end;
+    if (rc = SQLITE_OK) and (iBuf <> 0) then begin
+      nRead := pgsz - iBuf;
+      if (pReadr^.iReadOff + nRead) > pReadr^.iEof then
+        nRead := i32(pReadr^.iEof - pReadr^.iReadOff);
+      rc := sqlite3OsRead(pReadr^.pFd, @pReadr^.aBuffer[iBuf], nRead,
+                          pReadr^.iReadOff);
+    end;
+  end;
+
+  Result := rc;
+end;
+
+{ vdbePmaReaderNext — vdbesort.c:683..729.  Advance pReadr to the next key. }
+function vdbePmaReaderNext(pReadr: PPmaReader): i32;
+var
+  rc:    i32;
+  nRec:  u64;
+  bEof:  i32;
+  pIncr: PIncrMerger;
+begin
+  rc   := SQLITE_OK;
+  nRec := 0;
+
+  if pReadr^.iReadOff >= pReadr^.iEof then begin
+    pIncr := pReadr^.pIncr;
+    bEof := 1;
+    if pIncr <> nil then begin
+      rc := vdbeIncrSwap(pIncr);
+      if (rc = SQLITE_OK) and (pIncr^.bEof = 0) then begin
+        rc := vdbePmaReaderSeek(pIncr^.pTask, pReadr, @pIncr^.aFile[0],
+                                pIncr^.iStartOff);
+        bEof := 0;
+      end;
+    end;
+
+    if bEof <> 0 then begin
+      { This is an EOF condition }
+      vdbePmaReaderClear(pReadr);
+      Result := rc;
+      Exit;
+    end;
+  end;
+
+  if rc = SQLITE_OK then
+    rc := vdbePmaReadVarint(pReadr, @nRec);
+  if rc = SQLITE_OK then begin
+    pReadr^.nKey := i32(nRec);
+    rc := vdbePmaReadBlob(pReadr, i32(nRec), @pReadr^.aKey);
+  end;
+
+  Result := rc;
+end;
+
+{ vdbePmaReaderInit — vdbesort.c:730..761.  Initialise pReadr to scan the PMA
+  in pFile starting at iStart.  If pnByte is nil the PMA omits its initial
+  length varint. }
+function vdbePmaReaderInit(pTask: PSortSubtask; pFile: PSorterFile;
+                          iStart: i64; pReadr: PPmaReader; pnByte: Pi64): i32;
+var
+  rc:    i32;
+  nByte: u64;
+begin
+  Assert(pFile^.iEof > iStart);
+  Assert((pReadr^.aAlloc = nil) and (pReadr^.nAlloc = 0));
+  Assert(pReadr^.aBuffer = nil);
+  Assert(pReadr^.aMap = nil);
+
+  rc := vdbePmaReaderSeek(pTask, pReadr, pFile, iStart);
+  if rc = SQLITE_OK then begin
+    nByte := 0;
+    rc := vdbePmaReadVarint(pReadr, @nByte);
+    pReadr^.iEof := pReadr^.iReadOff + i64(nByte);
+    Inc(pnByte^, i64(nByte));
+  end;
+
+  if rc = SQLITE_OK then
+    rc := vdbePmaReaderNext(pReadr);
+  Result := rc;
+end;
+
+{ vdbeIncrFree — vdbesort.c:1229..1241.  Free the IncrMerger's MergeEngine and
+  the struct itself.  The threaded aFile[0]/aFile[1] teardown is gated
+  #if SQLITE_MAX_WORKER_THREADS>0 in C and omitted here: a single-threaded
+  IncrMerger does not own its temp files (it borrows a region of
+  pTask->file2), so there is nothing to close. }
+procedure vdbeIncrFree(pIncr: PIncrMerger);
+begin
+  if pIncr <> nil then begin
+    vdbeMergeEngineFree(pIncr^.pMerger);
+    sqlite3_free(pIncr);
+  end;
+end;
+
+{ vdbeIncrSwap — vdbesort.c:1985..2023, single-threaded (#else) arm only.
+  Called when the PmaReader has finished reading aFile[0]; "refills" the
+  region by literally reading keys from pIncr->pMerger via vdbeIncrPopulate,
+  copies aFile[1] (the just-written region) onto aFile[0], and flags EOF when
+  the population produced no new bytes (iEof back at iStartOff).  The
+  SQLITE_MAX_WORKER_THREADS>0 thread-join/file-swap arm is omitted. }
+function vdbeIncrSwap(pIncr: PIncrMerger): i32;
+var
+  rc: i32;
+begin
+  rc := vdbeIncrPopulate(pIncr);
+  pIncr^.aFile[0] := pIncr^.aFile[1];
+  if pIncr^.aFile[0].iEof = pIncr^.iStartOff then
+    pIncr^.bEof := 1;
+  Result := rc;
+end;
+
+{ ----------------------------------------------------------------------------
+  Phase 5.7.b.6 — MergeEngine (the aTree[] loser/winner tournament that
+  combines up to SORTER_MAX_MERGE_COUNT PmaReaders).  Ports vdbeMergeEngineNew/
+  Free/Compare/Step/Init/Level0 from vdbesort.c.  Single-threaded only:
+  the SQLITE_MAX_WORKER_THREADS>0 and INCRINIT_TASK/ROOT arms are omitted.
+  Not yet wired into production (5.7.b.8/.9 do that).
+  ---------------------------------------------------------------------------- }
+
+{ Forward declaration — real single-threaded body is in the 5.7.b.7 block
+  (vdbesort.c:2220..2280); vdbeMergeEngineInit calls it for each reader. }
+function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32; forward;
+function vdbePmaReaderIncrInit(pReadr: PPmaReader; eMode: i32): i32; forward;
+
+{ vdbeMergeEngineNew — vdbesort.c:1193..1215.  Allocate a MergeEngine able to
+  merge up to nReader inputs.  nReader is rounded up to the next power of two
+  (N), and a single allocation holds the MergeEngine header followed by the
+  aReadr[N] PmaReader array and the aTree[N] int array. }
+function vdbeMergeEngineNew(nReader: i32): PMergeEngine;
+var
+  N:     i32;     { smallest power of two >= nReader }
+  nByte: i64;     { total bytes of space to allocate }
+  pNew:  PMergeEngine;
+begin
+  N := 2;
+  Assert(nReader <= SORTER_MAX_MERGE_COUNT);
+
+  while N < nReader do N := N + N;
+  nByte := SizeOf(TMergeEngine) + i64(N) * (SizeOf(i32) + SizeOf(TPmaReader));
+
+  if sqlite3FaultSim(100) <> 0 then
+    pNew := nil
+  else
+    pNew := PMergeEngine(sqlite3MallocZero(csize_t(nByte)));
+  if pNew <> nil then begin
+    pNew^.nTree  := N;
+    pNew^.pTask  := nil;
+    { aReadr = &pNew[1] (the PmaReader array immediately follows the header);
+      aTree = &aReadr[N] (the int array immediately follows that). }
+    pNew^.aReadr := PPmaReader(PByte(pNew) + SizeOf(TMergeEngine));
+    pNew^.aTree  := Pi32(PByte(pNew^.aReadr) + i64(N) * SizeOf(TPmaReader));
+  end;
+  Result := pNew;
+end;
+
+{ vdbeMergeEngineFree — vdbesort.c:1216..1229.  Clear each PmaReader, then
+  free the single MergeEngine allocation. }
+procedure vdbeMergeEngineFree(pMerger: PMergeEngine);
+var
+  i: i32;
+begin
+  if pMerger <> nil then begin
+    for i := 0 to pMerger^.nTree - 1 do
+      vdbePmaReaderClear(@pMerger^.aReadr[i]);
+  end;
+  sqlite3_free(pMerger);
+end;
+
+{ vdbeMergeEngineCompare — vdbesort.c:2062..2114.  Recompute aTree[iOut] by
+  comparing the next keys on the two PmaReaders feeding that entry.  Neither
+  reader is advanced.  EOF reader is "greatest"; on a tie the lower-index
+  (older) reader wins (res<=0 -> i1). }
+procedure vdbeMergeEngineCompare(pMerger: PMergeEngine; iOut: i32);
+var
+  i1, i2, iRes: i32;
+  p1, p2:       PPmaReader;
+  pTask:        PSortSubtask;
+  bCached:      i32;
+  res:          i32;
+begin
+  Assert((iOut < pMerger^.nTree) and (iOut > 0));
+
+  if iOut >= (pMerger^.nTree div 2) then begin
+    i1 := (iOut - pMerger^.nTree div 2) * 2;
+    i2 := i1 + 1;
+  end else begin
+    i1 := pMerger^.aTree[iOut * 2];
+    i2 := pMerger^.aTree[iOut * 2 + 1];
+  end;
+
+  p1 := @pMerger^.aReadr[i1];
+  p2 := @pMerger^.aReadr[i2];
+
+  if p1^.pFd = nil then
+    iRes := i2
+  else if p2^.pFd = nil then
+    iRes := i1
+  else begin
+    pTask := pMerger^.pTask;
+    bCached := 0;
+    Assert(pTask^.pUnpacked <> nil);  { from vdbeSortSubtaskMain() }
+    res := pTask^.xCompare(pTask, @bCached,
+        p1^.aKey, p1^.nKey, p2^.aKey, p2^.nKey);
+    if res <= 0 then iRes := i1
+    else             iRes := i2;
+  end;
+
+  pMerger^.aTree[iOut] := iRes;
+end;
+
+{ vdbeMergeEngineStep — vdbesort.c:1642..1712.  Advance the current winner
+  (aTree[1]) one key, then walk UP the tree recomputing comparisons.  The C
+  pReadr1/pReadr2 pointers and the `pReadr1 - aReadr` index math / `pReadr1 <
+  pReadr2` tie rule are reproduced here via integer element indices into
+  aReadr[] (iReadr1/iReadr2), which preserves C's exact semantics. }
+function vdbeMergeEngineStep(pMerger: PMergeEngine; pbEof: Pi32): i32;
+var
+  rc:       i32;
+  iPrev:    i32;          { index of PmaReader to advance }
+  pTask:    PSortSubtask;
+  i:        i32;          { index of aTree[] to recalculate }
+  iReadr1:  i32;          { index of first PmaReader to compare }
+  iReadr2:  i32;          { index of second PmaReader to compare }
+  bCached:  i32;
+  iRes:     i32;
+  p1, p2:   PPmaReader;
+begin
+  iPrev := pMerger^.aTree[1];
+  pTask := pMerger^.pTask;
+
+  { Advance the current PmaReader }
+  rc := vdbePmaReaderNext(@pMerger^.aReadr[iPrev]);
+
+  { Update contents of aTree[] }
+  if rc = SQLITE_OK then begin
+    bCached := 0;
+
+    { Find the first two PmaReaders to compare. The one that was just
+      advanced (iPrev) and the one next to it in the array. }
+    iReadr1 := iPrev and $FFFE;
+    iReadr2 := iPrev or  $0001;
+
+    i := (pMerger^.nTree + iPrev) div 2;
+    while i > 0 do begin
+      { Compare the two readers. Store the result in iRes. }
+      p1 := @pMerger^.aReadr[iReadr1];
+      p2 := @pMerger^.aReadr[iReadr2];
+      if p1^.pFd = nil then
+        iRes := +1
+      else if p2^.pFd = nil then
+        iRes := -1
+      else
+        iRes := pTask^.xCompare(pTask, @bCached,
+            p1^.aKey, p1^.nKey, p2^.aKey, p2^.nKey);
+
+      { If pReadr1 contained the smaller value, set aTree[i] to its index.
+        Then set pReadr2 to the next PmaReader to compare to pReadr1.
+
+        Alternatively, if pReadr2 contains the smaller of the two values,
+        set aTree[i] to its index and update pReadr1.  If the comparison
+        was actually called above, then pTask->pUnpacked now contains a
+        value equivalent to pReadr2, so leave bCached set to prevent it
+        being decoded again.
+
+        If the two values were equal, the value from the oldest PMA (lower
+        aReadr[] index, i.e. iReadr1 < iReadr2) is considered smaller. }
+      if (iRes < 0) or ((iRes = 0) and (iReadr1 < iReadr2)) then begin
+        pMerger^.aTree[i] := iReadr1;
+        iReadr2 := pMerger^.aTree[i xor $0001];
+        bCached := 0;
+      end else begin
+        if p1^.pFd <> nil then bCached := 0;
+        pMerger^.aTree[i] := iReadr2;
+        iReadr1 := pMerger^.aTree[i xor $0001];
+      end;
+
+      i := i div 2;
+    end;
+    pbEof^ := Ord(pMerger^.aReadr[pMerger^.aTree[1]].pFd = nil);
+  end;
+
+  if rc = SQLITE_OK then
+    Result := pTask^.pUnpacked^.errCode
+  else
+    Result := rc;
+end;
+
+{ vdbeMergeEngineInit — vdbesort.c:2144..2218.  Initialise every PmaReader,
+  then build the initial aTree[] bottom-up.  Single-threaded: eMode is always
+  INCRINIT_NORMAL, so each reader is initialised via vdbePmaReaderIncrMergeInit
+  (5.7.b.7); the INCRINIT_ROOT / bg-thread arms are omitted. }
+function vdbeMergeEngineInit(pTask: PSortSubtask; pMerger: PMergeEngine;
+                            eMode: i32): i32;
+var
+  rc:    i32;
+  i:     i32;
+  nTree: i32;
+begin
+  rc := SQLITE_OK;
+
+  { Failure to allocate the merge would have been detected before now. }
+  Assert(pMerger <> nil);
+
+  { eMode is always INCRINIT_NORMAL in single-threaded mode. }
+  Assert(eMode = INCRINIT_NORMAL);
+
+  { Verify that the MergeEngine is assigned to a single thread. }
+  Assert(pMerger^.pTask = nil);
+  pMerger^.pTask := pTask;
+
+  nTree := pMerger^.nTree;
+  for i := 0 to nTree - 1 do begin
+    { vdbesort.c:2176 — the INCRINIT_NORMAL (else) arm calls IncrInit, which
+      no-ops on a level-0 reader (pIncr=nil) and only recurses through the
+      tree on incremental readers.  Calling IncrMergeInit directly would
+      deref a nil pIncr on the leaf readers. }
+    rc := vdbePmaReaderIncrInit(@pMerger^.aReadr[i], INCRINIT_NORMAL);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  for i := pMerger^.nTree - 1 downto 1 do
+    vdbeMergeEngineCompare(pMerger, i);
+  Result := pTask^.pUnpacked^.errCode;
+end;
+
+{ vdbeMergeEngineLevel0 — vdbesort.c:2338..2375.  Build a level-0 MergeEngine
+  reading nPMA PMAs directly from pTask->file starting at *piOffset; advance
+  *piOffset past the last PMA read. }
+function vdbeMergeEngineLevel0(pTask: PSortSubtask; nPMA: i32;
+                              piOffset: Pi64; ppOut: PPMergeEngine): i32;
+var
+  pNew:   PMergeEngine;
+  iOff:   i64;
+  i:      i32;
+  rc:     i32;
+  nDummy: i64;
+  pReadr: PPmaReader;
+begin
+  iOff := piOffset^;
+  rc := SQLITE_OK;
+
+  pNew := vdbeMergeEngineNew(nPMA);
+  ppOut^ := pNew;
+  if pNew = nil then rc := SQLITE_NOMEM_BKPT;
+
+  i := 0;
+  while (i < nPMA) and (rc = SQLITE_OK) do begin
+    nDummy := 0;
+    pReadr := @pNew^.aReadr[i];
+    rc := vdbePmaReaderInit(pTask, @pTask^.file_, iOff, pReadr, @nDummy);
+    iOff := pReadr^.iEof;
+    Inc(i);
+  end;
+
+  if rc <> SQLITE_OK then begin
+    vdbeMergeEngineFree(pNew);
+    ppOut^ := nil;
+  end;
+  piOffset^ := iOff;
+  Result := rc;
+end;
+
+{ ----------------------------------------------------------------------------
+  Phase 5.7.b.7 — single-threaded IncrMerger.  Reads keys from a wrapped
+  MergeEngine and incrementally merges them into a refillable region of
+  pTask->file2.  Ports vdbeIncrPopulate / vdbeIncrSwap / vdbeIncrFree /
+  vdbeIncrMergerNew / vdbeIncrMergerSetThreads / vdbePmaReaderIncrMergeInit /
+  vdbePmaReaderIncrInit (vdbeIncrFree/Swap bodies appear earlier, after the
+  PmaReader helpers).  Single-threaded only: all SQLITE_MAX_WORKER_THREADS>0
+  / INCRINIT_TASK / INCRINIT_ROOT / bg-thread arms are omitted.  In this mode
+  an IncrMerger borrows a region of pTask->file2 rather than owning temp files.
+  ---------------------------------------------------------------------------- }
+
+{ vdbeIncrPopulate — vdbesort.c:1908..1942.  Read keys from pIncr->pMerger and
+  populate pIncr->aFile[1].  The on-disk format matches a regular PMA except
+  the leading number-of-bytes varint is omitted (vdbesort.c:1903..1906).
+  Steps the merge engine, writing each winner key, until the output region is
+  full (iEof+nKey+VarintLen(nKey) would exceed iStartOff+mxSz) or the input is
+  exhausted (winning reader's pFd became nil). }
+function vdbeIncrPopulate(pIncr: PIncrMerger): i32;
+var
+  rc, rc2:  i32;
+  iStart:   i64;
+  pOut:     PSorterFile;
+  pTask:    PSortSubtask;
+  pMerger:  PMergeEngine;
+  writer:   TPmaWriter;
+  dummy:    i32;
+  pReader:  PPmaReader;
+  nKey:     i32;
+  iEof:     i64;
+begin
+  rc := SQLITE_OK;
+  iStart  := pIncr^.iStartOff;
+  pOut    := @pIncr^.aFile[1];
+  pTask   := pIncr^.pTask;
+  pMerger := pIncr^.pMerger;
+  Assert(pIncr^.bEof = 0);
+
+  vdbePmaWriterInit(pOut^.pFd, @writer, pTask^.pSorter^.pgsz, iStart);
+  while rc = SQLITE_OK do begin
+    pReader := @pMerger^.aReadr[pMerger^.aTree[1]];
+    nKey := pReader^.nKey;
+    iEof := writer.iWriteOff + writer.iBufEnd;
+
+    { Check if the output file is full or if the input has been exhausted.
+      In either case exit the loop. }
+    if pReader^.pFd = nil then Break;
+    if (iEof + nKey + i64(sqlite3VarintLen(u64(nKey)))) > (iStart + pIncr^.mxSz) then
+      Break;
+
+    { Write the next key to the output. }
+    vdbePmaWriteVarint(@writer, u64(nKey));
+    vdbePmaWriteBlob(@writer, pReader^.aKey, nKey);
+    Assert(pIncr^.pMerger^.pTask = pTask);
+    rc := vdbeMergeEngineStep(pIncr^.pMerger, @dummy);
+  end;
+
+  rc2 := vdbePmaWriterFinish(@writer, @pOut^.iEof, @pTask^.nSpill);
+  if rc = SQLITE_OK then rc := rc2;
+  Result := rc;
+end;
+
+{ vdbeIncrMergerNew — vdbesort.c:2024..2047.  Allocate an IncrMerger wrapping
+  pMerger and assign it to pTask.  mxSz = MAX(mxKeysize+9, mxPmaSize/2); the
+  task's file2 reservation grows by mxSz.  On OOM, free pMerger and return
+  SQLITE_NOMEM_BKPT (the contract: *ppOut<>nil iff rc=SQLITE_OK). }
+function vdbeIncrMergerNew(pTask: PSortSubtask; pMerger: PMergeEngine;
+                          ppOut: PPIncrMerger): i32;
+var
+  rc:    i32;
+  pIncr: PIncrMerger;
+  a, b:  i32;
+begin
+  rc := SQLITE_OK;
+  if sqlite3FaultSim(100) <> 0 then
+    pIncr := nil
+  else
+    pIncr := PIncrMerger(sqlite3MallocZero(SizeOf(TIncrMerger)));
+  ppOut^ := pIncr;
+  if pIncr <> nil then begin
+    pIncr^.pMerger := pMerger;
+    pIncr^.pTask   := pTask;
+    a := pTask^.pSorter^.mxKeysize + 9;
+    b := pTask^.pSorter^.mxPmaSize div 2;
+    if a > b then pIncr^.mxSz := a else pIncr^.mxSz := b;
+    Inc(pTask^.file2.iEof, pIncr^.mxSz);
+  end else begin
+    vdbeMergeEngineFree(pMerger);
+    rc := SQLITE_NOMEM_BKPT;
+  end;
+  Assert((ppOut^ <> nil) or (rc <> SQLITE_OK));
+  Result := rc;
+end;
+
+{ vdbeIncrMergerSetThreads — vdbesort.c:2049..2061.  Gated
+  #if SQLITE_MAX_WORKER_THREADS>0 in C; a no-op in single-threaded builds
+  (there are no bg threads to enable).  Provided for callers (5.7.b.8/.9). }
+procedure vdbeIncrMergerSetThreads(pIncr: PIncrMerger);
+begin
+  { single-threaded: no bg thread to enable; the threaded body that sets
+    bUseThread and reclaims file2.iEof is omitted. }
+end;
+
+{ vdbePmaReaderIncrMergeInit — vdbesort.c:2220..2280, single-threaded arm.
+  Initialise the wrapped MergeEngine, then reserve a region of pTask->file2
+  for this IncrMerger (opening file2 on first use, sized to its accumulated
+  iEof reservation).  Finally advance the reader to its first key, which
+  triggers the initial vdbeIncrSwap/Populate fill.  eMode is always
+  INCRINIT_NORMAL here; the threaded / INCRINIT_TASK / INCRINIT_ROOT arms and
+  the bg-thread populate are omitted. }
+function vdbePmaReaderIncrMergeInit(pReadr: PPmaReader; eMode: i32): i32;
+var
+  rc:    i32;
+  pIncr: PIncrMerger;
+  pTask: PSortSubtask;
+  db:    PTsqlite3;
+  mxSz:  i32;
+begin
+  rc    := SQLITE_OK;
+  pIncr := pReadr^.pIncr;
+  pTask := pIncr^.pTask;
+  db    := pTask^.pSorter^.db;
+
+  { eMode is always INCRINIT_NORMAL in single-threaded mode. }
+  Assert(eMode = INCRINIT_NORMAL);
+
+  rc := vdbeMergeEngineInit(pTask, pIncr^.pMerger, eMode);
+
+  { Set up the required files for pIncr.  A single-threaded object only
+    requires a region of pTask->file2 (the multi-threaded two-temp-file arm
+    is omitted). }
+  if rc = SQLITE_OK then begin
+    mxSz := pIncr^.mxSz;
+    if pTask^.file2.pFd = nil then begin
+      Assert(pTask^.file2.iEof > 0);
+      rc := vdbeSorterOpenTempFile(db, pTask^.file2.iEof, @pTask^.file2.pFd);
+      pTask^.file2.iEof := 0;
+    end;
+    if rc = SQLITE_OK then begin
+      pIncr^.aFile[1].pFd := pTask^.file2.pFd;
+      pIncr^.iStartOff    := pTask^.file2.iEof;
+      Inc(pTask^.file2.iEof, mxSz);
+    end;
+  end;
+
+  { SQLITE_MAX_WORKER_THREADS==0: eMode!=INCRINIT_TASK always holds. }
+  if rc = SQLITE_OK then
+    rc := vdbePmaReaderNext(pReadr);
+
+  Result := rc;
+end;
+
+{ vdbePmaReaderIncrInit — vdbesort.c:2308..2336, single-threaded arm.  If
+  pReadr->pIncr is set, drive vdbePmaReaderIncrMergeInit on the current thread
+  (the threaded bg-thread launch is omitted).  No-op otherwise. }
+function vdbePmaReaderIncrInit(pReadr: PPmaReader; eMode: i32): i32;
+var
+  pIncr: PIncrMerger;
+begin
+  pIncr  := pReadr^.pIncr;
+  Result := SQLITE_OK;
+  if pIncr <> nil then
+    Result := vdbePmaReaderIncrMergeInit(pReadr, eMode);
+end;
+
+{ ----------------------------------------------------------------------------
+  Phase 5.7.b.8 — merge-tree builder + final reader/merger setup.
+  Ports vdbeSorterTreeDepth / vdbeSorterAddToTree / vdbeSorterMergeTreeBuild /
+  vdbeSorterSetupMerge (vdbesort.c:2377..2611).  Single-threaded only
+  (SQLITE_MAX_WORKER_THREADS==0): nTask==1, bUseThreads==0; the >0 per-task
+  fan-out, INCRINIT_TASK/ROOT and bg-init branches are omitted.  Not yet wired
+  into Rewind (5.7.b.9 does that).
+  ---------------------------------------------------------------------------- }
+
+{ vdbeSorterTreeDepth — vdbesort.c:2377..2394.  Compute the depth of the
+  incremental-merge tree needed for nPMA PMAs: the number of times nDiv must be
+  multiplied by SORTER_MAX_MERGE_COUNT (starting at SORTER_MAX_MERGE_COUNT)
+  before it equals or exceeds nPMA. }
+function vdbeSorterTreeDepth(nPMA: i32): i32;
+var
+  nDepth: i32;
+  nDiv:   i64;
+begin
+  nDepth := 0;
+  nDiv   := SORTER_MAX_MERGE_COUNT;
+  while nDiv < i64(nPMA) do begin
+    nDiv := nDiv * SORTER_MAX_MERGE_COUNT;
+    Inc(nDepth);
+  end;
+  Result := nDepth;
+end;
+
+{ vdbeSorterAddToTree — vdbesort.c:2395..2450.  pRoot is the root of an
+  incremental merge-tree of depth nDepth (per vdbeSorterTreeDepth).  pLeaf is
+  the iSeq'th leaf (counting from zero); add it to the tree, creating the
+  intermediate MergeEngine+IncrMerger nodes on the descent path as needed.
+  On error pLeaf is freed (via vdbeIncrFree of the IncrMerger that wraps it). }
+function vdbeSorterAddToTree(pTask: PSortSubtask; nDepth: i32; iSeq: i32;
+                            pRoot: PMergeEngine; pLeaf: PMergeEngine): i32;
+var
+  rc:     i32;
+  nDiv:   i32;
+  i:      i32;
+  p:      PMergeEngine;
+  pIncr:  PIncrMerger;
+  iIter:  i32;
+  pReadr: PPmaReader;
+  pNew:   PMergeEngine;
+begin
+  rc   := SQLITE_OK;
+  nDiv := 1;
+  p    := pRoot;
+
+  rc := vdbeIncrMergerNew(pTask, pLeaf, @pIncr);
+
+  i := 1;
+  while i < nDepth do begin
+    nDiv := nDiv * SORTER_MAX_MERGE_COUNT;
+    Inc(i);
+  end;
+
+  i := 1;
+  while (i < nDepth) and (rc = SQLITE_OK) do begin
+    iIter  := (iSeq div nDiv) mod SORTER_MAX_MERGE_COUNT;
+    pReadr := @p^.aReadr[iIter];
+
+    if pReadr^.pIncr = nil then begin
+      pNew := vdbeMergeEngineNew(SORTER_MAX_MERGE_COUNT);
+      if pNew = nil then
+        rc := SQLITE_NOMEM_BKPT
+      else
+        rc := vdbeIncrMergerNew(pTask, pNew, @pReadr^.pIncr);
+    end;
+    if rc = SQLITE_OK then begin
+      p    := pReadr^.pIncr^.pMerger;
+      nDiv := nDiv div SORTER_MAX_MERGE_COUNT;
+    end;
+    Inc(i);
+  end;
+
+  if rc = SQLITE_OK then
+    p^.aReadr[iSeq mod SORTER_MAX_MERGE_COUNT].pIncr := pIncr
+  else
+    vdbeIncrFree(pIncr);
+  Result := rc;
+end;
+
+{ vdbeSorterMergeTreeBuild — vdbesort.c:2451..2529.  Build a tree of
+  MergeEngine/IncrMerger/PmaReader objects spanning all PMAs on disk; set
+  *ppOut to the root MergeEngine.  Single-threaded subset: the
+  SQLITE_MAX_WORKER_THREADS>0 multi-task top-level MergeEngine and per-task
+  IncrMerger wiring collapse to one task (aTask[0]) whose root becomes pMain. }
+function vdbeSorterMergeTreeBuild(pSorter: PVdbeSorter;
+                                 ppOut: PPMergeEngine): i32;
+var
+  pMain:    PMergeEngine;
+  rc:       i32;
+  iTask:    i32;
+  pTask:    PSortSubtask;
+  pRoot:    PMergeEngine;
+  nDepth:   i32;
+  iReadOff: i64;
+  i:        i32;
+  iSeq:     i32;
+  pMerger:  PMergeEngine;
+  nReader:  i32;
+begin
+  pMain := nil;
+  rc    := SQLITE_OK;
+
+  { SQLITE_MAX_WORKER_THREADS>0 top-level MergeEngine block omitted. }
+
+  iTask := 0;
+  while (rc = SQLITE_OK) and (iTask < pSorter^.nTask) do begin
+    pTask := @pSorter^.aTask;   { single-threaded: aTask[0] }
+    { C: assert(pTask->nPMA>0 || SQLITE_MAX_WORKER_THREADS>0).  With
+      SQLITE_MAX_WORKER_THREADS==0 the second disjunct is false, so the
+      assertion reduces to nPMA>0. }
+    Assert(pTask^.nPMA > 0);
+    { SQLITE_MAX_WORKER_THREADS==0: the guard is always taken. }
+    begin
+      pRoot    := nil;          { Root node of tree for this task }
+      nDepth   := vdbeSorterTreeDepth(pTask^.nPMA);
+      iReadOff := 0;
+
+      if pTask^.nPMA <= SORTER_MAX_MERGE_COUNT then begin
+        rc := vdbeMergeEngineLevel0(pTask, pTask^.nPMA, @iReadOff, @pRoot);
+      end else begin
+        iSeq  := 0;
+        pRoot := vdbeMergeEngineNew(SORTER_MAX_MERGE_COUNT);
+        if pRoot = nil then rc := SQLITE_NOMEM_BKPT;
+        i := 0;
+        while (i < pTask^.nPMA) and (rc = SQLITE_OK) do begin
+          pMerger := nil;       { New level-0 PMA merger }
+          { Number of level-0 PMAs to merge }
+          if (pTask^.nPMA - i) < SORTER_MAX_MERGE_COUNT then
+            nReader := pTask^.nPMA - i
+          else
+            nReader := SORTER_MAX_MERGE_COUNT;
+          rc := vdbeMergeEngineLevel0(pTask, nReader, @iReadOff, @pMerger);
+          if rc = SQLITE_OK then begin
+            rc := vdbeSorterAddToTree(pTask, nDepth, iSeq, pRoot, pMerger);
+            Inc(iSeq);
+          end;
+          Inc(i, SORTER_MAX_MERGE_COUNT);
+        end;
+      end;
+
+      if rc = SQLITE_OK then begin
+        { SQLITE_MAX_WORKER_THREADS>0 pMain<>nil arm omitted. }
+        Assert(pMain = nil);
+        pMain := pRoot;
+      end else
+        vdbeMergeEngineFree(pRoot);
+    end;
+    Inc(iTask);
+  end;
+
+  if rc <> SQLITE_OK then begin
+    vdbeMergeEngineFree(pMain);
+    pMain := nil;
+  end;
+  ppOut^ := pMain;
+  Result := rc;
+end;
+
+{ vdbeSorterSetupMerge — vdbesort.c:2530..2611.  Build the merge tree and set
+  up the final iterator.  Single-threaded only: SQLITE_MAX_WORKER_THREADS==0 so
+  bUseThreads==0; the result always goes through pSorter->pMerger (the bg-init
+  pReader branch is omitted).  After this returns OK, pSorter->pMerger points
+  at a ready-to-step engine. }
+function vdbeSorterSetupMerge(pSorter: PVdbeSorter): i32;
+var
+  rc:     i32;
+  pTask0: PSortSubtask;
+  pMain:  PMergeEngine;
+begin
+  pTask0 := @pSorter^.aTask;   { &pSorter->aTask[0] }
+  pMain  := nil;
+
+  { SQLITE_MAX_WORKER_THREADS xCompare-per-task setup omitted. }
+
+  rc := vdbeSorterMergeTreeBuild(pSorter, @pMain);
+  if rc = SQLITE_OK then begin
+    { bUseThreads==0: the threaded pReader/bg-init arm is omitted. }
+    rc := vdbeMergeEngineInit(pTask0, pMain, INCRINIT_NORMAL);
+    pSorter^.pMerger := pMain;
+    pMain := nil;
+  end;
+
+  if rc <> SQLITE_OK then
+    vdbeMergeEngineFree(pMain);
+  Result := rc;
+end;
+
+{ ============================================================================
+  In-memory sort engine + write-side PMA — vdbesort.c  (tasklist 5.7.b.5)
+
+  C-faithful 1:1 port of the in-memory linked-list merge engine and the
+  PMA write path.  KeyInfo header fields are read by byte offset because
+  PKeyInfo is opaque in this unit (nKeyField:u16@6, nAllField:u16@8,
+  aSortFlags:Pu8@24, aColl[0]:PCollSeq@32; see codegen.pas TKeyInfo).
+  Record layout: nVal:i32@0, union u@8, SRVAL(p)=p+16 (5.7.b.1).
+  ============================================================================ }
+
+{ Small KeyInfo header accessors (opaque PKeyInfo). }
+function kiNKeyField(pKI: PKeyInfo): i32; inline;
+begin Result := i32(Pu16(PByte(pKI) + 6)^); end;
+
+function kiAColl0(pKI: PKeyInfo): Pointer; inline;
+begin Result := PPointer(PByte(pKI) + 32)^; end;
+
+function kiASortFlags(pKI: PKeyInfo): Pu8; inline;
+begin Result := PPointer(PByte(pKI) + 24)^; end;
+
+{ vdbeSorterRecordFree — vdbesort.c:1050..1057.  Free a list of separately
+  allocated SorterRecords (u.pNext at offset 8). }
+procedure vdbeSorterRecordFree(db: PTsqlite3; pRecord: PSorterRecord);
+var
+  p, pNext: PSorterRecord;
+begin
+  p := pRecord;
+  while p <> nil do begin
+    pNext := p^.u.pNext;
+    sqlite3DbFree(db, p);
+    p := pNext;
+  end;
+end;
+
+{ vdbeSortSubtaskCleanup — vdbesort.c:1063..1083 (single-threaded subset).
+  list.aMemory is always 0 in single-threaded mode, so the record list is
+  freed via vdbeSorterRecordFree.  file/file2 teardown lands with the
+  merger (5.7.b.9); here they are nil until the spill gate flips. }
+procedure vdbeSortSubtaskCleanup(db: PTsqlite3; pTask: PSortSubtask);
+begin
+  sqlite3DbFree(db, pTask^.pUnpacked);
+  Assert(pTask^.list.aMemory = nil);
+  vdbeSorterRecordFree(nil, pTask^.list.pList);
+  if pTask^.file_.pFd <> nil then begin
+    sqlite3OsClose(pTask^.file_.pFd);
+    sqlite3_free(pTask^.file_.pFd);
+  end;
+  if pTask^.file2.pFd <> nil then begin
+    sqlite3OsClose(pTask^.file2.pFd);
+    sqlite3_free(pTask^.file2.pFd);
+  end;
+  FillChar(pTask^, SizeOf(TSortSubtask), 0);
+end;
+
+{ sqlite3VdbeSorterInit — vdbesort.c:936..1044 (single-threaded; nWorker==0).
+  Computes mnPmaSize/mxPmaSize from szPma + page-size + schema cache_size,
+  pgsz from the main btree, sets up aTask[0], and the bulk aMemory buffer.
+  KeyInfo is referenced (not copied) — pCsr->pKeyInfo outlives pSorter and
+  this port shares the same allocation, so the nField override below does
+  NOT clobber pCsr->pKeyInfo->nKeyField (we never write through it). }
+function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
+                               pCsr: PVdbeCursor): i32;
+var
+  pgsz:    i32;
+  pSorter: PVdbeSorter;
+  pKInfo:  PKeyInfo;   { local: pKeyInfo would shadow type PKeyInfo (FPC) }
+  rc:      i32;
+  pBt:     PBtree;
+  mxCache: i64;
+  szPma:   u32;
+begin
+  if pCsr = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  { Cannot sort without KeyInfo. }
+  if pCsr^.pKeyInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+  rc := SQLITE_OK;
+
+  pSorter := PVdbeSorter(sqlite3DbMallocZero(db, SizeOf(TVdbeSorter)));
+  pCsr^.uc.pSorter := pSorter;
+  if pSorter = nil then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+
+  pKInfo := pCsr^.pKeyInfo;
+  pSorter^.pKeyInfo := pKInfo;
+  if (nField <> 0) {and nWorker==0} then begin
+    { Override key-field count for a stable CREATE INDEX sort (9.4.divbug.30
+      keeps RecordCompare from walking the PK tail).  This port reuses the
+      caller's KeyInfo allocation rather than copying it (C copies), so we
+      record the override on the sorter and apply it to pUnpacked->nField in
+      vdbeSortAllocUnpacked — we must NOT write pKInfo->nKeyField here. }
+  end;
+
+  pBt := PBtree(db^.aDb[0].pBt);
+  sqlite3BtreeEnter(pBt);
+  pgsz := sqlite3BtreeGetPageSize(pBt);
+  pSorter^.pgsz := pgsz;
+  sqlite3BtreeLeave(pBt);
+  pSorter^.nTask := 1;
+  pSorter^.iPrev := 0;
+  pSorter^.bUseThreads := 0;
+  pSorter^.db := db;
+  pSorter^.aTask.pSorter := pSorter;
+
+  if sqlite3TempInMemory(db) = 0 then begin
+    szPma := sqlite3GlobalConfig.szPma;
+    pSorter^.mnPmaSize := i32(szPma) * pgsz;
+
+    mxCache := i64(db^.aDb[0].pSchema^.cache_size);
+    if mxCache < 0 then
+      mxCache := mxCache * (-1024)        { abs(C) KiB }
+    else
+      mxCache := mxCache * pgsz;
+    if mxCache > SQLITE_MAX_PMASZ then mxCache := SQLITE_MAX_PMASZ;
+    pSorter^.mxPmaSize := pSorter^.mnPmaSize;
+    if i32(mxCache) > pSorter^.mxPmaSize then pSorter^.mxPmaSize := i32(mxCache);
+
+    { Avoid large allocations under SQLITE_CONFIG_SMALL_MALLOC. }
+    if sqlite3GlobalConfig.bSmallMalloc = 0 then begin
+      Assert(pSorter^.iMemory = 0);
+      pSorter^.nMemory := pgsz;
+      pSorter^.list.aMemory := Pu8(sqlite3Malloc(pgsz));
+      if pSorter^.list.aMemory = nil then rc := SQLITE_NOMEM_BKPT;
+    end;
+  end;
+
+  if (i32(Pu16(PByte(pKInfo) + 8)^) < 13)   { nAllField@8 }
+   and ((kiAColl0(pKInfo) = nil) or (kiAColl0(pKInfo) = db^.pDfltColl))
+   and ((kiASortFlags(pKInfo)[0] and KEYINFO_ORDER_BIGNULL) = 0) then
+    pSorter^.typeMask := SORTER_TYPE_INTEGER or SORTER_TYPE_TEXT;
+
+  Result := rc;
+end;
+
+procedure sqlite3VdbeSorterReset(db: PTsqlite3; pSorter: PVdbeSorter);
+begin
+  { vdbesort.c:1247..1275 (single-threaded subset).  No thread joins
+    (bUseThreads==0); the SQLITE_MAX_WORKER_THREADS pReader-free arm is
+    omitted (pReader stays nil single-threaded), but the merge engine and
+    pUnpacked still need releasing.  vdbeMergeEngineFree walks aReadr[] and
+    frees each PmaReader's buffers + the engine block; subtask cleanup
+    closes the temp files (vdbesort.c:1063..1083). }
+  if pSorter = nil then Exit;
+  Assert((pSorter^.bUseThreads <> 0) or (pSorter^.pReader = nil));
+  vdbeMergeEngineFree(pSorter^.pMerger);
+  pSorter^.pMerger := nil;
+  vdbeSortSubtaskCleanup(db, @pSorter^.aTask);
+  pSorter^.aTask.pSorter := pSorter;
+  if pSorter^.list.aMemory = nil then
+    vdbeSorterRecordFree(nil, pSorter^.list.pList);
   pSorter^.list.pList := nil;
   pSorter^.list.szPMA := 0;
   pSorter^.bUsePMA    := 0;
+  pSorter^.iMemory    := 0;
+  pSorter^.mxKeysize  := 0;
+  sqlite3DbFree(db, pSorter^.pUnpacked);
+  pSorter^.pUnpacked := nil;
 end;
 
 procedure sqlite3VdbeSorterClose(db: PTsqlite3; pCsr: PVdbeCursor);
 var
   pSorter: PVdbeSorter;
 begin
+  { vdbesort.c:1280..1296 }
   if pCsr = nil then Exit;
   pSorter := pCsr^.uc.pSorter;
   if pSorter <> nil then begin
+    Inc(db^.nSpill, pSorter^.aTask.nSpill);
     sqlite3VdbeSorterReset(db, pSorter);
+    sqlite3_free(pSorter^.list.aMemory);
     sqlite3DbFree(db, pSorter);
     pCsr^.uc.pSorter := nil;
   end;
 end;
 
-{ ----------------------------------------------------------------------
-  Minimal in-memory VdbeSorter port — Phase 6.10 step 26(a) follow-on.
+{ -------- comparison family — vdbesort.c:763..915 -------- }
 
-  Layout of one record allocation: pNext (8B) | nVal (4B) | pad (4B) |
-  serialised key bytes (nVal).  pNext lives at offset 0 to match the
-  list-walking convention already used by sqlite3VdbeSorterReset above.
+{ vdbeSorterCompareTail — vdbesort.c:763..775 }
+function vdbeSorterCompareTail(pTask: PSortSubtask; pbKey2Cached: Pi32;
+  pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
+var
+  r2: PUnpackedRecord;
+begin
+  r2 := pTask^.pUnpacked;
+  if pbKey2Cached^ = 0 then begin
+    sqlite3VdbeRecordUnpack(pTask^.pSorter^.pKeyInfo, nKey2, pKey2, r2);
+    pbKey2Cached^ := 1;
+  end;
+  Result := sqlite3VdbeRecordCompareWithSkip(nKey1, pKey1, r2, 1);
+end;
 
-  This is a single-PMA, single-list implementation suitable for
-  CREATE INDEX over rows that fit in process memory.  Disk-spill
-  (PMA) and threaded merge are deferred — use sites that need them
-  (very large indexes / VACUUM with sort) will fall back to OOM,
-  matching SQLITE_DEFAULT_TEMP_CACHE_SIZE behaviour as a hard cap.
-  ---------------------------------------------------------------------- }
+{ vdbeSorterCompare — vdbesort.c:790..802 (generic) }
+function vdbeSorterCompare(pTask: PSortSubtask; pbKey2Cached: Pi32;
+  pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
+var
+  r2: PUnpackedRecord;
+begin
+  r2 := pTask^.pUnpacked;
+  if pbKey2Cached^ = 0 then begin
+    sqlite3VdbeRecordUnpack(pTask^.pSorter^.pKeyInfo, nKey2, pKey2, r2);
+    pbKey2Cached^ := 1;
+  end;
+  Result := sqlite3VdbeRecordCompare(nKey1, pKey1, r2);
+end;
 
+{ vdbeSorterCompareText — vdbesort.c:809..846.  First field assumed TEXT,
+  collation BINARY. }
+function vdbeSorterCompareText(pTask: PSortSubtask; pbKey2Cached: Pi32;
+  pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
+var
+  p1, p2, v1, v2: Pu8;
+  n1, n2, res, mn: i32;
+  un1, un2: u32;
+begin
+  p1 := Pu8(pKey1);
+  p2 := Pu8(pKey2);
+  v1 := @p1[p1[0]];
+  v2 := @p2[p2[0]];
+  { getVarint32NR(&p1[1], n1) }
+  sqlite3GetVarint32(@p1[1], un1); n1 := i32(un1);
+  sqlite3GetVarint32(@p2[1], un2); n2 := i32(un2);
+  if n1 < n2 then mn := n1 else mn := n2;
+  { memcmp — CompareByte returns the signed first-differing-byte delta. }
+  res := i32(CompareByte(v1^, v2^, (mn - 13) div 2));
+  if res = 0 then
+    res := n1 - n2;
+
+  if res = 0 then begin
+    if kiNKeyField(pTask^.pSorter^.pKeyInfo) > 1 then
+      res := vdbeSorterCompareTail(pTask, pbKey2Cached,
+                                   pKey1, nKey1, pKey2, nKey2);
+  end else begin
+    if kiASortFlags(pTask^.pSorter^.pKeyInfo)[0] <> 0 then
+      res := res * -1;
+  end;
+  Result := res;
+end;
+
+{ vdbeSorterCompareInt — vdbesort.c:852..914.  First field assumed INTEGER. }
+function vdbeSorterCompareInt(pTask: PSortSubtask; pbKey2Cached: Pi32;
+  pKey1: Pointer; nKey1: i32; pKey2: Pointer; nKey2: i32): i32; cdecl;
 const
-  SORTER_REC_HDR = 16;   { offset of payload bytes after pNext+nVal+pad }
-
-function vdbeSorterCountRecords(pSorter: PVdbeSorter): i32; forward;
-
-procedure vdbeSorterListToArray(pSorter: PVdbeSorter;
-  out aRec: array of Pointer; out nRec: i32);
+  aLen: array[0..9] of u8 = (0, 1, 2, 3, 4, 6, 8, 0, 0, 0);
 var
-  p, pNxt: Pointer;
-  i, n: i32;
+  p1, p2, v1, v2: Pu8;
+  s1, s2, res, i: i32;
+  n: u8;
 begin
-  { sqlite3VdbeSorterWrite inserts at the list head, so head→tail walks
-    records in REVERSE insertion order.  Pre-count and fill from the back
-    so aRec ends up in INSERTION order; the stable merge sort then keeps
-    tied keys in the order rows arrived (matches upstream PMA semantics). }
-  n := vdbeSorterCountRecords(pSorter);
-  if n > High(aRec) + 1 then n := High(aRec) + 1;
-  nRec := 0;
-  p := pSorter^.list.pList;
-  i := 0;
-  while (p <> nil) and (i < n) do begin
-    aRec[n - 1 - i] := p;
-    pNxt := PPointer(p)^;
-    p := pNxt;
-    Inc(i);
-  end;
-  nRec := i;
-end;
+  p1 := Pu8(pKey1);
+  p2 := Pu8(pKey2);
+  s1 := p1[1];
+  s2 := p2[1];
+  v1 := @p1[p1[0]];
+  v2 := @p2[p2[0]];
 
-function vdbeSorterCountRecords(pSorter: PVdbeSorter): i32;
-var
-  p: Pointer;
-  n: i32;
-begin
-  p := pSorter^.list.pList;
-  n := 0;
-  while p <> nil do begin
-    Inc(n);
-    p := PPointer(p)^;
-  end;
-  Result := n;
-end;
-
-{ Compare two encoded records pA, pB using pSorter^.pKeyInfo.
-  Returns <0 if A<B, 0 if equal, >0 if A>B. }
-function vdbeSorterCompareRec(pSorter: PVdbeSorter;
-  pA, pB: Pointer): i32;
-var
-  pUR: PUnpackedRecord;
-  resB: i32;
-  aBytes, bBytes: Pointer;
-  aLen, bLen: i32;
-begin
-  if pSorter^.pUnpacked = nil then
-    pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
-  pUR := PUnpackedRecord(pSorter^.pUnpacked);
-  if pUR = nil then begin Result := 0; Exit; end;
-  { default_rc must be 0 so that equal keys compare equal — the raw
-    DbMallocRaw in sqlite3VdbeAllocUnpackedRecord leaves it indeterminate.
-    Without this, tied records sort to a random side and group_concat /
-    aggregate row order becomes heap-layout-dependent (bug 6.13 residual). }
-  pUR^.default_rc := 0;
-  { 9.4.divbug.30 — match vdbesort.c:1358 vdbeSortAllocUnpacked: cap nField
-    at pKeyInfo->nKeyField so RecordUnpack/RecordCompare only walk the key
-    columns, leaving the data columns untouched.  Otherwise ORDER BY ties
-    under a non-default collation (e.g. NOCASE) fall through to BINARY
-    memcmp on the data column and lose insertion-order stability. }
-  pUR^.nField := i32(Pu16(PByte(pSorter^.pKeyInfo) + 6)^);  { TKeyInfo.nKeyField @6 }
-  aLen   := Pi32(PByte(pA) + 8)^;
-  bLen   := Pi32(PByte(pB) + 8)^;
-  aBytes := PByte(pA) + SORTER_REC_HDR;
-  bBytes := PByte(pB) + SORTER_REC_HDR;
-  sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, aLen, aBytes, pUR);
-  { sqlite3VdbeRecordCompare(nKey, pKey, pUnp) returns sign of (key vs unp). }
-  resB := sqlite3VdbeRecordCompare(bLen, bBytes, pUR);
-  if resB > 0 then Result := -1     { B>A => A<B }
-  else if resB < 0 then Result := 1
-  else Result := 0;
-end;
-
-procedure vdbeSorterMergeSort(pSorter: PVdbeSorter;
-  arr: PPointerArray; lo, hi: i32);
-var
-  mid, i, j, k: i32;
-  tmp: array of Pointer;
-begin
-  if hi - lo <= 0 then Exit;
-  if hi - lo = 1 then begin
-    if vdbeSorterCompareRec(pSorter, arr^[lo], arr^[hi]) > 0 then begin
-      tmp := nil;
-      SetLength(tmp, 1);
-      tmp[0]    := arr^[lo];
-      arr^[lo]  := arr^[hi];
-      arr^[hi]  := tmp[0];
+  if s1 = s2 then begin
+    { Same serial type — compare value bytes via memcmp with sign fix-up. }
+    n := aLen[s1];
+    res := 0;
+    for i := 0 to i32(n) - 1 do begin
+      res := i32(v1[i]) - i32(v2[i]);
+      if res <> 0 then begin
+        if ((v1[0] xor v2[0]) and $80) <> 0 then begin
+          if (v1[0] and $80) <> 0 then res := -1 else res := +1;
+        end;
+        break;
+      end;
     end;
-    Exit;
-  end;
-  mid := (lo + hi) div 2;
-  vdbeSorterMergeSort(pSorter, arr, lo, mid);
-  vdbeSorterMergeSort(pSorter, arr, mid + 1, hi);
-  SetLength(tmp, hi - lo + 1);
-  i := lo; j := mid + 1; k := 0;
-  while (i <= mid) and (j <= hi) do begin
-    if vdbeSorterCompareRec(pSorter, arr^[i], arr^[j]) <= 0 then begin
-      tmp[k] := arr^[i]; Inc(i);
+  end else if (s1 > 7) and (s2 > 7) then begin
+    res := s1 - s2;
+  end else begin
+    if s2 > 7 then res := +1
+    else if s1 > 7 then res := -1
+    else res := s1 - s2;
+    Assert(res <> 0);
+    if res > 0 then begin
+      if (v1[0] and $80) <> 0 then res := -1;
     end else begin
-      tmp[k] := arr^[j]; Inc(j);
+      if (v2[0] and $80) <> 0 then res := +1;
     end;
-    Inc(k);
   end;
-  while i <= mid do begin tmp[k] := arr^[i]; Inc(i); Inc(k); end;
-  while j <= hi  do begin tmp[k] := arr^[j]; Inc(j); Inc(k); end;
-  for i := 0 to hi - lo do arr^[lo + i] := tmp[i];
+
+  if res = 0 then begin
+    if kiNKeyField(pTask^.pSorter^.pKeyInfo) > 1 then
+      res := vdbeSorterCompareTail(pTask, pbKey2Cached,
+                                   pKey1, nKey1, pKey2, nKey2);
+  end else if kiASortFlags(pTask^.pSorter^.pKeyInfo)[0] <> 0 then
+    res := res * -1;
+
+  Result := res;
 end;
 
+{ vdbeSortAllocUnpacked — vdbesort.c:1354..1362.  default_rc:=0 (bug 6.13);
+  nField capped at nKeyField (9.4.divbug.30). }
+function vdbeSortAllocUnpacked(pTask: PSortSubtask): i32;
+begin
+  if pTask^.pUnpacked = nil then begin
+    pTask^.pUnpacked :=
+      PUnpackedRecord(sqlite3VdbeAllocUnpackedRecord(pTask^.pSorter^.pKeyInfo));
+    if pTask^.pUnpacked = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+    pTask^.pUnpacked^.nField := u16(kiNKeyField(pTask^.pSorter^.pKeyInfo));
+    pTask^.pUnpacked^.errCode := 0;
+    pTask^.pUnpacked^.default_rc := 0;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ vdbeSorterMerge — vdbesort.c:1368..1404.  Stable two-list merge (res<=0
+  keeps p1), linking via u.pNext. }
+function vdbeSorterMerge(pTask: PSortSubtask;
+  p1, p2: PSorterRecord): PSorterRecord;
+var
+  pFinal: PSorterRecord;
+  pp:     ^PSorterRecord;
+  bCached, res: i32;
+begin
+  pFinal := nil;
+  pp := @pFinal;
+  bCached := 0;
+  Assert((p1 <> nil) and (p2 <> nil));
+  while True do begin
+    res := pTask^.xCompare(pTask, @bCached,
+                           SRVAL(p1), p1^.nVal, SRVAL(p2), p2^.nVal);
+    if res <= 0 then begin
+      pp^ := p1;
+      pp  := @p1^.u.pNext;
+      p1  := p1^.u.pNext;
+      if p1 = nil then begin pp^ := p2; break; end;
+    end else begin
+      pp^ := p2;
+      pp  := @p2^.u.pNext;
+      p2  := p2^.u.pNext;
+      bCached := 0;
+      if p2 = nil then begin pp^ := p1; break; end;
+    end;
+  end;
+  Result := pFinal;
+end;
+
+{ vdbeSorterGetCompare — vdbesort.c:1410..1417. }
+function vdbeSorterGetCompare(p: PVdbeSorter): TSorterCompare;
+begin
+  if p^.typeMask = SORTER_TYPE_INTEGER then
+    Result := @vdbeSorterCompareInt
+  else if p^.typeMask = SORTER_TYPE_TEXT then
+    Result := @vdbeSorterCompareText
+  else
+    Result := @vdbeSorterCompare;
+end;
+
+{ vdbeSorterSort — vdbesort.c:1424..1474.  Bottom-up merge with aSlot[64],
+  converting aMemory iNext->pNext as the list is traversed. }
+function vdbeSorterSort(pTask: PSortSubtask; pList: PSorterList): i32;
+var
+  i, rc:  i32;
+  p, pNext: PSorterRecord;
+  aSlot:  array[0..63] of PSorterRecord;
+begin
+  rc := vdbeSortAllocUnpacked(pTask);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  p := pList^.pList;
+  pTask^.xCompare := vdbeSorterGetCompare(pTask^.pSorter);
+  FillChar(aSlot, SizeOf(aSlot), 0);
+
+  while p <> nil do begin
+    if pList^.aMemory <> nil then begin
+      if Pu8(p) = pList^.aMemory then
+        pNext := nil
+      else
+        pNext := PSorterRecord(@pList^.aMemory[p^.u.iNext]);
+    end else
+      pNext := p^.u.pNext;
+
+    p^.u.pNext := nil;
+    i := 0;
+    while aSlot[i] <> nil do begin
+      p := vdbeSorterMerge(pTask, p, aSlot[i]);
+      Assert(i < Length(aSlot));
+      aSlot[i] := nil;
+      Inc(i);
+    end;
+    aSlot[i] := p;
+    p := pNext;
+  end;
+
+  p := nil;
+  for i := 0 to Length(aSlot) - 1 do begin
+    if aSlot[i] = nil then Continue;
+    if p <> nil then p := vdbeSorterMerge(pTask, p, aSlot[i])
+    else             p := aSlot[i];
+  end;
+  pList^.pList := p;
+
+  Result := pTask^.pUnpacked^.errCode;
+end;
+
+{ vdbeSorterListToPMA — vdbesort.c:1578..1633 (single-threaded).  Sort the
+  list then write it as one PMA via the (already ported) PmaWriter. }
+function vdbeSorterListToPMA(pTask: PSortSubtask; pList: PSorterList): i32;
+var
+  db:     PTsqlite3;
+  rc:     i32;
+  writer: TPmaWriter;
+  p, pNext: PSorterRecord;
+begin
+  db := pTask^.pSorter^.db;
+  rc := SQLITE_OK;
+  FillChar(writer, SizeOf(writer), 0);
+  Assert(pList^.szPMA > 0);
+
+  { Open the first temporary PMA file if not yet open. }
+  if pTask^.file_.pFd = nil then begin
+    rc := vdbeSorterOpenTempFile(db, 0, @pTask^.file_.pFd);
+    Assert((rc <> SQLITE_OK) or (pTask^.file_.pFd <> nil));
+  end;
+
+  if rc = SQLITE_OK then
+    vdbeSorterExtendFile(db, pTask^.file_.pFd,
+                         pTask^.file_.iEof + pList^.szPMA + 9);
+
+  if rc = SQLITE_OK then
+    rc := vdbeSorterSort(pTask, pList);
+
+  if rc = SQLITE_OK then begin
+    pNext := nil;
+    vdbePmaWriterInit(pTask^.file_.pFd, @writer, pTask^.pSorter^.pgsz,
+                      pTask^.file_.iEof);
+    Inc(pTask^.nPMA);
+    vdbePmaWriteVarint(@writer, u64(pList^.szPMA));
+    p := pList^.pList;
+    while p <> nil do begin
+      pNext := p^.u.pNext;
+      vdbePmaWriteVarint(@writer, u64(p^.nVal));
+      vdbePmaWriteBlob(@writer, SRVAL(p), p^.nVal);
+      if pList^.aMemory = nil then sqlite3_free(p);
+      p := pNext;
+    end;
+    pList^.pList := p;
+    rc := vdbePmaWriterFinish(@writer, @pTask^.file_.iEof, @pTask^.nSpill);
+  end;
+
+  Assert((rc <> SQLITE_OK) or (pList^.pList = nil));
+  Result := rc;
+end;
+
+{ vdbeSorterFlushPMA — vdbesort.c:1727..1730 (SQLITE_MAX_WORKER_THREADS==0
+  branch only).  Sets bUsePMA and flushes aTask[0]'s list to a new PMA. }
+function vdbeSorterFlushPMA(pSorter: PVdbeSorter): i32;
+begin
+  pSorter^.bUsePMA := 1;
+  Result := vdbeSorterListToPMA(@pSorter^.aTask, @pSorter^.list);
+end;
+
+{ sqlite3VdbeSorterWrite — vdbesort.c:1797..1902.  Add a record to the
+  sorter.  typeMask update + bFlush computation are fully live; the actual
+  spill (vdbeSorterFlushPMA) is GATED behind SORTER_PMA_ENABLED (5.7.b.5)
+  — see the const block at the top of this section.  With the gate False,
+  everything stays in RAM (no spill, no data loss); 5.7.b.9 flips it. }
 function sqlite3VdbeSorterWrite(pCsr: PVdbeCursor; pVal: PMem): i32;
 var
   pSorter: PVdbeSorter;
-  pNew:    Pointer;
-  nByte:   u64;
+  rc:      i32;
+  pNew:    PSorterRecord;
+  bFlush:  Boolean;
+  nReq:    i64;
+  nPMA:    i64;
+  t:       u32;
+  nMin:    i32;
+  nNew:    i64;
+  iListOff: PtrInt;
+  aNew:    Pu8;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
   pSorter := pCsr^.uc.pSorter;
-  nByte := u64(SORTER_REC_HDR) + u64(pVal^.n);
-  pNew := sqlite3DbMallocRaw(pSorter^.db, nByte);
-  if pNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
-  PPointer(pNew)^ := pSorter^.list.pList;     { pNext at offset 0 }
-  Pi32(PByte(pNew) + 8)^ := pVal^.n;          { nVal at offset 8 }
-  if pVal^.n > 0 then
-    Move(pVal^.z^, (PByte(pNew) + SORTER_REC_HDR)^, pVal^.n);
+  rc := SQLITE_OK;
+
+  { getVarint32NR(&pVal->z[1], t) — serial type of first record field. }
+  sqlite3GetVarint32(@Pu8(pVal^.z)[1], t);
+  if (t > 0) and (t < 10) and (t <> 7) then
+    pSorter^.typeMask := pSorter^.typeMask and SORTER_TYPE_INTEGER
+  else if (t > 10) and ((t and $01) <> 0) then
+    pSorter^.typeMask := pSorter^.typeMask and SORTER_TYPE_TEXT
+  else
+    pSorter^.typeMask := 0;
+
+  nReq := i64(pVal^.n) + SZ_SORTER_RECORD;
+  nPMA := i64(pVal^.n) + sqlite3VarintLen(u64(pVal^.n));
+  if pSorter^.mxPmaSize <> 0 then begin
+    if pSorter^.list.aMemory <> nil then
+      bFlush := (pSorter^.iMemory <> 0)
+            and ((i64(pSorter^.iMemory) + nReq) > pSorter^.mxPmaSize)
+    else
+      bFlush := (pSorter^.list.szPMA > pSorter^.mxPmaSize)
+             or ((pSorter^.list.szPMA > pSorter^.mnPmaSize)
+                 and (sqlite3HeapNearlyFull <> 0));
+    if bFlush then begin
+      { *** 5.7.b.5 SPILL GATE — see SORTER_PMA_ENABLED comment block. ***
+        Faithful flush call deferred until the merge read-back (5.7.b.6..b.9)
+        exists; 5.7.b.9 flips SORTER_PMA_ENABLED to True. }
+      if SORTER_PMA_ENABLED then begin
+        rc := vdbeSorterFlushPMA(pSorter);
+        pSorter^.list.szPMA := 0;
+        pSorter^.iMemory := 0;
+        Assert((rc <> SQLITE_OK) or (pSorter^.list.pList = nil));
+      end;
+    end;
+  end;
+
+  pSorter^.list.szPMA := pSorter^.list.szPMA + nPMA;
+  if nPMA > pSorter^.mxKeysize then
+    pSorter^.mxKeysize := i32(nPMA);
+
+  if pSorter^.list.aMemory <> nil then begin
+    nMin := pSorter^.iMemory + i32(nReq);
+    if nMin > pSorter^.nMemory then begin
+      nNew := 2 * i64(pSorter^.nMemory);
+      iListOff := -1;
+      if pSorter^.list.pList <> nil then
+        iListOff := PtrInt(Pu8(pSorter^.list.pList) - pSorter^.list.aMemory);
+      while nNew < nMin do nNew := nNew * 2;
+      if nNew > pSorter^.mxPmaSize then nNew := pSorter^.mxPmaSize;
+      if nNew < nMin then nNew := nMin;
+      aNew := Pu8(sqlite3Realloc(pSorter^.list.aMemory, u64(nNew)));
+      if aNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+      if iListOff >= 0 then
+        pSorter^.list.pList := PSorterRecord(@aNew[iListOff]);
+      pSorter^.list.aMemory := aNew;
+      pSorter^.nMemory := i32(nNew);
+    end;
+
+    pNew := PSorterRecord(@pSorter^.list.aMemory[pSorter^.iMemory]);
+    Inc(pSorter^.iMemory, i32(ROUND8(SizeInt(nReq))));
+    if pSorter^.list.pList <> nil then
+      pNew^.u.iNext :=
+        i32(Pu8(pSorter^.list.pList) - pSorter^.list.aMemory);
+  end else begin
+    pNew := PSorterRecord(sqlite3Malloc(i32(nReq)));
+    if pNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+    pNew^.u.pNext := pSorter^.list.pList;
+  end;
+
+  Move(pVal^.z^, SRVAL(pNew)^, pVal^.n);
+  pNew^.nVal := pVal^.n;
   pSorter^.list.pList := pNew;
-  pSorter^.list.szPMA := pSorter^.list.szPMA + i64(pVal^.n);
-  Result := SQLITE_OK;
+
+  Result := rc;
 end;
 
+{ sqlite3VdbeSorterRewind — vdbesort.c:2612..2655.  In-memory (bUsePMA==0)
+  path only — sort the list; the VDBE then reads it directly.  The PMA
+  flush+merge-setup arm lands in 5.7.b.9 (gated by SORTER_PMA_ENABLED). }
 function sqlite3VdbeSorterRewind(pCsr: PVdbeCursor; out pbEof: i32): i32;
 var
   pSorter: PVdbeSorter;
-  arr:     array of Pointer;
-  n, i:    i32;
+  rc:      i32;
 begin
   pbEof := 1;
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
   pSorter := pCsr^.uc.pSorter;
-  if pSorter^.list.pList = nil then begin
+  rc := SQLITE_OK;
+
+  if pSorter^.bUsePMA = 0 then begin
+    if pSorter^.list.pList <> nil then begin
+      pbEof := 0;
+      rc := vdbeSorterSort(@pSorter^.aTask, @pSorter^.list);
+    end else
+      pbEof := 1;
     pSorter^.pReader := nil;
-    Result := SQLITE_OK; Exit;
+    Result := rc;
+    Exit;
   end;
-  n := vdbeSorterCountRecords(pSorter);
-  SetLength(arr, n);
-  vdbeSorterListToArray(pSorter, arr, n);
-  if n > 1 then
-    vdbeSorterMergeSort(pSorter, PPointerArray(arr), 0, n - 1);
-  { Re-thread the linked list head→...→tail in sorted order. }
-  for i := 0 to n - 2 do
-    PPointer(arr[i])^ := arr[i + 1];
-  PPointer(arr[n - 1])^ := nil;
-  pSorter^.list.pList := arr[0];
-  pSorter^.pReader    := arr[0];
-  pbEof := 0;
-  Result := SQLITE_OK;
+
+  { Write the residual in-memory list to a final PMA, then build the merge
+    tree.  After a spill VdbeSorterWrite always re-seeds list.pList with one
+    key, so the list is never empty here (vdbesort.c:2632..2654). }
+  Assert(pSorter^.list.pList <> nil);
+  rc := vdbeSorterFlushPMA(pSorter);
+  { vdbeSorterJoinAll is a no-op single-threaded; skipped. }
+  Assert(pSorter^.pReader = nil);
+  if rc = SQLITE_OK then begin
+    rc := vdbeSorterSetupMerge(pSorter);
+    pbEof := 0;
+  end;
+  Result := rc;
 end;
 
+{ sqlite3VdbeSorterNext — vdbesort.c:2664..2696.  In-memory path: advance the
+  list head and free the consumed record (separate-alloc only). }
 function sqlite3VdbeSorterNext(db: PTsqlite3; pCsr: PVdbeCursor): i32;
 var
   pSorter: PVdbeSorter;
-  cur:     Pointer;
+  pFree:   PSorterRecord;
+  rc:      i32;
+  res:     i32;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
   pSorter := pCsr^.uc.pSorter;
-  cur := pSorter^.pReader;
-  if cur = nil then begin Result := SQLITE_DONE; Exit; end;
-  pSorter^.pReader := PPointer(cur)^;
-  if pSorter^.pReader = nil then Result := SQLITE_DONE
-  else                         Result := SQLITE_OK;
+  if pSorter^.bUsePMA <> 0 then begin
+    { Single-threaded: drive the merge from pSorter->pMerger (vdbesort.c:
+      2681..2687).  res<>0 means the merge tree is exhausted. }
+    Assert(pSorter^.pMerger <> nil);
+    res := 0;
+    rc  := vdbeMergeEngineStep(pSorter^.pMerger, @res);
+    if (rc = SQLITE_OK) and (res <> 0) then rc := SQLITE_DONE;
+    Result := rc;
+    Exit;
+  end;
+  pFree := pSorter^.list.pList;
+  if pFree = nil then begin Result := SQLITE_DONE; Exit; end;
+  pSorter^.list.pList := pFree^.u.pNext;
+  pFree^.u.pNext := nil;
+  if pSorter^.list.aMemory = nil then vdbeSorterRecordFree(db, pFree);
+  if pSorter^.list.pList <> nil then Result := SQLITE_OK
+  else                              Result := SQLITE_DONE;
 end;
 
+{ vdbeSorterRowkey — vdbesort.c:2702..2724.  Returns the current key buffer
+  (in-memory path: SRVAL of the list head). }
+function vdbeSorterRowkey(pSorter: PVdbeSorter; out pnKey: i32): Pointer;
+var
+  pReadr: PPmaReader;
+begin
+  if pSorter^.bUsePMA <> 0 then begin
+    { Single-threaded: the winning reader is aReadr[aTree[1]] (vdbesort.c:
+      2714..2719). }
+    pReadr := @pSorter^.pMerger^.aReadr[pSorter^.pMerger^.aTree[1]];
+    pnKey  := pReadr^.nKey;
+    Result := pReadr^.aKey;
+  end else begin
+    pnKey := pSorter^.list.pList^.nVal;
+    Result := SRVAL(pSorter^.list.pList);
+  end;
+end;
+
+{ sqlite3VdbeSorterRowkey — vdbesort.c:2729..2744. }
 function sqlite3VdbeSorterRowkey(pCsr: PVdbeCursor; pOut: PMem): i32;
 var
   pSorter: PVdbeSorter;
-  cur:     Pointer;
-  nVal:    i32;
+  pKey:    Pointer;
+  nKey:    i32;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
   pSorter := pCsr^.uc.pSorter;
-  cur := pSorter^.pReader;
-  if cur = nil then begin
-    sqlite3VdbeMemSetNull(pOut);
-    Result := SQLITE_OK; Exit;
-  end;
-  nVal := Pi32(PByte(cur) + 8)^;
-  if sqlite3VdbeMemClearAndResize(pOut, nVal + 2) <> 0 then begin
+  pKey := vdbeSorterRowkey(pSorter, nKey);
+  if sqlite3VdbeMemClearAndResize(pOut, nKey) <> 0 then begin
     Result := SQLITE_NOMEM_BKPT; Exit;
   end;
-  if nVal > 0 then
-    Move((PByte(cur) + SORTER_REC_HDR)^, pOut^.z^, nVal);
-  pOut^.n := nVal;
+  pOut^.n := nKey;
   pOut^.flags := MEM_Blob;
+  if nKey > 0 then Move(pKey^, pOut^.z^, nKey);
   Result := SQLITE_OK;
 end;
 
+{ sqlite3VdbeSorterCompare — vdbesort.c:2762..2796. }
 function sqlite3VdbeSorterCompare(pCsr: PVdbeCursor; bOmitRowid: i32;
                                   pKey: Pointer; nKey: i32;
                                   out pRes: i32): i32;
 var
   pSorter: PVdbeSorter;
-  cur:     Pointer;
-  pUR:     PUnpackedRecord;
-  curBytes:Pointer;
-  curLen:  i32;
+  r2:      PUnpackedRecord;
+  pKInfo:  PKeyInfo;   { local: pKeyInfo would shadow type PKeyInfo (FPC) }
+  i:       i32;
+  pK:      Pointer;
+  nK:      i32;
   nKeyCol: i32;
   pVal:    PMem;
-  i:       i32;
 begin
   pRes := 0;
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
   pSorter := pCsr^.uc.pSorter;
-  cur := pSorter^.pReader;
-  if cur = nil then begin Result := SQLITE_OK; Exit; end;
   pVal := PMem(pKey);
   nKeyCol := nKey;
   if bOmitRowid <> 0 then Dec(nKeyCol);
-  if pSorter^.pUnpacked = nil then begin
-    pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
-    if pSorter^.pUnpacked = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  r2 := pSorter^.pUnpacked;
+  pKInfo := pCsr^.pKeyInfo;
+  if r2 = nil then begin
+    r2 := PUnpackedRecord(sqlite3VdbeAllocUnpackedRecord(pKInfo));
+    pSorter^.pUnpacked := r2;
+    if r2 = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+    r2^.nField := u16(nKeyCol);
   end;
-  pUR := PUnpackedRecord(pSorter^.pUnpacked);
-  curLen   := Pi32(PByte(cur) + 8)^;
-  curBytes := PByte(cur) + SORTER_REC_HDR;
-  sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, curLen, curBytes, pUR);
-  pUR^.nField := nKeyCol;
+  Assert(r2^.nField = u16(nKeyCol));
+
+  pK := vdbeSorterRowkey(pSorter, nK);
+  sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, nK, pK, r2);
   for i := 0 to nKeyCol - 1 do begin
-    if (PMem(pUR^.aMem)[i].flags and MEM_Null) <> 0 then begin
+    if (PMem(r2^.aMem)[i].flags and MEM_Null) <> 0 then begin
       pRes := -1;
       Result := SQLITE_OK;
       Exit;
     end;
   end;
-  pRes := sqlite3VdbeRecordCompare(pVal^.n, pVal^.z, pUR);
+
+  pRes := sqlite3VdbeRecordCompare(pVal^.n, pVal^.z, r2);
   Result := SQLITE_OK;
 end;
 
@@ -11451,11 +13074,7 @@ begin
           pFrame^.aOp         := v^.aOp;
           pFrame^.nOp         := v^.nOp;
           pFrame^.token       := pProgSub^.token;
-          { aOnce flags are stored just after the TVdbeFrame header in the alloc }
           pMemEnd := PMem(Pu8(pFrame) + ROUND8(SizeOf(TVdbeFrame)));
-          pFrame^.aOnce := Pu8(pMemEnd) + nProgMem * SizeOf(TMem)
-                         + u64(pProgSub^.nCsr) * SizeOf(PVdbeCursor);
-          FillChar(pFrame^.aOnce^, (pProgSub^.nOp + 7) div 8, 0);
           i := 0;
           while i < nProgMem do begin
             pMemEnd^.flags := MEM_Undefined;
@@ -11480,6 +13099,14 @@ begin
         v^.nMem            := pFrame^.nChildMem;
         v^.nCursor         := u16(pFrame^.nChildCsr);
         v^.apCsr           := @v^.aMem[v^.nMem];
+        { OP_Once flags live just past apCsr[nCsr]; per vdbe.c:7581..7582 they
+          must be (re)computed and zeroed on EVERY OP_Program invocation — not
+          only on the first (allocating) pass — else a cached frame reused for a
+          later row of a multi-row DML keeps the prior row's OP_Once bits set,
+          so cacheable scalar subqueries in the trigger body skip re-execution
+          and return stale results (trigger2 1.x.x). }
+        pFrame^.aOnce      := Pu8(@v^.apCsr[pProgSub^.nCsr]);
+        FillChar(pFrame^.aOnce^, (pProgSub^.nOp + 7) div 8, 0);
         aOp                := pProgSub^.aOp;
         v^.aOp             := aOp;
         v^.nOp             := pProgSub^.nOp;

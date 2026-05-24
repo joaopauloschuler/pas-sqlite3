@@ -792,8 +792,9 @@ begin
       end;
       i := 3;
       c := i32(z[2]);
-      while ((c <> i32(Ord('*'))) or (z[i] <> Ord('/'))) and (c <> 0) do begin
+      while ((c <> i32(Ord('*'))) or (z[i] <> Ord('/'))) do begin
         c := i32(z[i]);
+        if c = 0 then Break;
         Inc(i);
       end;
       if c <> 0 then Inc(i);

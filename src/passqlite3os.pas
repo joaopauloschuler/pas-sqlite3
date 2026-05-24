@@ -87,6 +87,92 @@ function  libc_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'reallo
 procedure libc_free(p: Pointer); external 'c' name 'free';
 function  libc_calloc(nmemb, size: csize_t): Pointer; external 'c' name 'calloc';
 
+{ ============================================================
+  Section 0b: C stdio (FILE*) bindings — shared by extensions
+  ============================================================
+  Consolidated here (2026-05-23) so the csv / fileio / zipfile /
+  vfslog / tmstmpvfs extensions and the shell share ONE faithful
+  set of libc stdio bindings instead of re-declaring them per unit
+  (those copies had drifted across NativeInt/NativeUInt/i32).
+  Canonical C-ABI types: csize_t (size_t), clong (long), cint (int).
+  NOTE: SQLite core itself never uses stdio — it goes through the
+  VFS (open/pread/pwrite).  These exist only for the extension and
+  shell consumers listed above. }
+type
+  PFILE = Pointer;
+
+function  libc_fopen(path, mode: PAnsiChar): PFILE; cdecl; external 'c' name 'fopen';
+function  libc_fclose(stream: PFILE): cint; cdecl; external 'c' name 'fclose';
+function  libc_fread(buf: Pointer; size, nmemb: csize_t; stream: PFILE): csize_t; cdecl; external 'c' name 'fread';
+function  libc_fwrite(buf: Pointer; size, nmemb: csize_t; stream: PFILE): csize_t; cdecl; external 'c' name 'fwrite';
+function  libc_fseek(stream: PFILE; offset: clong; whence: cint): cint; cdecl; external 'c' name 'fseek';
+function  libc_ftell(stream: PFILE): clong; cdecl; external 'c' name 'ftell';
+function  libc_fflush(stream: PFILE): cint; cdecl; external 'c' name 'fflush';
+procedure libc_rewind(stream: PFILE); cdecl; external 'c' name 'rewind';
+function  libc_fprintf(stream: PFILE; fmt: PAnsiChar): cint; cdecl; varargs; external 'c' name 'fprintf';
+function  libc_popen(command, mode: PAnsiChar): PFILE; cdecl; external 'c' name 'popen';
+function  libc_pclose(stream: PFILE): cint; cdecl; external 'c' name 'pclose';
+
+var
+  libc_stdout: PFILE; external 'c' name 'stdout';
+  libc_stderr: PFILE; external 'c' name 'stderr';
+
+{ ============================================================
+  Section 0c: shared OS time / process bindings
+  ============================================================
+  Consolidated here (2026-05-23) so extensions/shell share one
+  faithful binding instead of per-unit duplicates.  Canonical
+  C-ABI types: cint (int).  Note #17. }
+function libc_gettimeofday(tv: Pointer; tz: Pointer): cint; cdecl; external 'c' name 'gettimeofday';
+function libc_getpid: cint; cdecl; external 'c' name 'getpid';
+
+{ ============================================================
+  Section 0d: shared OS bindings — getrusage / utimes
+  ============================================================
+  Record layouts moved here from the shell (rusage) and fileio
+  (utimes timeval) so the bindings have a single home.  Canonical
+  C-ABI types: cint (int), clong (long).  Note #17. }
+type
+  TTVPas = record
+    tv_sec:  clong;
+    tv_usec: clong;
+  end;
+  TRUsagePas = record
+    ru_utime:    TTVPas;
+    ru_stime:    TTVPas;
+    ru_maxrss:   clong;
+    ru_ixrss:    clong;
+    ru_idrss:    clong;
+    ru_isrss:    clong;
+    ru_minflt:   clong;
+    ru_majflt:   clong;
+    ru_nswap:    clong;
+    ru_inblock:  clong;
+    ru_oublock:  clong;
+    ru_msgsnd:   clong;
+    ru_msgrcv:   clong;
+    ru_nsignals: clong;
+    ru_nvcsw:    clong;
+    ru_nivcsw:   clong;
+  end;
+  PRUsagePas = ^TRUsagePas;
+
+  TUtTimeVal = record
+    tv_sec  : clong;
+    tv_usec : clong;
+  end;
+  PUtTimeVal = ^TUtTimeVal;
+
+function libc_getrusage(who: cint; usage: PRUsagePas): cint; cdecl; external 'c' name 'getrusage';
+function libc_utimes(path: PAnsiChar; times: PUtTimeVal): cint; cdecl; external 'c' name 'utimes';
+
+{ ============================================================
+  Section 0e: shared OS bindings — realpath / time
+  ============================================================
+  Moved here from fileio so the bindings have a single home. }
+function libc_realpath(path: PAnsiChar; resolved: PAnsiChar): PAnsiChar; cdecl; external 'c' name 'realpath';
+function libc_time(t: Pi64): i64; cdecl; external 'c' name 'time';
+
 { Public API entry points — forwarded to the util.pas implementations
   that dispatch through sqlite3GlobalConfig.m.  Declared here so the
   many existing call sites (~835 in the tree) continue to compile.    }
@@ -788,8 +874,6 @@ end;
 
 function c_nanosleep(req: Pointer; rem: Pointer): cint; cdecl;
   external 'c' name 'nanosleep';
-function c_gettimeofday(tv: Pointer; tz: Pointer): cint; cdecl;
-  external 'c' name 'gettimeofday';
 function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
@@ -2639,7 +2723,7 @@ const
 var
   tv : TTimeVal;
 begin
-  c_gettimeofday(@tv, nil);
+  libc_gettimeofday(@tv, nil);
   piNow^ := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
   Result := 0;
 end;

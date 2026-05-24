@@ -60,6 +60,48 @@ This will:
    `SQLITE_ENABLE_API_ARMOR` for differential-testing fidelity).
 2. Compile all Pascal test binaries into `bin/`.
 
+### Compile-time feature parity with the oracle
+
+Because correctness is defined **differentially against the C oracle**, the
+Pascal port and the Tcl harness must expose the *same compile-time feature set*
+as the oracle build. A mismatch makes tests fail (or pass) for the wrong
+reason, even when the engine itself is correct.
+
+Inspect the oracle's flags at any time with:
+
+```bash
+../sqlite3/sqlite3 :memory: "SELECT name FROM pragma_compile_options;"
+```
+
+As of 3.53.0 the oracle build **enables** `ENABLE_FTS3`/`FTS4`, `ENABLE_RTREE`,
+`ENABLE_PERCENTILE`, `ENABLE_OFFSET_SQL_FUNC`, `ENABLE_DBPAGE_VTAB`,
+`ENABLE_DBSTAT_VTAB`, `ENABLE_BYTECODE_VTAB`, `ENABLE_STMTVTAB`,
+`ENABLE_UNKNOWN_SQL_FUNCTION`, `ENABLE_MATH_FUNCTIONS`, `STRICT_SUBTYPE`,
+`DQS=0`; and **does not** define `ENABLE_PREUPDATE_HOOK`, `ENABLE_SNAPSHOT`,
+`ENABLE_SESSION`, `ENABLE_MEMORY_MANAGEMENT`, `ENABLE_UNLOCK_NOTIFY`,
+`ENABLE_COLUMN_METADATA`, `ENABLE_NULL_TRIM`, `ENABLE_FTS5`, or
+`ENABLE_UPDATE_DELETE_LIMIT`. The core on-disk defaults (`auto_vacuum=0`,
+`page_size=4096`, `encoding=UTF-8`, `journal=delete`, `cache_size=-2000`,
+`synchronous=2`) match the port.
+
+Two mechanisms keep the harness aligned:
+
+- **`ifcapable` flags** live in `src/tests/tcl/tester_min.tcl` (mirroring
+  upstream `test_config.c`). Any capability **not** explicitly pinned there
+  defaults to `1`, so a feature the oracle *omits* must be pinned to `0` or its
+  tests will run a feature path the engine lacks (symptom: `... was omitted at
+  compile-time`, `no such function`, or a wrong-branch result). Currently
+  pinned to `0`: `columnmetadata`, `null_trim`, `preupdate`, `snapshot`,
+  `session`, `memorymanage`, `unlock_notify`, `fts3`/`fts5`, `stat4`, … Before
+  "fixing" a compile-flag-gated test, check `sqlite_compileoption_used` on the
+  real oracle `.so` rather than implementing the feature.
+- **Engine defines** live in `src/passqlite3.inc`. Keep these in lockstep with
+  the oracle. **Known divergence:** the port's parser is built
+  `SQLITE_UDL_CAPABLE_PARSER`, so it *accepts* `DELETE/UPDATE … LIMIT` whereas
+  the oracle (no `ENABLE_UPDATE_DELETE_LIMIT`) rejects it as a syntax error —
+  this diverges `e_delete`, `upfrom2`, `wherelimit2`. See `tasklist.md` 6.40 for
+  the full feature-gap inventory.
+
 ---
 
 ## Running the smoke test
@@ -140,25 +182,84 @@ window for db-blob mismatches) so each one is bisectable against the C
 oracle — see Phase 9.1 in `tasklist.md` for the workflow.  Supporting
 artefacts:
 
-- `src/tests/corpus/MANIFEST.txt` — tier-1 / tier-2 source-file inventory
-- `src/tests/corpus/MASK.md` — masked db-header byte ranges + C cites
-- `src/tests/SQLLiteralExtractor.pas` — the literal-extraction scanner
-- `src/tests/CorpusOracle.pas` — Pascal-port + libsqlite3 oracle plumbing
+- [`src/tests/corpus/MANIFEST.txt`](src/tests/corpus/MANIFEST.txt) — tier-1 / tier-2 source-file inventory
+- [`src/tests/corpus/MASK.md`](src/tests/corpus/MASK.md) — masked db-header byte ranges + C cites
+- [`src/tests/SQLLiteralExtractor.pas`](src/tests/SQLLiteralExtractor.pas) — the literal-extraction scanner
+- [`src/tests/CorpusOracle.pas`](src/tests/CorpusOracle.pas) — Pascal-port + libsqlite3 oracle plumbing
 
 The harness exits rc=0 even when divergences exist (catalogue-only by
 design); promotion to a hard CI gate is tracked under `9.1.5`.
 
 ### Upstream Tcl test suite (`bin/TclTestDriver`)
 
+#### Current status
+```
+$ bin/TclTestDriver --timeout 2000 --fail-log-dir bin/tcl-failure-logs
+...
+Total: 598 pass / 361 fail / 0 skip / 959 total in 377661 ms
+```
+
+#### How the integration works
+
+SQLite ships a large `.test` corpus written in Tcl.  Each test file drives
+the engine through a Tcl command named `sqlite3`, which upstream defines in
+C in `tclsqlite.c`.  Rather than rewrite those tests, this project makes the
+**Pascal engine impersonate that C shim**, so the *unmodified* upstream
+`.test` files run against pas-sqlite3 as a differential acceptance gate.
+
+Four layers cooperate (full design in [`src/tests/tcl/PLAN.md`](src/tests/tcl/PLAN.md)):
+
+```
+bin/TclTestDriver (Pascal)   forks system tclsh once per .test file,
+        │                    collects PASS / FAIL / SKIP + timing
+        ▼
+tclsh (system Tcl 8.6)       load bin/libpassqlite3tcl.so Sqlite3
+        │                    source tester_min.tcl   (harness shim)
+        │                    source <name>.test       (UNMODIFIED upstream test)
+        ▼
+libpassqlite3tcl.so          FPC-built bridge: registers the `sqlite3` Tcl
+        │                    command (PasTclBridge.pas + PasTclSqlite.pas,
+        │                    a faithful port of tclsqlite.c) + test-only
+        │                    vtab/extension modules (testmodules/)
+        ▼
+passqlite3 core              the pure-Pascal engine, called via the C ABI
+```
+
+Key points:
+
+- The driver **never links Tcl itself** — it shells out to `/usr/bin/tclsh`,
+  and the bridge `.so` is the *only* artefact that imports libtcl symbols.
+  This keeps the production engine build free of any Tcl dependency.
+- `src/tests/tcl/tester_min.tcl` is a trimmed port of upstream `tester.tcl`,
+  supplying the procs every test assumes (`do_test`, `do_execsql_test`,
+  `execsql`, `ifcapable`, `integrity_check`, `finalize_testing`, …) plus the
+  `ifcapable` capability map described under *Compile-time feature parity*
+  above.
+- The bridge is built **separately** by `src/tests/build_tcl_lib.sh` (with
+  `-dSQLITE_TEST`), **not** by `src/tests/build.sh`.  Re-run it after any
+  engine edit, or the sweep silently tests a stale `.so`.
+- Each test's verdict is tracked in `src/tests/tcl/STATUS.txt` as
+  `pas-strict` (must pass — the CI gate), `pas-soft` (a documented, tracked
+  divergence), or `pas-skip` (not yet exercisable).
+  `src/tests/tcl/check_status_regression.sh` fails only when a `pas-strict`
+  test regresses.
+
+The minimal build → run → gate sequence:
+
+```bash
+./src/tests/build_tcl_lib.sh          # → bin/libpassqlite3tcl.so  (rerun after engine edits)
+./src/tests/build_tcl_driver.sh       # → bin/TclTestDriver
+bin/TclTestDriver --filter select1    # run a subset (or omit --filter for all)
+bin/TclTestDriver --filter select1 | src/tests/tcl/check_status_regression.sh /dev/stdin
+```
+
+#### Running the full sweep
+
 `TclTestDriver` walks `src/tests/tcl/MANIFEST.txt` (~959 entries) and runs
 each `.test` file under a **20 s per-test watchdog**.  Read this before
 launching a run — picking the wrong invocation costs 25+ minutes.
 
-- **Never run unsharded.**  The single-process invocation
-  `bin/TclTestDriver --gate strict` is ~25 minutes on a quiet box and
-  hits the 20-min outer wall-clock used by most CI runners and agent
-  harnesses — you will get a truncated log, not a verdict.
-- **Always shard, but run the shards sequentially — never in parallel.**
+- **Run the shards sequentially — never in parallel.**
   Running shards (or multiple `Test*` binaries) concurrently exhausts
   RAM on a typical workstation: each driver loads its own `libpassqlite3tcl.so`
   + tclsh and many tests allocate multi-MB page caches.  Run one shard
@@ -167,6 +268,8 @@ launching a run — picking the wrong invocation costs 25+ minutes.
 ```bash
 rm bin/shard-*.log
 rm bin/shard-*.err
+./src/tests/build_tcl_lib.sh
+./src/tests/build_tcl_driver.sh
 for s in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   echo "=== shard $s/16 ==="
   timeout 3600 bin/TclTestDriver --gate strict \
@@ -183,6 +286,8 @@ whose path contains `SUBSTR` are run.  Combine with `--limit 1` if the
 substring still matches more than one entry:
 
 ```bash
+./src/tests/build_tcl_lib.sh
+./src/tests/build_tcl_driver.sh
 bin/TclTestDriver --filter select1            # every entry matching "select1"
 bin/TclTestDriver --filter select1 --limit 1  # just the first match
 ```

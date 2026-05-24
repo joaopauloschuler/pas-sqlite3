@@ -31,6 +31,7 @@ uses
   TestModuleIoerr,
   TestModuleCrash,
   TestModuleVfs,
+  TestModuleFts3,
   PasTclSqlite;
 
 exports

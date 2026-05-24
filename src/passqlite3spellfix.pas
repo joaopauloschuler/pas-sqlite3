@@ -43,6 +43,7 @@ unit passqlite3spellfix;
 interface
 
 uses
+  Strings,
   passqlite3types,
   passqlite3internal,
   passqlite3util,
@@ -60,9 +61,8 @@ uses
 
 {$POINTERMATH ON}
 
-function strlen(s: PAnsiChar): SizeUInt; cdecl; external 'c' name 'strlen';
-function strncmp(a, b: PAnsiChar; n: SizeUInt): i32; cdecl;
-  external 'c' name 'strncmp';
+{ 6.40.1.p.2.5 — strlen/strncmp externals replaced with FPC RTL:
+  StrLen / StrLComp (StrLComp is NUL-aware + signed, exactly like C strncmp). }
 
 { Character classes — spellfix.c:42..70.  Identical numeric values so
   the const tables below carry over byte-for-byte. }
@@ -1350,7 +1350,7 @@ begin
   if n > pB^.nFrom then n := pB^.nFrom;
   rc := 0;
   if n > 0 then
-    rc := i32(strncmp(@pA^.a[0], @pB^.a[0], n));
+    rc := i32(StrLComp(@pA^.a[0], @pB^.a[0], n));
   if rc = 0 then rc := i32(pA^.nFrom) - i32(pB^.nFrom);
   Result := rc;
 end;
@@ -1529,7 +1529,7 @@ begin
   Assert(n > 0);
   if p^.a[p^.nFrom] <> z[0] then Exit(0);
   if p^.nTo > n then Exit(0);
-  if strncmp(@p^.a[p^.nFrom], z, p^.nTo) <> 0 then Exit(0);
+  if StrLComp(@p^.a[p^.nFrom], z, p^.nTo) <> 0 then Exit(0);
   Result := 1;
 end;
 
@@ -1539,7 +1539,7 @@ begin
   if p^.nFrom <> 0 then
   begin
     if p^.a[0] <> z[0] then Exit(0);
-    if strncmp(@p^.a[0], z, p^.nFrom) <> 0 then Exit(0);
+    if StrLComp(@p^.a[0], z, p^.nFrom) <> 0 then Exit(0);
   end;
   Result := 1;
 end;
@@ -1555,7 +1555,7 @@ begin
   if b1 > n2 then Exit(0);
   Assert(b1 > 0);
   if pStr^.z[n1] <> z2[0] then Exit(0);
-  if strncmp(@pStr^.z[n1], z2, b1) <> 0 then Exit(0);
+  if StrLComp(@pStr^.z[n1], z2, b1) <> 0 then Exit(0);
   Result := 1;
 end;
 
@@ -1585,7 +1585,7 @@ var
   bumped: Boolean;
 begin
   if z = nil then Exit(nil);
-  if n < 0 then n := i32(strlen(z));
+  if n < 0 then n := i32(StrLen(z));
   pStr := PEditDist3FromString(sqlite3_malloc64(
             u64(SizeOf(TEditDist3FromString)
                 + SizeOf(TEditDist3From) * n
@@ -2063,7 +2063,7 @@ begin
   while (zIn <> nil) and (zIn[0] in [#9, #10, #11, #12, #13, ' ']) do Inc(zIn);
   zOut := sqlite3PfMprintf('%s', [zIn]);
   if zOut = nil then Exit(nil);
-  n := i32(strlen(zOut));
+  n := i32(StrLen(zOut));
   zOut[n] := #0;
   c := zOut[0];
   if (c = '''') or (c = '"') then begin
@@ -2097,7 +2097,7 @@ begin
   zDbName := argv[1];
   zTableName := argv[2];
   rc := SQLITE_OK;
-  nDbName := i32(strlen(zDbName));
+  nDbName := i32(StrLen(zDbName));
   pNew := PSpellfix1Vtab(sqlite3_malloc64(SizeOf(TSpellfix1Vtab) + nDbName + 1));
   if pNew = nil then
     rc := SQLITE_NOMEM
@@ -2135,7 +2135,7 @@ begin
     end;
     i := 3;
     while (rc = SQLITE_OK) and (i < argc) do begin
-      if (strncmp(argv[i], 'edit_cost_table=', 16) = 0)
+      if (StrLComp(argv[i], 'edit_cost_table=', 16) = 0)
          and (pNew^.zCostTable = nil) then begin
         pNew^.zCostTable := spellfix1Dequote(argv[i] + 16);
         if pNew^.zCostTable = nil then rc := SQLITE_NOMEM;
@@ -2540,7 +2540,7 @@ begin
     x.rc := SQLITE_NOMEM;
     goto filter_exit;
   end;
-  nPattern := i32(strlen(zPattern));
+  nPattern := i32(StrLen(zPattern));
   if (nPattern > 0) and (zPattern[nPattern-1] = '*') then Dec(nPattern);
   zSql := sqlite3PfMprintf(
     'SELECT id, word, rank, coalesce(k1,word)'
@@ -2683,9 +2683,9 @@ begin
       begin
         iMatchlen := (pCur^.a + pCur^.iRow)^.iMatchlen;
         if iMatchlen < 0 then begin
-          nPattern := i32(strlen(pCur^.zPattern));
+          nPattern := i32(StrLen(pCur^.zPattern));
           zWord := (pCur^.a + pCur^.iRow)^.zWord;
-          nWord := i32(strlen(zWord));
+          nWord := i32(StrLen(zWord));
           if (nPattern > 0) and (pCur^.zPattern[nPattern-1] = '*') then begin
             zTranslit := PAnsiChar(transliterate(PByte(zWord), nWord));
             if zTranslit = nil then Exit(SQLITE_NOMEM);
@@ -2776,12 +2776,12 @@ begin
           'NOT NULL constraint failed: %s.word', [p^.zTableName]);
         Exit(SQLITE_CONSTRAINT_NOTNULL);
       end;
-      if strncmp(zCmd, 'reset', 6) = 0 then begin
+      if StrLComp(zCmd, 'reset', 6) = 0 then begin
         editDist3ConfigDelete(p^.pConfig3);
         p^.pConfig3 := nil;
         Exit(SQLITE_OK);
       end;
-      if strncmp(zCmd, 'edit_cost_table=', 16) = 0 then begin
+      if StrLComp(zCmd, 'edit_cost_table=', 16) = 0 then begin
         editDist3ConfigDelete(p^.pConfig3);
         p^.pConfig3 := nil;
         sqlite3_free(p^.zCostTable);

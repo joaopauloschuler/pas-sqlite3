@@ -296,10 +296,17 @@ proc finalize_testing {} {
 # the BODY and `ifcapable foo` runs ELSEBODY.
 array set ::sqlite_options {}
 set ::sqlite_options(allow_rowid_in_view) 0
-# pas-sqlite3 does not ship FTS3/4/5 — mirror test_config.c when
-# SQLITE_OMIT_FTS3 / SQLITE_OMIT_FTS5 are defined.
-set ::sqlite_options(fts3) 0
+# 6.40.1.o — pas-sqlite3 now ships FTS3/FTS4 (passqlite3fts3.pas, registered
+# by sqlite3Fts3Init at openDatabase).  Mirror test_config.c:437..453: this
+# build defines SQLITE_ENABLE_FTS3 and does NOT define SQLITE_DISABLE_FTS3_UNICODE
+# (the unicode61 tokenizer is ported), so fts3=1 and fts3_unicode=1.  FTS5 is
+# not ported (fts5=0).  The port uses the no-deferred-token subset of
+# fts3_write.c, equivalent to building with SQLITE_DISABLE_FTS4_DEFERRED, so
+# fts4_deferred=0 (test_config.c:455..459).  (icu is already pinned 0 below.)
+set ::sqlite_options(fts3) 1
+set ::sqlite_options(fts3_unicode) 1
 set ::sqlite_options(fts5) 0
+set ::sqlite_options(fts4_deferred) 0
 # 9.4.divbug.87.066 — this build defines neither SQLITE_SECURE_DELETE nor
 # SQLITE_FAST_SECURE_DELETE (btree.c:2695..2699 / test_config.c:751..759),
 # so both caps must read 0.  Without these, `ifcapable fast_secure_delete`
@@ -325,6 +332,16 @@ set ::sqlite_options(rowid32) 0
 # strict failures / timeouts.  (No test uses `ifcapable stat3`, and
 # test_config.c sets no stat3 cap, so none is added here.)
 set ::sqlite_options(stat4) 0
+# capi2-11.x/12.x/13.x — the C reference oracle build does NOT define
+# SQLITE_ENABLE_COLUMN_METADATA (sqlite3_compileoption_used returns 0 for it;
+# only Makefile.msc enables it).  test_config.c:353..355 then writes
+# columnmetadata=0, so upstream SKIPS the check_origins blocks that exercise
+# sqlite3_column_{database,table,origin}_name.  pas-sqlite3 likewise builds the
+# non-SQLITE_ENABLE_COLUMN_METADATA arm of columnType (passqlite3codegen.pas
+# :28019), so COLNAME_N=2 and those names are never populated — matching the
+# oracle.  Without this, the cap defaults to 1 below and the section wrongly
+# RUNS, expecting {main tab1 colN} where the engine honestly returns {}.
+set ::sqlite_options(columnmetadata) 0
 # uri2.test is gated by `ifcapable !uri_00_error`.  A vanilla build does NOT
 # define SQLITE_ENABLE_URI_00_ERROR, so test_config.c writes no uri_00_error
 # cap and the oracle SKIPS this test (the !SQLITE_ENABLE_URI_00_ERROR arm in
@@ -332,6 +349,27 @@ set ::sqlite_options(stat4) 0
 # the cap defaults to 1 below → the test wrongly RUNS and expects the
 # "unexpected %00 in uri" error this build never raises.
 set ::sqlite_options(uri_00_error) 0
+# func6.test gates its expected sqlite_offset() values on `ifcapable null_trim`.
+# The oracle build does NOT define SQLITE_ENABLE_NULL_TRIM (verified:
+# sqlite_compileoption_used('ENABLE_NULL_TRIM')=0 on the reference .so), so
+# test_config.c writes null_trim=0 and the oracle's on-disk records keep
+# trailing-NULL serial bytes — making the first row's sqlite_offset(d) == 8179.
+# pas-sqlite3 likewise does no null-trimming (codegen makeRecord no-op), so it
+# produces 8179 too.  Without pinning, the cap defaults to 1 below → func6 takes
+# the bNullTrim=1 branch and wrongly expects 8180.
+set ::sqlite_options(null_trim) 0
+# The oracle build (../sqlite3, verified via pragma_compile_options) does NOT
+# define these compile flags, so its test_config.c writes each capability = 0.
+# Our harness otherwise defaults unset caps to 1 (below), making ifcapable-gated
+# tests RUN feature paths the engine lacks (e.g. "preupdate_hook was omitted at
+# compile-time") instead of skipping as on the oracle.  Pin them to match.
+set ::sqlite_options(preupdate) 0      ;# no SQLITE_ENABLE_PREUPDATE_HOOK
+set ::sqlite_options(snapshot) 0       ;# no SQLITE_ENABLE_SNAPSHOT
+set ::sqlite_options(session) 0        ;# no SQLITE_ENABLE_SESSION
+set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
+set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
+set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
+set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
@@ -493,6 +531,63 @@ proc test_pwd { args } {
   } else {
     return $suffix2
   }
+}
+
+# dumpbytes / catchcmd / catchsafecmd / catchcmdex — upstream tester.tcl:821..871.
+# 6.40.6 (HARNESS).  Pure-Tcl helpers used by shell*.test / avfs.test /
+# sqldiff*.test.  They shell out to the on-disk CLI via the global $CLI,
+# which those tests set with `set CLI [test_cli_invocation]`.  When the
+# upstream `sqlite3` CLI binary is absent test_cli_invocation does
+# `return -code return` and the whole test skips, so these procs are only
+# ever reached when a CLI is present.  Ported verbatim.
+proc dumpbytes {s} {
+  set r ""
+  for {set i 0} {$i < [string length $s]} {incr i} {
+    if {$i > 0} {append r " "}
+    append r [format %02X [scan [string index $s $i] %c]]
+  }
+  return $r
+}
+proc catchcmd {db {cmd ""}} {
+  global CLI
+  set out [open cmds.txt w]
+  puts $out $cmd
+  close $out
+  set line "exec $CLI $db < cmds.txt"
+  set rc [catch { eval $line } msg]
+  list $rc $msg
+}
+proc catchsafecmd {db {cmd ""}} {
+  global CLI
+  set out [open cmds.txt w]
+  puts $out $cmd
+  close $out
+  set line "exec $CLI -safe $db < cmds.txt"
+  set rc [catch { eval $line } msg]
+  list $rc $msg
+}
+proc catchcmdex {db {cmd ""}} {
+  global CLI
+  set out [open cmds.txt w]
+  fconfigure $out -translation binary
+  puts -nonewline $out $cmd
+  close $out
+  set line "exec -keepnewline -- $CLI $db < cmds.txt"
+  set chans [list stdin stdout stderr]
+  foreach chan $chans {
+    catch {
+      set modes($chan) [fconfigure $chan]
+      fconfigure $chan -translation binary -buffering none
+    }
+  }
+  set rc [catch { eval $line } msg]
+  foreach chan $chans {
+    catch {
+      eval fconfigure [list $chan] $modes($chan)
+    }
+  }
+  # puts [dumpbytes $msg]
+  list $rc $msg
 }
 
 # filepath_normalize / do_filepath_test — upstream tester.tcl:873..886.
@@ -783,6 +878,25 @@ proc working_64bit_int {} {
   return 1
 }
 
+# expand_all_sql — upstream tester.tcl:2601..2606.  A diagnostic helper that
+# walks every open prepared statement on $db (via sqlite3_next_stmt) and
+# evaluates sqlite3_expanded_sql on it.  Its result is discarded; call sites
+# (fts3aa.test:264 `expand_all_sql db`) invoke it purely to exercise the
+# expand path after all do_test assertions have run.  The pas-sqlite3 Tcl
+# bridge does not yet register sqlite3_next_stmt / sqlite3_expanded_sql, so
+# the verbatim body would raise "invalid command name".  Mirror the C proc
+# but guard the per-statement work with `catch` so the helper degrades to a
+# no-op on this build while staying forward-compatible once those commands
+# are bridged.  C ref: test/tester.tcl:2601.
+proc expand_all_sql {db} {
+  catch {
+    set stmt ""
+    while {[set stmt [sqlite3_next_stmt $db $stmt]]!=""} {
+      sqlite3_expanded_sql $stmt
+    }
+  }
+}
+
 # permutation — upstream tester.tcl:2329..2333.  Returns the name of the
 # active permutation, or "" for the baseline run.  The full permutation
 # matrix (permutations.test re-runs every test under ~30 build-flag
@@ -1032,6 +1146,42 @@ proc do_select_tests {prefix args} {
 
 }
 
+# do_select_test / do_restart_select_test / do_error_test —
+# upstream malloc_common.tcl:561..571.  In a non-malloc-fault build
+# (::DO_MALLOC_TEST==0, our default) doPassiveTest collapses to a single
+# do_test of [catchsql $sql] against {0 result} (or {1 error}).  We don't
+# port the full memdebug fault loop (SKIP-cited), only the passive form
+# fts3snippet / other eval tests actually exercise.
+proc doPassiveTest {isRestart name sql catchres} {
+  if {[info exists ::testprefix]
+   && [string is integer [string range $name 0 0]]
+  } {
+    set name $::testprefix.$name
+  }
+  if {$isRestart} { catch { db close }; sqlite3 db test.db }
+  do_test $name [list set {} [uplevel [list catchsql $sql]]] $catchres
+}
+proc do_select_test {name sql result} {
+  uplevel [list doPassiveTest 0 $name $sql [list 0 [list {*}$result]]]
+}
+proc do_restart_select_test {name sql result} {
+  uplevel [list doPassiveTest 1 $name $sql [list 0 $result]]
+}
+proc do_error_test {name sql error} {
+  uplevel [list doPassiveTest 0 $name $sql [list 1 $error]]
+}
+
+# sql_uses_stmt — upstream tester.tcl:1690..1695.  Reports whether the
+# prepared form of $sql would use a statement journal (uses_stmt_journal,
+# already provided by the test1 harness module).  Needed by
+# fts4onepass / fts3conf.
+proc sql_uses_stmt {db sql} {
+  set stmt [sqlite3_prepare $db $sql -1 dummy]
+  set uses [uses_stmt_journal $stmt]
+  sqlite3_finalize $stmt
+  return $uses
+}
+
 # drop_all_tables — upstream tester.tcl:2253..2275.  Drops all tables
 # and views from every attached database on connection [db].
 proc drop_all_tables {{db db}} {
@@ -1132,6 +1282,39 @@ if {[llength [info commands dbcksum]]==0} {
     return [md5 $txt]
   }
 }
+# allcksum — verbatim port of tester.tcl:2145..2170.  6.40.6 (HARNESS).
+# Generates an md5 over the contents of every table (plus the schema
+# tables and default_cache_size) of $db.  Used by corruptN/io/oserror/
+# walcrash-class tests to confirm a database is unchanged after a fault.
+if {[llength [info commands allcksum]]==0} {
+  proc allcksum {{db db}} {
+    set ret [list]
+    ifcapable tempdb {
+      set sql {
+        SELECT name FROM sqlite_master WHERE type = 'table' UNION
+        SELECT name FROM sqlite_temp_master WHERE type = 'table' UNION
+        SELECT 'sqlite_master' UNION
+        SELECT 'sqlite_temp_master' ORDER BY 1
+      }
+    } else {
+      set sql {
+        SELECT name FROM sqlite_master WHERE type = 'table' UNION
+        SELECT 'sqlite_master' ORDER BY 1
+      }
+    }
+    set tbllist [$db eval $sql]
+    set txt {}
+    foreach tbl $tbllist {
+      append txt [$db eval "SELECT * FROM $tbl"]
+    }
+    foreach prag {default_cache_size} {
+      append txt $prag-[$db eval "PRAGMA $prag"]\n
+    }
+    # puts txt=$txt
+    return [md5 $txt]
+  }
+}
+
 # output2 — verbatim port of tester.tcl: writes to stdout.
 if {[llength [info commands output2]]==0} {
   proc output2 {args} { uplevel puts $args }

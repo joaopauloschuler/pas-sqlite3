@@ -50,6 +50,7 @@ uses
   passqlite3os,
   BaseUnix,
   UnixType,
+  Strings,
   SysUtils,
   Math;
 
@@ -852,9 +853,6 @@ implementation
   libc helpers
   ============================================================ }
 
-function libc_strlen(s: PChar): csize_t; external 'c' name 'strlen';
-function libc_memcpy(dst, src: Pointer; n: csize_t): Pointer; external 'c' name 'memcpy';
-procedure libc_memset(dst: Pointer; c: i32; n: csize_t); external 'c' name 'memset';
 function libc_vasprintf(out strp: PChar; fmt: PChar; ap: Pointer): i32; external 'c' name 'vasprintf';
 function libc_vsnprintf(str: PChar; size: csize_t; fmt: PChar; ap: Pointer): i32; external 'c' name 'vsnprintf';
 function libc_snprintf_uri(str: PChar; size: csize_t; fmt: PChar): i32; cdecl; varargs; external 'c' name 'snprintf';
@@ -921,7 +919,7 @@ end;
 
 procedure InitGlobalConfig;
 begin
-  libc_memset(@sqlite3GlobalConfig, 0, SizeOf(sqlite3GlobalConfig));
+  FillChar(sqlite3GlobalConfig, SizeOf(sqlite3GlobalConfig), 0);
   sqlite3GlobalConfig.bMemstat    := 1;      { SQLITE_DEFAULT_MEMSTATUS }
   sqlite3GlobalConfig.bCoreMutex  := 1;
   sqlite3GlobalConfig.bFullMutex  := 1;      { SQLITE_THREADSAFE==1 }
@@ -1001,7 +999,7 @@ end;
 function sqlite3Strlen30(z: PChar): i32;
 begin
   if z = nil then Exit(0);
-  Result := $3fffffff and i32(libc_strlen(z));
+  Result := $3fffffff and i32(StrLen(z));
 end;
 
 function sqlite3StrICmp(zLeft, zRight: PChar): i32;
@@ -1348,7 +1346,7 @@ end;
 
 function sqlite3Strlen30NN(z: PChar): i32;
 begin
-  Result := $3fffffff and i32(libc_strlen(z));
+  Result := $3fffffff and i32(StrLen(z));
 end;
 
 { sqlite3IsOverflow — port of util.c:75.  Returns 1 if the IEEE-754 double
@@ -1823,7 +1821,7 @@ begin
   actual_size := u32(malloc_usable_size(new_ht) div SizeOf(THashBucket));
   if actual_size < new_size then actual_size := new_size;
   pH^.htsize := actual_size;
-  libc_memset(new_ht, 0, csize_t(actual_size) * SizeOf(THashBucket));
+  FillChar(new_ht^, csize_t(actual_size) * SizeOf(THashBucket), 0);
   elem := pH^.first;
   pH^.first := nil;
   while elem <> nil do begin
@@ -1972,7 +1970,7 @@ var
   x: array[0..15] of u32;
   i: i32;
 begin
-  libc_memcpy(@x[0], in_, 64);
+  Move(in_^, x[0], 64);
   for i := 0 to 9 do begin
     { column rounds }
     x[ 0] += x[ 4]; x[12] := x[12] xor x[ 0]; x[12] := (x[12] shl 16) or (x[12] shr 16);
@@ -2041,9 +2039,9 @@ begin
   { Initialize state on first call }
   if sqlite3Prng.s[0] = 0 then begin
     pVfs := sqlite3_vfs_find(nil);
-    libc_memcpy(@sqlite3Prng.s[0], @chacha20_init[0], 16);
+    Move(chacha20_init[0], sqlite3Prng.s[0], 16);
     if pVfs = nil then
-      libc_memset(@sqlite3Prng.s[4], 0, 44)
+      FillChar(sqlite3Prng.s[4], 44, 0)
     else
       sqlite3OsRandomness(pVfs, 44, PChar(@sqlite3Prng.s[4]));
     sqlite3Prng.s[15] := sqlite3Prng.s[12];
@@ -2053,12 +2051,12 @@ begin
 
   while True do begin
     if N <= i32(sqlite3Prng.n) then begin
-      libc_memcpy(zBuf, @sqlite3Prng.out_[sqlite3Prng.n - u8(N)], csize_t(N));
+      Move(sqlite3Prng.out_[sqlite3Prng.n - u8(N)], zBuf^, csize_t(N));
       sqlite3Prng.n := sqlite3Prng.n - u8(N);
       break;
     end;
     if sqlite3Prng.n > 0 then begin
-      libc_memcpy(zBuf, @sqlite3Prng.out_[0], csize_t(sqlite3Prng.n));
+      Move(sqlite3Prng.out_[0], zBuf^, csize_t(sqlite3Prng.n));
       Dec(N, sqlite3Prng.n);
       Inc(zBuf, sqlite3Prng.n);
     end;
@@ -2071,12 +2069,12 @@ end;
 
 procedure sqlite3PrngSaveState;
 begin
-  libc_memcpy(@sqlite3SavedPrng, @sqlite3Prng, SizeOf(sqlite3Prng));
+  Move(sqlite3Prng, sqlite3SavedPrng, SizeOf(sqlite3Prng));
 end;
 
 procedure sqlite3PrngRestoreState;
 begin
-  libc_memcpy(@sqlite3Prng, @sqlite3SavedPrng, SizeOf(sqlite3Prng));
+  Move(sqlite3SavedPrng, sqlite3Prng, SizeOf(sqlite3Prng));
 end;
 
 { ============================================================
@@ -2188,7 +2186,7 @@ bitvec_set_rehash:
     if p^.iDivisor < u32(BITVEC_NBIT) then p^.iDivisor := u32(BITVEC_NBIT);
     pNew := PBitvec(sqlite3MallocZero(SizeOf(TBitvec)));
     if pNew = nil then Exit(SQLITE_NOMEM_BKPT);
-    libc_memcpy(@pNew^.u.aHash[0], @p^.u.aHash[0], SizeOf(p^.u.aHash));
+    Move(p^.u.aHash[0], pNew^.u.aHash[0], SizeOf(p^.u.aHash));
     FillChar(p^.u.apSub, SizeOf(p^.u.apSub), 0);
     p^.nSet := 0;
     rc := sqlite3BitvecSet(p, i);
@@ -2228,8 +2226,8 @@ begin
   end else begin
     Inc(i); { restore 1-based }
     aiValues := Pu32(pBuf);
-    libc_memcpy(pBuf, @p^.u.aHash[0], csize_t(BITVEC_NINT) * SizeOf(u32));
-    libc_memset(@p^.u.aHash[0], 0, csize_t(BITVEC_NINT) * SizeOf(u32));
+    Move(p^.u.aHash[0], PByte(pBuf)^, csize_t(BITVEC_NINT) * SizeOf(u32));
+    FillChar(p^.u.aHash[0], csize_t(BITVEC_NINT) * SizeOf(u32), 0);
     p^.nSet := 0;
     for j := 0 to BITVEC_NINT - 1 do begin
       if (aiValues[j] <> 0) and (aiValues[j] <> i) then begin
@@ -2551,7 +2549,7 @@ end;
 function sqlite3MallocZero64(n: u64): Pointer;
 begin
   Result := sqlite3_malloc64(n);
-  if Result <> nil then libc_memset(Result, 0, csize_t(n));
+  if Result <> nil then FillChar(PByte(Result)^, csize_t(n), 0);
 end;
 
 function sqlite3DbMalloc(db: Psqlite3db; n: i32): Pointer;
@@ -2624,7 +2622,7 @@ begin
   if z = nil then Exit(nil);
   p := PChar(sqlite3_malloc64(n + 1));
   if p <> nil then begin
-    libc_memcpy(p, z, csize_t(n));
+    Move(z^, p^, csize_t(n));
     p[n] := #0;
   end else if db <> nil then
     { malloc.c:774..785 sqlite3DbStrNDup routes the alloc through
@@ -3831,7 +3829,7 @@ initialization
   InitUpperToLower;
   InitCtypeMap;
   InitGlobalConfig;
-  libc_memset(@sqlite3Stat, 0, SizeOf(sqlite3Stat));
-  libc_memset(@sqlite3Prng, 0, SizeOf(sqlite3Prng));
+  FillChar(sqlite3Stat, SizeOf(sqlite3Stat), 0);
+  FillChar(sqlite3Prng, SizeOf(sqlite3Prng), 0);
 
 end.

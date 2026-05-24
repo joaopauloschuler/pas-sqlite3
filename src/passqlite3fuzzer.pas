@@ -34,6 +34,7 @@ interface
 
 uses
   SysUtils,
+  Strings,
   passqlite3types,
   passqlite3util,
   passqlite3os,
@@ -122,11 +123,8 @@ type
 var
   fuzzerModule: Tsqlite3_module;
 
-{ ----- libc strlen / memcmp / strcmp / memcpy bindings -------------- }
-
-function strlenC(s: PAnsiChar): NativeUInt; cdecl; external 'c' name 'strlen';
-function memcmpC(a, b: Pointer; n: NativeUInt): i32; cdecl; external 'c' name 'memcmp';
-function strcmpC(a, b: PAnsiChar): i32; cdecl; external 'c' name 'strcmp';
+{ 6.40.1.p.2.4 — strlen/memcmp/strcmp externals replaced with FPC RTL:
+  StrLen / CompareByte / StrComp. }
 
 procedure memmoveP(dst, src: Pointer; n: NativeUInt);
 begin
@@ -181,11 +179,11 @@ begin
 
   if zFrom = nil then zFrom := PAnsiChar('');
   if zTo   = nil then zTo   := PAnsiChar('');
-  nFrom := i32(strlenC(zFrom));
-  nTo   := i32(strlenC(zTo));
+  nFrom := i32(StrLen(zFrom));
+  nTo   := i32(StrLen(zTo));
 
   { Silently ignore null transformations }
-  if strcmpC(zFrom, zTo) = 0 then begin
+  if StrComp(zFrom, zTo) = 0 then begin
     ppRule := nil;
     Result := SQLITE_OK;
     Exit;
@@ -316,7 +314,7 @@ var
   q          : AnsiChar;
   iIn, iOut  : i32;
 begin
-  nIn := i64(strlenC(zIn));
+  nIn := i64(StrLen(zIn));
   zOut := PAnsiChar(sqlite3_malloc64(u64(nIn + 1)));
   if zOut <> nil then begin
     q := zIn[0];
@@ -387,7 +385,7 @@ begin
     Exit;
   end;
 
-  nModule := i64(strlenC(zModule));
+  nModule := i64(StrLen(zModule));
   pNew := PFuzzerVtab(sqlite3_malloc64(u64(SizeOf(TFuzzerVtab)) + u64(nModule + 1)));
   if pNew = nil then begin
     rc := SQLITE_NOMEM;
@@ -541,7 +539,7 @@ begin
   end;
   h := fuzzerHash(pCur^.zBuf);
   pLookup := pCur^.apHash[h];
-  while (pLookup <> nil) and (strcmpC(pLookup^.zBasis, pCur^.zBuf) <> 0) do
+  while (pLookup <> nil) and (StrComp(pLookup^.zBasis, pCur^.zBuf) <> 0) do
     pLookup := pLookup^.pHash;
   if pLookup <> nil then Result := 1 else Result := 0;
 end;
@@ -567,7 +565,7 @@ begin
     while pStem^.n < (pStem^.nBasis - pRule^.nFrom) do begin
       pStem^.n := pStem^.n + 1;
       if (pRule^.nFrom = 0) or
-         (memcmpC(pStem^.zBasis + pStem^.n, pRule^.zFrom, NativeUInt(pRule^.nFrom)) = 0) then
+         (CompareByte((pStem^.zBasis + pStem^.n)^, pRule^.zFrom^, NativeUInt(pRule^.nFrom)) = 0) then
       begin
         rc := fuzzerSeen(pCur, pStem);
         if rc < 0 then begin Result := -1; Exit; end;
@@ -690,7 +688,7 @@ var
   h     : u32;
   nWord : NativeUInt;
 begin
-  nWord := strlenC(zWord);
+  nWord := StrLen(zWord);
   pNew := PFuzzerStem(sqlite3_malloc64(u64(SizeOf(TFuzzerStem)) + u64(nWord) + 1));
   if pNew = nil then begin Result := nil; Exit; end;
   FillChar(pNew^, SizeOf(TFuzzerStem), 0);
@@ -821,7 +819,7 @@ begin
   pCur^.iRowid := 1;
   Assert(pCur^.pStem = nil);
 
-  if i32(strlenC(zWord)) < FUZZER_MX_OUTPUT_LENGTH then begin
+  if i32(StrLen(zWord)) < FUZZER_MX_OUTPUT_LENGTH then begin
     pStem := fuzzerNewStem(pCur, zWord, 0);
     pCur^.pStem := pStem;
     if pStem = nil then begin Result := SQLITE_NOMEM; Exit; end;

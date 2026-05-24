@@ -58,6 +58,7 @@ type
   Pu32 = ^u32;
   Pi32 = ^i32;
   Pi64 = ^i64;
+  Pu64 = ^u64;
 
   { SQLite page number — always an unsigned 32-bit value. }
   Pgno  = u32;
