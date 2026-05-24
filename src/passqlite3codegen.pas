@@ -32146,6 +32146,22 @@ begin
       pItem := @SrcListItems(pTabList)[i];
       pTab  := pItem^.pSTab;
       Assert(pTab <> nil);
+      { minmax4 / filter1-1.8 — C resolves every FROM-clause subquery during
+        sqlite3SelectPrep (resolveSelectStep, resolve.c:1961..1964), which sets
+        SF_Aggregate on any aggregate sub-SELECT BEFORE this outer optimization
+        loop runs.  This Pas port's sqlite3SelectPrep does NOT mark nested
+        FROM-subqueries aggregate, so the SF_Aggregate guards consulted just
+        below — the superfluous-ORDER-BY drop (select.c:7795), the unused-
+        result-column null-out inside disableUnusedSubqueryResultColumns
+        (select.c:5305), and the later flattenSubquery skip (select.c:7795) —
+        would all fire on an aggregate subquery whose aggregate result column
+        the outer doesn't reference (e.g. `SELECT p FROM (SELECT p,min(q) ..)`),
+        nulling min(q) to TK_NULL and flattening the subquery into a plain scan
+        that returns every row instead of the single aggregated row.  Mark the
+        subquery aggregate here, mirroring C's pre-resolved state. }
+      if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil)
+         and (pItem^.u4.pSubq^.pSelect <> nil) then
+        selectMarkAggregate(pParse, pItem^.u4.pSubq^.pSelect);
       if ((pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0)
          and (sqlite3ExprImpliesNonNullRow(p^.pWhere, pItem^.iCursor,
                 i32(pItem^.fg.jointype and JT_LTORJ)) <> 0)
