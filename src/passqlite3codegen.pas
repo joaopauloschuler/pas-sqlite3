@@ -7320,19 +7320,14 @@ begin
       end;
       Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
     end;
+    { expr.c:6710..6727 — the TK_EQ..TK_CONCAT group sets seenNot:=1 and
+      then deliberately FALLS THROUGH into TK_STAR..TK_SLASH (recurse on
+      pRight) and again into TK_SPAN..TK_UMINUS (recurse on pLeft).  Net
+      effect: BOTH the pRight and pLeft recursions for this whole group
+      use seenNot=1. }
     TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT_TK, TK_GE,
-    TK_PLUS, TK_MINUS, TK_BITOR, TK_LSHIFT:
+    TK_PLUS, TK_MINUS, TK_BITOR, TK_LSHIFT, TK_RSHIFT, TK_CONCAT:
     begin
-      if exprImpliesNotNull(pParse, p^.pRight, pNN, iTab, seenNot) <> 0 then
-      begin
-        Result := 1;
-        Exit;
-      end;
-      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, seenNot);
-    end;
-    TK_RSHIFT, TK_CONCAT:
-    begin
-      { seenNot := 1 fall-through }
       if exprImpliesNotNull(pParse, p^.pRight, pNN, iTab, 1) <> 0 then
       begin
         Result := 1;
@@ -8929,14 +8924,23 @@ begin
       begin
         pE^.op      := TK_COLUMN;
         pE^.iTable  := pItem^.iCursor;
-        pE^.iColumn := i16(iCol);
+        { resolve.c:466 — IPK alias substitution (see bare-TK_ID arm below). }
+        if pItem^.pSTab^.iPKey = iCol then
+          pE^.iColumn := i16(-1)
+        else
+          pE^.iColumn := i16(iCol);
         pE^.y.pTab  := pItem^.pSTab;
         pE^.pLeft   := nil;
         pE^.pRight  := nil;
-        if iCol < BMS - 1 then
-          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
-        else
-          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        if pE^.iColumn >= 0 then
+        begin
+          if iCol < BMS - 1 then
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+          else
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        end;
+        if pE^.iColumn = -1 then
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
         AuthReadBound(pE);
         Exit;
       end;
@@ -8980,12 +8984,26 @@ begin
       begin
         pE^.op      := TK_COLUMN;
         pE^.iTable  := pItem^.iCursor;
-        pE^.iColumn := i16(iCol);
-        pE^.y.pTab  := pItem^.pSTab;
-        if iCol < BMS - 1 then
-          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+        { resolve.c:466 — substitute the rowid (column -1) for the INTEGER
+          PRIMARY KEY, so a self-ref `i` resolves identically to the query
+          side (which also rewrites IPK→-1).  Without this, a partial-index
+          WHERE referencing the IPK by name keeps iColumn=ordinal and
+          sqlite3ExprCompare against the query's iColumn=-1 fails the
+          implication test (indexA-7.0). }
+        if pItem^.pSTab^.iPKey = iCol then
+          pE^.iColumn := i16(-1)
         else
-          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+          pE^.iColumn := i16(iCol);
+        pE^.y.pTab  := pItem^.pSTab;
+        if (iCol >= 0) and (pE^.iColumn >= 0) then
+        begin
+          if iCol < BMS - 1 then
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+          else
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        end;
+        if pE^.iColumn = -1 then
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
         AuthReadBound(pE);
         Exit;
       end;
