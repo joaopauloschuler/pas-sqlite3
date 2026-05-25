@@ -6565,8 +6565,7 @@ begin
                     and (pExpr^.x.pSelect^.pEList^.nExpr <> 1)
         then begin
           { sub-select returns wrong number of columns }
-          sqlite3ErrorMsg(pParse,
-            'sub-select returns wrong number of columns');
+          sqlite3SubselectError(pParse, pExpr^.x.pSelect^.pEList^.nExpr, 1);
           done := True;
         end else begin
           Result := sqlite3CodeSubselect(pParse, pExpr);
