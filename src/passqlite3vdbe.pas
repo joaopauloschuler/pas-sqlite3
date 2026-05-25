@@ -5953,6 +5953,22 @@ begin
   pVar^.flags := MEM_Null;
   { vdbeapi.c:1675 — successful unbind clears any prior error. }
   db^.errCode := SQLITE_OK;
+
+  { vdbeapi.c:1685..1687 — if the bit for this variable is set in expmask,
+    binding a new value invalidates the current query plan, so flag the VM
+    expired (expired=1) to force a reprepare on the next sqlite3_step().  The
+    expired field is the low 2 bits of vdbeFlags (VDBF_EXPIRED_MASK).
+    C: if( p->expmask!=0 && (p->expmask & (i>=31?0x80000000:(u32)1<<i))!=0 ) }
+  if (p^.expmask <> 0) then
+  begin
+    if i >= 31 then
+    begin
+      if (p^.expmask and u32($80000000)) <> 0 then
+        p^.vdbeFlags := (p^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+    end
+    else if (p^.expmask and (u32(1) shl i)) <> 0 then
+      p^.vdbeFlags := (p^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+  end;
   Result := SQLITE_OK;
 end;
 
