@@ -27194,6 +27194,9 @@ var
   apAll: array[0..2] of PToken;
   p:     PToken;
   jointype, ii, j: i32;
+  matched: i32;
+  bufSp1, bufSp2: array[0..1] of AnsiChar;
+  zSp1, zSp2: PAnsiChar;
 begin
   jointype := 0;
   apAll[0] := pA; apAll[1] := pB; apAll[2] := pC;
@@ -27201,16 +27204,20 @@ begin
   begin
     p := apAll[ii];
     if p = nil then break;
-    j := -1;
+    { Faithful to select.c: scan aKeyword[]; on no match set JT_ERROR.
+      C relies on the for-counter equalling ArraySize after no break;
+      FPC leaves the loop var undefined, so use an explicit matched flag. }
+    matched := 0;
     for j := 0 to 6 do
       if (i32(p^.n) = i32(aKW[j].nChar)) and
          (sqlite3_strnicmp(PChar(p^.z),
             PChar(zKeyText) + aKW[j].i, p^.n) = 0) then
       begin
         jointype := jointype or i32(aKW[j].code);
+        matched := 1;
         break;
       end;
-    if j = 7 then
+    if matched = 0 then
     begin
       jointype := jointype or JT_ERROR;
       break;
@@ -27220,7 +27227,18 @@ begin
      ((jointype and JT_ERROR) <> 0) or
      ((jointype and (JT_OUTER or JT_LEFT or JT_RIGHT)) = JT_OUTER) then
   begin
-    sqlite3ErrorMsg(pParse, 'unknown join type');
+    { Match select.c's "%T%s%T%s%T" with the zSp1++/zSp2++ trick: a 2-byte
+      " " literal advanced one char becomes "".  %T emits nothing for a nil
+      Token (emitToken returns '' for a nil pointer / nil .z / .n=0). }
+    bufSp1[0] := ' '; bufSp1[1] := #0;
+    bufSp2[0] := ' '; bufSp2[1] := #0;
+    zSp1 := @bufSp1[0];
+    zSp2 := @bufSp2[0];
+    if pB = nil then Inc(zSp1);
+    if pC = nil then Inc(zSp2);
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'unknown join type: %T%s%T%s%T',
+      [Pointer(pA), zSp1, Pointer(pB), zSp2, Pointer(pC)]));
     jointype := JT_INNER;
   end;
   Result := jointype;
