@@ -49882,32 +49882,31 @@ begin
     end;
   end;
 
-  { Populate colNotIdxed bitmask (build.c around 4283).  Bit i set iff
-    column i of the table is NOT among this index's key columns.  Bit
-    BMS-1 (the saturation bit) is set whenever any column index >= BMS-1
-    appears.  Used by whereLoopAddBtree's coverage check (m=colUsed &
-    colNotIdxed); without it, every index falsely reports as covering
-    and WHERE_IDX_ONLY suppresses the table-cursor open. }
-  pIndex^.colNotIdxed := not Bitmask(0);  { TOPBIT included }
-  for n := 0 to i32(pIndex^.nKeyCol) - 1 do
-  begin
-    if (pIndex^.aiColumn + n)^ >= 0 then
-    begin
-      if (pIndex^.aiColumn + n)^ >= i16(BMS - 1) then
-        pIndex^.colNotIdxed := pIndex^.colNotIdxed
-                                or (Bitmask(1) shl (BMS - 1))
-      else
-        pIndex^.colNotIdxed := pIndex^.colNotIdxed
-                                and not (Bitmask(1) shl (pIndex^.aiColumn + n)^);
-    end;
-  end;
-
   sqlite3DefaultRowEst(pIndex);
   { build.c:4298 — standalone CREATE INDEX (pNewTable=nil) needs its
     szIdxRow estimated here; CREATE-TABLE-time indices get it via
     sqlite3EndTable instead.  Without this szIdxRow stays 0, making the
     covering-scan gate `szIdxRow < szTabRow` wrongly true. }
   if pParse^.pNewTable = nil then estimateIndexWidth(pIndex);
+
+  { If this index contains every column of its table, then mark it as a
+    covering index — port of build.c:4304..4314.  recomputeColumnsNotIndexed
+    rebuilds colNotIdxed over ALL of pIndex^.nColumn (including the WITHOUT
+    ROWID PK-suffix columns and skipping virtual columns); the inline
+    nKeyCol-only loop that used to live above missed those suffix columns so
+    a WITHOUT ROWID secondary index never reported as covering. }
+  recomputeColumnsNotIndexed(pIndex);
+  if (pTblName <> nil) and (i32(pIndex^.nColumn) >= i32(pTab^.nCol)) then
+  begin
+    pIndex^.idxFlags := pIndex^.idxFlags or (u32(1) shl 5);  { isCovering = 1 }
+    for jj := 0 to i32(pTab^.nCol) - 1 do
+    begin
+      if jj = i32(pTab^.iPKey) then Continue;
+      if sqlite3TableColumnToIndex(pIndex, i16(jj)) >= 0 then Continue;
+      pIndex^.idxFlags := pIndex^.idxFlags and not (u32(1) shl 5);  { isCovering = 0 }
+      Break;
+    end;
+  end;
 
   { build.c:4227..4228 — once an expression-index slot has pinned pList
     onto pIndex^.aColExpr, ownership has transferred; null the local so
