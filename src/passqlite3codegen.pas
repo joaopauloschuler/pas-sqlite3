@@ -56674,8 +56674,9 @@ const
     here because codegen cannot use passqlite3main (circular).  Honest
     to this port's actual default build config; keep in lockstep with
     sqlite3azCompileOpt / azCompileOpt2. }
-  azBuildOpts: array[0..4] of PAnsiChar = (
+  azBuildOpts: array[0..5] of PAnsiChar = (
     'COMPILER=fpc',
+    'DIRECT_OVERFLOW_READ',
     'ENABLE_MATH_FUNCTIONS',
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
@@ -60445,8 +60446,9 @@ end;
   the lockstep note in passqlite3main.pas).  Update both sites
   together. }
 const
-  azCompileOpt2: array[0..4] of PAnsiChar = (
+  azCompileOpt2: array[0..5] of PAnsiChar = (
     'COMPILER=fpc',
+    'DIRECT_OVERFLOW_READ',
     'ENABLE_MATH_FUNCTIONS',
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
@@ -60463,7 +60465,7 @@ var
   rc: i32;
 begin
   zOpt := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
-  if zOpt = nil then begin sqlite3_result_int(pCtx, 0); Exit; end;
+  if zOpt = nil then Exit;
   if sqlite3_strnicmp(zOpt, PAnsiChar('SQLITE_'), 7) = 0 then
     Inc(zOpt, 7);
   n := sqlite3Strlen30(zOpt);

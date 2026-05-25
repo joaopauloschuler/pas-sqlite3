@@ -396,6 +396,7 @@ set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
+set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""

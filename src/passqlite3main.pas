@@ -3538,8 +3538,9 @@ end;
   IMPORTANT: keep this list in lockstep with azCompileOpt2 in
   passqlite3codegen.pas (codegen cannot `uses passqlite3main`). }
 const
-  sqlite3azCompileOpt: array[0..4] of PAnsiChar = (
+  sqlite3azCompileOpt: array[0..5] of PAnsiChar = (
     'COMPILER=fpc',
+    'DIRECT_OVERFLOW_READ',
     'ENABLE_MATH_FUNCTIONS',
     'OMIT_DEPRECATED',
     'OMIT_LOAD_EXTENSION',
