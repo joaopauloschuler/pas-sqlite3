@@ -13255,6 +13255,19 @@ begin
     end;
   end;
 
+  { resolve.c:2069..2074 — if this is part of a compound SELECT, check that
+    it has the same number of result columns as the next arm to its right
+    (p^.pNext).  C returns WRC_Abort here; break out of the per-arm loop.
+    sqlite3SelectWrongNumTermsError takes p^.pNext (not p) so the message
+    names the right operator (UNION ALL / UNION / EXCEPT / INTERSECT) via
+    p^.pNext^.op. }
+  if (p^.pNext <> nil) and (p^.pEList <> nil) and (p^.pNext^.pEList <> nil)
+     and (p^.pEList^.nExpr <> p^.pNext^.pEList^.nExpr) then
+  begin
+    sqlite3SelectWrongNumTermsError(pParse, p^.pNext);
+    Break;
+  end;
+
   { resolve.c:2079 — once ON clauses have been spliced into pWhere
     (selectExpander tags Select with SF_OnToWhere when it does this),
     walk pWhere to confirm no ON term references a table to its right.
