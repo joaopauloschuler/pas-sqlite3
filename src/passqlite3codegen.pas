@@ -70336,6 +70336,8 @@ var
   zFault:  PAnsiChar;
   j:       i32;
   aiCol:   Pi16;
+  pFKb:    Pu8;
+  nFkCol:  i32;
 begin
   ppBlob := nil;
   zErr   := nil;
@@ -70409,6 +70411,27 @@ begin
 
   if wrFlag <> 0 then begin
     zFault := nil;
+{$ifndef SQLITE_OMIT_FOREIGN_KEY}
+    if (db^.flags and SQLITE_ForeignKeys) <> 0 then begin
+      { Check that the column is not part of an FK child key definition.  It
+        is not necessary to check if it is part of a parent key, as parent
+        key columns must be indexed.  The index loop below picks that up.
+        PFKey is opaque (Pointer) in this port; walk it via the documented
+        byte offsets (vdbeblob.c:215..230). }
+      pFKb := Pu8(pTab^.u.tab.pFKey);
+      while pFKb <> nil do begin
+        nFkCol := Pi32(pFKb + 40)^;                  { FKEY_NCOL_OFFSET }
+        if nFkCol > 0 then
+          for j := 0 to nFkCol - 1 do begin
+            { aCol[j].iFrom — COLMAP_IFROM_OFFSET=0 within a 16-byte entry,
+              array based at FKEY_ACOL_OFFSET=64 }
+            if Pi32(pFKb + 64 + PtrUInt(j) * 16)^ = iCol then
+              zFault := 'foreign key';
+          end;
+        pFKb := Pu8(PPointer(pFKb + 8)^);             { FKEY_PNEXTFROM_OFFSET }
+      end;
+    end;
+{$endif}
     pIdx := pTab^.pIndex;
     while pIdx <> nil do begin
       aiCol := pIdx^.aiColumn;
