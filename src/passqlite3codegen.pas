@@ -49793,7 +49793,18 @@ begin
       integer literal carries u.iValue under EP_IntValue) — dereferencing
       it segfaults (9.4.divbug.12).  Route such slots to XN_EXPR like C. }
     if (pColExpr <> nil) and (pColExpr^.op = TK_COLUMN) then
-      n := pColExpr^.iColumn
+    begin
+      { build.c:4236..4239 — j = pCExpr->iColumn; if(j<0) j = pTab->iPKey.
+        The self-reference resolver (resolveExprAgainstSrcList) rewrites a
+        reference to the INTEGER PRIMARY KEY to iColumn=-1 (XN_ROWID), so an
+        index key built over the IPK by name (e.g. CREATE INDEX i3 ON t(c,a)
+        with `a` the IPK) must be mapped BACK to the real ordinal here; an
+        index key column must never carry XN_ROWID, or indexColumnIsBeingUpdated
+        trips its `iIdxCol<>XN_ROWID` assert during UPDATE (intpkey-9.1). }
+      n := pColExpr^.iColumn;
+      if n < 0 then
+        n := pTab^.iPKey;
+    end
     else if (pColExpr <> nil)
        and ((pColExpr^.op = TK_ID) or (pColExpr^.op = TK_STRING))
        and ((pColExpr^.flags and EP_IntValue) = 0) then
@@ -49809,15 +49820,7 @@ begin
       pIndex^.idxFlags := (pIndex^.idxFlags and not u32($08))   { uniqNotNull }
                           or u32(1 shl 11);                     { bHasExpr   }
     end;
-    { build.c:4235..4239 — when the indexed term resolves to the rowid
-      alias (iColumn<0), C maps it BACK to the real IPK column number
-      (j = pTab->iPKey) and stores THAT in aiColumn[].  An index key
-      column must never carry XN_ROWID — only the implicit rowid tail
-      slot does.  The earlier port rewrote IPK columns to -1 here, which
-      tripped the `iIdxCol<>XN_ROWID` assert in indexColumnIsBeingUpdated
-      during UPDATE (9.4.divbug.25).  sqlite3ColumnIndex already returns
-      the real column number, so simply leave n unchanged. }
-    { Mirror build.c:4241..4243 — uniqNotNull only stays set when every
+    { build.c:4241..4243 — uniqNotNull only stays set when every
       indexed column is declared NOT NULL.  rowid (n<0) is implicitly
       NOT NULL so does not clear the bit. }
     if (n >= 0) and ((PColumn(pTab^.aCol)[n].typeFlags and $0F) = OE_None) then
