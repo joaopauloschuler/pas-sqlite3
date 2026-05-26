@@ -141,7 +141,7 @@ type
     Ms       : LongInt;
   end;
 const
-  PER_TEST_TIMEOUT_OVERRIDES: array[0..5] of TPerTestTimeout = (
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..6] of TPerTestTimeout = (
     (BaseName: 'securedel2.test'; Ms: 900000),
     (BaseName: 'select4.test';    Ms: 900000),
     (BaseName: 'writecrash.test'; Ms: 900000),
@@ -154,7 +154,12 @@ const
       backup_ioerr.test loops ~850 IO-error injections.  Both legitimately
       blow past 30s once we stop infinite-looping on $::sqlite_pending_byte. }
     (BaseName: 'backup.test';       Ms: 300000),
-    (BaseName: 'backup_ioerr.test'; Ms: 600000)
+    (BaseName: 'backup_ioerr.test'; Ms: 600000),
+    { incrvacuum2-4.3 runs ~4171 iterations of (journal_mode=WAL;
+      wal_checkpoint; incremental_vacuum(1)), ~7-9 fsyncs each — not a hang,
+      just fsync-bound (~93s pas / ~77s C), so it blows past the 30s default
+      on both engines.  Page/freelist/ptrmap logic is byte-identical to C. }
+    (BaseName: 'incrvacuum2.test'; Ms: 300000)
   );
 
 var
