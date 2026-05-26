@@ -5035,7 +5035,11 @@ begin
     sqlite3_data_count()/sqlite3_column_*() report no live row after a
     reset (capi2-1.9/1.10). }
   p^.pResultRow := nil;
-  p^.eVdbeState := VDBE_READY_STATE;
+  { vdbeaux.c:3586..3671 — sqlite3VdbeReset NEVER writes eVdbeState; the only
+    state transition it can cause is the RUN->HALT one performed by
+    sqlite3VdbeHalt above.  An unconditional ':= VDBE_READY_STATE' here flipped
+    a failed-prepare (never-MakeReady) Vdbe from INIT to READY, defeating the
+    INIT-gate in sqlite3VdbeClearObject and crashing on garbage aMem. }
   if db <> nil then
     Result := p^.rc and db^.errMask
   else
@@ -5047,7 +5051,11 @@ var
   rc: i32;
 begin
   if p = nil then begin Result := SQLITE_OK; Exit; end;
-  rc := sqlite3VdbeReset(p);
+  rc := SQLITE_OK;
+  { vdbeaux.c:3682 — only reset a Vdbe that actually reached READY (or beyond).
+    A failed-prepare Vdbe is still in VDBE_INIT_STATE and must not be reset. }
+  if p^.eVdbeState >= VDBE_READY_STATE then
+    rc := sqlite3VdbeReset(p);
   sqlite3VdbeDelete(p);
   Result := rc;
 end;
@@ -6294,9 +6302,13 @@ begin
   if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
   db := pStmt^.db;
 
-  { Auto-reset if in HALT state (vdbeapi.c:846) }
+  { Auto-reset if in HALT state (vdbeapi.c:846) — C calls the public
+    sqlite3_reset(), i.e. sqlite3VdbeReset + sqlite3VdbeRewind; the Rewind is
+    what restores VDBE_READY_STATE so the restart_step re-check below succeeds.
+    (sqlite3VdbeReset no longer sets eVdbeState — see vdbeaux.c:3586.) }
   if pStmt^.eVdbeState = VDBE_HALT_STATE then begin
     sqlite3VdbeReset(pStmt);
+    sqlite3VdbeRewind(pStmt);
   end;
 
   { vdbeapi.c:779..792 — expired-stmt short-circuit.  Must precede the
