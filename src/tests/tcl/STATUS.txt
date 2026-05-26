@@ -411,7 +411,7 @@ pas-soft	../sqlite3/test/fts4noti.test	6.40.1.o.3.4: 1/82 residual at 6.3.1 — 
 pas-soft	../sqlite3/test/fts4onepass.test	6.40.1.o.3.4: 6/50 — onepass UPDATE/DELETE result divergence (DELETE...WHERE rowid IN range over fts4)
 pas-soft	../sqlite3/test/fts4opt.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
 pas-soft	../sqlite3/test/fts4record.test	6.40.1.o.3.4: make_fts3record (test_hexio.c) unported; 1 result residual at 1.3.2 besides
-pas-soft	../sqlite3/test/fts4rename.test	6.40.1.o.3.5: 1/4 at 1.2 — resolver error text 'no such column' missing the column name (expected 'no such column: Col0')
+pas-strict	../sqlite3/test/fts4rename.test	-
 pas-soft	../sqlite3/test/fts4umlaut.test	6.40.1.o.3.6: count(*)/max()+MATCH (no-GROUP-BY aggregate arm does not route MATCH to xBestIndex)
 pas-strict	../sqlite3/test/fts4unicode.test	-
 pas-soft	../sqlite3/test/fts4upfrom.test	6.40.1.o.3.6: UPDATE...FROM over fts4 result divergence (4/30)

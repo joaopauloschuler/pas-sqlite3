@@ -13203,6 +13203,29 @@ begin
     ResolveIntegerOrderByCol(p^.pGroupBy, 'GROUP');
     ResolveStructuralOrderByCol(p^.pGroupBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pGroupBy, 'GROUP');
+    { resolve.c:2051..2066 — after resolving the GROUP BY clause, make sure
+      it does not contain aggregate functions.  An ordinal GROUP BY term that
+      points at an aggregate result-set column (e.g. `GROUP BY 2` over
+      `SELECT id, max(v) ...`) is rewritten by sqlite3ResolveOrderGroupBy into
+      an alias copy of that result-set expression, which carries the aggregate
+      call; C detects this via EP_Agg and rejects it here.  This port does not
+      stamp EP_Agg on the top expression the way C does, so reuse
+      ExprIsOrContainsAggregate (the port's aggregate detector) instead.
+      C returns WRC_Abort; we set the error and break out of the per-arm loop. }
+    if pParse^.nErr = 0 then
+    begin
+      items_ := ExprListItems(p^.pGroupBy);
+      for i_ := 0 to p^.pGroupBy^.nExpr - 1 do
+      begin
+        if ExprIsOrContainsAggregate(items_[i_].pExpr) = 1 then
+        begin
+          sqlite3ErrorMsg(pParse,
+            'aggregate functions are not allowed in the GROUP BY clause');
+          Break;
+        end;
+      end;
+      if pParse^.nErr <> 0 then Break;
+    end;
   end;
 
   { 9.4.divbug.89.016 — port resolve.c:1888 LIMIT/OFFSET resolution.
@@ -41730,7 +41753,9 @@ begin
       end
       else
       begin
-        sqlite3ErrorMsg(pParse, PAnsiChar('no such column'));
+        { update.c:500 — "no such column: %s" names the offending column. }
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+          'no such column: %s', [pELItems[i].zEName]));
         pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_CheckSchema;
         goto update_cleanup;
       end;
