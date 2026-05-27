@@ -37312,8 +37312,12 @@ begin
 
     { OFFSET skip — codeOffset (select.c:881..887): emit IfPos at top of
       inner loop body so rows below the OFFSET threshold are skipped.
-      Skip when bSort is on — OFFSET applies post-sort in generateSortTail. }
-    if (p^.iOffset > 0) and (bSort = 0) then
+      Skip when bSort is on — OFFSET applies post-sort in generateSortTail.
+      Mirror select.c:1170..1173: when DISTINCT is requested, the offset is
+      NOT applied here — it must run AFTER the distinct dedup (select.c
+      1299..1301) so duplicate rows do not consume the OFFSET counter. }
+    if (p^.iOffset > 0) and (bSort = 0)
+       and ((p^.selFlags and SF_Distinct) = 0) then
       sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, pWInfo^.iContinue, 1);
 
     { Inner loop body — one OP_Column per result column (selectInnerLoop:1197).
@@ -37408,6 +37412,16 @@ begin
         fixDistinctOpenEph(pParse, WHERE_DISTINCT_ORDERED,
                            regPrevTnct, addrDistinctEph);
     end;
+
+    { OFFSET skip for the DISTINCT path — codeOffset (select.c:1299..1301).
+      When DISTINCT is requested (and there is no sorter), the offset is
+      applied AFTER the distinct dedup so that only distinct rows that
+      survive the OP_Found / OP_Ne|OP_Eq gate decrement the OFFSET counter.
+      Without this, the top-of-loop gate (suppressed above for DISTINCT)
+      would let duplicate rows consume the OFFSET (limit-8.2/8.3). }
+    if (p^.iOffset > 0) and (bSort = 0)
+       and ((p^.selFlags and SF_Distinct) <> 0) then
+      sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, pWInfo^.iContinue, 1);
 
     { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits
       OP_ResultRow; SRT_Set hashes the row into the eph cursor referenced
