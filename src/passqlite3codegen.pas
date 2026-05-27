@@ -25708,6 +25708,19 @@ begin
       begin
         sqlite3VdbeAddOp3(v, OP_Return, pLevel^.pRJ^.regReturn, 0, 1);
       end;
+      { where.c:7679..7684 — skip-scan next-iteration tail.  For an index
+        skip-scan (codeAllEqualityTerms set pLevel^.addrSkip to the OP_SeekGT/
+        OP_SeekLT that seeks to the next distinct value of the skipped prefix),
+        emit OP_Goto back to that seek so the loop re-enters for each distinct
+        prefix value, then patch the seek's jump-on-not-found (addrSkip) and the
+        OP_Rewind/OP_Last jump-on-empty (addrSkip-2) to land just past this
+        OP_Goto (terminating the scan once the index is exhausted). }
+      if pLevel^.addrSkip <> 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, pLevel^.addrSkip);
+        sqlite3VdbeJumpHere(v, pLevel^.addrSkip);
+        sqlite3VdbeJumpHere(v, pLevel^.addrSkip - 2);
+      end;
       { where.c:7685..7691 — LIKE-optimization two-pass blob loop tail.
         When addrLikeRep is set, the loop body just coded scanned the index
         string region; emit OP_DecrJumpZero on the counter register so the
