@@ -194,9 +194,9 @@ design); promotion to a hard CI gate is tracked under `9.1.5`.
 
 #### Current status
 ```
-$ bin/TclTestDriver --timeout 15000 --fail-log-dir bin/tcl-failure-logs
+$ bin/TclTestDriver --timeout 60000 --fail-log-dir bin/tcl-failure-logs
 ...
-Total: 703 pass / 256 fail / 0 skip / 959 total in 945965 ms
+Total: 743 pass / 216 fail / 0 skip / 959 total in 2478395 ms
 ```
 
 #### How the integration works
