@@ -50081,7 +50081,17 @@ begin
       n := XN_EXPR;
     if n = XN_EXPR then
     begin
-      { build.c:4226..4233 — pin the per-column pExpr list, mark the index
+      { build.c:4221..4226 — an expression key column is only legal for a
+        standalone CREATE INDEX.  When the index being built is the implicit
+        PRIMARY KEY / UNIQUE constraint of the table currently under
+        construction (pTab = pParse->pNewTable), expressions are prohibited. }
+      if pTab = pParse^.pNewTable then
+      begin
+        sqlite3ErrorMsg(pParse, 'expressions prohibited in PRIMARY KEY and '
+                              + 'UNIQUE constraints');
+        goto exit_create_index;
+      end;
+      { build.c:4227..4234 — pin the per-column pExpr list, mark the index
         as carrying an expression key, and drop the uniqNotNull bit. }
       if pIndex^.aColExpr = nil then
         pIndex^.aColExpr := pList;
