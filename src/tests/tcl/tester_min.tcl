@@ -265,6 +265,32 @@ proc do_execsql_test {args} {
       [list [list {*}$result]]
 }
 
+# output1 — minimal stand-in for upstream tester.tcl:649.  The full
+# upstream proc keys off [verbose]; this minimal harness has no verbosity
+# machinery (verbose is absent), so we delegate to output2 (the default
+# v==1 behaviour) which writes to stdout.  Defined only if absent so a
+# fuller harness override still wins.
+if {[llength [info commands output1]]==0} {
+  proc output1 {args} { uplevel output2 $args }
+}
+
+# execsql_timed — upstream tester.tcl:1449.  Verbatim.
+proc execsql_timed {sql {db db}} {
+  set tm [time {
+    set x [uplevel [list $db eval $sql]]
+  } 1]
+  set tm [lindex $tm 0]
+  output1 -nonewline " ([expr {$tm*0.001}]ms) "
+  set x
+}
+
+# do_timed_execsql_test — upstream tester.tcl:977.  Verbatim.
+proc do_timed_execsql_test {testname sql {result {}}} {
+  fix_testname testname
+  uplevel do_test [list $testname] [list "execsql_timed {$sql}"]\
+                                   [list [list {*}$result]]
+}
+
 # finalize_testing — upstream tester.tcl:1256.. distilled down to the
 # summary print + exit-code arm.  We deliberately skip the soft/hard
 # heap-limit, vfs_unlink_test, sqlite3_reset_auto_extension and
@@ -370,6 +396,16 @@ set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
+set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
+# pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
+# behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its
+# own Btree/Pager, so two connections to the same file do NOT share a cached
+# iDataVersion.  The oracle build does NOT define SQLITE_OMIT_SHARED_CACHE, so its
+# test_config.c writes shared_cache=1; mirror the *engine's* capability here so
+# ifcapable shared_cache blocks (e.g. pragma3-300..340, which expect cross-
+# connection PRAGMA data_version bumps that only occur with a shared cache) SKIP
+# instead of running against the unsupported feature path.
+set ::sqlite_options(shared_cache) 0   ;# SQLITE_OMIT_SHARED_CACHE (port omits shared cache)
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""

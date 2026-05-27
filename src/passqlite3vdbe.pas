@@ -5035,7 +5035,11 @@ begin
     sqlite3_data_count()/sqlite3_column_*() report no live row after a
     reset (capi2-1.9/1.10). }
   p^.pResultRow := nil;
-  p^.eVdbeState := VDBE_READY_STATE;
+  { vdbeaux.c:3586..3671 — sqlite3VdbeReset NEVER writes eVdbeState; the only
+    state transition it can cause is the RUN->HALT one performed by
+    sqlite3VdbeHalt above.  An unconditional ':= VDBE_READY_STATE' here flipped
+    a failed-prepare (never-MakeReady) Vdbe from INIT to READY, defeating the
+    INIT-gate in sqlite3VdbeClearObject and crashing on garbage aMem. }
   if db <> nil then
     Result := p^.rc and db^.errMask
   else
@@ -5047,7 +5051,11 @@ var
   rc: i32;
 begin
   if p = nil then begin Result := SQLITE_OK; Exit; end;
-  rc := sqlite3VdbeReset(p);
+  rc := SQLITE_OK;
+  { vdbeaux.c:3682 — only reset a Vdbe that actually reached READY (or beyond).
+    A failed-prepare Vdbe is still in VDBE_INIT_STATE and must not be reset. }
+  if p^.eVdbeState >= VDBE_READY_STATE then
+    rc := sqlite3VdbeReset(p);
   sqlite3VdbeDelete(p);
   Result := rc;
 end;
@@ -5953,6 +5961,22 @@ begin
   pVar^.flags := MEM_Null;
   { vdbeapi.c:1675 — successful unbind clears any prior error. }
   db^.errCode := SQLITE_OK;
+
+  { vdbeapi.c:1685..1687 — if the bit for this variable is set in expmask,
+    binding a new value invalidates the current query plan, so flag the VM
+    expired (expired=1) to force a reprepare on the next sqlite3_step().  The
+    expired field is the low 2 bits of vdbeFlags (VDBF_EXPIRED_MASK).
+    C: if( p->expmask!=0 && (p->expmask & (i>=31?0x80000000:(u32)1<<i))!=0 ) }
+  if (p^.expmask <> 0) then
+  begin
+    if i >= 31 then
+    begin
+      if (p^.expmask and u32($80000000)) <> 0 then
+        p^.vdbeFlags := (p^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+    end
+    else if (p^.expmask and (u32(1) shl i)) <> 0 then
+      p^.vdbeFlags := (p^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+  end;
   Result := SQLITE_OK;
 end;
 
@@ -6278,9 +6302,13 @@ begin
   if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
   db := pStmt^.db;
 
-  { Auto-reset if in HALT state (vdbeapi.c:846) }
+  { Auto-reset if in HALT state (vdbeapi.c:846) — C calls the public
+    sqlite3_reset(), i.e. sqlite3VdbeReset + sqlite3VdbeRewind; the Rewind is
+    what restores VDBE_READY_STATE so the restart_step re-check below succeeds.
+    (sqlite3VdbeReset no longer sets eVdbeState — see vdbeaux.c:3586.) }
   if pStmt^.eVdbeState = VDBE_HALT_STATE then begin
     sqlite3VdbeReset(pStmt);
+    sqlite3VdbeRewind(pStmt);
   end;
 
   { vdbeapi.c:779..792 — expired-stmt short-circuit.  Must precede the
@@ -10147,6 +10175,12 @@ begin
       pOut^.z     := pOp^.p4.z;
       pOut^.n     := pOp^.p1;
       pOut^.enc   := enc;
+      { vdbe.c:1466..1472 — LIKE-optimization blob pass: when P3 names a
+        counter register whose value equals P5, reinterpret the bound string
+        as a BLOB so the second range scan covers the index's blob region. }
+      if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
+         (aMem[pOp^.p3].u.i = pOp^.p5) then
+        pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
     end;
 
     OP_String: begin
@@ -10219,7 +10253,10 @@ begin
       while i <= n do begin
         rc := sqlite3VdbeMemCopy(pOut, pIn1);
         if rc <> SQLITE_OK then goto abort_due_to_error;
-        pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or (pOut^.flags and MEM_TypeMask);
+        { vdbe.c:1663 — when the 0x0002 bit of P5 is set, clear MEM_Subtype
+          on the destination (value crosses a coroutine/subquery boundary). }
+        if ((pOut^.flags and MEM_Subtype) <> 0) and ((pOp^.p5 and $0002) <> 0) then
+          pOut^.flags := pOut^.flags and not u16(MEM_Subtype);
         Inc(pIn1);
         Inc(pOut);
         Inc(i);

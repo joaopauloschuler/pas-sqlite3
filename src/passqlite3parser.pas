@@ -3217,8 +3217,22 @@ begin
          pRight_104 := sqlite3PExpr(pPse, TK_ASTERISK, nil, nil);
          sqlite3ExprSetErrorOffset(pRight_104,
            i32(PtrUInt(yymsp[0].minor.yy0.z) - PtrUInt(pPse^.zTail)));
+         { parse.y:726 — C builds the `tab` prefix through tokenExpr
+           (parse.y:1140..1168), which sets w.iOfst and, under
+           IN_RENAME_OBJECT, records the Expr with its source token via
+           sqlite3RenameTokenMap.  The earlier port used sqlite3ExprAlloc
+           directly and omitted both, so the `tab` in `tab.*` had no rename
+           token; when ALTER ... RENAME rewrote the table, the `tab.` prefix
+           was left unchanged and the post-rename re-validation re-parsed
+           `t1.*` against the renamed schema and aborted "no such table: t1"
+           (altertab3-29.x). }
          pLeft_104 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
            @yymsp[-2].minor.yy0, 1);
+         if pLeft_104 <> nil then
+           pLeft_104^.w.iOfst :=
+             i32(PtrUInt(yymsp[-2].minor.yy0.z) - PtrUInt(pPse^.zTail));
+         if InRenameObject(pPse) and (pLeft_104 <> nil) then
+           sqlite3RenameTokenMap(pPse, Pointer(pLeft_104), @yymsp[-2].minor.yy0);
          pDot_104  := sqlite3PExpr(pPse, TK_DOT, pLeft_104, pRight_104);
          yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
            PExprList(yymsp[-4].minor.yy14), pDot_104);

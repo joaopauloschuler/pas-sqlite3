@@ -776,44 +776,123 @@ end;
     * sqlite3_backup family       test_backup.c:26..150 (backupTest*)
   ---------------------------------------------------------------------- }
 
-{ main.c — sqlite3ErrName: enum-name table for the rc codes the backup
-  Tcl commands surface.  Minimal subset, mirrors echoErrName but covers
-  every code sqlite3_backup_step / _finish can return. }
+{ main.c:1533 — sqlite3ErrName: faithful port of the two-pass enum-name
+  lookup.  First pass matches the full extended code; if unmatched, rc is
+  masked to the primary code (rc and $ff) and the second pass matches that.
+  Returns 'SQLITE_Unknown' for the still-unmatched case (existing harness
+  convention; C returns the static "SQLITE_UNKNOWN(%d)" buffer). }
 function t1ErrName(rc: cint): PAnsiChar;
+var
+  zName: PAnsiChar;
+  i: Integer;
 begin
-  case rc of
-    SQLITE_OK:         Result := PChar('SQLITE_OK');
-    SQLITE_ERROR:      Result := PChar('SQLITE_ERROR');
-    SQLITE_INTERNAL:   Result := PChar('SQLITE_INTERNAL');
-    SQLITE_PERM:       Result := PChar('SQLITE_PERM');
-    SQLITE_ABORT:      Result := PChar('SQLITE_ABORT');
-    SQLITE_BUSY:       Result := PChar('SQLITE_BUSY');
-    SQLITE_LOCKED:     Result := PChar('SQLITE_LOCKED');
-    SQLITE_NOMEM:      Result := PChar('SQLITE_NOMEM');
-    SQLITE_READONLY:   Result := PChar('SQLITE_READONLY');
-    SQLITE_INTERRUPT:  Result := PChar('SQLITE_INTERRUPT');
-    SQLITE_IOERR:      Result := PChar('SQLITE_IOERR');
-    SQLITE_CORRUPT:    Result := PChar('SQLITE_CORRUPT');
-    SQLITE_NOTFOUND:   Result := PChar('SQLITE_NOTFOUND');
-    SQLITE_FULL:       Result := PChar('SQLITE_FULL');
-    SQLITE_CANTOPEN:   Result := PChar('SQLITE_CANTOPEN');
-    SQLITE_PROTOCOL:   Result := PChar('SQLITE_PROTOCOL');
-    SQLITE_EMPTY:      Result := PChar('SQLITE_EMPTY');
-    SQLITE_SCHEMA:     Result := PChar('SQLITE_SCHEMA');
-    SQLITE_TOOBIG:     Result := PChar('SQLITE_TOOBIG');
-    SQLITE_CONSTRAINT: Result := PChar('SQLITE_CONSTRAINT');
-    SQLITE_MISMATCH:   Result := PChar('SQLITE_MISMATCH');
-    SQLITE_MISUSE:     Result := PChar('SQLITE_MISUSE');
-    SQLITE_NOLFS:      Result := PChar('SQLITE_NOLFS');
-    SQLITE_AUTH:       Result := PChar('SQLITE_AUTH');
-    SQLITE_FORMAT:     Result := PChar('SQLITE_FORMAT');
-    SQLITE_RANGE:      Result := PChar('SQLITE_RANGE');
-    SQLITE_NOTADB:     Result := PChar('SQLITE_NOTADB');
-    SQLITE_ROW:        Result := PChar('SQLITE_ROW');
-    SQLITE_DONE:       Result := PChar('SQLITE_DONE');
-  else
-    Result := PChar('SQLITE_Unknown');
+  zName := nil;
+  i := 0;
+  while (i < 2) and (zName = nil) do
+  begin
+    case rc of
+      SQLITE_OK:                 zName := PChar('SQLITE_OK');
+      SQLITE_ERROR:              zName := PChar('SQLITE_ERROR');
+      SQLITE_ERROR_SNAPSHOT:     zName := PChar('SQLITE_ERROR_SNAPSHOT');
+      SQLITE_ERROR_RETRY:        zName := PChar('SQLITE_ERROR_RETRY');
+      SQLITE_ERROR_MISSING_COLLSEQ:
+                                 zName := PChar('SQLITE_ERROR_MISSING_COLLSEQ');
+      SQLITE_INTERNAL:           zName := PChar('SQLITE_INTERNAL');
+      SQLITE_PERM:               zName := PChar('SQLITE_PERM');
+      SQLITE_ABORT:              zName := PChar('SQLITE_ABORT');
+      SQLITE_ABORT_ROLLBACK:     zName := PChar('SQLITE_ABORT_ROLLBACK');
+      SQLITE_BUSY:               zName := PChar('SQLITE_BUSY');
+      SQLITE_BUSY_RECOVERY:      zName := PChar('SQLITE_BUSY_RECOVERY');
+      SQLITE_BUSY_SNAPSHOT:      zName := PChar('SQLITE_BUSY_SNAPSHOT');
+      SQLITE_LOCKED:             zName := PChar('SQLITE_LOCKED');
+      SQLITE_LOCKED_SHAREDCACHE: zName := PChar('SQLITE_LOCKED_SHAREDCACHE');
+      SQLITE_NOMEM:              zName := PChar('SQLITE_NOMEM');
+      SQLITE_READONLY:           zName := PChar('SQLITE_READONLY');
+      SQLITE_READONLY_RECOVERY:  zName := PChar('SQLITE_READONLY_RECOVERY');
+      SQLITE_READONLY_CANTINIT:  zName := PChar('SQLITE_READONLY_CANTINIT');
+      SQLITE_READONLY_ROLLBACK:  zName := PChar('SQLITE_READONLY_ROLLBACK');
+      SQLITE_READONLY_DBMOVED:   zName := PChar('SQLITE_READONLY_DBMOVED');
+      SQLITE_READONLY_DIRECTORY: zName := PChar('SQLITE_READONLY_DIRECTORY');
+      SQLITE_INTERRUPT:          zName := PChar('SQLITE_INTERRUPT');
+      SQLITE_IOERR:              zName := PChar('SQLITE_IOERR');
+      SQLITE_IOERR_READ:         zName := PChar('SQLITE_IOERR_READ');
+      SQLITE_IOERR_SHORT_READ:   zName := PChar('SQLITE_IOERR_SHORT_READ');
+      SQLITE_IOERR_WRITE:        zName := PChar('SQLITE_IOERR_WRITE');
+      SQLITE_IOERR_FSYNC:        zName := PChar('SQLITE_IOERR_FSYNC');
+      SQLITE_IOERR_DIR_FSYNC:    zName := PChar('SQLITE_IOERR_DIR_FSYNC');
+      SQLITE_IOERR_TRUNCATE:     zName := PChar('SQLITE_IOERR_TRUNCATE');
+      SQLITE_IOERR_FSTAT:        zName := PChar('SQLITE_IOERR_FSTAT');
+      SQLITE_IOERR_UNLOCK:       zName := PChar('SQLITE_IOERR_UNLOCK');
+      SQLITE_IOERR_RDLOCK:       zName := PChar('SQLITE_IOERR_RDLOCK');
+      SQLITE_IOERR_DELETE:       zName := PChar('SQLITE_IOERR_DELETE');
+      SQLITE_IOERR_NOMEM:        zName := PChar('SQLITE_IOERR_NOMEM');
+      SQLITE_IOERR_ACCESS:       zName := PChar('SQLITE_IOERR_ACCESS');
+      SQLITE_IOERR_CHECKRESERVEDLOCK:
+                                 zName := PChar('SQLITE_IOERR_CHECKRESERVEDLOCK');
+      SQLITE_IOERR_LOCK:         zName := PChar('SQLITE_IOERR_LOCK');
+      SQLITE_IOERR_CLOSE:        zName := PChar('SQLITE_IOERR_CLOSE');
+      SQLITE_IOERR_DIR_CLOSE:    zName := PChar('SQLITE_IOERR_DIR_CLOSE');
+      SQLITE_IOERR_SHMOPEN:      zName := PChar('SQLITE_IOERR_SHMOPEN');
+      SQLITE_IOERR_SHMSIZE:      zName := PChar('SQLITE_IOERR_SHMSIZE');
+      SQLITE_IOERR_SHMLOCK:      zName := PChar('SQLITE_IOERR_SHMLOCK');
+      SQLITE_IOERR_SHMMAP:       zName := PChar('SQLITE_IOERR_SHMMAP');
+      SQLITE_IOERR_SEEK:         zName := PChar('SQLITE_IOERR_SEEK');
+      SQLITE_IOERR_DELETE_NOENT: zName := PChar('SQLITE_IOERR_DELETE_NOENT');
+      SQLITE_IOERR_MMAP:         zName := PChar('SQLITE_IOERR_MMAP');
+      SQLITE_IOERR_GETTEMPPATH:  zName := PChar('SQLITE_IOERR_GETTEMPPATH');
+      SQLITE_IOERR_CONVPATH:     zName := PChar('SQLITE_IOERR_CONVPATH');
+      SQLITE_CORRUPT:            zName := PChar('SQLITE_CORRUPT');
+      SQLITE_CORRUPT_VTAB:       zName := PChar('SQLITE_CORRUPT_VTAB');
+      SQLITE_NOTFOUND:           zName := PChar('SQLITE_NOTFOUND');
+      SQLITE_FULL:               zName := PChar('SQLITE_FULL');
+      SQLITE_CANTOPEN:           zName := PChar('SQLITE_CANTOPEN');
+      SQLITE_CANTOPEN_NOTEMPDIR: zName := PChar('SQLITE_CANTOPEN_NOTEMPDIR');
+      SQLITE_CANTOPEN_ISDIR:     zName := PChar('SQLITE_CANTOPEN_ISDIR');
+      SQLITE_CANTOPEN_FULLPATH:  zName := PChar('SQLITE_CANTOPEN_FULLPATH');
+      SQLITE_CANTOPEN_CONVPATH:  zName := PChar('SQLITE_CANTOPEN_CONVPATH');
+      SQLITE_CANTOPEN_SYMLINK:   zName := PChar('SQLITE_CANTOPEN_SYMLINK');
+      SQLITE_PROTOCOL:           zName := PChar('SQLITE_PROTOCOL');
+      SQLITE_EMPTY:              zName := PChar('SQLITE_EMPTY');
+      SQLITE_SCHEMA:             zName := PChar('SQLITE_SCHEMA');
+      SQLITE_TOOBIG:             zName := PChar('SQLITE_TOOBIG');
+      SQLITE_CONSTRAINT:         zName := PChar('SQLITE_CONSTRAINT');
+      SQLITE_CONSTRAINT_UNIQUE:  zName := PChar('SQLITE_CONSTRAINT_UNIQUE');
+      SQLITE_CONSTRAINT_TRIGGER: zName := PChar('SQLITE_CONSTRAINT_TRIGGER');
+      SQLITE_CONSTRAINT_FOREIGNKEY:
+                                 zName := PChar('SQLITE_CONSTRAINT_FOREIGNKEY');
+      SQLITE_CONSTRAINT_CHECK:   zName := PChar('SQLITE_CONSTRAINT_CHECK');
+      SQLITE_CONSTRAINT_PRIMARYKEY:
+                                 zName := PChar('SQLITE_CONSTRAINT_PRIMARYKEY');
+      SQLITE_CONSTRAINT_NOTNULL: zName := PChar('SQLITE_CONSTRAINT_NOTNULL');
+      SQLITE_CONSTRAINT_COMMITHOOK:
+                                 zName := PChar('SQLITE_CONSTRAINT_COMMITHOOK');
+      SQLITE_CONSTRAINT_VTAB:    zName := PChar('SQLITE_CONSTRAINT_VTAB');
+      SQLITE_CONSTRAINT_FUNCTION:
+                                 zName := PChar('SQLITE_CONSTRAINT_FUNCTION');
+      SQLITE_CONSTRAINT_ROWID:   zName := PChar('SQLITE_CONSTRAINT_ROWID');
+      SQLITE_MISMATCH:           zName := PChar('SQLITE_MISMATCH');
+      SQLITE_MISUSE:             zName := PChar('SQLITE_MISUSE');
+      SQLITE_NOLFS:              zName := PChar('SQLITE_NOLFS');
+      SQLITE_AUTH:               zName := PChar('SQLITE_AUTH');
+      SQLITE_FORMAT:             zName := PChar('SQLITE_FORMAT');
+      SQLITE_RANGE:              zName := PChar('SQLITE_RANGE');
+      SQLITE_NOTADB:             zName := PChar('SQLITE_NOTADB');
+      SQLITE_ROW:                zName := PChar('SQLITE_ROW');
+      SQLITE_NOTICE:             zName := PChar('SQLITE_NOTICE');
+      SQLITE_NOTICE_RECOVER_WAL: zName := PChar('SQLITE_NOTICE_RECOVER_WAL');
+      SQLITE_NOTICE_RECOVER_ROLLBACK:
+                                 zName := PChar('SQLITE_NOTICE_RECOVER_ROLLBACK');
+      SQLITE_NOTICE_RBU:         zName := PChar('SQLITE_NOTICE_RBU');
+      SQLITE_WARNING:            zName := PChar('SQLITE_WARNING');
+      SQLITE_WARNING_AUTOINDEX:  zName := PChar('SQLITE_WARNING_AUTOINDEX');
+      SQLITE_DONE:               zName := PChar('SQLITE_DONE');
+    end;
+    rc := rc and $ff;
+    Inc(i);
   end;
+  if zName = nil then
+    zName := PChar('SQLITE_Unknown');
+  Result := zName;
 end;
 
 { test1.c:147 — sqlite3TestErrCode.  In a non-threadsafe build, when the
@@ -7017,6 +7096,38 @@ begin
   if clientData = nil then ;
 end;
 
+{ test1.c:1707 test_extended_result_codes.
+  Usage: sqlite3_extended_result_codes DB BOOLEAN.  Toggles db->errMask
+  between 0xff (primary codes) and 0xffffffff (extended codes) at the API
+  boundary.  Required so without_rowid7-3.5.1 sees the extended rc (257)
+  after enabling, while 3.4.1 (before enabling) sees the masked code (1).
+  Engine entry: passqlite3main.pas:3857. }
+function test_extended_result_codes(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+  enable: cint;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  db := nil;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  enable := 0;
+  if Tcl_GetBooleanFromObj(interp, objv[2], @enable) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_extended_result_codes(db, enable);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.88.012.f — test1.c:4884..4902 test_errcode.
   Usage: sqlite3_errcode DB.  Returns the symbolic name of the most
   recent error (e.g. "SQLITE_CORRUPT"), via t1ErrName/sqlite3ErrName.
@@ -8237,6 +8348,10 @@ begin
     notnull.test).  C ref test1.c registered at 9133. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_extended_errcode'),
     @test_extended_errcode, nil, nil);
+  { test1.c:9185 sqlite3_extended_result_codes DB BOOLEAN — toggles the
+    API-boundary errMask so without_rowid7-3.5.1 sees the extended rc. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_extended_result_codes'),
+    @test_extended_result_codes, nil, nil);
   { 9.4.divbug.88.012.f — sqlite3_errcode DB returns symbolic rc
     name (test1.c:4884..4902, registered :9134). Without this the
     tester_min.tcl fallback `[$db errorcode]` returns numeric 11 and
