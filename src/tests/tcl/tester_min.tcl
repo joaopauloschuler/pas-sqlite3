@@ -397,6 +397,15 @@ set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
 set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
+# pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
+# behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its
+# own Btree/Pager, so two connections to the same file do NOT share a cached
+# iDataVersion.  The oracle build does NOT define SQLITE_OMIT_SHARED_CACHE, so its
+# test_config.c writes shared_cache=1; mirror the *engine's* capability here so
+# ifcapable shared_cache blocks (e.g. pragma3-300..340, which expect cross-
+# connection PRAGMA data_version bumps that only occur with a shared cache) SKIP
+# instead of running against the unsupported feature path.
+set ::sqlite_options(shared_cache) 0   ;# SQLITE_OMIT_SHARED_CACHE (port omits shared cache)
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
