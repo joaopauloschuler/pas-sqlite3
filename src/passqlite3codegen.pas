@@ -11334,6 +11334,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end;
         pSrc := p^.pSrc;
         base := SrcListItems(pSrc);
+        { resolve.c:340..706 — the qualified-ref scan counts ALL matching
+          sources (cnt) rather than binding to the first one, so that
+          `A.f1` over `test1 AS A, test1 AS A` is detected as ambiguous
+          (select1-6.8c).  Accumulate cnt / pMatch / matchCol over every
+          source, then decide after the loop: cnt=1 binds, cnt>1 raises
+          "ambiguous column name: A.f1". }
+        cnt      := 0;
+        pMatch   := nil;
+        matchCol := -1;
+        effCol   := 0;
         for i := 0 to pSrc^.nSrc - 1 do
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
@@ -11367,31 +11377,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.u.zToken);
           if iCol >= 0 then
           begin
-            pE^.op      := TK_COLUMN;
-            pE^.iTable  := pItem^.iCursor;
-            { 9.4.divbug.30 — IPK alias to iColumn=-1 (resolve.c:871). }
+            { resolve.c:438..470 — a real-column match.  Count it; remember
+              the source/column.  Do NOT bind/Exit here so a second matching
+              source can lift cnt above 1 (ambiguity).  Binding happens after
+              the loop when cnt=1. }
+            Inc(cnt);
+            pMatch   := pItem;
+            matchCol := iCol;
+            { 9.4.divbug.30 — IPK alias to iColumn=-1 (resolve.c:466). }
             if pItem^.pSTab^.iPKey = iCol then
-            begin
-              pE^.iColumn := i16(-1);
-              pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
-            end
+              effCol := i16(-1)
             else
-              pE^.iColumn := i16(iCol);
-            pE^.y.pTab  := pItem^.pSTab;
-            pE^.pLeft   := nil;
-            pE^.pRight  := nil;
-            if iCol < BMS - 1 then
-              pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
-            else
-              pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
-            { 9.4.divbug.87.040 — port resolve.c:509..511.  Columns from a
-              JT_LEFT/JT_LTORJ source can become NULL on outer-join misses;
-              flag so sqlite3ExprCanBeNull (expr.c:2982) returns true and
-              codeAllEqualityTerms emits the OP_IsNull skip-search guard. }
-            if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
-              ExprSetProperty(pE, EP_CanBeNull);
-            AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
-            Exit;
+              effCol := i16(iCol);
+            Continue;
           end;
           { 9.4.divbug.19 — qualified rowid alias (Tab.rowid / sp.oid).
             Mirror lookupName at resolve.c:471..503 + 623..638: the table
@@ -11404,7 +11402,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             TF_NoVisibleRowid; resolving `subq.rowid` against them would
             bind iColumn=-1 to a cursor whose pEList has no such slot,
             crashing substExpr during pushdown (misc8-3.0). }
-          if (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
+          if (cnt = 0)
+             and (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
              and ((pItem^.pSTab^.tabFlags and TF_NoVisibleRowid) = 0) then
           begin
             pE^.op      := TK_COLUMN;
@@ -11419,6 +11418,43 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
             Exit;
           end;
+        end;
+        { resolve.c:761..795 — post-scan decision for the qualified ref.
+          cnt>1 → ambiguous; report with the qualifier as written
+          ("A.f1") to match C's "%s: %s.%s" (zErr, zTab, zCol) branch
+          (select1-6.8c).  cnt=1 → bind to the single matched source.
+          cnt=0 falls through to the "no such column" tail below. }
+        if cnt > 1 then
+        begin
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('ambiguous column name: '
+                      + AnsiString(pE^.pLeft^.u.zToken) + '.'
+                      + AnsiString(pE^.pRight^.u.zToken)));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          Exit;
+        end
+        else if (cnt = 1) and (pMatch <> nil) then
+        begin
+          pE^.op      := TK_COLUMN;
+          pE^.iTable  := pMatch^.iCursor;
+          pE^.iColumn := effCol;
+          if effCol = i16(-1) then
+            pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+          pE^.y.pTab  := pMatch^.pSTab;
+          pE^.pLeft   := nil;
+          pE^.pRight  := nil;
+          if (matchCol >= 0) then
+          begin
+            if matchCol < BMS - 1 then
+              pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
+            else
+              pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl (BMS - 1));
+          end;
+          { 9.4.divbug.87.040 — resolve.c:509..511 outer-join NULLability. }
+          if (pMatch^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+            ExprSetProperty(pE, EP_CanBeNull);
+          AuthReadCol(pE);  { resolve.c:835..844 lookupname_end }
+          Exit;
         end;
       end;
       { Unresolved TK_DOT — mirror resolve.c lookupName cnt==0 tail:
@@ -13172,11 +13208,16 @@ begin
   if pParse^.nErr = 0 then
     ResolveExpr    (p^.pHaving);
 
-  { resolve.c:1797..1806 — alias-arm runs BEFORE ResolveExprList on
-    pOrderBy so a bare alias TK_ID gets tagged via iOrderByCol and is
-    skipped by name resolution (which would otherwise fail with
-    "no such column: rn"). }
-  if (p^.pOrderBy <> nil) and (not deferOB) then
+  { resolve.c:2040..2045 — the ORDER BY clause is resolved only AFTER the
+    result set (resolve.c:1953).  In C, if result-set resolution detects an
+    error it does `return WRC_Abort` (resolve.c:1953) and the ORDER BY
+    resolveOrderGroupBy() at resolve.c:2042 is never reached.  This port's
+    sqlite3ErrorMsg unconditionally frees+replaces pParse^.zErrMsg, so a
+    later ambiguous ORDER BY term would clobber an earlier ambiguous result
+    column message (select1-6.8 / 6.8c: result column f1 is ambiguous, but
+    ORDER BY f2 overwrote it).  Gate the whole ORDER BY resolution on
+    nErr=0 so the FIRST-resolved error (the result set) is preserved. }
+  if (p^.pOrderBy <> nil) and (not deferOB) and (pParse^.nErr = 0) then
     ResolveAliasOrderByCol(p^.pOrderBy, False);
 
   { 9.4.divbug.30 — port resolve.c:658..698 NC_UEList fallback for ORDER BY.
@@ -13187,7 +13228,8 @@ begin
     swapping alias TK_IDs for the underlying result-set expression; reuse
     it here so bare aliases inside any ORDER BY sub-expression bind to the
     alias target before name resolution (collate8-1.15). }
-  if (p^.pOrderBy <> nil) and (not deferOB) and (p^.pEList <> nil) then
+  if (p^.pOrderBy <> nil) and (not deferOB) and (p^.pEList <> nil)
+     and (pParse^.nErr = 0) then
   begin
     items_ := ExprListItems(p^.pOrderBy);
     for i_ := 0 to p^.pOrderBy^.nExpr - 1 do
@@ -13195,7 +13237,7 @@ begin
         ResolveAliasInHaving(items_[i_].pExpr);
   end;
 
-  if not deferOB then
+  if (not deferOB) and (pParse^.nErr = 0) then
     ResolveExprList(p^.pOrderBy);
 
   { 9.4.divbug.1 — for a non-aggregate query, tag aggregate-function
@@ -13204,14 +13246,15 @@ begin
     non-aggregate SELECT, so codegen's TK_AGG_FUNCTION misuse arm
     (expr.c:5320) raises "misuse of aggregate: <name>()" instead of
     coding a scalar OP_Function that crashes minStep at run time. }
-  if (p^.pOrderBy <> nil) and (not deferOB) and (not SelectIsAggregate(p)) then
+  if (p^.pOrderBy <> nil) and (not deferOB) and (pParse^.nErr = 0)
+     and (not SelectIsAggregate(p)) then
     RewriteOrderByAggToAggFunc(p^.pOrderBy);
 
   { Integer-arm tagging + structural-compare match + alias rewrite for
     ORDER BY / GROUP BY (resolve.c:1793..1834).  The structural-compare
     pass runs after the integer arm so an explicit positional reference
     is not overridden by a coincidental structural match. }
-  if (p^.pOrderBy <> nil) and (not deferOB) then
+  if (p^.pOrderBy <> nil) and (not deferOB) and (pParse^.nErr = 0) then
   begin
     ResolveIntegerOrderByCol(p^.pOrderBy, 'ORDER');
     ResolveStructuralOrderByCol(p^.pOrderBy);
@@ -29121,11 +29164,12 @@ begin
   pTab := pFrom^.pSTab;
   if pTab = nil then begin Result := SQLITE_NOMEM; Exit; end;
   pTab^.nTabRef := 1;
-  if pFrom^.zAlias <> nil then
-    pTab^.zName := sqlite3DbStrDup(pParse^.db, pFrom^.zAlias)
-  else
-    pTab^.zName := sqlite3DbStrDup(pParse^.db, PAnsiChar(
-                     AnsiString(Format('subq_%p', [pFrom]))));
+  { select.c:5890 — pTab->zName = sqlite3MPrintf(pParse->db, "%!S", pFrom);
+    The %!S (etSRCITEM, altform) specifier emits zName / zAlias / a
+    synthetic "(subquery-N)" / "(join-N)" / "N-ROW VALUES CLAUSE"
+    descriptor from the SrcItem.  Faithful to C (do NOT derive a
+    pointer-based name). }
+  pTab^.zName := sqlite3MPrintf(pParse^.db, '%!S', [Pointer(pFrom)]);
   while pSel^.pPrior <> nil do pSel := pSel^.pPrior;
   sqlite3ColumnsFromExprList(pParse, pSel^.pEList, @pTab^.nCol, @pTab^.aCol);
   pTab^.iPKey := -1;
