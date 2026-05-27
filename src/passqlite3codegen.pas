@@ -22993,6 +22993,26 @@ begin
   end;
 end;
 
+{ sqlite3StorageColumnToTable (build.c:1107..1115).  Convert a storage
+  (on-disk record) column number into a table (declared) column number.
+  The storage number is < the table number iff there are VIRTUAL columns
+  to the left.  No-op when the table has no virtual columns. }
+function sqlite3StorageColumnToTable(pTab: PTable2; iCol: i16): i16;
+var
+  i: i32;
+begin
+  if (pTab^.tabFlags and TF_HasVirtual) <> 0 then
+  begin
+    i := 0;
+    while i <= iCol do
+    begin
+      if (pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) <> 0 then Inc(iCol);
+      Inc(i);
+    end;
+  end;
+  Result := iCol;
+end;
+
 function sqlite3ParseToplevel(p: PParse): PParse;
 begin
   if p^.pToplevel <> nil then Result := p^.pToplevel else Result := p;
@@ -25696,9 +25716,19 @@ begin
                 begin
                   pPkR := sqlite3PrimaryKeyIndex(pTabR);
                   xCol := pPkR^.aiColumn[xCol];
+                end
+                else
+                begin
+                  { where.c:7838..7841 — the OP_Column p2 holds the STORAGE
+                    column number; convert it back to the declared table column
+                    number before mapping into the index.  Omitting this (for a
+                    table with leading VIRTUAL generated columns) lets a base
+                    column's storage index collide with a different declared
+                    column that *is* indexed, so the read is wrongly rewritten
+                    onto the index cursor (gencol1-2.x.110/140/150: SELECT a FROM
+                    t1 WHERE w=10 with leading VIRTUAL w indexed read w not a). }
+                  xCol := sqlite3StorageColumnToTable(pTabR, i16(xCol));
                 end;
-                { sqlite3StorageColumnToTable is a no-op pass-through unless
-                  SQLITE_ENABLE_HIDDEN_COLUMNS is defined (sqliteInt.h:4985) — skip. }
               end;
               xCol := sqlite3TableColumnToIndex(pIdxR, i16(xCol));
               if xCol >= 0 then
@@ -50103,6 +50133,18 @@ begin
       NOT NULL so does not clear the bit. }
     if (n >= 0) and ((PColumn(pTab^.aCol)[n].typeFlags and $0F) = OE_None) then
       pIndex^.idxFlags := pIndex^.idxFlags and not u32($08);
+    { build.c:4244..4247 — when the indexed key column is a VIRTUAL generated
+      column the index carries a VIRTUAL column (bHasVCol) and is treated as an
+      expression index (bHasExpr).  Without these flags the planner mistakes the
+      index for an ordinary covering index over the table columns, so a query
+      reading an un-indexed base column (e.g. SELECT a FROM t1 WHERE w=10 with
+      INDEX(w) over a leading VIRTUAL w) reads the wrong storage slot from the
+      index cursor instead of seeking the table (gencol1-2.x.110/140/150). }
+    if (n >= 0)
+       and ((PColumn(pTab^.aCol)[n].colFlags and COLFLAG_VIRTUAL) <> 0) then
+      pIndex^.idxFlags := pIndex^.idxFlags
+                          or u32(1 shl 10)    { bHasVCol }
+                          or u32(1 shl 11);   { bHasExpr }
     (pIndex^.aiColumn + i)^ := i16(n);
     { build.c:4251..4269 — when no explicit COLLATE wrapper is present and
       the indexed term resolves to a real table column (n>=0), the index
