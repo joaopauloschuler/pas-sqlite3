@@ -11790,6 +11790,34 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end;
       end;
     end;
+    { resolve.c:1178..1193 — if the resolved function may call
+      sqlite3_value_subtype() (SQLITE_SUBTYPE), or the function expression
+      itself already carries EP_SubtArg, stamp EP_SubtArg on every argument
+      expression.  This prevents where.c / sqlite3IndexedExprLookup from
+      replacing a subexpression with a value read from an index on the same
+      expression — the index value would not carry the correct subtype
+      (https://sqlite.org/forum/forumpost/68d284c86b082c3e).  Because this
+      resolver is preorder (parent before children), the flag propagates
+      transitively to grandchildren as their own functions are resolved.
+      Without this, indexexpr3-1.5/1.6 replaced json_extract() (a SUBTYPE
+      arg to json_insert) with the i2 covering-index column → one fewer
+      OP_Function than the oracle. }
+    if (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+       and ExprUseXList(pE) then
+    begin
+      if pE^.x.pList <> nil then nArg_ := pE^.x.pList^.nExpr else nArg_ := 0;
+      pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg_,
+                                   pParse^.db^.enc, 0);
+      if pDef_ = nil then
+        pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                     pParse^.db^.enc, 0);
+      if (pDef_ <> nil)
+         and (((pDef_^.funcFlags and SQLITE_SUBTYPE) <> 0)
+              or ExprHasProperty(pE, EP_SubtArg))
+         and (pE^.x.pList <> nil) then
+        for i := 0 to nArg_ - 1 do
+          ExprSetProperty(ExprListItems(pE^.x.pList)[i].pExpr, EP_SubtArg);
+    end;
     { resolve.c:1226..1231 — trusted-schema enforcement in the SELECT
       resolver.  When the resolved function carries SQLITE_FUNC_DIRECT
       (SQLITE_DIRECTONLY) or SQLITE_FUNC_UNSAFE (i.e. NOT registered
@@ -25357,6 +25385,7 @@ var
   viaCoroLevel: Boolean;
   nRJ:    i32;
   pRJ2:   PWhereRightJoin;
+  pIEp:   PIndexedExpr;
 begin
   { Phase 6.9-bis 11g.2.b — productive loop-tail.
 
@@ -25580,6 +25609,25 @@ begin
           lastAddr := iEnd
         else
           lastAddr := pWInfo^.iEndWhere;
+        { where.c:7787..7803 — once the body opcodes for this index level have
+          been translated, the IndexedExpr entries for this index cursor are
+          no longer eligible (a later level / sub-statement coded against the
+          same cursor would read stale index data).  Mark each entry whose
+          iIdxCur matches this level dead (iDataCur := -1; iIdxCur := -1) so
+          sqlite3IndexedExprLookup skips it (iDataCur<0 → continue). }
+        if indexBHasExpr(pIdxR) <> 0 then
+        begin
+          pIEp := PIndexedExpr(pPrs^.pIdxEpr);
+          while pIEp <> nil do
+          begin
+            if pIEp^.iIdxCur = pLevel^.iIdxCur then
+            begin
+              pIEp^.iDataCur := -1;
+              pIEp^.iIdxCur  := -1;
+            end;
+            pIEp := pIEp^.pIENext;
+          end;
+        end;
         kAddr := pLevel^.addrBody + 1;
         while kAddr < lastAddr do
         begin
@@ -25614,8 +25662,28 @@ begin
               begin
                 pOpR^.p2 := xCol;
                 pOpR^.p1 := pLevel^.iIdxCur;
+              end
+              else if (pLoop^.wsFlags and (WHERE_IDX_ONLY or WHERE_EXPRIDX)) <> 0 then
+              begin
+                { where.c:7847..7868 — the VM still reads a table column not
+                  present in the index, so the loop is NOT truly covering.
+                  WHERE_IDX_ONLY would be a planner error; for the speculative
+                  WHERE_EXPRIDX case (set when an indexed expression *might*
+                  cover the loop) clear the flag and re-render the OP_Explain
+                  text at addrBody-1 so the EQP says "INDEX" not "COVERING
+                  INDEX" (indexexpr3-2.3/2.5). }
+                if (pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0 then
+                begin
+                  sqlite3ErrorMsg(pPrs, 'internal query planner error');
+                  pPrs^.rc := SQLITE_INTERNAL;
+                end
+                else
+                begin
+                  pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_EXPRIDX);
+                  sqlite3WhereAddExplainText(pPrs, pLevel^.addrBody - 1,
+                    pWInfo^.pTabList, pLevel, pWInfo^.wctrlFlags);
+                end;
               end;
-              { WHERE_IDX_ONLY / WHERE_EXPRIDX miss-handling deferred. }
             end
             else if pOpR^.opcode = OP_Rowid then
             begin
