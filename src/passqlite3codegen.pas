@@ -25167,16 +25167,36 @@ begin
       Assert((pStart^.wtFlags and TERM_VNULL) = 0);
       pX := pStart^.pExpr;
       Assert(pX <> nil);
-      r1 := sqlite3ExprCodeTemp(pParse, pX^.pRight, @rTemp);
-      disableTerm(pLevel, pStart);
       { aMoveOp[TK_GT_TK..TK_GE - TK_GT_TK]: SeekGT, SeekLE, SeekLT, SeekGE.
         See wherecode.c:1741..1746; same table inlined in sqlite3WhereCodeOneLoopStart. }
-      case pX^.op of
-        TK_GT_TK: op3 := OP_SeekGT;
-        TK_LE:    op3 := OP_SeekLE;
-        TK_LT:    op3 := OP_SeekLT;
-        TK_GE:    op3 := OP_SeekGE;
-      else        op3 := OP_SeekGE;
+      if sqlite3ExprIsVector(pX^.pRight) <> 0 then
+      begin
+        { wherecode.c:1756..1767 — vector RHS: code only the FIRST element
+          into a temp register (codeExprOrVector nReg=1), select the seek
+          op via ((op - TK_GT - 1) & 3) | 1 (always SeekGE/SeekLE), and do
+          NOT disableTerm — the full vector compare stays as a residual. }
+        rTemp := sqlite3GetTempReg(pParse);
+        r1    := rTemp;
+        codeExprOrVector(pParse, pX^.pRight, r1, 1);
+        case (((pX^.op - TK_GT_TK - 1) and 3) or 1) of
+          0: op3 := OP_SeekGT;
+          1: op3 := OP_SeekLE;
+          2: op3 := OP_SeekLT;
+          3: op3 := OP_SeekGE;
+        else op3 := OP_SeekGE;
+        end;
+      end
+      else
+      begin
+        r1 := sqlite3ExprCodeTemp(pParse, pX^.pRight, @rTemp);
+        disableTerm(pLevel, pStart);
+        case pX^.op of
+          TK_GT_TK: op3 := OP_SeekGT;
+          TK_LE:    op3 := OP_SeekLE;
+          TK_LT:    op3 := OP_SeekLT;
+          TK_GE:    op3 := OP_SeekGE;
+        else        op3 := OP_SeekGE;
+        end;
       end;
       sqlite3VdbeAddOp3(v, op3, pLevel^.iTabCur, pLevel^.addrBrk, r1);
       sqlite3ReleaseTempReg(pParse, rTemp);
@@ -25193,10 +25213,14 @@ begin
       Assert((pEnd^.wtFlags and TERM_VNULL) = 0);
       Inc(pParse^.nMem);
       memEndValue := pParse^.nMem;
-      sqlite3ExprCode(pParse, pX^.pRight, memEndValue);
+      { wherecode.c:1793 — code only the FIRST element of the (possibly
+        vector) RHS into memEndValue (codeExprOrVector nReg=1). }
+      codeExprOrVector(pParse, pX^.pRight, memEndValue, 1);
       { 9.4.divbug.83 — port wherecode.c:1794..1800 bRev branch of testOp.
-        Strict bounds (TK_LT / TK_GT) use Ge/Le; non-strict use Gt/Lt. }
-      if (pX^.op = TK_LT) or (pX^.op = TK_GT_TK) then
+        Scalar strict bounds (TK_LT / TK_GT) use Ge/Le; otherwise (non-strict
+        OR a vector RHS, whose residual handles the strictness) use Gt/Lt. }
+      if (sqlite3ExprIsVector(pX^.pRight) = 0)
+         and ((pX^.op = TK_LT) or (pX^.op = TK_GT_TK)) then
       begin
         if (pWInfo^.revMask and Bitmask(1)) <> 0 then
           testOp := OP_Le
@@ -25210,7 +25234,10 @@ begin
         else
           testOp := OP_Gt;
       end;
-      disableTerm(pLevel, pEnd);
+      { wherecode.c:1801..1803 — only disable the term (skip the residual)
+        when the RHS is scalar; a vector bound needs its residual compare. }
+      if sqlite3ExprIsVector(pX^.pRight) = 0 then
+        disableTerm(pLevel, pEnd);
     end;
 
     startAddr := sqlite3VdbeCurrentAddr(v);
