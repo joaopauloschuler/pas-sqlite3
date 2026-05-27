@@ -29289,6 +29289,29 @@ begin
   end;
 end;
 
+{ inAnyUsingClause — port of select.c:5917..5930.  Returns True if zName
+  appears in the USING() IdList of any of the N SrcItems FOLLOWING pBase
+  (pBase[1] .. pBase[N]).  Used by expandStar to decide whether a join
+  column on the LEFT of a RIGHT/FULL JOIN must be emitted as a bare TK_ID
+  (so lookupName can coalesce it / pick the right table) rather than a
+  TK_DOT/TK_COLUMN bound to this (left) table. }
+function inAnyUsingClause(zName: PAnsiChar; pBase: PSrcItem; N: i32): Boolean;
+var
+  p: PSrcItem;
+begin
+  Result := False;
+  p := pBase;
+  while N > 0 do
+  begin
+    Dec(N);
+    p := PSrcItem(PByte(p) + SizeOf(TSrcItem));
+    if (p^.fg.fgBits2 and $08) = 0 then Continue;  { not isUsing }
+    if p^.u3.pUsing = nil then Continue;
+    if sqlite3IdListIndex(p^.u3.pUsing, zName) >= 0 then
+    begin Result := True; Exit; end;
+  end;
+end;
+
 { expandStar — minimum-viable port of the TK_ASTERISK expansion arm
   inside selectExpander (select.c:830..980 / 6090..6326).  Builds a
   fresh pEList by replacing each top-level `*` (plain or `T.*`) with
@@ -29513,6 +29536,55 @@ begin
            (sqlite3IdListIndex(pItem^.u3.pUsing,
                                pCol^.zCnName) >= 0) then
           Continue;
+        { select.c:6261..6281 — RIGHT/FULL-JOIN coalescing of the shared join
+          column.  C decides between emitting a TABLE-QUALIFIED reference
+          (TK_DOT, which binds to THIS table) and a BARE column reference
+          (just the TK_ID, which lookupName resolves — picking the right-most
+          table for a RIGHT JOIN or building a coalesce() for a FULL JOIN).
+          The qualified form is used only when nSrc>1 AND (this item is NOT on
+          the LHS of a RIGHT/FULL JOIN, OR we are under SF_NestedFrom, OR the
+          column is NOT in any following USING clause).  Otherwise emit the
+          bare TK_ID so the shared join column coalesces correctly.
+
+          This port normally builds a fully-formed TK_COLUMN bound to
+          pItem^.iCursor (= this/left table).  For the bare-TK_ID case that is
+          WRONG on right/full-join-only rows (the left column is NULL there),
+          so emit a bare TK_ID instead and let sqlite3ResolveSelectNames
+          (lookupName) bind it to the correct cursor / coalesce. }
+        if (zTName = nil)
+           and (pSrc^.nSrc > 1)
+           and ((pItem^.fg.jointype and JT_LTORJ) <> 0)
+           and ((p^.selFlags and SF_NestedFrom) = 0)
+           and inAnyUsingClause(pCol^.zCnName, pItem, pSrc^.nSrc - i - 1)
+           and (not InRenameObject(pParse)) then
+        begin
+          zColName := pCol^.zCnName;
+          pColExpr := sqlite3Expr(db, TK_ID, zColName);
+          if pColExpr = nil then Continue;
+          if j < BMS - 1 then
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
+          else
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+          pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
+          if pNew <> nil then
+          begin
+            pNewItem := PExprListItem(PByte(ExprListItems(pNew)) +
+                          (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+            if longNames then
+            begin
+              if pItem^.zAlias <> nil then
+                zTabName := pItem^.zAlias
+              else
+                zTabName := pTab^.zName;
+              pNewItem^.zEName := sqlite3MPrintf(db, '%s.%s',
+                                    [zTabName, zColName]);
+            end else
+              pNewItem^.zEName := sqlite3DbStrDup(db, zColName);
+            pNewItem^.fg.eBits :=
+              (pNewItem^.fg.eBits and not u8($03)) or u8(ENAME_NAME);
+          end;
+          Continue;
+        end;
         { select.c:6260..6274 — under IN_RENAME_OBJECT, T.* must expand to a
           TK_DOT(TK_ID tab, TK_ID col) node (NOT the executable TK_COLUMN
           this port normally synthesises) and the new TK_ID `tab` left node
