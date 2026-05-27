@@ -36823,6 +36823,16 @@ begin
     a fresh register pair and emit a second OP_OffsetLimit, shadowing the
     already-adjusted shared counter and re-applying OFFSET from scratch
     (offset1-1.2.x). }
+  { select.c:8242..8244 (tag-select-0650) — reset the row estimate to the
+    "4 billion rows" default unless a prior compound LIMIT already pinned it
+    via SF_FixedLimit.  This MUST run before the inline computeLimitRegisters
+    arm below: the LIMIT-cap branch (select.c:2534) only fires when
+    `p->nSelectRow > LogEst(n)`, so without this reset nSelectRow can be 0
+    here and the cap (and SF_FixedLimit / WHERE_USE_LIMIT) never applies —
+    the planner then prices an ORDER-BY sort at full N instead of the LIMIT,
+    over-preferring an index scan that satisfies ORDER BY (index8-1.1eqp). }
+  if (p^.selFlags and SF_FixedLimit) = 0 then
+    p^.nSelectRow := 320;
   if p^.iLimit <> 0 then
   begin
     { fall through with the inherited registers; no new emission }
@@ -37024,8 +37034,10 @@ begin
     wctrlFlagsSel := wctrlFlagsSel or WHERE_WANT_DISTINCT;
   if (p^.selFlags and SF_FixedLimit) <> 0 then
     wctrlFlagsSel := wctrlFlagsSel or u16(SF_FixedLimit);
+  { select.c:8281 — pass p->nSelectRow as iAuxArg so pWInfo->iLimit carries
+    the LIMIT-capped row estimate into whereSortingCost's N-cap (where.c:5575). }
   pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
-                              pEList, p, wctrlFlagsSel, 0);
+                              pEList, p, wctrlFlagsSel, p^.nSelectRow);
   if pWInfo = nil then
   begin
     Result := SQLITE_ERROR; Exit;
