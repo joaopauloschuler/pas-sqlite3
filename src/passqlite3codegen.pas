@@ -11211,6 +11211,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pMatch: PSrcItem;
     matchCol: i32;
     cnt:    i32;
+    cntTab: i32;          { rowid-16.9 — visible-rowid candidate count (resolve.c cntTab) }
+    pRowidMatch: PSrcItem; { rowid-16.9 — chosen visible-rowid source (resolve.c pMatch) }
     pFJMatch: PExprList;  { 9.4.divbug.89.013 — FULL JOIN coalesce gather (resolve.c:297) }
     effCol: i16;          { iCol with IPK→-1 alias applied (resolve.c:466) }
     matchEffCol: i16;     { stored per-match effective column for extendFJMatch }
@@ -11682,17 +11684,44 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         is the expected error). }
       if sqlite3IsRowid(pE^.u.zToken) <> 0 then
       begin
+        { resolve.c:471..503 — every FROM source with a VisibleRowid is a
+          candidate ROWID match.  C tracks the candidate count in cntTab and
+          the chosen source in pMatch (the non-ALLOW_ROWID_IN_VIEW build does
+          `cntTab++; pMatch=pItem;` per qualifying source).  rowid-16.9 — when
+          TWO or more visible-rowid sources are in scope the bare `rowid` is
+          ambiguous: the rowid arm at resolve.c:623..638 sets `cnt=cntTab`,
+          and the standard `cnt>1` tail then raises "ambiguous column name".
+          16.1..16.8 — a single visible-rowid source (the WITHOUT-ROWID /
+          view / subquery siblings carry TF_NoVisibleRowid and do NOT count)
+          gives cntTab==1 → resolves to iColumn=-1.
+          9.4.divbug.90.008 — C uses VisibleRowid (sqliteInt.h:2545) here,
+          not HasRowid: subquery synthetic tables and views carry
+          TF_NoVisibleRowid and must NOT match a bare `rowid` reference,
+          otherwise iColumn=-1 is bound to a cursor whose pEList has no
+          such column and substExpr SIGSEGVs during WHERE pushdown
+          (misc8-3.0). }
+        cntTab := 0;
+        pRowidMatch := nil;
         for i := 0 to pSrc^.nSrc - 1 do
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
-          { 9.4.divbug.90.008 — C uses VisibleRowid (sqliteInt.h:2545) here,
-            not HasRowid: subquery synthetic tables and views carry
-            TF_NoVisibleRowid and must NOT match a bare `rowid` reference,
-            otherwise iColumn=-1 is bound to a cursor whose pEList has no
-            such column and substExpr SIGSEGVs during WHERE pushdown
-            (misc8-3.0). }
           if (pItem^.pSTab^.tabFlags and TF_NoVisibleRowid) <> 0 then Continue;
+          Inc(cntTab);          { resolve.c:500 cntTab++ }
+          pRowidMatch := pItem;  { resolve.c:501 pMatch=pItem }
+        end;
+        if cntTab >= 1 then
+        begin
+          { resolve.c:623..630 — cnt=cntTab; the cnt>1 ambiguity tail below
+            (resolve.c:761) then fires for two-or-more candidates. }
+          if cntTab > 1 then
+          begin
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('ambiguous column name: ' + AnsiString(pE^.u.zToken)));
+            sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+            Exit;
+          end;
+          pItem := pRowidMatch;
           pE^.op      := TK_COLUMN;
           pE^.iTable  := pItem^.iCursor;
           pE^.iColumn := i16(-1);
