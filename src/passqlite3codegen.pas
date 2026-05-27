@@ -38429,11 +38429,26 @@ begin
     Result := zDflt;
 end;
 
-{ sqlite3ColumnPropertiesFromName — set Column flags from name heuristics }
+{ sqlite3ColumnPropertiesFromName — set Column flags from the (magical)
+  name of the column.  Faithful port of build.c:1401 under
+  SQLITE_ENABLE_HIDDEN_COLUMNS. }
 procedure sqlite3ColumnPropertiesFromName(pTab: PTable2; pCol: PColumn);
+var
+  iCol: PtrUInt;
 begin
-  { heuristic: "rowid"-named column is not a hidden key }
-  { Phase 6.5 will add full implementation }
+  if sqlite3_strnicmp(pCol^.zCnName, PAnsiChar('__hidden__'), 10) = 0 then
+  begin
+    pCol^.colFlags := pCol^.colFlags or COLFLAG_HIDDEN;
+    if pTab <> nil then
+      pTab^.tabFlags := pTab^.tabFlags or TF_HasHidden;
+  end
+  else if (pTab <> nil) and (pCol <> @pTab^.aCol[0]) then
+  begin
+    { pCol != pTab->aCol && (pCol[-1].colFlags & COLFLAG_HIDDEN) }
+    iCol := (PtrUInt(pCol) - PtrUInt(@pTab^.aCol[0])) div SizeOf(TColumn);
+    if (pTab^.aCol[iCol - 1].colFlags and COLFLAG_HIDDEN) <> 0 then
+      pTab^.tabFlags := pTab^.tabFlags or TF_OOOHidden;
+  end;
 end;
 
 { sqlite3IdListIndex — find index of zName in IdList; -1 if not found }
@@ -44442,6 +44457,11 @@ begin
   begin
     pDestCol := @pDest^.aCol[i];
     pSrcCol  := @pSrc^.aCol[i];
+    { insert.c:3118..3124 — neither table may have __hidden__ columns
+      (except during VACUUM). }
+    if ((db^.mDbFlags and DBFLAG_Vacuum) = 0)
+       and (((pDestCol^.colFlags or pSrcCol^.colFlags) and COLFLAG_HIDDEN) <> 0) then
+      Exit;
     { COLFLAG_GENERATED match. }
     destGenerated := pDestCol^.colFlags and COLFLAG_GENERATED;
     srcGenerated  := pSrcCol^.colFlags  and COLFLAG_GENERATED;
