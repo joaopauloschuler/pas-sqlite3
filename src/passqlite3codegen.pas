@@ -56932,7 +56932,7 @@ const
     (name: 'recursive_triggers';       mask: SQLITE_RecTriggers),
     (name: 'reverse_unordered_selects';mask: SQLITE_ReverseOrder),
     (name: 'defer_foreign_keys';       mask: SQLITE_DeferFKs),
-    (name: 'writable_schema';          mask: SQLITE_WriteSchema),
+    (name: 'writable_schema';          mask: SQLITE_WriteSchema or SQLITE_NoSchemaError),
     (name: 'legacy_alter_table';       mask: SQLITE_LegacyAlter),
     (name: 'cell_size_check';          mask: SQLITE_CellSizeCk),
     (name: 'automatic_index';          mask: SQLITE_AutoIndex),

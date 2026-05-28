@@ -275,6 +275,7 @@ const
   SQLITE_CellSizeCk     = u64($00200000);
   SQLITE_CorruptRdOnly  = u64($02000000);  { internal flag }
   SQLITE_LegacyAlter    = u64($04000000);
+  SQLITE_NoSchemaError  = u64($08000000);  { Do not report schema parse errors }
   { HI() flag bits — sqliteInt.h: HI(X) = u64(X)<<32 }
   SQLITE_CountRows      = u64($0000000100000000);  { HI(0x00001) }
   SQLITE_ReadUncommit   = u64($0000000400000000);  { HI(0x00004) }
