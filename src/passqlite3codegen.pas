@@ -58087,7 +58087,12 @@ begin
       iVal := sqlite3BtreeSecureDelete(PBtree(db^.aDb[iDb].pBt), iVal);
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-      sqlite3VdbeReusable(v);
+      { pragma.c:642 — NO sqlite3VdbeReusable here.  The btree write that
+        mutates BTS_SECURE_DELETE happens at codegen time; if the prepared
+        statement were cached and re-run, the OP_Integer result would
+        replay but the propagation to db2 (and other attached pBts) would
+        not.  securedel-1.4..1.8 hit exactly this: PRAGMA secure_delete=ON
+        on a re-prepared statement left db2 stale at 0. }
       Exit;
     end;
 

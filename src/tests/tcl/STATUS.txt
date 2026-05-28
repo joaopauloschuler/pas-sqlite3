@@ -734,7 +734,7 @@ pas-strict	../sqlite3/test/schema4.test	-
 pas-strict	../sqlite3/test/schema5.test	-
 pas-strict	../sqlite3/test/schema6.test	-
 pas-skip	../sqlite3/test/schemafault.test	unswept
-pas-soft	../sqlite3/test/securedel.test	9.4.divbug.86
+pas-strict	../sqlite3/test/securedel.test	-
 pas-skip	../sqlite3/test/securedel2.test	9.4.divbug.84
 pas-strict	../sqlite3/test/seekscan1.test	-
 pas-soft	../sqlite3/test/select1.test	9.4.divbug.70
