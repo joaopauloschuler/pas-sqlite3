@@ -59050,7 +59050,6 @@ begin
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0
-    else if SameText(zName, 'journal_size_limit') then iVal := -1
     { pragma.c:951..978 PragTyp_MMAP_SIZE — when SQLITE_MAX_MMAP_SIZE<=0
       sz=0 and returnSingleInt(v, 0).  The Pas port does not yet wire
       sqlite3_file_control(SQLITE_FCNTL_MMAP_SIZE) so default to 0,
@@ -59085,6 +59084,33 @@ begin
       sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, i32(iValPragma));
     end else
       sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
+  { PragTyp_JOURNAL_SIZE_LIMIT (pragma.c:780..789).  Get/set the size limit
+    on rollback journal files via sqlite3PagerJournalSizeLimit (which also
+    propagates the new limit into pWal->mxWalSize via sqlite3WalLimit, so
+    `PRAGMA journal_size_limit=N` truncates the WAL on the next commit
+    that completes the first transaction in the WAL — wal7-2.0/3.0/4.0).
+    Read form passes iLimit=-2 (sqlite3PagerJournalSizeLimit treats <-1 as
+    read-only).  Both arms emit returnSingleInt with the (possibly updated)
+    current limit.  i64 because the limit may exceed 32-bit. }
+  if SameText(zName, 'journal_size_limit') then begin
+    iValPragma := -2;
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma);
+      if iValPragma < -1 then iValPragma := -1;
+    end;
+    pBtArg := PBtree(db^.aDb[iDb].pBt);
+    if pBtArg <> nil then
+      iValPragma := sqlite3PagerJournalSizeLimit(
+                       sqlite3BtreePager(pBtArg), iValPragma)
+    else
+      iValPragma := -1;
+    sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 1, 0, Pu8(@iValPragma), P4_INT64);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
