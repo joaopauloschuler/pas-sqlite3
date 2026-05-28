@@ -13282,7 +13282,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     n:    i32;
   begin
     if pX = nil then Exit;
-    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil) then
+    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil)
+       { Don't rewrite a window-function call (EP_WinFunc + non-FILTER
+         carrier) — resolve.c:1314 keeps op = TK_FUNCTION on the window
+         arm so sqlite3WindowRewrite + disallowAggregatesInOrderByCb don't
+         misfire (wherelimit2-6.1). }
+       and not (((pX^.flags and EP_WinFunc) <> 0)
+                and (pX^.y.pWin <> nil)
+                and (pX^.y.pWin^.eFrmType <> TK_FILTER)) then
     begin
       if ExprUseXList(pX) and (pX^.x.pList <> nil) then
         n := pX^.x.pList^.nExpr
@@ -31897,7 +31904,17 @@ var
   db:   PTsqlite3;
   n:    i32;
 begin
-  if (pExpr^.op = TK_FUNCTION) and (pExpr^.u.zToken <> nil) then
+  if (pExpr^.op = TK_FUNCTION) and (pExpr^.u.zToken <> nil)
+     { Don't rewrite window functions to TK_AGG_FUNCTION — resolve.c:1314
+       routes EP_WinFunc/pWin expressions through the window arm
+       (sqlite3WindowLink) and leaves op = TK_FUNCTION so
+       sqlite3WindowRewrite + disallowAggregatesInOrderByCb (window.c:942)
+       don't misfire "misuse of aggregate" on `ORDER BY rank()OVER()` etc.
+       (wherelimit2-6.1).  TK_FILTER eFrmType is the FILTER-only carrier
+       on a plain aggregate, which DOES need the rewrite. }
+     and not (((pExpr^.flags and EP_WinFunc) <> 0)
+              and (pExpr^.y.pWin <> nil)
+              and (pExpr^.y.pWin^.eFrmType <> TK_FILTER)) then
   begin
     if ExprUseXList(pExpr) and (pExpr^.x.pList <> nil) then
       n := pExpr^.x.pList^.nExpr
