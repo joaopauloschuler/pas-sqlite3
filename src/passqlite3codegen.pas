@@ -34112,12 +34112,13 @@ begin
     reached and sqlite3_vtab_distinct reports eDistinct=1 to match C.
     Non-redundant DISTINCT+GROUP BY still falls through to the simple
     DISTINCT path, which applies the dedup ephemeral correctly. }
-  bDistinctOverGroupOK := ((p^.selFlags and SF_Distinct) = 0);
-  if (not bDistinctOverGroupOK)
-     and (p^.pGroupBy <> nil) and (p^.pEList <> nil)
-     and (p^.pEList^.nExpr = p^.pGroupBy^.nExpr)
-     and (sqlite3ExprListCompare(p^.pEList, p^.pGroupBy, -1) = 0) then
-    bDistinctOverGroupOK := True;
+  { DISTINCT + GROUP BY: C runs the GROUP BY arm regardless of SF_Distinct
+    (select.c:8253..8260 opens the DISTINCT eph cursor unconditionally, then
+    8456 runs the GROUP BY arm which feeds rows through selectInnerLoop's
+    codeDistinct dedup at select.c:1297..1301).  Admit the case here and
+    open a per-output dedup ephemeral below; result-row emission applies
+    OP_Found / OP_MakeRecord / OP_IdxInsert before OP_ResultRow. }
+  bDistinctOverGroupOK := True;
   if (p^.pGroupBy <> nil)
      and bDistinctOverGroupOK
      and (p^.pWin = nil)
@@ -34346,6 +34347,26 @@ begin
                                                pAggI2^.nColumn);
       sqlite3VdbeAddOp4(v, OP_SorterOpen, pAggI2^.sortingIdx, nGroupBy, 0,
                         PAnsiChar(pKeyInfoGB), P4_KEYINFO);
+
+      { DISTINCT + GROUP BY (non-redundant): open the dedup ephemeral.
+        Mirrors select.c:8253..8260.  Per-group result-row emission below
+        gates on iTabTnct via OP_Found / OP_MakeRecord / OP_IdxInsert
+        before OP_ResultRow.  Skip when DISTINCT is provably redundant
+        over the GROUP BY key (pEList ~= pGroupBy) — that case yields
+        unique rows already. }
+      iTabTnct        := -1;
+      addrDistinctEph := -1;
+      if ((p^.selFlags and SF_Distinct) <> 0)
+         and not ((p^.pEList^.nExpr = p^.pGroupBy^.nExpr)
+                  and (sqlite3ExprListCompare(p^.pEList, p^.pGroupBy, -1) = 0)) then
+      begin
+        iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
+        pDistKey := sqlite3KeyInfoFromExprList(pParse, p^.pEList, 0, 0);
+        addrDistinctEph := sqlite3VdbeAddOp4(v, OP_OpenEphemeral,
+                                             iTabTnct, 0, 0,
+                                             PAnsiChar(pDistKey), P4_KEYINFO);
+        sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
+      end;
 
       { Bug 10.1.bug.12 — secondary sorter for ORDER BY when the GROUP BY
         ordering does not satisfy the ORDER BY.  Payload = pOrderBy keys
@@ -34774,6 +34795,24 @@ begin
         if r1 <> pDest^.iSdst + i then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
       end;
+      { DISTINCT dedup over the per-group output row — codeDistinct
+        UNORDERED arm (select.c:933..985, 1297..1301).  When DISTINCT
+        coexists with GROUP BY and is not provably redundant, gate
+        OP_ResultRow on OP_Found against the ephemeral opened above.
+        Jumps back to the addrOutputRow Return path when the row is a
+        duplicate so the subroutine returns without emitting. }
+      if iTabTnct >= 0 then
+      begin
+        rDistTmp := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4Int(v, OP_Found, iTabTnct, addrOutputRow + 1,
+                             pDest^.iSdst, nResultCol);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                          rDistTmp);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iTabTnct, rDistTmp,
+                             pDest^.iSdst, nResultCol);
+        sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+        sqlite3ReleaseTempReg(pParse, rDistTmp);
+      end;
       if needSortOB then
       begin
         { Push (orderKeys + resultCols) into the ORDER BY sorter.
@@ -34875,8 +34914,12 @@ begin
       { LIMIT counter — selectInnerLoop select.c:1522..1523.  When a LIMIT
         is in force (iLimit allocated by computeLimitRegisters above), the
         group-output subroutine decrements it after each emitted row and
-        aborts the scan once it reaches zero. }
-      if p^.iLimit <> 0 then
+        aborts the scan once it reaches zero.  When a secondary ORDER BY
+        sorter is in use (needSortOB) the LIMIT must run on the sorter
+        drain, not here — otherwise pre-sort rows are clipped, defeating
+        the LIMIT-after-sort semantics (view-9.2: DISTINCT + GROUP BY +
+        ORDER BY 1 LIMIT 3 over groups emitted in non-sorted order). }
+      if (p^.iLimit <> 0) and (not needSortOB) then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSetAbort);
       sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
 
@@ -34937,6 +34980,11 @@ begin
           sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
         else
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        { LIMIT on sorter drain — generateSortTail (select.c:1740..1748).
+          When LIMIT applies to the post-sort row stream, decrement after
+          each emit; jump to the break label once it hits zero. }
+        if p^.iLimit <> 0 then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrkOB);
         sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterOB, addrSortLoopOB);
         sqlite3VdbeResolveLabel(v, addrSortBrkOB);
         sqlite3ReleaseTempReg(pParse, regSortOutOB);
@@ -49742,11 +49790,13 @@ begin
   end;
 
   if (isView <> 0) and (pTab^.eTabType <> TABTYP_VIEW) then begin
-    sqlite3ErrorMsg(pParse, 'use DROP TABLE to delete table');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'use DROP TABLE to delete table %s', [pTab^.zName]));
     goto exit_drop_table;
   end;
   if (isView = 0) and (pTab^.eTabType = TABTYP_VIEW) then begin
-    sqlite3ErrorMsg(pParse, 'use DROP VIEW to delete view');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'use DROP VIEW to delete view %s', [pTab^.zName]));
     goto exit_drop_table;
   end;
 
