@@ -12159,6 +12159,15 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
          and (pE^.x.pList <> nil) then
         for i := 0 to nArg_ - 1 do
           ExprSetProperty(ExprListItems(pE^.x.pList)[i].pExpr, EP_SubtArg);
+      { resolve.c:1195..1201 — stamp EP_ConstFunc on TK_FUNCTION whose
+        registered def carries SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG,
+        so the wherePathSatisfiesOrderBy constant-ORDER-BY arm (where.c:5462)
+        and exprIsConst (expr.c:2557) can hoist abs(5) / similar pure
+        function calls (where2-2.6/2.6b). }
+      if (pDef_ <> nil)
+         and ((pDef_^.funcFlags
+               and (SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG)) <> 0) then
+        ExprSetProperty(pE, EP_ConstFunc);
     end;
     { resolve.c:1226..1231 — trusted-schema enforcement in the SELECT
       resolver.  When the resolved function carries SQLITE_FUNC_DIRECT
@@ -47225,6 +47234,12 @@ begin
     aRowEst[i + 1] := aVal[i];
   for i := nCopy + 1 to pIdx^.nKeyCol do
     aRowEst[i] := 23;
+  { build.c:4587..4588 — UNIQUE indices have at most one row per full key,
+    so the last aiRowLogEst slot is 0 (sqlite3LogEst(1) = 0).  Without this
+    the planner sees i1w (UNIQUE w) as 10-dups-per-key and prefers a
+    two-column non-unique index over it (where2-1.1). }
+  if pIdx^.onError <> OE_None then
+    aRowEst[pIdx^.nKeyCol] := 0;
 end;
 
 { estimateIndexWidth — port of build.c:2236..2246.
