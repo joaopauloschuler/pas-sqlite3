@@ -3083,6 +3083,13 @@ var
   gVtabOverloadFunction: TVtabOverloadFunctionFn;
   gVtabFindFunctionOp: TVtabFindFunctionOpFn;
   gVtabCallConnect: TVtabCallConnectFn;
+  { filter1-2.2/2.3 — unit-level NC_AllowAgg|NC_AllowWin tracker for
+    sqlite3ResolveSelectNames / ResolveExpr.  Mirrors the relevant bits of
+    resolve.c's NameContext.ncFlags so the misuse arm in the TK_FUNCTION
+    resolution path can distinguish "aggregate" vs "window" misuse inside a
+    FILTER subtree.  Saved/restored across each top-level invocation of
+    sqlite3ResolveSelectNames so recursive sub-SELECT resolution is isolated. }
+  gNcAllowAggWin: i32;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -12014,10 +12021,37 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     { resolve.c:1334 — walk pE^.y.pWin^.pFilter inside the TK_AGG_FUNCTION arm.
       Without this, column refs inside a FILTER (WHERE …) clause stay as TK_ID
       and never become TK_COLUMN, so the FILTER predicate cannot fire at
-      runtime.  Phase 6.10 step 17(e) sub-task (1). }
+      runtime.  Phase 6.10 step 17(e) sub-task (1).
+
+      filter1-2.2/2.3 — resolve.c:1292..1300: when the outer call is an
+      aggregate function, descend into its FILTER subtree with NC_AllowAgg
+      and NC_AllowWin cleared, so a nested aggregate or window misuse trips
+      the misuse arm with the C wording ("misuse of window/aggregate
+      function NAME()"). }
     if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
        and (pE^.y.pWin^.pFilter <> nil) then
-      ResolveExpr(pE^.y.pWin^.pFilter);
+    begin
+      if (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil) and ExprUseXList(pE) then
+      begin
+        if pE^.x.pList <> nil then nArg_ := pE^.x.pList^.nExpr else nArg_ := 0;
+        pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg_,
+                                     pParse^.db^.enc, 0);
+        if pDef_ = nil then
+          pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                       pParse^.db^.enc, 0);
+      end
+      else
+        pDef_ := nil;
+      if (pDef_ <> nil) and Assigned(pDef_^.xFinalize) then
+      begin
+        iCol := gNcAllowAggWin;
+        gNcAllowAggWin := gNcAllowAggWin and not (NC_AllowAgg or NC_AllowWin);
+        ResolveExpr(pE^.y.pWin^.pFilter);
+        gNcAllowAggWin := iCol;
+      end
+      else
+        ResolveExpr(pE^.y.pWin^.pFilter);
+    end;
     if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
     begin
       if (pE^.flags and EP_xIsSelect) = 0 then
@@ -12371,6 +12405,47 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           begin
             sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
               '%s() may not be used as a window function', [pE^.u.zToken]));
+            sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          end
+          else
+          { resolve.c:1245..1259 — misuse arm.  Order mirrors C exactly:
+              (is_agg && NC_AllowAgg==0)
+              || (is_agg && SQLITE_FUNC_WINDOW && !pWin)
+              || (is_agg && pWin && NC_AllowWin==0)
+            When `pDef->funcFlags & SQLITE_FUNC_WINDOW` OR `pWin` is set,
+            the diagnostic says "window function"; otherwise "aggregate
+            function".  Without this arm, an aggregate-inside-aggregate-FILTER
+            or window-inside-aggregate-FILTER misuse silently passed resolve
+            then triggered the late codegen arm with the wrong wording
+            ("misuse of aggregate: NAME()" instead of "misuse of aggregate
+            function NAME()" / "misuse of window function NAME()").
+            filter1-2.2/2.3. }
+          if Assigned(pDef_^.xFinalize)
+             and ( ((gNcAllowAggWin and NC_AllowAgg) = 0)
+                or (((pDef_^.funcFlags and SQLITE_FUNC_WINDOW) <> 0) and (pWin_ = nil))
+                or ((pWin_ <> nil) and ((gNcAllowAggWin and NC_AllowWin) = 0)) ) then
+          begin
+            if ((pDef_^.funcFlags and SQLITE_FUNC_WINDOW) <> 0) or (pWin_ <> nil) then
+              sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+                'misuse of window function %s()', [pE^.u.zToken]))
+            else
+              sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+                'misuse of aggregate function %s()', [pE^.u.zToken]));
+            sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          end
+          else
+          { resolve.c:1280..1286 — FILTER may not be used with a non-aggregate
+            function.  Fires when is_agg=0 (pDef^.xFinalize nil) and the
+            parser attached a FILTER clause (EP_WinFunc set).  Required for
+            filter1-2.1: `SELECT upper(a) FILTER (WHERE a=1) FROM t1` must
+            error rather than silently dropping the FILTER and returning
+            all rows. }
+          if (not Assigned(pDef_^.xFinalize))
+             and ExprHasProperty(pE, EP_WinFunc) then
+          begin
+            sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+              'FILTER may not be used with non-aggregate %s()',
+              [pE^.u.zToken]));
             sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
           end;
         end;
@@ -13237,9 +13312,19 @@ var
   i_:         i32;          { 9.4.divbug.30 — ORDER BY alias walk index }
   items_:     PExprListItem; { 9.4.divbug.30 — ORDER BY alias walk items }
   pWinDef:    PWindow;       { altertab3-1.x — IN_RENAME_OBJECT window-def resolve }
+  savedNcAllowAggWin: i32;   { filter1-2.2/2.3 — save/restore for nested calls
+                               on the unit-level gNcAllowAggWin (resolve.c:1948
+                               re-inits sNC.ncFlags per Select; we save/restore
+                               around each top-level invocation so recursive
+                               sub-SELECT resolution is isolated). }
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
+  { resolve.c:1948 sNC.ncFlags = NC_AllowAgg|NC_AllowWin; both flags default
+    set at top-level SELECT resolution.  Cleared in C when descending into an
+    aggregate function's FILTER subtree (resolve.c:1297 with !pWin). }
+  savedNcAllowAggWin := gNcAllowAggWin;
+  gNcAllowAggWin := NC_AllowAgg or NC_AllowWin;
   { Walk the compound pPrior chain so every leaf SELECT in a UNION ALL
     has its expressions resolved against its own FROM clause.  Mirrors
     C resolve.c which dispatches per-Select via the walker. }
@@ -13494,6 +13579,11 @@ begin
   p := p^.pPrior;
   end;
   p := pTopSel;
+  { filter1-2.2/2.3 — restore the unit-level NC_AllowAgg/NC_AllowWin tracker
+    so that an outer (caller's) sqlite3ResolveSelectNames invocation sees
+    its own previously-saved flag state.  The local 'savedNcAllowAggWin' was
+    snapshotted at the head of begin (before we set it to the default). }
+  gNcAllowAggWin := savedNcAllowAggWin;
 end;
 
 { resolve.c:1226..1231 — DDL self-reference trusted-schema enforcement.
@@ -72231,6 +72321,9 @@ end;
 {$ENDIF}
 
 initialization
+  { filter1-2.2/2.3 — sentinel-default the resolver NC_AllowAgg|NC_AllowWin
+    tracker (sqlite3ResolveSelectNames sets it before each top-level walk). }
+  gNcAllowAggWin := NC_AllowAgg or NC_AllowWin;
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
     autovacuum follow-on) call through these to reach the real ports
