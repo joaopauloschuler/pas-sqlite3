@@ -7125,6 +7125,58 @@ begin
   end;
 end;
 
+{ notNullStrengthReductionCb (resolve.c:1022..1062) — TK_NOTNULL/TK_ISNULL
+  strength reduction in WHERE clauses.  For non-nullable operands, fold
+  `X IS NULL` → 0 and `X IS NOT NULL` → 1.  Prune descent into subqueries
+  (TK_SELECT/TK_EXISTS/TK_IN with EP_xIsSelect) because each subquery has
+  its own NameContext without NC_Where in C. }
+function notNullStrengthReductionCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+begin
+  { Don't descend into subqueries — they have their own NC scope. }
+  if (pExpr^.op = TK_SELECT) or (pExpr^.op = TK_EXISTS)
+     or ((pExpr^.op = TK_IN) and ExprUseXSelect(pExpr)) then
+  begin
+    Result := WRC_Prune;
+    Exit;
+  end;
+  if (pExpr^.op = TK_NOTNULL) or (pExpr^.op = TK_ISNULL) then
+  begin
+    if (pExpr^.pLeft <> nil) and (sqlite3ExprCanBeNull(pExpr^.pLeft) = 0) then
+    begin
+      Assert(not ExprHasProperty(pExpr, EP_IntValue));
+      if pExpr^.op = TK_NOTNULL then
+        pExpr^.u.iValue := 1
+      else
+        pExpr^.u.iValue := 0;
+      pExpr^.flags := pExpr^.flags or EP_IntValue;
+      pExpr^.op := TK_INTEGER;
+      sqlite3ExprDelete(pWalker^.pParse^.db, pExpr^.pLeft);
+      pExpr^.pLeft := nil;
+      Result := WRC_Prune;
+      Exit;
+    end;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ Apply NOT NULL strength reduction to every TK_NOTNULL/TK_ISNULL in pWhere.
+  Mirrors the NC_Where arm of resolveExprStep (resolve.c:1022..1062 +
+  resolve.c:1987 sNC.ncFlags|=NC_Where).  This port lacks the full
+  per-node resolveExprStep walker, so apply the reduction as a post-pass
+  over pWhere only.  notnull2-1.4.1: `0==(d IS NOT NULL)` on NOT NULL d
+  must fold to `0==1`→ FALSE so the WHERE is constant-false. }
+procedure ApplyNotNullStrengthReductionWhere(pParse: PParse; pWhere: PExpr);
+var
+  w: TWalker;
+begin
+  if pWhere = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.pParse          := pParse;
+  w.xExprCallback   := @notNullStrengthReductionCb;
+  w.xSelectCallback := @sqlite3SelectWalkFail;
+  sqlite3WalkExpr(@w, pWhere);
+end;
+
 { sqlite3CompareAffinity (expr.c:342..358) — pExpr is one operand of a
   comparison; aff2 is the affinity of the other.  Returns the affinity that
   should be used for the comparison.  When both sides are columns, picks
@@ -13390,6 +13442,14 @@ begin
     ResolveAliasInWhere(p^.pWhere);
   if pParse^.nErr = 0 then
     ResolveExpr    (p^.pWhere);
+  { resolve.c:1022..1062 / 1987 — apply NOT NULL strength reduction to
+    pWhere now that columns are bound (so sqlite3ExprCanBeNull can consult
+    aCol[i].notNull).  In C this runs inline in resolveExprStep gated by
+    NC_Where; Pas's lean ResolveExpr lacks that arm.  Fixes notnull2-1.4.1
+    (vmsteps must collapse to <100 once `d IS NOT NULL` folds to 1 and
+    `0==1` constant-folds to FALSE during planning). }
+  if (pParse^.nErr = 0) and (p^.pWhere <> nil) then
+    ApplyNotNullStrengthReductionWhere(pParse, p^.pWhere);
   { resolve.c:1112..1266 — an aggregate-function call resolved in WHERE is
     illegal.  In an aggregate query (NC_AllowAgg set) rewrite it to
     TK_AGG_FUNCTION so codegen emits "misuse of aggregate: NAME()"
