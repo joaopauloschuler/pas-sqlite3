@@ -64652,10 +64652,14 @@ end;
   to be treated as deferred).  Matches C semantically when DeferFKs is set;
   the per-FK INITIALLY DEFERRED case still no-ops until TFKey lands. }
 procedure sqlite3FkDropTable(pParse: PParse; pName: PSrcList; pTab: PTable2);
+const
+  FKEY_PNEXTFROM_OFFSET  = 8;
+  FKEY_ISDEFERRED_OFFSET = 44;
 var
   db:    PTsqlite3;
   v:     PVdbe;
   iSkip: i32;
+  pFK:   Pu8;
 begin
   db := pParse^.db;
   if ((db^.flags and SQLITE_ForeignKeys) = 0)
@@ -64669,10 +64673,18 @@ begin
   iSkip := 0;
   if sqlite3FkReferences(pTab) = nil then
   begin
-    { Table is not parent of any FK.  Decide whether the deferred-child
-      arm needs the FkIfZero skip. }
-    if pTab^.u.tab.pFKey = nil then Exit;
-    if (db^.flags and SQLITE_DeferFKs) = 0 then Exit;  { partial: cannot inspect p^.isDeferred }
+    { Table is not parent of any FK.  Walk pTab->u.tab.pFKey chain for a
+      deferred FK (per-FK isDeferred OR global SQLITE_DeferFKs).  Match
+      fkey.c:751..754. }
+    pFK := Pu8(pTab^.u.tab.pFKey);
+    while pFK <> nil do
+    begin
+      if ((pFK + FKEY_ISDEFERRED_OFFSET)^ <> 0)
+         or ((db^.flags and SQLITE_DeferFKs) <> 0) then
+        break;
+      pFK := Pu8(PPointer(pFK + FKEY_PNEXTFROM_OFFSET)^);
+    end;
+    if pFK = nil then Exit;
     iSkip := sqlite3VdbeMakeLabel(pParse);
     sqlite3VdbeAddOp2(v, OP_FkIfZero, 1, iSkip);
   end;
