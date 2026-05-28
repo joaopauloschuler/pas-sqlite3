@@ -12717,12 +12717,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           non-rename path, record iOrderByCol for the merge-sort path. }
         if sqlite3ExprIsInteger(pE, @iCol, nil) <> 0 then
         begin
-          if (iCol >= 1) and (iCol <= pEList^.nExpr) then
+          if (iCol <= 0) or (iCol > pEList^.nExpr) then
           begin
-            if not InRenameObject(pParse) then
-              pItems[i].u.x.iOrderByCol := u16(iCol);
-            pItems[i].fg.eBits := pItems[i].fg.eBits or $04;  { fg.done }
+            { resolve.c:1626..1629 — integer out of range is an immediate
+              error; C returns 1 here.  Without this arm the term silently
+              falls through and is later misreported as "does not match any
+              column in the result set" (select4-5.2h). }
+            resolveOutOfRangeError(pParse, 'ORDER', i + 1, pEList^.nExpr, pE);
+            Exit;
           end;
+          if not InRenameObject(pParse) then
+            pItems[i].u.x.iOrderByCol := u16(iCol);
+          pItems[i].fg.eBits := pItems[i].fg.eBits or $04;  { fg.done }
           Continue;
         end;
         { resolveAsName arm — resolve.c:1631.  Matches a bare TK_ID against
