@@ -11281,7 +11281,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   begin
     if pX = nil then Exit;
     if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
-    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil)
+    if ((pX^.op = TK_FUNCTION) or (pX^.op = TK_AGG_FUNCTION))
+       and (pX^.u.zToken <> nil)
        and ((pX^.flags and EP_xIsSelect) = 0) then
     begin
       if pX^.x.pList <> nil then n := pX^.x.pList^.nExpr else n := 0;
@@ -11303,6 +11304,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
         if refOuter and not refInner then
         begin
+          { aggnested-3.11: MarkOrRejectAggInWhere may have already
+            converted TK_FUNCTION→TK_AGG_FUNCTION with op2=0 (treating
+            the agg as belonging to inner's WHERE).  Re-rebind to outer
+            by bumping op2 to 1 so analyzeAggregate's depth gate fires. }
           pX^.op  := TK_AGG_FUNCTION;
           pX^.op2 := 1;
           bFound  := True;
