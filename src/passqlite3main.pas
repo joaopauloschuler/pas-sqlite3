@@ -1072,6 +1072,12 @@ begin
     if rc <> SQLITE_OK then goto opendb_out;
   end;
 
+  { main.c:3654 — install the default WAL auto-checkpoint hook so that
+    `PRAGMA wal_autocheckpoint` reports SQLITE_DEFAULT_WAL_AUTOCHECKPOINT
+    (1000) on a fresh connection and auto-checkpoints fire at that
+    frame threshold (walhook-2.1, e_walauto). }
+  sqlite3_wal_autocheckpoint(db, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT);
+
 opendb_out:
   if (rc and $FF) = SQLITE_NOMEM then begin
     sqlite3_close(db);
