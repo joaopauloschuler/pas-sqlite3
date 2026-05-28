@@ -1768,15 +1768,28 @@ const
 
 function sqlite3_vtab_collation(pIdxInfo: PSqlite3IndexInfo;
   iCons: i32): PAnsiChar; cdecl;
+var
+  pHidden: PHiddenIndexInfo;
+  pC:      PTCollSeq;
+  iTerm:   i32;
+  pTerm:   PWhereTerm;
+  pX:      passqlite3codegen.PExpr;
 begin
-  if (pIdxInfo = nil)
-     or (iCons < 0)
-     or (iCons >= pIdxInfo^.nConstraint) then
+  Result := nil;
+  if (iCons >= 0) and (pIdxInfo <> nil) and (iCons < pIdxInfo^.nConstraint) then
   begin
-    Result := nil;
-    Exit;
+    pHidden := PHiddenIndexInfo(PByte(pIdxInfo) + SizeOf(Tsqlite3_index_info));
+    pC      := nil;
+    iTerm   := pIdxInfo^.aConstraint[iCons].iTermOffset;
+    pTerm   := termFromWhereClause(pHidden^.pWC, iTerm);
+    pX      := pTerm^.pExpr;
+    if pX^.pLeft <> nil then
+      pC := PTCollSeq(sqlite3ExprCompareCollSeq(pHidden^.pParse, pX));
+    if pC <> nil then
+      Result := pC^.zName
+    else
+      Result := zBINARY;
   end;
-  Result := zBINARY;
 end;
 
 { HiddenInfoOf — recover the THiddenIndexInfo header that allocateIndexInfo
