@@ -8840,6 +8840,42 @@ var
 
 begin
   if pE = nil then Exit;
+  { resolve.c:1163..1176 — SQLITE_FUNCTION authorizer.  Fire the auth
+    callback as the function-call node is encountered, BEFORE descending
+    into argument resolution (preorder, matching C's resolveExprStep walker
+    order).  The full ResolveExpr (codegen.pas:12023) handles the SELECT
+    path; this lean walker is reached by UPDATE SET / WHERE, DELETE WHERE,
+    CHECK, DEFAULT, partial-index WHERE and trigger bodies — all of which
+    must also fire SQLITE_FUNCTION on every called function (alterauth2
+    1.1..1.7: nested-parse UPDATE SET sql=sqlite_rename_table(...) emitted
+    no auth, so the helpers used by ALTER TABLE went unreported).  Gated
+    on a live authorizer and 0==IN_RENAME_OBJECT (sqlite3AuthCheck asserts
+    !IN_RENAME_OBJECT under SQLITE_OMIT_AUTHORIZATION builds, but in the
+    productive path the eParseMode!=NORMAL guard inside sqlite3AuthCheck
+    already no-ops the call during rename-resolution and schema init). }
+  if (pE^.op = TK_FUNCTION) and (pParse <> nil)
+     and (pParse^.db^.xAuth <> nil)
+     and (not InRenameObject(pParse))
+     and (pE^.u.zToken <> nil) and ExprUseXList(pE) then
+  begin
+    if pE^.x.pList <> nil then nArgU := pE^.x.pList^.nExpr else nArgU := 0;
+    pDefU := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArgU,
+                                 pParse^.db^.enc, 0);
+    if pDefU = nil then
+      pDefU := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                   pParse^.db^.enc, 0);
+    if pDefU <> nil then
+    begin
+      if sqlite3AuthCheck(pParse, SQLITE_FUNCTION_AUTH, nil,
+                          pDefU^.zName, nil) <> SQLITE_OK then
+      begin
+        { resolve.c:1172 — DENY/IGNORE rewrites the call to a NULL literal
+          and prunes the walk (no descent into args). }
+        pE^.op := TK_NULL;
+        Exit;
+      end;
+    end;
+  end;
   { resolve.c:1140..1161 (TK_FUNCTION arm of resolveExprStep) — validate the
     SQLITE_FUNC_UNLIKELY family in any resolution context that flows through
     this lean walker (CREATE INDEX / CHECK / DEFAULT / partial-index WHERE),
