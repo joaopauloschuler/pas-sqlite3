@@ -44696,11 +44696,14 @@ generic_coro_done:
         sqlite3VdbeJumpHere(v, addrIpkNotNull);
         sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
       end
-      else if (pTab^.iPKey < 0) and (ipkColumn >= 0) then
+      else if ipkColumn >= 0 then
       begin
-        { Rowid alias named in IDLIST, no declared INTEGER PRIMARY KEY —
-          C insert.c:1506..1535.  Load the user-supplied rowid term, then
-          fall back to OP_NewRowid when it is NULL. }
+        { Rowid alias named in IDLIST (rowid/_rowid_/oid) — whether or not the
+          table has a declared INTEGER PRIMARY KEY.  C insert.c:1506..1535
+          treats both cases identically once ipkColumn>=0: load the
+          user-supplied rowid term, fall back to OP_NewRowid when NULL.
+          Previously the iPKey>=0 + rowid-alias case fell through to the
+          default OP_NewRowid arm (auto-rowid=1), losing the user value. }
         if useTempTable then
           sqlite3VdbeAddOp3(v, OP_Column, srcTab, ipkColumn, regRowid)
         else if useCoroutine then
@@ -47763,7 +47766,8 @@ begin
       goto begin_table_error;
     end;
     if sqlite3FindIndex(db, zName, zDb) <> nil then begin
-      sqlite3ErrorMsg(pParse, 'there is already an index with that name');
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'there is already an index named %s', [zName]));
       goto begin_table_error;
     end;
   end;
@@ -47949,7 +47953,8 @@ begin
   db := pParse^.db;
 
   if i32(p^.nCol) + 1 > db^.aLimit[SQLITE_LIMIT_COLUMN] then begin
-    sqlite3ErrorMsg(pParse, 'too many columns');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'too many columns on %s', [AnsiString(p^.zName)]));
     Exit;
   end;
 
@@ -65119,6 +65124,13 @@ begin
   iJD := Int64(tv.tv_sec) * Int64(1000)
          + (Int64(tv.tv_usec) div Int64(1000))
          + Int64(210866760000000);
+{$ifdef SQLITE_TEST}
+  { os_unix.c:7210..7213 / test1.c:9380 — honour the pinned $sqlite_current_time
+    override so date/time tests (e_createtable-3.5/3.8 etc.) are deterministic.
+    Mirrors what setDateTimeToCurrent receives through the VFS path. }
+  if sqlite3_current_time <> 0 then
+    iJD := Int64(1000) * sqlite3_current_time + Int64(210866760000000);
+{$endif}
   Result := Double(iJD) / Double(86400000.0);
 end;
 

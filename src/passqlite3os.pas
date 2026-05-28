@@ -779,6 +779,11 @@ var
     real close in unixClose_impl (os_unix.c:2332 OpenCounter(-1)).
     Linked into Tcl as $sqlite_open_file_count (test1.c:9378). }
   sqlite3_open_file_count   : cint = 0;
+  { os_unix.c:7180 — fake system time (seconds since 1970) used by tests
+    that need a pinned clock.  When non-zero, unixCurrentTimeInt64 returns
+    `1000*sqlite3_current_time + unixEpoch` instead of the wall clock.
+    Linked into Tcl as $sqlite_current_time (test1.c:9380). }
+  sqlite3_current_time      : cint = 0;
 {$endif}
 
 
@@ -2725,6 +2730,11 @@ var
 begin
   libc_gettimeofday(@tv, nil);
   piNow^ := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
+{$ifdef SQLITE_TEST}
+  { os_unix.c:7210..7213 — honour the SQLITE_TEST clock override. }
+  if sqlite3_current_time <> 0 then
+    piNow^ := i64(1000) * sqlite3_current_time + unixEpoch;
+{$endif}
   Result := 0;
 end;
 
