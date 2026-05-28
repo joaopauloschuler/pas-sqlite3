@@ -34347,7 +34347,7 @@ begin
   if (p^.pGroupBy <> nil)
      and bDistinctOverGroupOK
      and (p^.pWin = nil)
-     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
+     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 0)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine)
@@ -34363,8 +34363,21 @@ begin
       populated.  Disposal arm at the post-finalize result-render below
       handles SRT_Set (MakeRecord with zAffSdst + IdxInsert).  Mirrors C
       select.c:8456 (no eDest gate). }
-    pItem := SrcListItems(p^.pSrc);
-    pTab  := pItem^.pSTab;
+    if p^.pSrc^.nSrc = 0 then
+    begin
+      { No-FROM GROUP BY (`SELECT 1,2,3 GROUP BY 2 [HAVING ...]`) — admit
+        and fall through to the WhereBegin/AggInfo plumbing.  C reaches the
+        same code via select.c:8456 with nTabList=0 and WhereBegin's
+        no-FROM special case (where.c:6942..6955) drives a single
+        constant-row scan.  e_select-0.2.0001.1 family. }
+      pItem := nil;
+      pTab  := nil;
+    end
+    else
+    begin
+      pItem := SrcListItems(p^.pSrc);
+      pTab  := pItem^.pSTab;
+    end;
     if p^.pSrc^.nSrc = 1 then
     begin
       { Single-source GROUP BY.  Match select.c:8456 — no special bail
