@@ -34439,7 +34439,8 @@ begin
         Without obCandidate the arm bailed here producing zero rows, so
         `INSERT INTO t SELECT ... GROUP BY ... EXCEPT SELECT ...` inserted
         nothing (insert2-1.2.x / 1.3.x). }
-      if (pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine) then
+      if (pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
+         or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table) then
         obCandidate := True
       else if orderByGrp = 0 then
       begin
@@ -35200,6 +35201,20 @@ begin
           yield the row to the consumer coroutine instead of OP_ResultRow. }
         if pDest^.eDest = SRT_Coroutine then
           sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else if (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table) then
+        begin
+          { Sorter-drain disposal for SRT_EphemTab/SRT_Table — append the
+            now-sorted row to the consumer's rowid-keyed eph cursor
+            (mirrors selectInnerLoop SRT_Table arm, select.c:1349..1370). }
+          r1 := sqlite3GetTempReg(pParse);
+          r2 := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+          sqlite3VdbeAddOp2(v, OP_NewRowid,   pDest^.iSDParm, r2);
+          sqlite3VdbeAddOp3(v, OP_Insert,     pDest^.iSDParm, r1, r2);
+          sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+          sqlite3ReleaseTempReg(pParse, r2);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
         else
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
         { LIMIT on sorter drain — generateSortTail (select.c:1740..1748).
