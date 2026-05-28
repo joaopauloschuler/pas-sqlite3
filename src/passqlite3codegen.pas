@@ -31752,6 +31752,8 @@ var
   pAFunc: PAggInfoFunc;
   pOBList: PExprList;
   enc: u8;
+  pIEpr: PIndexedExpr;
+  tmp: TExpr;
 begin
   pNC  := pWalker^.u.pNC;
   pP   := pNC^.pParse;
@@ -31875,10 +31877,59 @@ begin
     end;
     else
     begin
-      { Default arm — IndexedExpr shortcut.  Pas port keeps pIdxEpr=nil,
-        so this is currently always a no-op (matches C's break;). }
-      if pP^.pIdxEpr = nil then begin Result := WRC_Continue; Exit; end;
-      Result := WRC_Continue;
+      { Default arm — IndexedExpr shortcut (expr.c:7392..7432).
+        When walking aggregate-function args, look for an indexed
+        expression that matches pExpr; if found, rewrite pExpr to a
+        TK_AGG_COLUMN reference to the index column so the agg-step
+        loads the precomputed value instead of recomputing. }
+      Assert(pP^.iSelfTab = 0);
+      if (pNC^.ncFlags and NC_InAggFunc) = 0 then
+      begin Result := WRC_Continue; Exit; end;
+      if pP^.pIdxEpr = nil then
+      begin Result := WRC_Continue; Exit; end;
+      pIEpr := PIndexedExpr(pP^.pIdxEpr);
+      while pIEpr <> nil do
+      begin
+        if pIEpr^.iDataCur >= 0 then
+        begin
+          if sqlite3ExprCompare(nil, pExpr, pIEpr^.pExpr, pIEpr^.iDataCur) = 0 then
+            break;
+        end;
+        pIEpr := pIEpr^.pIENext;
+      end;
+      if pIEpr = nil then
+      begin Result := WRC_Continue; Exit; end;
+      { ExprUseYTab: (flags & EP_xIsSelect)==0 }
+      if (pExpr^.flags and EP_xIsSelect) <> 0 then
+      begin Result := WRC_Continue; Exit; end;
+      if pSL = nil then
+      begin Result := WRC_Continue; Exit; end;
+      srcItems := SrcListItems(pSL);
+      i := 0;
+      while i < pSL^.nSrc do
+      begin
+        if srcItems[i].iCursor = pIEpr^.iDataCur then break;
+        Inc(i);
+      end;
+      if i >= pSL^.nSrc then
+      begin Result := WRC_Continue; Exit; end;
+      if pExpr^.pAggInfo <> nil then
+      begin Result := WRC_Continue; Exit; end;
+      if pP^.nErr <> 0 then
+      begin Result := WRC_Abort; Exit; end;
+      FillChar(tmp, SizeOf(tmp), 0);
+      tmp.op      := TK_AGG_COLUMN;
+      tmp.iTable  := pIEpr^.iIdxCur;
+      tmp.iColumn := pIEpr^.iIdxCol;
+      findOrCreateAggInfoColumn(pP, pAgg, @tmp);
+      if pP^.nErr <> 0 then
+      begin Result := WRC_Abort; Exit; end;
+      Assert(pAgg^.aCol <> nil);
+      Assert(tmp.iAgg < pAgg^.nColumn);
+      pAgg^.aCol[tmp.iAgg].pCExpr := pExpr;
+      pExpr^.pAggInfo := pAgg;
+      pExpr^.iAgg := tmp.iAgg;
+      Result := WRC_Prune;
       Exit;
     end;
   end;
