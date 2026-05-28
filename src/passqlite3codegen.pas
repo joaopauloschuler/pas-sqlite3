@@ -29650,8 +29650,16 @@ begin
         { select.c:6232 — only hidden columns are omitted from `*`.
           VIRTUAL generated columns must still appear. }
         if (pCol^.colFlags and COLFLAG_HIDDEN) <> 0 then Continue;
+        { select.c:6241..6246 — a COLFLAG_NOEXPAND column is skipped from a
+          bare `*` (zTName=nil) ONLY when the SELECT is NOT itself an
+          SF_NestedFrom wrapper.  Under SF_NestedFrom the duplicate USING
+          columns (e.g. the right-side `a` of `t4 JOIN t5 USING(a)`) must be
+          KEPT (re-marked bNoExpand below) so an outer qualified reference
+          like `t5.a` two-or-more levels deep can still match through this
+          wrapper's pEList (joinC-1, t5.a/t4.a at 2+ nesting levels). }
         if ((pCol^.colFlags and COLFLAG_NOEXPAND) <> 0) and
-           (zTName = nil) then Continue;
+           (zTName = nil) and
+           ((p^.selFlags and SF_NestedFrom) = 0) then Continue;
         { select.c:6251..6258 — for non-T.* expansion of a non-first FROM
           item that is part of a USING-style join, omit any column whose
           name appears in the USING IdList.  This is what NATURAL JOIN
