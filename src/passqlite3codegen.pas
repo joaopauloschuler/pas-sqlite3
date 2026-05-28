@@ -37788,6 +37788,28 @@ begin
             sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
                               pItem^.pSTab^.nCol);
             sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
+            { with3-3.1.2 / 3.1.3 / 3.2.2 — recursive-CTE FROM item:
+              C runs this as a coroutine (fromClauseTermCanBeCoroutine true)
+              and emits "CO-ROUTINE %!S" before recursing (select.c:8054),
+              under which the body's SETUP / RECURSIVE STEP nest.  Pas
+              materialises here instead, but the EQP wrapper must still be
+              emitted so the inner SETUP/RECURSIVE STEP nest correctly.
+              Narrowly gated on recursive-compound subqueries to avoid
+              perturbing non-recursive FROM-subquery EQP. }
+            if (pItem^.u4.pSubq^.pSelect^.pPrior <> nil)
+               and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Recursive) <> 0)
+               and (hasAnchor(pItem^.u4.pSubq^.pSelect) <> 0) then
+            begin
+              ctAddrExplain := pParse^.addrExplain;
+              sqlite3VdbeExplain(pParse, 1, 'CO-ROUTINE %!S', [Pointer(pItem)]);
+              if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+              begin
+                pParse^.addrExplain := ctAddrExplain;
+                Result := SQLITE_ERROR; Exit;
+              end;
+              pParse^.addrExplain := ctAddrExplain;
+            end
+            else
             if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
             begin
               Result := SQLITE_ERROR; Exit;
