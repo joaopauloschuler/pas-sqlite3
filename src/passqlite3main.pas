@@ -3447,6 +3447,23 @@ begin
     of step 11g.1+. }
   // if (rc = SQLITE_OK) and (initData.nInitRow = 0) then
   //   rc := SQLITE_CORRUPT;
+  { Port-local NoSchemaError swallow — see prepare.c:393 in sqlite3InitOne.
+    Because we drop the WHERE/ORDER BY filter on the schema-cache SELECT
+    (banner above), this OP_ParseSchema iterates every sqlite_schema row
+    on every fire — including rows whose CREATE text is corrupt (e.g.
+    after PRAGMA writable_schema=ON; UPDATE sqlite_master...; VACUUM in
+    misc4-7.2).  C's vdbe.c:7152..7154 filters by the caller-supplied
+    "tbl_name=... AND type!=..." predicate so a corrupt unrelated row is
+    never touched.  Until the productive Select-with-WHERE arm is wired
+    here, mirror sqlite3InitOne's writable_schema lenience: when
+    SQLITE_NoSchemaError is set, swallow non-NOMEM failures.  This keeps
+    misc4-7.2 (and any later writable_schema/VACUUM corruption tests)
+    aligned with the C reference. }
+  if (rc <> SQLITE_OK)
+     and ((db^.flags and SQLITE_NoSchemaError_Bit) <> 0)
+     and (rc <> SQLITE_NOMEM) then begin
+    rc := SQLITE_OK;
+  end;
   sqlite3DbFree(db, zSql);
   Result := rc;
 end;
