@@ -938,6 +938,8 @@ begin
     u64($00010000) or        { SQLITE_LoadExtension_Bit — main.c:3473 default-on }
     (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
     (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
+    u64($20000000) or        { SQLITE_DqsDDL — SQLITE_DQS=3 legacy default (main.c:3453..3462) }
+    u64($40000000) or        { SQLITE_DqsDML — SQLITE_DQS=3 legacy default }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
 
   sqlite3HashInit(@db^.aCollSeq);

@@ -50810,7 +50810,20 @@ begin
     else if (pColExpr <> nil)
        and ((pColExpr^.op = TK_ID) or (pColExpr^.op = TK_STRING))
        and ((pColExpr^.flags and EP_IntValue) = 0) then
-      n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken)
+    begin
+      n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken);
+      { When ResolveSelfReference fired the DqsDDL demotion (resolve.c:719..746
+        via flagUnresolvedTKID), an unresolved double-quoted identifier comes
+        out as a TK_STRING literal, not a column reference.  C reaches the
+        post-resolve `pCExpr->op!=TK_COLUMN` arm and assigns XN_EXPR; the Pas
+        TK_ID/TK_STRING fallback above is only safe when the token names a
+        real column (sqlite3ColumnIndex>=0).  An unresolved name (n<0) is an
+        expression key — keep aiColumn out of XN_ROWID, which would trip
+        indexColumnIsBeingUpdated's iIdxCol<>XN_ROWID assert on UPDATE
+        (indexexpr1-2110/2120/2140). }
+      if (n < 0) and (pColExpr^.op = TK_STRING) then
+        n := XN_EXPR;
+    end
     else
       n := XN_EXPR;
     if n = XN_EXPR then
