@@ -930,6 +930,10 @@ Crash never fires without the explicit page_size PRAGMA after RESERVE_BYTES, nor
   - [X] **9.4.divbug.91.016** `types` — sqlite_options(utf16)=1 seeded; test now reaches engine.
   - [X] **9.4.divbug.92.001** `filter1-3.3/3.5` — updateAccumulator FILTER+NEEDCOLL magnet (OP_Copy regAcc->regHit before filter jump) was omitted; bare col from min/max row now correct (codegen.pas:32464, select.c:6826..6847).
   - [X] **9.4.divbug.92.002** `json101-19.3` — sqlite3VdbeAddFunctionCall missing sqlite3MayAbort; multi-row VALUES INSERT mid-error left preceding row in t1 (vdbe.pas:2762, vdbeaux.c:466, commit 6f8f4e7).
+  - [X] **9.4.divbug.92.003** `gencol1-23.5` — RAISE() in generated col / CHECK ctx now rejected: ported `OP_SqlExec("SELECT*FROM\"db\".\"tab\"")` post-emit for TF_HasGenerated tables (build.c:2940..2944, codegen.pas:49586).
+  - [X] **9.4.divbug.92.004** `gencol1-20.2` — UPSERT excluded.col with VIRTUAL gen col stored offset; resolveUpsertExcludedRefs now uses sqlite3TableColumnToStorage(pTab,iCol) not raw iCol (resolve.c:585, codegen.pas:9562).
+  - [X] **9.4.divbug.92.005** `gencol1-8.20` — `generated column loop` error message now includes `on "<colname>"` (expr.c:4441, codegen.pas:42060).
+  - [ ] **9.4.divbug.92.006** `gencol1-9.20/13.10` "internal query planner error" — bb-UNIQUE auto-index on a VIRTUAL gen col gets WHERE_IDX_ONLY because colNotIdxed bit for the virtual col is 0 (UNIQUE auto-index created BEFORE AS clause sets COLFLAG_VIRTUAL); whereIndexExprTrans then sees OP_Column for the base column on the table cursor and trips the planner-error gate (codegen.pas:26250). C exhibits same parse order yet picks table-scan — root-cause mechanism differs (cost / IPK preference); needs deeper trace before a faithful fix.
 
 ---
 

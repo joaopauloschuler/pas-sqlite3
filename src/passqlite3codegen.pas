@@ -9552,14 +9552,15 @@ begin
       if (iCol >= -1) and (iCol < pItem^.pSTab^.nCol) then
       begin
         { Mirror resolve.c:574..587 — collapse excluded.<col> directly to
-          TK_REGISTER pointing at pUps->regData + iCol (storage order). }
+          TK_REGISTER pointing at pUps->regData + storage(iCol). }
         pE^.op      := TK_REGISTER;
         pE^.op2     := TK_COLUMN;
         pE^.iColumn := i16(iCol);
         pE^.y.pTab  := pItem^.pSTab;
-        { sqlite3TableColumnToStorage simplified — iCol<0 returns iCol;
-          TF_HasVirtual not exercised in the upsert path. }
-        pE^.iTable  := pUps^.regData + iCol;
+        { sqlite3TableColumnToStorage(pTab, iCol) collapses VIRTUAL gen
+          cols so the storage offset stays dense (gencol1-20.2). }
+        pE^.iTable  := pUps^.regData + i32(
+                         sqlite3TableColumnToStorage(pItem^.pSTab, i16(iCol)));
         pE^.pLeft   := nil;
         pE^.pRight  := nil;
         Exit;
@@ -42057,8 +42058,8 @@ begin
       pPse := sqlite3VdbeParser(v);
       if (pCol^.colFlags and COLFLAG_BUSY) <> 0 then
       begin
-        sqlite3ErrorMsg(pPse,
-          PAnsiChar('generated column loop'));
+        sqlite3ErrorMsg(pPse, sqlite3MPrintf(pPse^.db,
+          'generated column loop on "%s"', [pCol^.zCnName]));
       end
       else
       begin
@@ -49583,7 +49584,18 @@ begin
     sqlite3VdbeAddParseSchemaOp(v, iDb, zReparse, 0);
     sqlite3MayAbort(pParse);
 
-    { TF_HasGenerated post-emit check (OP_SqlExec) deferred. }
+    { Test for cycles in generated columns and illegal expressions in CHECK
+      constraints and DEFAULT clauses (build.c:2938..2944).  Emit
+      OP_SqlExec("SELECT*FROM\"db\".\"tab\"") which forces codegen of the
+      generated-column expressions and CHECK constraints, exposing things
+      like a RAISE() outside a trigger-program. }
+    if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+    begin
+      sqlite3VdbeAddOp4(v, OP_SqlExec, $0001, 0, 0,
+        sqlite3MPrintf(db, 'SELECT*FROM"%w"."%w"',
+                       [db^.aDb[iDb].zDbSName, pTab^.zName]),
+        P4_DYNAMIC);
+    end;
   end;
 
   { Add the table to the in-memory representation of the database. }
