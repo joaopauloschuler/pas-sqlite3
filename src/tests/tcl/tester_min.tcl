@@ -406,6 +406,60 @@ set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREA
 # connection PRAGMA data_version bumps that only occur with a shared cache) SKIP
 # instead of running against the unsupported feature path.
 set ::sqlite_options(shared_cache) 0   ;# SQLITE_OMIT_SHARED_CACHE (port omits shared cache)
+# integrityck: engine supports PRAGMA integrity_check (no SQLITE_OMIT_INTEGRITY_CHECK).
+# pragma.test reads $sqlite_options(integrityck) directly (not via ifcapable).
+set ::sqlite_options(integrityck) 1
+# configslower: CONFIG_SLOWDOWN_FACTOR multiplier; like.test uses it as a numeric
+# scale for timing budgets. Mirror upstream test_config.c default (1.0).
+set ::sqlite_options(configslower) 1.0
+# rtree: pas-sqlite3 omits the rtree virtual-table module — pin to 0 so
+# `ifcapable rtree { ... }` blocks (alterlegacy-14.x etc.) SKIP rather than
+# run and hit "no such module: rtree".
+set ::sqlite_options(rtree) 0
+
+# sqlite3_exec_hex: harness shim for upstream test1.c:test_exec_hex. Decodes
+# %HH escapes in a SQL string then runs it, returning {rc {colName val ...}}.
+# Used by like-9.3.x..9.5.x; engine supports the underlying SQL fine, only the
+# Tcl wrapper was missing.
+proc sqlite3_exec_hex {db zHex} {
+  set zSql ""
+  set n [string length $zHex]
+  for {set i 0} {$i < $n} {incr i} {
+    set ch [string index $zHex $i]
+    if {$ch eq "%" && $i+2 < $n} {
+      set hh [string range $zHex [expr {$i+1}] [expr {$i+2}]]
+      if {[scan $hh %2x byte] == 1} {
+        append zSql [format %c $byte]
+        incr i 2
+        continue
+      }
+    }
+    append zSql $ch
+  }
+  set rc 0
+  set res [list]
+  set firstRow 1
+  set rcErr [catch {
+    $db eval $zSql row {
+      if {$firstRow} {
+        foreach col $row(*) { lappend res $col }
+        set firstRow 0
+      }
+      foreach col $row(*) {
+        if {[info exists row($col)]} {
+          lappend res $row($col)
+        } else {
+          lappend res NULL
+        }
+      }
+    }
+  } emsg]
+  if {$rcErr} {
+    # Map generic error -> SQLITE_ERROR (1)
+    return [list 1 $emsg]
+  }
+  return [list 0 $res]
+}
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
