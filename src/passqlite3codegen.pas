@@ -24495,6 +24495,7 @@ var
   jRng:        i32;
   iInTabDummy: i32;
   fSingleTabCoroutine: Boolean;
+  fShortCutOneRow: Boolean;      { where2-2.1 — preserve nOBSat=nExpr }
   addrExplainScan: i32;          { Phase 8.2.1 — scanstatus wiring }
 
   { Phase 6.9-bis 11g.2.f sub-progress 21 — hoist nested helper.
@@ -24809,12 +24810,23 @@ begin
   if (pWInfo^.pOrderBy = nil) and ((db^.flags and SQLITE_ReverseOrder) <> 0) then
     whereReverseScanOrder(pWInfo);
 
+  fShortCutOneRow := false;
   if fSingleTabCoroutine
      or (nTabList <> 1)
      or (whereShortCut(@sWLB) = 0)
      or ((sWLB.pNew^.wsFlags and WHERE_INDEXED) <> 0)
      or ((sWLB.pNew^.wsFlags and WHERE_COLUMN_IN) <> 0) then
   begin
+    { where2-2.1 — when whereShortCut succeeded with WHERE_ONEROW but Pas
+      re-routes to the full planner for codegen reasons (WHERE_INDEXED /
+      WHERE_COLUMN_IN), preserve the shortcut's "one row trivially satisfies
+      any ORDER BY" decision so the sorter elision (select.c:8298 nOBSat ==
+      nExpr → sSort.pOrderBy = 0) still fires.  Matches C where.c:6424,
+      which whereShortCut applies in the SAME nLoop=1 case Pas re-routes. }
+    if ((sWLB.pNew^.wsFlags and WHERE_ONEROW) <> 0)
+       and (pWInfo^.pOrderBy <> nil) then
+      fShortCutOneRow := true;
+
     { Full planner path — where.c:7079..7473.
       Covers multi-table FROM (nTabList>1), single-table viaCoroutine
       subqueries (forced via fSingleTabCoroutine), and single-table
@@ -24859,6 +24871,11 @@ begin
         Exit(nil);
       end;
     end;
+
+    { where2-2.1 — restore the whereShortCut ONEROW nOBSat=nExpr decision
+      that the full planner just overwrote.  See gate comment above. }
+    if fShortCutOneRow and (pWInfo^.pOrderBy <> nil) then
+      pWInfo^.nOBSat := i8(pWInfo^.pOrderBy^.nExpr);
 
     { where.c:7113..7121 — TUNING: a DISTINCT clause on a subquery is
       assumed to reduce output cardinality by a factor of 8 (LogEst -30).
