@@ -515,6 +515,15 @@ proc do_catchsql_test {testname sql result} {
   uplevel do_test [list $testname] [list "catchsql {$sql}"] [list $result]
 }
 
+# delete_all_data — upstream tester.tcl:1159..1163.  Iterate every
+# user table in the open `db` handle and DELETE its rows.  Used by
+# e_insert.test between assertion blocks to clear state.
+proc delete_all_data {} {
+  db eval {SELECT tbl_name AS t FROM sqlite_master WHERE type = 'table'} {
+    db eval "DELETE FROM '[string map {' ''} $t]'"
+  }
+}
+
 # expected — passthrough stub.  Upstream tester.tcl has no such proc as
 # a self-contained helper (the word "expected" only appears as a
 # parameter name to do_test, see upstream lines 692..702).  A handful
