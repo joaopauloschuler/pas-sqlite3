@@ -43926,7 +43926,16 @@ begin
     no-FROM single-row SELECT shape (`INSERT INTO t SELECT <exprs>` with no
     FROM / WHERE / GROUP / ORDER / LIMIT / window) — semantically a
     single-row VALUES, and the rest of sqlite3Insert handles it via pList. }
+  { with1-27.1 / cte-in-insert-source — if pSelect carries a WITH clause,
+    do NOT strip the wrapping Select to feed only pEList through the
+    expression-row path: that drops the CTE on the floor (sqlite3WithPush
+    is only invoked from selectExpander, never reached by the pList drain),
+    so any bare table reference inside a SELECT-list scalar subquery
+    resolves to a schema table instead of the shadowing CTE.  Keep pSelect
+    wrapped and let the generic SRT_Coroutine arm below run, which calls
+    sqlite3Select → selectExpander → sqlite3WithPush(pSelect->pWith). }
   if (pSelect <> nil)
+     and (pSelect^.pWith = nil)
      and ((pSelect^.selFlags and SF_Values) <> 0)
      and (pSelect^.pPrior = nil) then
   begin
@@ -43936,6 +43945,7 @@ begin
     pSelect := nil;
   end
   else if (pSelect <> nil)
+     and (pSelect^.pWith = nil)
      and (pSelect^.pPrior = nil)
      and ((pSelect^.pSrc = nil) or (pSelect^.pSrc^.nSrc = 0))
      and (pSelect^.pWhere = nil)
