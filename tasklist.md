@@ -926,6 +926,7 @@ Crash never fires without the explicit page_size PRAGMA after RESERVE_BYTES, nor
   - [X] **9.4.divbug.91.014** `tkt3992` — **PASS** 6/6 via driver (was a stale flake — already passing on entry).
   - [X] **9.4.divbug.91.015** `trans2` — md5sum landed; test now reaches engine (407 cases run).
   - [X] **9.4.divbug.91.016** `types` — sqlite_options(utf16)=1 seeded; test now reaches engine.
+  - [X] **9.4.divbug.92.001** `filter1-3.3/3.5` — updateAccumulator FILTER+NEEDCOLL magnet (OP_Copy regAcc->regHit before filter jump) was omitted; bare col from min/max row now correct (codegen.pas:32464, select.c:6826..6847).
 
 ---
 

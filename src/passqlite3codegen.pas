@@ -32463,12 +32463,36 @@ begin
     pList := pF^.pFExpr^.x.pList;
     { select.c:6826..6847 — FILTER arm.  When the aggregate carries
       EP_WinFunc with eFrmType=TK_FILTER, jump over the AggStep when
-      the FILTER predicate evaluates false or NULL. }
+      the FILTER predicate evaluates false or NULL.
+
+      Magnet (select.c:6828..6844): when this is a NEEDCOLL (min/max)
+      aggregate with a FILTER and the query has bare accumulator
+      columns, allocate regHit and OP_Copy regAcc->regHit BEFORE the
+      filter jump.  On first row regAcc=0 → regHit=0 → after-loop
+      OP_If falls through and bare cols populate from this row (the
+      one that produced the min/max); on later rows regAcc=1 →
+      regHit=1 → bare-col re-read skipped unless min/max AggStep
+      cleared regHit because a new extreme was seen.  Without this,
+      `SELECT a, c, max(b) FILTER(WHERE c='x') ... GROUP BY a`
+      reports c from the last row scanned instead of the row whose
+      b became max (filter1-3.3 / 3.5). }
     if ((pF^.pFExpr^.flags and EP_WinFunc) <> 0)
        and (pF^.pFExpr^.y.pWin <> nil)
        and (pF^.pFExpr^.y.pWin^.eFrmType = TK_FILTER)
        and (pF^.pFExpr^.y.pWin^.pFilter <> nil) then
     begin
+      if (pAggInfo^.nAccumulator > 0)
+         and (pF^.pFunc <> nil)
+         and ((PTFuncDef(pF^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
+         and (regAcc <> 0) then
+      begin
+        if regHit = 0 then
+        begin
+          Inc(pParse^.nMem);
+          regHit := pParse^.nMem;
+        end;
+        sqlite3VdbeAddOp2(v, OP_Copy, regAcc, regHit);
+      end;
       addrNext := sqlite3VdbeMakeLabel(pParse);
       sqlite3ExprIfFalse(pParse, pF^.pFExpr^.y.pWin^.pFilter, addrNext,
                          SQLITE_JUMPIFNULL);
