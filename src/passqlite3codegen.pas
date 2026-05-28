@@ -1657,6 +1657,7 @@ const
     here so far; the remainder land alongside their first reader. }
   SQLITE_QueryFlattener = u32($00000001);
   SQLITE_WindowFunc     = u32($00000002);  { use xInverse for window functions (sqliteInt.h:1900) }
+  SQLITE_Transitive     = u32($00000080);  { Transitive constraints (sqliteInt.h:1906) }
   SQLITE_CoverIdxScan   = u32($00000020);  { covering-index scan opt (sqliteInt.h:1904) }
   SQLITE_DistinctOpt    = u32($00000010);
   SQLITE_GroupByOrder   = u32($00000004);  { GROUP BY cover of ORDER BY (sqliteInt.h:1901) }
@@ -1823,6 +1824,7 @@ function  sqlite3WhereExprListUsage(pMaskSet: PWhereMaskSet; pList: PExprList): 
 function  sqlite3WhereFindTerm(pWC: PWhereClause; iCur: i32; iColumn: i32;
   notReady: Bitmask; op: u32; pIdx: PIndex2): PWhereTerm;
 procedure exprAnalyze(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
+function  OptimizationEnabled(db: PTsqlite3; mask: u32): Boolean;
 procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
 procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem; pWC: PWhereClause);
 procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
@@ -16893,6 +16895,41 @@ begin
   Result := 0;
 end;
 
+{ termIsEquivalence (whereexpr.c:948..991) — we already know pExpr is a binary
+  operator whose operands are both column references.  Return non-zero when
+  pExpr is an equivalence relation suitable for transitive constraint
+  propagation (the RHS column may be substituted for the LHS column anywhere
+  else in the WHERE clause).  No harm in returning 0; returning 1 wrongly
+  could produce incorrect answers. }
+function termIsEquivalence(pParse: PParse; pExpr: PExpr;
+  const pSrc: PSrcList): i32;
+var
+  aff1, aff2: AnsiChar;
+  pColl:      Pointer;
+begin
+  if not OptimizationEnabled(pParse^.db, SQLITE_Transitive) then
+  begin Result := 0; Exit; end;                                       { (1) }
+  if (pExpr^.op <> TK_EQ) and (pExpr^.op <> TK_IS) then
+  begin Result := 0; Exit; end;                                       { (2) }
+  if ExprHasProperty(pExpr, EP_OuterON) then
+  begin Result := 0; Exit; end;                                       { (3) }
+  Assert(pSrc <> nil);
+  if (pExpr^.op = TK_IS)
+     and (pSrc^.nSrc >= 2)
+     and ((SrcListItems(pSrc)[0].fg.jointype and JT_LTORJ) <> 0) then
+  begin Result := 0; Exit; end;                                       { (4) }
+  aff1 := sqlite3ExprAffinity(pExpr^.pLeft);
+  aff2 := sqlite3ExprAffinity(pExpr^.pRight);
+  if (aff1 <> aff2)
+     and ((u8(aff1) < SQLITE_AFF_NUMERIC) or (u8(aff2) < SQLITE_AFF_NUMERIC)) then
+  begin Result := 0; Exit; end;                                       { (5) }
+  pColl := sqlite3ExprCompareCollSeq(pParse, pExpr);
+  if (sqlite3IsBinary(pColl) = 0)
+     and (sqlite3ExprCollSeqMatch(pParse, pExpr^.pLeft, pExpr^.pRight) = 0) then
+  begin Result := 0; Exit; end;                                       { (6) }
+  Result := 1;
+end;
+
 procedure exprAnalyze(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
 var
   pWInfo:     PWhereInfo;
@@ -17074,9 +17111,12 @@ begin
         { whereClauseInsert may have realloc'd pWC^.a — re-derive pTerm. }
         pTerm := @pWC^.a[idxTerm];
         pTerm^.wtFlags := pTerm^.wtFlags or TERM_COPIED;
-        { termIsEquivalence (whereexpr.c:1245..1248) deferred.  Without
-          it eExtraOp stays 0, which is the conservative pick — the
-          virtual mirror is still a usable equality term. }
+        Assert(pWC^.pWInfo^.pTabList <> nil);
+        if termIsEquivalence(pPrs, pDup, pWC^.pWInfo^.pTabList) <> 0 then
+        begin
+          pTerm^.eOperator := pTerm^.eOperator or WO_EQUIV;
+          eExtraOp := WO_EQUIV;
+        end;
       end
       else
       begin
