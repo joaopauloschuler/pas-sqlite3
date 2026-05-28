@@ -16831,9 +16831,11 @@ begin
   if op = TK_IN then
   begin
     Assert(pX^.pRight = nil);
-    { sqlite3ExprCheckIN deferred to 11g.2.c — the rowid-EQ shape never
-      generates a TK_IN predicate.  Skip the check, fall through to the
-      usage walk so prereqRight is still populated correctly. }
+    { whereexpr.c:1160 — verify LHS/RHS arity for vector IN before
+      continuing.  Without this gate `(a,b) IN (SELECT * FROM t3)`
+      (3 cols) silently codes as a 2-vs-3 mismatch instead of raising
+      "sub-select returns 3 columns - expected 2" (rowvalue4-2.6). }
+    if sqlite3ExprCheckIN(pPrs, pX) <> 0 then Exit;
     { whereexpr.c:1158..1164 — when the IN RHS is a SELECT, prereqRight must
       be the mask of every cursor the subquery references (exprSelectUsage),
       NOT 0.  For a correlated IN such as
