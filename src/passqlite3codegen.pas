@@ -35134,7 +35134,15 @@ begin
   { p^.pWhere <> nil gate lifted in sub-progress 9 — sqlite3WhereBegin
     now drives whereShortCut → IPK / SCAN with per-row residual filter
     emission, so any single-table WHERE shape produces a stepable body. }
-  if p^.pGroupBy   <> nil then begin Result := SQLITE_OK; Exit; end;
+  { Window-functions: sqlite3WindowRewrite (window.c:996) moves pGroupBy /
+    pHaving into the synthetic sub-SELECT and clears them on the outer p
+    before reaching the agg/no-agg dispatch (select.c:8265).  So if pWin is
+    set, fall through to the window arm below — the rewrite will strip the
+    GroupBy before any sqlite3WhereBegin call.  Without this skip, queries
+    like `SELECT max(c), max(b) OVER (...) FROM t GROUP BY b` returned
+    no rows (window4-4.1..4.3). }
+  if (p^.pGroupBy <> nil) and (p^.pWin = nil) then
+    begin Result := SQLITE_OK; Exit; end;
   { 10.1.bug.52 — HAVING in non-GROUP-BY aggregate query.  Allow the
     aggregate-no-GROUP-BY arm at codegen.pas:24297 to handle pHaving
     when SF_Aggregate is set.  Non-aggregate HAVING is still a no-op
