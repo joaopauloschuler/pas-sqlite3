@@ -10563,6 +10563,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                                   pOuterSrc, pW^.x.pSelect^.pSrc);
           ResolveOuterRefsInList(pW^.x.pSelect^.pOrderBy,
                                   pOuterSrc, pW^.x.pSelect^.pSrc);
+          { whereF-6.x — also walk pSrc TVF args for outer refs (json_each
+            of an outer column inside an IN/EXISTS subquery). }
+          if pW^.x.pSelect^.pSrc <> nil then
+          begin
+            base_o := SrcListItems(pW^.x.pSelect^.pSrc);
+            for j := 0 to pW^.x.pSelect^.pSrc^.nSrc - 1 do
+            begin
+              pItO := PSrcItem(PByte(base_o) + j * SizeOf(TSrcItem));
+              if ((pItO^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+                 and (pItO^.u1.pFuncArg <> nil) then
+                ResolveOuterRefsInList(pItO^.u1.pFuncArg,
+                                        pOuterSrc, pW^.x.pSelect^.pSrc);
+            end;
+          end;
         end;
       end;
     end;
@@ -10896,6 +10910,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                             pOuterSrc, pW^.x.pSelect^.pSrc);
       ResolveOuterIDsInList(pW^.x.pSelect^.pOrderBy,
                             pOuterSrc, pW^.x.pSelect^.pSrc);
+      { whereF-6.1 — bare TK_ID outer ref inside a TVF arg
+        (`json_each(x)` where x is an outer column). }
+      if pW^.x.pSelect^.pSrc <> nil then
+      begin
+        pInItem := SrcListItems(pW^.x.pSelect^.pSrc);
+        for iInCol := 0 to pW^.x.pSelect^.pSrc^.nSrc - 1 do
+        begin
+          pOutItem := PSrcItem(PByte(pInItem) + iInCol * SizeOf(TSrcItem));
+          if ((pOutItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+             and (pOutItem^.u1.pFuncArg <> nil) then
+            ResolveOuterIDsInList(pOutItem^.u1.pFuncArg,
+                                   pOuterSrc, pW^.x.pSelect^.pSrc);
+        end;
+      end;
     end;
   end;
 
@@ -11043,6 +11071,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             begin
               ResolveOuterRefs(pIt_o^.u3.pOn, pOuterSrc, pDeep_^.pSrc);
               ResolveOuterIDs(pIt_o^.u3.pOn, pOuterSrc, pDeep_^.pSrc);
+            end;
+            { whereF-6.x — table-valued function args (json_each(t.col), etc.)
+              in a FROM clause may reference an OUTER source.  Mirrors C's
+              Walker descent into SrcItem.u1.pFuncArg in resolveExprStep.
+              Without this, the args resolve only against pDeep_^.pSrc (which
+              contains only the TVF itself) and the resolver reports
+              "no such column: <outer>". }
+            if ((pIt_o^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+               and (pIt_o^.u1.pFuncArg <> nil) then
+            begin
+              ResolveOuterRefsInList(pIt_o^.u1.pFuncArg, pOuterSrc, pDeep_^.pSrc);
+              ResolveOuterIDsInList(pIt_o^.u1.pFuncArg,  pOuterSrc, pDeep_^.pSrc);
             end;
           end;
         end;
@@ -12292,6 +12332,26 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               (resolve.c:1384..1388).  Without this the enclosing IN/scalar
               subquery is materialised once instead of recomputed per row. }
             if SelectDeepRefsOuterCursor(pCompArm, p^.pSrc) then bCorr := True;
+            { whereF-6.x — outer ref inside a TVF arg of pCompArm^.pSrc
+              (`json_each(t.json)` etc.) is a correlation too. }
+            if pCompArm^.pSrc <> nil then
+            begin
+              base := SrcListItems(pCompArm^.pSrc);
+              for i := 0 to pCompArm^.pSrc^.nSrc - 1 do
+              begin
+                pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+                if ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+                   and (pItem^.u1.pFuncArg <> nil) then
+                begin
+                  if ExprListRefsOuterTable(pItem^.u1.pFuncArg,
+                                             p^.pSrc, pCompArm^.pSrc) then
+                    bCorr := True;
+                  if ExprListRefsOuterID(pItem^.u1.pFuncArg,
+                                          p^.pSrc, pCompArm^.pSrc) then
+                    bCorr := True;
+                end;
+              end;
+            end;
             pCompArm := pCompArm^.pPrior;
           end;
         end;
@@ -12321,6 +12381,28 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             ResolveOuterIDs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
             ResolveOuterIDsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
             ResolveOuterIDsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            { whereF-6.x — table-valued function args in pSrc may reference
+              an OUTER column (json_each(x), json_each(t6.c), etc.).  Mirrors
+              C's Walker descent into SrcItem.u1.pFuncArg via lookupName's
+              NameContext-chain climb.  Without this the inner per-Select
+              resolver sees only pCompArm^.pSrc (which contains just the
+              TVF) and raises "no such column" for the outer reference. }
+            if pCompArm^.pSrc <> nil then
+            begin
+              base := SrcListItems(pCompArm^.pSrc);
+              for i := 0 to pCompArm^.pSrc^.nSrc - 1 do
+              begin
+                pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+                if ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+                   and (pItem^.u1.pFuncArg <> nil) then
+                begin
+                  ResolveOuterRefsInList(pItem^.u1.pFuncArg,
+                                          p^.pSrc, pCompArm^.pSrc);
+                  ResolveOuterIDsInList(pItem^.u1.pFuncArg,
+                                          p^.pSrc, pCompArm^.pSrc);
+                end;
+              end;
+            end;
             pCompArm := pCompArm^.pPrior;
           end;
         end;
