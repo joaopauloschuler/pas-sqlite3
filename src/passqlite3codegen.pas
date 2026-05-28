@@ -11129,6 +11129,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end else if sqlite3StrICmp(pRef^.pSTab^.zName, zTab_) <> 0 then
           Continue;
         iColL := sqlite3ColumnIndex(pRef^.pSTab, zCol_);
+        { IPK alias: a leaf INTEGER PRIMARY KEY column is bound in the inner
+          result list as iColumn=-1 (resolve.c:466 iColumn = j==iPKey?-1:j).
+          sqlite3ColumnIndex returns the declared index (e.g. 0), so map a
+          match on iPKey to -1 before comparing against the inner TK_COLUMN's
+          iColumn — otherwise `t1.a` over an aliased nested (t1 JOIN ...)
+          where a is INTEGER PRIMARY KEY never matches (tkt-7a31705a7e6-1.1). }
+        if (iColL >= 0) and (iColL = pRef^.pSTab^.iPKey) then
+          iColL := -1;
         if iColL <> iInnerCol then Continue;
         idx_ := j;
         Result := True;
