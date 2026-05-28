@@ -10748,8 +10748,30 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if ExprRefsOuterID(pW^.pLeft,  pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
     if ExprRefsOuterID(pW^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
     if (pW^.flags and EP_xIsSelect) = 0 then
+    begin
       if ExprListRefsOuterID(pW^.x.pList, pOuterSrc, pInnerSrc) then
       begin Result := True; Exit; end;
+    end
+    else if pW^.x.pSelect <> nil then
+    begin
+      { tkt-3a77c9714e-3.0 — mirror ResolveOuterIDs's subquery descent so
+        correlation through an IN-RHS / scalar-subquery is detected. }
+      if ExprListRefsOuterID(pW^.x.pSelect^.pEList,
+                             pOuterSrc, pW^.x.pSelect^.pSrc) then
+      begin Result := True; Exit; end;
+      if ExprRefsOuterID(pW^.x.pSelect^.pWhere,
+                         pOuterSrc, pW^.x.pSelect^.pSrc) then
+      begin Result := True; Exit; end;
+      if ExprRefsOuterID(pW^.x.pSelect^.pHaving,
+                         pOuterSrc, pW^.x.pSelect^.pSrc) then
+      begin Result := True; Exit; end;
+      if ExprListRefsOuterID(pW^.x.pSelect^.pGroupBy,
+                             pOuterSrc, pW^.x.pSelect^.pSrc) then
+      begin Result := True; Exit; end;
+      if ExprListRefsOuterID(pW^.x.pSelect^.pOrderBy,
+                             pOuterSrc, pW^.x.pSelect^.pSrc) then
+      begin Result := True; Exit; end;
+    end;
   end;
 
   procedure ResolveOuterIDs(pW: PExpr; pOuterSrc: PSrcList;
@@ -10817,7 +10839,28 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     ResolveOuterIDs(pW^.pLeft,  pOuterSrc, pInnerSrc);
     ResolveOuterIDs(pW^.pRight, pOuterSrc, pInnerSrc);
     if (pW^.flags and EP_xIsSelect) = 0 then
-      ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc);
+      ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc)
+    else if pW^.x.pSelect <> nil then
+    begin
+      { tkt-3a77c9714e-3.0 — recurse into x.pSelect so a bare TK_ID inside
+        an IN-RHS / scalar-subquery (e.g. `b IN (SELECT a=1)` where `a` is
+        an outer column) gets pre-resolved to the outer pSrc.  The deeper
+        SELECT's own pSrc takes over as the "inner" filter so its own
+        FROM-columns don't get rebound as outer.  Mirrors C's
+        sqlite3WalkExpr -> sqlite3WalkSelect descent + lookupName
+        pNC->pNext climb (resolve.c:341..706, 1378..1390).  This matches
+        the analogous descent already done in ResolveOuterRefs. }
+      ResolveOuterIDsInList(pW^.x.pSelect^.pEList,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+      ResolveOuterIDs(pW^.x.pSelect^.pWhere,
+                      pOuterSrc, pW^.x.pSelect^.pSrc);
+      ResolveOuterIDs(pW^.x.pSelect^.pHaving,
+                      pOuterSrc, pW^.x.pSelect^.pSrc);
+      ResolveOuterIDsInList(pW^.x.pSelect^.pGroupBy,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+      ResolveOuterIDsInList(pW^.x.pSelect^.pOrderBy,
+                            pOuterSrc, pW^.x.pSelect^.pSrc);
+    end;
   end;
 
   { resolver01-7.1/7.2 — NC_UEList outer result-alias fallback.
