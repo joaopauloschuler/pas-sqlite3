@@ -28675,30 +28675,32 @@ begin
   { ExplainQueryPlan("MERGE (op-name)") — debug-only macro, no-op in port. }
 
   { Generate the "A" coroutine — the SELECT to the left of the operator.
-    Strip SF_Compound on the leaf so the per-arm fast paths in sqlite3Select
-    fire (Pas no-FROM fast path gates on SF_Compound=0; matches the inline
-    UNION ALL arm's strip-and-restore idiom). }
+    KEEP SF_Compound set (matches select.c:3573..3577 which never touches
+    selFlags here).  Stripping SF_Compound defeats flattenSubquery
+    restriction 15 (select.c:4329) and the inner FROM-subquery's LIMIT is
+    flattened up into this arm, replacing pPrior^.iLimit with the inner
+    LIMIT before this assignment lands — so the arm runs unbounded and
+    the merged compound returns the wrong rows after the outer LIMIT
+    (tkt-38cb5df375 36.4..36.7 / 41.4..41.9).  The per-arm fast paths in
+    sqlite3Select no longer require SF_Compound=0; see the
+    feedback_compound_arm_must_keep_SF_Compound.md remediation. }
   addrSelectA := sqlite3VdbeCurrentAddr(v) + 1;
   addr1 := sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrA, 0, addrSelectA);
   pPrior^.iLimit := regLimitA;
-  savedLimit := i32(pPrior^.selFlags);  { reuse: stash flags }
-  pPrior^.selFlags := pPrior^.selFlags and (not u32(SF_Compound));
   sqlite3Select(pParse, pPrior, @destA);
-  pPrior^.selFlags := u32(savedLimit);
   sqlite3VdbeEndCoroutine(v, regAddrA);
   sqlite3VdbeJumpHere(v, addr1);
 
-  { Generate the "B" coroutine — the SELECT to the right of the operator. }
+  { Generate the "B" coroutine — the SELECT to the right of the operator.
+    Same KEEP-SF_Compound rationale as the A arm above (matches
+    select.c:3582..3593). }
   addrSelectB := sqlite3VdbeCurrentAddr(v) + 1;
   addr1 := sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrB, 0, addrSelectB);
   savedLimit  := p^.iLimit;
   savedOffset := p^.iOffset;
   p^.iLimit   := regLimitB;
   p^.iOffset  := 0;
-  i := i32(p^.selFlags);  { stash flags in unused i }
-  p^.selFlags := p^.selFlags and (not u32(SF_Compound));
   sqlite3Select(pParse, p, @destB);
-  p^.selFlags := u32(i);
   p^.iLimit   := savedLimit;
   p^.iOffset  := savedOffset;
   sqlite3VdbeEndCoroutine(v, regAddrB);
