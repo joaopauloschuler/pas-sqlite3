@@ -252,8 +252,8 @@ const
   { DBFLAG_* flags (sqliteInt.h) }
   DBFLAG_InternalFunc = u32($0008);
 
-  { SQLITE_PREPARE_FROM_DDL flag }
-  SQLITE_PREPARE_FROM_DDL = $02;
+  { SQLITE_PREPARE_FROM_DDL flag — sqlite3.h:4486 public value }
+  SQLITE_PREPARE_FROM_DDL = $20;
 
   NC_AllowAgg  = i32($000001);
   NC_PartIdx   = i32($000002);
