@@ -928,6 +928,7 @@ Crash never fires without the explicit page_size PRAGMA after RESERVE_BYTES, nor
   - [X] **9.4.divbug.91.015** `trans2` — md5sum landed; test now reaches engine (407 cases run).
   - [X] **9.4.divbug.91.016** `types` — sqlite_options(utf16)=1 seeded; test now reaches engine.
   - [X] **9.4.divbug.92.001** `filter1-3.3/3.5` — updateAccumulator FILTER+NEEDCOLL magnet (OP_Copy regAcc->regHit before filter jump) was omitted; bare col from min/max row now correct (codegen.pas:32464, select.c:6826..6847).
+  - [X] **9.4.divbug.92.002** `json101-19.3` — sqlite3VdbeAddFunctionCall missing sqlite3MayAbort; multi-row VALUES INSERT mid-error left preceding row in t1 (vdbe.pas:2762, vdbeaux.c:466, commit 6f8f4e7).
 
 ---
 
