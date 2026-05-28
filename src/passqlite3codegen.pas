@@ -30893,8 +30893,18 @@ begin
       begin
         if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then Exit;
         if (pTab^.eTabType = TABTYP_VIEW) and (pTab^.u.view_pSelect <> nil) then
+        begin
+          { select.c:6045..6051 — SQLITE_DBCONFIG_ENABLE_VIEW gate.
+            A non-TEMP view becomes inaccessible when the EnableView bit
+            is cleared.  Views in the TEMP schema (aDb[1]) bypass. }
+          if ((pParse^.db^.flags and u64($80000000)) = 0)  { SQLITE_EnableView }
+             and (pTab^.pSchema <> pParse^.db^.aDb[1].pSchema) then
+            sqlite3ErrorMsg(pParse,
+              sqlite3MPrintf(pParse^.db,
+                'access to view "%s" prohibited', [pTab^.zName]));
           sqlite3SrcItemAttachSubquery(pParse, pItem,
                                        pTab^.u.view_pSelect, 1);
+        end;
         if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
         begin
           pVwBody := pItem^.u4.pSubq^.pSelect;
