@@ -761,6 +761,7 @@ acceptance gate for this section.
   - [X] **9.4.divbug.88.027** `e_dropview` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (48 PASS / 0 FAIL).
   - [X] **9.4.divbug.88.028** `e_reindex` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (100 PASS / 15 FAIL of 115).
   - [X] **9.4.divbug.88.029** `e_select2` — SOURCE-ERROR cleared via drop_all_tables port at tester.tcl:2253..2275 (do_select_tests also added); downstream subtests now run (199 PASS / 6 FAIL of 205).
+  - [X] **e_select-0.2.0001.1 family** — no-FROM GROUP BY admitted by aggregate arm (codegen.pas:34347 gate + nSrc=0 guard at 34368, C ref select.c:8456 + where.c:6942..6955); 9 fails closed (commit 2a35723).
   - [X] **9.4.divbug.88.030** `e_update` — SOURCE-ERROR cleared via do_select_tests port at tester.tcl:1103..1157; downstream subtests now run (136 PASS / 12 FAIL of 148).
   - [X] **9.4.divbug.88.031** `e_uri` — sqlite3_close / sqlite3_close_v2 Tcl trampolines ported (TestModuleTest1.pas test_close + test_close_v2; C ref test1.c:684..725, registered :9079..9080).
   - [X] **9.4.divbug.88.032** `e_wal` — ported `testvfs` wrapper VFS + Tcl object cmd (test_vfs.c:1084..1695) in src/tests/tcl/testmodules/TestModuleVfs.pas; wired via Sqlitetestvfs_Init in PasTclSqlite.pas.
