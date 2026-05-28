@@ -10336,7 +10336,7 @@ begin
     OP_OpenRead,
     OP_OpenWrite: begin
       if (v^.vdbeFlags and VDBF_EXPIRED_MASK) = 1 then begin
-        rc := SQLITE_ABORT or (1 shl 8);  { SQLITE_ABORT_ROLLBACK }
+        rc := SQLITE_ABORT_ROLLBACK;  { vdbe.c:4395 — was wrongly (1 shl 8); C sqlite.h.in:562 defines it as SQLITE_ABORT|(2<<8) }
         goto abort_due_to_error;
       end;
       nField   := 0;
