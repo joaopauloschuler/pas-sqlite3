@@ -11722,10 +11722,15 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pE^.y.pTab  := pMatch^.pSTab;
           pE^.pLeft   := nil;
           pE^.pRight  := nil;
-          if (matchCol >= 0) then
+          { resolve.c:826..832 — gate on POST-substitution iColumn:
+            an IPK rowid alias (effCol=-1) must NOT bit-set colUsed
+            (sets pMatch->fg.rowidUsed instead in C; rowidUsed is not
+            yet ported here, but suppressing the bit is what matters for
+            the covering-index decision — where9-3.1/3.2). }
+          if (effCol >= 0) then
           begin
-            if matchCol < BMS - 1 then
-              pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
+            if effCol < BMS - 1 then
+              pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl effCol)
             else
               pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl (BMS - 1));
           end;
