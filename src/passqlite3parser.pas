@@ -1481,11 +1481,21 @@ end;
 { ---- parserStackRealloc — grow stack on demand (yyGrowStack equivalent) -- }
 function parserStackRealloc(p: PyyParser): i32;
 var
-  oldSize, newSize, idx: i32;
+  oldSize, newSize, idx, nLimit: i32;
   pNew: PyyStackEntry;
+  pPse: PParse;
 begin
   oldSize := 1 + i32(p^.yystackEnd - p^.yystack);
   newSize := oldSize * 2 + 100;
+  { Enforce SQLITE_LIMIT_PARSER_DEPTH (parse.c parserStackSizeLimit, YYSIZELIMIT) }
+  pPse := PParse(p^.pParse);
+  if (pPse <> nil) and (pPse^.db <> nil) then begin
+    nLimit := pPse^.db^.aLimit[12 { SQLITE_LIMIT_PARSER_DEPTH }];
+    if newSize > nLimit then begin
+      newSize := nLimit;
+      if newSize <= oldSize then begin Result := 1; Exit; end;
+    end;
+  end;
   idx := i32(p^.yytos - p^.yystack);
   if p^.yystack = @p^.yystk0[0] then begin
     GetMem(pNew, newSize * SizeOf(yyStackEntry));

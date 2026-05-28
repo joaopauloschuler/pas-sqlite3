@@ -12288,6 +12288,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         { Step 1: expand inner pSrc (assign cursors to inner FROM tables). }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
           sqlite3SelectExpand(pParse, pInner);
+        { misc5-6.2 — if expand surfaced a missing-table error (e.g. inner
+          `FROM logs_base` against a nonexistent table), stop here so the
+          "no such table" message is preserved.  Without this gate the
+          downstream FindNestedAggToOuter / outer-resolver passes and the
+          enclosing select's later LIMIT walk can call sqlite3ErrorMsg,
+          which unconditionally frees+replaces pParse^.zErrMsg, clobbering
+          the original error (memory: feedback_select1_6_8c). }
+        if pParse^.nErr > 0 then Exit;
         { Step 2: detect outer refs across ALL inner clauses (not just
           pWhere) — correlation can live in pEList, pHaving, pGroupBy,
           pOrderBy.  Without this, an inner subquery whose ONLY outer

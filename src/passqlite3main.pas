@@ -659,7 +659,8 @@ const
   SQLITE_DEFAULT_WORKER_THREADS    = 0;
 
 const
-  aHardLimit: array[0..11] of i32 = (
+  SQLITE_MAX_PARSER_DEPTH = 1000;
+  aHardLimit: array[0..12] of i32 = (
     SQLITE_MAX_LENGTH,
     SQLITE_MAX_SQL_LENGTH,
     SQLITE_MAX_COLUMN_LIMIT,
@@ -671,7 +672,8 @@ const
     SQLITE_MAX_LIKE_PATTERN_LENGTH,
     SQLITE_MAX_VARIABLE_NUMBER,
     SQLITE_MAX_TRIGGER_DEPTH,
-    SQLITE_MAX_WORKER_THREADS_LIMIT
+    SQLITE_MAX_WORKER_THREADS_LIMIT,
+    SQLITE_MAX_PARSER_DEPTH
   );
 
 { ----------------------------------------------------------------------
