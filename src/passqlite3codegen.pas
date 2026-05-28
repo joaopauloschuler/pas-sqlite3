@@ -11307,6 +11307,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
                and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
+        { filter1-6.1 — a FILTER predicate that references the inner
+          FROM cursors anchors the aggregate to the inner SELECT.  Do
+          not promote to the outer in that case, otherwise the outer
+          codegen emits OP_Column on cursors not yet opened (the inner
+          FROM is only scanned per-row inside the subquery's subroutine). }
+        if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil)
+           and (pX^.y.pWin^.pFilter <> nil) then
+        begin
+          if ExprRefsOuterCursor(pX^.y.pWin^.pFilter, pInnerSrc) then
+            refInner := True;
+          if ExprRefsOuterCursor(pX^.y.pWin^.pFilter, pOuterSrc) then
+            refOuter := True;
+        end;
         if refOuter and not refInner then
         begin
           { aggnested-3.11: MarkOrRejectAggInWhere may have already
