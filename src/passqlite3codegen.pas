@@ -17349,13 +17349,12 @@ procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
 var
   i: i32;
 begin
-  { whereexpr.c:1882..1893 — straight loop walks every base term in the
-    WhereClause and runs exprAnalyze.  The C source iterates from the tail
-    so newly-inserted virtual terms can be skipped; until the BETWEEN/OR/
-    NOTNULL/LIKE virtual-term synthesis lands (11g.2.c), iteration order
-    does not matter, so the simpler ascending walk is used here. }
+  { whereexpr.c:1887 — iterate from tail to head.  Newly-inserted virtual
+    terms append at the back and need not be re-analyzed; the descending
+    walk also fixes the OR-disjunct virtual-swap insertion order so that
+    pOrWc[n..2n-1] matches C exactly (where8-3.11..3.22). }
   if pWC^.nTerm <= 0 then Exit;
-  for i := 0 to pWC^.nBase - 1 do
+  for i := pWC^.nTerm - 1 downto 0 do
     exprAnalyze(pTabList, pWC, i);
 end;
 
