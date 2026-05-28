@@ -61700,50 +61700,67 @@ begin
 end;
 
 procedure replaceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+{ Faithful port of func.c:1476..1563.  Output buffer starts at nStr+1 and
+  grows in power-of-two substitution steps; only SQLITE_LIMIT_LENGTH gates
+  toobig. }
 var
-  zStr, zPat, zRep, zOut, p: PAnsiChar;
-  nStr, nPat, nRep, nOut, i, j: i32;
+  zStr, zPat, zRep, zOut, zOld: PAnsiChar;
+  nStr, nPat, nRep, loopLimit, i, j: i32;
+  nOut: i64;
+  cntExpand: u32;
+  db: PTsqlite3;
 begin
-  { Mirrors func.c:1476..1517: NULL str/pattern/replacement → NULL result
-    (the default), empty pattern → return str unchanged. }
+  db := sqlite3_context_db_handle(pCtx);
   zStr := sqlite3_value_text(Psqlite3_value(argv^));
-  if zStr = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if zStr = nil then Exit;
   nStr := sqlite3_value_bytes(Psqlite3_value(argv^));
   zPat := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  if zPat = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if zPat = nil then Exit;
   if zPat^ = #0 then begin
     sqlite3_result_text(pCtx, zStr, nStr, SQLITE_TRANSIENT); Exit;
   end;
   nPat := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
   zRep := sqlite3_value_text(Psqlite3_value((argv+2)^));
-  if zRep = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if zRep = nil then Exit;
   nRep := sqlite3_value_bytes(Psqlite3_value((argv+2)^));
-  { Conservative output buffer size }
-  nOut := nStr * 2 + nRep + 64;
-  zOut := sqlite3_malloc(nOut + 1);
+  nOut := i64(nStr) + 1;
+  zOut := sqlite3_malloc(i32(nOut));
   if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
-  p := zOut;
-  i := 0;
-  while i <= nStr - nPat do begin
-    if CompareMem(zStr + i, zPat, nPat) then begin
-      if p - zOut + nRep > nOut then begin
-        sqlite3_free(zOut);
-        sqlite3_result_error_toobig(pCtx); Exit;
-      end;
-      Move(zRep^, p^, nRep);
-      Inc(p, nRep);
-      Inc(i, nPat);
+  loopLimit := nStr - nPat;
+  cntExpand := 0;
+  i := 0; j := 0;
+  while i <= loopLimit do begin
+    if ((zStr + i)^ <> zPat^) or (not CompareMem(zStr + i, zPat, nPat)) then begin
+      (zOut + j)^ := (zStr + i)^;
+      Inc(j); Inc(i);
     end else begin
-      p^ := (zStr + i)^;
-      Inc(p); Inc(i);
+      if nRep > nPat then begin
+        nOut := nOut + (nRep - nPat);
+        if nOut - 1 > db^.aLimit[SQLITE_LIMIT_LENGTH] then begin
+          sqlite3_result_error_toobig(pCtx);
+          sqlite3_free(zOut);
+          Exit;
+        end;
+        Inc(cntExpand);
+        if (cntExpand and (cntExpand - 1)) = 0 then begin
+          zOld := zOut;
+          zOut := sqlite3_realloc64(zOut, u64(nOut + (nOut - nStr - 1)));
+          if zOut = nil then begin
+            sqlite3_result_error_nomem(pCtx);
+            sqlite3_free(zOld);
+            Exit;
+          end;
+        end;
+      end;
+      Move(zRep^, (zOut + j)^, nRep);
+      Inc(j, nRep);
+      Inc(i, nPat - 1 + 1);  { i += nPat-1; loop ++i }
     end;
   end;
-  { copy tail }
-  j := nStr - i;
-  Move((zStr + i)^, p^, j);
-  Inc(p, j);
-  p^ := #0;
-  sqlite3_result_text(pCtx, zOut, p - zOut, SQLITE_TRANSIENT);
+  Move((zStr + i)^, (zOut + j)^, nStr - i);
+  Inc(j, nStr - i);
+  (zOut + j)^ := #0;
+  sqlite3_result_text(pCtx, zOut, j, SQLITE_TRANSIENT);
   sqlite3_free(zOut);
 end;
 
