@@ -3091,6 +3091,10 @@ var
     sqlite3ResolveSelectNames so recursive sub-SELECT resolution is isolated. }
   gNcAllowAggWin: i32;
 
+  { with2-5.x — Tcl_LinkVar-exposed counter for INSERT-from-SELECT xfer
+    optimization invocations.  C reference: insert.c:2935 + 3235. }
+  sqlite3_xferopt_count: i32 = 0;
+
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
 
@@ -31209,6 +31213,15 @@ begin
   begin
     if (pCur^.pEList <> nil) and (pCur^.pSrc <> nil) then
       expandStar(pParse, pCur);
+    { with2-4.7 — enforce SQLITE_LIMIT_COLUMN on the result set after
+      wildcard expansion.  Mirrors select.c:6328..6332. }
+    if (pCur^.pEList <> nil)
+       and (pCur^.pEList^.nExpr > pParse^.db^.aLimit[SQLITE_LIMIT_COLUMN]) then
+    begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'too many columns in result set', []));
+      Exit;
+    end;
     pCur := pCur^.pPrior;
   end;
 
@@ -35996,7 +36009,9 @@ begin
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
-          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_EphemTab))
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_EphemTab)
+          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
+          or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue))
   then
   begin
     canUseAgg := True;
@@ -36641,6 +36656,70 @@ begin
           sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
           sqlite3ReleaseTempReg(pParse, r2);
           sqlite3ReleaseTempReg(pParse, r1);
+        end
+        else if (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo) then
+        begin
+          { with2-1.4 — recursive-CTE seed where the anchor is an aggregate
+            query (e.g. `SELECT min(i)-1 FROM x1`).  destQueue from
+            generateWithRecursiveQuery hands us SRT_Fifo (UNION ALL anchor)
+            or SRT_DistFifo (UNION anchor); the single aggregate row must
+            land in the Queue ephemeral.  Mirrors selectInnerLoop's
+            SRT_Fifo / SRT_DistFifo branch (select.c:1349..1370 / codegen.pas:
+            28355..28377). }
+          r1 := sqlite3GetTempReg(pParse);
+          r2 := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+          if pDest^.eDest = SRT_DistFifo then
+          begin
+            sqlite3VdbeAddOp4Int(v, OP_Found, pDest^.iSDParm + 1,
+                                 sqlite3VdbeCurrentAddr(v) + 4, r1, 0);
+            sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm + 1, r1,
+              pDest^.iSdst, nResultCol);
+          end;
+          sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+          sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+          sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+          sqlite3ReleaseTempReg(pParse, r2);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
+        else if (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue) then
+        begin
+          { with2-1.4 (ORDER BY variant) — recursive-CTE seed with an
+            ORDER BY clause uses SRT_Queue / SRT_DistQueue keyed on the
+            order-by columns + sequence + payload.  Mirrors
+            selectInnerLoop's SRT_DistQueue/SRT_Queue branch
+            (codegen.pas:28413..28445).  destQueue.pOrderBy provides the
+            key columns. }
+          if pDest^.pOrderBy <> nil then
+          begin
+            nKeyNF := pDest^.pOrderBy^.nExpr;
+            r1 := sqlite3GetTempReg(pParse);
+            r2 := sqlite3GetTempRange(pParse, nKeyNF + 2);
+            r3 := r2 + nKeyNF + 1;
+            addrTestNF := 0;
+            if pDest^.eDest = SRT_DistQueue then
+              addrTestNF := sqlite3VdbeAddOp4Int(v, OP_Found,
+                              pDest^.iSDParm + 1, 0,
+                              pDest^.iSdst, nResultCol);
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r3);
+            if pDest^.eDest = SRT_DistQueue then
+            begin
+              sqlite3VdbeAddOp2(v, OP_IdxInsert, pDest^.iSDParm + 1, r3);
+              sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+            end;
+            pSOItemsNF := ExprListItems(pDest^.pOrderBy);
+            for iiNF := 0 to nKeyNF - 1 do
+              sqlite3VdbeAddOp2(v, OP_SCopy,
+                pDest^.iSdst + i32(pSOItemsNF[iiNF].u.x.iOrderByCol) - 1,
+                r2 + iiNF);
+            sqlite3VdbeAddOp2(v, OP_Sequence, pDest^.iSDParm, r2 + nKeyNF);
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, r2, nKeyNF + 2, r1);
+            sqlite3VdbeAddOp2(v, OP_IdxInsert, pDest^.iSDParm, r1);
+            if pDest^.eDest = SRT_DistQueue then
+              sqlite3VdbeJumpHere(v, addrTestNF);
+            sqlite3ReleaseTempReg(pParse, r1);
+            sqlite3ReleaseTempRange(pParse, r2, nKeyNF + 2);
+          end;
         end;
         { LIMIT gate — selectInnerLoop OP_DecrJumpZero (select.c:1522).
           Decrement the limit counter; the single aggregate row is the
@@ -45609,6 +45688,9 @@ begin
   end
   else
     Result := 1;
+  { with2-5.2 — bump $sqlite3_xferopt_count for the test harness on every
+    successful xfer-optimised INSERT.  Mirrors insert.c:3235. }
+  Inc(sqlite3_xferopt_count);
   { Suppress unused warnings. }
   if False then begin pSrcEListItem := nil; if pSrcEListItem = nil then ; end;
 end;

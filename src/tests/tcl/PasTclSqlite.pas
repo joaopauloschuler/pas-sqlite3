@@ -4832,6 +4832,11 @@ begin
     is undefined → Tcl reads 0 → expected {4 3} comes back as {4 0}. }
   Tcl_LinkVar(interp, PChar('sqlite_search_count'),
               @sqlite3_search_count, TCL_LINK_INT);
+  { with2-5.x — test1.c:9386 Tcl_LinkVar `sqlite3_xferopt_count`.  Counts
+    successful INSERT-from-SELECT xfer optimization invocations
+    (insert.c:3235). }
+  Tcl_LinkVar(interp, PChar('sqlite3_xferopt_count'),
+              @sqlite3_xferopt_count, TCL_LINK_INT);
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
               @sqlite3_sort_count, TCL_LINK_INT);
   { test1.c:9374 Tcl_LinkVar( sqlite_like_count ) — LIKE/GLOB
