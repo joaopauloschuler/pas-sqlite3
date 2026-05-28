@@ -24755,6 +24755,9 @@ begin
     end;
     if pWInfo^.pOrderBy <> nil then
     begin
+      { where.c:7108 — disable plans that would degrade to a full scan
+        when the second solver pass runs to satisfy ORDER BY. }
+      whereInterstageHeuristic(pWInfo);
       if pWInfo^.nRowOut < 0 then
         rc := wherePathSolver(pWInfo, 1)
       else
@@ -38533,13 +38536,13 @@ begin
            and ((p^.pOrderBy^.nExpr - pWInfo^.nOBSat) = 1)) then
     begin
       if pWInfo^.nOBSat <> 0 then
-        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+        sqlite3VdbeAddOp4(v, OP_Explain, i, pParse^.addrExplain, 0,
                           sqlite3MPrintf(pParse^.db,
                                          'USE TEMP B-TREE FOR %s',
                                          ['LAST TERM OF ORDER BY']),
                           P4_DYNAMIC)
       else
-        sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+        sqlite3VdbeAddOp4(v, OP_Explain, i, pParse^.addrExplain, 0,
                           sqlite3MPrintf(pParse^.db,
                                          'USE TEMP B-TREE FOR %s',
                                          ['ORDER BY']),
@@ -38547,7 +38550,7 @@ begin
     end
     else
     begin
-      sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+      sqlite3VdbeAddOp4(v, OP_Explain, i, pParse^.addrExplain, 0,
                         sqlite3MPrintf(pParse^.db,
                                        'USE TEMP B-TREE FOR LAST %d TERMS OF ORDER BY',
                                        [p^.pOrderBy^.nExpr - pWInfo^.nOBSat]),
