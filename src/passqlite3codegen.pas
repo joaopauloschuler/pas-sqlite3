@@ -33028,6 +33028,7 @@ var
   iSortPTabOB:   i32;
   regSortOutOB:  i32;
   addrSortBrkOB: i32;
+  addrSortContOB:i32;
   addrSortLoopOB:i32;
   groupBySortLoc:i32;            { select.c:8533 — 0 when WhereIsOrdered
                                     delivers full GROUP BY order via index }
@@ -34856,6 +34857,19 @@ begin
         sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
         sqlite3ReleaseTempReg(pParse, rDistTmp);
       end;
+      { OFFSET — codeOffset (select.c:1170..1173, 1299..1301) inside
+        selectInnerLoop, reached from select.c:8736 via the GROUP BY
+        output subroutine.  When no secondary ORDER BY sorter is in play
+        (needSortOB=False — GROUP BY ordering satisfies ORDER BY, or no
+        ORDER BY), decrement p^.iOffset and Return from the output
+        subroutine without emitting when OFFSET still positive.  Target
+        is addrOutputRow+1 (the OP_Return after the IfPos iUseFlag gate),
+        mirroring iContinue passed as `addrOutputRow+1` at select.c:8738.
+        The needSortOB branch applies OFFSET post-sort in the drain
+        below.  Closes select4-10.5/10.6: DISTINCT->GROUP BY transformed
+        SELECT with LIMIT/OFFSET ignored OFFSET entirely. }
+      if (p^.iOffset > 0) and (not needSortOB) then
+        sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrOutputRow + 1, 1);
       if needSortOB then
       begin
         { Push (orderKeys + resultCols) into the ORDER BY sorter.
@@ -35007,10 +35021,18 @@ begin
         sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortPTabOB, regSortOutOB,
                           nOrderByOB + nResultCol);
         addrSortBrkOB  := sqlite3VdbeMakeLabel(pParse);
+        addrSortContOB := sqlite3VdbeMakeLabel(pParse);
         sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterOB, addrSortBrkOB);
         addrSortLoopOB := sqlite3VdbeCurrentAddr(v);
         sqlite3VdbeAddOp3(v, OP_SorterData, iSorterOB, regSortOutOB,
                           iSortPTabOB);
+        { OFFSET post-sort — generateSortTail codeOffset (select.c:1765):
+          decrement p^.iOffset and skip the row dispatch when still positive,
+          jumping to addrSortContOB which feeds SorterNext.  Without this,
+          DISTINCT->GROUP BY transformed queries with secondary ORDER BY
+          sorter and OFFSET emit every grouped row, ignoring OFFSET. }
+        if p^.iOffset > 0 then
+          sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrSortContOB, 1);
         for iOB := 0 to nResultCol - 1 do
           sqlite3VdbeAddOp3(v, OP_Column, iSortPTabOB,
                             nOrderByOB + iOB, pDest^.iSdst + iOB);
@@ -35028,6 +35050,7 @@ begin
           each emit; jump to the break label once it hits zero. }
         if p^.iLimit <> 0 then
           sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrkOB);
+        sqlite3VdbeResolveLabel(v, addrSortContOB);
         sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterOB, addrSortLoopOB);
         sqlite3VdbeResolveLabel(v, addrSortBrkOB);
         sqlite3ReleaseTempReg(pParse, regSortOutOB);
