@@ -1938,6 +1938,14 @@ begin
         end;
 
         while (rc = SQLITE_OK) and (walIteratorNext(pIter, @iDbpage, @iFrame) = 0) do begin
+          { wal.c:2302..2305 — abort backfill on sqlite3_interrupt. }
+          if (db <> nil) and (PTsqlite3(db)^.u1.isInterrupted <> 0) then begin
+            if PTsqlite3(db)^.mallocFailed <> 0 then
+              rc := SQLITE_NOMEM
+            else
+              rc := SQLITE_INTERRUPT;
+            break;
+          end;
           if iFrame <= nBackfill then continue;
           if iFrame > mxSafeFrame then continue;
           if iDbpage > mxPage then continue;

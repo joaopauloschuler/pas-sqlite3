@@ -6339,6 +6339,14 @@ begin
     Exit;
   end;
 
+  { vdbeapi.c:794..800 — if no other statements are running, reset the
+    interrupt flag so a stale sqlite3_interrupt from a previous statement
+    doesn't immediately abort this one. }
+  if (pStmt^.eVdbeState = VDBE_READY_STATE)
+     and (db <> nil) and (db^.nVdbeActive = 0) then begin
+    db^.u1.isInterrupted := 0;
+  end;
+
   { Transition READY → RUN — vdbeapi.c:815..819 }
   if pStmt^.eVdbeState = VDBE_READY_STATE then begin
     if db <> nil then begin
