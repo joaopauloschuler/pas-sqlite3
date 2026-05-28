@@ -70556,6 +70556,7 @@ var
   rRhsHasNull: i32;
   eType:       i32;
   rLhs:        i32;
+  rLhsOrig:    i32;
   v:           PVdbe;
   zAff:        PAnsiChar;
   pLeft:       PExpr;
@@ -70579,12 +70580,14 @@ var
   r3:          i32;
   pVF:         PExpr;
   regCkNull:   i32;
+  aiMap:       Pi32;
 begin
   rRhsHasNull := 0;
   destStep6   := 0;
   addrTruthOp := 0;
   zAff        := nil;
   iTab        := 0;
+  aiMap       := nil;
   v           := pParse^.pVdbe;
   if v = nil then Exit;
   pLeft   := pExpr^.pLeft;
@@ -70626,10 +70629,17 @@ begin
   if destIfFalse = destIfNull then prRhs := nil
   else                             prRhs := @rRhsHasNull;
 
-  { Find or build the RHS index/eph table. }
+  { Find or build the RHS index/eph table.  Allocate aiMap so the
+    index-reuse path (expr.c:3366) can record the LHS→index-col mapping;
+    expr.c:4165..4174 then reorders LHS registers when the SELECT projects
+    index columns in a different order than the index declares them
+    (rowvalue3-1.4). }
+  if nVector >= 1 then
+    aiMap := Pi32(sqlite3DbMallocZero(pParse^.db,
+                    u64(SizeOf(i32)) * u64(nVector)));
   eType := sqlite3FindInIndex(pParse, pExpr,
              IN_INDEX_MEMBERSHIP or IN_INDEX_NOOP_OK,
-             prRhs, nil, @iTab);
+             prRhs, aiMap, @iTab);
 
   { Code the LHS into a register block: rLhs..rLhs+nVector-1.  Must not
     const-factor — the OP_Affinity path may need to mutate the register.
@@ -70702,7 +70712,28 @@ begin
       reached on the shapes this port codes; nVector=1 for the index/rowid
       arms here.) }
     if eType <> IN_INDEX_ROWID then
+    begin
       sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
+      { expr.c:4165..4174 — if the IN-index column order differs from the
+        LHS vector order, reorder LHS via OP_Copy into a fresh range.
+        Required when the SELECT projects index cols in a swapped order,
+        e.g. (5,4) IN (SELECT b,a FROM t1) with INDEX i1(a,b) — aiMap = {1,0}
+        means RHS col 0 (b) is at index pos 1, so LHS field 0 (=5) must
+        land at rLhs+1 (rowvalue3-1.4). }
+      if aiMap <> nil then
+      begin
+        ii := 0;
+        while (ii < nVector) and (aiMap[ii] = ii) do Inc(ii);
+        if ii <> nVector then
+        begin
+          rLhsOrig := rLhs;
+          rLhs := sqlite3GetTempRange(pParse, nVector);
+          for ii := 0 to nVector - 1 do
+            sqlite3VdbeAddOp3(v, OP_Copy, rLhsOrig + ii, rLhs + aiMap[ii], 0);
+          sqlite3ReleaseTempReg(pParse, rLhsOrig);
+        end;
+      end;
+    end;
 
     { Step 2 (expr.c:4178..4194) — IsNull guard per LHS field that can
       be NULL.  destStep2/destStep6 differ only when destIfFalse !=
@@ -70752,6 +70783,7 @@ begin
       { goto sqlite3ExprCodeIN_finished — skip Steps 4..7. }
       sqlite3ReleaseTempReg(pParse, regFree1);
       sqlite3DbFree(pParse^.db, zAff);
+      sqlite3DbFree(pParse^.db, aiMap);
       Exit;
     end
     else
@@ -70802,6 +70834,7 @@ begin
 
   sqlite3ReleaseTempReg(pParse, regFree1);
   sqlite3DbFree(pParse^.db, zAff);
+  sqlite3DbFree(pParse^.db, aiMap);
   if rRhsHasNull = 0 then ; { silence unused }
 end;
 
