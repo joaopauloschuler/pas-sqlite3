@@ -2713,6 +2713,7 @@ var
   baseSz: u64;
   addr:   i32;
   op:     i32;
+  pTop:   PParse;
 begin
   v := vdbeParsePVdbe(pParse);
   Assert(v <> nil);
@@ -2748,6 +2749,19 @@ begin
     pCtx^.argc at runtime, not pOp^.p5. }
   if (p5 and $2E) <> 0 then
     sqlite3VdbeChangeP5(v, u16(p5 and $2E));
+  { vdbeaux.c:466 — any OP_Function/OP_PureFunc may set sqlite3_result_error
+    at run-time, so the surrounding statement may need to abort.  Marking
+    mayAbort here is what lets a multi-row INSERT (e.g. VALUES(0),(json(...))
+    inside a BEGIN) open a statement-journal savepoint at OP_Transaction and
+    roll back the partial row on a json() "malformed JSON" failure.  Without
+    this call usesStmtJournal stays 0, OP_Transaction skips BeginStmt, and
+    json101-19.3's COMMIT keeps row 0.  Inlined to avoid a uses-cycle on
+    passqlite3codegen.pas — equivalent to sqlite3MayAbort: set bit 1 of the
+    toplevel Parse.parseFlags (PARSEFLAG_MayAbort).  Parse offsets:
+    pToplevel @152 (PParse), parseFlags @40 (u32). }
+  pTop := PPointer(PByte(pParse) + 152)^;
+  if pTop = nil then pTop := pParse;
+  PUInt32(PByte(pTop) + 40)^ := PUInt32(PByte(pTop) + 40)^ or u32(1 shl 1);
   Result := addr;
 end;
 
