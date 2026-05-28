@@ -10525,6 +10525,85 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { tkt-54844eea3f-1.2 — a bare TK_ID may be safely rebound to an OUTER
+    cursor only when we can be CERTAIN it names no column of the inner
+    FROM.  ColumnInSrcList(pInnerSrc,...) reports "not found" both when an
+    inner item genuinely lacks the column AND when the item is not yet
+    expanded (pSTab=nil) — its columns are simply unknown.  When the deep
+    FROM-subquery walk (WalkDeepFromSubqueries) runs BEFORE expansion, a
+    bare column that really belongs to a deeply-nested inner table (e.g.
+    `a` inside `(SELECT * FROM t4 WHERE a=out.a)` two levels under a scalar
+    subquery) would slip past the unexpanded inner-scope test and be bound
+    to the outer `out`.  This function inspects each unexpanded inner item
+    by NAME — real tables via the schema, subqueries via their result
+    EName list — and returns True when the column MIGHT belong to the
+    inner FROM, so the caller defers the outer binding (the post-expand
+    WalkDeep pass and the inner per-Select resolver handle it correctly).
+    When no inner item can provide the column (e.g. subquery2-1.1's `a`
+    against an inner FROM of only t3(e,f)) it returns False and the outer
+    binding proceeds as before. }
+  function BareColMaybeInner(pSrc: PSrcList; zCol: PAnsiChar): Boolean;
+  var
+    base_: PSrcItem;
+    pIt:   PSrcItem;
+    j_, k_: i32;
+    pTb:   PTable2;
+    pSub:  PSelect;
+    pEL:   PExprList;
+    itm:   PExprListItem;
+    zEn:   PAnsiChar;
+  begin
+    Result := False;
+    if (pSrc = nil) or (zCol = nil) then Exit;
+    base_ := SrcListItems(pSrc);
+    for j_ := 0 to pSrc^.nSrc - 1 do
+    begin
+      pIt := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+      if pIt^.pSTab <> nil then
+      begin
+        { Expanded — definitive test. }
+        if sqlite3ColumnIndex(pIt^.pSTab, zCol) >= 0 then
+        begin Result := True; Exit; end;
+      end
+      else if (pIt^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0 then
+      begin
+        { Unexpanded subquery — match against its result-column names. }
+        pSub := nil;
+        if pIt^.u4.pSubq <> nil then pSub := pIt^.u4.pSubq^.pSelect;
+        if pSub <> nil then pEL := pSub^.pEList else pEL := nil;
+        if pEL <> nil then
+        begin
+          itm := ExprListItems(pEL);
+          for k_ := 0 to pEL^.nExpr - 1 do
+          begin
+            zEn := itm[k_].zEName;
+            if (zEn <> nil) and ((itm[k_].fg.eBits and $03) = ENAME_NAME)
+               and (sqlite3StrICmp(zEn, zCol) = 0) then
+            begin Result := True; Exit; end;
+          end;
+        end
+        else
+        begin
+          { Cannot determine the subquery's columns — be conservative. }
+          Result := True; Exit;
+        end;
+      end
+      else if pIt^.zName <> nil then
+      begin
+        { Unexpanded real table — look it up by name in the schema. }
+        pTb := sqlite3FindTable(pParse^.db, pIt^.zName, pIt^.u4.zDatabase);
+        if (pTb <> nil) and (sqlite3ColumnIndex(pTb, zCol) >= 0) then
+        begin Result := True; Exit; end;
+        if pTb = nil then begin Result := True; Exit; end; { unknown → defer }
+      end
+      else
+      begin
+        { Table-valued function or other unnamed item — be conservative. }
+        Result := True; Exit;
+      end;
+    end;
+  end;
+
   { autoindex5-2.2 — rowid outer-scope climb (resolve.c:471..503 + 619..638).
     A bare `rowid`/`oid`/`_rowid_` that matches no real column in the inner
     scope and whose inner scope has no VisibleRowid source must resolve
@@ -10639,6 +10718,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if (pW^.u.zToken = nil) or (pOuterSrc = nil) then Exit;
       { Inner scope wins — leave for the inner resolver to bind. }
       if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
+      { tkt-54844eea3f-1.2 — do not rebind to the outer scope when the bare
+        column might belong to a still-unexpanded inner FROM table.  The
+        ColumnInSrcList test above only sees expanded items; BareColMaybeInner
+        inspects unexpanded items by name so a deeply-nested inner column
+        (t4.a under a scalar subquery) is left for the post-expand pass. }
+      if BareColMaybeInner(pInnerSrc, pW^.u.zToken) then Exit;
       if ColumnInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutCol) then
       begin
         pW^.op      := TK_COLUMN;
@@ -36395,8 +36480,10 @@ begin
         Assert(pItem^.u4.pSubq^.regReturn <> 0);
         Assert(pItem^.u4.pSubq^.regResult <> 0);
         Assert(pItem^.u4.pSubq^.addrFillSub > 0);
-        sqlite3VdbeAddOp3(v, OP_InitCoroutine,
-          pItem^.u4.pSubq^.regReturn, 0, pItem^.u4.pSubq^.addrFillSub);
+        { The consumer-side reset InitCoroutine is emitted unconditionally
+          below, right before the OP_Yield loop (mirrors C where.c:1199 /
+          wherecode.c:1550).  Nothing to do here for the pre-emitted
+          (VALUES) coroutine beyond the asserts. }
       end
       else
       begin
@@ -36479,6 +36566,22 @@ begin
         both clauses entirely. }
       if p^.pLimit <> nil then
         computeLimitRegisters(pParse, p, addrEnd);
+
+      { Consumer-side coroutine reset — port of where.c:1199 /
+        wherecode.c:1550.  C codes the FROM-subquery coroutine producer
+        (the jump-over OP_InitCoroutine + body + OP_EndCoroutine) once, then
+        the consumer ALWAYS emits a fresh OP_InitCoroutine(regReturn, 0,
+        addrFillSub) immediately before its OP_Yield loop to re-prime the
+        coroutine PC to addrFillSub.  This is essential when the whole
+        consumer block is re-executed per outer row (a correlated FROM
+        subquery inside a scalar subquery): after the coroutine reaches
+        OP_EndCoroutine on the first outer row its return register holds the
+        end address, so the next outer iteration must reset it.  Without
+        this reset the second invocation resumes a spent coroutine and
+        returns stale rows (tkt-54844eea3f-1.2: 'three two three two'
+        instead of '{} two {} four'). }
+      sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+        pItem^.u4.pSubq^.regReturn, 0, pItem^.u4.pSubq^.addrFillSub);
 
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
                           pItem^.u4.pSubq^.regReturn, addrEnd);
