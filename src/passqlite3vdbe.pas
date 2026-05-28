@@ -9752,6 +9752,7 @@ var
   { 5.4c locals — record I/O }
   pCol:    PVdbeCursor;   { OP_Column: cursor being read }
   p2col:   u32;           { OP_Column: column index }
+  iAltMap: u32;           { OP_Column: index-alias map entry (vdbe.c:3025) }
   aOffset: Pu32;          { OP_Column: aOffset array pointer }
   lenCol:  i32;           { OP_Column: data length }
   zData:   Pu8;           { OP_Column: pointer into page data }
@@ -10678,10 +10679,11 @@ begin
     OP_Column: begin
       pCol   := v^.apCsr[pOp^.p1];
       p2col  := u32(pOp^.p2);
-      aOffset := Pu32(Pu8(pCol) + 120 + u32(pCol^.nField) * SizeOf(u32));
-      { aOffset = pCol->aType + pCol->nField }
 
       op_column_restart:
+      { vdbe.c:3000 — aOffset recomputed from current pCol so an aAltMap
+        redirect (below) lands on the alias cursor's aType/aOffset. }
+      aOffset := Pu32(Pu8(pCol) + 120 + u32(pCol^.nField) * SizeOf(u32));
       if pCol^.cacheStatus <> v^.cacheCtr then begin
         if pCol^.nullRow <> 0 then begin
           if (pCol^.eCurType = CURTYPE_PSEUDO) and (pCol^.seekResult > 0) then begin
@@ -10697,6 +10699,19 @@ begin
         end else begin
           pCrsr := pCol^.uc.pCursor;
           if pCol^.deferredMoveto <> 0 then begin
+            { vdbe.c:3025..3031 — covering-index alias redirect: if the
+              table cursor was set up by OP_DeferredSeek with an aAltMap
+              (P4_INTARRAY), and the requested column maps to an index
+              column, read directly from the index cursor and skip the
+              deferred table seek entirely (saves a sqlite3_search_count
+              tick for covering-index OR plans — see whereD-3.5.1). }
+            if (pCol^.ub.aAltMap <> nil)
+               and (Pu32(pCol^.ub.aAltMap)[1 + p2col] > 0) then begin
+              iAltMap := Pu32(pCol^.ub.aAltMap)[1 + p2col];
+              pCol    := pCol^.pAltCursor;
+              p2col   := iAltMap - 1;
+              goto op_column_restart;
+            end;
             rc := sqlite3VdbeFinishMoveto(pCol);
             if rc <> SQLITE_OK then goto abort_due_to_error;
           end else if sqlite3BtreeCursorHasMoved(pCrsr) <> 0 then begin
