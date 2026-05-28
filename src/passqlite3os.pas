@@ -784,6 +784,12 @@ var
     `1000*sqlite3_current_time + unixEpoch` instead of the wall clock.
     Linked into Tcl as $sqlite_current_time (test1.c:9380). }
   sqlite3_current_time      : cint = 0;
+  { os_unix.c:3728..3729 — count of fsync()s and FULLFSYNCs performed by
+    unixSync_impl/full_fsync.  Linked into Tcl as $sqlite_sync_count /
+    $sqlite_fullsync_count (test1.c:9439..9442) so sync.test can verify
+    that PRAGMA synchronous gates fsync correctly. }
+  sqlite3_sync_count        : cint = 0;
+  sqlite3_fullsync_count    : cint = 0;
 {$endif}
 
 
@@ -1853,6 +1859,13 @@ begin
     Result := SQLITE_FULL;
     Exit;
   end;
+  { os_unix.c:3800..3803 — record the fsync.  full_fsync() bumps
+    sqlite3_sync_count unconditionally and sqlite3_fullsync_count when
+    the caller requested SQLITE_SYNC_FULL (fullSync arg).  sync.test
+    (and others) read these via $sqlite_sync_count / $sqlite_fullsync_count. }
+  if (flags and $0F) = SQLITE_SYNC_FULL then
+    Inc(sqlite3_fullsync_count);
+  Inc(sqlite3_sync_count);
   {$endif}
   rc := c_fsync(pf^.h);
   {$ifdef SQLITE_TEST}

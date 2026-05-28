@@ -8703,6 +8703,14 @@ begin
     can read/reset it. }
   Tcl_LinkVar(interp, PChar('unaligned_string_counter'),
     @unaligned_string_counter, TCL_LINK_INT);
+  { test1.c:9439..9442 — expose unixSync's fsync/FULLFSYNC counters
+    (sqlite3_sync_count / sqlite3_fullsync_count, os_unix.c:3728..3729)
+    so sync.test / sync2.test / wal2.test can verify that PRAGMA
+    synchronous gates fsync correctly. }
+  Tcl_LinkVar(interp, PChar('sqlite_sync_count'),
+    @sqlite3_sync_count, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('sqlite_fullsync_count'),
+    @sqlite3_fullsync_count, TCL_LINK_INT);
   { 9.4.divbug.62.d — sqlite3_config_uri / _config_pmasz
     (test_malloc.c:1163..1241, registered at test_malloc.c:1497, 1499)
     and sqlite3_reset_auto_extension (test_autoext.c:189..219). }

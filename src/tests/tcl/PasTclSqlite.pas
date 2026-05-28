@@ -4842,6 +4842,13 @@ begin
     open-file-handle counter (passqlite3os.pas), read by exclusive-5.x. }
   Tcl_LinkVar(interp, PChar('sqlite_open_file_count'),
               @sqlite3_open_file_count, TCL_LINK_INT);
+  { test1.c:9439..9442 Tcl_LinkVar( sqlite_sync_count / sqlite_fullsync_count )
+    — fsync()/FULLFSYNC counters from unixSync (passqlite3os.pas) read by
+    sync.test / sync2.test / wal2.test. }
+  Tcl_LinkVar(interp, PChar('sqlite_sync_count'),
+              @sqlite3_sync_count, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('sqlite_fullsync_count'),
+              @sqlite3_fullsync_count, TCL_LINK_INT);
   { test1.c:9380..9381 Tcl_LinkVar($sqlite_current_time) — when set to a
     non-zero unix-seconds value, unixCurrentTimeInt64 (os_unix.c:7211) returns
     the pinned time so date/time tests (e_createtable-3.5/3.8, etc.) are
