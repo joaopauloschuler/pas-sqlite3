@@ -406,6 +406,32 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:8708..8729 — test_dbconfig_maindbname_icecube.
+  Usage: dbconfig_maindbname_icecube DB
+  Change the name of the main database schema from "main" to "icecube". }
+function test_dbconfig_maindbname_icecube(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: cint;
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  rc := sqlite3_db_config_text(db, SQLITE_DBCONFIG_MAINDBNAME,
+    PAnsiChar('icecube'));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+end;
+
 { test1.c:2876..2911 — test_atomic_batch_write.
   Usage: atomic_batch_write PATH
   Returns 1 if the VFS reports SQLITE_IOCAP_BATCH_ATOMIC for PATH. }
@@ -8303,6 +8329,9 @@ begin
     @get_sqlite_pointer, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
+  { misc8.test — test1.c:9187 dbconfig_maindbname_icecube. }
+  Tcl_CreateObjCommand(interp, PChar('dbconfig_maindbname_icecube'),
+    @test_dbconfig_maindbname_icecube, nil, nil);
   { 9.4.divbug.88.003 — test1.c:9173 sqlite3_db_cacheflush. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_cacheflush'),
     @test_db_cacheflush, nil, nil);
