@@ -66549,8 +66549,12 @@ begin
   zPat := sqlite3_value_text(Psqlite3_value(argv^));
   zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
   if (zPat <> nil) and (zStr <> nil) then
+  begin
+    { Test-only counter — func.c:966 (SQLITE_TEST). }
+    Inc(passqlite3vdbe.sqlite3_like_count);
     sqlite3_result_int(pCtx,
       i32(patternCompare(Pu8(zPat), Pu8(zStr), pInfo^, escape) = 0));
+  end;
 end;
 
 procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -66564,6 +66568,8 @@ begin
   zPat := sqlite3_value_text(Psqlite3_value(argv^));
   zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
   if (zPat = nil) or (zStr = nil) then begin sqlite3_result_null(pCtx); Exit; end;
+  { Test-only counter — GLOB shares the LIKE counter (func.c:966). }
+  Inc(passqlite3vdbe.sqlite3_like_count);
   sqlite3_result_int(pCtx, i32(sqlite3_strglob(zPat, zStr) = 0));
 end;
 

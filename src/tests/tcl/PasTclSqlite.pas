@@ -4834,6 +4834,10 @@ begin
               @sqlite3_search_count, TCL_LINK_INT);
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
               @sqlite3_sort_count, TCL_LINK_INT);
+  { test1.c:9374 Tcl_LinkVar( sqlite_like_count ) — LIKE/GLOB
+    invocation counter (func.c:891) for like.test 3.x / 4.x / 5.x. }
+  Tcl_LinkVar(interp, PChar('sqlite_like_count'),
+              @sqlite3_like_count, TCL_LINK_INT);
   { test1.c:9378 Tcl_LinkVar( sqlite_open_file_count ) — the OS-layer
     open-file-handle counter (passqlite3os.pas), read by exclusive-5.x. }
   Tcl_LinkVar(interp, PChar('sqlite_open_file_count'),

@@ -2035,6 +2035,15 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 var
   sqlite3_sort_count: i32 = 0;
 
+{ Test-only global incremented by likeFunc on each LIKE/GLOB invocation
+  (func.c:891, 924, 966 — guarded by SQLITE_TEST).  Regression tests
+  (like.test, e_expr-* etc.) read it via the Tcl-linked
+  `sqlite_like_count` variable (test1.c:9374) to verify the optimizer
+  has, or has not, elided LIKE/GLOB function calls.  Always present
+  here; harmless when unused. }
+var
+  sqlite3_like_count: i32 = 0;
+
 { 9.4.divbug.73 — Test-only global incremented by OP_SeekGE/GT/LT/LE on
   success (vdbe.c:4975), by OP_Next/Prev/SorterNext on success (vdbe.c:6532),
   and decremented by OP_Sort/OP_SorterSort (vdbe.c:6351).  Read by regression
