@@ -10918,6 +10918,75 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   procedure ResolveOuterIDs(pW: PExpr; pOuterSrc: PSrcList;
                             pInnerSrc: PSrcList); forward;
 
+  { select1-6.22 — a bare-column ORDER BY term on a COMPOUND subquery hangs
+    off the top-most arm but resolves against the result-set of ANY arm of
+    the compound (resolve.c:resolveCompoundOrderBy, beginning with the
+    left-most).  When ResolveOuterIDs descends into such a subquery it must
+    treat the union of all arms' FROM clauses as the inner scope, or a name
+    that exists only in the left arm's FROM (and not the top arm's) would be
+    wrongly rebound to an outer cursor.  Returns True when zCol names a column
+    of any arm's FROM source, walking the pPrior chain. }
+  function ColInAnyCompoundArm(pTop: PSelect; zCol: PAnsiChar): Boolean;
+  var
+    pArm_: PSelect;
+    pM_:   PSrcItem;
+    ic_:   i32;
+  begin
+    Result := False;
+    pArm_ := pTop;
+    while pArm_ <> nil do
+    begin
+      if ColumnInSrcList(pArm_^.pSrc, zCol, pM_, ic_) then
+      begin Result := True; Exit; end;
+      if BareColMaybeInner(pArm_^.pSrc, zCol) then
+      begin Result := True; Exit; end;
+      pArm_ := pArm_^.pPrior;
+    end;
+  end;
+
+  { Resolve outer bare-IDs in a compound's top-most ORDER BY list, but skip
+    any term whose bare name belongs to an arm of the compound. }
+  procedure ResolveOuterIDsInCompoundOrderBy(pList: PExprList; pTop: PSelect;
+                                             pOuterSrc: PSrcList);
+  var
+    k_: i32;
+    pT_: PExpr;
+  begin
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+    begin
+      pT_ := sqlite3ExprSkipCollateAndLikely(ExprListItems(pList)[k_].pExpr);
+      if (pT_ <> nil) and (pT_^.op = TK_ID) and (pT_^.u.zToken <> nil)
+         and ColInAnyCompoundArm(pTop, pT_^.u.zToken) then
+        Continue;
+      ResolveOuterIDs(ExprListItems(pList)[k_].pExpr, pOuterSrc, pTop^.pSrc);
+    end;
+  end;
+
+  { select1-6.22 — does the top-most ORDER BY of a compound reference an outer
+    column?  A bare-name term that matches any arm of the compound is NOT an
+    outer reference (resolveCompoundOrderBy binds it to an arm's result set),
+    so exclude those before deferring to the per-term ExprRefsOuterID test. }
+  function CompoundOrderByRefsOuterID(pList: PExprList; pTop: PSelect;
+                                      pOuterSrc: PSrcList): Boolean;
+  var
+    k_: i32;
+    pT_, pItm_: PExpr;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+    begin
+      pItm_ := ExprListItems(pList)[k_].pExpr;
+      pT_ := sqlite3ExprSkipCollateAndLikely(pItm_);
+      if (pT_ <> nil) and (pT_^.op = TK_ID) and (pT_^.u.zToken <> nil)
+         and ColInAnyCompoundArm(pTop, pT_^.u.zToken) then
+        Continue;
+      if ExprRefsOuterID(pItm_, pOuterSrc, pTop^.pSrc) then
+      begin Result := True; Exit; end;
+    end;
+  end;
+
   procedure ResolveOuterIDsInList(pList: PExprList; pOuterSrc: PSrcList;
                                   pInnerSrc: PSrcList);
   var k_: i32;
@@ -10933,6 +11002,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   var
     pInItem, pOutItem: PSrcItem;
     iInCol, iOutCol: i32;
+    pInner: PSelect;
   begin
     if pW = nil then Exit;
     if pW^.op = TK_ID then
@@ -10991,16 +11061,27 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         sqlite3WalkExpr -> sqlite3WalkSelect descent + lookupName
         pNC->pNext climb (resolve.c:341..706, 1378..1390).  This matches
         the analogous descent already done in ResolveOuterRefs. }
-      ResolveOuterIDsInList(pW^.x.pSelect^.pEList,
-                            pOuterSrc, pW^.x.pSelect^.pSrc);
-      ResolveOuterIDs(pW^.x.pSelect^.pWhere,
-                      pOuterSrc, pW^.x.pSelect^.pSrc);
-      ResolveOuterIDs(pW^.x.pSelect^.pHaving,
-                      pOuterSrc, pW^.x.pSelect^.pSrc);
-      ResolveOuterIDsInList(pW^.x.pSelect^.pGroupBy,
-                            pOuterSrc, pW^.x.pSelect^.pSrc);
-      ResolveOuterIDsInList(pW^.x.pSelect^.pOrderBy,
-                            pOuterSrc, pW^.x.pSelect^.pSrc);
+      { select1-6.22 — when the subquery is a COMPOUND, each arm's own
+        pEList/pWHERE/etc. must be resolved against THAT arm's pSrc (the
+        clauses hang off each arm), and the ORDER BY (which hangs off the
+        top-most arm) is resolved against the union of all arms' FROM
+        scopes via ResolveOuterIDsInCompoundOrderBy.  For a singleton this
+        loop runs once on the top select, identical to the prior code. }
+      pInner := pW^.x.pSelect;
+      while pInner <> nil do
+      begin
+        ResolveOuterIDsInList(pInner^.pEList,
+                              pOuterSrc, pInner^.pSrc);
+        ResolveOuterIDs(pInner^.pWhere,
+                        pOuterSrc, pInner^.pSrc);
+        ResolveOuterIDs(pInner^.pHaving,
+                        pOuterSrc, pInner^.pSrc);
+        ResolveOuterIDsInList(pInner^.pGroupBy,
+                              pOuterSrc, pInner^.pSrc);
+        pInner := pInner^.pPrior;
+      end;
+      ResolveOuterIDsInCompoundOrderBy(pW^.x.pSelect^.pOrderBy,
+                                       pW^.x.pSelect, pOuterSrc);
       { whereF-6.1 — bare TK_ID outer ref inside a TVF arg
         (`json_each(x)` where x is an outer column). }
       if pW^.x.pSelect^.pSrc <> nil then
@@ -12968,7 +13049,15 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                                p^.pSrc, pCompArm^.pSrc)   then bCorr := True;
             if ExprListRefsOuterID(pCompArm^.pGroupBy,
                                    p^.pSrc, pCompArm^.pSrc) then bCorr := True;
-            if ExprListRefsOuterID(pCompArm^.pOrderBy,
+            { select1-6.22 — the compound's ORDER BY hangs off the top arm
+              (pInner) but its bare-name terms resolve against ANY arm; only
+              terms matching no arm are genuine outer refs. }
+            if (pCompArm = pInner) and (pCompArm^.pPrior <> nil) then
+            begin
+              if CompoundOrderByRefsOuterID(pCompArm^.pOrderBy,
+                                            pInner, p^.pSrc) then bCorr := True;
+            end
+            else if ExprListRefsOuterID(pCompArm^.pOrderBy,
                                    p^.pSrc, pCompArm^.pSrc) then bCorr := True;
             { subquery2-1.1/1.2/1.21/1.22 — correlation may live one (or more)
               FROM-subquery levels deeper than pCompArm's own clauses, e.g.
@@ -13028,7 +13117,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             ResolveOuterIDs(pCompArm^.pWhere,         p^.pSrc, pCompArm^.pSrc);
             ResolveOuterIDs(pCompArm^.pHaving,        p^.pSrc, pCompArm^.pSrc);
             ResolveOuterIDsInList(pCompArm^.pGroupBy, p^.pSrc, pCompArm^.pSrc);
-            ResolveOuterIDsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
+            { select1-6.22 — compound ORDER BY: skip terms that resolve to any
+              arm of the compound (see CompoundOrderByRefsOuterID above). }
+            if (pCompArm = pInner) and (pCompArm^.pPrior <> nil) then
+              ResolveOuterIDsInCompoundOrderBy(pCompArm^.pOrderBy, pInner, p^.pSrc)
+            else
+              ResolveOuterIDsInList(pCompArm^.pOrderBy, p^.pSrc, pCompArm^.pSrc);
             { whereF-6.x — table-valued function args in pSrc may reference
               an OUTER column (json_each(x), json_each(t6.c), etc.).  Mirrors
               C's Walker descent into SrcItem.u1.pFuncArg via lookupName's
