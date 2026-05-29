@@ -33684,6 +33684,63 @@ begin
         pSubFC^.pOrderBy := nil;
       end;
 
+      { tag-select-0240 — attempt to flatten a multi-source FROM subquery
+        (select.c:7866..7871).  The single-source (nSrc=1) flatten is handled
+        later in the per-FROM-item codegen path (the Phase 6.13(b)-fl wiring),
+        which TestExplainParity already pins byte-for-byte; only the
+        multi-source outer query (nSrc>1) was never offered to the flattener,
+        so its FROM subqueries were always materialised into ephemeral tables
+        (select6-8.3 / 8.6).  Mirror C: skip MATERIALIZED-CTE fences
+        (select.c:7785) and aggregate subqueries (select.c:7796), apply the
+        complex-result ORDER BY guard (select.c:7857..7864), then call
+        flattenSubquery and, on success, restart the FROM scan (i := -1, C
+        select.c:7870) because cursor numbering and the FROM list changed. }
+      if (pTabList^.nSrc > 1)
+         and SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil)
+         and (pItem^.u4.pSubq^.pSelect <> nil)
+         { Skip FROM items that are the right operand of an outer join.
+           C does flatten these (flattenSubquery's isOuterJoin path wraps the
+           substituted result columns in TK_IF_NULL_ROW), but the pas
+           IF_NULL_ROW codegen for a substituted *constant* result column
+           currently yields NULL instead of the constant (select3-11.x / 12.x:
+           `t1 LEFT JOIN (SELECT x,59 AS m FROM t2)`).  Such outer-join FROM
+           subqueries are still materialised here, exactly as before this
+           change, so no runtime regression; only inner-join multi-source
+           subqueries (select6-8.3 / 8.6) are newly flattened. }
+         and ((pItem^.fg.jointype and (JT_OUTER or JT_LTORJ)) = 0) then
+      begin
+        pSubFC := pItem^.u4.pSubq^.pSelect;
+        { Conservatively skip CTE-backed FROM items in this multi-source
+          flatten pass.  Flattening a CTE subquery (especially one whose own
+          FROM references other CTEs, e.g. with1-19.1b) interacts with the
+          pas CTE materialisation pass in ways the late single-source path
+          never exercised; the C result for those is reached via a different
+          code path.  8.3/8.6 use plain table subqueries, not CTEs. }
+        if ((pItem^.fg.fgBits2 and u8($02)) = 0)                { not isCte }
+           and not (((pItem^.fg.fgBits2 and u8($02)) <> 0)      { isCte fence }
+                and (pItem^.u2.pCteUse <> nil)
+                and (pItem^.u2.pCteUse^.eM10d = u8(0)))         { M10d_Yes }
+           and ((pSubFC^.selFlags and SF_Aggregate) = 0)        { 7796 }
+           { Complex-result ORDER BY guard (select.c:7857..7864). }
+           and not ((pSubFC^.pOrderBy <> nil)
+                    and (i = 0)
+                    and ((p^.selFlags and SF_ComplexResult) <> 0)
+                    and ((pTabList^.nSrc = 1)
+                         or ((SrcListItems(pTabList)[1].fg.jointype
+                              and (JT_OUTER or JT_CROSS)) <> 0)))
+        then
+        begin
+          if flattenSubquery(pParse, p, i, i32(Ord((p^.selFlags and SF_Aggregate) <> 0))) <> 0 then
+          begin
+            if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+            pTabList := p^.pSrc;
+            i := 0;    { C: i = -1 then for-loop i++ -> restart scan at 0 }
+            Continue;
+          end;
+          pTabList := p^.pSrc;
+        end;
+      end;
+
       { 10.1.42.a.9 — Predicate push-down + unused result-column null-out.
         Mirrors select.c:8000..8036 (tag-select-0420 / tag-select-0440).
         Only meaningful when the i-th FROM item is a subquery.  C runs
