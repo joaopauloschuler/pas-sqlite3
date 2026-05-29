@@ -3414,13 +3414,20 @@ begin
     sqlite_master.  Without the qualifier, every iDb>0 fell through to
     main's sqlite_master and CREATE TABLE in attached dbs never appeared
     in the cache. }
+  { prepare.c:366 appends "ORDER BY rowid" so the schema rows are visited
+    in creation order: a CREATE TABLE row is always processed before the
+    auto-index row it owns (sqlite3InitCallback branch (d) needs the parent
+    Index struct to already exist).  Without this, PRAGMA
+    reverse_unordered_selects=ON reverses the unordered schema scan and the
+    sqlite_autoindex_<tab>_1 row is read first → "orphan index"
+    (rowid-15.0). }
   if iDb = 1 then
     zSql := sqlite3MPrintf(db,
-              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+              'SELECT type,name,tbl_name,rootpage,sql FROM %s ORDER BY rowid',
               [LEGACY_TEMP_SCHEMA_TABLE])
   else
     zSql := sqlite3MPrintf(db,
-              'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s',
+              'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s ORDER BY rowid',
               [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
