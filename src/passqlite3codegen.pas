@@ -11323,6 +11323,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
                                     pParse^.db^.enc, 0);
       isAgg := (pDef <> nil) and Assigned(pDef^.xFinalize);
+      { resolve.c:1314 — a window-function call (pWin set) takes the window
+        branch and is NEVER converted to TK_AGG_FUNCTION nor promoted to an
+        outer aggregate (it only sets NC_HasWin on its own SELECT).  So a
+        subquery like (SELECT min(a) OVER()) referencing an outer column must
+        stay a window function bound to the inner SELECT, not pull the outer
+        query into aggregate mode (colname-9.330). }
+      if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil) then
+        isAgg := False;
       if isAgg then
       begin
         refOuter := ExprListArgRefsOuterCursor(pX^.x.pList, pOuterSrc)
@@ -12550,18 +12558,33 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         if (p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0) then
         begin
           bNestedAgg := False;
-          FindNestedAggListToOuter(pInner^.pEList, p^.pSrc, pInner^.pSrc,
-                                   bNestedAgg);
-          FindNestedAggToOuter(pInner^.pHaving, p^.pSrc, pInner^.pSrc,
-                               bNestedAgg);
-          { 9.4.divbug.24.b.3 — aggregate function may also live in the
+          { resolve.c iterates every arm of a compound (resolveSelectStep
+            walks the pPrior chain), so the aggregate-to-outer promotion at
+            resolve.c:1337 must run on EACH arm's clauses, not just the
+            rightmost (pInner).  Without the pPrior loop, an aggregate in a
+            non-rightmost arm — e.g. `avg(a)` in
+            `(SELECT avg(a) UNION SELECT min(a) OVER())` (colname-9.330) —
+            never promotes to the outer SELECT, so the outer query is not
+            marked SF_Aggregate and wrongly yields one row per outer row
+            instead of a single aggregated row.
+
+            9.4.divbug.24.b.3 — aggregate function may also live in the
             inner subquery's WHERE clause, e.g. aggnested-3.11:
               (SELECT count(*) FROM t2 WHERE value2=max(value1))
             without this scan, max(value1) stays TK_FUNCTION and the
             inner codegen emits OP_Function dispatch on an aggregate
             FuncDef whose xFunc=NULL → SIGSEGV. }
-          FindNestedAggToOuter(pInner^.pWhere, p^.pSrc, pInner^.pSrc,
-                               bNestedAgg);
+          pCompArm := pInner;
+          while pCompArm <> nil do
+          begin
+            FindNestedAggListToOuter(pCompArm^.pEList, p^.pSrc,
+                                     pCompArm^.pSrc, bNestedAgg);
+            FindNestedAggToOuter(pCompArm^.pHaving, p^.pSrc,
+                                 pCompArm^.pSrc, bNestedAgg);
+            FindNestedAggToOuter(pCompArm^.pWhere, p^.pSrc,
+                                 pCompArm^.pSrc, bNestedAgg);
+            pCompArm := pCompArm^.pPrior;
+          end;
           if bNestedAgg then
             p^.selFlags := p^.selFlags or SF_Aggregate;
         end;
@@ -68331,6 +68354,17 @@ end;
 // ---------------------------------------------------------------------------
 procedure sqlite3WindowLink(pSel: PSelect; pWin: PWindow);
 begin
+  { This port resolves some sub-SELECT expression lists more than once (the
+    two-phase correlated-subquery resolver plus the later sqlite3SelectPrep
+    re-entry).  In C (resolve.c:1324) sqlite3WindowLink is reached exactly
+    once per window because resolveSelectStep prunes on SF_Resolved, so pWin
+    is never already in a list at link time.  Guard against a second link of
+    an already-linked window: re-linking the current head (pSel^.pWin=pWin)
+    would set pWin^.pNextWin:=pWin, an infinite self-cycle that hangs
+    sqlite3WindowRewrite's per-window loop (colname-9.330:
+    `(SELECT 1 UNION SELECT min(a) OVER())`).  ppThis<>nil means already
+    linked; skipping is a no-op under C's single-resolution model. }
+  if (pWin <> nil) and (pWin^.ppThis <> nil) then Exit;
   if pSel <> nil then begin
     if (pSel^.pWin = nil) or
        (sqlite3WindowCompare(nil, pSel^.pWin, pWin, 0) = 0) then begin
