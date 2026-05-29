@@ -11518,6 +11518,276 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                            pOuterSrc, pInnerSrc, bFound);
   end;
 
+  { ----- Depth-aware nested-aggregate outward binding -----------------------
+    aggnested-8.0/8.1/8.2/7.x: the aggregate may be buried several SELECT
+    levels deep inside FROM-subqueries and/or expression-subqueries of the
+    scalar/EXISTS subquery hanging off the outer query.  resolve.c computes
+    pExpr->op2 as the WalkSelect-nesting distance from the analyzeAggregate
+    driver (the outer query) down to the SELECT that owns the aggregate
+    (resolve.c:1337..1352 pNC2 loop; op2 += 1+nNestedSelect per level).
+    analyzeAggregate then binds the node only when walkerDepth == op2.
+
+    The fixed-op2=1 scan above only reaches aggregates living directly in
+    pInner's own clauses.  This depth-aware variant additionally descends
+    into pInner's FROM-subqueries and into expression-subqueries, tracking
+    the current select-nesting depth so the correct op2 is stamped, and it
+    accumulates the FROM SrcLists of every intervening level so an aggregate
+    that actually references an intermediate level stays bound there (it is
+    NOT promoted to the outer).  pSrcStack[0..nStack-1] are the intervening
+    inner FROM SrcLists (nil entries for FROM-less levels are skipped). }
+
+  function RefsAnyStack(pX: PExpr; const pSrcStack: array of PSrcList;
+    nStack: i32): Boolean;
+  var s: i32;
+  begin
+    Result := False;
+    for s := 0 to nStack - 1 do
+      if (pSrcStack[s] <> nil)
+         and ExprArgRefsOuterCursor(pX, pSrcStack[s]) then
+      begin Result := True; Exit; end;
+  end;
+
+  procedure FindNestedAggDeep(pSel: PSelect; pOuterSrc: PSrcList;
+    depth: i32; const pSrcStack: array of PSrcList; nStack: i32;
+    var bFound: Boolean); forward;
+
+  { Append pPushSrc to the current stack and descend the expression-subquery
+    pSel.  Needed because Pascal cannot extend an open `array of` in place. }
+  procedure DescendExprSubqueryWithSrc(pSel: PSelect; pOuterSrc: PSrcList;
+    depth: i32; const pSrcStack: array of PSrcList; nStack: i32;
+    pPushSrc: PSrcList; var bFound: Boolean);
+  var
+    childStack: array[0..31] of PSrcList;
+    s, nChild: i32;
+  begin
+    nChild := nStack;
+    for s := 0 to nStack - 1 do childStack[s] := pSrcStack[s];
+    if (pPushSrc <> nil) and (nChild < 32) then
+    begin
+      childStack[nChild] := pPushSrc;
+      Inc(nChild);
+    end;
+    FindNestedAggDeep(pSel, pOuterSrc, depth, childStack, nChild, bFound);
+  end;
+
+  { True iff some column referenced by pX and resolved to the OUTER (pOuterSrc)
+    has a name that ALSO exists as a column of a table at some intervening
+    stack level.  This guards against a Pas name-resolution quirk where a
+    column whose name appears in an enclosing FROM is mis-bound to the
+    outermost matching cursor instead of the nearest one: C's lookupName binds
+    to the nearest scope, so sqlite3ReferencesSrcList would stop the pNC2 walk
+    at that intervening level and never promote to the outer.  When the same
+    column name exists at an intervening level we therefore decline promotion
+    (aggnested-5.5).  Recurses through the aggregate's argument subtree. }
+  function OuterColNameAlsoInStack(pX: PExpr; pOuterSrc: PSrcList;
+    const pSrcStack: array of PSrcList; nStack: i32): Boolean;
+  var
+    j, s, k: i32;
+    obase, sbase, pIt: PSrcItem;
+    pT: PTable2;
+    zName: PAnsiChar;
+  begin
+    Result := False;
+    if pX = nil then Exit;
+    if (pX^.op = TK_COLUMN) or (pX^.op = TK_AGG_COLUMN) then
+    begin
+      obase := SrcListItems(pOuterSrc);
+      for j := 0 to pOuterSrc^.nSrc - 1 do
+      begin
+        pIt := PSrcItem(PByte(obase) + j * SizeOf(TSrcItem));
+        if pX^.iTable <> pIt^.iCursor then Continue;
+        pT := pIt^.pSTab;
+        if (pT = nil) then Exit;
+        if (pX^.iColumn < 0) or (pX^.iColumn >= pT^.nCol) then Exit;
+        zName := PColumn(PByte(pT^.aCol)
+                         + pX^.iColumn * SizeOf(TColumn))^.zCnName;
+        if zName = nil then Exit;
+        for s := 0 to nStack - 1 do
+        begin
+          if pSrcStack[s] = nil then Continue;
+          sbase := SrcListItems(pSrcStack[s]);
+          for k := 0 to pSrcStack[s]^.nSrc - 1 do
+          begin
+            pIt := PSrcItem(PByte(sbase) + k * SizeOf(TSrcItem));
+            if (pIt^.pSTab <> nil)
+               and (sqlite3ColumnIndex(pIt^.pSTab, zName) >= 0) then
+            begin Result := True; Exit; end;
+          end;
+        end;
+        Exit;
+      end;
+      Exit;
+    end;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if OuterColNameAlsoInStack(pX^.pLeft,  pOuterSrc, pSrcStack, nStack) then
+    begin Result := True; Exit; end;
+    if OuterColNameAlsoInStack(pX^.pRight, pOuterSrc, pSrcStack, nStack) then
+    begin Result := True; Exit; end;
+    if (pX^.flags and EP_xIsSelect) = 0 then
+      if pX^.x.pList <> nil then
+        for j := 0 to pX^.x.pList^.nExpr - 1 do
+          if OuterColNameAlsoInStack(ExprListItems(pX^.x.pList)[j].pExpr,
+                                     pOuterSrc, pSrcStack, nStack) then
+          begin Result := True; Exit; end;
+  end;
+
+  { Scan a single expression at the given select-nesting depth.  Aggregates
+    found directly here (not inside an expr-subquery) get op2 := depth when
+    promoted to the outer query.  Expression-subqueries are descended via
+    FindNestedAggDeep at depth+1. }
+  procedure FindNestedAggExprDeep(pX: PExpr; pOuterSrc: PSrcList;
+    pInnerSrc: PSrcList; depth: i32;
+    const pSrcStack: array of PSrcList; nStack: i32; var bFound: Boolean);
+  var
+    pDef: PTFuncDef;
+    n, j: i32;
+    isAgg, refOuter, refInner: Boolean;
+  begin
+    if pX = nil then Exit;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if ((pX^.op = TK_FUNCTION) or (pX^.op = TK_AGG_FUNCTION))
+       and (pX^.u.zToken <> nil)
+       and ((pX^.flags and EP_xIsSelect) = 0) then
+    begin
+      if pX^.x.pList <> nil then n := pX^.x.pList^.nExpr else n := 0;
+      pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, n,
+                                  pParse^.db^.enc, 0);
+      if (pDef = nil) and (n <> 0) then
+        pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
+                                    pParse^.db^.enc, 0);
+      isAgg := (pDef <> nil) and Assigned(pDef^.xFinalize);
+      if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil) then
+        isAgg := False;
+      if isAgg then
+      begin
+        refOuter := ExprListArgRefsOuterCursor(pX^.x.pList, pOuterSrc)
+           or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+               and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+               and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pOuterSrc));
+        refInner := ExprListArgRefsOuterCursor(pX^.x.pList, pInnerSrc)
+           or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+               and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+               and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
+        { An aggregate that references any intervening (intermediate) level
+          binds there, not at the outer; do not promote. }
+        if RefsAnyStack(pX, pSrcStack, nStack) then refInner := True
+        { ... or whose outer-bound column name also exists at an intervening
+          level (Pas mis-bind guard; C would have bound it there). }
+        else if OuterColNameAlsoInStack(pX, pOuterSrc, pSrcStack, nStack) then
+          refInner := True
+        else if (pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+                and (pX^.pLeft^.x.pList <> nil) then
+        begin
+          for j := 0 to pX^.pLeft^.x.pList^.nExpr - 1 do
+            if RefsAnyStack(ExprListItems(pX^.pLeft^.x.pList)[j].pExpr,
+                            pSrcStack, nStack) then
+            begin refInner := True; Break; end;
+        end;
+        if refOuter and not refInner then
+        begin
+          pX^.op  := TK_AGG_FUNCTION;
+          pX^.op2 := depth;
+          bFound  := True;
+        end;
+        Exit;
+      end;
+    end;
+    if (pX^.flags and EP_xIsSelect) <> 0 then
+    begin
+      { Expression-subquery — descend one nesting level.  The enclosing
+        select's FROM (pInnerSrc) is now an intervening level for anything
+        inside this subquery, so push it on the stack (matches the NC chain
+        in resolve.c, which links the enclosing select's pSrcList whether the
+        descent is via an expression- or FROM-subquery). }
+      if (pInnerSrc <> nil) and (nStack < 31) then
+      begin
+        DescendExprSubqueryWithSrc(pX^.x.pSelect, pOuterSrc, depth + 1,
+                                   pSrcStack, nStack, pInnerSrc, bFound);
+      end
+      else
+        FindNestedAggDeep(pX^.x.pSelect, pOuterSrc, depth + 1,
+                          pSrcStack, nStack, bFound);
+      Exit;
+    end;
+    FindNestedAggExprDeep(pX^.pLeft,  pOuterSrc, pInnerSrc, depth,
+                          pSrcStack, nStack, bFound);
+    FindNestedAggExprDeep(pX^.pRight, pOuterSrc, pInnerSrc, depth,
+                          pSrcStack, nStack, bFound);
+    if pX^.x.pList <> nil then
+      for j := 0 to pX^.x.pList^.nExpr - 1 do
+        FindNestedAggExprDeep(ExprListItems(pX^.x.pList)[j].pExpr,
+                              pOuterSrc, pInnerSrc, depth,
+                              pSrcStack, nStack, bFound);
+  end;
+
+  procedure FindNestedAggExprListDeep(pList: PExprList; pOuterSrc: PSrcList;
+    pInnerSrc: PSrcList; depth: i32;
+    const pSrcStack: array of PSrcList; nStack: i32; var bFound: Boolean);
+  var i: i32;
+  begin
+    if pList = nil then Exit;
+    for i := 0 to pList^.nExpr - 1 do
+      FindNestedAggExprDeep(ExprListItems(pList)[i].pExpr,
+                            pOuterSrc, pInnerSrc, depth,
+                            pSrcStack, nStack, bFound);
+  end;
+
+  { Descend a SELECT (and its compound arms) at the given nesting depth.
+    For each arm, scan its scalar clauses at this depth, then descend each
+    FROM-subquery at depth+1 with this arm's pSrc pushed on the stack. }
+  procedure FindNestedAggDeep(pSel: PSelect; pOuterSrc: PSrcList;
+    depth: i32; const pSrcStack: array of PSrcList; nStack: i32;
+    var bFound: Boolean);
+  var
+    pArm: PSelect;
+    pSrc: PSrcList;
+    base: PSrcItem;
+    pIt:  PSrcItem;
+    k:    i32;
+    childStack: array[0..31] of PSrcList;
+    s, nChild: i32;
+  begin
+    if (pSel = nil) or (depth > 30) or (nStack >= 31) then Exit;
+    pArm := pSel;
+    while pArm <> nil do
+    begin
+      pSrc := pArm^.pSrc;
+      FindNestedAggExprListDeep(pArm^.pEList, pOuterSrc, pSrc, depth,
+                                pSrcStack, nStack, bFound);
+      FindNestedAggExprDeep(pArm^.pHaving, pOuterSrc, pSrc, depth,
+                            pSrcStack, nStack, bFound);
+      FindNestedAggExprDeep(pArm^.pWhere, pOuterSrc, pSrc, depth,
+                            pSrcStack, nStack, bFound);
+      FindNestedAggExprListDeep(pArm^.pGroupBy, pOuterSrc, pSrc, depth,
+                                pSrcStack, nStack, bFound);
+      FindNestedAggExprListDeep(pArm^.pOrderBy, pOuterSrc, pSrc, depth,
+                                pSrcStack, nStack, bFound);
+      { Build child stack = current stack + this arm's pSrc. }
+      nChild := nStack;
+      for s := 0 to nStack - 1 do childStack[s] := pSrcStack[s];
+      if (pSrc <> nil) and (nChild < 32) then
+      begin
+        childStack[nChild] := pSrc;
+        Inc(nChild);
+      end;
+      if pSrc <> nil then
+      begin
+        base := SrcListItems(pSrc);
+        for k := 0 to pSrc^.nSrc - 1 do
+        begin
+          pIt := PSrcItem(PByte(base) + k * SizeOf(TSrcItem));
+          if (pIt^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0 then
+            if pIt^.u4.pSubq <> nil then
+              FindNestedAggDeep(PSubquery(pIt^.u4.pSubq)^.pSelect,
+                                pOuterSrc, depth + 1, childStack, nChild,
+                                bFound);
+        end;
+      end;
+      pArm := pArm^.pPrior;
+    end;
+  end;
+
   { Recursive helper for 9.4.divbug.59 — given a nested-from wrapper pWrap,
     locate the pEList-index inside pWrap^.pSelect^.pEList that corresponds
     to qualifier (zTab, zCol).  Each pEList entry is a TK_COLUMN whose
@@ -12877,17 +13147,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             without this scan, max(value1) stays TK_FUNCTION and the
             inner codegen emits OP_Function dispatch on an aggregate
             FuncDef whose xFunc=NULL → SIGSEGV. }
-          pCompArm := pInner;
-          while pCompArm <> nil do
-          begin
-            FindNestedAggListToOuter(pCompArm^.pEList, p^.pSrc,
-                                     pCompArm^.pSrc, bNestedAgg);
-            FindNestedAggToOuter(pCompArm^.pHaving, p^.pSrc,
-                                 pCompArm^.pSrc, bNestedAgg);
-            FindNestedAggToOuter(pCompArm^.pWhere, p^.pSrc,
-                                 pCompArm^.pSrc, bNestedAgg);
-            pCompArm := pCompArm^.pPrior;
-          end;
+          { Depth-aware descent: pInner is one WalkSelect level below the
+            outer (depth 1).  This descends pInner's whole subtree (compound
+            arms, FROM-subqueries, expression-subqueries), stamping each
+            promoted aggregate's op2 with its true nesting depth so
+            analyzeAggregate's `walkerDepth == op2` gate fires (aggnested-8.x,
+            7.x).  An empty initial stack means only refs to p^.pSrc promote. }
+          FindNestedAggDeep(pInner, p^.pSrc, 1, [], 0, bNestedAgg);
           if bNestedAgg then
             p^.selFlags := p^.selFlags or SF_Aggregate;
         end;
@@ -33527,6 +33793,25 @@ begin
     p^.selFlags := p^.selFlags or SF_Aggregate;
 end;
 
+{ Mark a (possibly compound) SELECT: run selectMarkAggregate on every arm of
+  the pPrior chain.  C's resolveSelectStep walks the whole compound and tags
+  SF_Aggregate per arm (resolve.c:1961); Pas's selectMarkAggregate only looks
+  at the SELECT it is handed, so a FROM-subquery whose aggregate lives in a
+  non-rightmost UNION arm (select4-17.2:
+    (SELECT a, sum(b) FROM t1 GROUP BY a UNION SELECT 98,99))
+  would otherwise leave that arm unmarked and codegen sum() as a scalar
+  ("unknown function: sum()"). }
+procedure selectMarkAggregateCompound(pParse: PParse; p: PSelect);
+var pArm: PSelect;
+begin
+  pArm := p;
+  while pArm <> nil do
+  begin
+    selectMarkAggregate(pParse, pArm);
+    pArm := pArm^.pPrior;
+  end;
+end;
+
 { Phase 6.26 helper — gather window functions in pSel and finish the
   resolve-time wiring (sqlite3WindowUpdate + sqlite3WindowLink).  The
   pas resolver doesn't yet implement the resolve.c:1314..1325 arm, so
@@ -34077,7 +34362,7 @@ begin
         subquery aggregate here, mirroring C's pre-resolved state. }
       if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil)
          and (pItem^.u4.pSubq^.pSelect <> nil) then
-        selectMarkAggregate(pParse, pItem^.u4.pSubq^.pSelect);
+        selectMarkAggregateCompound(pParse, pItem^.u4.pSubq^.pSelect);
       if ((pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0)
          and (sqlite3ExprImpliesNonNullRow(p^.pWhere, pItem^.iCursor,
                 i32(pItem^.fg.jointype and JT_LTORJ)) <> 0)
@@ -37694,8 +37979,9 @@ begin
         flattenSubquery with selFlags clean and gets absorbed — its
         sum()/avg()/etc. lose aggregate codegen and emit OP_Function,
         whose sumStep then sees a pCtx with no pMem and segfaults.
-        Mark the inner explicitly here, just like C's resolver would. }
-      selectMarkAggregate(pParse, pItem^.u4.pSubq^.pSelect);
+        Mark the inner explicitly here, just like C's resolver would.
+        Compound variant so each UNION arm is marked (select4-17.2). }
+      selectMarkAggregateCompound(pParse, pItem^.u4.pSubq^.pSelect);
     end;
     if (pItem^.pSTab <> nil)
        and SrcItemIsSubquery(pItem^.fg)
