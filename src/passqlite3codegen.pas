@@ -34436,7 +34436,14 @@ begin
   if (p^.pPrior = nil) and (pTabList <> nil) then
   begin
     i := 0;
-    while i < pTabList^.nSrc do
+    { C select.c:7708 `for(i=0; !p->pPrior && i<pTabList->nSrc; i++)` —
+      the `!p->pPrior` guard is re-tested on EVERY iteration.  A successful
+      flattenSubquery of a compound (UNION ALL) FROM subquery turns p into a
+      compound (p^.pPrior <> nil); C then terminates the loop and never offers
+      a later FROM term to the flattener with a compound parent.  Without this
+      re-check the Pas loop would call flattenSubquery again with a compound p,
+      whose compound-clone / lockstep pSub walk derefs nil (where9-11.1). }
+    while (p^.pPrior = nil) and (i < pTabList^.nSrc) do
     begin
       pItem := @SrcListItems(pTabList)[i];
       pTab  := pItem^.pSTab;
