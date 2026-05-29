@@ -368,6 +368,15 @@ set ::sqlite_options(stat4) 0
 # oracle.  Without this, the cap defaults to 1 below and the section wrongly
 # RUNS, expecting {main tab1 colN} where the engine honestly returns {}.
 set ::sqlite_options(columnmetadata) 0
+# cursorhint2.test is gated by `ifcapable !cursorhints {finish_test; return}`.
+# The C reference oracle build does NOT define SQLITE_ENABLE_CURSOR_HINTS
+# (verified: PRAGMA compile_options has no cursor/hint entry), so
+# test_config.c:156..160 writes cursorhints=0 and upstream SKIPS this test.
+# pas-sqlite3 likewise makes codeCursorHint a deliberate no-op
+# (passqlite3codegen.pas:71144), matching the oracle's default build.  Without
+# this, the cap defaults to 1 below → the test wrongly RUNS and fails because no
+# OP_CursorHint opcodes are emitted.
+set ::sqlite_options(cursorhints) 0
 # uri2.test is gated by `ifcapable !uri_00_error`.  A vanilla build does NOT
 # define SQLITE_ENABLE_URI_00_ERROR, so test_config.c writes no uri_00_error
 # cap and the oracle SKIPS this test (the !SQLITE_ENABLE_URI_00_ERROR arm in
