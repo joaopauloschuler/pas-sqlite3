@@ -28794,6 +28794,8 @@ var
   bKeep:         i32;
   nExpr:         i32;
   aColl:         PPointer;
+  savedAddrExplainMSB: i32;   { EQP nesting save/restore (MERGE/LEFT/RIGHT) }
+  mergeLevelAddrMSB:   i32;   { addrExplain of the MERGE node (LEFT/RIGHT parent) }
 begin
   pKeyDup := nil;
   AssertH(p^.pOrderBy <> nil, 'multiSelectByMerge: ORDER BY required');
@@ -28961,7 +28963,15 @@ begin
   sqlite3SelectDestInit(@destA, SRT_Coroutine, regAddrA);
   sqlite3SelectDestInit(@destB, SRT_Coroutine, regAddrB);
 
-  { ExplainQueryPlan("MERGE (op-name)") — debug-only macro, no-op in port. }
+  { ExplainQueryPlan(1, "MERGE (%s)", sqlite3SelectOpName(p->op))
+    (select.c:3565).  Save the outer EQP baseline so MERGE/LEFT/RIGHT and
+    their leaf-SCAN children nest correctly and the outer context is
+    restored when this routine returns (this port's sqlite3Select does not
+    auto-pop the LEFT/RIGHT push the way C's ExplainQueryPlanPop does, so
+    each leaf recursion is bracketed by an explicit save/restore). }
+  savedAddrExplainMSB := pParse^.addrExplain;
+  sqlite3VdbeExplain(pParse, 1, 'MERGE (%s)', [sqlite3SelectOpName(op)]);
+  mergeLevelAddrMSB := pParse^.addrExplain;
 
   { Generate the "A" coroutine — the SELECT to the left of the operator.
     KEEP SF_Compound set (matches select.c:3573..3577 which never touches
@@ -28976,7 +28986,12 @@ begin
   addrSelectA := sqlite3VdbeCurrentAddr(v) + 1;
   addr1 := sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrA, 0, addrSelectA);
   pPrior^.iLimit := regLimitA;
+  { ExplainQueryPlan(1, "LEFT") (select.c:3574).  The A select + its
+    "USE TEMP B-TREE FOR LAST TERM OF ORDER BY" nest under this node;
+    restore the MERGE level afterwards so RIGHT becomes a sibling of LEFT. }
+  sqlite3VdbeExplain(pParse, 1, 'LEFT', []);
   sqlite3Select(pParse, pPrior, @destA);
+  pParse^.addrExplain := mergeLevelAddrMSB;
   sqlite3VdbeEndCoroutine(v, regAddrA);
   sqlite3VdbeJumpHere(v, addr1);
 
@@ -28989,7 +29004,11 @@ begin
   savedOffset := p^.iOffset;
   p^.iLimit   := regLimitB;
   p^.iOffset  := 0;
+  { ExplainQueryPlan(1, "RIGHT") (select.c:3589).  Restore the MERGE level
+    afterwards so the outer-context restore below is exact. }
+  sqlite3VdbeExplain(pParse, 1, 'RIGHT', []);
   sqlite3Select(pParse, p, @destB);
+  pParse^.addrExplain := mergeLevelAddrMSB;
   p^.iLimit   := savedLimit;
   p^.iOffset  := savedOffset;
   sqlite3VdbeEndCoroutine(v, regAddrB);
@@ -29093,6 +29112,10 @@ begin
   pPrior^.pNext  := pSplit;
   sqlite3ExprListDelete(db, pPrior^.pOrderBy);
   pPrior^.pOrderBy := nil;
+
+  { Pop the MERGE node — restore the outer EQP baseline (C pops via
+    ExplainQueryPlanPop in the caller; this port pops here). }
+  pParse^.addrExplain := savedAddrExplainMSB;
 
   if pParse^.nErr <> 0 then Result := 1 else Result := 0;
 end;
