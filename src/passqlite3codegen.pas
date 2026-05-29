@@ -11576,6 +11576,24 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end else if sqlite3StrICmp(pRef^.pSTab^.zName, zTab_) <> 0 then
           Continue;
         iColL := sqlite3ColumnIndex(pRef^.pSTab, zCol_);
+        { resolve.c:367..414 — the wrapper's pEList carries an implicit
+          ENAME_ROWID entry (added by expandStar) for each VisibleRowid leaf
+          table.  A qualified `tab.rowid`/`tab.oid`/`tab._rowid_` matches that
+          entry (sqlite3MatchEName bRowid path).  sqlite3ColumnIndex returns
+          -1 for the rowid alias, which would otherwise collide with the IPK
+          iColumn=-1 binding; require both (a) zCol_ is a rowid alias and
+          (b) this pEList entry is the ENAME_ROWID slot. }
+        if (iColL < 0) and (sqlite3IsRowid(zCol_) <> 0) then
+        begin
+          if (iInnerCol = -1)
+             and ((items_[j].fg.eBits and u8($03)) = u8(ENAME_ROWID)) then
+          begin
+            idx_ := j;
+            Result := True;
+            Exit;
+          end;
+          Continue;
+        end;
         { IPK alias: a leaf INTEGER PRIMARY KEY column is bound in the inner
           result list as iColumn=-1 (resolve.c:466 iColumn = j==iPKey?-1:j).
           sqlite3ColumnIndex returns the declared index (e.g. 0), so map a
@@ -11585,6 +11603,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         if (iColL >= 0) and (iColL = pRef^.pSTab^.iPKey) then
           iColL := -1;
         if iColL <> iInnerCol then Continue;
+        { A real IPK column (iColL mapped to -1) must NOT match the implicit
+          ENAME_ROWID entry; skip it so e.g. `tab.ipkcol` binds the IPK slot. }
+        if (iColL = -1) and ((items_[j].fg.eBits and u8($03)) = u8(ENAME_ROWID)) then
+          Continue;
         idx_ := j;
         Result := True;
         Exit;
@@ -11600,6 +11622,104 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         Result := True;
         Exit;
       end;
+    end;
+  end;
+
+  { FindWrapperBareIdx — bare (unqualified) column resolution through an
+    SF_NestedFrom wrapper's pEList, mirroring the resolve.c:367..414 loop with
+    zTab==0.  The wrapper carries an implicit ENAME_ROWID entry per VisibleRowid
+    leaf (added by expandStar); a bare `rowid`/`oid`/`_rowid_` matches those with
+    bRowid=1 but C only USES a rowid match when no real (bRowid=0) column match
+    exists anywhere (resolve.c:402..406).  Returns the chosen pEList index in
+    idx_; sets bRowid_ when the chosen entry is an implicit rowid.  This must be
+    consulted instead of sqlite3ColumnIndex(pWrap^.pSTab,...) for wrappers,
+    because sqlite3ColumnsFromExprList mangles the 2nd "rowid" synthetic column
+    to "rowid:1" — so a plain name lookup would pick the wrong (implicit) one
+    (joinH-9.8). }
+  function FindWrapperBareIdx(pWrap: PSrcItem; zCol_: PAnsiChar;
+    out idx_: i32; out bRowid_: Boolean; out nRowid_: i32): Boolean;
+  var
+    pSel:    PSelect;
+    pELst:   PExprList;
+    items_:  PExprListItem;
+    pE2:     PExpr;
+    pInnerS: PSrcList;
+    pRef:    PSrcItem;
+    j, k:    i32;
+    iInnerCol: i32;
+    isRowidEnt: Boolean;
+    zEntName: PAnsiChar;
+    rowidIdx: i32;
+  begin
+    Result   := False;
+    bRowid_  := False;
+    nRowid_  := 0;
+    rowidIdx := -1;
+    if pWrap^.u4.pSubq = nil then Exit;
+    pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    pELst   := pSel^.pEList;
+    pInnerS := pSel^.pSrc;
+    if (pELst = nil) or (pInnerS = nil) then Exit;
+    items_ := ExprListItems(pELst);
+    for j := 0 to pELst^.nExpr - 1 do
+    begin
+      pE2 := items_[j].pExpr;
+      if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Continue;
+      isRowidEnt := (items_[j].fg.eBits and u8($03)) = u8(ENAME_ROWID);
+      { Locate the inner leaf SrcItem this column reads from. }
+      pRef := nil;
+      for k := 0 to pInnerS^.nSrc - 1 do
+      begin
+        pRef := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+        if pRef^.iCursor = pE2^.iTable then Break;
+        pRef := nil;
+      end;
+      if pRef = nil then Continue;
+      iInnerCol := pE2^.iColumn;
+      if isRowidEnt then
+      begin
+        { Implicit rowid entry — matches any rowid alias (resolve.c bRowid). }
+        if sqlite3IsRowid(zCol_) <> 0 then
+        begin
+          Inc(nRowid_);
+          if rowidIdx < 0 then rowidIdx := j;
+        end;
+        Continue;
+      end;
+      { Real column entry — compute its name and compare to zCol_. }
+      if (pRef^.fg.fgBits2 and $40) = 0 then  { leaf table }
+      begin
+        if pRef^.pSTab = nil then Continue;
+        if (iInnerCol >= 0) and (iInnerCol < pRef^.pSTab^.nCol) then
+          zEntName := PColumn(PByte(pRef^.pSTab^.aCol) +
+                        iInnerCol * SizeOf(TColumn))^.zCnName
+        else if (iInnerCol < 0) and (pRef^.pSTab^.iPKey >= 0) then
+          zEntName := PColumn(PByte(pRef^.pSTab^.aCol) +
+                        pRef^.pSTab^.iPKey * SizeOf(TColumn))^.zCnName
+        else
+          zEntName := nil;
+      end
+      else
+        { Inner item is itself a wrapper — use the synthetic column name. }
+        if (pWrap^.pSTab <> nil) and (j < pWrap^.pSTab^.nCol) then
+          zEntName := PColumn(PByte(pWrap^.pSTab^.aCol) +
+                        j * SizeOf(TColumn))^.zCnName
+        else
+          zEntName := nil;
+      if (zEntName <> nil) and (sqlite3StrICmp(zEntName, zCol_) = 0) then
+      begin
+        idx_    := j;
+        bRowid_ := False;
+        Result  := True;
+        Exit;   { real match wins immediately }
+      end;
+    end;
+    if rowidIdx >= 0 then
+    begin
+      idx_    := rowidIdx;
+      bRowid_ := True;
+      Result  := True;
     end;
   end;
 
@@ -11676,6 +11796,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pDeep: PSelect;      { 9.4.divbug.76 — walks FROM-subquery interior selects }
     zDb: PAnsiChar;        { 9.4.divbug.87.058 — 3-part qualifier `db.tab.col` }
     pDbSchema: Pointer;
+    bWrapBare: Boolean;    { joinH-9.8 — bare ref matched a nested wrapper }
+    bWrapRowid: Boolean;   { joinH-9.8 — that wrapper match was a rowid entry }
+    nWrapRowid: i32;       { joinH-9.2 — rowid candidate count within a wrapper }
 
     { resolve.c:835..844 lookupname_end — when a column reference resolves
       successfully (cnt==1) and an authorizer is installed, invoke the
@@ -11983,7 +12106,33 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
         if pItem^.pSTab = nil then Continue;
-        iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.u.zToken);
+        { joinH-9.8 — for an SF_NestedFrom wrapper, a bare ROWID alias must be
+          resolved against the wrapper's pEList (resolve.c:351..417): the
+          implicit ENAME_ROWID entries the wrapper carries are only used when no
+          real column matched, and sqlite3ColumnsFromExprList mangles a 2nd
+          "rowid" synthetic column to "rowid:1", so a plain name lookup would
+          pick the wrong one.  Non-rowid bare names keep the original
+          synthetic-name sqlite3ColumnIndex path (which faithfully handles
+          USING-coalesced duplicate columns — joinC/join9/joinB). }
+        bWrapBare  := False;
+        bWrapRowid := False;
+        if (sqlite3IsRowid(pE^.u.zToken) <> 0)
+           and ((pItem^.fg.fgBits2 and $40) <> 0)
+           and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+           and (pItem^.u4.pSubq <> nil)
+           and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil) then
+        begin
+          if FindWrapperBareIdx(pItem, pE^.u.zToken, iCol, bWrapRowid, nWrapRowid) then
+            bWrapBare := True
+          else
+            iCol := -1;
+          { Defer a rowid-only wrapper match: like C's bRowid, a wrapper rowid
+            is only used when no real column matched anywhere.  Skip it in the
+            main loop; the rowid pseudo-column arm below picks it up. }
+          if bWrapBare and bWrapRowid then iCol := -1;
+        end
+        else
+          iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.u.zToken);
         if iCol >= 0 then
         begin
           { 10.1.bug.97 — count matches across sources to detect ambiguous
@@ -12158,13 +12307,37 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           (misc8-3.0). }
         cntTab := 0;
         pRowidMatch := nil;
+        matchCol := -1;   { joinH-9.9 — wrapper pEList idx of a rowid match, else -1 }
         for i := 0 to pSrc^.nSrc - 1 do
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
+          { joinH-9.9/9.10/9.11 — an SF_NestedFrom wrapper is a rowid candidate
+            when one of its leaves has a VisibleRowid (the wrapper carries an
+            implicit ENAME_ROWID pEList entry, added by expandStar).  The
+            wrapper's own synthetic pSTab is TF_NoVisibleRowid, so it would
+            otherwise be skipped.  Bind to (wrapper.iCursor, pEList-idx). }
+          if ((pItem^.fg.fgBits2 and $40) <> 0)
+             and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+             and (pItem^.u4.pSubq <> nil)
+             and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil) then
+          begin
+            if FindWrapperBareIdx(pItem, pE^.u.zToken, iCol, bWrapRowid, nWrapRowid)
+               and bWrapRowid then
+            begin
+              { Each VisibleRowid leaf inside the wrapper is its own rowid
+                candidate (resolve.c cntTab++ per source); two or more →
+                ambiguous (joinH-9.2/9.3). }
+              cntTab := cntTab + nWrapRowid;
+              pRowidMatch := pItem;
+              matchCol := iCol;
+            end;
+            Continue;
+          end;
           if (pItem^.pSTab^.tabFlags and TF_NoVisibleRowid) <> 0 then Continue;
           Inc(cntTab);          { resolve.c:500 cntTab++ }
           pRowidMatch := pItem;  { resolve.c:501 pMatch=pItem }
+          matchCol := -1;
         end;
         if cntTab >= 1 then
         begin
@@ -12180,7 +12353,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           pItem := pRowidMatch;
           pE^.op      := TK_COLUMN;
           pE^.iTable  := pItem^.iCursor;
-          pE^.iColumn := i16(-1);
+          if matchCol >= 0 then
+            pE^.iColumn := i16(matchCol)   { wrapper implicit-rowid pEList slot }
+          else
+            pE^.iColumn := i16(-1);
           pE^.y.pTab  := pItem^.pSTab;
           pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
           if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
@@ -30202,6 +30378,27 @@ begin
   end;
 end;
 
+{ NestedFromColIsRowid — does result column j of an SF_NestedFrom wrapper's
+  pEList carry eEName==ENAME_ROWID?  Mirrors the select.c:6221 test
+  `pNestedFrom->a[j].fg.eEName==ENAME_ROWID`, used to skip the implicit rowid
+  entry when re-expanding `*`/T.* through the wrapper (joinH-7.1). }
+function NestedFromColIsRowid(pWrap: PSrcItem; j: i32): Boolean;
+var
+  pSel:  PSelect;
+  pELst: PExprList;
+  items_: PExprListItem;
+begin
+  Result := False;
+  if (pWrap = nil) or (pWrap^.u4.pSubq = nil) then Exit;
+  pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+  if pSel = nil then Exit;
+  pELst := pSel^.pEList;
+  if pELst = nil then Exit;
+  if (j < 0) or (j >= pELst^.nExpr) then Exit;
+  items_ := ExprListItems(pELst);
+  Result := (items_[j].fg.eBits and u8($03)) = u8(ENAME_ROWID);
+end;
+
 { inAnyUsingClause — port of select.c:5917..5930.  Returns True if zName
   appears in the USING() IdList of any of the N SrcItems FOLLOWING pBase
   (pBase[1] .. pBase[N]).  Used by expandStar to decide whether a join
@@ -30425,6 +30622,11 @@ begin
       for j := 0 to pTab^.nCol - 1 do
       begin
         pCol := PColumn(PByte(pTab^.aCol) + j * SizeOf(TColumn));
+        { select.c:6219..6223 — if pTab is an SF_NestedFrom wrapper, do NOT
+          re-expand any of its implicit ENAME_ROWID result columns.  Those
+          exist only so an outer qualified `tab.rowid` can resolve through the
+          wrapper; a bare `*`/T.* must skip them (joinH-7.1). }
+        if isNestedWrap and NestedFromColIsRowid(pItem, j) then Continue;
         { select.c:6225..6230 — for T.* over a nested-from wrapper, only
           emit the wrapper columns that originate from table zTName
           (sqlite3MatchEName test against pNestedFrom->a[j]). }
@@ -30610,6 +30812,49 @@ begin
               bMarkNoExpand := True;
             if bMarkNoExpand then
               pNewItem^.fg.eBits2 := pNewItem^.fg.eBits2 or u8($01);
+          end;
+        end;
+      end;
+
+      { select.c:6207..6299 — when expanding `*` (or T.*) inside an
+        SF_NestedFrom wrapper, C bumps nAdd by one for every table with a
+        VisibleRowid and emits an EXTRA pEList entry for the implicit rowid
+        (zName = sqlite3RowidAlias(pTab), eEName = ENAME_ROWID).  This is the
+        entry that lets an outer qualified `t2.rowid` resolve through the
+        wrapper (resolve.c:367..414 sqlite3MatchEName bRowid path; joinH-7.1).
+        This port emits a TK_COLUMN(iColumn=-1) directly rather than C's
+        TK_DOT; FindWrapperEListIdx recognises the iColumn=-1 entry as the
+        rowid slot.  Skip when the table has no spare rowid alias (all of
+        _rowid_/rowid/oid shadowed → sqlite3RowidAlias returns nil). }
+      if (not InRenameObject(pParse))
+         and ((p^.selFlags and SF_NestedFrom) <> 0)
+         and ((pTab^.tabFlags and TF_NoVisibleRowid) = 0)
+         and (not isNestedWrap) then
+      begin
+        zColName := sqlite3RowidAlias(pTab);
+        if zColName <> nil then
+        begin
+          pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
+          if pColExpr <> nil then
+          begin
+            pColExpr^.iTable  := pItem^.iCursor;
+            pColExpr^.iColumn := i16(-1);
+            pColExpr^.y.pTab  := pTab;
+            pColExpr^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
+            if pNew <> nil then
+            begin
+              if pItem^.zAlias <> nil then
+                zTabName := pItem^.zAlias
+              else
+                zTabName := pTab^.zName;
+              pNewItem := PExprListItem(PByte(ExprListItems(pNew)) +
+                            (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+              pNewItem^.zEName := sqlite3MPrintf(db, '%s.%s',
+                                    [zTabName, zColName]);
+              pNewItem^.fg.eBits :=
+                (pNewItem^.fg.eBits and not u8($03)) or u8(ENAME_ROWID);
+            end;
           end;
         end;
       end;

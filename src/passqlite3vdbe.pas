@@ -2052,12 +2052,29 @@ var
 var
   sqlite3_search_count: i32 = 0;
 
+{ vdbe.c:90 — largest blob (MEM_Str|MEM_Blob, by Mem.n, excluding zero-padding)
+  ever materialised on the VDBE register stack.  Test-only watermark read by the
+  regression suite via the Tcl-linked `sqlite3_max_blobsize` variable
+  (test1.c:9372).  Bumped by UPDATE_MAX_BLOBSIZE / updateMaxBlobsize. }
+var
+  sqlite3_max_blobsize: i32 = 0;
+
 implementation
 
 uses
   SysUtils,        { Format — used by the Phase 7.4c trace capture }
   passqlite3vtab;  { Phase 6.bis.3a: VTable + sqlite3VtabBegin/CallCreate/CallDestroy/ImportErrmsg
                      — implementation-only to break the interface-side cycle (vtab uses vdbe). }
+
+{ vdbe.c:91 updateMaxBlobsize — record the largest string/blob ever placed in a
+  VDBE register.  Uses p^.n only (the materialised byte count); MEM_Zero blobs
+  carry their padding in u.nZero and are NOT counted, which is exactly how the
+  zeroblob.test watermark proves zeroblobs are never instantiated on the stack. }
+procedure UpdateMaxBlobsize(p: PMem); inline;
+begin
+  if ((p^.flags and (MEM_Str or MEM_Blob)) <> 0) and (p^.n > sqlite3_max_blobsize) then
+    sqlite3_max_blobsize := p^.n;
+end;
 
 { ============================================================================
   Phase 5.2 — vdbeaux.c port
@@ -10172,6 +10189,7 @@ begin
       pOut^.enc := enc;
       rc := sqlite3VdbeMemTooBig(pOut);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1566 }
     end;
 
     { ────── OP_String8 / OP_String ────── (vdbe.c:1414/1458)
@@ -10213,6 +10231,7 @@ begin
       if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
          (aMem[pOp^.p3].u.i = pOp^.p5) then
         pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1465 }
     end;
 
     OP_String: begin
@@ -10224,6 +10243,7 @@ begin
       if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
          (aMem[pOp^.p3].u.i = pOp^.p5) then
         pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1465 }
     end;
 
     { ────── OP_Concat ────── (vdbe.c:1791)
@@ -10259,6 +10279,7 @@ begin
         pOut^.n   := nByte;
         pOut^.enc := enc;
       end;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1849 }
     end;
 
     { ────── OP_Move ────── (vdbe.c:1601) }
@@ -10862,7 +10883,7 @@ begin
       end;
 
       op_column_out:
-      { UPDATE_MAX_BLOBSIZE — update db->szMalloc watermark (skip for now) }
+      UpdateMaxBlobsize(pDest);   { vdbe.c:3256 UPDATE_MAX_BLOBSIZE(pDest) }
     end;
 
     { ────── OP_MakeRecord ────── (vdbe.c:3469) }
@@ -10975,6 +10996,7 @@ begin
         pOut^.u.nZero := nZeroMR;
         pOut^.flags := pOut^.flags or MEM_Zero;
       end;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:3710 }
       zHdrMR := Pu8(pOut^.z);
       zPayMR := zHdrMR + nHdr;
 
@@ -11811,6 +11833,7 @@ begin
       end;
       rc := sqlite3VdbeChangeEncoding(@aMem[pOp^.p1], enc);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+      UpdateMaxBlobsize(@aMem[pOp^.p1]);   { vdbe.c:7998 }
     end;
 
     { ────── OP_Real ────── (vdbe.c:1397)
@@ -11865,6 +11888,7 @@ begin
       Move(pVarH^, pOut^, MEMCELLSIZE);
       pOut^.flags := pOut^.flags and not u16(MEM_Dyn or MEM_Ephem);
       pOut^.flags := pOut^.flags or u16(MEM_Static or MEM_FromBind);
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1588 }
     end;
 
     { ────── OP_CollSeq ────── (vdbe.c:1992)
@@ -11909,6 +11933,7 @@ begin
       end;
       rc := sqlite3VdbeMemCast(pIn1, u8(pOp^.p2), enc);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+      UpdateMaxBlobsize(pIn1);   { vdbe.c:2175 }
     end;
 
     { ────── OP_And / OP_Or ────── (vdbe.c:2594)
@@ -12098,6 +12123,7 @@ begin
         pCtxAgg^.isError := 0;
         if rc <> 0 then goto abort_due_to_error;
       end;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:8898 }
     end;
 
     { ────── OP_Noop / OP_Explain ────── }
@@ -12581,6 +12607,7 @@ begin
           if sqlite3VdbeMemMakeWriteable(pDest) <> SQLITE_OK then goto no_mem;
         end;
       end;
+      UpdateMaxBlobsize(pDest);   { vdbe.c:6139 }
     end;
 
     { ────── OP_RowCell ────── (vdbe.c:5847) }
@@ -13431,6 +13458,7 @@ begin
                              SQLITE_UTF8, SQLITE_DYNAMIC);
       end;
       sqlite3VdbeChangeEncoding(@aMem[pOp^.p1 + 1], enc);
+      UpdateMaxBlobsize(@aMem[pOp^.p1]);   { vdbe.c:7296 }
       goto check_for_interrupt;
     end;
 
@@ -13818,6 +13846,7 @@ begin
           rc := sCtxV.isError;
         end;
         sqlite3VdbeChangeEncoding(pOut, enc);
+        UpdateMaxBlobsize(pOut);   { vdbe.c:8596 }
         if rc <> SQLITE_OK then goto abort_due_to_error;
       end;
     end;
