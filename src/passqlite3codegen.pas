@@ -33458,6 +33458,8 @@ var
   idxConstraints: array of passqlite3vtab.Tsqlite3_index_constraint;
   idxUsage:      array of passqlite3vtab.Tsqlite3_index_constraint_usage;
   idxInfo:       passqlite3vtab.Tsqlite3_index_info;
+  vtabOrderBy:   passqlite3vtab.Tsqlite3_index_orderby;
+  pMMExpr:       PExpr;
   pVTab2:        passqlite3vtab.PVTable;
   pModFunc:      passqlite3vtab.PSqlite3Module;
   kHC, jHC:      i32;
@@ -36520,6 +36522,31 @@ begin
                 SrcItem so xBestIndex can build a covering scan query. }
               idxInfo.colUsed         := pItem^.colUsed;
               idxInfo.estimatedCost   := 1.0E99;
+              { min/max optimisation (select.c:8872 passes pMinMaxOrderBy +
+                minMaxFlag to sqlite3WhereBegin, which feeds the single
+                ORDER BY term into allocateIndexInfo's aOrderBy[] — where.c:
+                1485..1530).  This Pas-only hand-rolled VFilter loop replaces
+                WhereBegin, so seed the orderBy here too; otherwise the vtab's
+                xBestIndex (e.g. FTS3 fts3BestIndexMethod) never sees nOrderBy
+                and never sets idxStr "DESC"/"ASC" / orderByConsumed, and the
+                EQP "VIRTUAL TABLE INDEX 0:DESC" comment is lost (fts4min). }
+              if (minMaxFlag <> WHERE_ORDERBY_NORMAL) and (pMinMaxOrderBy <> nil)
+                 and (pMinMaxOrderBy^.nExpr = 1) then
+              begin
+                pMMExpr := ExprListItems(pMinMaxOrderBy)[0].pExpr;
+                FillChar(vtabOrderBy, SizeOf(vtabOrderBy), 0);
+                if (pMMExpr <> nil) and (pMMExpr^.op = TK_COLUMN) then
+                  vtabOrderBy.iColumn := pMMExpr^.iColumn
+                else
+                  vtabOrderBy.iColumn := -1;
+                if (ExprListItems(pMinMaxOrderBy)[0].fg.sortFlags
+                    and KEYINFO_ORDER_DESC) <> 0 then
+                  vtabOrderBy.desc := 1
+                else
+                  vtabOrderBy.desc := 0;
+                idxInfo.nOrderBy := 1;
+                idxInfo.aOrderBy := @vtabOrderBy;
+              end;
               if passqlite3vtab.TxBestIndex(pVTab2^.pVtab^.pModule^.xBestIndex)
                      (pVTab2^.pVtab, @idxInfo) = SQLITE_OK then
               begin
@@ -36535,6 +36562,18 @@ begin
               end;
             end;
           end;
+
+          { EQP: sqlite3WhereExplainOneScan (wherecode.c:120..209) emits an
+            OP_Explain row for the vtab scan; for a vtab loop the comment is
+            "SEARCH <tab> VIRTUAL TABLE INDEX <idxNum>:<idxStr>" (SEARCH not
+            SCAN because wctrlFlags & WHERE_ORDERBY_MIN/MAX forces isSearch).
+            This Pas-only VFilter loop bypasses WhereExplainOneScan, so emit
+            the equivalent here when the min/max optimisation supplied an
+            idxStr (fts4min-1.1.1/1.1.2). }
+          if (minMaxFlag <> WHERE_ORDERBY_NORMAL) and (vtabIdxStr <> nil) then
+            sqlite3VdbeExplain(pParse, 0,
+              'SEARCH %S VIRTUAL TABLE INDEX %d:%s',
+              [Pointer(pItem), vtabIdxNum, vtabIdxStr]);
 
           sqlite3VdbeAddOp2(v, OP_Integer, vtabIdxNum, regAgg);
           sqlite3VdbeAddOp2(v, OP_Integer, nFuncArg, regAgg + 1);
