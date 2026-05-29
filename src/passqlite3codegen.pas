@@ -13495,7 +13495,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           'misuse of aggregate function %s()', [pX^.u.zToken]));
         Exit;
       end;
-      childAgg := True;
+      { resolve.c:1292..1300 — entering an aggregate's argument list clears
+        NC_AllowWin and, only when this is NOT a window function (pWin=0),
+        NC_AllowAgg.  A window function (sum(...) OVER ()) keeps NC_AllowAgg
+        set for its args, so aggregates ARE legal inside a window function's
+        arguments (window4-11.5/11.7/11.8: `sum(min(t)) OVER ()`).  This
+        checker only flags nested AGGREGATES, so a window-function node must
+        leave the inAgg restriction unchanged rather than asserting it. }
+      if ((pX^.flags and EP_WinFunc) <> 0) and (pX^.y.pWin <> nil)
+         and (pX^.y.pWin^.eFrmType <> TK_FILTER) then
+        childAgg := inAgg
+      else
+        childAgg := True;
     end
     else
       childAgg := inAgg;
@@ -14700,6 +14711,44 @@ begin
   items := ExprListItems(pList);
   for i := 0 to pList^.nExpr - 1 do
     if exprHasWin(items[i].pExpr) then begin Result := True; Exit; end;
+end;
+
+{ exprListHasAggFunc — True if any expression in pList contains a genuine
+  aggregate-function call (TK_AGG_FUNCTION).  Used by the window arm to decide
+  whether the window-rewrite sub-SELECT must keep SF_Aggregate so its
+  aggregate-no-GROUP-BY codegen runs (`sum(min(t)) OVER ()`, window4-11.7/11.8).
+  Mirrors the C invariant: pSub keeps SF_Aggregate only when it really holds an
+  aggregate, not when SF_Aggregate was spuriously OR'd from a window func. }
+function exprListHasAggFunc(pList: PExprList): Boolean;
+
+  function exprHasAgg(pE: PExpr): Boolean;
+  var
+    items: PExprListItem;
+    i: i32;
+  begin
+    Result := False;
+    if pE = nil then Exit;
+    if pE^.op = TK_AGG_FUNCTION then begin Result := True; Exit; end;
+    if exprHasAgg(pE^.pLeft) then begin Result := True; Exit; end;
+    if exprHasAgg(pE^.pRight) then begin Result := True; Exit; end;
+    if ((pE^.flags and EP_xIsSelect) = 0)
+       and ExprUseXList(pE) and (pE^.x.pList <> nil) then
+    begin
+      items := ExprListItems(pE^.x.pList);
+      for i := 0 to pE^.x.pList^.nExpr - 1 do
+        if exprHasAgg(items[i].pExpr) then begin Result := True; Exit; end;
+    end;
+  end;
+
+var
+  items: PExprListItem;
+  i: i32;
+begin
+  Result := False;
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+    if exprHasAgg(items[i].pExpr) then begin Result := True; Exit; end;
 end;
 
 { pushDownWhereTerms — port of select.c:5125..5286.  Try to copy constant
@@ -35635,14 +35684,22 @@ begin
       sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, 1);
     sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
     { Window-rewrite OR'd SF_Aggregate from outer (window.c:1086) onto pSub.
-      Pas's sqlite3Select bails early on SF_Aggregate when no agg path matches
-      (the SRT_EphemTab dest doesn't fire the agg-no-GROUP-BY arm).  Strip
-      it for the materialise — the inner sub here is a plain row-by-row
-      scan; restore after so any later code that inspects pSub still sees
-      the C-faithful flag set. }
+      Pas's selectMarkAggregate conflates window funcs into SF_Aggregate, so a
+      PURE window query (e.g. `sum(x) OVER ()`, x a column) leaves pSub with a
+      spurious SF_Aggregate and no real aggregate in its result list — the
+      agg-no-GROUP-BY arm would then wrongly collapse the scan to a single
+      group.  Strip SF_Aggregate for the materialise in that case.  BUT when
+      pSub genuinely holds an aggregate (a window function whose argument is an
+      aggregate, e.g. `sum(min(t)) OVER ()` with no GROUP BY — window4-11.7/
+      11.8), the aggregate must be computed by the agg-no-GROUP-BY arm (which
+      now handles SRT_EphemTab), so SF_Aggregate must be KEPT or `min(t)` lands
+      at codegen with no AggInfo → "misuse of aggregate".  Restore the saved
+      flags after the materialise either way. }
     pSubSel := pItem^.u4.pSubq^.pSelect;
     selFlagsSavedW := pSubSel^.selFlags;
-    pSubSel^.selFlags := pSubSel^.selFlags and (not u32(SF_Aggregate));
+    if (pSubSel^.pGroupBy = nil)
+       and (not exprListHasAggFunc(pSubSel^.pEList)) then
+      pSubSel^.selFlags := pSubSel^.selFlags and (not u32(SF_Aggregate));
     if sqlite3Select(pParse, pSubSel, @innerDest) <> SQLITE_OK then
     begin
       pSubSel^.selFlags := selFlagsSavedW;
