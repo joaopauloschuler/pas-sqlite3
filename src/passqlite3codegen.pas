@@ -68435,6 +68435,20 @@ begin
     sqlite3WalkExprList(@w, p^.pOrderBy);
   end;
 
+  { window4-4.1..4.3: C's resolver (resolve.c:1330) flips every non-window
+    aggregate call to TK_AGG_FUNCTION at name-resolution time, so the
+    selectWindowRewriteEList walk below pushes those aggregates down into the
+    synthetic sub-SELECT (where pGroupBy/SF_Aggregate also move).  The Pas
+    resolver defers that flip to the agg-codegen path (markAggregateExprNode),
+    which never runs for the window case — leaving `max(c)` etc. as plain
+    TK_FUNCTION nodes that selectWindowRewriteExprCb skips, so they survive in
+    the outer pEList and codegen later raises "unknown function: max()".  Mark
+    them here, ahead of the rewrite, matching the resolved shape C feeds in.
+    markAggregateExprNode skips genuine window functions (EP_WinFunc). }
+  markAggregateInExprList(pParse, p^.pEList);
+  markAggregateInExprList(pParse, p^.pOrderBy);
+  markAggregateInExpr(pParse, p^.pHaving);
+
   p^.pSrc     := nil;
   p^.pWhere   := nil;
   p^.pGroupBy := nil;
