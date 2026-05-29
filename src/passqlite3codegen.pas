@@ -58069,6 +58069,27 @@ var
   { pragma.c:566 — VdbeOp* aOp + int size for PRAGMA default_cache_size. }
   aOpDc:   PVdbeOp;
   sizeDc:  i32;
+  { pragma.c:1541 — PRAGMA foreign_key_check locals.  Mirror the C var set
+    (pFK, pTab, pParent, pIdx, i, j, k, x, regResult, regRow, addrTop,
+    addrOk, aiCols).  *Fc suffix where the bare C name collides above. }
+  zDbFkc:      PAnsiChar;
+  pTabFkc:     PTable2;
+  pParentFkc:  PTable2;
+  pIdxFkc:     PIndex2;
+  pFKfc:       Pu8;
+  kHashFkc:    passqlite3util.PHashElem;
+  iFkc:        i32;
+  jFkc:        i32;
+  xFkc:        i32;
+  iColFkc:     i32;
+  jmpFkc:      i32;
+  nColFkc:     i32;
+  regResultFc: i32;
+  regRowFc:    i32;
+  addrTopFc:   i32;
+  addrOkFc:    i32;
+  aiColsFc:    Pi32;
+  fkAbortFc:   Boolean;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   { pragma.c:2744..2745 — LOCK_STATUS names (slots 0..4) plus
@@ -58438,6 +58459,136 @@ begin
           pIdxA := pIdxA^.pNext;
           Inc(i);
         end;
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1541 — PRAGMA [schema.]foreign_key_check[(table)].  Iterate
+      every ordinary table that has a child FK (or the single named table),
+      open its parent btrees/indexes, then row-walk the child checking each
+      FK; emit one row {child-table, rowid, parent-table, fkid} per violation.
+      FKey field offsets match sqlite3FkLocateIndex: nCol@40, pNextFrom@8,
+      zTo@16, aCol[]@64 (sColMap stride 16, iFrom@0). }
+    PragTyp_FOREIGN_KEY_CHECK: begin
+      regResultFc := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + 4;
+      Inc(pParse^.nMem);
+      regRowFc := pParse^.nMem;
+      { zDb: only set from the explicit `db.` prefix (pragma.c init). }
+      if (pId2 <> nil) and (pId2^.n > 0) then
+        zDbFkc := db^.aDb[iDb].zDbSName
+      else
+        zDbFkc := nil;
+      kHashFkc := db^.aDb[iDb].pSchema^.tblHash.first;
+      while kHashFkc <> nil do
+      begin
+        if zRight <> '' then begin
+          pTabFkc := sqlite3LocateTable(pParse, 0, PAnsiChar(zRight), zDbFkc);
+          kHashFkc := nil;
+        end else begin
+          pTabFkc := PTable2(kHashFkc^.data);
+          kHashFkc := passqlite3util.PHashElem(kHashFkc^.next);
+        end;
+        if (pTabFkc = nil) or (pTabFkc^.eTabType <> TABTYP_NORM)
+           or (pTabFkc^.u.tab.pFKey = nil) then Continue;
+
+        iDb := sqlite3SchemaToIndex(db, passqlite3util.PSchema(pTabFkc^.pSchema));
+        zDbFkc := db^.aDb[iDb].zDbSName;
+        sqlite3CodeVerifySchema(pParse, iDb);
+        { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
+        sqlite3TouchRegister(pParse, pTabFkc^.nCol + regRowFc);
+        sqlite3OpenTable(pParse, 0, iDb, pTabFkc, OP_OpenRead);
+        sqlite3VdbeLoadString(v, regResultFc, pTabFkc^.zName);
+
+        { First pass: locate + open the parent btree/index for each FK. }
+        fkAbortFc := False;
+        iFkc := 1;
+        pFKfc := Pu8(pTabFkc^.u.tab.pFKey);
+        while pFKfc <> nil do
+        begin
+          pParentFkc := sqlite3FindTable(db, PPAnsiChar(pFKfc + 16)^, zDbFkc);
+          if pParentFkc <> nil then
+          begin
+            pIdxFkc := nil;
+            xFkc := sqlite3FkLocateIndex(pParse, pParentFkc, pFKfc,
+              @pIdxFkc, nil);
+            if xFkc = 0 then
+            begin
+              if pIdxFkc = nil then
+                sqlite3OpenTable(pParse, iFkc, iDb, pParentFkc, OP_OpenRead)
+              else begin
+                sqlite3VdbeAddOp3(v, OP_OpenRead, iFkc, pIdxFkc^.tnum, iDb);
+                sqlite3VdbeSetP4KeyInfo(pParse, PIndex(pIdxFkc));
+              end;
+            end else begin
+              kHashFkc := nil;
+              fkAbortFc := True;
+              break;
+            end;
+          end;
+          Inc(iFkc);
+          pFKfc := Pu8(PPointer(pFKfc + 8)^);  { pNextFrom }
+        end;
+        if fkAbortFc then break;
+        if pParse^.nTab < iFkc then pParse^.nTab := iFkc;
+
+        addrTopFc := sqlite3VdbeAddOp1(v, OP_Rewind, 0);
+
+        { Second pass: for each FK, read child key cols and probe parent. }
+        iFkc := 1;
+        pFKfc := Pu8(pTabFkc^.u.tab.pFKey);
+        while pFKfc <> nil do
+        begin
+          pParentFkc := sqlite3FindTable(db, PPAnsiChar(pFKfc + 16)^, zDbFkc);
+          pIdxFkc := nil;
+          aiColsFc := nil;
+          if pParentFkc <> nil then
+            xFkc := sqlite3FkLocateIndex(pParse, pParentFkc, pFKfc,
+              @pIdxFkc, @aiColsFc);
+          addrOkFc := sqlite3VdbeMakeLabel(pParse);
+
+          nColFkc := PInt32(pFKfc + 40)^;       { FKey.nCol }
+          sqlite3TouchRegister(pParse, regRowFc + nColFkc);
+          for jFkc := 0 to nColFkc - 1 do
+          begin
+            if aiColsFc <> nil then
+              iColFkc := aiColsFc[jFkc]
+            else
+              iColFkc := PInt32(pFKfc + 64 + jFkc * 16)^;  { aCol[j].iFrom }
+            sqlite3ExprCodeGetColumnOfTable(v, pTabFkc, 0, iColFkc,
+              regRowFc + jFkc);
+            sqlite3VdbeAddOp2(v, OP_IsNull, regRowFc + jFkc, addrOkFc);
+          end;
+
+          if pIdxFkc <> nil then
+          begin
+            sqlite3VdbeAddOp4(v, OP_Affinity, regRowFc, nColFkc, 0,
+              sqlite3IndexAffinityStr(db, pIdxFkc), nColFkc);
+            sqlite3VdbeAddOp4Int(v, OP_Found, iFkc, addrOkFc, regRowFc, nColFkc);
+          end
+          else if pParentFkc <> nil then
+          begin
+            jmpFkc := sqlite3VdbeCurrentAddr(v) + 2;
+            sqlite3VdbeAddOp3(v, OP_SeekRowid, iFkc, jmpFkc, regRowFc);
+            sqlite3VdbeGoto(v, addrOkFc);
+          end;
+
+          { Report the violation. }
+          if HasRowid(pTabFkc) then
+            sqlite3VdbeAddOp2(v, OP_Rowid, 0, regResultFc + 1)
+          else
+            sqlite3VdbeAddOp2(v, OP_Null, 0, regResultFc + 1);
+          sqlite3VdbeMultiLoad(v, regResultFc + 2, 'siX',
+            [Pointer(PPAnsiChar(pFKfc + 16)^), iFkc - 1]);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, regResultFc, 4);
+          sqlite3VdbeResolveLabel(v, addrOkFc);
+          sqlite3DbFree(Psqlite3db(db), aiColsFc);
+
+          Inc(iFkc);
+          pFKfc := Pu8(PPointer(pFKfc + 8)^);  { pNextFrom }
+        end;
+        sqlite3VdbeAddOp2(v, OP_Next, 0, addrTopFc + 1);
+        sqlite3VdbeJumpHere(v, addrTopFc);
       end;
       Exit;
     end;
@@ -60375,7 +60526,13 @@ begin
                                   PPointer(@pCsr^.pPragma), nil);
   sqlite3_free(zSql);
   if rc <> SQLITE_OK then begin
-    pTab^.base.zErrMsg := sqlite3StrDup(PChar(sqlite3ErrStr(pTab^.db^.errCode)));
+    { pragma.c:3018 — surface the detailed connection error message
+      (sqlite3_errmsg), not the generic sqlite3ErrStr code string. }
+    zText := nil;
+    if pTab^.db^.errCode <> 0 then
+      zText := sqlite3_value_text(Psqlite3_value(pTab^.db^.pErr));
+    if zText = nil then zText := sqlite3ErrStr(pTab^.db^.errCode);
+    pTab^.base.zErrMsg := sqlite3StrDup(PChar(zText));
     Result := rc; Exit;
   end;
   Result := pragmaVtabNext(pVtabCursor);
