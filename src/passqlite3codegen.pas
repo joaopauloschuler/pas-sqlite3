@@ -35660,7 +35660,7 @@ begin
       partitions) emit nested co-routine layers, one per distinct OVER spec
       (window.c:1332 sqlite3WindowLink chain + select.c:7686 recursion). }
     if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab)
-       and (pDest^.eDest <> SRT_Coroutine) then
+       and (pDest^.eDest <> SRT_Coroutine) and (pDest^.eDest <> SRT_Mem) then
     begin Result := SQLITE_OK; Exit; end;
     { Outer ORDER BY combined with LIMIT not yet supported.  DISTINCT
       combined with ORDER BY needs OMITREF/sorter-key dedup that the
@@ -35858,6 +35858,18 @@ begin
       if p^.iOffset <> 0 then
         codeOffset(v, p^.iOffset, iContW);
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
+    end
+    else if pDest^.eDest = SRT_Mem then
+    begin
+      { SRT_Mem (scalar/expr sub-SELECT, e.g. `SELECT (SELECT row_number()
+        OVER())`): the result columns are already coded into pDest^.iSdst
+        (= iSDParm for SRT_Mem) by the per-column loop above.  Mirrors
+        selectInnerLoop's SRT_Mem case (select.c:1428..1436) — no ResultRow;
+        the injected LIMIT 1 jumps out of the scan for us. }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, iContW);
       if p^.iLimit <> 0 then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
     end
