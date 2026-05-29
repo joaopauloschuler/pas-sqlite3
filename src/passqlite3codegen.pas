@@ -33592,6 +33592,19 @@ begin
     couple of common nested shapes) to wire up. }
   linkWindowsForSelect(pParse, p);
 
+  { Mirror select.c:7682..7684 — emit OP_ResultRow column names early (BEFORE
+    the outer-join strength-reduction / flatten FROM-scan loop below), so that
+    a result column that refers directly to a view/sub-query column keeps that
+    column's name even when the FROM subquery is subsequently flattened and the
+    result Expr is rewritten to the underlying table column (colname-9.211:
+    `SELECT t1.a AS n, v3.a FROM t1 JOIN v3` — v3.a must report 'a', not 'c').
+    Also keeps names published before compound + multiSelectByMerge dispatch
+    so sqlite3_column_count is non-zero for compound SELECTs. }
+  if pDest^.eDest = SRT_Output then begin
+    if sqlite3GetVdbe(pParse) <> nil then
+      sqlite3GenerateColumnNames(pParse, p);
+  end;
+
   { 10.1.42.a.7 — Outer-join strength-reduction (select.c:7708..7770).
     Walk the FROM clause and for each term whose LEFT/LTORJ side is
     proven non-nullable by the WHERE clause, simplify
@@ -34082,16 +34095,10 @@ begin
       of compound SELECT processing. }
     p^.selFlags := p^.selFlags and (not u32(SF_UFSrcCheck));
   end;
-  { Mirror select.c:7682..7684 — emit OP_ResultRow column names early, so
-    compound + multiSelectByMerge dispatch (and any path that recurses into
-    sqlite3Select with SRT_Coroutine destinations) still publishes nResColumn
-    on the top-level VDBE.  Without this, sqlite3_column_count returns 0
-    for `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` and the shell renders
-    blank rows. }
-  if pDest^.eDest = SRT_Output then begin
-    if sqlite3GetVdbe(pParse) <> nil then
-      sqlite3GenerateColumnNames(pParse, p);
-  end;
+  { select.c:7682..7684 emits OP_ResultRow column names early — already done
+    above, before the outer-join / flatten FROM-scan loop, so that result
+    columns referring to a flattened view column keep the view column's name
+    (colname-9.211: v3.a must report 'a', not the underlying 't2.c'). }
 
   { 9.4.divbug.89.002 — SRT_EphemTab opener (port of select.c:8223..8237
     tag-select-0630).  When the destination is an ephemeral rowid table
