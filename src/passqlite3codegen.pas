@@ -33301,6 +33301,7 @@ procedure linkWindowsForSelect(pParse: PParse; pSel: PSelect);
     nArg: i32;
     items2: PExprListItem;
     i:     i32;
+    sNC:   TNameContext;
   begin
     if pE = nil then Exit;
     { Skip FILTER-only aggregates — TK_FILTER eFrmType means the pWin is
@@ -33325,6 +33326,22 @@ procedure linkWindowsForSelect(pParse: PParse; pSel: PSelect);
       end;
       if pE^.y.pWin^.pWFunc <> nil then
         sqlite3WindowLink(pSel, pE^.y.pWin);
+      { resolve.c:1321..1322 — after sqlite3WindowUpdate has chained a NAMED
+        window's PARTITION/ORDER BY into pWin (via pWinDefn), those copied
+        expressions are raw TK_ID tokens and must be resolved against the
+        FROM clause.  For inline `OVER (...)` windows the resolver's
+        walkWindowList (resolve.c:89) already resolved them, but for named
+        `OVER win` windows the definition lives in pWinDefn and is only
+        copied in here, so it is otherwise never resolved — leaving the
+        window ORDER BY column with no collation (BINARY) for the peer
+        OP_Compare / windowCodeRangeTest KeyInfo (windowE-1.3). }
+      FillChar(sNC, SizeOf(sNC), 0);
+      sNC.pParse      := pParse;
+      sNC.pSrcList    := pSel^.pSrc;
+      sNC.ncFlags     := NC_AllowAgg or NC_AllowWin;
+      sNC.pWinSelect  := pSel;
+      sqlite3ResolveExprListNames(@sNC, pE^.y.pWin^.pPartition);
+      sqlite3ResolveExprListNames(@sNC, pE^.y.pWin^.pOrderBy);
       { Note: do NOT rewrite TK_FUNCTION → TK_AGG_FUNCTION here.  Window
         funcs stay as TK_FUNCTION; selectWindowRewriteExprCb's TK_FUNCTION
         arm prunes them out of the rewrite (so they survive in the outer
@@ -35843,8 +35860,6 @@ begin
     bSortW := 0;
     if p^.pOrderBy <> nil then bSortW := 1;
     if (bSortW <> 0) and (p^.pLimit <> nil) then
-    begin Result := SQLITE_OK; Exit; end;
-    if (bSortW <> 0) and ((p^.selFlags and SF_Distinct) <> 0) then
     begin Result := SQLITE_OK; Exit; end;
 
     v := sqlite3GetVdbe(pParse);
