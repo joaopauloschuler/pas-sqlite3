@@ -59584,7 +59584,12 @@ begin
     else
       sqlite3VdbeLoadString(v, 1, 'normal');
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
+    { pragma.c:725 returnSingleText — locking_mode is NOT marked reusable
+      (only schema-version/cookie + compile_options call sqlite3VdbeReusable,
+      pragma.c:2361/2382).  It stays RunOnlyOnce (OP_Expire from pragma.c:445)
+      so Tcl/sqlite3_prepare statement caches do not serve a STALE baked mode
+      string after a subsequent `PRAGMA locking_mode=...` mutates the pager
+      (exclusive-1.2/1.7..1.11). }
     Exit;
   end;
 
