@@ -59158,7 +59158,10 @@ begin
   if SameText(zName, 'auto_vacuum') and (pValue <> nil) then begin
     pBtArg := PBtree(db^.aDb[iDb].pBt);
     if pBtArg = nil then Exit;
-    SetString(zRight, pValue^.z, pValue^.n);
+    { Use the already-dequoted zRight (computed at pragma.c:466 above), NOT a
+      fresh SetString of the raw pValue token.  getAutoVacuum() in C runs on
+      the dequoted string, so `PRAGMA auto_vacuum='full'` must compare against
+      full/incremental without the surrounding quotes (incrvacuum-1.2/1.3). }
     if sqlite3StrICmp(PChar(zRight), 'none') = 0 then
       iVal := BTREE_AUTOVACUUM_NONE
     else if sqlite3StrICmp(PChar(zRight), 'full') = 0 then
