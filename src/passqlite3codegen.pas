@@ -29569,6 +29569,22 @@ begin
           zName := pX^.zEName;
       end else
         zName := pX^.zEName;
+      { In C, sqlite3ColumnsFromExprList runs during selectExpander BEFORE the
+        subquery's pEList is name-resolved, so a synthesised USING leading term
+        (added by expandStar under SF_NestedFrom as a bare TK_ID with
+        zEName "..<col>" / eEName=ENAME_TAB; select.c:6192..6200) is still a
+        TK_ID and C derives the column name "<col>" from its token (select.c:
+        2279..2281).  This port resolves that bare TK_ID into a coalesce()
+        TK_FUNCTION (for a RIGHT/FULL join) before this routine runs, so the
+        op is neither TK_COLUMN nor TK_ID and the fallback above grabbed the
+        raw zEName "..<col>" — which then fails the parent expandStar's USING
+        omission (sqlite3IdListIndex looks up "<col>", not "..<col>") and
+        duplicates the join key column.  Recover the bare "<col>" name from
+        the unambiguous "..%s" USING-term marker so the column name matches C. }
+      if (zName <> nil) and (zName = pX^.zEName)
+         and ((pX^.fg.eBits and $03) = ENAME_TAB)
+         and (zName[0] = '.') and (zName[1] = '.') then
+        zName := zName + 2;
     end;
     if (zName <> nil) and (sqlite3IsTrueOrFalse(zName) = 0) then
       zName := sqlite3DbStrDup(db, zName)
