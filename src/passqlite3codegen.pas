@@ -10360,6 +10360,10 @@ procedure resolveAlias(pParse: PParse; pEList: PExprList; iCol: i32;
 procedure resolveOutOfRangeError(pParse: PParse; zType: PAnsiChar;
   i: i32; mx: i32; pError: PExpr); forward;
 
+{ Forward — searchWith is defined later (codegen.pas ~30574) but the
+  CteColumnMatches helper inside sqlite3ResolveSelectNames needs it. }
+function searchWith(pWth: PWith; pItem: PSrcItem; ppContext: PPointer): PCte; forward;
+
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
 
@@ -10682,6 +10686,49 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     When no inner item can provide the column (e.g. subquery2-1.1's `a`
     against an inner FROM of only t3(e,f)) it returns False and the outer
     binding proceeds as before. }
+  { with3-4.1/4.2 — resolve an unexpanded bare FROM-name as a CTE in the
+    current WITH scope.  Returns True when the name IS a CTE in scope (and
+    sets bMatch := whether zCol is one of that CTE's columns).  Returns False
+    when the name is not a CTE in scope.  Columns come from the explicit
+    `cte(c1,...)` list when present, else from the leftmost body SELECT's
+    result EName list. }
+  function CteColumnMatches(pItem: PSrcItem; zCol: PAnsiChar;
+                            out bMatch: Boolean): Boolean;
+  var
+    pCt_:   PCte;
+    pCtx_:  Pointer;
+    pCols_: PExprList;
+    pBody_: PSelect;
+    itm_:   PExprListItem;
+    zEn_:   PAnsiChar;
+    k2_:    i32;
+  begin
+    Result := False;
+    bMatch := False;
+    if pParse^.pWith = nil then Exit;
+    pCtx_ := nil;
+    pCt_ := searchWith(pParse^.pWith, pItem, @pCtx_);
+    if pCt_ = nil then Exit;
+    Result := True;   { name is a CTE in scope }
+    pCols_ := pCt_^.pCols;
+    if pCols_ = nil then
+    begin
+      pBody_ := pCt_^.pSelect;
+      while (pBody_ <> nil) and (pBody_^.pPrior <> nil) do
+        pBody_ := pBody_^.pPrior;
+      if pBody_ <> nil then pCols_ := pBody_^.pEList;
+    end;
+    if pCols_ = nil then begin bMatch := True; Exit; end; { unknown → defer }
+    itm_ := ExprListItems(pCols_);
+    for k2_ := 0 to pCols_^.nExpr - 1 do
+    begin
+      zEn_ := itm_[k2_].zEName;
+      if (zEn_ <> nil) and ((itm_[k2_].fg.eBits and $03) = ENAME_NAME)
+         and (sqlite3StrICmp(zEn_, zCol) = 0) then
+      begin bMatch := True; Exit; end;
+    end;
+  end;
+
   function BareColMaybeInner(pSrc: PSrcList; zCol: PAnsiChar): Boolean;
   var
     base_: PSrcItem;
@@ -10734,7 +10781,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         pTb := sqlite3FindTable(pParse^.db, pIt^.zName, pIt^.u4.zDatabase);
         if (pTb <> nil) and (sqlite3ColumnIndex(pTb, zCol) >= 0) then
         begin Result := True; Exit; end;
-        if pTb = nil then begin Result := True; Exit; end; { unknown → defer }
+        if pTb = nil then
+        begin
+          { with3-4.1/4.2 — the unknown bare name may be a CTE in scope (not a
+            schema table).  An unexpanded CTE FROM-item still has a definite
+            column set: either the explicit `cte(c1,c2,...)` list or the
+            leftmost body SELECT's result columns.  Consult it so a correlated
+            outer reference is not falsely deferred to the inner resolver
+            (which would then raise "no such column").  If the name is a CTE in
+            scope and zCol is NOT among its columns, it is genuinely an outer
+            ref — fall through (do not defer).  If the name is not a CTE in
+            scope at all, keep the conservative defer. }
+          if CteColumnMatches(pIt, zCol, Result) then Exit;
+          Result := True; Exit; { unknown → defer }
+        end;
       end
       else
       begin
@@ -11050,6 +11110,71 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     get pre-resolved before the inner per-Select resolver runs.  Mirrors
     resolve.c's NameContext-chain walk (lookupName resolve.c:341..706)
     which climbs pNC->pNext to arbitrary depth. }
+  procedure WalkDeepFromSubqueries(pSel: PSelect; pOuterSrc: PSrcList); forward;
+
+  { with2-10.1 / with3-4.0 / with3-4.2 — pre-bind outer-column references that
+    live inside a CTE body.  resolveFromTermToCte (codegen.pas:30544) preps
+    each CTE body EAGERLY during sqlite3SelectExpand with a nil outer
+    NameContext, so a correlated reference in the body (e.g. `VALUES(c)` where
+    `c` is an outer result alias, or `SELECT a` where `a` is an outer table
+    column) aborts the prep with "no such column" before the normal deep-walk
+    machinery reaches it.  C never hits this because resolveFromTermToCte only
+    runs the EXPANDER walk on the body; name resolution happens later with the
+    full NameContext chain (select.c:5793..5816 + resolve.c lookupName
+    pNC->pNext climb).  Mirror that here by descending into every CTE body of
+    pSel^.pWith BEFORE expansion and pre-binding its outer refs against
+    pOuterSrc, using each body's own pSrc as the inner scope.  Recurse so a CTE
+    body's own FROM-subqueries and nested WITH clauses are covered too. }
+  procedure WalkWithCteBodies(pSel: PSelect; pOuterSrc: PSrcList);
+  var
+    pWth_:  PWith;
+    pBase_: PCte;
+    pBody_: PSelect;
+    iC_:    i32;
+    pSavW_: PWith;
+  begin
+    if (pSel = nil) or (pSel^.pWith = nil) or (pOuterSrc = nil) then Exit;
+    pWth_ := pSel^.pWith;
+    if pWth_^.nCte <= 0 then Exit;
+    pBase_ := PCte(PByte(pWth_) + SZ_WITH_HEADER);
+    for iC_ := 0 to pWth_^.nCte - 1 do
+    begin
+      pBody_ := pBase_[iC_].pSelect;
+      while pBody_ <> nil do
+      begin
+        { Already prepped (SF_HasTypeInfo) bodies are skipped — they have no
+          unresolved outer refs left and re-binding would be wrong. }
+        if (pBody_^.selFlags and SF_HasTypeInfo) = 0 then
+        begin
+          { Make this CTE body's own WITH scope visible so CteColumnMatches
+            (consulted by BareColMaybeInner) can recognise the body's
+            sibling/nested CTE names and not falsely defer an outer ref.
+            pBody_^.pWith^.pOuter already points at the enclosing scope from
+            parse time, so a transient swap of pParse^.pWith suffices — no
+            push/pop (which would mutate pOuter). }
+          pSavW_ := pParse^.pWith;
+          if pBody_^.pWith <> nil then pParse^.pWith := pBody_^.pWith;
+          ResolveOuterRefsInList(pBody_^.pEList,   pOuterSrc, pBody_^.pSrc);
+          ResolveOuterRefs(pBody_^.pWhere,         pOuterSrc, pBody_^.pSrc);
+          ResolveOuterRefs(pBody_^.pHaving,        pOuterSrc, pBody_^.pSrc);
+          ResolveOuterRefsInList(pBody_^.pGroupBy, pOuterSrc, pBody_^.pSrc);
+          ResolveOuterRefsInList(pBody_^.pOrderBy, pOuterSrc, pBody_^.pSrc);
+          ResolveOuterIDsInList(pBody_^.pEList,    pOuterSrc, pBody_^.pSrc);
+          ResolveOuterIDs(pBody_^.pWhere,          pOuterSrc, pBody_^.pSrc);
+          ResolveOuterIDs(pBody_^.pHaving,         pOuterSrc, pBody_^.pSrc);
+          ResolveOuterIDsInList(pBody_^.pGroupBy,  pOuterSrc, pBody_^.pSrc);
+          ResolveOuterIDsInList(pBody_^.pOrderBy,  pOuterSrc, pBody_^.pSrc);
+          pParse^.pWith := pSavW_;
+          { Nested WITH inside this CTE body, and the body's own
+            FROM-subqueries. }
+          WalkWithCteBodies(pBody_, pOuterSrc);
+          WalkDeepFromSubqueries(pBody_, pOuterSrc);
+        end;
+        pBody_ := pBody_^.pPrior;
+      end;
+    end;
+  end;
+
   procedure WalkDeepFromSubqueries(pSel: PSelect; pOuterSrc: PSrcList);
   var
     base_d: PSrcItem;
@@ -11060,6 +11185,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pIt_o:  PSrcItem;
     k_o:    i32;
   begin
+    { Descend into pSel's own WITH-clause CTE bodies first. }
+    WalkWithCteBodies(pSel, pOuterSrc);
     if (pSel = nil) or (pSel^.pSrc = nil) or (pOuterSrc = nil) then Exit;
     base_d := SrcListItems(pSel^.pSrc);
     for j_d := 0 to pSel^.pSrc^.nSrc - 1 do
