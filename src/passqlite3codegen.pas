@@ -50998,6 +50998,7 @@ var
   nTab:    i32;
   nSelect: i32;
   savedXAuth: Pointer;  { build.c:3096 — saved db->xAuth }
+  pSavedWith: PWith;    { saved pParse->pWith around the throw-away body prep }
 begin
   nErr := 0;
   db := pParse^.db;
@@ -51037,7 +51038,21 @@ begin
       outer SELECT's selectExpander/SelectPrep pass (auth2-2.3). }
     savedXAuth := db^.xAuth;
     db^.xAuth := nil;
+    { Save/restore pParse^.pWith around the throw-away column-name prep.
+      sqlite3ResultSetOfSelect → sqlite3SelectPrep → sqlite3SelectExpand
+      pushes pSel^.pWith onto pParse^.pWith (select.c:5991) when the view
+      body carries a WITH clause (e.g. CREATE VIEW v AS WITH c AS(..)
+      SELECT ..).  In C that push is balanced by the sqlite3SelectPopWith
+      callback of the same walker pass; this port's iterative expander runs
+      the pop walk with a nil xSelectCallback, so the push leaks.  Because
+      pSel is a transient dup freed below (sqlite3SelectDelete), a leaked
+      pParse^.pWith would dangle into freed memory and crash a later
+      resolveFromTermToCte when the same view is referenced twice in one
+      FROM clause (a self-join), or any subsequent CTE name lookup.  Snapshot
+      and restore here so the net effect matches C's balanced pParse->pWith. }
+    pSavedWith := pParse^.pWith;
     pSelTab := sqlite3ResultSetOfSelect(pParse, pSel, AnsiChar(SQLITE_AFF_NONE));
+    pParse^.pWith := pSavedWith;
     db^.xAuth := savedXAuth;
     pParse^.nTab    := nTab;
     pParse^.nSelect := nSelect;
