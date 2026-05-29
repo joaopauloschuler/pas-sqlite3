@@ -8762,6 +8762,30 @@ begin
   end;
 end;
 
+{ srcItemColUsedForCol — port of the colUsed-setting body of
+  sqlite3CreateColumnExpr (resolve.c:875..885).  When a GENERATED column of a
+  TF_HasGenerated table is referenced, every base column it can depend on must
+  be marked, so colUsed is set to the full all-columns mask; otherwise only the
+  single column bit is OR'd in.  Used by the inlined CreateColumnExpr sites in
+  the join (USING/NATURAL) processing so generated columns in a USING clause
+  set colUsed correctly (gencol1-9.20/13.10). }
+procedure srcItemColUsedForCol(pItem: PSrcItem; pTab: PTable2; iCol: i32);
+begin
+  if ((pTab^.tabFlags and TF_HasGenerated) <> 0)
+     and ((pTab^.aCol[iCol].colFlags and COLFLAG_GENERATED) <> 0) then
+  begin
+    if pTab^.nCol >= 64 then
+      pItem^.colUsed := not Bitmask(0)
+    else
+      pItem^.colUsed := (Bitmask(1) shl pTab^.nCol) - 1;
+  end else begin
+    if iCol < BMS - 1 then
+      pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+    else
+      pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+  end;
+end;
+
 { exprProbability — faithful port of resolve.c:935..943.  The second argument
   to likelihood() must be a constant floating-point value between 0.0 and 1.0.
   Return 134,217,728 (2^27) times this value.  Or return -1 if p is not a
@@ -11957,15 +11981,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         { resolve.c:826..832 — only a real column (iColumn>=0) contributes
           to colUsed; the rowid/IPK alias (iColumn=-1) sets rowidUsed and
           must NOT set a colUsed bit, else the index falsely fails the
-          covering-index test (indexedby-11.10). }
+          covering-index test (indexedby-11.10).  Use sqlite3ExprColUsed
+          (resolve.c:828) so that a referenced GENERATED column sets bits
+          for every base column it depends on (gencol1-9.20/13.10). }
         if pE^.iColumn >= 0 then
-        begin
-          if matchCol < BMS - 1 then
-            pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
-          else
-            pMatch^.colUsed := pMatch^.colUsed or
-                               (Bitmask(1) shl (BMS - 1));
-        end
+          pMatch^.colUsed := pMatch^.colUsed or sqlite3ExprColUsed(pE)
         else
           pMatch^.fg.fgBits2 := pMatch^.fg.fgBits2 or $80;  { rowidUsed }
         if pE^.iColumn = -1 then
@@ -31124,12 +31144,7 @@ begin
             else
             begin
               pE1^.iColumn := i16(iLeftCol);
-              if iLeftCol < BMS - 1 then
-                pLeftSrc^.colUsed := pLeftSrc^.colUsed or
-                                       (Bitmask(1) shl iLeftCol)
-              else
-                pLeftSrc^.colUsed := pLeftSrc^.colUsed or
-                                       (Bitmask(1) shl (BMS - 1));
+              srcItemColUsedForCol(pLeftSrc, pLeftSrc^.pSTab, iLeftCol);
             end;
             sqlite3SrcItemColumnUsed(pLeftSrc, iLeftCol);
             { 9.4.divbug.89.014 — port select.c:596..633.  When ANY RIGHT or
@@ -31176,12 +31191,7 @@ begin
                 else
                 begin
                   pE1^.iColumn := i16(iLtoR_LC);
-                  if iLtoR_LC < BMS - 1 then
-                    pLeftSrc^.colUsed := pLeftSrc^.colUsed or
-                                           (Bitmask(1) shl iLtoR_LC)
-                  else
-                    pLeftSrc^.colUsed := pLeftSrc^.colUsed or
-                                           (Bitmask(1) shl (BMS - 1));
+                  srcItemColUsedForCol(pLeftSrc, pLeftSrc^.pSTab, iLtoR_LC);
                 end;
                 pE1^.flags := pE1^.flags or EP_CanBeNull;
                 sqlite3SrcItemColumnUsed(pLeftSrc, iLtoR_LC);
@@ -31213,12 +31223,7 @@ begin
             else
             begin
               pE2^.iColumn := i16(iRightCol);
-              if iRightCol < BMS - 1 then
-                pItem^.colUsed := pItem^.colUsed or
-                                    (Bitmask(1) shl iRightCol)
-              else
-                pItem^.colUsed := pItem^.colUsed or
-                                    (Bitmask(1) shl (BMS - 1));
+              srcItemColUsedForCol(pItem, pRightTab, iRightCol);
             end;
             sqlite3SrcItemColumnUsed(pItem, iRightCol);
             pEq := sqlite3PExpr(pParse, TK_EQ, pE1, pE2);
