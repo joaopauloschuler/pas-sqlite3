@@ -1151,7 +1151,8 @@ begin
   until (tt <> TK_SPACE) and (tt <> TK_COMMENT);
   { Tokens that behave as identifiers in the grammar }
   if (tt = TK_ID) or (tt = TK_STRING) or (tt = TK_JOIN_KW) or
-     (tt = TK_WINDOW) or (tt = TK_OVER) then
+     (tt = TK_WINDOW) or (tt = TK_OVER) or
+     (sqlite3ParserFallback(tt) = TK_ID) then
     Result := TK_ID
   else
     Result := tt;
