@@ -60607,7 +60607,11 @@ begin
   if SameText(zName, 'journal_size_limit') then begin
     iValPragma := -2;
     if pValue <> nil then begin
-      SetString(zRight, pValue^.z, pValue^.n);
+      { pragma.c:780..789 — parse the sign-restored zRight built at the top of
+        sqlite3Pragma (minusFlag folded in there); re-reading pValue^.z here
+        dropped the leading '-' so `PRAGMA journal_size_limit=-4` clamped to a
+        positive 4 instead of -1, truncating the persistent journal on commit
+        (jrnlmode-5.19). }
       sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma);
       if iValPragma < -1 then iValPragma := -1;
     end;
@@ -60619,7 +60623,11 @@ begin
       iValPragma := -1;
     sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 1, 0, Pu8(@iValPragma), P4_INT64);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
+    { pragma.c:780..789 — JOURNAL_SIZE_LIMIT returns via returnSingleInt(),
+      which does NOT mark the statement reusable.  Marking it reusable here
+      baked the first-read value (-1) into a Tcl-cached prepared statement, so
+      a later read after `PRAGMA main.journal_size_limit=N` served the stale
+      -1 (jrnlmode-5.6).  C never marks this reusable; neither do we. }
     Exit;
   end;
 
