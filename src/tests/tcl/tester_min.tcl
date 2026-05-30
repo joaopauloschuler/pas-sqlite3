@@ -1142,6 +1142,30 @@ proc do_eqp_test {name sql res} {
   }
 }
 
+# do_eqp_execsql_test — upstream tester.tcl:1068..1089.  Do both an
+# eqp_test (EXPLAIN QUERY PLAN graph compare) and an execsql_test
+# (result-set compare) on the same SQL, emitting "${name}a" / "${name}b"
+# sub-tests.  Verbatim port of the upstream proc (orderbyB.test:50/72
+# relies on it).  C ref: test/tester.tcl:1068..1089.
+proc do_eqp_execsql_test {name sql res1 res2} {
+  if {[regexp {^\s+QUERY PLAN\n} $res1]} {
+    set query_plan [query_plan_graph $sql]
+    if {[list {*}$query_plan]==[list {*}$res1]} {
+      uplevel [list do_test ${name}a [list set {} ok] ok]
+    } else {
+      uplevel [list \
+        do_test ${name}a [list query_plan_graph $sql] $res1
+      ]
+    }
+  } else {
+    if {[string index $res1 0]!="/"} {
+      set res1 "/*$res1*/"
+    }
+    uplevel do_execsql_test ${name}a [list "EXPLAIN QUERY PLAN $sql"] [list $res1]
+  }
+  uplevel do_execsql_test ${name}b [list $sql] [list $res2]
+}
+
 # do_vmstep_test — upstream tester.tcl:913..933.  Run SQL and verify
 # that the number of "vmsteps" required is greater than or less than
 # some constant.  If $nstep starts with "+", asserts vmstep>=N;
