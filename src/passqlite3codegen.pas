@@ -34392,6 +34392,41 @@ begin
   if (sqlite3TreeTrace and $10) <> 0 then
     sqlite3DebugPrintf('after name resolution:'#10, []);
   {$ENDIF}
+
+  { select.c:7656..7680 — If SF_UFSrcCheck is set, this SELECT is populating
+    the temp table for an UPDATE...FROM statement.  It is an error if the
+    target object (pSrc->a[0]) name or alias is duplicated within the FROM
+    clause (pSrc->a[1..n]).  This must run here — immediately after
+    sqlite3SelectPrep and BEFORE the early flattenSubquery FROM-scan loop
+    below — to match C's ordering (the C check at select.c:7665 runs before
+    the main flatten loop at select.c:7795).  Running it after flatten would
+    pull a `FROM (SELECT * FROM t1)` subquery's underlying table t1 directly
+    into pSrc and spuriously report it as a duplicate of the target. }
+  if (p^.selFlags and SF_UFSrcCheck) <> 0 then begin
+    p0 := @SrcListItems(p^.pSrc)[0];
+    if sameSrcAlias(p0, p^.pSrc) <> 0 then begin
+      if p0^.zAlias <> nil then
+        zUFMsg := sqlite3MPrintf(pParse^.db,
+          'target object/alias may not appear in FROM clause: %s',
+          [p0^.zAlias])
+      else
+        zUFMsg := sqlite3MPrintf(pParse^.db,
+          'target object/alias may not appear in FROM clause: %s',
+          [p0^.pSTab^.zName]);
+      if zUFMsg <> nil then begin
+        sqlite3ErrorMsg(pParse, zUFMsg);
+        sqlite3DbFree(pParse^.db, zUFMsg);
+      end;
+      Result := SQLITE_ERROR;
+      Exit;
+    end;
+    { Clear the SF_UFSrcCheck flag.  The check has already been performed,
+      and leaving it set can cause errors if a compound sub-query in p->pSrc
+      is flattened into this query and this function is called again as part
+      of compound SELECT processing (select.c:7675..7679). }
+    p^.selFlags := p^.selFlags and (not u32(SF_UFSrcCheck));
+  end;
+
   selectMarkAggregate(pParse, p);
   { resolve.c:1980..1986 — HAVING without GROUP BY and without any aggregate
     function is an error.  C raises this during resolveSelectStep; Pas's
@@ -34911,35 +34946,9 @@ begin
      and (pDest^.eDest <> SRT_Discard)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
-  { select.c:7656..7680 — If SF_UFSrcCheck is set, this SELECT is populating
-    the temp table for an UPDATE...FROM statement.  It is an error if the
-    target object (pSrc->a[0]) name or alias is duplicated within the FROM
-    clause (pSrc->a[1..n]).  Postgres disallows this too; following PG's lead
-    avoids the divergent behaviour of other systems. }
-  if (p^.selFlags and SF_UFSrcCheck) <> 0 then begin
-    p0 := @SrcListItems(p^.pSrc)[0];
-    if sameSrcAlias(p0, p^.pSrc) <> 0 then begin
-      if p0^.zAlias <> nil then
-        zUFMsg := sqlite3MPrintf(pParse^.db,
-          'target object/alias may not appear in FROM clause: %s',
-          [p0^.zAlias])
-      else
-        zUFMsg := sqlite3MPrintf(pParse^.db,
-          'target object/alias may not appear in FROM clause: %s',
-          [p0^.pSTab^.zName]);
-      if zUFMsg <> nil then begin
-        sqlite3ErrorMsg(pParse, zUFMsg);
-        sqlite3DbFree(pParse^.db, zUFMsg);
-      end;
-      Result := SQLITE_ERROR;
-      Exit;
-    end;
-    { Clear the SF_UFSrcCheck flag.  The check has already been performed,
-      and leaving it set can cause errors if a compound sub-query in p->pSrc
-      is flattened into this query and this function is called again as part
-      of compound SELECT processing. }
-    p^.selFlags := p^.selFlags and (not u32(SF_UFSrcCheck));
-  end;
+  { SF_UFSrcCheck (select.c:7656..7680) is handled earlier — immediately after
+    sqlite3SelectPrep and before the early flattenSubquery FROM-scan loop — to
+    match C's ordering; see the block near the top of sqlite3Select. }
   { select.c:7682..7684 emits OP_ResultRow column names early — already done
     above, before the outer-join / flatten FROM-scan loop, so that result
     columns referring to a flattened view column keep the view column's name
