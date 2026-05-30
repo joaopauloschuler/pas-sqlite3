@@ -12081,6 +12081,161 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { joinH-16.5 — return the real (un-mangled) base column name projected by
+    pEList entry j of an SF_NestedFrom wrapper, descending through inner
+    wrappers.  sqlite3ColumnsFromExprList mangles duplicate synthetic column
+    names ("c0" -> "c0:1"), so the wrapper's own pSTab->aCol[j].zCnName cannot
+    be compared against a bare column name; this follows the TK_COLUMN chain
+    down to the leaf table/IPK and reads the leaf's real column name. }
+  function WrapperEntryBaseName(pWrap: PSrcItem; j: i32): PAnsiChar;
+  var
+    pSel:    PSelect;
+    pELst:   PExprList;
+    items_:  PExprListItem;
+    pE2:     PExpr;
+    pInnerS: PSrcList;
+    pRef:    PSrcItem;
+    k:       i32;
+    iInnerCol: i32;
+  begin
+    Result := nil;
+    if pWrap^.u4.pSubq = nil then Exit;
+    pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    pELst   := pSel^.pEList;
+    pInnerS := pSel^.pSrc;
+    if (pELst = nil) or (pInnerS = nil) then Exit;
+    if (j < 0) or (j >= pELst^.nExpr) then Exit;
+    items_ := ExprListItems(pELst);
+    pE2 := items_[j].pExpr;
+    if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Exit;
+    pRef := nil;
+    for k := 0 to pInnerS^.nSrc - 1 do
+    begin
+      pRef := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+      if pRef^.iCursor = pE2^.iTable then Break;
+      pRef := nil;
+    end;
+    if pRef = nil then Exit;
+    iInnerCol := pE2^.iColumn;
+    if (pRef^.fg.fgBits2 and $40) = 0 then  { leaf table }
+    begin
+      if pRef^.pSTab = nil then Exit;
+      if (iInnerCol >= 0) and (iInnerCol < pRef^.pSTab^.nCol) then
+        Result := PColumn(PByte(pRef^.pSTab^.aCol) +
+                    iInnerCol * SizeOf(TColumn))^.zCnName
+      else if (iInnerCol < 0) and (pRef^.pSTab^.iPKey >= 0) then
+        Result := PColumn(PByte(pRef^.pSTab^.aCol) +
+                    pRef^.pSTab^.iPKey * SizeOf(TColumn))^.zCnName;
+    end
+    else
+      { Inner item is itself a wrapper — recurse on its iInnerCol entry. }
+      Result := WrapperEntryBaseName(pRef, iInnerCol);
+  end;
+
+  { joinH-16.x — count the number of *real* (bRowid==0) matches for a bare
+    column name inside an SF_NestedFrom wrapper's pEList, faithfully to the
+    resolve.c:367..414 inner loop with zTab==0.  C iterates every pEList entry
+    and bumps cnt per match; two matching columns in the SAME wrapper that are
+    not coalesced by a USING term (e.g. the comma-join `(x1, x2)` where both
+    x1 and x2 have column a) push cnt above 1 and the post-scan tail raises
+    "ambiguous column name".  sqlite3ColumnsFromExprList mangles the 2nd "a"
+    synthetic column to "a:1", so FindWrapperBareIdx (which stops at the first
+    real match and reads synthetic names) cannot detect this — hence a
+    dedicated counting pass over the pEList.  Returns the count in nMatch_ and
+    the LAST matched pEList index in idx_ (resolve.c keeps pExpr->iColumn=j of
+    the last match before any bUsingTerm break).  A bUsingTerm entry ends the
+    scan early (resolve.c:414 break) so USING-coalesced duplicates count once. }
+  function CountWrapperBareMatches(pWrap: PSrcItem; zCol_: PAnsiChar;
+    out nMatch_: i32; out idx_: i32): Boolean;
+  var
+    pSel:    PSelect;
+    pELst:   PExprList;
+    items_:  PExprListItem;
+    pE2:     PExpr;
+    pInnerS: PSrcList;
+    pRef:    PSrcItem;
+    j, k:    i32;
+    iInnerCol: i32;
+    zEntName: PAnsiChar;
+  begin
+    Result  := False;
+    nMatch_ := 0;
+    idx_    := -1;
+    if pWrap^.u4.pSubq = nil then Exit;
+    pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+    if pSel = nil then Exit;
+    pELst   := pSel^.pEList;
+    pInnerS := pSel^.pSrc;
+    if (pELst = nil) or (pInnerS = nil) then Exit;
+    items_ := ExprListItems(pELst);
+    for j := 0 to pELst^.nExpr - 1 do
+    begin
+      { resolve.c:367..414 — C tests each pEList entry with sqlite3MatchEName
+        (zTab==0).  expandStar emits, ahead of a USING wrapper's regular
+        columns, ONE synthetic bUsingTerm entry per USING column: a TK_ID with
+        zEName="..<name>" / eName=ENAME_TAB / bit$80 (codegen.pas:31130..31146).
+        That entry is what C matches FIRST, and resolve.c:414 then breaks — so a
+        USING-coalesced column counts exactly once even though both physical
+        sides (t4.a, t5.a) remain in the pEList.  Match such zEName-bearing
+        entries via sqlite3MatchEName; match the plain TK_COLUMN leaf entries by
+        their real (un-mangled) base name. }
+      zEntName := nil;
+      if (items_[j].zEName <> nil)
+         and ((items_[j].fg.eBits and u8($03)) = u8(ENAME_TAB)) then
+      begin
+        { ENAME_TAB synthetic entry — compare via the zEName "[db.]tab.col"
+          triple against the bare (zTab=nil,zDb=nil) name. }
+        if sqlite3MatchEName(@items_[j], zCol_, nil, nil, nil) <> 0 then
+        begin
+          Inc(nMatch_);
+          idx_   := j;
+          Result := True;
+          { resolve.c:414 — bUsingTerm entry ends the scan. }
+          if (items_[j].fg.eBits and u8($80)) <> 0 then Break;
+        end;
+        Continue;
+      end;
+      pE2 := items_[j].pExpr;
+      if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Continue;
+      { Skip implicit rowid entries — resolve.c bRowid==1 path is not counted. }
+      if (items_[j].fg.eBits and u8($03)) = u8(ENAME_ROWID) then Continue;
+      { Locate the inner leaf SrcItem this column reads from. }
+      pRef := nil;
+      for k := 0 to pInnerS^.nSrc - 1 do
+      begin
+        pRef := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+        if pRef^.iCursor = pE2^.iTable then Break;
+        pRef := nil;
+      end;
+      if pRef = nil then Continue;
+      iInnerCol := pE2^.iColumn;
+      if (pRef^.fg.fgBits2 and $40) = 0 then  { leaf table }
+      begin
+        if pRef^.pSTab = nil then Continue;
+        if (iInnerCol >= 0) and (iInnerCol < pRef^.pSTab^.nCol) then
+          zEntName := PColumn(PByte(pRef^.pSTab^.aCol) +
+                        iInnerCol * SizeOf(TColumn))^.zCnName
+        else if (iInnerCol < 0) and (pRef^.pSTab^.iPKey >= 0) then
+          zEntName := PColumn(PByte(pRef^.pSTab^.aCol) +
+                        pRef^.pSTab^.iPKey * SizeOf(TColumn))^.zCnName
+        else
+          zEntName := nil;
+      end
+      else
+        { Inner item is itself a wrapper — get its real (un-mangled) base name. }
+        zEntName := WrapperEntryBaseName(pRef, iInnerCol);
+      if (zEntName <> nil) and (sqlite3StrICmp(zEntName, zCol_) = 0) then
+      begin
+        Inc(nMatch_);
+        idx_   := j;
+        Result := True;
+        { resolve.c:414 — a USING-coalesced (bUsingTerm) match ends the scan. }
+        if (items_[j].fg.eBits and u8($80)) <> 0 then Break;
+      end;
+    end;
+  end;
+
   { 9.4.divbug.59 — port of resolve.c:351..417 nested-from arm, adapted
     to the Pas expandStar slice.  The C resolver matches zTab.zCol against
     the wrapper's pEList via sqlite3MatchEName, then binds pE to
@@ -12157,6 +12312,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     bWrapBare: Boolean;    { joinH-9.8 — bare ref matched a nested wrapper }
     bWrapRowid: Boolean;   { joinH-9.8 — that wrapper match was a rowid entry }
     nWrapRowid: i32;       { joinH-9.2 — rowid candidate count within a wrapper }
+    nWrapMatch: i32;       { joinH-16.x — real (non-rowid) matches in a wrapper }
+    iWrapIdx:   i32;       { joinH-16.x — last matched pEList idx in a wrapper }
 
     { resolve.c:835..844 lookupname_end — when a column reference resolves
       successfully (cnt==1) and an authorizer is installed, invoke the
@@ -12555,6 +12712,31 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             matchEffCol := i16(-1)
           else
             matchEffCol := i16(iCol);
+          { joinH-16.x — resolve.c:367..414 counts EVERY matching pEList entry
+            of an SF_NestedFrom wrapper, not just the first.  Two non-coalesced
+            duplicate columns in the SAME wrapper (e.g. `(x1, x2)` where both
+            have column a, RIGHT JOIN ... USING(a)) are an "ambiguous column
+            name" (the cnt>0 / pMatch==pItem arm at resolve.c:372..385 clears
+            pFJMatch and lets cnt rise above 1).  sqlite3ColumnIndex only sees
+            the first (the duplicate is name-mangled to "a:1"), so count the
+            wrapper's real matches explicitly and add the surplus to cnt. }
+          if (not bWrapRowid)
+             and ((pItem^.fg.fgBits2 and $40) <> 0)  { isNestedFrom }
+             and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+             and (pItem^.u4.pSubq <> nil)
+             and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil) then
+          begin
+            if CountWrapperBareMatches(pItem, pE^.u.zToken, nWrapMatch, iWrapIdx)
+               and (nWrapMatch > 1) then
+            begin
+              if pFJMatch <> nil then
+              begin
+                sqlite3ExprListDelete(pParse^.db, pFJMatch);
+                pFJMatch := nil;
+              end;
+              cnt := cnt + (nWrapMatch - 1);
+            end;
+          end;
         end;
       end;
       { 9.4.divbug.89.013 — resolve.c:761..782.  If a FULL JOIN coalesce
