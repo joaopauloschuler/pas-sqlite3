@@ -14314,6 +14314,7 @@ var
                                re-inits sNC.ncFlags per Select; we save/restore
                                around each top-level invocation so recursive
                                sub-SELECT resolution is isolated). }
+  sNCLimit:   TNameContext;  { resolve.c:1885 — empty NameContext for LIMIT/OFFSET }
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
@@ -14511,21 +14512,26 @@ begin
     end;
   end;
 
-  { 9.4.divbug.89.016 — port resolve.c:1888 LIMIT/OFFSET resolution.
-    C runs `sqlite3ResolveExprNames(&sNC, p->pLimit)` with an empty
-    NameContext: LIMIT may not reference any names, but its subexpressions
-    (in particular, embedded TK_SELECT scalar subqueries like
-    `LIMIT (SELECT ...)`) must be Prep'd here so the inner select gains
-    SF_Resolved BEFORE sqlite3SelectAddTypeInfo blanket-sets SF_HasTypeInfo
-    on the whole tree.  Without this, the inner LIMIT subquery's
-    SelectPrep call at codeSubselect time early-returns on SF_HasTypeInfo
-    and ResolveCompoundOrderBy never runs — an `ORDER BY 1` term then
-    reaches multiSelectByMerge with iOrderByCol=0 and trips the
-    AssertH (`multiSelectByMerge: iOrderByCol<=0`).  Reusing ResolveExpr
-    here also handles the OFFSET expression via pLimit^.pRight via the
-    standard recursion. }
+  { resolve.c:1882..1890 — resolve the LIMIT/OFFSET expressions with an
+    EMPTY NameContext (memset to 0; only pParse + pWinSelect set).  LIMIT
+    may not reference any column names, so it must NOT be resolved against
+    the FROM clause (p^.pSrc).  The earlier port reused the nested
+    ResolveExpr, which binds against p^.pSrc — so `SELECT * FROM t1 LIMIT x`
+    (x a real column of t1) bound `x` to a TK_COLUMN and then coded an
+    OP_Column read into the LIMIT register with no open cursor, crashing in
+    sqlite3VdbeExec (limit-12.3 / in7-2.1 / join8-9000 SIGSEGV).  An empty
+    NameContext has pSrcList=nil and pNext=nil, so sqlite3ResolveExprNames
+    takes its self-contained arm: flagUnresolvedTKID raises "no such
+    column: x" (matching C), and resolveExprSubqueries still preps embedded
+    `LIMIT (SELECT ...)` scalar subqueries (the SF_Resolved-before-typeinfo
+    requirement noted previously, divbug.89.016). }
   if (pParse^.nErr = 0) and (p^.pLimit <> nil) then
-    ResolveExpr(p^.pLimit);
+  begin
+    FillChar(sNCLimit, SizeOf(sNCLimit), 0);
+    sNCLimit.pParse     := pParse;
+    sNCLimit.pWinSelect := p;
+    sqlite3ResolveExprNames(@sNCLimit, p^.pLimit);
+  end;
   { 9.4.divbug.72 — vector-size sweep across result-list / HAVING /
     ORDER BY / LIMIT post-resolution.  See WHERE comment above. }
   if (pParse^.nErr = 0) and (p^.pHaving <> nil) then
