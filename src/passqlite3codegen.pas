@@ -11467,7 +11467,6 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     j:    i32;
     base: PSrcItem;
     pIt:  PSrcItem;
-    pSub: PSelect;
   begin
     Result := False;
     if (pX = nil) or (pOuterSrc = nil) then Exit;
@@ -11492,13 +11491,21 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                                     pOuterSrc) then
           begin Result := True; Exit; end;
     end
-    else if pX^.x.pSelect <> nil then
-    begin
-      pSub := pX^.x.pSelect;
-      if ExprListArgRefsOuterCursor(pSub^.pEList, pOuterSrc) then begin Result := True; Exit; end;
-      if ExprArgRefsOuterCursor(pSub^.pWhere,  pOuterSrc) then begin Result := True; Exit; end;
-      if ExprArgRefsOuterCursor(pSub^.pHaving, pOuterSrc) then begin Result := True; Exit; end;
-    end;
+    { randexpr1 regression (commit 07b8678 over-reach): do NOT descend into a
+      nested expression-subquery (pX^.x.pSelect) when deciding whether THIS
+      aggregate's arguments reference the outer SrcList.  This mirrors C's
+      sqlite3ReferencesSrcList / exprRefToSrcList (expr.c:6529..6560): a
+      correlated TK_COLUMN that lives inside a nested sub-SELECT of the
+      aggregate's argument is an "inside reference" (exprRefToSrcList sets
+      eCode bit 0x02 via the aiCursor[] sub-select cursor list, NOT bit 0x01
+      "out-of-scope SrcList reference").  Such a column belongs to the nested
+      subquery's own resolution, so it must not promote the enclosing
+      aggregate to the outer query.  Descending here wrongly treated e.g.
+        avg(coalesce((SELECT max(a) FROM t1 WHERE a NOT IN (b, ... t1.f ...)),e))
+      as referencing the outer t1 cursor (because the deep t1.f is correlated
+      to the outer), promoting avg() into the outer non-aggregate query and
+      raising a bogus "misuse of aggregate". }
+    ;
   end;
 
   { Walk pX looking for aggregate-function TK_FUNCTION nodes that, per
@@ -34599,6 +34606,21 @@ begin
       if (pTabList^.nSrc > 1)
          and SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil)
          and (pItem^.u4.pSubq^.pSelect <> nil)
+         { upfrom1-5.1 — do NOT flatten a *compound* (UNION ALL) FROM subquery
+           in this multi-source loop.  flattenSubquery faithfully rewrites the
+           OUTER p into a compound (select.c:4490..4527), but this Pas port's
+           compound dispatch (multiSelect) runs earlier in sqlite3Select, not
+           after the FROM-clause optimisation loop as in C (select.c:7884), so
+           a p turned compound here is never coded arm-by-arm: a fall-through
+           codes only the rightmost arm, and a recursive sqlite3Select
+           re-entry double-processes the half-analysed outer and SIGSEGVs at
+           finalize.  Leaving a compound subquery to materialise into an
+           ephemeral table (the pre-fe6d56d behaviour) keeps every arm and
+           matches the oracle (`UPDATE t3 SET (c,b)=(SELECT 3,4) FROM t1, t2`
+           with t2 a UNION ALL view -> [4 3]).  The single-source compound
+           flatten + safe re-dispatch is handled separately at
+           codegen.pas:33385 (commit 67f987a). }
+         and (pItem^.u4.pSubq^.pSelect^.pPrior = nil)
          { Skip FROM items that are the right operand of an outer join.
            C does flatten these (flattenSubquery's isOuterJoin path wraps the
            substituted result columns in TK_IF_NULL_ROW), but the pas
