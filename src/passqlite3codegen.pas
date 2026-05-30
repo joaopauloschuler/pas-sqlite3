@@ -60168,10 +60168,11 @@ begin
   if SameText(zName, 'cache_size') then begin
     if pValue = nil then begin
       { Read arm (pragma.c:884..885): returnSingleInt(pSchema->cache_size).
-        pSchema->cache_size is seeded in sqlite3InitOne (main.pas:6162),
-        so it is never 0 here; fall back to the default defensively. }
-      if (db^.aDb[iDb].pSchema <> nil)
-         and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
+        pSchema->cache_size is seeded to the default in sqlite3InitOne
+        (main.pas:6306, mirroring prepare.c:323..332), so a user-set 0 must
+        be returned verbatim — do NOT substitute the default for 0, that
+        would make `PRAGMA cache_size=0` read back -2000. }
+      if db^.aDb[iDb].pSchema <> nil then
         iVal := db^.aDb[iDb].pSchema^.cache_size
       else
         iVal := SQLITE_DEFAULT_CACHE_SIZE;
