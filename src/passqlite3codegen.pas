@@ -36520,15 +36520,13 @@ begin
       partitions) emit nested co-routine layers, one per distinct OVER spec
       (window.c:1332 sqlite3WindowLink chain + select.c:7686 recursion). }
     if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab)
-       and (pDest^.eDest <> SRT_Coroutine) and (pDest^.eDest <> SRT_Mem) then
+       and (pDest^.eDest <> SRT_Coroutine) and (pDest^.eDest <> SRT_Mem)
+       and (pDest^.eDest <> SRT_Set) then
     begin Result := SQLITE_OK; Exit; end;
-    { Outer ORDER BY combined with LIMIT not yet supported.  DISTINCT
-      combined with ORDER BY needs OMITREF/sorter-key dedup that the
+    { DISTINCT combined with ORDER BY needs OMITREF/sorter-key dedup that the
       simple inline arm here does not implement. }
     bSortW := 0;
     if p^.pOrderBy <> nil then bSortW := 1;
-    if (bSortW <> 0) and (p^.pLimit <> nil) then
-    begin Result := SQLITE_OK; Exit; end;
 
     v := sqlite3GetVdbe(pParse);
     if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
@@ -36626,10 +36624,12 @@ begin
     { LIMIT/OFFSET — allocate counters BEFORE WhereBegin so the OP_Integer
       init lands outside the scan loop.  Inner-loop subroutine below applies
       codeOffset + OP_DecrJumpZero around the OP_ResultRow.  Mirrors select.c
-      flow for window queries with LIMIT.  Bypassed when bSortW=1 (LIMIT is
-      gated off above; OFFSET applies post-sort in the sort tail). }
-    if bSortW = 0 then
-      computeLimitRegisters(pParse, p, iBreakW);
+      flow for window queries with LIMIT.  When bSortW=1 the counters are
+      still allocated here (init outside the scan), but LIMIT/OFFSET are
+      applied post-sort in the sort tail via generateSortTail, not inline.
+      For LIMIT 0 computeLimitRegisters jumps to iBreakW which skips the
+      scan, leaving the sorter empty → zero rows drained. }
+    computeLimitRegisters(pParse, p, iBreakW);
 
     pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, nil,
                                 pEList, p, 0, 0);
@@ -36704,6 +36704,24 @@ begin
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
       sqlite3ReleaseTempReg(pParse, r2);
       sqlite3ReleaseTempReg(pParse, r1);
+    end
+    else if pDest^.eDest = SRT_Set then
+    begin
+      { Windowed SELECT as the RHS of an IN(...) operator (sqlite3CodeRhsOfIN
+        materialises via SRT_Set).  Mirrors selectInnerLoop SRT_Set arm
+        (select.c:1384..1407 / codegen.pas:35298): codeOffset skips the row
+        before disposal, then MakeRecord with the affinity in dest.zAffSdst,
+        IdxInsert into the set cursor, and DecrJumpZero for LIMIT. }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, iContW);
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1,
+                        pDest^.zAffSdst, nResultCol);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                           pDest^.iSdst, nResultCol);
+      sqlite3ReleaseTempReg(pParse, r1);
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
     end
     else if pDest^.eDest = SRT_Coroutine then
     begin
@@ -36781,12 +36799,30 @@ begin
         sqlite3ReleaseTempReg(pParse, r2);
         sqlite3ReleaseTempReg(pParse, r1);
       end
+      else if pDest^.eDest = SRT_Set then
+      begin
+        { Sorter-drain disposal for SRT_Set (IN-RHS via sqlite3CodeRhsOfIN
+          with outer ORDER BY): MakeRecord with dest.zAffSdst affinity then
+          IdxInsert into the set cursor.  Mirrors selectInnerLoop SRT_Set
+          (select.c:1384..1407 / codegen.pas:35298). }
+        r1 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1,
+                          pDest^.zAffSdst, nResultCol);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                             pDest^.iSdst, nResultCol);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
       else if pDest^.eDest = SRT_Coroutine then
         { Windowed coroutine subquery WITH outer ORDER BY: drain the sorter and
           yield each row.  Mirrors selectInnerLoop SRT_Coroutine (select.c:1448). }
         sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
       else
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      { LIMIT on sorter drain — generateSortTail (select.c:1740..1748).
+        Decrement the LIMIT counter after each drained row; once it hits
+        zero jump past the drain.  OFFSET is handled pre-dispatch above. }
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrkW);
       if addrSortContW <> 0 then
         sqlite3VdbeResolveLabel(v, addrSortContW);
       sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsrW, addrSortLoopW);
