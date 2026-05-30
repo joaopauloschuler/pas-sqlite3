@@ -38227,7 +38227,23 @@ begin
         { The consumer-side reset InitCoroutine is emitted unconditionally
           below, right before the OP_Yield loop (mirrors C where.c:1199 /
           wherecode.c:1550).  Nothing to do here for the pre-emitted
-          (VALUES) coroutine beyond the asserts. }
+          (VALUES) coroutine beyond the asserts.
+
+          EXPLAIN QUERY PLAN narrator — port of wherecode.c:1544..1554,
+          which codes the viaCoroutine FROM item under sqlite3WhereBegin's
+          ExplainQueryPlan(pParse,0,"SCAN %S",pTabItem).  For a multi-row
+          VALUES wrapper (SF_MultiValue on the coroutine body) printf.c:998
+          renders that "%S" as "<u1.nRow>-ROW VALUES CLAUSE".  Without this
+          node a top-level standalone `VALUES(1),(2),...` (eDest=SRT_Output)
+          produced an EQP with no rows at all, so the tester.tcl
+          query_plan_graph helper crashed reading cx(0) (values.test FAIL). }
+        if ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_MultiValue) <> 0)
+           and (pItem^.pSTab <> nil) then
+          sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v),
+                            pParse^.addrExplain, 0,
+                            sqlite3MPrintf(pParse^.db, 'SCAN %d-ROW VALUES CLAUSE',
+                                           [PtrInt(pItem^.u1.nRow)]),
+                            P4_DYNAMIC);
       end
       else
       begin
