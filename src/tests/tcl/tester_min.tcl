@@ -1310,6 +1310,18 @@ proc drop_all_tables {{db db}} {
   }
 }
 
+# drop_all_indexes — upstream tester.tcl:2277..2284.  Drops every
+# auxiliary (user-created) index from the main database on connection
+# [db].  rowvalue3.test / rowvalue4.test call this inside their foreach
+# index-permutation loops to reset between index variants.  Verbatim
+# port.  C ref: tester.tcl:2277..2284.
+proc drop_all_indexes {{db db}} {
+  set L [$db eval {
+    SELECT name FROM sqlite_master WHERE type='index' AND sql LIKE 'create%'
+  }]
+  foreach idx $L { $db eval "DROP INDEX $idx" }
+}
+
 # ===========================================================================
 # Fault-injection helpers — do_malloc_test (task 9.4.2.g.9) and
 # do_ioerr_test (task 9.4.2.g.10).
