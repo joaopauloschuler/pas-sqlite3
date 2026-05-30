@@ -5565,6 +5565,15 @@ begin
   sqlite3PagerPagecount(pPgr, @nPage);
   szPage := sqlite3BtreeGetPageSize(pBt);
   sz     := i64(nPage) * szPage;
+  { memdb.c:802 — a fresh, never-written-to database has page_count 0.
+    Force page 1 to come into existence with a BEGIN IMMEDIATE;COMMIT;,
+    then re-read the page count, so the serialized image is non-empty. }
+  if sz = 0 then begin
+    sqlite3_exec(db, 'BEGIN IMMEDIATE; COMMIT;', nil, nil, nil);
+    nPage := 0;
+    sqlite3PagerPagecount(pPgr, @nPage);
+    sz := i64(nPage) * szPage;
+  end;
   if piSize <> nil then piSize^ := sz;
   if (mFlags and SQLITE_SERIALIZE_NOCOPY) <> 0 then begin
     Result := nil; Exit;
