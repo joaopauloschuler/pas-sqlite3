@@ -322,6 +322,10 @@ proc finalize_testing {} {
 # the BODY and `ifcapable foo` runs ELSEBODY.
 array set ::sqlite_options {}
 set ::sqlite_options(allow_rowid_in_view) 0
+# test_config.c sets hiddencolumns from SQLITE_ENABLE_HIDDEN_COLUMNS, which the
+# oracle does NOT define (and neither does this FPC build), so the name-based
+# __hidden__ column mechanism is a no-op.  Pin it 0 to match the oracle.
+set ::sqlite_options(hiddencolumns) 0
 # 6.40.1.o — pas-sqlite3 now ships FTS3/FTS4 (passqlite3fts3.pas, registered
 # by sqlite3Fts3Init at openDatabase).  Mirror test_config.c:437..453: this
 # build defines SQLITE_ENABLE_FTS3 and does NOT define SQLITE_DISABLE_FTS3_UNICODE

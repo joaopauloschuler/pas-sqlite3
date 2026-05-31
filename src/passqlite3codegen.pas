@@ -40783,9 +40783,12 @@ end;
   name of the column.  Faithful port of build.c:1401 under
   SQLITE_ENABLE_HIDDEN_COLUMNS. }
 procedure sqlite3ColumnPropertiesFromName(pTab: PTable2; pCol: PColumn);
+{$IFDEF SQLITE_ENABLE_HIDDEN_COLUMNS}
 var
   iCol: PtrUInt;
+{$ENDIF}
 begin
+{$IFDEF SQLITE_ENABLE_HIDDEN_COLUMNS}
   if sqlite3_strnicmp(pCol^.zCnName, PAnsiChar('__hidden__'), 10) = 0 then
   begin
     pCol^.colFlags := pCol^.colFlags or COLFLAG_HIDDEN;
@@ -40799,6 +40802,7 @@ begin
     if (pTab^.aCol[iCol - 1].colFlags and COLFLAG_HIDDEN) <> 0 then
       pTab^.tabFlags := pTab^.tabFlags or TF_OOOHidden;
   end;
+{$ENDIF}
 end;
 
 { sqlite3IdListIndex — find index of zName in IdList; -1 if not found }
