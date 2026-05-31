@@ -9418,34 +9418,48 @@ end;
   from the integer arm — without it a string like '3.14abc' would
   truncate to integer 3 (C falls through to MEM_Real with rValue=3.14). }
 function numericType(pMem: PMem): u16;
-var r: Double; iVal: i64; rcM: i32;
+var iVal: i64; rcM: i32;
 begin
   if (pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null)) <> 0 then begin
     Result := pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null);
     Exit;
   end;
-  rcM := sqlite3MemRealValueRC(pMem, r);
+  { computeNumericType (vdbe.c:467): the value is a Str/Blob.  Materialise any
+    MEM_Zero padding FIRST so the subsequent writes into the pMem.u union do
+    not clobber u.nZero (which shares the union slot) while MEM_Zero is still
+    set — otherwise a zeroblob operand of an arithmetic op silently loses its
+    trailing zero bytes (ticket bb4bdb9f7f654b0bb9). }
+  if sqlite3VdbeMemExpandBlob(pMem) <> SQLITE_OK then begin
+    pMem^.u.i := 0;
+    Result := MEM_Int;
+    Exit;
+  end;
+  rcM := sqlite3MemRealValueRC(pMem, pMem^.u.r);
   if rcM <= 0 then begin
     if ((rcM and 2) = 0) and
        (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
       pMem^.u.i := iVal;
       Result := MEM_Int;
-    end else begin
-      pMem^.u.r := r;
+    end else
       Result := MEM_Real;
-    end;
   end else if ((rcM and 2) = 0) and
               (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
     pMem^.u.i := iVal;
     Result := MEM_Int;
-  end else begin
-    pMem^.u.r := r;
+  end else
     Result := MEM_Real;
-  end;
 end;
 
 { sqlite3BlobCompare — compare two blob/binary Mem values.
   Port of vdbeaux.c:4508. }
+function memIsAllZero(z: Pu8; n: i32): Boolean;
+var i: i32;
+begin
+  for i := 0 to n - 1 do
+    if z[i] <> 0 then begin Result := False; Exit; end;
+  Result := True;
+end;
+
 function sqlite3BlobCompare(pB1, pB2: PMem): i32;
 var n1, n2, c, nMin: i32;
 begin
@@ -9455,9 +9469,11 @@ begin
     if (pB1^.flags and pB2^.flags and MEM_Zero) <> 0 then begin
       Result := pB1^.u.nZero - pB2^.u.nZero; Exit;
     end else if (pB1^.flags and MEM_Zero) <> 0 then begin
-      Result := -1; Exit;  { simplified: treat MEM_Zero as less }
+      if not memIsAllZero(Pu8(pB2^.z), pB2^.n) then begin Result := -1; Exit; end;
+      Result := pB1^.u.nZero - n2; Exit;
     end else begin
-      Result := +1; Exit;
+      if not memIsAllZero(Pu8(pB1^.z), pB1^.n) then begin Result := +1; Exit; end;
+      Result := n1 - pB2^.u.nZero; Exit;
     end;
   end;
   if n1 < n2 then nMin := n1 else nMin := n2;
