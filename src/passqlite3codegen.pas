@@ -41088,10 +41088,16 @@ end;
 function sqlite3UpsertNextIsIPK(pUpsert: PUpsert): i32;
 var pNext: PUpsert;
 begin
+  if pUpsert = nil then begin Result := 0; Exit; end;  { NEVER(pUpsert==0) }
   pNext := pUpsert^.pNextUpsert;
-  if pNext = nil then begin Result := 0; Exit; end;
-  if pNext^.pUpsertIdx <> nil then begin Result := 0; Exit; end;
-  Result := 1;
+  while True do
+  begin
+    if pNext = nil then begin Result := 1; Exit; end;
+    if pNext^.pUpsertTarget = nil then begin Result := 1; Exit; end;
+    if pNext^.pUpsertIdx = nil then begin Result := 1; Exit; end;
+    if pNext^.isDup = 0 then begin Result := 0; Exit; end;
+    pNext := pNext^.pNextUpsert;
+  end;
 end;
 
 { sqlite3UpsertOfIndex — return upsert clause that targets pIdx }
