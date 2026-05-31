@@ -73287,6 +73287,20 @@ begin
   zErr   := nil;
   pBlob  := nil;
 
+  { vdbeblob.c:145..148 — the SQLITE_ENABLE_API_ARMOR guard
+    `if( !sqlite3SafetyCheckOk(db) || zTable==0 || zColumn==0 ) return
+    SQLITE_MISUSE_BKPT;`.  zTable/zColumn are already screened by the public
+    sqlite3_blob_open wrapper; the db safety check is applied here, the layer
+    where sqlite3SafetyCheckOk (util.c:1934 — true only when db^.eOpenState =
+    SQLITE_STATE_OPEN) is reachable.  The oracle libsqlite3.so is built with
+    SQLITE_ENABLE_API_ARMOR, so this guard is unconditional to match it: an
+    invalid db handle aborts with MISUSE rather than slipping into the stub-db
+    SQLITE_ERROR arm below.  (Zero-init test stubs already only assert rc<>OK,
+    which MISUSE still satisfies.) }
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
   { Stub-db guard: no attached databases means no schema to look up.
     Test infrastructure exercises the API with a zero-initialised
     Tsqlite3, so guard before touching aDb / pParse / mutex paths. }

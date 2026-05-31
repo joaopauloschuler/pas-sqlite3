@@ -6782,6 +6782,9 @@ function sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
                            out ppBlob: Psqlite3_blob): i32;
 begin
   ppBlob := nil;
+  { vdbeblob.c:139..148 — the SQLITE_ENABLE_API_ARMOR misuse guard
+    (sqlite3SafetyCheckOk(db) || zTable==0 || zColumn==0) is applied inside
+    gBlobOpenImpl (codegen), where sqlite3SafetyCheckOk is reachable. }
   if (db = nil) or (zTable = nil) or (zColumn = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
