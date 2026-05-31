@@ -46172,13 +46172,25 @@ generic_coro_done:
   Inc(pParse^.nMem);
   (aRegIdx + nIdx)^ := pParse^.nMem;
 
-  { ExplainQueryPlan SCAN announcement — insert.c:1133.  C emits this
-    before OpenWrite so the EQP marker leads the consumer block.  Done
-    here for the viaCoroutine arm only; the inline-unrolled multi-row
-    path doesn't need it (no run-time loop). }
-  if useCoroutine then
-    sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v),
-      pParse^.addrExplain, 0);
+  { ExplainQueryPlan SCAN announcement — insert.c:1133 (ExplainQueryPlan
+    "SCAN %S").  C emits this before OpenWrite so the EQP marker leads the
+    consumer block.  Only the viaCoroutine arm (pSubqCoro <> nil) narrates
+    here; the generic SRT_Coroutine arm (needsGenericCoro) gets its own EQP
+    node from sqlite3Select, so it must not also emit here.  printf.c:998
+    renders "%S" of the SF_MultiValue subquery SrcItem as "<u1.nRow>-ROW
+    VALUES CLAUSE"; we inline that text (sqlite3MPrintf does not set
+    SQLITE_PRINTF_INTERNAL, so "%S" would render empty there) and emit the
+    OP_Explain unconditionally, mirroring the SCANSTATUS-enabled oracle and
+    the existing VALUES-scan narrator at codegen ~38475.  Previously this
+    emitted an OP_Explain with an empty p4 string, producing a blank EQP row
+    (values-15.3). }
+  if useCoroutine and (pSubqCoro <> nil)
+     and ((pSubqCoro^.pSelect^.selFlags and SF_MultiValue) <> 0) then
+    sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v),
+                      pParse^.addrExplain, 0,
+                      sqlite3MPrintf(pParse^.db, 'SCAN %d-ROW VALUES CLAUSE',
+                                     [PtrInt(pCoroItem^.u1.nRow)]),
+                      P4_DYNAMIC);
 
   iDataCur := 0;
   iIdxCur  := 0;
