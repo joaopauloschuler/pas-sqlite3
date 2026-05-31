@@ -41097,12 +41097,13 @@ end;
 { sqlite3UpsertOfIndex — return upsert clause that targets pIdx }
 function sqlite3UpsertOfIndex(pUpsert: PUpsert; pIdx: PIndex2): PUpsert;
 begin
-  while pUpsert <> nil do
+  while (pUpsert <> nil)
+    and (pUpsert^.pUpsertTarget <> nil)
+    and (pUpsert^.pUpsertIdx <> pIdx) do
   begin
-    if pUpsert^.pUpsertIdx = pIdx then begin Result := pUpsert; Exit; end;
     pUpsert := pUpsert^.pNextUpsert;
   end;
-  Result := nil;
+  Result := pUpsert;
 end;
 
 { sqlite3UpsertDoUpdate — port of upsert.c:267.
