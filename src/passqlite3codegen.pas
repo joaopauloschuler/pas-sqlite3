@@ -34473,6 +34473,7 @@ var
   pModFunc:      passqlite3vtab.PSqlite3Module;
   kHC, jHC:      i32;
   pSubFC:        PSelect;  { 10.1.42.a.8 — FROM-clause subquery select }
+  bWillFlatten:  Boolean;  { skip push-down for a to-be-flattened single-source view }
   { 9.2.divbug.H — simple-count(*) WITHOUT ROWID arm.  For a
     WITHOUT ROWID table the row payload lives in the PRIMARY KEY index
     btree (an mxRecord-keyed b-tree), not the table root.  C
@@ -34898,7 +34899,30 @@ begin
         pSubFC := pItem^.u4.pSubq^.pSelect
       else
         pSubFC := nil;
+      { In C the FROM-subquery flatten runs in the analysis phase, BEFORE this
+        predicate push-down loop (select.c flatten ~7866 then push-down ~8000),
+        so a flatten-eligible single-source view is already flattened and is
+        never offered to pushDownWhereTerms.  This Pas port defers the
+        single-source flatten to the per-FROM-item codegen path
+        (codegen.pas:~38324), which runs AFTER this loop.  If push-down copied
+        the outer WHERE terms into pSub->pWhere here and the subquery were then
+        flattened, flattenSubquery's pSub->pWhere merge (codegen.pas:16191)
+        would re-AND those pushed copies onto the parent WHERE that still holds
+        the originals — duplicating (and reordering) every body term
+        (fts3aux1-2.1.2.2 / 2.1.3.2: the full-scan visit count doubled and the
+        residual EQ jumped ahead of a non-deterministic body function).  Mirror
+        C's phase ordering by skipping push-down for a FROM item that the late
+        single-source flatten will absorb (gate mirrors codegen.pas:38324..38359). }
+      bWillFlatten := (pSubFC <> nil)
+         and (p^.pPrior = nil) and (pTabList^.nSrc = 1)
+         and ((p^.selFlags and SF_Aggregate) = 0)
+         and (pItem^.pSTab <> nil)
+         and ((pSubFC^.selFlags and SF_Aggregate) = 0)
+         and (pSubFC^.pGroupBy = nil)
+         and (pSubFC^.pHaving = nil)
+         and ((pSubFC^.selFlags and SF_HasAgg) = 0);
       if (pSubFC <> nil)
+         and (not bWillFlatten)
          { CTE eligibility gate (select.c:8005..8006). }
          and (((pItem^.fg.fgBits2 and u8($02)) = 0)
               or ((pItem^.u2.pCteUse <> nil)
