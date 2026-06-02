@@ -35280,6 +35280,18 @@ begin
         pLimitDupCS := sqlite3ExprDup(pParse^.db, p^.pLimit, 0);
       pPriorSel^.pLimit := pLimitDupCS;
 
+      { ExplainQueryPlan parent nodes (select.c:3001..3006).  When this is the
+        outermost compound term (pPrior^.pPrior = nil, i.e. the left arm is the
+        left-most leaf) push a "COMPOUND QUERY" node and a "LEFT-MOST SUBQUERY"
+        node so every arm's SCAN nests under the compound tree.  The push order
+        and the per-arm "UNION ALL" node + final pop mirror C exactly; the
+        emission self-gates on EXPLAIN QUERY PLAN mode inside sqlite3VdbeExplain. }
+      if pPriorSel^.pPrior = nil then
+      begin
+        sqlite3VdbeExplain(pParse, 1, 'COMPOUND QUERY', []);
+        sqlite3VdbeExplain(pParse, 1, 'LEFT-MOST SUBQUERY', []);
+      end;
+
       {$IFDEF SQLITE_DEBUG}
       { 10.1.42.a.1 — TREETRACE(0x200) "multiSelect UNION ALL left..."
         (select.c:3011).  Mask 0x200 traces compound-SELECT peer
@@ -35289,6 +35301,16 @@ begin
         sqlite3DebugPrintf('multiSelect UNION ALL left...'#10, []);
       {$ENDIF}
       rcSel := sqlite3Select(pParse, pPriorSel, pDest);
+
+      { Pop the "LEFT-MOST SUBQUERY" node so the "UNION ALL" pushed below
+        becomes its sibling under "COMPOUND QUERY" (not its child).  In C this
+        pop is performed by the left-arm's own sqlite3Select tail
+        (select.c:8962, unconditional ExplainQueryPlanPop); this port's
+        sqlite3Select has no such trailing pop, so it must be issued here.
+        Gate on the same condition that pushed LEFT-MOST (pPriorSel^.pPrior =
+        nil) so nested multi-arm compounds don't over-pop. }
+      if pPriorSel^.pPrior = nil then
+        sqlite3VdbeExplainPop(pParse);
 
       { Drop the duplicated LIMIT Expr (select.c:3013..3014). }
       if pPriorSel^.pLimit <> nil then
@@ -35312,6 +35334,10 @@ begin
                                 p^.iLimit, p^.iOffset + 1, p^.iOffset);
           end;
         end;
+        { ExplainQueryPlan((pParse, 1, "UNION ALL")) — select.c:3029.  Pushed
+          before recursing into the right arm so its SCAN nests under the
+          UNION ALL node. }
+        sqlite3VdbeExplain(pParse, 1, 'UNION ALL', []);
         {$IFDEF SQLITE_DEBUG}
         { 10.1.42.a.1 — TREETRACE(0x200) "multiSelect UNION ALL right..."
           (select.c:3030).  Pairs with the "left" breadcrumb; printed
@@ -35321,12 +35347,20 @@ begin
         {$ENDIF}
         rcSel := sqlite3Select(pParse, p, pDest);
         p^.pPrior := pPriorSel;
+        { Pop the "UNION ALL" node coded above.  In C this is done by the
+          right-arm's own sqlite3Select tail (select.c:8962); replicated here
+          because this port's sqlite3Select does not auto-pop. }
+        sqlite3VdbeExplainPop(pParse);
         if addrLimJmp <> 0 then
         begin
           vdbeUA := sqlite3GetVdbe(pParse);
           if vdbeUA <> nil then sqlite3VdbeJumpHere(vdbeUA, addrLimJmp);
         end;
       end;
+      { ExplainQueryPlanPop (select.c:3045..3048) — pop the "COMPOUND QUERY"
+        node once the right-most arm has been coded (p^.pNext = nil). }
+      if p^.pNext = nil then
+        sqlite3VdbeExplainPop(pParse);
       p^.selFlags         := savedFlagsP;
       pPriorSel^.selFlags := savedFlagsPP;
       Result := rcSel;
