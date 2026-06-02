@@ -961,7 +961,13 @@ begin
     goto opendb_out;
   end;
 
-  if (zFilename = nil) or (zFilename[0] = #0) then
+  { main.c:3559 — only a NULL filename defaults to ":memory:".  An empty
+    string "" must flow through to sqlite3ParseUri and become a temporary
+    on-disk database (matching sqlite3 db "" in the Tcl suite); treating ""
+    as NULL here wrongly opened it in memory, so cache spilling never
+    occurred and PRAGMA lock_status reported "unknown" instead of
+    "unlocked" (tempdb2-1.1). }
+  if zFilename = nil then
     zFilename := ':memory:';
 
   { Port of main.c:3560 — peel URI parameters (mode=, cache=, vfs=, ...)
