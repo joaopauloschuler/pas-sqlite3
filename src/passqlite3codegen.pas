@@ -72375,6 +72375,30 @@ begin
     constraint context (iSelfTab) forces re-evaluation per row. }
   if (not ExprHasProperty(pX, EP_VarSelect)) and (pParse^.iSelfTab = 0) then
   begin
+    { Reuse fast-path (expr.c:3638..3657) — when this IN expression has
+      already been materialised once (EP_Subrtn set, e.g. the WHERE
+      pre-loop hoist), the subroutine body laid down at pX^.y.sub.iAddr
+      remains valid for re-entry.  Re-running it requires a fresh cursor
+      (iTab here, distinct from pX^.iTable) opened as a duplicate of the
+      original eph table via OP_OpenDup, guarded by OP_Once + OP_Gosub so
+      the body only runs the first time.  Without this, a second coding of
+      the IN (e.g. the RIGHT/OUTER-JOIN "process unmatched rows" loop in
+      wherecode.c) would reuse the original eph cursor without restoring
+      its state → OP_Found/OP_NotFound on a stale cursor SIGSEGVs.
+      (findCompatibleInRhsSubrtn cross-expr matching is deferred; only the
+      same-expr EP_Subrtn reuse is honoured.) }
+    if ExprHasProperty(pX, EP_Subrtn) then
+    begin
+      addrOnce := sqlite3VdbeAddOp0(v, OP_Once);
+      Assert(iTab <> pX^.iTable);
+      sqlite3VdbeAddOp2(v, OP_Gosub, pX^.y.sub.regReturn, pX^.y.sub.iAddr);
+      sqlite3VdbeAddOp2(v, OP_OpenDup, iTab, pX^.iTable);
+      sqlite3VdbeJumpHere(v, addrOnce);
+      { C does NOT update pX^.iTable here — the original eph cursor stays
+        the OpenDup source so a third coding duplicates from the same root.
+        The caller reads the fresh cursor from *piTab (= iTab), not iTable. }
+      Exit;
+    end;
     ExprSetProperty(pX, EP_Subrtn);
     Inc(pParse^.nMem);
     pX^.y.sub.regReturn := pParse^.nMem;
@@ -72909,9 +72933,26 @@ begin
     body.  EP_Subrtn marks the expression as already-cached.  Honour the
     cache only when the caller's MEMBERSHIP / NOOP intent is satisfiable
     by the eph table — IN_INDEX_LOOP (multi-pass index lookup) needs a
-    fresh allocation per call so it falls through. }
+    fresh allocation per call so it falls through.
+
+    This early-out is a port artefact: this engine pre-hoists list-IN RHS
+    materialisation in the sqlite3WhereBegin pre-loop (DoInRhsHoist), so a
+    plain `WHERE a IN (...)` codes CodeRhsOfIN once at hoist time and the
+    per-row residual test re-enters here.  C (expr.c:3230..3451) codes the
+    IN exactly once and has no such early-out — so for the ordinary
+    in-place reuse we must NOT re-emit anything (the hoisted cursor is
+    still positioned), matching C's single-coding op stream.
+
+    EXCEPTION: when withinRJSubrtn>0 we are coding the duplicated WHERE of
+    the RIGHT/OUTER-JOIN "process unmatched rows" subroutine
+    (sqlite3WhereRightJoinLoop). There the outer-loop OP_NullRow has moved
+    the original eph cursor off its rows, so reuse-in-place would SIGSEGV
+    on OP_Found/OP_NotFound. Fall through so the EPH arm allocates a fresh
+    cursor and CodeRhsOfIN's reuse fast-path re-primes it via
+    OP_Once/OP_Gosub/OP_OpenDup — exactly the C layout (expr.c:3638..3657,
+    reached because sqlite3ExprDup preserves EP_Subrtn + y.sub). }
   if ExprHasProperty(pX, EP_Subrtn) and ((inFlags and IN_INDEX_LOOP) = 0)
-     and (pX^.iTable > 0) then
+     and (pX^.iTable > 0) and (pParse^.withinRJSubrtn = 0) then
   begin
     piTab^ := pX^.iTable;
     if aiMap <> nil then
