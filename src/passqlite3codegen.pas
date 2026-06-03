@@ -61191,6 +61191,35 @@ begin
     Exit;
   end;
 
+  { PragTyp_MMAP_SIZE — pragma.c:951..978.  Both the read form and the
+    write form fall through to returnSingleInt(v, sz).  The Pas port does
+    not wire SQLITE_FCNTL_MMAP_SIZE so the effective mmap size is always 0
+    (mmap I/O is not implemented), matching the C SQLITE_MAX_MMAP_SIZE<=0
+    branch (sz=0).  The write form still runs the state-update side
+    (db->szMmap + sqlite3BtreeSetMmapLimit) faithfully, then emits the row.
+    Prior bug: only the read form (pValue=nil) emitted a result row, so
+    `PRAGMA mmap_size = N` produced an empty result instead of {0}
+    (sort5-1.0). }
+  if SameText(zName, 'mmap_size') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma) <> 0 then
+        iValPragma := 0;
+      if iValPragma < 0 then
+        iValPragma := sqlite3GlobalConfig.szMmap;
+      if pId2^.n = 0 then
+        db^.szMmap := iValPragma;
+      for i := db^.nDb - 1 downto 0 do begin
+        if (db^.aDb[i].pBt <> nil) and ((i = iDb) or (pId2^.n = 0)) then
+          sqlite3BtreeSetMmapLimit(db^.aDb[i].pBt, iValPragma);
+      end;
+    end;
+    sqlite3VdbeAddOp2(v, OP_Integer,   0, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -61202,8 +61231,7 @@ begin
     else if SameText(zName, 'threads')            then iVal := 0
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
-    else if SameText(zName, 'analysis_limit')     then iVal := 0
-    else if SameText(zName, 'mmap_size')          then iVal := 0;
+    else if SameText(zName, 'analysis_limit')     then iVal := 0;
     if iVal <> MaxInt then begin
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
