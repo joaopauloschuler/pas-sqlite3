@@ -28216,7 +28216,8 @@ begin
 
     { Iteration opcode. }
     if ((pLoop^.wsFlags and WHERE_ONEROW) <> 0)
-       or ((pLevel^.u.in_nIn <> 0) and (whereLoopIsOneRow(pLoop) <> 0)) then
+       or ((pLevel^.u.in_nIn <> 0) and (regBignull = 0)
+           and (whereLoopIsOneRow(pLoop) <> 0)) then
       pLevel^.op := OP_Noop
     else if bRev <> 0 then
       pLevel^.op := OP_Prev
