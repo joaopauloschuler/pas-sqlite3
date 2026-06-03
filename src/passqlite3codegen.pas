@@ -31362,6 +31362,81 @@ begin
   Result := (items_[j].fg.eBits and u8($03)) = u8(ENAME_ROWID);
 end;
 
+{ NestedFromColBaseName — return the real (un-mangled) base column name
+  projected by pEList entry j of an SF_NestedFrom wrapper, descending through
+  inner wrappers to the originating leaf table/IPK.  sqlite3ColumnsFromExprList
+  mangles duplicate synthetic column names ("a" -> "a:1"), so the wrapper's own
+  pSTab->aCol[j].zCnName cannot be used to detect a genuine same-name collision;
+  this follows the TK_COLUMN chain down to the leaf and reads its real name.
+  Mirror of the lookupName-local WrapperEntryBaseName helper (codegen.pas
+  ~12328), hoisted to file scope for expandStar's duplicate-name check. }
+function NestedFromColBaseName(pWrap: PSrcItem; j: i32): PAnsiChar;
+var
+  pSel:    PSelect;
+  pELst:   PExprList;
+  items_:  PExprListItem;
+  pE2:     PExpr;
+  pInnerS: PSrcList;
+  pRef:    PSrcItem;
+  k:       i32;
+  iInnerCol: i32;
+begin
+  Result := nil;
+  if (pWrap = nil) or (pWrap^.u4.pSubq = nil) then Exit;
+  pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+  if pSel = nil then Exit;
+  pELst   := pSel^.pEList;
+  pInnerS := pSel^.pSrc;
+  if (pELst = nil) or (pInnerS = nil) then Exit;
+  if (j < 0) or (j >= pELst^.nExpr) then Exit;
+  items_ := ExprListItems(pELst);
+  pE2 := items_[j].pExpr;
+  if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Exit;
+  pRef := nil;
+  for k := 0 to pInnerS^.nSrc - 1 do
+  begin
+    pRef := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+    if pRef^.iCursor = pE2^.iTable then Break;
+    pRef := nil;
+  end;
+  if pRef = nil then Exit;
+  iInnerCol := pE2^.iColumn;
+  if (pRef^.fg.fgBits2 and $40) = 0 then  { leaf table }
+  begin
+    if pRef^.pSTab = nil then Exit;
+    if (iInnerCol >= 0) and (iInnerCol < pRef^.pSTab^.nCol) then
+      Result := PColumn(PByte(pRef^.pSTab^.aCol) +
+                  iInnerCol * SizeOf(TColumn))^.zCnName
+    else if (iInnerCol < 0) and (pRef^.pSTab^.iPKey >= 0) then
+      Result := PColumn(PByte(pRef^.pSTab^.aCol) +
+                  pRef^.pSTab^.iPKey * SizeOf(TColumn))^.zCnName;
+  end
+  else
+    Result := NestedFromColBaseName(pRef, iInnerCol);  { inner wrapper }
+end;
+
+{ NestedFromColNoExpand — is pEList entry j of an SF_NestedFrom wrapper tagged
+  bNoExpand (eBits2 bit 0)?  expandStar sets this on USING/NATURAL-coalesced
+  duplicate columns (select.c:6300..6306).  Such columns must NOT participate in
+  the duplicate-name ambiguity check, because a USING-coalesced join exposes the
+  shared column exactly once. }
+function NestedFromColNoExpand(pWrap: PSrcItem; j: i32): Boolean;
+var
+  pSel:   PSelect;
+  pELst:  PExprList;
+  items_: PExprListItem;
+begin
+  Result := False;
+  if (pWrap = nil) or (pWrap^.u4.pSubq = nil) then Exit;
+  pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+  if pSel = nil then Exit;
+  pELst := pSel^.pEList;
+  if pELst = nil then Exit;
+  if (j < 0) or (j >= pELst^.nExpr) then Exit;
+  items_ := ExprListItems(pELst);
+  Result := (items_[j].fg.eBits2 and u8($01)) <> 0;
+end;
+
 { inAnyUsingClause — port of select.c:5917..5930.  Returns True if zName
   appears in the USING() IdList of any of the N SrcItems FOLLOWING pBase
   (pBase[1] .. pBase[N]).  Used by expandStar to decide whether a join
@@ -31434,6 +31509,10 @@ var
   anyNestedMatch:  Boolean;
   pDotLeft:  PExpr;
   pDotRight: PExpr;
+  jj, kk:    i32;
+  zBaseJ:    PAnsiChar;
+  zBaseK:    PAnsiChar;
+  nWrapCol:  i32;
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
@@ -31540,6 +31619,44 @@ begin
         if not anyNestedMatch then Continue;
       end;
       tableSeen := True;
+
+      { join-26.1 — a parenthesised join given an alias becomes an
+        SF_NestedFrom wrapper (e.g. `(t5 JOIN t6) t7`).  When the parent `*`
+        re-expands such a wrapper, C emits one column reference per wrapper
+        result column, each carrying the ORIGINAL (un-mangled) base name; for a
+        non-coalesced join (plain/CROSS) two leaves sharing column `a` yield two
+        references that name-resolve to the same `a`, which lookupName reports
+        as "ambiguous column name: a" (resolve.c:367..414 + 784).  This port
+        builds bound TK_COLUMN nodes directly, bypassing that resolution, so it
+        otherwise mangles the duplicate to `a:1` and silently succeeds.  Detect
+        the collision here: if two emitted (non-rowid, non-bNoExpand) wrapper
+        result columns share a base name, raise the same error.  USING/NATURAL
+        joins coalesce the shared column (bNoExpand on the right side), so they
+        expose it once and are correctly accepted. }
+      if isNestedWrap and (zTName = nil) and (not InRenameObject(pParse)) then
+      begin
+        nWrapCol := pTab^.nCol;
+        for jj := 0 to nWrapCol - 1 do
+        begin
+          if NestedFromColIsRowid(pItem, jj) then Continue;
+          if NestedFromColNoExpand(pItem, jj) then Continue;
+          zBaseJ := NestedFromColBaseName(pItem, jj);
+          if zBaseJ = nil then Continue;
+          for kk := 0 to jj - 1 do
+          begin
+            if NestedFromColIsRowid(pItem, kk) then Continue;
+            if NestedFromColNoExpand(pItem, kk) then Continue;
+            zBaseK := NestedFromColBaseName(pItem, kk);
+            if zBaseK = nil then Continue;
+            if sqlite3StrICmp(zBaseJ, zBaseK) = 0 then
+            begin
+              sqlite3ErrorMsg(pParse,
+                PAnsiChar('ambiguous column name: ' + AnsiString(zBaseJ)));
+              Exit;
+            end;
+          end;
+        end;
+      end;
 
       { select.c:6184..6205 — under SF_NestedFrom, if the NEXT FROM item
         carries a USING clause, emit one synthetic TK_ID per USING column
