@@ -10917,6 +10917,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
 
   procedure ResolveOuterIDs(pW: PExpr; pOuterSrc: PSrcList;
                             pInnerSrc: PSrcList); forward;
+  procedure WalkDeepFromSubqueries(pSel: PSelect; pOuterSrc: PSrcList); forward;
 
   { select1-6.22 — a bare-column ORDER BY term on a COMPOUND subquery hangs
     off the top-most arm but resolves against the result-set of ANY arm of
@@ -11078,6 +11079,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                         pOuterSrc, pInner^.pSrc);
         ResolveOuterIDsInList(pInner^.pGroupBy,
                               pOuterSrc, pInner^.pSrc);
+        { select1-18.3 / with2-10.1 — this scalar / IN-RHS subquery may itself
+          have FROM-subqueries whose interiors carry a bare outer reference to
+          the OUTERmost pSrc (e.g. `c` two FROM-subquery levels down inside a
+          chain of correlated scalar subqueries).  ResolveOuterIDs only walks
+          pInner's own clauses; descend into pInner's FROM-subqueries here so
+          the outermost column reference is pre-bound, mirroring C's lookupName
+          pNC->pNext climb to arbitrary depth across FROM-subquery levels. }
+        WalkDeepFromSubqueries(pInner, pOuterSrc);
         pInner := pInner^.pPrior;
       end;
       ResolveOuterIDsInCompoundOrderBy(pW^.x.pSelect^.pOrderBy,
@@ -11121,28 +11130,112 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     This pre-resolution runs against the OUTER p^.pEList before the inner
     per-Select resolver; it only fires for bare TK_IDs that bind neither in
     the inner FROM nor the outer FROM, so it cannot mask a real column. }
-  procedure ResolveOuterAliasIDs(pW: PExpr; pOuterSrc, pInnerSrc: PSrcList;
-                                 pOuterEList: PExprList); forward;
+  procedure ResolveOuterAliasIDsDepth(pW: PExpr; pInnerSrc: PSrcList;
+             pOuterEList: PExprList; nSub: i32); forward;
+  procedure WalkAliasDeepFromSubqueries(pSel: PSelect; pOuterEList: PExprList;
+             nSub: i32); forward;
 
-  procedure ResolveOuterAliasIDsInList(pList: PExprList;
-             pOuterSrc, pInnerSrc: PSrcList; pOuterEList: PExprList);
+  procedure ResolveOuterAliasIDsInListDepth(pList: PExprList;
+             pInnerSrc: PSrcList; pOuterEList: PExprList; nSub: i32);
   var k_: i32;
   begin
     if pList = nil then Exit;
     for k_ := 0 to pList^.nExpr - 1 do
-      ResolveOuterAliasIDs(ExprListItems(pList)[k_].pExpr,
-                           pOuterSrc, pInnerSrc, pOuterEList);
+      ResolveOuterAliasIDsDepth(ExprListItems(pList)[k_].pExpr,
+                                pInnerSrc, pOuterEList, nSub);
   end;
 
+  { Public entry points used by the top-level subquery-prep block keep the
+    original signature (nSubquery=1, the inner subquery is one level out from
+    the matched alias).  pOuterSrc is no longer consulted for the FROM-column
+    short-circuit (ResolveOuterIDs owns outer-FROM binding) so it is ignored
+    here; the alias scan only needs the inner scope + the outer pEList. }
   procedure ResolveOuterAliasIDs(pW: PExpr; pOuterSrc, pInnerSrc: PSrcList;
                                  pOuterEList: PExprList);
+  begin
+    ResolveOuterAliasIDsDepth(pW, pInnerSrc, pOuterEList, 1);
+  end;
+
+  procedure ResolveOuterAliasIDsInList(pList: PExprList;
+             pOuterSrc, pInnerSrc: PSrcList; pOuterEList: PExprList);
+  begin
+    ResolveOuterAliasIDsInListDepth(pList, pInnerSrc, pOuterEList, 1);
+  end;
+
+  { Descend into every clause / CTE body / FROM-subquery of pSel, scanning for
+    bare TK_IDs that bind to the OUTER result-set alias pOuterEList.  nSub is
+    the subquery distance from pSel's clauses up to pOuterEList (>=1).  Mirrors
+    the lookupName pNC->pNext climb (resolve.c:658..698) that increments
+    nSubquery per NameContext level: an outer result alias is visible from
+    arbitrarily-deep correlated subqueries / CTE bodies. }
+  procedure WalkAliasDeepFromSubqueries(pSel: PSelect; pOuterEList: PExprList;
+             nSub: i32);
   var
-    pInItem, pOutItem: PSrcItem;
-    iInCol, iOutCol:   i32;
+    pWth_:  PWith;
+    pBase_: PCte;
+    pBody_: PSelect;
+    base_d: PSrcItem;
+    pIt_d:  PSrcItem;
+    iC_, j_d: i32;
+    pDeep_: PSelect;
+  begin
+    if (pSel = nil) or (pOuterEList = nil) then Exit;
+    { Sibling/nested CTE bodies of pSel's own WITH clause (e.g. with2-10.1's
+      `WITH t1(a) AS (VALUES(c))`, where c is the outer alias). }
+    pWth_ := pSel^.pWith;
+    if (pWth_ <> nil) and (pWth_^.nCte > 0) then
+    begin
+      pBase_ := PCte(PByte(pWth_) + SZ_WITH_HEADER);
+      for iC_ := 0 to pWth_^.nCte - 1 do
+      begin
+        pBody_ := pBase_[iC_].pSelect;
+        while pBody_ <> nil do
+        begin
+          if (pBody_^.selFlags and SF_HasTypeInfo) = 0 then
+          begin
+            ResolveOuterAliasIDsInListDepth(pBody_^.pEList,   pBody_^.pSrc, pOuterEList, nSub);
+            ResolveOuterAliasIDsDepth(pBody_^.pWhere,         pBody_^.pSrc, pOuterEList, nSub);
+            ResolveOuterAliasIDsDepth(pBody_^.pHaving,        pBody_^.pSrc, pOuterEList, nSub);
+            ResolveOuterAliasIDsInListDepth(pBody_^.pGroupBy, pBody_^.pSrc, pOuterEList, nSub);
+            ResolveOuterAliasIDsInListDepth(pBody_^.pOrderBy, pBody_^.pSrc, pOuterEList, nSub);
+            WalkAliasDeepFromSubqueries(pBody_, pOuterEList, nSub);
+          end;
+          pBody_ := pBody_^.pPrior;
+        end;
+      end;
+    end;
+    { FROM-subqueries of pSel: one level deeper, so nSub+1. }
+    if pSel^.pSrc = nil then Exit;
+    base_d := SrcListItems(pSel^.pSrc);
+    for j_d := 0 to pSel^.pSrc^.nSrc - 1 do
+    begin
+      pIt_d := PSrcItem(PByte(base_d) + j_d * SizeOf(TSrcItem));
+      if (pIt_d^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
+      if pIt_d^.u4.pSubq = nil then Continue;
+      pDeep_ := pIt_d^.u4.pSubq^.pSelect;
+      while pDeep_ <> nil do
+      begin
+        ResolveOuterAliasIDsInListDepth(pDeep_^.pEList,   pDeep_^.pSrc, pOuterEList, nSub + 1);
+        ResolveOuterAliasIDsDepth(pDeep_^.pWhere,         pDeep_^.pSrc, pOuterEList, nSub + 1);
+        ResolveOuterAliasIDsDepth(pDeep_^.pHaving,        pDeep_^.pSrc, pOuterEList, nSub + 1);
+        ResolveOuterAliasIDsInListDepth(pDeep_^.pGroupBy, pDeep_^.pSrc, pOuterEList, nSub + 1);
+        ResolveOuterAliasIDsInListDepth(pDeep_^.pOrderBy, pDeep_^.pSrc, pOuterEList, nSub + 1);
+        WalkAliasDeepFromSubqueries(pDeep_, pOuterEList, nSub + 1);
+        pDeep_ := pDeep_^.pPrior;
+      end;
+    end;
+  end;
+
+  procedure ResolveOuterAliasIDsDepth(pW: PExpr; pInnerSrc: PSrcList;
+             pOuterEList: PExprList; nSub: i32);
+  var
+    pInItem:           PSrcItem;
+    iInCol:            i32;
     j_:                i32;
     itemsE:            PExprListItem;
     pOrig:             PExpr;
     zAs:               PAnsiChar;
+    pSub_:             PSelect;
   begin
     if pW = nil then Exit;
     if pW^.op = TK_ID then
@@ -11151,7 +11244,6 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if (pW^.flags and EP_IntValue) <> 0 then Exit;
       { Inner scope wins; an outer FROM column is handled by ResolveOuterIDs. }
       if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
-      if ColumnInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutCol) then Exit;
       { resolve.c:664..698 — scan outer NC_UEList pEList for an ENAME_NAME
         alias match. }
       itemsE := ExprListItems(pOuterEList);
@@ -11169,8 +11261,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             sqlite3ErrorMsg(pParse, 'row value misused');
             Exit;
           end;
-          { nSubquery=1: the alias is one subquery level out from pW. }
-          resolveAlias(pParse, pOuterEList, j_, pW, 1);
+          { nSub = subquery levels from pW up to the alias's NameContext. }
+          resolveAlias(pParse, pOuterEList, j_, pW, nSub);
           Exit;
         end;
       end;
@@ -11178,10 +11270,31 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
     if pW^.op = TK_DOT then Exit;
     if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
-    ResolveOuterAliasIDs(pW^.pLeft,  pOuterSrc, pInnerSrc, pOuterEList);
-    ResolveOuterAliasIDs(pW^.pRight, pOuterSrc, pInnerSrc, pOuterEList);
+    ResolveOuterAliasIDsDepth(pW^.pLeft,  pInnerSrc, pOuterEList, nSub);
+    ResolveOuterAliasIDsDepth(pW^.pRight, pInnerSrc, pOuterEList, nSub);
     if (pW^.flags and EP_xIsSelect) = 0 then
-      ResolveOuterAliasIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc, pOuterEList);
+      ResolveOuterAliasIDsInListDepth(pW^.x.pList, pInnerSrc, pOuterEList, nSub)
+    else if pW^.x.pSelect <> nil then
+    begin
+      { with2-10.1 — the alias may be referenced inside a nested correlated
+        subquery / its CTE body, one subquery level deeper.  Descend into the
+        subquery's own clauses (against its own pSrc) and CTE bodies / FROM-
+        subqueries, incrementing nSub.  Mirrors the per-level pNC->pNext climb. }
+      pSub_ := pW^.x.pSelect;
+      while pSub_ <> nil do
+      begin
+        if (pSub_^.selFlags and SF_HasTypeInfo) = 0 then
+        begin
+          ResolveOuterAliasIDsInListDepth(pSub_^.pEList,   pSub_^.pSrc, pOuterEList, nSub + 1);
+          ResolveOuterAliasIDsDepth(pSub_^.pWhere,         pSub_^.pSrc, pOuterEList, nSub + 1);
+          ResolveOuterAliasIDsDepth(pSub_^.pHaving,        pSub_^.pSrc, pOuterEList, nSub + 1);
+          ResolveOuterAliasIDsInListDepth(pSub_^.pGroupBy, pSub_^.pSrc, pOuterEList, nSub + 1);
+          ResolveOuterAliasIDsInListDepth(pSub_^.pOrderBy, pSub_^.pSrc, pOuterEList, nSub + 1);
+          WalkAliasDeepFromSubqueries(pSub_, pOuterEList, nSub + 1);
+        end;
+        pSub_ := pSub_^.pPrior;
+      end;
+    end;
   end;
 
   { 9.4.divbug.87.019 — recursive deep walk of FROM-subquery interiors.
@@ -11190,8 +11303,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     and bare TK_ID outer refs (e.g. having-5.2's `Col0` two levels deep)
     get pre-resolved before the inner per-Select resolver runs.  Mirrors
     resolve.c's NameContext-chain walk (lookupName resolve.c:341..706)
-    which climbs pNC->pNext to arbitrary depth. }
-  procedure WalkDeepFromSubqueries(pSel: PSelect; pOuterSrc: PSrcList); forward;
+    which climbs pNC->pNext to arbitrary depth.  (Forward-declared earlier,
+    alongside ResolveOuterIDs, so the scalar/IN-RHS subquery recursion can
+    descend into FROM-subqueries.) }
 
   { with2-10.1 / with3-4.0 / with3-4.2 — pre-bind outer-column references that
     live inside a CTE body.  resolveFromTermToCte (codegen.pas:30544) preps
