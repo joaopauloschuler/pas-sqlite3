@@ -37137,11 +37137,31 @@ begin
     if (pSubSel^.pGroupBy = nil)
        and (not exprListHasAggFunc(pSubSel^.pEList)) then
       pSubSel^.selFlags := pSubSel^.selFlags and (not u32(SF_Aggregate));
+    { CO-ROUTINE (subquery-N) EQP narrator — values-15.4/16.3/16.5/16.7.
+      sqlite3WindowRewrite wraps the original FROM in a single-source
+      subquery; C codes that FROM term as a co-routine via
+      fromClauseTermCanBeCoroutine (select.c:8043..8062, which for the
+      i==0/nSrc==1 uncorrelated case returns 1) and emits
+      ExplainQueryPlan(pParse,1,"CO-ROUTINE %!S") before recursing.  This
+      Pas port materialises the rewritten subquery into an eph table
+      instead of running a true coroutine, but the EQP tree must still
+      carry the CO-ROUTINE node so the inner SCAN (SCAN CONSTANT ROW /
+      SCAN t1) nests under it — matching the C oracle's plan exactly.
+      Push the explain node (saving/restoring pParse^.addrExplain) only
+      around the inner recursion so the consumer-side `SCAN (subquery-N)`
+      emitted later by sqlite3WhereBegin stays a sibling, not a child.
+      Mirrors the recursive-CTE narrator at codegen.pas:~39516. }
+    ctAddrExplain := pParse^.addrExplain;
+    if ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+       and OptimizationEnabled(pParse^.db, SQLITE_Coroutines) then
+      sqlite3VdbeExplain(pParse, 1, 'CO-ROUTINE %!S', [Pointer(pItem)]);
     if sqlite3Select(pParse, pSubSel, @innerDest) <> SQLITE_OK then
     begin
+      pParse^.addrExplain := ctAddrExplain;
       pSubSel^.selFlags := selFlagsSavedW;
       Result := SQLITE_ERROR; Exit;
     end;
+    pParse^.addrExplain := ctAddrExplain;
     pSubSel^.selFlags := selFlagsSavedW;
 
     sqlite3WindowCodeInit(pParse, p);
