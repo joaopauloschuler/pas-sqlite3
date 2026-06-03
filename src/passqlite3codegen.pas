@@ -3054,6 +3054,9 @@ type
     sqlite3WalDefaultHook pointer into PragTyp_WAL_AUTOCHECKPOINT without
     circular uses.  Both must be installed by passqlite3main at unit init. }
   TWalAutoCheckpointFn = function(db: PTsqlite3; nFrame: i32): i32;
+  { PRAGMA shrink_memory (pragma.c:2439..2442) calls sqlite3_db_release_memory,
+    which lives in passqlite3main (circular uses).  Wired at unit init. }
+  TDbReleaseMemoryFn = function(db: PTsqlite3): i32; cdecl;
   { 9.4.divbug.88.068.a — wire sqlite3_file_control so sqlite3Pragma can
     dispatch unknown pragmas to the VFS via SQLITE_FCNTL_PRAGMA (port of
     pragma.c:475..511).  Installed by passqlite3main at unit init. }
@@ -3089,6 +3092,7 @@ var
   gSqlite3Init:      TSqlite3InitFn;
   gBusyTimeout:      TBusyTimeoutFn;
   gWalAutoCheckpoint: TWalAutoCheckpointFn;
+  gDbReleaseMemory:  TDbReleaseMemoryFn;
   gWalDefaultHook:   Pointer;
   gFileControl:      TFileControlFn;
   gOverloadFunction: TOverloadFunctionFn;
@@ -61179,6 +61183,14 @@ begin
     Exit;
   end;
 
+  { PragTyp_SHRINK_MEMORY — pragma.c:2439..2442.  Just calls
+    sqlite3_db_release_memory(db); emits no result row. }
+  if SameText(zName, 'shrink_memory') then begin
+    if Assigned(gDbReleaseMemory) then
+      gDbReleaseMemory(db);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -61191,10 +61203,6 @@ begin
     else if SameText(zName, 'soft_heap_limit')    then iVal := 0
     else if SameText(zName, 'hard_heap_limit')    then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0
-    { pragma.c:951..978 PragTyp_MMAP_SIZE — when SQLITE_MAX_MMAP_SIZE<=0
-      sz=0 and returnSingleInt(v, 0).  The Pas port does not yet wire
-      sqlite3_file_control(SQLITE_FCNTL_MMAP_SIZE) so default to 0,
-      matching the disabled-mmap C reference (Phase 9.1.divbug.2). }
     else if SameText(zName, 'mmap_size')          then iVal := 0;
     if iVal <> MaxInt then begin
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);

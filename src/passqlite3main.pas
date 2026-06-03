@@ -6430,6 +6430,9 @@ initialization
   passqlite3codegen.gWalAutoCheckpoint :=
     passqlite3codegen.TWalAutoCheckpointFn(@sqlite3_wal_autocheckpoint);
   passqlite3codegen.gWalDefaultHook := @sqlite3WalDefaultHook;
+  { PRAGMA shrink_memory (pragma.c:2439..2442) -> sqlite3_db_release_memory. }
+  passqlite3codegen.gDbReleaseMemory :=
+    passqlite3codegen.TDbReleaseMemoryFn(@sqlite3_db_release_memory);
   { Wire sqlite3_overload_function so sqlite3RegisterPerConnectionBuiltinFunctions
     (codegen.pas, func.c:2331) can register the per-connection MATCH placeholder
     at connection open.  Lives here to avoid a circular codegen->main uses. }

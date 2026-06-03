@@ -4641,6 +4641,28 @@ begin
   if clientData = nil then ;
 end;
 
+{ test1.c:6359..6381 — sqlite3_db_release_memory DB. }
+function tcl_test_db_release_memory(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:  PTsqlite3;
+  rc:  cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_db_release_memory(db);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:7372..7433 — sqlite3_limit DB ID VALUE. }
 function tcl_test_limit(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
@@ -9016,6 +9038,8 @@ begin
     @tcl_test_status, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_release_memory'),
     @tcl_test_release_memory, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_db_release_memory'),
+    @tcl_test_db_release_memory, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_limit'),
     @tcl_test_limit, nil, nil);
   { 9.4.divbug.62.d — sqlite3_db_status / _soft_heap_limit[64] /
