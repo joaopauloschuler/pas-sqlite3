@@ -32401,8 +32401,21 @@ begin
     into the SELECT's WHERE.  Skipping this pass is what previously caused
     NATURAL JOIN to degenerate into a cross join (rows unfiltered) and JOIN
     USING(col) to access-violate at codegen time. }
-  if (pCur <> nil) and (pCur^.pSrc <> nil) then
+  { select.c:6094..6100 — sqlite3ProcessJoin runs EXACTLY ONCE per Select
+    node.  C guarantees this because selectExpander prunes on SF_Expanded
+    (set early in the same pass) and ProcessJoin is invoked once from
+    sqlite3Select.  This port folds ProcessJoin into the expander, so when
+    the same Select is re-expanded (e.g. a trigger-body subquery reached via
+    two prep paths before SF_HasTypeInfo is set), the NATURAL->USING
+    synthesis would re-run: the second pass sees isUsing already set and
+    wrongly raises "a NATURAL join may not have an ON or USING clause"
+    (in7-4.0), and the USING->WHERE emission would double the EQ predicates.
+    Mark pCur with SF_Expanded after processing and skip the whole join pass
+    if it is already set — the faithful equivalent of C's SF_Expanded prune. }
+  if (pCur <> nil) and (pCur^.pSrc <> nil)
+     and ((pCur^.selFlags and SF_Expanded) = 0) then
   begin
+    pCur^.selFlags := pCur^.selFlags or SF_Expanded;
     pSrc := pCur^.pSrc;
     base := SrcListItems(pSrc);
     for i := 0 to pSrc^.nSrc - 1 do
