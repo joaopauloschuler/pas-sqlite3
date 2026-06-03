@@ -13446,10 +13446,13 @@ begin
       aMem[pOp^.p1+1]; the remaining-error counter is decremented in
       aMem[pOp^.p1] by (nErr-1). }
     OP_IntegrityCk: begin
-      icRoot := PPgno(pOp^.p4.ai);
       icnRoot := pOp^.p2;
+      { aRoot[0] holds the count; the roots are aRoot[1..nRoot].  Pass
+        &aRoot[1] to sqlite3BtreeIntegrityCheck (vdbe.c:7284). }
+      icRoot := @PPgno(pOp^.p4.ai)[1];
       Assert(icnRoot > 0);
-      Assert(icRoot <> nil);
+      Assert(PPgno(pOp^.p4.ai) <> nil);
+      Assert(PPgno(pOp^.p4.ai)[0] = Pgno(icnRoot));
       icpnErr := @aMem[pOp^.p1];
       icpzOut := nil;
       icnErr  := 0;

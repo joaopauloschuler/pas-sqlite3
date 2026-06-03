@@ -61298,32 +61298,23 @@ begin
       end;
       if cntIc = 0 then Continue;
 
-      { Allocate the P4_INTARRAY.  Pascal OP_IntegrityCk arm passes the
-        base pointer directly to sqlite3BtreeIntegrityCheck (vdbe.pas:
-        10727), unlike C VDBE which passes &aRoot[1].  So we lay out
-        the array as plain [root0..rootN-1] with no leading count
-        sentinel — btree.pas then sees aRoot[0]=firstRoot (non-zero,
-        bPartial=0) which matches a full check.
-
-        divbug.71.b: when pObjTab restricts the walk to one table, we
-        must signal a "partial" check so btree.pas does not flag the
-        unlisted rootpages as "never used".  C does this by prepending
-        an aRoot[0]==0 sentinel (pragma.c:1763, btree.c:11148..11151);
-        we do the same here — alloc cnt+1 cells, write 0 at index 0,
-        fill roots from index 1, and pass nRoot=cnt+1 to OP_IntegrityCk.
-        Lifetime is owned by the VDBE via P4_INTARRAY. }
-      if pObjTabIc <> nil then
-        aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc + 1)))
-      else
-        aRootIc := PPgno(sqlite3DbMallocZero(db, u64(SizeOf(Pgno)) * u64(cntIc)));
+      { Allocate the P4_INTARRAY exactly as C (pragma.c:1762..1775):
+        cnt+1 cells where aRoot[0] holds the COUNT and aRoot[1..cnt]
+        hold the root page numbers.  For a partial check (pObjTab set)
+        the first root element (index 1) is the 0 sentinel
+        (if(pObjTab) aRoot[++cnt]=0;), counted in cnt; the VDBE passes
+        &aRoot[1] to sqlite3BtreeIntegrityCheck so btree.pas sees
+        aRoot[0]==0 → bPartial=1 (btree.c:11148..11151).  displayP4
+        renders ai[1..ai[0]] (vdbeaux.c:1987).  Lifetime owned by the
+        VDBE via P4_INTARRAY. }
+      aRootIc := PPgno(sqlite3DbMallocRawNN(db, u64(SizeOf(Pgno)) * u64(cntIc + 1)));
       if aRootIc = nil then Break;
+      cntIc := 0;
       if pObjTabIc <> nil then
       begin
-        aRootIc[0] := 0;
-        cntIc := 1;     { fill subsequent roots starting at index 1 }
-      end
-      else
-        cntIc := 0;
+        Inc(cntIc);
+        aRootIc[cntIc] := 0;   { if(pObjTab) aRoot[++cnt]=0; }
+      end;
       xIc := pTblsIc^.first;
       while xIc <> nil do
       begin
@@ -61333,19 +61324,20 @@ begin
         begin
           if HasRowid(pTabIc) then
           begin
-            aRootIc[cntIc] := Pgno(pTabIc^.tnum);
             Inc(cntIc);
+            aRootIc[cntIc] := Pgno(pTabIc^.tnum);
           end;
           pIdxIc := pTabIc^.pIndex;
           while pIdxIc <> nil do
           begin
-            aRootIc[cntIc] := Pgno(pIdxIc^.tnum);
             Inc(cntIc);
+            aRootIc[cntIc] := Pgno(pIdxIc^.tnum);
             pIdxIc := pIdxIc^.pNext;
           end;
         end;
         xIc := xIc^.next;
       end;
+      aRootIc[0] := Pgno(cntIc);   { aRoot[0] = cnt; }
 
       { pragma.c:1777..1779 — make room for per-tree row-count regs
         starting at reg 8.  Even though our slice does not emit the
