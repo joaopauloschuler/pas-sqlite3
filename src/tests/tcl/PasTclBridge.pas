@@ -250,6 +250,7 @@ function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): 
 { String-arg accessors — used by the old-style argc/argv handlers in
   test1.c (sqlite3_mprintf_int etc.). }
 function Tcl_GetInt(interp: PTclInterp; src: PAnsiChar; intPtr: pcint): cint; cdecl; external 'tcl8.6';
+function Tcl_GetBoolean(interp: PTclInterp; src: PAnsiChar; boolPtr: pcint): cint; cdecl; external 'tcl8.6';
 function Tcl_GetDouble(interp: PTclInterp; src: PAnsiChar; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
 function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';
 function Tcl_GetDoubleFromObj(interp: PTclInterp; objPtr: PTclObj; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';

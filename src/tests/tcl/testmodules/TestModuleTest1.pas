@@ -2002,6 +2002,300 @@ begin
   Result := TCL_OK;
 end;
 
+{ test3.c:25..28 — a bogus sqlite3 connection used by the [btree_open]
+  family.  Only pVfs and mutex are ever touched. }
+var
+  t3_sDb: Tsqlite3;
+  t3_nRefSqlite3: cint = 0;
+
+{ Render a pointer as test3.c does (sqlite3_snprintf "%p") and append it
+  to the interp result.  Mirrors btree_from_db's 0x-hex formatting. }
+procedure t3AppendPtr(interp: PTclInterp; p: Pointer);
+var
+  s:    AnsiString;
+  zBuf: array[0..99] of AnsiChar;
+begin
+  s := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+end;
+
+{ test3.c:30..77 — btree_open FILENAME NCACHE.  Open a new database at the
+  raw b-tree level against the bogus sDb connection. }
+function btree_open(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt:       PBtree;
+  rc:        cint;
+  nCache:    cint;
+  n:         cint;
+  zFilename: PAnsiChar;
+begin
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' FILENAME NCACHE FLAGS"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetInt(interp, argv[2], @nCache) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  Inc(t3_nRefSqlite3);
+  if t3_nRefSqlite3 = 1 then
+  begin
+    t3_sDb.pVfs := sqlite3_vfs_find(nil);
+    t3_sDb.mutex := sqlite3MutexAlloc(SQLITE_MUTEX_RECURSIVE);
+    sqlite3_mutex_enter(t3_sDb.mutex);
+  end;
+  n := StrLen(argv[1]);
+  zFilename := sqlite3_malloc(n + 2);
+  if zFilename = nil then begin Result := TCL_ERROR; Exit; end;
+  Move(argv[1]^, zFilename^, n + 1);
+  zFilename[n + 1] := #0;
+  pBt := nil;
+  rc := sqlite3BtreeOpen(t3_sDb.pVfs, zFilename, @t3_sDb, @pBt, 0,
+          SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or SQLITE_OPEN_MAIN_DB);
+  sqlite3_free(zFilename);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3BtreeSetCacheSize(pBt, nCache);
+  t3AppendPtr(interp, pBt);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:83..110 — btree_close ID. }
+function btree_close(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt: PBtree;
+  rc:  cint;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  rc := sqlite3BtreeClose(pBt);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Dec(t3_nRefSqlite3);
+  if t3_nRefSqlite3 = 0 then
+  begin
+    sqlite3_mutex_leave(t3_sDb.mutex);
+    sqlite3_mutex_free(t3_sDb.mutex);
+    t3_sDb.mutex := nil;
+    t3_sDb.pVfs := nil;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:118..143 — btree_begin_transaction ID. }
+function btree_begin_transaction(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt: PBtree;
+  rc:  cint;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pBt);
+  rc := sqlite3BtreeBeginTrans(pBt, 1, nil);
+  sqlite3BtreeLeave(pBt);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:197..244 — btree_cursor ID TABLENUM WRITEABLE. }
+function btree_cursor(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt:    PBtree;
+  iTable: cint;
+  pCur:   PBtCursor;
+  rc:     cint;
+  wrFlag: cint;
+begin
+  rc := SQLITE_OK;
+  if argc <> 4 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID TABLENUM WRITEABLE"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  if Tcl_GetInt(interp, argv[2], @iTable) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if Tcl_GetBoolean(interp, argv[3], @wrFlag) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if wrFlag <> 0 then wrFlag := BTREE_WRCSR;
+  pCur := PBtCursor(sqlite3_malloc(sqlite3BtreeCursorSize()));
+  FillChar(pCur^, sqlite3BtreeCursorSize(), 0);
+  sqlite3_mutex_enter(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3BtreeEnter(pBt);
+  rc := sqlite3BtreeLockTable(pBt, iTable, Ord(wrFlag <> 0));
+  if rc = SQLITE_OK then
+    rc := sqlite3BtreeCursor(pBt, iTable, wrFlag, nil, pCur);
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(PTsqlite3(pBt^.db)^.mutex);
+  if rc <> 0 then
+  begin
+    sqlite3_free(pCur);
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  t3AppendPtr(interp, pCur);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:246..286 — btree_close_cursor ID. }
+function btree_close_cursor(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  pBt:  PBtree;
+  rc:   cint;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  pBt := pCur^.pBtree;
+  sqlite3_mutex_enter(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3BtreeEnter(pBt);
+  rc := sqlite3BtreeCloseCursor(pCur);
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3_free(pCur);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:288..325 — btree_next ID.  0 on success, 1 if at/past last. }
+function btree_next(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  rc:   cint;
+  res:  cint;
+  zBuf: array[0..99] of AnsiChar;
+  s:    AnsiString;
+begin
+  res := 0;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pCur^.pBtree);
+  rc := sqlite3BtreeNext(pCur, 0);
+  if rc = SQLITE_DONE then
+  begin
+    res := 1;
+    rc := SQLITE_OK;
+  end;
+  sqlite3BtreeLeave(pCur^.pBtree);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  s := IntToStr(res);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:327..361 — btree_first ID.  0 if positioned, 1 if table empty. }
+function btree_first(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  rc:   cint;
+  res:  cint;
+  zBuf: array[0..99] of AnsiChar;
+  s:    AnsiString;
+begin
+  res := 0;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pCur^.pBtree);
+  rc := sqlite3BtreeFirst(pCur, @res);
+  sqlite3BtreeLeave(pCur^.pBtree);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  s := IntToStr(res);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:391..417 — btree_payload_size ID. }
+function btree_payload_size(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  n:    u32;
+  zBuf: array[0..99] of AnsiChar;
+  s:    AnsiString;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pCur^.pBtree);
+  n := sqlite3BtreePayloadSize(pCur);
+  sqlite3BtreeLeave(pCur^.pBtree);
+  s := IntToStr(n);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test3.c:504..546 — btree_from_db DB-HANDLE ?N?.
   Returns the Btree* pointer for database iDb (default 0) of the SQLite
   connection bound to the Tcl `db` command.  Rendered as "%p" hex.
@@ -8520,6 +8814,23 @@ begin
   { 9.4.divbug.88.011 — btree_from_db.  test3.c:676. }
   Tcl_CreateCommand(interp, PChar('btree_from_db'),
     @btree_from_db, nil, nil);
+  { types.test — raw b-tree harness commands.  test3.c:664..674. }
+  Tcl_CreateCommand(interp, PChar('btree_open'),
+    @btree_open, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_close'),
+    @btree_close, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_begin_transaction'),
+    @btree_begin_transaction, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_cursor'),
+    @btree_cursor, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_close_cursor'),
+    @btree_close_cursor, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_next'),
+    @btree_next, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_first'),
+    @btree_first, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_payload_size'),
+    @btree_payload_size, nil, nil);
   { 6.40.6 (HARNESS) — btree_pager_stats.  test3.c:668. }
   Tcl_CreateCommand(interp, PChar('btree_pager_stats'),
     @btree_pager_stats, nil, nil);
