@@ -31893,6 +31893,113 @@ begin
   Result := nil;
 end;
 
+{ Helpers for classifying WHERE an unmarked self-reference to a recursive CTE
+  lives, so resolveFromTermToCte can pick C's "circular reference" vs "multiple
+  recursive references" message (select.c:5793 vs 5834).  An unmarked reference
+  is a FROM SrcItem whose zName equals the CTE name and which is NOT flagged
+  isRecursive (fg.fgBits bit 7 / $80); the recursive-CTE detection loop marks
+  the legitimate per-arm self-reference, so any remaining match is an EXTRA
+  reference (typically inside a WHERE / result expression subquery). }
+
+function selectArmRefsCteName(p: PSelect; zName: PAnsiChar;
+  scanPrior: Boolean): Boolean; forward;
+function exprListRefsCteName(pList: PExprList; zName: PAnsiChar): Boolean; forward;
+
+function exprRefsCteName(pExpr: PExpr; zName: PAnsiChar): Boolean;
+begin
+  Result := False;
+  if pExpr = nil then Exit;
+  if (pExpr^.flags and EP_xIsSelect) <> 0 then
+  begin
+    if selectArmRefsCteName(pExpr^.x.pSelect, zName, True) then
+    begin Result := True; Exit; end;
+  end
+  else if pExpr^.x.pList <> nil then
+  begin
+    if exprListRefsCteName(pExpr^.x.pList, zName) then
+    begin Result := True; Exit; end;
+  end;
+  if exprRefsCteName(pExpr^.pLeft, zName) then begin Result := True; Exit; end;
+  if exprRefsCteName(pExpr^.pRight, zName) then begin Result := True; Exit; end;
+end;
+
+function exprListRefsCteName(pList: PExprList; zName: PAnsiChar): Boolean;
+var i: i32; a: PExprListItem;
+begin
+  Result := False;
+  if pList = nil then Exit;
+  a := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+    if exprRefsCteName(a[i].pExpr, zName) then begin Result := True; Exit; end;
+end;
+
+{ True if SELECT arm p (its FROM, WHERE, result list, HAVING, GROUP/ORDER BY,
+  LIMIT — and, when scanPrior, its pPrior chain) contains an unmarked FROM
+  reference to the named CTE.  FROM subqueries and expression subqueries are
+  searched recursively. }
+function selectArmRefsCteName(p: PSelect; zName: PAnsiChar;
+  scanPrior: Boolean): Boolean;
+var
+  pSrc:   PSrcList;
+  items:  PSrcItem;
+  it:     PSrcItem;
+  i:      i32;
+begin
+  Result := False;
+  while p <> nil do
+  begin
+    pSrc := p^.pSrc;
+    if pSrc <> nil then
+    begin
+      items := SrcListItems(pSrc);
+      for i := 0 to pSrc^.nSrc - 1 do
+      begin
+        it := PSrcItem(PByte(items) + i * SizeOf(TSrcItem));
+        if (it^.fg.fgBits and u8($04)) <> 0 then            { isSubquery }
+        begin
+          if (it^.u4.pSubq <> nil)
+             and selectArmRefsCteName(it^.u4.pSubq^.pSelect, zName, True) then
+          begin Result := True; Exit; end;
+        end
+        else if (it^.zName <> nil)
+             and ((it^.fg.fgBits and u8($80)) = 0)           { not isRecursive }
+             and (sqlite3StrICmp(it^.zName, zName) = 0) then
+        begin Result := True; Exit; end;
+      end;
+    end;
+    if exprRefsCteName(p^.pWhere, zName) then begin Result := True; Exit; end;
+    if exprRefsCteName(p^.pHaving, zName) then begin Result := True; Exit; end;
+    if exprRefsCteName(p^.pLimit, zName) then begin Result := True; Exit; end;
+    if exprListRefsCteName(p^.pEList, zName) then begin Result := True; Exit; end;
+    if exprListRefsCteName(p^.pGroupBy, zName) then begin Result := True; Exit; end;
+    if exprListRefsCteName(p^.pOrderBy, zName) then begin Result := True; Exit; end;
+    if not scanPrior then Exit;
+    p := p^.pPrior;
+  end;
+end;
+
+{ True if any SETUP arm (pRecTerm and its pPrior chain) references the CTE. }
+function cteSetupChainRefsCte(pRecTerm: PSelect; zName: PAnsiChar): Boolean;
+begin
+  Result := selectArmRefsCteName(pRecTerm, zName, True);
+end;
+
+{ True if any RECURSIVE arm (pSel down to, but not including, pRecTerm) has an
+  EXTRA unmarked reference to the CTE.  Scans each recursive arm's own node
+  (scanPrior=False) so the setup chain below pRecTerm is not re-scanned. }
+function cteRecursiveArmsHaveExtraRef(pSel, pRecTerm: PSelect;
+  zName: PAnsiChar): Boolean;
+var p: PSelect;
+begin
+  Result := False;
+  p := pSel;
+  while (p <> nil) and (p <> pRecTerm) do
+  begin
+    if selectArmRefsCteName(p, zName, False) then begin Result := True; Exit; end;
+    p := p^.pPrior;
+  end;
+end;
+
 { select.c:5670 — resolveFromTermToCte.  Match pFrom against an in-scope
   CTE; on match, attach pCt^.pSelect as a subquery of pFrom and synthesise
   the ephemeral Table* for column-resolution.  Returns 0 on no match,
@@ -32135,12 +32242,74 @@ begin
       Exit;
     end;
   end;
-  sqlite3SelectPrep(pParse, pSel, nil);
+  { select.c:5796..5839 — C walks the CTE body in TWO phases.
+      Phase 1 (zCteErr = "circular reference: %s"):
+        - SF_Recursive body: walk ONLY the setup/anchor term chain
+          (pRecTerm and its pPrior), leaving the recursive arms unexpanded.
+          A self-reference inside a SETUP term (e.g. the anchor's subquery,
+          with1-7.6) trips "circular reference" here.
+        - non-recursive body: walk the FULL compound.  A self-reference
+          reached this way (with1-7.4) trips "circular reference" here.
+      Phase 2 (bMayRecursive only): re-set zCteErr to
+        "multiple recursive references: %s"  (SF_Recursive) or
+        "recursive reference in a subquery: %s"  (else), then walk the FULL
+        compound.  This expands the recursive arms; an EXTRA, unmarked
+        self-reference there (with1-7.5) trips the phase-2 message.
+    C's two walks are EXPAND-only (selectExpander); name resolution happens
+    later.  So this port maps each C walk to sqlite3SelectExpand (idempotent
+    via SF_Expanded) and runs ONE sqlite3SelectPrep afterwards for resolution.
+    selectExpander follows pPrior only, so expanding pRecTerm reaches exactly
+    the setup terms; the recursive arms (linked via pNext) stay unexpanded
+    until the phase-2 full-compound expand. }
+  if (pSel^.selFlags and SF_Recursive) = 0 then
+  begin
+    { Non-recursive body (select.c:5810..5814 else-branch): a single full prep
+      with zCteErr="circular reference" matches the original behaviour and
+      catches an in-subquery self-reference as "circular reference"
+      (with1-7.4). }
+    sqlite3SelectPrep(pParse, pSel, nil);
+    if pParse^.nErr <> 0 then
+    begin
+      pParse^.pWith := pSavedWith;
+      pCt^.zCteErr := nil;
+      Result := 2;
+      Exit;
+    end;
+  end
+  else
+  begin
+    { Recursive body (select.c:5796..5839).  C walks the body in two EXPAND
+      phases: phase 1 walks only the setup/anchor terms (a setup self-reference
+      trips "circular reference"); phase 2 walks the full compound (an extra,
+      unmarked self-reference in a RECURSIVE arm trips "multiple recursive
+      references").  This port resolves the whole body in ONE sqlite3SelectPrep
+      (separate per-arm resolution double-resolves and either hangs or corrupts
+      a valid recursive CTE — with1-7.2 / 26.x), and binds a CTE reference
+      buried in a WHERE / result expression subquery during that single resolve
+      pass — so both a setup-arm ref and a recursive-arm ref would otherwise
+      trip the SAME zCteErr.  To pick C's message we pre-classify (purely
+      structurally, on the un-expanded AST) WHERE the extra, unmarked
+      self-reference lives:
+        - if any SETUP arm references the CTE        -> "circular reference"
+          (default; with1-7.4/7.6),
+        - else if any RECURSIVE arm has an extra ref -> "multiple recursive
+          references" (with1-7.5).
+      The legitimate per-arm recursive self-reference is already isRecursive-
+      marked by the detection loop above, so it is excluded from the scan. }
+    if (not cteSetupChainRefsCte(pRecTerm, pCt^.zName))
+       and cteRecursiveArmsHaveExtraRef(pSel, pRecTerm, pCt^.zName) then
+      pCt^.zCteErr := PAnsiChar('multiple recursive references: %s');
+
+    sqlite3SelectPrep(pParse, pSel, nil);
+    { A self-reference bound during the prep trips zCteErr (the pre-classified
+      message).  Defer the bail to AFTER the column-count check below so a
+      wrong-width anchor whose expand also raised "no tables specified"
+      (with1-13.3) is overridden by the more specific column-count message. }
+  end;
   pParse^.pWith := pSavedWith;
   pCt^.zCteErr := nil;
-  if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
 
-  { Walk to leftmost SELECT for the result-set column list. }
+  { Walk to leftmost SELECT for the result-set column list (select.c:5818). }
   pLeft := pSel;
   while pLeft^.pPrior <> nil do pLeft := pLeft^.pPrior;
   pEList := pLeft^.pEList;
@@ -32160,7 +32329,11 @@ begin
     end;
     pEList := pCt^.pCols;
   end;
-  { Skip if columns were already populated up-front for the recursive arm. }
+  { Any prep error not converted into the more specific column-count message
+    above is authoritative; bail now (select.c:5806..5814). }
+  if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
+  { sqlite3ColumnsFromExprList (select.c:5831).  Skip if columns were already
+    populated up-front for the recursive arm. }
   if pTab^.nCol = 0 then
     sqlite3ColumnsFromExprList(pParse, pEList, @pTab^.nCol, @pTab^.aCol);
   Result := 1;
