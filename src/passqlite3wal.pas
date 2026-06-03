@@ -879,7 +879,11 @@ begin
       walSetWiPage(pWal, cint(iPg), aShare);
       if iPg = 0 then nHdr := WALINDEX_HDR_SIZE else nHdr := 0;
       nHdr32 := nHdr div SizeOf(u32);
-      Move((aShare + nHdr32)^, (aPrivate + nHdr32)^, WALINDEX_PGSZ - cint(nHdr));
+      { wal.c:1533 — memcpy(&aShare[nHdr32], &aPrivate[nHdr32], ...): copy the
+        recovered private hash/page-number page INTO the shared wal-index
+        page.  Pascal Move(src,dst,n) reverses memcpy's (dst,src,n) order, so
+        the source is aPrivate and the destination is aShare. }
+      Move((aPrivate + nHdr32)^, (aShare + nHdr32)^, WALINDEX_PGSZ - cint(nHdr));
 
       if iFrame <= iLast then break;
       Inc(iPg);
