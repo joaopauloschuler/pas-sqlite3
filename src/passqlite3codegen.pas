@@ -257,6 +257,7 @@ const
   { SQLITE_MAX_EXPR_DEPTH }
   SQLITE_MAX_EXPR_DEPTH  = 1000;
   SQLITE_MAX_COLUMN      = 2000;
+  SQLITE_MAX_SRCLIST     = 200;    { build.c:4768 — max FROM-clause terms }
 
   { DBFLAG_* flags (sqliteInt.h) }
   DBFLAG_InternalFunc = u32($0008);
@@ -31067,16 +31068,29 @@ begin
     rename mode never reaches; without this walk the VALUES-arity error is
     silently dropped during a rename (altertab2-9.1).  Walk the pPrior chain
     and compare each arm's pEList count with its prior arm's. }
-  pArm := p;
-  while (pArm <> nil) and (pArm^.pPrior <> nil) do
+  { This eager pPrior-based arity scan only mirrors C's intent under
+    PARSE_MODE_RENAME, where the re-parse resolves but never codegens (so the
+    multiSelect-time check is never reached — altertab2-9.1).  In normal
+    compilation C does NOT scan here: the per-arm check lives in
+    resolveSelectStep (gated on p->pNext, which is only wired by an ORDER BY
+    resolve) and the genuine codegen-time check in multiSelect.  Running this
+    eagerly in normal mode reorders it ahead of withExpand's CTE column-count
+    check ("table %s has %d values for %d columns"), so for a CTE whose body is
+    a mismatched compound the wrong message wins (with1-5.6.4 / 13.3).  Gate it
+    to rename mode to keep the workaround without distorting the normal path. }
+  if pParse^.eParseMode = PARSE_MODE_RENAME then
   begin
-    if (pArm^.pEList <> nil) and (pArm^.pPrior^.pEList <> nil)
-       and (pArm^.pEList^.nExpr <> pArm^.pPrior^.pEList^.nExpr) then
+    pArm := p;
+    while (pArm <> nil) and (pArm^.pPrior <> nil) do
     begin
-      sqlite3SelectWrongNumTermsError(pParse, pArm);
-      Exit;
+      if (pArm^.pEList <> nil) and (pArm^.pPrior^.pEList <> nil)
+         and (pArm^.pEList^.nExpr <> pArm^.pPrior^.pEList^.nExpr) then
+      begin
+        sqlite3SelectWrongNumTermsError(pParse, pArm);
+        Exit;
+      end;
+      pArm := pArm^.pPrior;
     end;
-    pArm := pArm^.pPrior;
   end;
   sqlite3ResolveSelectNames(pParse, p, pOuterNC);
   if pParse^.nErr <> 0 then Exit;
@@ -31743,6 +31757,9 @@ var
   pSrcItems: PSrcItem;
   pRecItem:  PSrcItem;
   ii:    i32;
+  leftHasStar: Boolean;   { with1-5.6.4 early column-count check }
+  iStar:  i32;
+  pEStar: PExpr;
 begin
   if pParse^.pWith = nil then begin Result := 0; Exit; end;
   if pParse^.nErr <> 0 then begin Result := 0; Exit; end;
@@ -31904,6 +31921,60 @@ begin
     CTEs visible where this CTE was DEFINED, then restore the use-site With. }
   pSavedWith := pParse^.pWith;
   pParse^.pWith := PWith(pWthC);
+  { select.c:5794..5841 — set zCteErr so a recursive self-reference inside the
+    body trips the zCteErr arm above, then prep the body in its DEFINITION
+    scope.  C runs withExpand's column-count check during EXPANSION, before
+    resolveSelectStep's own pNext-gated arity check; this port preps (expand +
+    resolve) in one shot, so to keep the C error ORDER we pass bSkipArityCheck
+    to suppress resolveSelectStep's "SELECTs ... do not have the same number of
+    result columns" while prepping a CTE body — the authoritative
+    "table %s has %d values for %d columns" check below fires instead
+    (with1-5.6.4).
+
+    C performs withExpand's column-count check during EXPANSION, before the
+    separate resolve pass runs resolveSelectStep's own pNext-gated arity check.
+    This port preps (expand+resolve) in one shot, so to preserve the C error
+    ORDER for the common case we do an EARLY column-count check here against
+    the leftmost arm's UNEXPANDED result list whenever the CTE declares an
+    explicit column list AND that leftmost arm contains no "*" to expand (so
+    its expr count is already final).  This catches e.g.
+    `i(x) AS (SELECT 1,2 UNION ALL SELECT 1)` (2 vs 1) ahead of resolve,
+    reporting "table i has 2 values for 1 columns" instead of the wrong-num
+    message.  Cases whose leftmost arm has a "*" (count not yet final) fall
+    through to the post-prep check below, exactly as before. }
+  if pCt^.pCols <> nil then
+  begin
+    pLeft := pSel;
+    while pLeft^.pPrior <> nil do pLeft := pLeft^.pPrior;
+    { Determine whether the leftmost arm contains any unexpanded "*"/"tab.*". }
+    leftHasStar := False;
+    if pLeft^.pEList <> nil then
+      for iStar := 0 to pLeft^.pEList^.nExpr - 1 do
+      begin
+        pEStar := ExprListItems(pLeft^.pEList)[iStar].pExpr;
+        if pEStar = nil then Continue;
+        if pEStar^.op = TK_ASTERISK then begin leftHasStar := True; Break; end;
+        if (pEStar^.op = TK_DOT) and (pEStar^.pRight <> nil)
+           and (pEStar^.pRight^.op = TK_ASTERISK) then
+        begin leftHasStar := True; Break; end;
+      end;
+    if (pLeft^.pEList <> nil)
+       and (not leftHasStar)
+       and (pLeft^.pEList^.nExpr <> pCt^.pCols^.nExpr) then
+    begin
+      zMsg := sqlite3MPrintf(db,
+        'table %s has %d values for %d columns',
+        [pCt^.zName, pLeft^.pEList^.nExpr, pCt^.pCols^.nExpr]);
+      if zMsg <> nil then begin
+        sqlite3ErrorMsg(pParse, zMsg);
+        sqlite3DbFree(db, zMsg);
+      end;
+      pParse^.pWith := pSavedWith;
+      pCt^.zCteErr := nil;
+      Result := 2;
+      Exit;
+    end;
+  end;
   sqlite3SelectPrep(pParse, pSel, nil);
   pParse^.pWith := pSavedWith;
   pCt^.zCteErr := nil;
@@ -32538,21 +32609,34 @@ begin
     descends pPrior internally.  Without this, `SELECT * FROM t UNION
     ALL ...` left the prior arm's pEList holding TK_ASTERISK, which
     codegen then emitted as OP_Null instead of OP_Column. }
-  pCur := pSelect;
-  while pCur <> nil do
+  { select.c:6085..6087 — `if( pParse->nErr || sqlite3ProcessJoin(pParse,p) )
+    return WRC_Abort;`.  C bails out of selectExpander (skipping expandStar)
+    whenever a parse error is already pending.  This port reaches expandStar
+    even after a parse-time error (e.g. "a JOIN clause is required before
+    USING" emitted by sqlite3SrcListAppendFromTerm for `FROM t1 USING(a)`,
+    which returns a nil/empty FROM); without this gate expandStar then sees an
+    empty FROM and overwrites the real diagnostic with "no tables specified"
+    (join-3.5).  Honour the nErr gate so the first/authoritative message wins.
+    (Still fall through to the SelectPopWith tail-call to keep the pWith stack
+    balanced.) }
+  if pParse^.nErr = 0 then
   begin
-    if (pCur^.pEList <> nil) and (pCur^.pSrc <> nil) then
-      expandStar(pParse, pCur);
-    { with2-4.7 — enforce SQLITE_LIMIT_COLUMN on the result set after
-      wildcard expansion.  Mirrors select.c:6328..6332. }
-    if (pCur^.pEList <> nil)
-       and (pCur^.pEList^.nExpr > pParse^.db^.aLimit[SQLITE_LIMIT_COLUMN]) then
+    pCur := pSelect;
+    while pCur <> nil do
     begin
-      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
-        'too many columns in result set', []));
-      Exit;
+      if (pCur^.pEList <> nil) and (pCur^.pSrc <> nil) then
+        expandStar(pParse, pCur);
+      { with2-4.7 — enforce SQLITE_LIMIT_COLUMN on the result set after
+        wildcard expansion.  Mirrors select.c:6328..6332. }
+      if (pCur^.pEList <> nil)
+         and (pCur^.pEList^.nExpr > pParse^.db^.aLimit[SQLITE_LIMIT_COLUMN]) then
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+          'too many columns in result set', []));
+        Break;
+      end;
+      pCur := pCur^.pPrior;
     end;
-    pCur := pCur^.pPrior;
   end;
 
   {$IFDEF SQLITE_DEBUG}
@@ -53030,6 +53114,17 @@ var
   iSeed: i32;
 begin
   db := pParse^.db;
+  { build.c:4810..4814 — enforce SQLITE_MAX_SRCLIST (200).  C performs this
+    only inside its grow-the-allocation branch (nSrc+nExtra > nAlloc); this
+    port reallocates on every Enlarge, so the equivalent guard lives here.
+    Reports "too many FROM clause terms, max: 200" (with1-22.1). }
+  if pSrc^.nSrc + nExtra >= SQLITE_MAX_SRCLIST then
+  begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'too many FROM clause terms, max: %d', [i32(SQLITE_MAX_SRCLIST)]));
+    Result := pSrc; { C returns 0; callers treat unchanged list + nErr as failure }
+    Exit;
+  end;
   nNew := pSrc^.nSrc + nExtra;
   { Pascal TSrcList header is 8 bytes with no items; all slots allocated separately }
   pNew := PSrcList(sqlite3DbMallocRaw(db,
