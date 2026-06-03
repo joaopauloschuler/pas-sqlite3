@@ -37513,7 +37513,7 @@ begin
       (window.c:1332 sqlite3WindowLink chain + select.c:7686 recursion). }
     if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab)
        and (pDest^.eDest <> SRT_Coroutine) and (pDest^.eDest <> SRT_Mem)
-       and (pDest^.eDest <> SRT_Set) then
+       and (pDest^.eDest <> SRT_Set) and (pDest^.eDest <> SRT_Exists) then
     begin Result := SQLITE_OK; Exit; end;
     { DISTINCT combined with ORDER BY needs OMITREF/sorter-key dedup that the
       simple inline arm here does not implement. }
@@ -37760,6 +37760,19 @@ begin
         codeOffset(v, p^.iOffset, iContW);
       if p^.iLimit <> 0 then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
+    end
+    else if pDest^.eDest = SRT_Exists then
+    begin
+      { window9-6.1/6.2 — windowed SELECT as the body of an EXISTS subquery
+        (sqlite3CodeSubselect codes it with SRT_Exists + injected LIMIT 1).
+        The subquery produced a row, so flip iSDParm to 1.  Mirrors
+        selectInnerLoop's SRT_Exists arm (select.c:1412..1416): set the
+        exists register, then break out of the scan (one row is enough).
+        No ResultRow / result-column evaluation is needed. }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, iContW);
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, iBreakW);
     end
     else
     begin
