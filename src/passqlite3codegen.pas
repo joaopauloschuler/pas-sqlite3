@@ -34765,6 +34765,56 @@ begin
   end;
 end;
 
+{ window8-8.1/8.3 — clear a PREMATURE SF_HasTypeInfo stamp on subqueries
+  inside an INLINE window PARTITION BY / ORDER BY list.
+
+  C resolves window partition/order-by expressions during the resolver pass
+  (resolve.c:1321..1322), so by the time sqlite3SelectAddTypeInfo runs a
+  partition subquery is already fully expanded+resolved.  This port defers all
+  window partition/order-by resolution to the codegen-time linkWindowsForSelect
+  pass below (sqlite3ResolveExprListNames at codegen.pas:34826), which runs
+  AFTER sqlite3SelectPrep -> sqlite3SelectAddTypeInfo.
+
+  sqlite3SelectAddTypeInfo's walker descends into the inline window's partition
+  subquery (via walkWindowList's EP_WinFunc arm) and stamps SF_HasTypeInfo on
+  it BEFORE it has ever been expanded or resolved.  The later resolution then
+  short-circuits resolveSubqueryOuterRefs' expand (it is gated on
+  SF_HasTypeInfo==0) and the subquery body (e.g. `SELECT t FROM map WHERE v=a`)
+  is never resolved — so its outer reference `a` does not bind to the outer
+  cursor and the partition key is a constant, collapsing the per-partition
+  restart into one un-partitioned running aggregate.
+
+  Named windows are unaffected: their definition lives in pWinDefn (the walker
+  does not descend there) and pWin->pPartition is still nil at AddTypeInfo time.
+
+  Fix: a subquery that carries SF_HasTypeInfo but was never actually expanded
+  (SF_Expanded clear) is a victim of the premature stamp; drop SF_HasTypeInfo
+  so the resolution below performs the real expand+resolve, matching the named
+  path. }
+procedure clearPrematureWinSubqTypeInfo(pList: PExprList);
+var
+  items: PExprListItem;
+  i: i32;
+  pE: PExpr;
+  pInner: PSelect;
+begin
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+  begin
+    pE := items[i].pExpr;
+    if pE = nil then continue;
+    if (pE^.flags and EP_xIsSelect) <> 0 then
+    begin
+      pInner := pE^.x.pSelect;
+      if (pInner <> nil)
+         and ((pInner^.selFlags and SF_HasTypeInfo) <> 0)
+         and ((pInner^.selFlags and SF_Expanded) = 0) then
+        pInner^.selFlags := pInner^.selFlags and (not u32(SF_HasTypeInfo));
+    end;
+  end;
+end;
+
 { Phase 6.26 helper — gather window functions in pSel and finish the
   resolve-time wiring (sqlite3WindowUpdate + sqlite3WindowLink).  The
   pas resolver doesn't yet implement the resolve.c:1314..1325 arm, so
@@ -34823,6 +34873,11 @@ procedure linkWindowsForSelect(pParse: PParse; pSel: PSelect);
       sNC.pSrcList    := pSel^.pSrc;
       sNC.ncFlags     := NC_AllowAgg or NC_AllowWin;
       sNC.pWinSelect  := pSel;
+      { window8-8.1/8.3 — undo any premature SF_HasTypeInfo stamp left by
+        sqlite3SelectAddTypeInfo on an inline partition/order-by subquery,
+        so the resolution below actually expands+resolves its body. }
+      clearPrematureWinSubqTypeInfo(pE^.y.pWin^.pPartition);
+      clearPrematureWinSubqTypeInfo(pE^.y.pWin^.pOrderBy);
       sqlite3ResolveExprListNames(@sNC, pE^.y.pWin^.pPartition);
       sqlite3ResolveExprListNames(@sNC, pE^.y.pWin^.pOrderBy);
       { Note: do NOT rewrite TK_FUNCTION → TK_AGG_FUNCTION here.  Window
