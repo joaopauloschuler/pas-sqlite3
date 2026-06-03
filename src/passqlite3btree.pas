@@ -352,6 +352,13 @@ function  btreeGetPage(pBt: PBtShared; pgno: Pgno; out ppPage: PMemPage; flags: 
 function  btreePageLookup(pBt: PBtShared; pgno: Pgno): PMemPage;
 function  btreePagecount(pBt: PBtShared): Pgno; inline;
 
+{ Ptrmap helpers (defined later in this unit) — forward-declared so the
+  autoVacuum branch of getOverflowPage can use them. }
+function  PENDING_BYTE_PAGE(pBt: PBtShared): Pgno; inline;
+function  PTRMAP_ISPAGE(pBt: PBtShared; pg: Pgno): Boolean; inline;
+function  ptrmapGet(pBt: PBtShared; key: Pgno; out pEType: u8;
+                    out pPgno: Pgno): i32;
+
 { Cell insert / drop }
 procedure dropCell(pPage: PMemPage; idx: i32; sz: i32; pRC: Pi32);
 function  insertCell(pPage: PMemPage; i: i32; pCell: Pu8; sz: i32;
@@ -2463,17 +2470,49 @@ end;
 function getOverflowPage(pBt: PBtShared; ovfl: Pgno;
                          ppPage: PPMemPage; pPgnoNext: PPgno): i32;
 var
-  next  : Pgno;
-  pPage : PMemPage;
-  rc    : i32;
+  next   : Pgno;
+  pPage  : PMemPage;
+  rc     : i32;
+  pg     : Pgno;        { btree.c:5024 (renamed from 'pgno' to avoid type collision) }
+  iGuess : Pgno;
+  eType  : u8;
+  flags  : i32;
 begin
   next  := 0;
   pPage := nil;
   rc    := SQLITE_OK;
 
-  rc := btreeGetPage(pBt, ovfl, pPage, PAGER_GET_READONLY);
-  if rc = SQLITE_OK then
-    next := get4byte(pPage^.aData);
+{$IFNDEF SQLITE_OMIT_AUTOVACUUM}
+  { Try to find the next page in the overflow list using the autovacuum
+    pointer-map pages. Guess that the next page in the overflow list is
+    page number (ovfl+1). If that guess turns out to be wrong, fall back
+    to loading the data of page number ovfl to determine the next page
+    number.  btree.c:5016..5040 }
+  if pBt^.autoVacuum <> 0 then begin
+    iGuess := ovfl + 1;
+
+    while PTRMAP_ISPAGE(pBt, iGuess) or (iGuess = PENDING_BYTE_PAGE(pBt)) do
+      Inc(iGuess);
+
+    if iGuess <= btreePagecount(pBt) then begin
+      rc := ptrmapGet(pBt, iGuess, eType, pg);
+      if (rc = SQLITE_OK) and (eType = PTRMAP_OVERFLOW2) and (pg = ovfl) then
+      begin
+        next := iGuess;
+        rc   := SQLITE_DONE;
+      end;
+    end;
+  end;
+{$ENDIF}
+
+  Assert((next = 0) or (rc = SQLITE_DONE));
+  if rc = SQLITE_OK then begin
+    if ppPage = nil then flags := PAGER_GET_READONLY else flags := 0;
+    rc := btreeGetPage(pBt, ovfl, pPage, flags);
+    Assert((rc = SQLITE_OK) or (pPage = nil));
+    if rc = SQLITE_OK then
+      next := get4byte(pPage^.aData);
+  end;
   { btreeGetPage uses 'out ppPage: PMemPage' so pPage is already assigned }
 
   pPgnoNext^ := next;
@@ -2482,7 +2521,10 @@ begin
   else
     releasePage(pPage);
 
-  Result := rc;
+  if rc = SQLITE_DONE then
+    Result := SQLITE_OK
+  else
+    Result := rc;
 end;
 
 { ---------------------------------------------------------------------------
