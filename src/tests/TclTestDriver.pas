@@ -514,6 +514,13 @@ begin
     sb.Add('set ::argv0 {' + testAbsPath + '}');
     sb.Add('set ::argv {}');
     sb.Add('set ::argc 0');
+    { tester.tcl:498 — cmdlinearg(INFO_SCRIPT) is the normalized path of the
+      running test script.  Upstream derives it from [info script]; here the
+      .test is sourced via the monkey-patched [source] so [info script] would
+      report the wrong file.  Pin it to the test path (== ::argv0) so tests
+      that read their own source bytes (incrblob-5.1/5.2 read
+      $::cmdlinearg(INFO_SCRIPT) into a blob) resolve correctly. }
+    sb.Add('set ::cmdlinearg(INFO_SCRIPT) {' + testAbsPath + '}');
     sb.Add('if {[catch {source ' + testAbsPath + '} __err __opts]} {');
     sb.Add('  puts stderr "SOURCE-ERROR: $__err"');
     sb.Add('}');
