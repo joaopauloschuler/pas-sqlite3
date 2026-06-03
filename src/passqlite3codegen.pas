@@ -29780,9 +29780,13 @@ begin
         r1, pDest^.zAffSdst, pIn^.nSdst);
       sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
         pIn^.iSdst, pIn^.nSdst);
-      if pDest^.iSDParm2 > 0 then
+      if pDest^.iSDParm2 > 0 then begin
         sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
           pIn^.iSdst, pIn^.nSdst);
+        { select.c:1402 — narrate the Bloom filter populated for this IN-RHS
+          materialisation as a child of the enclosing LIST SUBQUERY node. }
+        sqlite3VdbeExplain(pParse, 0, 'CREATE BLOOM FILTER', []);
+      end;
       sqlite3ReleaseTempReg(pParse, r1);
     end;
 
@@ -40755,9 +40759,13 @@ begin
         pDest^.zAffSdst, nResultCol);
       sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, i,
         pDest^.iSdst, nResultCol);
-      if pDest^.iSDParm2 <> 0 then
+      if pDest^.iSDParm2 <> 0 then begin
         sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
           pDest^.iSdst, nResultCol);
+        { select.c:1402 — narrate the Bloom filter populated for this IN-RHS
+          materialisation as a child of the enclosing LIST SUBQUERY node. }
+        sqlite3VdbeExplain(pParse, 0, 'CREATE BLOOM FILTER', []);
+      end;
       sqlite3ReleaseTempReg(pParse, i);
     end;
 
@@ -72930,6 +72938,7 @@ var
   pCoroSrc:    PSrcItem;       { 9.4.divbug.78 }
   addrCoroYield: i32;
   rCoroBase, rCoroRec, iCoro: i32;
+  savedAddrExplain: i32;
 begin
   v := pParse^.pVdbe;
   Assert(v <> nil);
@@ -72997,6 +73006,20 @@ begin
   if ExprUseXSelect(pX) then begin
     pSel   := pX^.x.pSelect;
     pEList := pSel^.pEList;
+    { ExplainQueryPlan (expr.c:3704) — emit the "[CORRELATED ]LIST SUBQUERY %d"
+      OP_Explain node and push the EQP nesting so the inner SELECT's SCAN/SEARCH
+      lines chain off this node as children.  addrOnce<>0 means the RHS is
+      hoisted once (non-correlated); a 0 addrOnce means it re-evaluates per row
+      (correlated).  sqlite3VdbeExplain(bPush=1) updates pParse^.addrExplain;
+      restore it after the inner sqlite3Select so the caller's parent EQP
+      context is preserved.  The helper is a no-op outside EXPLAIN-QUERY-PLAN
+      mode (Parse.explain<>2), so production codegen is unaffected. }
+    savedAddrExplain := pParse^.addrExplain;
+    if addrOnce <> 0 then
+      sqlite3VdbeExplain(pParse, 1, 'LIST SUBQUERY %d', [pSel^.selId])
+    else
+      sqlite3VdbeExplain(pParse, 1, 'CORRELATED LIST SUBQUERY %d',
+                         [pSel^.selId]);
     if (pEList <> nil) and (pEList^.nExpr = nVal) then
     begin
       sqlite3SelectDestInit(@destSet, SRT_Set, iTab);
@@ -73089,6 +73112,8 @@ begin
           if pOpRef <> nil then pOpRef^.p1 := 10;
         end;
       end;
+      { Pop the LIST SUBQUERY EQP nesting now that the inner SELECT is coded. }
+      pParse^.addrExplain := savedAddrExplain;
       if rcSelect <> 0 then
       begin
         sqlite3KeyInfoUnref(pKeyInfo);
