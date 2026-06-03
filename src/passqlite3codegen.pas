@@ -25861,6 +25861,8 @@ var
   iInTabDummy: i32;
   fSingleTabCoroutine: Boolean;
   fShortCutOneRow: Boolean;      { where2-2.1 — preserve nOBSat=nExpr }
+  fScWantOneRow: Boolean;        { in7-1.1.3 — restore WHERE_ONEROW on chosen loop }
+  pLoopChosen: PWhereLoop;       { in7-1.1.3 — level-0 chosen WhereLoop }
   addrExplainScan: i32;          { Phase 8.2.1 — scanstatus wiring }
 
   { Phase 6.9-bis 11g.2.f sub-progress 21 — hoist nested helper.
@@ -26176,6 +26178,7 @@ begin
     whereReverseScanOrder(pWInfo);
 
   fShortCutOneRow := false;
+  fScWantOneRow := false;
   if fSingleTabCoroutine
      or (nTabList <> 1)
      or (whereShortCut(@sWLB) = 0)
@@ -26191,6 +26194,18 @@ begin
     if ((sWLB.pNew^.wsFlags and WHERE_ONEROW) <> 0)
        and (pWInfo^.pOrderBy <> nil) then
       fShortCutOneRow := true;
+
+    { in7-1.1.3 — whereShortCut (where.c:6405) sets WHERE_ONEROW on a
+      UNIQUE-index plan in which every key column is matched by an EQ term,
+      independent of the index's uniqNotNull flag.  Pas re-routes that
+      WHERE_INDEXED plan through the cost-based planner (above), whose
+      whereLoopAddBtreeIndex only sets WHERE_ONEROW when uniqNotNull is set
+      (where.c:3417).  For a UNIQUE index over nullable columns the cost path
+      therefore drops WHERE_ONEROW, so sqlite3WhereCodeOneLoopStart emits an
+      OP_Next where C emits OP_Noop.  Remember that whereShortCut wanted
+      WHERE_ONEROW so it can be restored on the matching chosen loop below. }
+    fScWantOneRow := ((sWLB.pNew^.wsFlags and WHERE_ONEROW) <> 0)
+                 and ((sWLB.pNew^.wsFlags and WHERE_INDEXED) <> 0);
 
     { Full planner path — where.c:7079..7473.
       Covers multi-table FROM (nTabList>1), single-table viaCoroutine
@@ -26241,6 +26256,26 @@ begin
       that the full planner just overwrote.  See gate comment above. }
     if fShortCutOneRow and (pWInfo^.pOrderBy <> nil) then
       pWInfo^.nOBSat := i8(pWInfo^.pOrderBy^.nExpr);
+
+    { in7-1.1.3 — restore WHERE_ONEROW that whereShortCut would have set.
+      Only when the chosen level-0 loop is exactly the unique-index full-EQ
+      shape whereShortCut recognises: WHERE_INDEXED, every key column matched
+      (nEq == nKeyCol), the index UNIQUE, and not an IN-list plan.  This
+      reproduces where.c:6405's WHERE_ONEROW so the loop terminator emits
+      OP_Noop (whereShortCut runs BEFORE the cost planner in C, so the
+      uniqNotNull-gated whereLoopAddBtreeIndex path is never consulted for
+      this query). }
+    if fScWantOneRow and (pWInfo^.nLevel >= 1) then
+    begin
+      pLoopChosen := whereInfoLevels(pWInfo)[0].pWLoop;
+      if (pLoopChosen <> nil)
+         and ((pLoopChosen^.wsFlags and WHERE_INDEXED) <> 0)
+         and ((pLoopChosen^.wsFlags and WHERE_COLUMN_IN) = 0)
+         and (pLoopChosen^.u.btree.pIndex <> nil)
+         and (pLoopChosen^.u.btree.pIndex^.onError <> OE_None)
+         and (pLoopChosen^.u.btree.nEq = pLoopChosen^.u.btree.pIndex^.nKeyCol) then
+        pLoopChosen^.wsFlags := pLoopChosen^.wsFlags or WHERE_ONEROW;
+    end;
 
     { where.c:7113..7121 — TUNING: a DISTINCT clause on a subquery is
       assumed to reduce output cardinality by a factor of 8 (LogEst -30).
@@ -36313,7 +36348,8 @@ begin
         `INSERT INTO t SELECT ... GROUP BY ... EXCEPT SELECT ...` inserted
         nothing (insert2-1.2.x / 1.3.x). }
       if (pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
-         or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table) then
+         or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
+         or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Set) then
         obCandidate := True
       else if orderByGrp = 0 then
       begin
@@ -37086,6 +37122,38 @@ begin
           sqlite3VdbeAddOp3(v, OP_Insert,     pDest^.iSDParm, r1, r2);
           sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
           sqlite3ReleaseTempReg(pParse, r2);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
+        else if pDest^.eDest = SRT_Mem then
+        begin
+          { misc5-3.1 — scalar subquery (SRT_Mem) with GROUP BY + an
+            ORDER BY that references an aggregate not in the select list
+            (e.g. `(SELECT a FROM t GROUP BY a ORDER BY sum(b) DESC)`).
+            C selectInnerLoop SRT_Mem arm (select.c:1422..1436): the result
+            columns are already evaluated into regResult == iParm
+            (sqlite3CodeSubselect sets dest.iSdst = dest.iSDParm), so the
+            sorted first row sitting in pDest^.iSdst already is the answer.
+            When the drained register block differs from iSDParm, copy it
+            over.  The LIMIT 1 that sqlite3CodeSubselect attaches breaks the
+            drain after this first row (OP_DecrJumpZero below). }
+          if pDest^.iSdst <> pDest^.iSDParm then
+            sqlite3VdbeAddOp3(v, OP_Copy, pDest^.iSdst, pDest^.iSDParm,
+                              nResultCol - 1);
+        end
+        else if pDest^.eDest = SRT_Set then
+        begin
+          { Sorter-drain disposal for SRT_Set (IN-RHS subselect with outer
+            GROUP BY + agg ORDER BY).  Mirrors selectInnerLoop SRT_Set arm
+            (select.c:1384..1407): MakeRecord with per-row affinity, then
+            OP_IdxInsert into the iSDParm eph cursor. }
+          r1 := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                            r1, pDest^.zAffSdst, nResultCol);
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                               pDest^.iSdst, nResultCol);
+          if pDest^.iSDParm2 > 0 then
+            sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+                                 pDest^.iSdst, nResultCol);
           sqlite3ReleaseTempReg(pParse, r1);
         end
         else
