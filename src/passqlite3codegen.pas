@@ -25712,6 +25712,103 @@ begin
   end;
 end;
 
+{ Faithful port of where.c:6530..6611 — whereOmitNoopJoin.
+
+  Attempt to omit unreferenced tables from a join that do not affect the
+  result.  A pure LEFT JOIN whose table contributes nothing to the result-set
+  or ORDER BY, and which every WHERE term either ignores or constrains only
+  via its own ON clause, can be dropped from the plan entirely.  See the C
+  header comment for the full preconditions; the caller checks (1)/(6)/(7). }
+function whereOmitNoopJoin(pWInfo: PWhereInfo; notReady: Bitmask): Bitmask;
+var
+  i:           i32;
+  tabUsed:     Bitmask;
+  hasRightJoin: Boolean;
+  pTermBase:   PWhereTerm;
+  k:           i32;
+  nTermWC:     i32;
+  pTerm:       PWhereTerm;
+  pItem:       PSrcItem;
+  pLoop:       PWhereLoop;
+  m1:          Bitmask;
+  broke:       Boolean;
+  nByte:       SizeInt;
+  aLevels:     PWhereLevel;
+begin
+  Assert(pWInfo^.nLevel >= 2);
+  Assert(OptimizationEnabled(pWInfo^.pParse^.db, SQLITE_OmitNoopJoin));
+  Assert(pWInfo^.pResultSet <> nil);
+  Assert((pWInfo^.wctrlFlags and WHERE_AGG_DISTINCT) = 0);
+
+  tabUsed := sqlite3WhereExprListUsage(@pWInfo^.sMaskSet, pWInfo^.pResultSet);
+  if pWInfo^.pOrderBy <> nil then
+    tabUsed := tabUsed or
+      sqlite3WhereExprListUsage(@pWInfo^.sMaskSet, pWInfo^.pOrderBy);
+  hasRightJoin :=
+    (SrcListItems(pWInfo^.pTabList)[0].fg.jointype and JT_LTORJ) <> 0;
+
+  aLevels   := whereInfoLevels(pWInfo);
+  pTermBase := pWInfo^.sWC.a;
+  nTermWC   := pWInfo^.sWC.nTerm;
+
+  for i := pWInfo^.nLevel - 1 downto 1 do
+  begin
+    pLoop := aLevels[i].pWLoop;
+    pItem := @SrcListItems(pWInfo^.pTabList)[pLoop^.iTab];
+    if (pItem^.fg.jointype and (JT_LEFT or JT_RIGHT)) <> JT_LEFT then continue;
+    if ((pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) = 0)
+       and ((pLoop^.wsFlags and WHERE_ONEROW) = 0) then
+      continue;
+    if (tabUsed and pLoop^.maskSelf) <> 0 then continue;
+
+    broke := False;
+    for k := 0 to nTermWC - 1 do
+    begin
+      pTerm := @pTermBase[k];
+      if (pTerm^.prereqAll and pLoop^.maskSelf) <> 0 then
+      begin
+        if (not ExprHasProperty(pTerm^.pExpr, EP_OuterON))
+           or (pTerm^.pExpr^.w.iJoin <> pItem^.iCursor) then
+        begin
+          broke := True;
+          break;
+        end;
+      end;
+      if hasRightJoin
+         and ExprHasProperty(pTerm^.pExpr, EP_InnerON)
+         and (pTerm^.pExpr^.w.iJoin = pItem^.iCursor) then
+      begin
+        broke := True;   { restriction (5) }
+        break;
+      end;
+    end;
+    if broke then continue;
+
+    { -> omit unused FROM-clause term }
+    m1 := (Bitmask(1) shl i) - 1;
+    pWInfo^.revMask :=
+      (m1 and pWInfo^.revMask) or ((pWInfo^.revMask shr 1) and (not m1));
+    notReady := notReady and (not pLoop^.maskSelf);
+    for k := 0 to nTermWC - 1 do
+    begin
+      pTerm := @pTermBase[k];
+      if (pTerm^.prereqAll and pLoop^.maskSelf) <> 0 then
+      begin
+        pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+        pTerm^.prereqAll := 0;
+      end;
+    end;
+    if i <> pWInfo^.nLevel - 1 then
+    begin
+      nByte := SizeInt(pWInfo^.nLevel - 1 - i) * SizeOf(TWhereLevel);
+      Move(aLevels[i + 1], aLevels[i], nByte);
+    end;
+    pWInfo^.nLevel := pWInfo^.nLevel - 1;
+    Assert(pWInfo^.nLevel > 0);
+  end;
+  Result := notReady;
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
@@ -26230,6 +26327,23 @@ begin
     { where.c:7197 — accumulate row-count estimate. }
     pParse^.nQueryLoop := i16(pParse^.nQueryLoop + pWInfo^.nRowOut);
 
+    { where.c:7160..7179 — attempt to omit tables from a join that do not
+      affect the result (whereOmitNoopJoin).  Factored into a separate
+      "no-inline" procedure upstream.  The reduced nLevel is reflected back
+      into nTabList so the cursor-open + per-level codegen loops below see
+      the trimmed plan.  notReady starts all-ones; the omitted levels have
+      their bit cleared so later seek-readiness checks treat them as ready. }
+    notReady := not Bitmask(0);
+    if (pWInfo^.nLevel >= 2)
+       and (pResultSet <> nil)
+       and ((wctrlFlags and (WHERE_AGG_DISTINCT or WHERE_KEEP_ALL_JOINS)) = 0)
+       and OptimizationEnabled(db, SQLITE_OmitNoopJoin) then
+    begin
+      notReady := whereOmitNoopJoin(pWInfo, notReady);
+      nTabList := pWInfo^.nLevel;
+      Assert(nTabList > 0);
+    end;
+
     v := sqlite3GetVdbe(pParse);
     if v = nil then
     begin
@@ -26525,8 +26639,9 @@ begin
     end;
     pWInfo^.iTop := sqlite3VdbeCurrentAddr(v);
 
-    { where.c:7431..7473 — emit code for each nested loop. }
-    notReady := not Bitmask(0);
+    { where.c:7431..7473 — emit code for each nested loop.  notReady was
+      seeded at where.c:7170 (above) and possibly narrowed by
+      whereOmitNoopJoin; C never re-initialises it here, so neither do we. }
     for ii := 0 to nTabList - 1 do
     begin
       if pParse^.nErr <> 0 then
