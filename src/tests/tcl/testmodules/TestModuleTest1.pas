@@ -406,6 +406,32 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:8708..8729 — test_dbconfig_maindbname_icecube.
+  Usage: dbconfig_maindbname_icecube DB
+  Change the name of the main database schema from "main" to "icecube". }
+function test_dbconfig_maindbname_icecube(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: cint;
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  rc := sqlite3_db_config_text(db, SQLITE_DBCONFIG_MAINDBNAME,
+    PAnsiChar('icecube'));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+end;
+
 { test1.c:2876..2911 — test_atomic_batch_write.
   Usage: atomic_batch_write PATH
   Returns 1 if the VFS reports SQLITE_IOCAP_BATCH_ATOMIC for PATH. }
@@ -1013,6 +1039,72 @@ begin
   zSql[j] := #0;
   rc := sqlite3_exec(db, zSql, @execPrintfCb, @str, @zErr);
   FreeMem(zSql);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  StrPCopy(zBuf, IntToStr(rc));
+  Tcl_AppendElement(interp, @zBuf[0]);
+  if rc = SQLITE_OK then
+    Tcl_AppendElement(interp, Tcl_DStringValue(@str))
+  else if zErr <> nil then
+    Tcl_AppendElement(interp, zErr)
+  else
+    Tcl_AppendElement(interp, PChar(''));
+  Tcl_DStringFree(@str);
+  if zErr <> nil then sqlite3_free(zErr);
+  Result := TCL_OK;
+end;
+
+{ test1.c:331..375 — test_exec_hex.
+  Usage: sqlite3_exec_hex DB HEX.
+  Copies HEX into a 501-byte buffer, replacing each "%XX" with the raw
+  byte 0xXX (test1.c:357..364), then runs sqlite3_exec with execPrintfCb
+  accumulating into a Tcl_DString and appends "{rc} {result-or-err}".
+  Must be a native command (not a Tcl shim) so the raw 0xFF/0xFE bytes
+  reach sqlite3_exec unchanged — a Tcl `db eval` would UTF-8 re-encode
+  them (0xFF -> 0xC3 0xBF), corrupting the LIKE-range optimisation tests
+  like-9.4.3 / 9.5.1 / 9.5.2. }
+function test_exec_hex(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db:    PTsqlite3;
+  rc:    i32;
+  zErr:  PAnsiChar;
+  str:   TTclDString;
+  zBuf:  array[0..29] of AnsiChar;
+  zSql:  array[0..500] of AnsiChar;
+  zHex:  PAnsiChar;
+  av:    PPAnsiCharArr;
+  i, j:  cint;
+begin
+  av := argv;
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB HEX'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zHex := av[2];
+  zErr := nil;
+  i := 0; j := 0;
+  while (i < (SizeOf(zSql) - 1)) and (zHex[j] <> #0) do
+  begin
+    if (zHex[j] = '%') and (zHex[j+1] <> #0) and (zHex[j+2] <> #0) then
+    begin
+      zSql[i] := AnsiChar((testHexToInt(Ord(zHex[j+1])) shl 4)
+                        + testHexToInt(Ord(zHex[j+2])));
+      Inc(j, 2);
+    end
+    else
+      zSql[i] := zHex[j];
+    Inc(i); Inc(j);
+  end;
+  zSql[i] := #0;
+  Tcl_DStringInit(@str);
+  rc := sqlite3_exec(db, @zSql[0], @execPrintfCb, @str, @zErr);
   FillChar(zBuf, SizeOf(zBuf), 0);
   StrPCopy(zBuf, IntToStr(rc));
   Tcl_AppendElement(interp, @zBuf[0]);
@@ -3873,6 +3965,7 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -8303,6 +8396,9 @@ begin
     @get_sqlite_pointer, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
+  { misc8.test — test1.c:9187 dbconfig_maindbname_icecube. }
+  Tcl_CreateObjCommand(interp, PChar('dbconfig_maindbname_icecube'),
+    @test_dbconfig_maindbname_icecube, nil, nil);
   { 9.4.divbug.88.003 — test1.c:9173 sqlite3_db_cacheflush. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_cacheflush'),
     @test_db_cacheflush, nil, nil);
@@ -8364,6 +8460,11 @@ begin
     @install_fts3_rank_function, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_exec'),
     @test_exec, nil, nil);
+  { test1.c:331..375 / registered test1.c:9073 — sqlite3_exec_hex DB HEX.
+    Native command so %ff/%fe decode to raw bytes (a Tcl shim would
+    UTF-8 re-encode them and break the LIKE-range opt tests). }
+  Tcl_CreateCommand(interp, PChar('sqlite3_exec_hex'),
+    @test_exec_hex, nil, nil);
   { 9.4.divbug.88.047 — sqlite3_exec_printf DB FORMAT STRING.
     test1.c:299..328, registered at test1.c:9072.  Used by
     laststmtchanges-1.2.1 to inject a value into a CREATE TABLE statement
@@ -8666,10 +8767,22 @@ begin
     verify the optimizer correctly elides ORDER BY sorts. }
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
     @sqlite3_sort_count, TCL_LINK_INT);
+  { test1.c:9374 Tcl_LinkVar(sqlite_like_count) — LIKE/GLOB invocation
+    counter (func.c:891) for like.test 3.x / 4.x / 5.x. }
+  Tcl_LinkVar(interp, PChar('sqlite_like_count'),
+    @sqlite3_like_count, TCL_LINK_INT);
   { test1.c:9395 — expose the alignment-collation counter so utf16align.test
     can read/reset it. }
   Tcl_LinkVar(interp, PChar('unaligned_string_counter'),
     @unaligned_string_counter, TCL_LINK_INT);
+  { test1.c:9439..9442 — expose unixSync's fsync/FULLFSYNC counters
+    (sqlite3_sync_count / sqlite3_fullsync_count, os_unix.c:3728..3729)
+    so sync.test / sync2.test / wal2.test can verify that PRAGMA
+    synchronous gates fsync correctly. }
+  Tcl_LinkVar(interp, PChar('sqlite_sync_count'),
+    @sqlite3_sync_count, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('sqlite_fullsync_count'),
+    @sqlite3_fullsync_count, TCL_LINK_INT);
   { 9.4.divbug.62.d — sqlite3_config_uri / _config_pmasz
     (test_malloc.c:1163..1241, registered at test_malloc.c:1497, 1499)
     and sqlite3_reset_auto_extension (test_autoext.c:189..219). }

@@ -2035,6 +2035,15 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 var
   sqlite3_sort_count: i32 = 0;
 
+{ Test-only global incremented by likeFunc on each LIKE/GLOB invocation
+  (func.c:891, 924, 966 — guarded by SQLITE_TEST).  Regression tests
+  (like.test, e_expr-* etc.) read it via the Tcl-linked
+  `sqlite_like_count` variable (test1.c:9374) to verify the optimizer
+  has, or has not, elided LIKE/GLOB function calls.  Always present
+  here; harmless when unused. }
+var
+  sqlite3_like_count: i32 = 0;
+
 { 9.4.divbug.73 — Test-only global incremented by OP_SeekGE/GT/LT/LE on
   success (vdbe.c:4975), by OP_Next/Prev/SorterNext on success (vdbe.c:6532),
   and decremented by OP_Sort/OP_SorterSort (vdbe.c:6351).  Read by regression
@@ -2043,12 +2052,29 @@ var
 var
   sqlite3_search_count: i32 = 0;
 
+{ vdbe.c:90 — largest blob (MEM_Str|MEM_Blob, by Mem.n, excluding zero-padding)
+  ever materialised on the VDBE register stack.  Test-only watermark read by the
+  regression suite via the Tcl-linked `sqlite3_max_blobsize` variable
+  (test1.c:9372).  Bumped by UPDATE_MAX_BLOBSIZE / updateMaxBlobsize. }
+var
+  sqlite3_max_blobsize: i32 = 0;
+
 implementation
 
 uses
   SysUtils,        { Format — used by the Phase 7.4c trace capture }
   passqlite3vtab;  { Phase 6.bis.3a: VTable + sqlite3VtabBegin/CallCreate/CallDestroy/ImportErrmsg
                      — implementation-only to break the interface-side cycle (vtab uses vdbe). }
+
+{ vdbe.c:91 updateMaxBlobsize — record the largest string/blob ever placed in a
+  VDBE register.  Uses p^.n only (the materialised byte count); MEM_Zero blobs
+  carry their padding in u.nZero and are NOT counted, which is exactly how the
+  zeroblob.test watermark proves zeroblobs are never instantiated on the stack. }
+procedure UpdateMaxBlobsize(p: PMem); inline;
+begin
+  if ((p^.flags and (MEM_Str or MEM_Blob)) <> 0) and (p^.n > sqlite3_max_blobsize) then
+    sqlite3_max_blobsize := p^.n;
+end;
 
 { ============================================================================
   Phase 5.2 — vdbeaux.c port
@@ -2704,6 +2730,7 @@ var
   baseSz: u64;
   addr:   i32;
   op:     i32;
+  pTop:   PParse;
 begin
   v := vdbeParsePVdbe(pParse);
   Assert(v <> nil);
@@ -2739,6 +2766,19 @@ begin
     pCtx^.argc at runtime, not pOp^.p5. }
   if (p5 and $2E) <> 0 then
     sqlite3VdbeChangeP5(v, u16(p5 and $2E));
+  { vdbeaux.c:466 — any OP_Function/OP_PureFunc may set sqlite3_result_error
+    at run-time, so the surrounding statement may need to abort.  Marking
+    mayAbort here is what lets a multi-row INSERT (e.g. VALUES(0),(json(...))
+    inside a BEGIN) open a statement-journal savepoint at OP_Transaction and
+    roll back the partial row on a json() "malformed JSON" failure.  Without
+    this call usesStmtJournal stays 0, OP_Transaction skips BeginStmt, and
+    json101-19.3's COMMIT keeps row 0.  Inlined to avoid a uses-cycle on
+    passqlite3codegen.pas — equivalent to sqlite3MayAbort: set bit 1 of the
+    toplevel Parse.parseFlags (PARSEFLAG_MayAbort).  Parse offsets:
+    pToplevel @152 (PParse), parseFlags @40 (u32). }
+  pTop := PPointer(PByte(pParse) + 152)^;
+  if pTop = nil then pTop := pParse;
+  PUInt32(PByte(pTop) + 40)^ := PUInt32(PByte(pTop) + 40)^ or u32(1 shl 1);
   Result := addr;
 end;
 
@@ -6330,6 +6370,14 @@ begin
     Exit;
   end;
 
+  { vdbeapi.c:794..800 — if no other statements are running, reset the
+    interrupt flag so a stale sqlite3_interrupt from a previous statement
+    doesn't immediately abort this one. }
+  if (pStmt^.eVdbeState = VDBE_READY_STATE)
+     and (db <> nil) and (db^.nVdbeActive = 0) then begin
+    db^.u1.isInterrupted := 0;
+  end;
+
   { Transition READY → RUN — vdbeapi.c:815..819 }
   if pStmt^.eVdbeState = VDBE_READY_STATE then begin
     if db <> nil then begin
@@ -6734,6 +6782,9 @@ function sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
                            out ppBlob: Psqlite3_blob): i32;
 begin
   ppBlob := nil;
+  { vdbeblob.c:139..148 — the SQLITE_ENABLE_API_ARMOR misuse guard
+    (sqlite3SafetyCheckOk(db) || zTable==0 || zColumn==0) is applied inside
+    gBlobOpenImpl (codegen), where sqlite3SafetyCheckOk is reachable. }
   if (db = nil) or (zTable = nil) or (zColumn = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
@@ -9367,34 +9418,48 @@ end;
   from the integer arm — without it a string like '3.14abc' would
   truncate to integer 3 (C falls through to MEM_Real with rValue=3.14). }
 function numericType(pMem: PMem): u16;
-var r: Double; iVal: i64; rcM: i32;
+var iVal: i64; rcM: i32;
 begin
   if (pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null)) <> 0 then begin
     Result := pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null);
     Exit;
   end;
-  rcM := sqlite3MemRealValueRC(pMem, r);
+  { computeNumericType (vdbe.c:467): the value is a Str/Blob.  Materialise any
+    MEM_Zero padding FIRST so the subsequent writes into the pMem.u union do
+    not clobber u.nZero (which shares the union slot) while MEM_Zero is still
+    set — otherwise a zeroblob operand of an arithmetic op silently loses its
+    trailing zero bytes (ticket bb4bdb9f7f654b0bb9). }
+  if sqlite3VdbeMemExpandBlob(pMem) <> SQLITE_OK then begin
+    pMem^.u.i := 0;
+    Result := MEM_Int;
+    Exit;
+  end;
+  rcM := sqlite3MemRealValueRC(pMem, pMem^.u.r);
   if rcM <= 0 then begin
     if ((rcM and 2) = 0) and
        (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
       pMem^.u.i := iVal;
       Result := MEM_Int;
-    end else begin
-      pMem^.u.r := r;
+    end else
       Result := MEM_Real;
-    end;
   end else if ((rcM and 2) = 0) and
               (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
     pMem^.u.i := iVal;
     Result := MEM_Int;
-  end else begin
-    pMem^.u.r := r;
+  end else
     Result := MEM_Real;
-  end;
 end;
 
 { sqlite3BlobCompare — compare two blob/binary Mem values.
   Port of vdbeaux.c:4508. }
+function memIsAllZero(z: Pu8; n: i32): Boolean;
+var i: i32;
+begin
+  for i := 0 to n - 1 do
+    if z[i] <> 0 then begin Result := False; Exit; end;
+  Result := True;
+end;
+
 function sqlite3BlobCompare(pB1, pB2: PMem): i32;
 var n1, n2, c, nMin: i32;
 begin
@@ -9404,9 +9469,11 @@ begin
     if (pB1^.flags and pB2^.flags and MEM_Zero) <> 0 then begin
       Result := pB1^.u.nZero - pB2^.u.nZero; Exit;
     end else if (pB1^.flags and MEM_Zero) <> 0 then begin
-      Result := -1; Exit;  { simplified: treat MEM_Zero as less }
+      if not memIsAllZero(Pu8(pB2^.z), pB2^.n) then begin Result := -1; Exit; end;
+      Result := pB1^.u.nZero - n2; Exit;
     end else begin
-      Result := +1; Exit;
+      if not memIsAllZero(Pu8(pB1^.z), pB1^.n) then begin Result := +1; Exit; end;
+      Result := n1 - pB2^.u.nZero; Exit;
     end;
   end;
   if n1 < n2 then nMin := n1 else nMin := n2;
@@ -9735,6 +9802,7 @@ var
   { 5.4c locals — record I/O }
   pCol:    PVdbeCursor;   { OP_Column: cursor being read }
   p2col:   u32;           { OP_Column: column index }
+  iAltMap: u32;           { OP_Column: index-alias map entry (vdbe.c:3025) }
   aOffset: Pu32;          { OP_Column: aOffset array pointer }
   lenCol:  i32;           { OP_Column: data length }
   zData:   Pu8;           { OP_Column: pointer into page data }
@@ -10140,6 +10208,7 @@ begin
       pOut^.enc := enc;
       rc := sqlite3VdbeMemTooBig(pOut);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1566 }
     end;
 
     { ────── OP_String8 / OP_String ────── (vdbe.c:1414/1458)
@@ -10181,6 +10250,7 @@ begin
       if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
          (aMem[pOp^.p3].u.i = pOp^.p5) then
         pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1465 }
     end;
 
     OP_String: begin
@@ -10192,6 +10262,7 @@ begin
       if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
          (aMem[pOp^.p3].u.i = pOp^.p5) then
         pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1465 }
     end;
 
     { ────── OP_Concat ────── (vdbe.c:1791)
@@ -10227,6 +10298,7 @@ begin
         pOut^.n   := nByte;
         pOut^.enc := enc;
       end;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1849 }
     end;
 
     { ────── OP_Move ────── (vdbe.c:1601) }
@@ -10336,7 +10408,7 @@ begin
     OP_OpenRead,
     OP_OpenWrite: begin
       if (v^.vdbeFlags and VDBF_EXPIRED_MASK) = 1 then begin
-        rc := SQLITE_ABORT or (1 shl 8);  { SQLITE_ABORT_ROLLBACK }
+        rc := SQLITE_ABORT_ROLLBACK;  { vdbe.c:4395 — was wrongly (1 shl 8); C sqlite.h.in:562 defines it as SQLITE_ABORT|(2<<8) }
         goto abort_due_to_error;
       end;
       nField   := 0;
@@ -10661,10 +10733,11 @@ begin
     OP_Column: begin
       pCol   := v^.apCsr[pOp^.p1];
       p2col  := u32(pOp^.p2);
-      aOffset := Pu32(Pu8(pCol) + 120 + u32(pCol^.nField) * SizeOf(u32));
-      { aOffset = pCol->aType + pCol->nField }
 
       op_column_restart:
+      { vdbe.c:3000 — aOffset recomputed from current pCol so an aAltMap
+        redirect (below) lands on the alias cursor's aType/aOffset. }
+      aOffset := Pu32(Pu8(pCol) + 120 + u32(pCol^.nField) * SizeOf(u32));
       if pCol^.cacheStatus <> v^.cacheCtr then begin
         if pCol^.nullRow <> 0 then begin
           if (pCol^.eCurType = CURTYPE_PSEUDO) and (pCol^.seekResult > 0) then begin
@@ -10680,6 +10753,19 @@ begin
         end else begin
           pCrsr := pCol^.uc.pCursor;
           if pCol^.deferredMoveto <> 0 then begin
+            { vdbe.c:3025..3031 — covering-index alias redirect: if the
+              table cursor was set up by OP_DeferredSeek with an aAltMap
+              (P4_INTARRAY), and the requested column maps to an index
+              column, read directly from the index cursor and skip the
+              deferred table seek entirely (saves a sqlite3_search_count
+              tick for covering-index OR plans — see whereD-3.5.1). }
+            if (pCol^.ub.aAltMap <> nil)
+               and (Pu32(pCol^.ub.aAltMap)[1 + p2col] > 0) then begin
+              iAltMap := Pu32(pCol^.ub.aAltMap)[1 + p2col];
+              pCol    := pCol^.pAltCursor;
+              p2col   := iAltMap - 1;
+              goto op_column_restart;
+            end;
             rc := sqlite3VdbeFinishMoveto(pCol);
             if rc <> SQLITE_OK then goto abort_due_to_error;
           end else if sqlite3BtreeCursorHasMoved(pCrsr) <> 0 then begin
@@ -10816,7 +10902,7 @@ begin
       end;
 
       op_column_out:
-      { UPDATE_MAX_BLOBSIZE — update db->szMalloc watermark (skip for now) }
+      UpdateMaxBlobsize(pDest);   { vdbe.c:3256 UPDATE_MAX_BLOBSIZE(pDest) }
     end;
 
     { ────── OP_MakeRecord ────── (vdbe.c:3469) }
@@ -10929,6 +11015,7 @@ begin
         pOut^.u.nZero := nZeroMR;
         pOut^.flags := pOut^.flags or MEM_Zero;
       end;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:3710 }
       zHdrMR := Pu8(pOut^.z);
       zPayMR := zHdrMR + nHdr;
 
@@ -11765,6 +11852,7 @@ begin
       end;
       rc := sqlite3VdbeChangeEncoding(@aMem[pOp^.p1], enc);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+      UpdateMaxBlobsize(@aMem[pOp^.p1]);   { vdbe.c:7998 }
     end;
 
     { ────── OP_Real ────── (vdbe.c:1397)
@@ -11819,6 +11907,7 @@ begin
       Move(pVarH^, pOut^, MEMCELLSIZE);
       pOut^.flags := pOut^.flags and not u16(MEM_Dyn or MEM_Ephem);
       pOut^.flags := pOut^.flags or u16(MEM_Static or MEM_FromBind);
+      UpdateMaxBlobsize(pOut);   { vdbe.c:1588 }
     end;
 
     { ────── OP_CollSeq ────── (vdbe.c:1992)
@@ -11863,6 +11952,7 @@ begin
       end;
       rc := sqlite3VdbeMemCast(pIn1, u8(pOp^.p2), enc);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+      UpdateMaxBlobsize(pIn1);   { vdbe.c:2175 }
     end;
 
     { ────── OP_And / OP_Or ────── (vdbe.c:2594)
@@ -12052,6 +12142,7 @@ begin
         pCtxAgg^.isError := 0;
         if rc <> 0 then goto abort_due_to_error;
       end;
+      UpdateMaxBlobsize(pOut);   { vdbe.c:8898 }
     end;
 
     { ────── OP_Noop / OP_Explain ────── }
@@ -12535,6 +12626,7 @@ begin
           if sqlite3VdbeMemMakeWriteable(pDest) <> SQLITE_OK then goto no_mem;
         end;
       end;
+      UpdateMaxBlobsize(pDest);   { vdbe.c:6139 }
     end;
 
     { ────── OP_RowCell ────── (vdbe.c:5847) }
@@ -13385,6 +13477,7 @@ begin
                              SQLITE_UTF8, SQLITE_DYNAMIC);
       end;
       sqlite3VdbeChangeEncoding(@aMem[pOp^.p1 + 1], enc);
+      UpdateMaxBlobsize(@aMem[pOp^.p1]);   { vdbe.c:7296 }
       goto check_for_interrupt;
     end;
 
@@ -13772,6 +13865,7 @@ begin
           rc := sCtxV.isError;
         end;
         sqlite3VdbeChangeEncoding(pOut, enc);
+        UpdateMaxBlobsize(pOut);   { vdbe.c:8596 }
         if rc <> SQLITE_OK then goto abort_due_to_error;
       end;
     end;

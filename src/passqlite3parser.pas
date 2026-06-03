@@ -1151,7 +1151,8 @@ begin
   until (tt <> TK_SPACE) and (tt <> TK_COMMENT);
   { Tokens that behave as identifiers in the grammar }
   if (tt = TK_ID) or (tt = TK_STRING) or (tt = TK_JOIN_KW) or
-     (tt = TK_WINDOW) or (tt = TK_OVER) then
+     (tt = TK_WINDOW) or (tt = TK_OVER) or
+     (sqlite3ParserFallback(tt) = TK_ID) then
     Result := TK_ID
   else
     Result := tt;
@@ -1282,6 +1283,7 @@ var
   pPse:            PParse;
   zCur:            PAnsiChar;
   tok:             TToken;
+  zMsg:            PAnsiChar;
 begin
   pPse := pParse;
   nErr := 0;
@@ -1352,13 +1354,25 @@ begin
         Inc(zCur, n);
         Continue;
       end else if tokenType <> TK_QNUMBER then begin
-        { Mirror tokenize.c: include the offending token text and stamp
-          db^.errByteOffset so the CLI caret marker (10.1.bug.80) anchors
-          under the bad token. }
-        sqlite3ErrorMsg(pPse,
-          PAnsiChar('unrecognized token: "'
-                    + Copy(AnsiString(PAnsiChar(zCur)), 1, n)
-                    + '"'));
+        { Mirror tokenize.c:707: sqlite3ErrorMsg(pParse, "unrecognized token: \"%T\"", &x);
+          Format via sqlite3MPrintf with %.*s (the bad token isn't NUL-
+          terminated at position n; and may itself contain '%' chars,
+          e.g. misc4-7.1's "[M%s%s%s..." which previously truncated to
+          "[M" when sqlite3ErrorMsg re-printf'd the literal as a format).
+          Inline the sqlite3ErrorMsg bookkeeping (nErr++, rc, zErrMsg)
+          so the already-formatted message isn't re-interpreted. }
+        if (db <> nil) and (db^.suppressErr <> 0) then begin
+          Inc(pPse^.nErr);
+          pPse^.rc := SQLITE_ERROR;
+        end else begin
+          zMsg := sqlite3MPrintf(db, 'unrecognized token: "%.*s"', [n, zCur]);
+          Inc(pPse^.nErr);
+          pPse^.rc := SQLITE_ERROR;
+          if zMsg <> nil then begin
+            if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+            pPse^.zErrMsg := zMsg;
+          end;
+        end;
         if db <> nil then
           db^.errByteOffset :=
             i32(PtrUInt(zCur) - PtrUInt(pPse^.zTail));
@@ -1468,11 +1482,21 @@ end;
 { ---- parserStackRealloc — grow stack on demand (yyGrowStack equivalent) -- }
 function parserStackRealloc(p: PyyParser): i32;
 var
-  oldSize, newSize, idx: i32;
+  oldSize, newSize, idx, nLimit: i32;
   pNew: PyyStackEntry;
+  pPse: PParse;
 begin
   oldSize := 1 + i32(p^.yystackEnd - p^.yystack);
   newSize := oldSize * 2 + 100;
+  { Enforce SQLITE_LIMIT_PARSER_DEPTH (parse.c parserStackSizeLimit, YYSIZELIMIT) }
+  pPse := PParse(p^.pParse);
+  if (pPse <> nil) and (pPse^.db <> nil) then begin
+    nLimit := pPse^.db^.aLimit[12 { SQLITE_LIMIT_PARSER_DEPTH }];
+    if newSize > nLimit then begin
+      newSize := nLimit;
+      if newSize <= oldSize then begin Result := 1; Exit; end;
+    end;
+  end;
   idx := i32(p^.yytos - p^.yystack);
   if p^.yystack = @p^.yystk0[0] then begin
     GetMem(pNew, newSize * SizeOf(yyStackEntry));

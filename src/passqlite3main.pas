@@ -659,7 +659,8 @@ const
   SQLITE_DEFAULT_WORKER_THREADS    = 0;
 
 const
-  aHardLimit: array[0..11] of i32 = (
+  SQLITE_MAX_PARSER_DEPTH = 1000;
+  aHardLimit: array[0..12] of i32 = (
     SQLITE_MAX_LENGTH,
     SQLITE_MAX_SQL_LENGTH,
     SQLITE_MAX_COLUMN_LIMIT,
@@ -671,7 +672,8 @@ const
     SQLITE_MAX_LIKE_PATTERN_LENGTH,
     SQLITE_MAX_VARIABLE_NUMBER,
     SQLITE_MAX_TRIGGER_DEPTH,
-    SQLITE_MAX_WORKER_THREADS_LIMIT
+    SQLITE_MAX_WORKER_THREADS_LIMIT,
+    SQLITE_MAX_PARSER_DEPTH
   );
 
 { ----------------------------------------------------------------------
@@ -936,6 +938,8 @@ begin
     u64($00010000) or        { SQLITE_LoadExtension_Bit — main.c:3473 default-on }
     (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
     (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
+    u64($20000000) or        { SQLITE_DqsDDL — SQLITE_DQS=3 legacy default (main.c:3453..3462) }
+    u64($40000000) or        { SQLITE_DqsDML — SQLITE_DQS=3 legacy default }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
 
   sqlite3HashInit(@db^.aCollSeq);
@@ -1067,6 +1071,12 @@ begin
     rc := sqlite3_errcode(db);
     if rc <> SQLITE_OK then goto opendb_out;
   end;
+
+  { main.c:3654 — install the default WAL auto-checkpoint hook so that
+    `PRAGMA wal_autocheckpoint` reports SQLITE_DEFAULT_WAL_AUTOCHECKPOINT
+    (1000) on a fresh connection and auto-checkpoints fire at that
+    frame threshold (walhook-2.1, e_walauto). }
+  sqlite3_wal_autocheckpoint(db, SQLITE_DEFAULT_WAL_AUTOCHECKPOINT);
 
 opendb_out:
   if (rc and $FF) = SQLITE_NOMEM then begin
@@ -3404,13 +3414,20 @@ begin
     sqlite_master.  Without the qualifier, every iDb>0 fell through to
     main's sqlite_master and CREATE TABLE in attached dbs never appeared
     in the cache. }
+  { prepare.c:366 appends "ORDER BY rowid" so the schema rows are visited
+    in creation order: a CREATE TABLE row is always processed before the
+    auto-index row it owns (sqlite3InitCallback branch (d) needs the parent
+    Index struct to already exist).  Without this, PRAGMA
+    reverse_unordered_selects=ON reverses the unordered schema scan and the
+    sqlite_autoindex_<tab>_1 row is read first → "orphan index"
+    (rowid-15.0). }
   if iDb = 1 then
     zSql := sqlite3MPrintf(db,
-              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+              'SELECT type,name,tbl_name,rootpage,sql FROM %s ORDER BY rowid',
               [LEGACY_TEMP_SCHEMA_TABLE])
   else
     zSql := sqlite3MPrintf(db,
-              'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s',
+              'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s ORDER BY rowid',
               [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
@@ -3443,6 +3460,23 @@ begin
     of step 11g.1+. }
   // if (rc = SQLITE_OK) and (initData.nInitRow = 0) then
   //   rc := SQLITE_CORRUPT;
+  { Port-local NoSchemaError swallow — see prepare.c:393 in sqlite3InitOne.
+    Because we drop the WHERE/ORDER BY filter on the schema-cache SELECT
+    (banner above), this OP_ParseSchema iterates every sqlite_schema row
+    on every fire — including rows whose CREATE text is corrupt (e.g.
+    after PRAGMA writable_schema=ON; UPDATE sqlite_master...; VACUUM in
+    misc4-7.2).  C's vdbe.c:7152..7154 filters by the caller-supplied
+    "tbl_name=... AND type!=..." predicate so a corrupt unrelated row is
+    never touched.  Until the productive Select-with-WHERE arm is wired
+    here, mirror sqlite3InitOne's writable_schema lenience: when
+    SQLITE_NoSchemaError is set, swallow non-NOMEM failures.  This keeps
+    misc4-7.2 (and any later writable_schema/VACUUM corruption tests)
+    aligned with the C reference. }
+  if (rc <> SQLITE_OK)
+     and ((db^.flags and SQLITE_NoSchemaError_Bit) <> 0)
+     and (rc <> SQLITE_NOMEM) then begin
+    rc := SQLITE_OK;
+  end;
   sqlite3DbFree(db, zSql);
   Result := rc;
 end;
@@ -5531,6 +5565,15 @@ begin
   sqlite3PagerPagecount(pPgr, @nPage);
   szPage := sqlite3BtreeGetPageSize(pBt);
   sz     := i64(nPage) * szPage;
+  { memdb.c:802 — a fresh, never-written-to database has page_count 0.
+    Force page 1 to come into existence with a BEGIN IMMEDIATE;COMMIT;,
+    then re-read the page count, so the serialized image is non-empty. }
+  if sz = 0 then begin
+    sqlite3_exec(db, 'BEGIN IMMEDIATE; COMMIT;', nil, nil, nil);
+    nPage := 0;
+    sqlite3PagerPagecount(pPgr, @nPage);
+    sz := i64(nPage) * szPage;
+  end;
   if piSize <> nil then piSize^ := sz;
   if (mFlags and SQLITE_SERIALIZE_NOCOPY) <> 0 then begin
     Result := nil; Exit;

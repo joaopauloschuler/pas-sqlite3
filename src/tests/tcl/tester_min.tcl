@@ -322,6 +322,10 @@ proc finalize_testing {} {
 # the BODY and `ifcapable foo` runs ELSEBODY.
 array set ::sqlite_options {}
 set ::sqlite_options(allow_rowid_in_view) 0
+# test_config.c sets hiddencolumns from SQLITE_ENABLE_HIDDEN_COLUMNS, which the
+# oracle does NOT define (and neither does this FPC build), so the name-based
+# __hidden__ column mechanism is a no-op.  Pin it 0 to match the oracle.
+set ::sqlite_options(hiddencolumns) 0
 # 6.40.1.o — pas-sqlite3 now ships FTS3/FTS4 (passqlite3fts3.pas, registered
 # by sqlite3Fts3Init at openDatabase).  Mirror test_config.c:437..453: this
 # build defines SQLITE_ENABLE_FTS3 and does NOT define SQLITE_DISABLE_FTS3_UNICODE
@@ -368,6 +372,15 @@ set ::sqlite_options(stat4) 0
 # oracle.  Without this, the cap defaults to 1 below and the section wrongly
 # RUNS, expecting {main tab1 colN} where the engine honestly returns {}.
 set ::sqlite_options(columnmetadata) 0
+# cursorhint2.test is gated by `ifcapable !cursorhints {finish_test; return}`.
+# The C reference oracle build does NOT define SQLITE_ENABLE_CURSOR_HINTS
+# (verified: PRAGMA compile_options has no cursor/hint entry), so
+# test_config.c:156..160 writes cursorhints=0 and upstream SKIPS this test.
+# pas-sqlite3 likewise makes codeCursorHint a deliberate no-op
+# (passqlite3codegen.pas:71144), matching the oracle's default build.  Without
+# this, the cap defaults to 1 below → the test wrongly RUNS and fails because no
+# OP_CursorHint opcodes are emitted.
+set ::sqlite_options(cursorhints) 0
 # uri2.test is gated by `ifcapable !uri_00_error`.  A vanilla build does NOT
 # define SQLITE_ENABLE_URI_00_ERROR, so test_config.c writes no uri_00_error
 # cap and the oracle SKIPS this test (the !SQLITE_ENABLE_URI_00_ERROR arm in
@@ -396,6 +409,13 @@ set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
+# pas-sqlite3's unixSync_impl (passqlite3os.pas) does NOT port the os_unix.c
+# UNIXFILE_DIRSYNC arm (no openDirectory + dirfd fsync after the journal sync);
+# directory fsyncs are effectively disabled, matching a SQLITE_DISABLE_DIRSYNC
+# build (test_config.c:116..119).  Pin dirsync=0 so sync.test / sync2.test /
+# wal2.test's cond_incr_sync_count adjusts the expected count to match the
+# engine's actual fsync tally.
+set ::sqlite_options(dirsync) 0        ;# unixSync omits the dir-fsync arm
 set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
 # pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
 # behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its
@@ -406,6 +426,24 @@ set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREA
 # connection PRAGMA data_version bumps that only occur with a shared cache) SKIP
 # instead of running against the unsupported feature path.
 set ::sqlite_options(shared_cache) 0   ;# SQLITE_OMIT_SHARED_CACHE (port omits shared cache)
+# integrityck: engine supports PRAGMA integrity_check (no SQLITE_OMIT_INTEGRITY_CHECK).
+# pragma.test reads $sqlite_options(integrityck) directly (not via ifcapable).
+set ::sqlite_options(integrityck) 1
+# configslower: CONFIG_SLOWDOWN_FACTOR multiplier; like.test uses it as a numeric
+# scale for timing budgets. Mirror upstream test_config.c default (1.0).
+set ::sqlite_options(configslower) 1.0
+# rtree: pas-sqlite3 omits the rtree virtual-table module — pin to 0 so
+# `ifcapable rtree { ... }` blocks (alterlegacy-14.x etc.) SKIP rather than
+# run and hit "no such module: rtree".
+set ::sqlite_options(rtree) 0
+
+# sqlite3_exec_hex is provided natively by the sqlite3 test package
+# (TestModuleTest1.test_exec_hex, a faithful port of test1.c:test_exec_hex).
+# A pure-Tcl shim was previously defined here, but `[format %c $byte]` makes a
+# Unicode char that the SQLite Tcl binding then UTF-8 re-encodes (0xff -> 0xc3
+# 0xbf), so raw high-byte LIKE patterns never reached sqlite3_exec as single
+# bytes — breaking like-9.4.3 / 9.5.1 / 9.5.2.  The native command decodes
+# %HH to raw bytes and calls sqlite3_exec directly, matching the C oracle.
 
 proc ifcapable {expr code {else ""} {elsecode ""}} {
   set e2 ""
@@ -459,6 +497,15 @@ proc catchsql {sql {db db}} {
 proc do_catchsql_test {testname sql result} {
   fix_testname testname
   uplevel do_test [list $testname] [list "catchsql {$sql}"] [list $result]
+}
+
+# delete_all_data — upstream tester.tcl:1159..1163.  Iterate every
+# user table in the open `db` handle and DELETE its rows.  Used by
+# e_insert.test between assertion blocks to clear state.
+proc delete_all_data {} {
+  db eval {SELECT tbl_name AS t FROM sqlite_master WHERE type = 'table'} {
+    db eval "DELETE FROM '[string map {' ''} $t]'"
+  }
 }
 
 # expected — passthrough stub.  Upstream tester.tcl has no such proc as
@@ -1099,6 +1146,30 @@ proc do_eqp_test {name sql res} {
   }
 }
 
+# do_eqp_execsql_test — upstream tester.tcl:1068..1089.  Do both an
+# eqp_test (EXPLAIN QUERY PLAN graph compare) and an execsql_test
+# (result-set compare) on the same SQL, emitting "${name}a" / "${name}b"
+# sub-tests.  Verbatim port of the upstream proc (orderbyB.test:50/72
+# relies on it).  C ref: test/tester.tcl:1068..1089.
+proc do_eqp_execsql_test {name sql res1 res2} {
+  if {[regexp {^\s+QUERY PLAN\n} $res1]} {
+    set query_plan [query_plan_graph $sql]
+    if {[list {*}$query_plan]==[list {*}$res1]} {
+      uplevel [list do_test ${name}a [list set {} ok] ok]
+    } else {
+      uplevel [list \
+        do_test ${name}a [list query_plan_graph $sql] $res1
+      ]
+    }
+  } else {
+    if {[string index $res1 0]!="/"} {
+      set res1 "/*$res1*/"
+    }
+    uplevel do_execsql_test ${name}a [list "EXPLAIN QUERY PLAN $sql"] [list $res1]
+  }
+  uplevel do_execsql_test ${name}b [list $sql] [list $res2]
+}
+
 # do_vmstep_test — upstream tester.tcl:913..933.  Run SQL and verify
 # that the number of "vmsteps" required is greater than or less than
 # some constant.  If $nstep starts with "+", asserts vmstep>=N;
@@ -1241,6 +1312,18 @@ proc drop_all_tables {{db db}} {
   ifcapable trigger&&foreignkey {
     $db eval "PRAGMA foreign_keys = $pk"
   }
+}
+
+# drop_all_indexes — upstream tester.tcl:2277..2284.  Drops every
+# auxiliary (user-created) index from the main database on connection
+# [db].  rowvalue3.test / rowvalue4.test call this inside their foreach
+# index-permutation loops to reset between index variants.  Verbatim
+# port.  C ref: tester.tcl:2277..2284.
+proc drop_all_indexes {{db db}} {
+  set L [$db eval {
+    SELECT name FROM sqlite_master WHERE type='index' AND sql LIKE 'create%'
+  }]
+  foreach idx $L { $db eval "DROP INDEX $idx" }
 }
 
 # ===========================================================================

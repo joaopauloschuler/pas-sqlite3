@@ -73,6 +73,9 @@ var
   { Backing storage for $SQLITE_MAX_COMPOUND_SELECT (test_config.c:814
     LINKVAR).  Required by select7.test.  READ_ONLY on the Tcl side. }
   cv_max_compound_select: cint;
+  { Backing storage for $SQLITE_MAX_COLUMN (test_config.c:811 LINKVAR).
+    Required by e_createtable-3-9.x.  READ_ONLY on the Tcl side. }
+  cv_max_column: cint;
 
 function TclObjTypeName(p: PTclObj): PAnsiChar;
 var
@@ -4829,12 +4832,39 @@ begin
     is undefined → Tcl reads 0 → expected {4 3} comes back as {4 0}. }
   Tcl_LinkVar(interp, PChar('sqlite_search_count'),
               @sqlite3_search_count, TCL_LINK_INT);
+  { test1.c:9372 Tcl_LinkVar( sqlite3_max_blobsize ) — watermark of the
+    largest string/blob materialised on the VDBE register stack.  zeroblob.test
+    reads it to prove trailing zeroblobs are never instantiated. }
+  Tcl_LinkVar(interp, PChar('sqlite3_max_blobsize'),
+              @sqlite3_max_blobsize, TCL_LINK_INT);
+  { with2-5.x — test1.c:9386 Tcl_LinkVar `sqlite3_xferopt_count`.  Counts
+    successful INSERT-from-SELECT xfer optimization invocations
+    (insert.c:3235). }
+  Tcl_LinkVar(interp, PChar('sqlite3_xferopt_count'),
+              @sqlite3_xferopt_count, TCL_LINK_INT);
   Tcl_LinkVar(interp, PChar('sqlite_sort_count'),
               @sqlite3_sort_count, TCL_LINK_INT);
+  { test1.c:9374 Tcl_LinkVar( sqlite_like_count ) — LIKE/GLOB
+    invocation counter (func.c:891) for like.test 3.x / 4.x / 5.x. }
+  Tcl_LinkVar(interp, PChar('sqlite_like_count'),
+              @sqlite3_like_count, TCL_LINK_INT);
   { test1.c:9378 Tcl_LinkVar( sqlite_open_file_count ) — the OS-layer
     open-file-handle counter (passqlite3os.pas), read by exclusive-5.x. }
   Tcl_LinkVar(interp, PChar('sqlite_open_file_count'),
               @sqlite3_open_file_count, TCL_LINK_INT);
+  { test1.c:9439..9442 Tcl_LinkVar( sqlite_sync_count / sqlite_fullsync_count )
+    — fsync()/FULLFSYNC counters from unixSync (passqlite3os.pas) read by
+    sync.test / sync2.test / wal2.test. }
+  Tcl_LinkVar(interp, PChar('sqlite_sync_count'),
+              @sqlite3_sync_count, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('sqlite_fullsync_count'),
+              @sqlite3_fullsync_count, TCL_LINK_INT);
+  { test1.c:9380..9381 Tcl_LinkVar($sqlite_current_time) — when set to a
+    non-zero unix-seconds value, unixCurrentTimeInt64 (os_unix.c:7211) returns
+    the pinned time so date/time tests (e_createtable-3.5/3.8, etc.) are
+    deterministic. }
+  Tcl_LinkVar(interp, PChar('sqlite_current_time'),
+              @sqlite3_current_time, TCL_LINK_INT);
   { Shard 0 fix 2 — attach4.test / attach.test / sqllimits1.test / wal.test
     read $SQLITE_MAX_ATTACHED.  Mirror the C test_config.c:827 LINKVAR
     so the Tcl side sees the same compiled-in limit.  TCL_LINK_READ_ONLY
@@ -4847,6 +4877,11 @@ begin
   cv_max_compound_select := SQLITE_MAX_COMPOUND_SELECT;
   Tcl_LinkVar(interp, PChar('SQLITE_MAX_COMPOUND_SELECT'),
               @cv_max_compound_select, TCL_LINK_INT or TCL_LINK_READ_ONLY);
+  { test_config.c:811 LINKVAR( MAX_COLUMN ).  e_createtable-3-9.x reads
+    $SQLITE_MAX_COLUMN to size a "columns X" expansion. }
+  cv_max_column := SQLITE_MAX_COLUMN;
+  Tcl_LinkVar(interp, PChar('SQLITE_MAX_COLUMN'),
+              @cv_max_column, TCL_LINK_INT or TCL_LINK_READ_ONLY);
   rc := Tcl_PkgProvide(interp, PChar('sqlite3'), PChar(SQLITE_VERSION));
   Result := rc;
 end;

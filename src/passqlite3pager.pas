@@ -5022,7 +5022,8 @@ begin
     AssertH(pPager^.eState <> PAGER_ERROR, 'PagerSetJournalMode: eState=ERROR');
     pPager^.journalMode := u8(eMode);
 
-    AssertH(isOpen(pPager^.fd) <> 0, 'PagerSetJournalMode: fd closed and not exclusive');
+    AssertH((isOpen(pPager^.fd) <> 0) or (pPager^.exclusiveMode <> 0),
+      'PagerSetJournalMode: fd closed and not exclusive');
 
     { When transitioning from TRUNCATE or PERSIST (mask & 5 == 1) to any
       mode whose low bit is 0 (DELETE/MEMORY/OFF), and not in exclusive

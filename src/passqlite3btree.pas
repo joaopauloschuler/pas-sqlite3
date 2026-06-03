@@ -885,7 +885,10 @@ var
 begin
   minLocal := pPage^.minLocal;
   maxLocal := pPage^.maxLocal;
-  surplus := minLocal + i32(i64(pInfo^.nPayload) - minLocal) mod i32(pPage^.pBt^.usableSize - 4);
+  { btree.c:1198 — surplus = minLocal + (nPayload - minLocal) % (usableSize-4);
+    Compute as u32 so a corrupt huge nPayload (e.g. 0xFFFFFFFF) doesn't wrap
+    through signed i32 and produce a negative surplus that aliases via u16. }
+  surplus := i32(u32(minLocal) + (u32(pInfo^.nPayload) - u32(minLocal)) mod u32(pPage^.pBt^.usableSize - 4));
   if surplus <= maxLocal then
     pInfo^.nLocal := u16(surplus)
   else
@@ -5097,8 +5100,13 @@ begin
   end;
   ovflPgno := sqlite3Get4byte(pCell + pInfo^.nSize - 4);
   ovflPageSize := pBt^.usableSize - 4;
-  nOvfl := i32((u32(pInfo^.nPayload) - pInfo^.nLocal + ovflPageSize - 1)
-               div ovflPageSize);
+  { btree.c:6987 — nOvfl = (nPayload - nLocal + ovflPageSize - 1)/ovflPageSize.
+    Computed entirely in u32 so that a corrupt huge nPayload wraps modulo 2^32
+    (matching gcc-emitted code) and yields a tiny quotient.  Otherwise FPC
+    widens to i64 and we end up looping ~8M times on bogus pages
+    (corruptI-6.1). }
+  nOvfl := i32(u32(u32(u32(pInfo^.nPayload) - u32(pInfo^.nLocal))
+                   + u32(ovflPageSize - 1)) div ovflPageSize);
   Result := SQLITE_OK;
   while nOvfl > 0 do begin
     Dec(nOvfl);
