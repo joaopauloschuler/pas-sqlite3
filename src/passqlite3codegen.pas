@@ -73954,6 +73954,7 @@ var
   aiCol:   Pi16;
   pFKb:    Pu8;
   nFkCol:  i32;
+  nAttempt: i32;
 begin
   ppBlob := nil;
   zErr   := nil;
@@ -73982,15 +73983,27 @@ begin
 
   FillChar(sParse, SizeOf(sParse), 0);
   if wrFlag <> 0 then wrFlag := 1;
+  nAttempt := 0;
+  rc := SQLITE_OK;
 
   sqlite3_mutex_enter(db^.mutex);
 
   pBlob := PIncrblob(sqlite3DbMallocZero(db, SizeOf(TIncrblob)));
+
+  { vdbeblob.c:155 — while(1) schema-retry loop.  The whole open body is
+    re-run on a transient SQLITE_SCHEMA error (another connection changed
+    the schema between OP_Transaction's cookie check and the seek), up to
+    SQLITE_MAX_SCHEMA_RETRY times.  pBlob is allocated once, above; pStmt is
+    re-created each iteration (and finalized by blobSeekToRow on the failing
+    iteration). }
+  while True do begin
+  sqlite3ParseObjectInit(@sParse, db);
   if pBlob = nil then begin
     rc := SQLITE_NOMEM; goto blob_open_out;
   end;
+  sqlite3DbFree(db, zErr);
+  zErr := nil;
 
-  sqlite3ParseObjectInit(@sParse, db);
   sqlite3BtreeEnterAll(db);
   pTab := sqlite3LocateTable(@sParse, 0, zTable, zDb);
 
@@ -74119,6 +74132,14 @@ begin
   end;
 
   rc := vdbeBlobSeekToRow(pBlob, iRow, zErr);
+
+  { vdbeblob.c:337 — `if( (++nAttempt)>=SQLITE_MAX_SCHEMA_RETRY ||
+    rc!=SQLITE_SCHEMA ) break; sqlite3ParseObjectReset(&sParse);` }
+  Inc(nAttempt);
+  if (nAttempt >= SQLITE_MAX_SCHEMA_RETRY) or (rc <> SQLITE_SCHEMA) then
+    break;
+  sqlite3ParseObjectReset(@sParse);
+  end; { while True }
 
 blob_open_out:
   if (rc = SQLITE_OK) and (db^.mallocFailed = 0) then begin
