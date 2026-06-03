@@ -22549,7 +22549,8 @@ begin
     if (iTerm >= nConstraint) or (jOff < 0) or (pTerm = nil)
        or (aLT[iTerm] <> nil) or (pIdxCons[i].usable = 0) then
     begin
-      sqlite3ErrorMsg(pPrs, 'xBestIndex malfunction');
+      sqlite3ErrorMsg(pPrs, sqlite3MPrintf(pPrs^.db,
+        '%s.xBestIndex malfunction', [pSrc^.pSTab^.zName]));
       freeIdxStr(pIdxInfo);
       Result := SQLITE_ERROR;
       Exit;
@@ -22586,7 +22587,8 @@ begin
   begin
     if aLT[i] = nil then
     begin
-      sqlite3ErrorMsg(pPrs, 'xBestIndex malfunction');
+      sqlite3ErrorMsg(pPrs, sqlite3MPrintf(pPrs^.db,
+        '%s.xBestIndex malfunction', [pSrc^.pSTab^.zName]));
       freeIdxStr(pIdxInfo);
       Result := SQLITE_ERROR;
       Exit;
