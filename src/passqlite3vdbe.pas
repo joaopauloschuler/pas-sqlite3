@@ -16320,6 +16320,13 @@ end;
 
 initialization
   FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
+  { vdbeapi.c:1295 — the static nullMem returned by columnNullValue() is a
+    const Mem with flags=MEM_Null.  Without MEM_Null set here, a column read
+    of an out-of-range / post-reset statement returns @gNullMem with flags=0,
+    which sqlite3ValueText() then treats as a real value and mutates/caches
+    (leaking a stale "0.0" etc. into every later null-column access). }
+  FillChar(gNullMem, SizeOf(gNullMem), 0);
+  gNullMem.flags := MEM_Null;
   SQLITE_DYNAMIC   := @sqlite3FreeXDel;
   SQLITE_TRANSIENT := TxDelProc(Pointer(-1));
   btreeMovetoIndexHook   := @btreeMovetoIndexImpl;
