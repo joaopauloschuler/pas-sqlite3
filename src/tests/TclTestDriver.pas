@@ -98,7 +98,7 @@ program TclTestDriver;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, Process, Pipes, SyncObjs;
+  SysUtils, Classes, Process, Pipes, SyncObjs, BaseUnix;
 
 const
   PER_TEST_TIMEOUT_MS = 30000;
@@ -650,6 +650,40 @@ begin
   end;
 end;
 
+{ Copy the parent environment into p.Environment, overriding TCLLIBPATH so it
+  contains gBinDir (prepended if already set).  FPC's TProcess replaces — never
+  merges — the inherited environment when p.Environment is non-empty, so every
+  existing variable must be carried across explicitly. }
+procedure SetupChildEnvironment(p: TProcess);
+var
+  i: Integer;
+  e, nm, want, cur: string;
+  eqPos: Integer;
+  haveTcllib: Boolean;
+begin
+  cur := GetEnvironmentVariable('TCLLIBPATH');
+  if cur <> '' then
+    want := gBinDir + ' ' + cur
+  else
+    want := gBinDir;
+  haveTcllib := False;
+  for i := 1 to GetEnvironmentVariableCount do
+  begin
+    e := GetEnvironmentString(i);
+    eqPos := Pos('=', e);
+    if eqPos > 0 then nm := Copy(e, 1, eqPos - 1) else nm := e;
+    if nm = 'TCLLIBPATH' then
+    begin
+      p.Environment.Add('TCLLIBPATH=' + want);
+      haveTcllib := True;
+    end
+    else
+      p.Environment.Add(e);
+  end;
+  if not haveTcllib then
+    p.Environment.Add('TCLLIBPATH=' + want);
+end;
+
 { 9.4.7.g: RunOneCapture is the parallel-safe core — caller passes the
   coverage dump path (pre-allocated under gCovTmpDir, indexed by slot
   ordinal not nTotal) and the caller is responsible for the
@@ -688,6 +722,16 @@ begin
     if cwd <> '' then p.CurrentDirectory := cwd;
     p.Options := [poUsePipes];
     p.ShowWindow := swoHIDE;
+
+    { Inherit the full parent environment but force TCLLIBPATH to include bin/,
+      so a child tclsh the *test* itself spawns (pragma3.test does
+      `exec [info nameofexecutable] script.txt`, running a plain tclsh with no
+      `package require sqlite3`) can auto-load the bare `sqlite3` command via
+      bin/tclIndex.  FPC's TProcess passes its own Environment list verbatim
+      when non-empty (it does NOT merge with the parent), so we must copy every
+      existing var across, then append/override TCLLIBPATH. Mirrors how the
+      upstream testfixture binary has sqlite3 built in. }
+    SetupChildEnvironment(p);
 
     startTick := GetTickCount64;
     try
@@ -1396,6 +1440,7 @@ begin
   gRoot := ResolveRoot;
   gBinDir := IncludeTrailingPathDelimiter(gRoot) + 'bin';
   gSoPath := IncludeTrailingPathDelimiter(gBinDir) + 'libpassqlite3tcl.so';
+
   gTclDir := IncludeTrailingPathDelimiter(gRoot) + 'src' + DirectorySeparator + 'tests' + DirectorySeparator + 'tcl';
   gManifest := IncludeTrailingPathDelimiter(gTclDir) + 'MANIFEST.txt';
 
