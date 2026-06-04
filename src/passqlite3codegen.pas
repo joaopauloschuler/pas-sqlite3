@@ -31775,6 +31775,46 @@ begin
     Result := pRef^.pSTab^.zName;
 end;
 
+{ NestedFromColSchema — schema (database identity) of the originating inner
+  table for pEList entry j of an SF_NestedFrom wrapper.  Parallels
+  NestedFromColTabName but follows down to the real Table->pSchema so the
+  cross-source `*` ambiguity check can distinguish same-named tables that
+  live in different attached databases (matches C, which qualifies by db). }
+function NestedFromColSchema(pWrap: PSrcItem; j: i32): PSchema;
+var
+  pSel:    PSelect;
+  pELst:   PExprList;
+  items_:  PExprListItem;
+  pE2:     PExpr;
+  pInnerS: PSrcList;
+  pRef:    PSrcItem;
+  k:       i32;
+begin
+  Result := nil;
+  if (pWrap = nil) or (pWrap^.u4.pSubq = nil) then Exit;
+  pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+  if pSel = nil then Exit;
+  pELst   := pSel^.pEList;
+  pInnerS := pSel^.pSrc;
+  if (pELst = nil) or (pInnerS = nil) then Exit;
+  if (j < 0) or (j >= pELst^.nExpr) then Exit;
+  items_ := ExprListItems(pELst);
+  pE2 := items_[j].pExpr;
+  if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Exit;
+  pRef := nil;
+  for k := 0 to pInnerS^.nSrc - 1 do
+  begin
+    pRef := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+    if pRef^.iCursor = pE2^.iTable then Break;
+    pRef := nil;
+  end;
+  if pRef = nil then Exit;
+  if (pRef^.fg.fgBits2 and $40) <> 0 then            { inner wrapper }
+    Result := NestedFromColSchema(pRef, pE2^.iColumn)
+  else if pRef^.pSTab <> nil then
+    Result := pRef^.pSTab^.pSchema;
+end;
+
 { NestedFromColNoExpand — is pEList entry j of an SF_NestedFrom wrapper tagged
   bNoExpand (eBits2 bit 0)?  expandStar sets this on USING/NATURAL-coalesced
   duplicate columns (select.c:6300..6306).  Such columns must NOT participate in
@@ -31891,6 +31931,20 @@ var
       Result := nil;
   end;
 
+  function StarColSchema(pIt: PSrcItem; isWrap: Boolean; col: i32): PSchema;
+  begin
+    { Database identity of the source's originating real table.  Two sources
+      with the same effective qualifier collide only if they also share this
+      schema; same table name in a DIFFERENT attached database is NOT
+      ambiguous (C qualifies `*`-expanded refs by database). }
+    if isWrap then
+      Result := NestedFromColSchema(pIt, col)
+    else if pIt^.pSTab <> nil then
+      Result := pIt^.pSTab^.pSchema
+    else
+      Result := nil;
+  end;
+
   function StarColName(pIt: PSrcItem; isWrap: Boolean; col: i32): PAnsiChar;
   begin
     if isWrap then
@@ -31946,6 +32000,7 @@ var
     pItA, pItB: PSrcItem;
     wA, wB: Boolean;
     qA, qB, nmA, nmB: PAnsiChar;
+    schA, schB: PSchema;
   begin
     Result := nil;
     for iA := 0 to pSrc^.nSrc - 1 do
@@ -31962,6 +32017,7 @@ var
         if StarColSkip(pItA, iA, wA, cA) then Continue;
         qA  := StarColQual(pItA, wA, cA);
         nmA := StarColName(pItA, wA, cA);
+        schA := StarColSchema(pItA, wA, cA);
         if (qA = nil) or (nmA = nil) then Continue;
         { Compare against every LATER (source,col) pair. }
         for iB := iA to pSrc^.nSrc - 1 do
@@ -31979,9 +32035,15 @@ var
             if StarColSkip(pItB, iB, wB, cB) then Continue;
             qB  := StarColQual(pItB, wB, cB);
             nmB := StarColName(pItB, wB, cB);
+            schB := StarColSchema(pItB, wB, cB);
             if (qB = nil) or (nmB = nil) then Continue;
+            { Same qualifier + same column name is only ambiguous when the
+              two sources resolve to the SAME database/schema.  `main.t` vs
+              `aux.t` share a qualifier (t) but differ in schema → not
+              ambiguous, matching C (pragma4-211 cross-db `SELECT *`). }
             if (sqlite3StrICmp(qA, qB) = 0)
-               and (sqlite3StrICmp(nmA, nmB) = 0) then
+               and (sqlite3StrICmp(nmA, nmB) = 0)
+               and (schA = schB) then
             begin
               Result := nmA;
               Exit;
