@@ -11754,6 +11754,91 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     stays bound to the inner query, so we must leave it alone.)
     Rewrite each qualifying node to TK_AGG_FUNCTION/op2=1 and set
     bFound. }
+
+  { Faithful port of sqlite3ReferencesSrcList's 0x01-bit (expr.c:7143
+    exprRefToSrcList + 7106 selectRefEnter/Leave): TRUE iff some
+    TK_COLUMN/TK_AGG_COLUMN anywhere in pX's subtree — INCLUDING inside
+    nested expression-subqueries — references a cursor in pRef, where
+    cursors belonging to a nested subquery's own FROM clause are
+    excluded from the search while inside that subquery.
+
+    ExprArgRefsOuterCursor above deliberately does NOT descend into
+    nested expression-subqueries (randexpr1 over-reach guard).  That is
+    correct for the 0x02 "out-of-scope outer" bit, but it MISSES a
+    correlated reference back to pRef that lives inside such a subquery,
+    e.g. sum(x+(SELECT y)) over FROM bb: the inner (SELECT y) references
+    bb, so C keeps sum bound to the bb subquery.  This helper supplies
+    exactly that 0x01 detection so refInner is computed faithfully. }
+  function ExprRefsSrcListThruSubq(pX: PExpr; pRef: PSrcList): Boolean; forward;
+
+  function SelectRefsSrcListThruSubq(pSel: PSelect; pRef: PSrcList): Boolean;
+  var
+    j: i32;
+  begin
+    Result := False;
+    if (pSel = nil) or (pRef = nil) then Exit;
+    { selectRefEnter (expr.c:7106) would add this subquery's own FROM
+      cursors to the exclude set; we do not need an explicit exclude list
+      because a sub-FROM cursor carries a different iCursor than any pRef
+      cursor, so it simply never matches pRef in the walk below.
+      Walk the subquery's expression children looking for pRef refs. }
+    if pSel^.pEList <> nil then
+      for j := 0 to pSel^.pEList^.nExpr - 1 do
+        if ExprRefsSrcListThruSubq(ExprListItems(pSel^.pEList)[j].pExpr, pRef) then
+        begin Result := True; Exit; end;
+    if ExprRefsSrcListThruSubq(pSel^.pWhere,  pRef) then begin Result := True; Exit; end;
+    if ExprRefsSrcListThruSubq(pSel^.pHaving, pRef) then begin Result := True; Exit; end;
+    if pSel^.pGroupBy <> nil then
+      for j := 0 to pSel^.pGroupBy^.nExpr - 1 do
+        if ExprRefsSrcListThruSubq(ExprListItems(pSel^.pGroupBy)[j].pExpr, pRef) then
+        begin Result := True; Exit; end;
+    if pSel^.pOrderBy <> nil then
+      for j := 0 to pSel^.pOrderBy^.nExpr - 1 do
+        if ExprRefsSrcListThruSubq(ExprListItems(pSel^.pOrderBy)[j].pExpr, pRef) then
+        begin Result := True; Exit; end;
+  end;
+
+  function ExprRefsSrcListThruSubq(pX: PExpr; pRef: PSrcList): Boolean;
+  var
+    j: i32;
+    base, pIt: PSrcItem;
+  begin
+    Result := False;
+    if (pX = nil) or (pRef = nil) then Exit;
+    if (pX^.op = TK_COLUMN) or (pX^.op = TK_AGG_COLUMN) then
+    begin
+      base := SrcListItems(pRef);
+      for j := 0 to pRef^.nSrc - 1 do
+      begin
+        pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+        if pX^.iTable = pIt^.iCursor then begin Result := True; Exit; end;
+      end;
+      Exit;
+    end;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if ExprRefsSrcListThruSubq(pX^.pLeft,  pRef) then begin Result := True; Exit; end;
+    if ExprRefsSrcListThruSubq(pX^.pRight, pRef) then begin Result := True; Exit; end;
+    if (pX^.flags and EP_xIsSelect) <> 0 then
+    begin
+      if SelectRefsSrcListThruSubq(pX^.x.pSelect, pRef) then
+      begin Result := True; Exit; end;
+    end
+    else if pX^.x.pList <> nil then
+      for j := 0 to pX^.x.pList^.nExpr - 1 do
+        if ExprRefsSrcListThruSubq(ExprListItems(pX^.x.pList)[j].pExpr, pRef) then
+        begin Result := True; Exit; end;
+  end;
+
+  function ExprListRefsSrcListThruSubq(pList: PExprList; pRef: PSrcList): Boolean;
+  var i: i32;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for i := 0 to pList^.nExpr - 1 do
+      if ExprRefsSrcListThruSubq(ExprListItems(pList)[i].pExpr, pRef) then
+      begin Result := True; Exit; end;
+  end;
+
   procedure FindNestedAggToOuter(pX: PExpr; pOuterSrc: PSrcList;
     pInnerSrc: PSrcList; var bFound: Boolean);
   var
@@ -11794,6 +11879,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
                and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
+        { sqlite3ReferencesSrcList 0x01 bit (expr.c:7152): a correlated
+          reference to the inner FROM that lives inside a nested
+          expression-subquery of the aggregate's args (e.g.
+          sum(x+(SELECT y)) FROM bb) also anchors the aggregate to the
+          inner SELECT.  ExprListArgRefsOuterCursor above does not see it
+          because it skips nested subqueries (aggnested-4.1). }
+        if not refInner then
+          refInner := ExprListRefsSrcListThruSubq(pX^.x.pList, pInnerSrc)
+            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+                and ExprListRefsSrcListThruSubq(pX^.pLeft^.x.pList, pInnerSrc));
         { filter1-6.1 — a FILTER predicate that references the inner
           FROM cursors anchors the aggregate to the inner SELECT.  Do
           not promote to the outer in that case, otherwise the outer
@@ -11994,6 +12090,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
                and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
+        { sqlite3ReferencesSrcList 0x01 bit: correlated reference to the
+          inner FROM inside a nested expression-subquery of the args
+          (aggnested-4.1). }
+        if not refInner then
+          refInner := ExprListRefsSrcListThruSubq(pX^.x.pList, pInnerSrc)
+            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+                and ExprListRefsSrcListThruSubq(pX^.pLeft^.x.pList, pInnerSrc));
         { An aggregate that references any intervening (intermediate) level
           binds there, not at the outer; do not promote. }
         if RefsAnyStack(pX, pSrcStack, nStack) then refInner := True
