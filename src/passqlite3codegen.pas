@@ -5996,6 +5996,10 @@ var
   caseDb:        PTsqlite3;
   { TK_UMINUS runtime-path temp }
   tempX:         TExpr;
+  { TK_IF_NULL_ROW locals }
+  addrINR:       i32;
+  savedOkCF:     u32;
+  pAggInfoINR:   PAggInfo;
 begin
   Result := target;
   v := pParse^.pVdbe;
@@ -6793,6 +6797,46 @@ begin
           C raises "row value misused" and falls through (no OP). }
         sqlite3ErrorMsg(pParse, 'row value misused');
         done := True;
+      end;
+    TK_IF_NULL_ROW:
+      begin
+        { Port of expr.c:5602..5639.  TK_IF_NULL_ROW nodes are inserted ahead
+          of expressions derived from the RHS table of a LEFT JOIN; the wrapped
+          expression is only evaluated when that table (iTable) is not on a
+          LEFT-JOIN NULL row. }
+        pAggInfoINR := pExpr^.pAggInfo;
+        if pAggInfoINR <> nil then
+        begin
+          Assert((pExpr^.iAgg >= 0) and (pExpr^.iAgg < pAggInfoINR^.nColumn));
+          if pAggInfoINR^.directMode = 0 then
+          begin
+            Result := pAggInfoINR^.iFirstReg + pExpr^.iAgg;  { AggInfoColumnReg }
+            done := True;
+          end
+          else if pAggInfoINR^.useSortingIdx <> 0 then
+          begin
+            sqlite3VdbeAddOp3(v, OP_Column, pAggInfoINR^.sortingIdxPTab,
+              pAggInfoINR^.aCol[pExpr^.iAgg].iSorterColumn, target);
+            Result := target;
+            done := True;
+          end;
+        end;
+        if not done then
+        begin
+          addrINR := sqlite3VdbeAddOp3(v, OP_IfNullRow, pExpr^.iTable, 0, target);
+          { The OP_IfNullRow opcode above can overwrite the result register with
+            NULL.  So the result register must not be a value supposed to be a
+            constant.  Two defenses: (1) temporarily disable const factoring,
+            (2) ensure the computed value really is stored in "target". }
+          savedOkCF := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
+          pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
+          sqlite3ExprCode(pParse, pExpr^.pLeft, target);
+          Assert(target = Result);
+          pParse^.parseFlags := (pParse^.parseFlags and (not PARSEFLAG_OkConstFactor))
+                                or savedOkCF;
+          sqlite3VdbeJumpHere(v, addrINR);
+          done := True;
+        end;
       end;
     TK_RAISE:
       begin
@@ -35946,17 +35990,15 @@ begin
            with t2 a UNION ALL view -> [4 3]).  The single-source compound
            flatten + safe re-dispatch is handled separately at
            codegen.pas:33385 (commit 67f987a). }
-         and (pItem^.u4.pSubq^.pSelect^.pPrior = nil)
-         { Skip FROM items that are the right operand of an outer join.
-           C does flatten these (flattenSubquery's isOuterJoin path wraps the
-           substituted result columns in TK_IF_NULL_ROW), but the pas
-           IF_NULL_ROW codegen for a substituted *constant* result column
-           currently yields NULL instead of the constant (select3-11.x / 12.x:
-           `t1 LEFT JOIN (SELECT x,59 AS m FROM t2)`).  Such outer-join FROM
-           subqueries are still materialised here, exactly as before this
-           change, so no runtime regression; only inner-join multi-source
-           subqueries (select6-8.3 / 8.6) are newly flattened. }
-         and ((pItem^.fg.jointype and (JT_OUTER or JT_LTORJ)) = 0) then
+         and (pItem^.u4.pSubq^.pSelect^.pPrior = nil) then
+         { C also flattens FROM items that are the right operand of an outer
+           join (flattenSubquery's isOuterJoin path wraps the substituted
+           result columns in TK_IF_NULL_ROW).  This was previously skipped
+           because the TK_IF_NULL_ROW codegen arm was missing — a substituted
+           constant column yielded NULL instead of the constant.  Now that the
+           expr.c:5602..5639 TK_IF_NULL_ROW arm is ported (with the
+           okConstFactor defense), outer-join multi-source subqueries flatten
+           faithfully (fts3join-4.2). }
       begin
         pSubFC := pItem^.u4.pSubq^.pSelect;
         { Conservatively skip CTE-backed FROM items in this multi-source
