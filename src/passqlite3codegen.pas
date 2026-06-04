@@ -47384,6 +47384,7 @@ var
   ipkColumn:      i32;
   pTabItem0:      PSrcItem;
   needsGenericCoro: Boolean;
+  srcWasSelect:   Boolean;
   addrTopCoro:    i32;
   rcSel:          i32;
   destCoro:       TSelectDest;
@@ -47429,6 +47430,7 @@ begin
   pCoroItem     := nil;
   ipkInSelect   := False;
   useTempTable  := False;
+  srcWasSelect  := False;
   srcTab        := -1;
 
   db := pParse^.db;
@@ -47473,6 +47475,15 @@ begin
      and (pSelect^.pLimit = nil)
      and (pSelect^.pWin = nil) then
   begin
+    { This bare no-FROM SELECT strip is a port-local optimization with no C
+      equivalent (C keeps pSelect non-null for `INSERT...SELECT <exprs>`).
+      Remember the source was genuinely a SELECT so the multi-write/FK
+      semantics below match C: sqlite3BeginWriteOperation must still pass
+      setStatement=1, which makes the parent-side sqlite3FkCheck loop run
+      sqlite3FkLocateIndex (raising "foreign key mismatch" for a malformed
+      FK) instead of taking the immediate-single-row-insert continue at
+      fkey.c:1028..1035. }
+    srcWasSelect := True;
     pList := pSelect^.pEList;
     pSelect^.pEList := nil;
     sqlite3SelectDelete(db, pSelect);
@@ -47530,8 +47541,13 @@ begin
   v := sqlite3GetVdbe(pParse);
   if v = nil then goto insert_cleanup;
   if pParse^.nested = 0 then sqlite3VdbeCountChanges(v);
+  { insert.c:1018 — sqlite3BeginWriteOperation(pParse, pSelect||pTrigger, iDb).
+    In C `INSERT...SELECT <exprs>` keeps pSelect non-null here, so a SELECT
+    source always sets isMultiWrite.  This port may have already stripped a
+    bare no-FROM SELECT into pList (srcWasSelect) — OR that in so the
+    statement is still flagged multi-write, matching C. }
   sqlite3BeginWriteOperation(pParse,
-    i32(ord((pSelect <> nil) or (pTrg <> nil))), iDb);
+    i32(ord((pSelect <> nil) or srcWasSelect or (pTrg <> nil))), iDb);
 
   { xferOptimization — insert.c:1030..1038.  Take the transfer fast path
     for `INSERT INTO t1 SELECT * FROM t2;`.  When it returns 1 the
