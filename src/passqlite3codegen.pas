@@ -12029,6 +12029,79 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin Result := True; Exit; end;
   end;
 
+  { Like ExprRefsSrcListThruSubq but only descends into nested expression-
+    subqueries that have NO FROM clause of their own (a bare `(SELECT <expr>)`).
+    A FROM-less subquery cannot rebind a column, so a TK_COLUMN/TK_AGG_COLUMN
+    inside it that hits pRef is a genuine reference to pRef.  Used to decide
+    refOuter for an aggregate whose argument carries such a correlated bare
+    subquery (rowvalue-30.2) without over-reaching into subqueries that own a
+    FROM (rowvalue-30.3). }
+  function ExprRefsSrcListThruFromlessSubq(pX: PExpr; pRef: PSrcList): Boolean;
+  var
+    j: i32;
+    base, pIt: PSrcItem;
+    pSel: PSelect;
+  begin
+    Result := False;
+    if (pX = nil) or (pRef = nil) then Exit;
+    if (pX^.op = TK_COLUMN) or (pX^.op = TK_AGG_COLUMN) then
+    begin
+      base := SrcListItems(pRef);
+      for j := 0 to pRef^.nSrc - 1 do
+      begin
+        pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+        if pX^.iTable = pIt^.iCursor then begin Result := True; Exit; end;
+      end;
+      Exit;
+    end;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if ExprRefsSrcListThruFromlessSubq(pX^.pLeft,  pRef) then
+    begin Result := True; Exit; end;
+    if ExprRefsSrcListThruFromlessSubq(pX^.pRight, pRef) then
+    begin Result := True; Exit; end;
+    if (pX^.flags and EP_xIsSelect) <> 0 then
+    begin
+      pSel := pX^.x.pSelect;
+      { Only a single-arm (no compound), FROM-less subquery is safe to treat
+        as transparent for outer-reference detection. }
+      if (pSel <> nil) and (pSel^.pPrior = nil)
+         and ((pSel^.pSrc = nil) or (pSel^.pSrc^.nSrc = 0)) then
+      begin
+        if pSel^.pEList <> nil then
+          for j := 0 to pSel^.pEList^.nExpr - 1 do
+            if ExprRefsSrcListThruFromlessSubq(
+                 ExprListItems(pSel^.pEList)[j].pExpr, pRef) then
+            begin Result := True; Exit; end;
+        if ExprRefsSrcListThruFromlessSubq(pSel^.pWhere, pRef) then
+        begin Result := True; Exit; end;
+        if ExprRefsSrcListThruFromlessSubq(pSel^.pHaving, pRef) then
+        begin Result := True; Exit; end;
+      end;
+    end
+    else if pX^.x.pList <> nil then
+      for j := 0 to pX^.x.pList^.nExpr - 1 do
+        if ExprRefsSrcListThruFromlessSubq(
+             ExprListItems(pX^.x.pList)[j].pExpr, pRef) then
+        begin Result := True; Exit; end;
+  end;
+
+  function ExprListRefsSrcListThruFromlessSubq(pList: PExprList;
+    pRef: PSrcList): Boolean;
+  var i: i32;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for i := 0 to pList^.nExpr - 1 do
+      if ExprRefsSrcListThruFromlessSubq(ExprListItems(pList)[i].pExpr,
+                                         pRef) then
+      begin Result := True; Exit; end;
+  end;
+
+  { Forward — FindNestedAggToOuter descends a window function's PARTITION BY /
+    ORDER BY clauses via this list helper, which is defined just below it. }
+  procedure FindNestedAggListToOuter(pList: PExprList; pOuterSrc: PSrcList;
+    pInnerSrc: PSrcList; var bFound: Boolean); forward;
+
   procedure FindNestedAggToOuter(pX: PExpr; pOuterSrc: PSrcList;
     pInnerSrc: PSrcList; var bFound: Boolean);
   var
@@ -12117,6 +12190,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         for j := 0 to pX^.x.pList^.nExpr - 1 do
           FindNestedAggToOuter(ExprListItems(pX^.x.pList)[j].pExpr,
                                pOuterSrc, pInnerSrc, bFound);
+    end;
+    { walker.c:88..89 + walkWindowList — descend a window function's clauses
+      (PARTITION BY / ORDER BY / FILTER) so an aggregate buried in the window
+      spec is reached for outward binding (see FindNestedAggExprDeep). }
+    if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil) then
+    begin
+      FindNestedAggListToOuter(pX^.y.pWin^.pPartition, pOuterSrc, pInnerSrc,
+                               bFound);
+      FindNestedAggListToOuter(pX^.y.pWin^.pOrderBy, pOuterSrc, pInnerSrc,
+                               bFound);
+      FindNestedAggToOuter(pX^.y.pWin^.pFilter, pOuterSrc, pInnerSrc, bFound);
     end;
   end;
 
@@ -12243,6 +12327,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           begin Result := True; Exit; end;
   end;
 
+  { Forward — FindNestedAggExprDeep descends a window function's PARTITION BY /
+    ORDER BY clauses via this list helper, which is defined just below it. }
+  procedure FindNestedAggExprListDeep(pList: PExprList; pOuterSrc: PSrcList;
+    pInnerSrc: PSrcList; depth: i32;
+    const pSrcStack: array of PSrcList; nStack: i32;
+    var bFound: Boolean); forward;
+
   { Scan a single expression at the given select-nesting depth.  Aggregates
     found directly here (not inside an expr-subquery) get op2 := depth when
     promoted to the outer query.  Expression-subqueries are descended via
@@ -12288,6 +12379,28 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
                 and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
                 and ExprListRefsSrcListThruSubq(pX^.pLeft^.x.pList, pInnerSrc));
+        { Same 0x01-bit detection against the OUTER SrcList — the aggregate's
+          argument may reference the outer FROM only through a nested
+          expression-subquery, e.g. sum((SELECT t1.y)) where t1 is the outer
+          FROM (rowvalue-30.2).  ExprListArgRefsOuterCursor above does not
+          descend into such subqueries, so refOuter would otherwise miss it
+          and the aggregate would never be promoted to the outer query.
+
+          Restrict the descent to FROM-less nested subqueries: a subquery with
+          its OWN FROM clause resolves its column refs against that inner FROM
+          (selectRefEnter excludes those cursors), so a reference there is NOT
+          an outer reference.  Descending into such a subquery here would
+          wrongly promote aggregates like
+          sum((SELECT y FROM t1 UNION SELECT x ORDER BY 1)) whose argument
+          subquery owns its FROM — the resulting outer-level codegen of that
+          compound-with-ORDER-BY argument hits multiSelectByMerge with no
+          usable ORDER-BY column (rowvalue-30.3 crash).  Limiting to FROM-less
+          subqueries keeps the 30.2 fix while leaving 30.3 unchanged. }
+        if not refOuter then
+          refOuter := ExprListRefsSrcListThruFromlessSubq(pX^.x.pList, pOuterSrc)
+            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
+                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
+                and ExprListRefsSrcListThruFromlessSubq(pX^.pLeft^.x.pList, pOuterSrc));
         { An aggregate that references any intervening (intermediate) level
           binds there, not at the outer; do not promote. }
         if RefsAnyStack(pX, pSrcStack, nStack) then refInner := True
@@ -12312,6 +12425,24 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end;
         Exit;
       end;
+    end;
+    { walker.c:88..89 + walkWindowList (walker.c:25..42): sqlite3WalkExpr
+      descends into a window function's y.pWin clauses (PARTITION BY, ORDER BY,
+      FILTER).  An aggregate that lives inside a window's PARTITION BY whose
+      argument references the outer FROM (e.g.
+      `max(t1.x) OVER(PARTITION BY sum((SELECT t1.y)))` in
+      `UPDATE t2 SET (a,b)=(SELECT ...) FROM t1`, rowvalue-30.2) must therefore
+      be reached and promoted to the outer aggregate just like any other agg.
+      The FindNested* recursion above only follows pLeft/pRight/x.pList, so
+      descend the window clauses explicitly here. }
+    if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil) then
+    begin
+      FindNestedAggExprListDeep(pX^.y.pWin^.pPartition, pOuterSrc, pInnerSrc,
+                                depth, pSrcStack, nStack, bFound);
+      FindNestedAggExprListDeep(pX^.y.pWin^.pOrderBy, pOuterSrc, pInnerSrc,
+                                depth, pSrcStack, nStack, bFound);
+      FindNestedAggExprDeep(pX^.y.pWin^.pFilter, pOuterSrc, pInnerSrc,
+                            depth, pSrcStack, nStack, bFound);
     end;
     if (pX^.flags and EP_xIsSelect) <> 0 then
     begin
@@ -16193,7 +16324,19 @@ function exprListHasAggFunc(pList: PExprList): Boolean;
   begin
     Result := False;
     if pE = nil then Exit;
-    if pE^.op = TK_AGG_FUNCTION then begin Result := True; Exit; end;
+    { An aggregate whose Expr.op2 (nesting depth) is non-zero was promoted to
+      an ENCLOSING query level (resolve.c:1337..1352 / analyzeAggregate's
+      `walkerDepth==op2` gate); it does NOT belong to *this* sub-SELECT — its
+      accumulator is computed by the outer query and read here as a precomputed
+      value.  Counting it would wrongly mark the window-rewrite sub-SELECT as an
+      aggregate query, so its no-FROM constant row would be coded by the
+      aggregate arm (which emits no SRT_EphemTab row) instead of the no-FROM
+      fast path → empty window source → NULL result.  This is the
+      `UPDATE t2 SET a=(SELECT max(t1.x) OVER(PARTITION BY sum(t1.y))) FROM t1`
+      case (rowvalue-30.2): the sum() partition aggregate is bound to the outer
+      UPDATE-FROM query (op2=1).  Only own-level aggregates (op2=0) count. }
+    if (pE^.op = TK_AGG_FUNCTION) and (pE^.op2 = 0) then
+    begin Result := True; Exit; end;
     if exprHasAgg(pE^.pLeft) then begin Result := True; Exit; end;
     if exprHasAgg(pE^.pRight) then begin Result := True; Exit; end;
     if ((pE^.flags and EP_xIsSelect) = 0)
