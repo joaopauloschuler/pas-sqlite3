@@ -35855,6 +35855,48 @@ begin
   Result := 0;
 end;
 
+{ isSelfJoinView — faithful port of select.c:7061..7096.  Search the FROM
+  range [iFirst,iEnd) for a prior subquery SrcItem that is a reference to the
+  same view/subquery as pThis (same pSTab schema + same name), so its
+  materialisation can be reused via OP_OpenDup.  Returns the prior SrcItem or
+  nil.  pThis must be a subquery item. }
+function isSelfJoinView(pTabList: PSrcList; pThis: PSrcItem;
+                        iFirst, iEnd: i32): PSrcItem;
+var
+  a:    PSrcItem;
+  pIt:  PSrcItem;
+  pSel: PSelect;
+  pS1:  PSelect;
+begin
+  Result := nil;
+  pSel := pThis^.u4.pSubq^.pSelect;
+  if pSel = nil then Exit;
+  { select.c:7071 — if( pSel->selFlags & SF_PushDown ) return 0; }
+  if (pSel^.selFlags and SF_PushDown) <> 0 then Exit;
+  a := SrcListItems(pTabList);
+  while iFirst < iEnd do
+  begin
+    pIt := @a[iFirst];
+    Inc(iFirst);
+    if (pIt^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0 then Continue;
+    if (pIt^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then Continue;
+    if pIt^.zName = nil then Continue;
+    if pIt^.pSTab = nil then Continue;
+    if pThis^.pSTab = nil then Continue;
+    if pIt^.pSTab^.pSchema <> pThis^.pSTab^.pSchema then Continue;
+    if sqlite3_stricmp(pIt^.zName, pThis^.zName) <> 0 then Continue;
+    pS1 := pIt^.u4.pSubq^.pSelect;
+    { select.c:7083 — flattener may leave two different CTE tables with
+      identical names in the same FROM clause. }
+    if (pIt^.pSTab^.pSchema = nil) and (pSel^.selId <> pS1^.selId) then
+      Continue;
+    { select.c:7088 — view modified by pushDownWhereTerms(). }
+    if (pS1^.selFlags and SF_PushDown) <> 0 then Continue;
+    Result := pIt;
+    Exit;
+  end;
+end;
+
 { codeNoFromWhere — code the WHERE clause of a no-FROM SELECT, jumping to
   `dest` when the term is false/NULL.  The Pascal no-FROM fast path bypasses
   sqlite3WhereBegin, so it also misses whereexpr.c's vector-comparison
@@ -36185,6 +36227,7 @@ var
   ctTopAddr:    i32;
   ctOnceAddr:   i32;
   ctAddrExplain: i32;
+  pSelfPrior:   PSrcItem;   { with1-24.1 — isSelfJoinView prior reference }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   { select.c:7603 — create (or fetch) the VDBE before name resolution so
@@ -41099,6 +41142,66 @@ begin
               (where.c:7439..7451): `[OP_Once] OP_Gosub regReturn,addrFillSub`.
               The Pas port materialises here (before WhereBegin) instead of
               inside the WHERE prologue, so emit the invocation at this site.
+              The non-correlated gate adds OP_Once so the Gosub is skipped on
+              re-entry of an enclosing loop. }
+            ctOnceAddr := 0;
+            if (pItem^.fg.fgBits and u8($10)) = 0 then  { not isCorrelated }
+              ctOnceAddr := sqlite3VdbeAddOp0(v, OP_Once);
+            sqlite3VdbeAddOp2(v, OP_Gosub, pItem^.u4.pSubq^.regReturn,
+                              pItem^.u4.pSubq^.addrFillSub);
+            if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
+          end
+          else if isSelfJoinView(pTabList, pItem, 0, i) <> nil then
+          begin
+            { with1-24.1 — self-join of a view/subquery already materialised
+              by an earlier entry in this same FROM clause.  Faithful port of
+              select.c:8075..8087 (tag-select-0486): invoke the prior
+              materialisation subroutine (if it has one) then make this
+              cursor an OP_OpenDup of the prior cursor.  This avoids
+              re-materialising the view N times. }
+            pSelfPrior := isSelfJoinView(pTabList, pItem, 0, i);
+            if pSelfPrior^.u4.pSubq^.addrFillSub <> 0 then
+              sqlite3VdbeAddOp2(v, OP_Gosub,
+                                pSelfPrior^.u4.pSubq^.regReturn,
+                                pSelfPrior^.u4.pSubq^.addrFillSub);
+            sqlite3VdbeAddOp2(v, OP_OpenDup, pItem^.iCursor,
+                              pSelfPrior^.iCursor);
+            pItem^.u4.pSubq^.pSelect^.nSelectRow :=
+              pSelfPrior^.u4.pSubq^.pSelect^.nSelectRow;
+          end
+          else if isSelfJoinView(pTabList, pItem, i + 1, pTabList^.nSrc) <> nil
+          then
+          begin
+            { with1-24.1 — first reference of a view/subquery that is
+              self-joined later in this same FROM clause.  Materialise it
+              into a once-run subroutine (select.c:8088..8128, tag-select-
+              0488) so the later reference(s) can reuse it via OP_Gosub +
+              OP_OpenDup.  Mirrors the CTE materialise-once arm above. }
+            Inc(pParse^.nMem);
+            pItem^.u4.pSubq^.regReturn := pParse^.nMem;
+            ctTopAddr := sqlite3VdbeAddOp0(v, OP_Goto);
+            pItem^.u4.pSubq^.addrFillSub := ctTopAddr + 1;
+            pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_MATERIALIZED;
+            ctOnceAddr := 0;
+            if (pItem^.fg.fgBits and u8($10)) = 0 then  { not isCorrelated }
+              ctOnceAddr := sqlite3VdbeAddOp0(v, OP_Once);
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
+                              pItem^.pSTab^.nCol);
+            sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
+            ctAddrExplain := pParse^.addrExplain;
+            sqlite3VdbeExplain(pParse, 1, 'MATERIALIZE %!S', [Pointer(pItem)]);
+            if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+            begin
+              pParse^.addrExplain := ctAddrExplain;
+              Result := SQLITE_ERROR; Exit;
+            end;
+            pParse^.addrExplain := ctAddrExplain;
+            pItem^.pSTab^.nRowLogEst := pItem^.u4.pSubq^.pSelect^.nSelectRow;
+            if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
+            sqlite3VdbeAddOp2(v, OP_Return, pItem^.u4.pSubq^.regReturn,
+                              ctTopAddr + 1);
+            sqlite3VdbeJumpHere(v, ctTopAddr);
+            { Invoke the just-coded materialisation for THIS (first) reference.
               The non-correlated gate adds OP_Once so the Gosub is skipped on
               re-entry of an enclosing loop. }
             ctOnceAddr := 0;
