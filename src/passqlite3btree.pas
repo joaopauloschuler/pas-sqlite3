@@ -6942,9 +6942,13 @@ begin
     pBt^.btsFlags   := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
     pBt^.pageSize   := pageSize;
     pBt^.usableSize := usableSize;
-    { autovacuum flags from header meta[4] / meta[7] }
-    pBt^.autoVacuum := u8(get4byte(page1 + 36 + 4*4));
-    pBt^.incrVacuum := u8(get4byte(page1 + 36 + 7*4));
+    { autovacuum flags from header meta[4] / meta[7].  C btree.c:2727..2728
+      coerces each to a 0/1 boolean (`get4byte(...)?1:0`); meta[4] holds the
+      LARGEST ROOT PAGE number (e.g. 3), not a flag, so without the ?1:0 the
+      raw page number would land in autoVacuum and break the
+      sqlite3BtreeSetAutoVacuum readonly gate `(av?1:0)!=pBt->autoVacuum`. }
+    pBt^.autoVacuum := u8(Ord(get4byte(page1 + 36 + 4*4) <> 0));
+    pBt^.incrVacuum := u8(Ord(get4byte(page1 + 36 + 7*4) <> 0));
   end;
 
   { Recompute page-size-dependent limits }
