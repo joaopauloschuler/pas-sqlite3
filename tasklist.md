@@ -239,6 +239,21 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs are excluded.
 
 ## Phase 9 — Acceptance: differential + fuzz
 
+> **a4 session 2026-06-04 (pas-soft sweep):** Verified-and-FIXED — `reservebytes` 3→0
+> (full `sqlite3BtreeSetPageSize` port incl. `nReserveWanted`, btree.c:3069..3100; 7b5c5e0);
+> `shell2` 10→3 / `shell3` 1→0 (CLI: `.header` abbrev, case-insens on/off, `-safe` auth,
+> hexdb `%x` parse; c39a82a — NOTE shell tests need `TESTFIXTURE_HOME=$(pwd)/bin` or
+> runtest.sh measures /usr/bin/sqlite3); `corrupt2` 3→1 (dup-index schema via INITFLAG_FreshLoad
+> + flipped-page-type seek leaving *pRes=0, btree.c:5945; cd9b1ca); `e_fkey` 10→4
+> (INSERT…SELECT into parent must keep isMultiWrite so sqlite3FkLocateIndex runs, insert.c:1018;
+> 583ecfc).  WATER-LEAKS (root-caused, reverted, do NOT re-pick as quick wins):
+> `pushdown-6.x` needs IN-RHS subroutine-dedup/bloom machinery (deferred at codegen 74088);
+> `pushdown-3.6`/`select9-4.5` flatten a compound view C keeps as CO-ROUTINE (affinity restriction-17h);
+> `aggnested-10.1` needs NameContext `pNC->nRef` correlation accounting (port uses bespoke passes
+> that don't descend into expr-subqueries); `update-21.12` flattens a windowed CTE (no auto-idx/bloom);
+> `corruptN-6.3`/`corruptK-3.3` need deeper btree cell-overflow / cursor-save corruption checks.
+> Many other pas-soft files now pass (joinC, windowE, collate4, count, etc.) — tasklist notes stale.
+
 Each 9.x lands a self-contained gate.  All four use the same C oracle:
 `libsqlite3.so` from `../sqlite3/` (already built by `src/tests/build.sh`).
 Pascal output → C output diff is the only pass criterion; any deviation
