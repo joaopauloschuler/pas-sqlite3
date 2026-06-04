@@ -35166,6 +35166,65 @@ begin
   Result := 0;
 end;
 
+{ codeNoFromWhere — code the WHERE clause of a no-FROM SELECT, jumping to
+  `dest` when the term is false/NULL.  The Pascal no-FROM fast path bypasses
+  sqlite3WhereBegin, so it also misses whereexpr.c's vector-comparison
+  decomposition (whereexpr.c:1467..1489, tag-20220128a): a vector `==`/`IS`
+  term `(a,b) == (c,d)` must be split into per-component comparisons
+  `a==c AND b==d`, recursively, so that a NESTED row value such as
+  `(2,(2,0)) IS (2,(2,0))` is reduced to scalar leaf comparisons.  Without
+  this split, sqlite3ExprIfFalse routes the whole vector through
+  codeVectorCompare, whose element coder calls sqlite3ExprCodeTemp on the
+  nested `(2,0)` vector in scalar context and wrongly raises "row value
+  misused" (rowvalue-20.1).  This mirrors exactly the decomposition that
+  WhereBegin would have performed for the same WHERE on a query with a FROM
+  clause — and, like C, it only applies to TK_EQ/TK_IS, so non-equality
+  vector comparisons and bare row values in scalar contexts still error. }
+procedure codeNoFromWhere(pParse: PParse; pX: PExpr; dest: i32);
+var
+  db:        PTsqlite3;
+  nLeft:     i32;
+  iVec:      i32;
+  pVecLeft:  PExpr;
+  pVecRight: PExpr;
+  pNewExpr:  PExpr;
+begin
+  if pX = nil then Exit;
+  db := pParse^.db;
+  { Split a top-level AND so each conjunct is decomposed independently
+    (whereexpr.c sqlite3WhereSplit on TK_AND). }
+  if pX^.op = TK_AND then
+  begin
+    codeNoFromWhere(pParse, pX^.pLeft,  dest);
+    codeNoFromWhere(pParse, pX^.pRight, dest);
+    Exit;
+  end;
+  { Vector == / IS decomposition, mirroring whereexpr.c:1467..1489. }
+  if ((pX^.op = TK_EQ) or (pX^.op = TK_IS))
+     and (pX^.pLeft <> nil) and (pX^.pRight <> nil) then
+  begin
+    nLeft := sqlite3ExprVectorSize(pX^.pLeft);
+    if (nLeft > 1)
+       and (sqlite3ExprVectorSize(pX^.pRight) = nLeft)
+       and (((pX^.pLeft^.flags  and EP_xIsSelect) = 0)
+            or ((pX^.pRight^.flags and EP_xIsSelect) = 0)) then
+    begin
+      for iVec := 0 to nLeft - 1 do
+      begin
+        pVecLeft  := sqlite3ExprForVectorField(pParse, pX^.pLeft,  iVec, nLeft);
+        pVecRight := sqlite3ExprForVectorField(pParse, pX^.pRight, iVec, nLeft);
+        pNewExpr  := sqlite3PExpr(pParse, pX^.op, pVecLeft, pVecRight);
+        codeNoFromWhere(pParse, pNewExpr, dest);
+        sqlite3ExprDelete(db, pNewExpr);
+        if pParse^.nErr <> 0 then Exit;
+      end;
+      Exit;
+    end;
+  end;
+  { Scalar (or sub-select vector) term — code directly. }
+  sqlite3ExprIfFalse(pParse, pX, dest, SQLITE_JUMPIFNULL);
+end;
+
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 var
@@ -36458,7 +36517,7 @@ begin
     { WHERE — bypass body when pWhere is false (mirrors WhereBegin's
       false-WHERE-term-bypass). }
     if p^.pWhere <> nil then
-      sqlite3ExprIfFalse(pParse, p^.pWhere, addrEndNoFrom, SQLITE_JUMPIFNULL);
+      codeNoFromWhere(pParse, p^.pWhere, addrEndNoFrom);
     if pDest^.eDest <> SRT_Exists then
       sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     { OFFSET — codeOffset emits IfPos to skip the row when iOffset>0.
