@@ -40106,6 +40106,36 @@ begin
               end;
               pParse^.addrExplain := ctAddrExplain;
             end
+            { orderbyB-1.1a / 1.2a — single-use CTE FROM item.  C never
+              flattens a CTE here (the CTE body carries its own ORDER BY and,
+              under restriction (11)/(28), is materialised as a coroutine or
+              an explicit MATERIALIZE node) — see select.c:8043..8114.  This
+              Pas port materialises every single-use FROM subquery into an
+              ephemeral table without an EQP wrapper (the known architectural
+              deviation), which left the CTE body's SCAN / USE TEMP B-TREE at
+              the OUTER indent level.  For a CTE item, mirror C's wrapper-node
+              choice so the body nests correctly:
+                eM10d = M10d_Yes (AS MATERIALIZED)          -> "MATERIALIZE %!S"
+                                  (fromClauseTermCanBeCoroutine 2a returns 0)
+                otherwise (single-use, planner's choice)    -> "CO-ROUTINE %!S"
+              Narrowly gated on isCte so non-CTE FROM subqueries keep their
+              current (wrapper-less) EQP shape and TestExplainParity stays
+              pinned. }
+            else if ((pItem^.fg.fgBits2 and u8($02)) <> 0)   { isCte }
+                    and (pItem^.u2.pCteUse <> nil) then
+            begin
+              ctAddrExplain := pParse^.addrExplain;
+              if pItem^.u2.pCteUse^.eM10d = u8(0) then  { M10d_Yes }
+                sqlite3VdbeExplain(pParse, 1, 'MATERIALIZE %!S', [Pointer(pItem)])
+              else
+                sqlite3VdbeExplain(pParse, 1, 'CO-ROUTINE %!S', [Pointer(pItem)]);
+              if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+              begin
+                pParse^.addrExplain := ctAddrExplain;
+                Result := SQLITE_ERROR; Exit;
+              end;
+              pParse^.addrExplain := ctAddrExplain;
+            end
             else
             if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
             begin
