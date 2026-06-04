@@ -10691,6 +10691,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       ResolveOuterRefs(pW^.pLeft,  pOuterSrc, pInnerSrc);
       ResolveOuterRefs(pW^.pRight, pOuterSrc, pInnerSrc);
+      { rowvalue-30.1 — a window function's PARTITION BY / ORDER BY lists hang
+        off pW^.y.pWin, not x.pList, so the arg-walk above never reaches them.
+        When a correlated outer column (e.g. `PARTITION BY t1.y` where t1 is an
+        outer FROM source) appears there, pre-bind it to the outer cursor here,
+        mirroring resolve.c:1321..1322 which walks pWin->pPartition/pOrderBy
+        with the current (outer-chained) NameContext. }
+      if ExprHasProperty(pW, EP_WinFunc) and (pW^.y.pWin <> nil) then
+      begin
+        ResolveOuterRefsInList(pW^.y.pWin^.pPartition, pOuterSrc, pInnerSrc);
+        ResolveOuterRefsInList(pW^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc);
+      end;
       if (pW^.flags and EP_xIsSelect) = 0 then
       begin
         if pW^.x.pList <> nil then
@@ -11174,6 +11185,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
     ResolveOuterIDs(pW^.pLeft,  pOuterSrc, pInnerSrc);
     ResolveOuterIDs(pW^.pRight, pOuterSrc, pInnerSrc);
+    { rowvalue-30.1 — bare TK_ID outer refs inside a window function's
+      PARTITION BY / ORDER BY (see ResolveOuterRefs companion). }
+    if ExprHasProperty(pW, EP_WinFunc) and (pW^.y.pWin <> nil) then
+    begin
+      ResolveOuterIDsInList(pW^.y.pWin^.pPartition, pOuterSrc, pInnerSrc);
+      ResolveOuterIDsInList(pW^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc);
+    end;
     if (pW^.flags and EP_xIsSelect) = 0 then
       ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc)
     else if pW^.x.pSelect <> nil then
