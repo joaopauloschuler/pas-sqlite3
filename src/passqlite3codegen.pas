@@ -36776,9 +36776,11 @@ begin
          and ((pAggFunc^.pFExpr^.y.pWin = nil)
               or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
       then begin canUseAgg := False; break; end;
-      if (pAggFunc^.pFunc <> nil)
-         and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
-      then begin canUseAgg := False; break; end;
+      { NEEDCOLL (min/max) aggregates are fine here: updateAccumulatorSimple
+        emits the OP_CollSeq before OP_AggStep (codegen.pas:34834), and with
+        no FROM source nAccumulator is 0 so its regHit gating is inert.
+        Mirrors C's general no-GROUP-BY path (select.c:8856), which runs the
+        same updateAccumulator over the dummy single-row loop. }
     end;
     if canUseAgg and (pAggI2^.nAccumulator > 0) then canUseAgg := False;
 
@@ -36787,7 +36789,19 @@ begin
       sqlite3GenerateColumnNames(pParse, p);
       assignAggregateRegisters(pParse, pAggI2);
       resetAccumulatorSimple(pParse, pAggI2);
-      updateAccumulatorSimple(pParse, pAggI2);
+      { Honour the WHERE clause — C's no-FROM aggregate still runs through
+        sqlite3WhereBegin over a dummy single-row loop, where pWhere guards
+        the body (select.c:8872).  `SELECT count(*) WHERE 0` must skip the
+        AggStep so count stays 0 (e_select-1.1.5). }
+      if p^.pWhere <> nil then
+      begin
+        addrSkip := sqlite3VdbeMakeLabel(pParse);
+        sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip, SQLITE_JUMPIFNULL);
+        updateAccumulatorSimple(pParse, pAggI2);
+        sqlite3VdbeResolveLabel(v, addrSkip);
+      end
+      else
+        updateAccumulatorSimple(pParse, pAggI2);
       finalizeAggFunctionsSimple(pParse, pAggI2);
 
       nResultCol     := p^.pEList^.nExpr;
