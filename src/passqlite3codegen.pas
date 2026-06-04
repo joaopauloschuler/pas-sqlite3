@@ -60875,6 +60875,7 @@ var
   pPragmaId: PToken;
   newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
   iValPragma: i64; { 9.4.divbug.87.067 — PRAGMA max_page_count=N parse }
+  iPriorHeap: i64; { PRAGMA hard_heap_limit — prior limit (pragma.c:2685) }
   { 9.4.divbug.88.068.a — locals for SQLITE_FCNTL_PRAGMA fallback
     (pragma.c:475..511).  aFcntlPragma is the four-slot char** argument
     handed to the VFS xFileControl. }
@@ -62312,6 +62313,33 @@ begin
     Exit;
   end;
 
+  { PragTyp_SOFT_HEAP_LIMIT (pragma.c:2655..2677).  Set/read the soft
+    heap-size limit via sqlite3_soft_heap_limit64; the read form passes -1
+    (query-only) and returns the current limit. }
+  if SameText(zName, 'soft_heap_limit') then begin
+    if (zRight <> '') and (sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma) = 0) then
+      passqlite3util.sqlite3SoftHeapLimit64(iValPragma);
+    iValPragma := passqlite3util.sqlite3SoftHeapLimit64(-1);
+    sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 1, 0, Pu8(@iValPragma), P4_INT64);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
+  { PragTyp_HARD_HEAP_LIMIT (pragma.c:2681..2698).  A new hard limit is only
+    installed when N>0 and it is stricter than (or replaces an unset) prior
+    limit. }
+  if SameText(zName, 'hard_heap_limit') then begin
+    if (zRight <> '') and (sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma) = 0) then begin
+      iPriorHeap := passqlite3util.sqlite3HardHeapLimit64(-1);
+      if (iValPragma > 0) and ((iPriorHeap = 0) or (iPriorHeap > iValPragma)) then
+        passqlite3util.sqlite3HardHeapLimit64(iValPragma);
+    end;
+    iValPragma := passqlite3util.sqlite3HardHeapLimit64(-1);
+    sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, 1, 0, Pu8(@iValPragma), P4_INT64);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -62321,8 +62349,6 @@ begin
     iVal := MaxInt; { sentinel "not handled" }
     if      SameText(zName, 'temp_store')         then iVal := 0
     else if SameText(zName, 'threads')            then iVal := 0
-    else if SameText(zName, 'soft_heap_limit')    then iVal := 0
-    else if SameText(zName, 'hard_heap_limit')    then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0;
     if iVal <> MaxInt then begin
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
