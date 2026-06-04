@@ -919,6 +919,12 @@ var
     compilation unit. }
   unixIoMethods : sqlite3_io_methods;
 
+  { nolock ("unix-none") and dotlock ("unix-dotfile") I/O method tables.
+    Share xRead/xWrite/etc. with unixIoMethods but override the locking
+    quartet (os_unix.c:5853..5882). Filled by InitUnixIoMethods. }
+  nolockIoMethods   : sqlite3_io_methods;
+  dotlockIoMethods  : sqlite3_io_methods;
+
   { Per-file pthreadMutexMethods table returned by sqlite3DefaultMutex }
   pthreadMutexMethodsData : sqlite3_mutex_methods;
 
@@ -943,6 +949,18 @@ function  unixFileControl_impl(pFile: Psqlite3_file; op: cint;
 function  unixSectorSize_impl(pFile: Psqlite3_file): cint; cdecl; forward;
 function  unixDeviceCharacteristics_impl(pFile: Psqlite3_file): cint; cdecl; forward;
 function  unixGetTempname(nBuf: cint; zBuf: PAnsiChar): cint; forward;
+
+{ nolock / dotlock locking-style methods (os_unix.c:2390..2591) }
+function  nolockClose_impl(pFile: Psqlite3_file): cint; cdecl; forward;
+function  nolockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  nolockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  nolockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl; forward;
+function  dotlockClose_impl(pFile: Psqlite3_file): cint; cdecl; forward;
+function  dotlockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  dotlockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  dotlockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl; forward;
 
 { ============================================================
   Section 0: Memory helpers
@@ -2374,6 +2392,9 @@ var
   pInode     : PunixInodeInfo;
   ctrlFlags  : u16;
   tmpNameBuf : array[0..MAX_PATHNAME+1] of char;
+  pLockMethods : Psqlite3_io_methods;
+  zLockFile  : PChar;
+  nFilename  : cint;
 begin
   p := PunixFile(pFile);
   FillChar(p^, SizeOf(unixFile), 0);
@@ -2488,8 +2509,39 @@ begin
     Exit;
   end;
 
-  { Fill in the unixFile record (os_unix.c: fillInUnixFile) }
-  p^.pMethod   := @unixIoMethods;
+  { Fill in the unixFile record (os_unix.c: fillInUnixFile).
+    Select the locking style (os_unix.c:6120..6207).  Non-MAIN_DB files
+    (journal/wal/temp) carry UNIXFILE_NOLOCK and always use nolock.
+    Otherwise the VFS name picks the finder: unix-none -> nolock,
+    unix-dotfile -> dotlock (with a ".lock" lockingContext path), and
+    unix / unix-excl -> posix (the default unixIoMethods). }
+  pLockMethods := @unixIoMethods;
+  if (ctrlFlags and UNIXFILE_NOLOCK) <> 0 then
+    pLockMethods := @nolockIoMethods
+  else if (pVfs <> nil) and (pVfs^.zName <> nil) then begin
+    if StrComp(pVfs^.zName, 'unix-none') = 0 then
+      pLockMethods := @nolockIoMethods
+    else if StrComp(pVfs^.zName, 'unix-dotfile') = 0 then begin
+      { Dotfile locking caches the "<db>.lock" path as lockingContext
+        (os_unix.c:6192..6207). }
+      nFilename := cint(StrLen(zName)) + 6;
+      zLockFile := PChar(sqlite3_malloc64(nFilename));
+      if zLockFile = nil then begin
+        FpClose(fd);
+        p^.h := -1;
+        if p^.pPreallocatedUnused <> nil then
+          sqlite3_free(p^.pPreallocatedUnused);
+        Result := SQLITE_NOMEM;
+        Exit;
+      end;
+      StrLCopy(zLockFile, zName, nFilename - 1);
+      StrLCat(zLockFile, '.lock', nFilename - 1);
+      p^.lockingContext := zLockFile;
+      pLockMethods := @dotlockIoMethods;
+    end;
+  end;
+
+  p^.pMethod   := pLockMethods;
   p^.pVfs      := pVfs;
   p^.pInode    := pInode;
   p^.h         := fd;
@@ -2897,6 +2949,11 @@ function  c_close(fd: cint): cint;
   cdecl; external 'c' name 'close';
 function  c_access(zPath: PChar; mode: cint): cint;
   cdecl; external 'c' name 'access';
+{ Raw libc errno location.  The `c_*` externals below set the C library's
+  errno, which FPC's fpgeterrno (its own internal copy) does not observe;
+  read it directly so dotlock can distinguish EEXIST/ENOENT. }
+function  c_errno_location: pcint;
+  cdecl; external 'c' name '__errno_location';
 function  c_getcwd(buf: PChar; size: csize_t): PChar;
   cdecl; external 'c' name 'getcwd';
 function  c_stat(zPath: PChar; buf: Pointer): cint;
@@ -3718,6 +3775,180 @@ begin
 end;
 
 { ============================================================
+  Section 14c: nolock / dotlock locking-style methods (os_unix.c)
+  ============================================================ }
+
+{ os_unix.c:2410 nolockClose — closeUnixFile only (no lock to drop). }
+function nolockClose_impl(pFile: Psqlite3_file): cint; cdecl;
+var
+  pf : PunixFile;
+begin
+  pf := PunixFile(pFile);
+  { closeUnixFile: drop inode ref, close fd, zero struct.  Mirror the tail
+    of unixClose_impl but without unixUnlock (no-op lock). }
+  if pf^.pInode <> nil then begin
+    unixEnterMutex;
+    unixReleaseInodeInfo(pf);
+    unixLeaveMutex;
+  end;
+  if pf^.pPreallocatedUnused <> nil then
+    sqlite3_free(pf^.pPreallocatedUnused);
+  if pf^.h >= 0 then
+    FpClose(pf^.h);
+  {$ifdef SQLITE_TEST}
+  Dec(sqlite3_open_file_count);
+  {$endif}
+  FillChar(pf^, SizeOf(unixFile), 0);
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2397 nolockLock — no-op. }
+function nolockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2401 nolockUnlock — no-op. }
+function nolockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2393 nolockCheckReservedLock — never reserved. }
+function nolockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl;
+begin
+  pResOut^ := 0;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2452 dotlockCheckReservedLock. }
+function dotlockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl;
+var
+  pf : PunixFile;
+begin
+  pf := PunixFile(pFile);
+  {$ifdef SQLITE_TEST}
+  if SimulateIOError then begin
+    Result := SQLITE_IOERR_CHECKRESERVEDLOCK;
+    Exit;
+  end;
+  {$endif}
+  if pf^.eFileLock >= SHARED_LOCK then
+    pResOut^ := 0
+  else begin
+    if c_access(PChar(pf^.lockingContext), 0) = 0 then
+      pResOut^ := 1
+    else
+      pResOut^ := 0;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2492 dotlockLock. }
+function dotlockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+var
+  pf        : PunixFile;
+  zLockFile : PChar;
+  rc        : cint;
+  tErrno    : cint;
+begin
+  pf := PunixFile(pFile);
+  zLockFile := PChar(pf^.lockingContext);
+  rc := SQLITE_OK;
+
+  { If we already hold a lock, just adjust the internal level + touch file. }
+  if pf^.eFileLock > NO_LOCK then begin
+    pf^.eFileLock := eFileLock;
+    libc_utimes(zLockFile, nil);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Grab an exclusive lock by creating the lock directory. }
+  if c_mkdir(zLockFile, &777) < 0 then begin
+    tErrno := c_errno_location^;
+    if tErrno = ESysEEXIST then
+      rc := SQLITE_BUSY
+    else begin
+      rc := SQLITE_IOERR_LOCK;
+      pf^.lastErrno := tErrno;
+    end;
+    Result := rc;
+    Exit;
+  end;
+
+  pf^.eFileLock := eFileLock;
+  Result := rc;
+end;
+
+{ os_unix.c:2542 dotlockUnlock. }
+function dotlockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+var
+  pf        : PunixFile;
+  zLockFile : PChar;
+  tErrno    : cint;
+begin
+  pf := PunixFile(pFile);
+  zLockFile := PChar(pf^.lockingContext);
+
+  { no-op if possible }
+  if pf^.eFileLock = eFileLock then begin
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Downgrade to shared: only update internal state. }
+  if eFileLock = SHARED_LOCK then begin
+    pf^.eFileLock := SHARED_LOCK;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Fully unlock: delete the lock directory. }
+  if c_rmdir(zLockFile) < 0 then begin
+    tErrno := c_errno_location^;
+    if tErrno = ESysENOENT then
+      Result := SQLITE_OK
+    else begin
+      Result := SQLITE_IOERR_UNLOCK;
+      pf^.lastErrno := tErrno;
+    end;
+    Exit;
+  end;
+  pf^.eFileLock := NO_LOCK;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2585 dotlockClose — release lock, free context, closeUnixFile. }
+function dotlockClose_impl(pFile: Psqlite3_file): cint; cdecl;
+var
+  pf : PunixFile;
+begin
+  pf := PunixFile(pFile);
+  dotlockUnlock_impl(pFile, NO_LOCK);
+  if pf^.lockingContext <> nil then
+    sqlite3_free(pf^.lockingContext);
+  pf^.lockingContext := nil;
+  { closeUnixFile }
+  if pf^.pInode <> nil then begin
+    unixEnterMutex;
+    unixReleaseInodeInfo(pf);
+    unixLeaveMutex;
+  end;
+  if pf^.pPreallocatedUnused <> nil then
+    sqlite3_free(pf^.pPreallocatedUnused);
+  if pf^.h >= 0 then
+    FpClose(pf^.h);
+  {$ifdef SQLITE_TEST}
+  Dec(sqlite3_open_file_count);
+  {$endif}
+  FillChar(pf^, SizeOf(unixFile), 0);
+  Result := SQLITE_OK;
+end;
+
+{ ============================================================
   InitUnixIoMethods — build the unixIoMethods vtable.
   Called from the initialization section once all functions are known.
   ============================================================ }
@@ -3744,6 +3975,32 @@ begin
   unixIoMethods.xShmUnmap   := @unixShmUnmap_impl;
   unixIoMethods.xFetch      := nil;
   unixIoMethods.xUnfetch    := nil;
+
+  { nolock ("unix-none"): same as unix but locking quartet is a no-op
+    (os_unix.c:5853..5867).  iVersion 1 — no SHM/WAL under nolock. }
+  nolockIoMethods := unixIoMethods;
+  nolockIoMethods.iVersion           := 1;
+  nolockIoMethods.xClose             := @nolockClose_impl;
+  nolockIoMethods.xLock              := @nolockLock_impl;
+  nolockIoMethods.xUnlock            := @nolockUnlock_impl;
+  nolockIoMethods.xCheckReservedLock := @nolockCheckReservedLock_impl;
+  nolockIoMethods.xShmMap     := nil;
+  nolockIoMethods.xShmLock    := nil;
+  nolockIoMethods.xShmBarrier := nil;
+  nolockIoMethods.xShmUnmap   := nil;
+
+  { dotlock ("unix-dotfile"): dotfile locking quartet (os_unix.c:5869..5882).
+    iVersion 1 — no SHM/WAL under dotlock. }
+  dotlockIoMethods := unixIoMethods;
+  dotlockIoMethods.iVersion           := 1;
+  dotlockIoMethods.xClose             := @dotlockClose_impl;
+  dotlockIoMethods.xLock              := @dotlockLock_impl;
+  dotlockIoMethods.xUnlock            := @dotlockUnlock_impl;
+  dotlockIoMethods.xCheckReservedLock := @dotlockCheckReservedLock_impl;
+  dotlockIoMethods.xShmMap     := nil;
+  dotlockIoMethods.xShmLock    := nil;
+  dotlockIoMethods.xShmBarrier := nil;
+  dotlockIoMethods.xShmUnmap   := nil;
 end;
 
 { ============================================================
