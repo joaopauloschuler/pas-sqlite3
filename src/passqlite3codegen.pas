@@ -36087,6 +36087,8 @@ var
     coroutine) into pItem^.iCursor instead of routing through WhereBegin
     (which lacks the viaCoroutine / TF_Ephemeral plumbing). }
   isGBSubquery:    Boolean;
+  bGBSort:         Boolean;       { select.c groupBySort — 0 ⇒ inline scan,
+                                    1 ⇒ push rows through GROUP BY sorter }
   pGBInnerSel:     PSelect;
   pGBCoroItem:     PSrcItem;
   addrGBBodyStart: i32;
@@ -36201,6 +36203,8 @@ var
   addrSortLoopOB:i32;
   groupBySortLoc:i32;            { select.c:8533 — 0 when WhereIsOrdered
                                     delivers full GROUP BY order via index }
+  addrSortingIdxGB:i32;          { addr of the GROUP BY OP_SorterOpen, NOOP'd
+                                    when groupBySort=0 (select.c:8491/8704) }
   addrSortIndexOB:i32;           { addr of the ORDER BY OP_SorterOpen, NOOP'd
                                     when the sort is unneeded (select.c:8628) }
   whereSortedOB: i32;            { sqlite3WhereIsSorted(pWInfo) cache }
@@ -37805,7 +37809,8 @@ begin
       pAggI2^.sortingIdx := pParse^.nTab; Inc(pParse^.nTab);
       pKeyInfoGB := sqlite3KeyInfoFromExprList(pParse, pGroupByLoc, 0,
                                                pAggI2^.nColumn);
-      sqlite3VdbeAddOp4(v, OP_SorterOpen, pAggI2^.sortingIdx, nGroupBy, 0,
+      addrSortingIdxGB := sqlite3VdbeAddOp4(v, OP_SorterOpen,
+                        pAggI2^.sortingIdx, nGroupBy, 0,
                         PAnsiChar(pKeyInfoGB), P4_KEYINFO);
 
       { DISTINCT + GROUP BY (non-redundant): open the dedup ephemeral.
@@ -38080,66 +38085,78 @@ begin
                           P4_DYNAMIC);
       end;
 
-      { Push rows into sorter (always groupBySort=1).  Encode pGroupBy
-        terms first, then any accumulator columns whose iSorterColumn
-        falls past the GROUP BY range. }
-      nColGB := nGroupBy;
-      jj := nGroupBy;
-      for i := 0 to pAggI2^.nColumn - 1 do
+      { select.c:8533..8598 — when the planner already delivers rows in
+        full GROUP BY order (an index / ordered vtab covers every GROUP BY
+        term, groupBySortLoc=0) the temp B-tree sort is unnecessary: the
+        scan loop feeds the accumulator inline and no sorter is opened.
+        Otherwise (groupBySort=1) each row is pushed into the sorting index,
+        the WHERE loop terminated, then the sorter is drained in order.
+        The subquery/coroutine GROUP BY source path has no plain WhereInfo
+        loop to leave open, so it always uses the sorter shape. }
+      bGBSort := (groupBySortLoc <> 0) or isGBSubquery;
+      if bGBSort then
       begin
-        if pAggI2^.aCol[i].iSorterColumn >= jj then
+        { Push rows into sorter (groupBySort=1).  Encode pGroupBy terms
+          first, then any accumulator columns whose iSorterColumn falls
+          past the GROUP BY range. }
+        nColGB := nGroupBy;
+        jj := nGroupBy;
+        for i := 0 to pAggI2^.nColumn - 1 do
         begin
-          Inc(nColGB);
-          Inc(jj);
+          if pAggI2^.aCol[i].iSorterColumn >= jj then
+          begin
+            Inc(nColGB);
+            Inc(jj);
+          end;
         end;
-      end;
-      regBase := sqlite3GetTempRange(pParse, nColGB);
-      for i := 0 to nGroupBy - 1 do
-      begin
-        r1 := sqlite3ExprCodeTarget(pParse,
-                ExprListItems(pGroupByLoc)[i].pExpr, regBase + i);
-        if r1 <> regBase + i then
-          sqlite3VdbeAddOp2(v, OP_Copy, r1, regBase + i);
-      end;
-      pAggI2^.directMode := 1;
-      jj := nGroupBy;
-      for i := 0 to pAggI2^.nColumn - 1 do
-      begin
-        pColGB := @pAggI2^.aCol[i];
-        if pColGB^.iSorterColumn >= jj then
+        regBase := sqlite3GetTempRange(pParse, nColGB);
+        for i := 0 to nGroupBy - 1 do
         begin
-          sqlite3ExprCode(pParse, pColGB^.pCExpr, jj + regBase);
-          Inc(jj);
+          r1 := sqlite3ExprCodeTarget(pParse,
+                  ExprListItems(pGroupByLoc)[i].pExpr, regBase + i);
+          if r1 <> regBase + i then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, regBase + i);
         end;
-      end;
-      pAggI2^.directMode := 0;
-      regRecord := sqlite3GetTempReg(pParse);
-      sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nColGB, regRecord);
-      sqlite3VdbeAddOp2(v, OP_SorterInsert, pAggI2^.sortingIdx, regRecord);
-      sqlite3ReleaseTempReg(pParse, regRecord);
-      sqlite3ReleaseTempRange(pParse, regBase, nColGB);
-      if isGBSubquery then
-      begin
-        if pGBCoroItem <> nil then
+        pAggI2^.directMode := 1;
+        jj := nGroupBy;
+        for i := 0 to pAggI2^.nColumn - 1 do
         begin
-          translateColumnToCopy(pParse, addrGBBodyStart, iCsr,
-                                pGBCoroItem^.u4.pSubq^.regResult, 0);
-          sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
-          sqlite3VdbeResolveLabel(v, addrGBLoopDone);
+          pColGB := @pAggI2^.aCol[i];
+          if pColGB^.iSorterColumn >= jj then
+          begin
+            sqlite3ExprCode(pParse, pColGB^.pCExpr, jj + regBase);
+            Inc(jj);
+          end;
+        end;
+        pAggI2^.directMode := 0;
+        regRecord := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nColGB, regRecord);
+        sqlite3VdbeAddOp2(v, OP_SorterInsert, pAggI2^.sortingIdx, regRecord);
+        sqlite3ReleaseTempReg(pParse, regRecord);
+        sqlite3ReleaseTempRange(pParse, regBase, nColGB);
+        if isGBSubquery then
+        begin
+          if pGBCoroItem <> nil then
+          begin
+            translateColumnToCopy(pParse, addrGBBodyStart, iCsr,
+                                  pGBCoroItem^.u4.pSubq^.regResult, 0);
+            sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
+            sqlite3VdbeResolveLabel(v, addrGBLoopDone);
+          end
+          else
+          begin
+            sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
+            sqlite3VdbeResolveLabel(v, addrGBLoopDone);
+            sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+          end;
         end
         else
         begin
-          sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
-          sqlite3VdbeResolveLabel(v, addrGBLoopDone);
-          sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+          {$IFDEF SQLITE_DEBUG}
+          TreeTraceLine($2, 'WhereEnd');  { select.c:8702 }
+          {$ENDIF}
+          sqlite3WhereEnd(pWInfo);
         end;
-      end
-      else
-      begin
-        {$IFDEF SQLITE_DEBUG}
-        TreeTraceLine($2, 'WhereEnd');  { select.c:8702 }
-        {$ENDIF}
-        sqlite3WhereEnd(pWInfo);
       end;
 
       { 10.1.42.a.6.4 — convert pAggInfo->aFunc[].pExpr nodes that were
@@ -38155,20 +38172,36 @@ begin
         {$ENDIF}
       end;
 
-      pAggI2^.sortingIdxPTab := pParse^.nTab; Inc(pParse^.nTab);
-      sortPTab := pAggI2^.sortingIdxPTab;
-      sortOut  := sqlite3GetTempReg(pParse);
-      sqlite3VdbeAddOp3(v, OP_OpenPseudo, sortPTab, sortOut, nColGB);
-      sqlite3VdbeAddOp2(v, OP_SorterSort, pAggI2^.sortingIdx, addrEnd);
-      pAggI2^.useSortingIdx := 1;
+      sortPTab := 0;
+      sortOut  := 0;
+      if bGBSort then
+      begin
+        pAggI2^.sortingIdxPTab := pParse^.nTab; Inc(pParse^.nTab);
+        sortPTab := pAggI2^.sortingIdxPTab;
+        sortOut  := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_OpenPseudo, sortPTab, sortOut, nColGB);
+        sqlite3VdbeAddOp2(v, OP_SorterSort, pAggI2^.sortingIdx, addrEnd);
+        pAggI2^.useSortingIdx := 1;
+      end;
 
       { Top of input loop. }
       addrTopOfLoop := sqlite3VdbeCurrentAddr(v);
-      sqlite3VdbeAddOp3(v, OP_SorterData, pAggI2^.sortingIdx,
-                        sortOut, sortPTab);
+      if bGBSort then
+        sqlite3VdbeAddOp3(v, OP_SorterData, pAggI2^.sortingIdx,
+                          sortOut, sortPTab);
       for jj := 0 to nGroupBy - 1 do
       begin
-        sqlite3VdbeAddOp3(v, OP_Column, sortPTab, jj, iBMem + jj);
+        if bGBSort then
+          sqlite3VdbeAddOp3(v, OP_Column, sortPTab, jj, iBMem + jj)
+        else
+        begin
+          { groupBySort=0 — read the GROUP BY term straight from the open
+            scan cursor (select.c:8646..8648, pAggInfo->directMode=1). }
+          pAggI2^.directMode := 1;
+          sqlite3ExprCode(pParse, ExprListItems(pGroupByLoc)[jj].pExpr,
+                          iBMem + jj);
+          pAggI2^.directMode := 0;
+        end;
         { call-function-once optimisation — select.c:8651..8664.  When the
           GROUP BY term j+1 was resolved by ResolveOrderGroupBy as an alias
           for result-list column iOrderByCol, rewrite that result-list
@@ -38219,7 +38252,19 @@ begin
       updateAccumulatorSimple(pParse, pAggI2, iUseFlag, eDistResult);
       sqlite3VdbeAddOp2(v, OP_Integer, 1, iUseFlag);
 
-      sqlite3VdbeAddOp2(v, OP_SorterNext, pAggI2^.sortingIdx, addrTopOfLoop);
+      { End of the input loop — select.c:8696..8705.  When the sorter is in
+        use, advance to the next sorted row; otherwise close the WHERE loop
+        and cancel the (unused) OP_SorterOpen coded earlier. }
+      if bGBSort then
+        sqlite3VdbeAddOp2(v, OP_SorterNext, pAggI2^.sortingIdx, addrTopOfLoop)
+      else
+      begin
+        {$IFDEF SQLITE_DEBUG}
+        TreeTraceLine($2, 'WhereEnd');  { select.c:8702 }
+        {$ENDIF}
+        sqlite3WhereEnd(pWInfo);
+        sqlite3VdbeChangeToNoop(v, addrSortingIdxGB);
+      end;
 
       { Final group output + jump to end. }
       sqlite3VdbeAddOp2(v, OP_Gosub, regOutputRow, addrOutputRow);
