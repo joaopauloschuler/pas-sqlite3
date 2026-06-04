@@ -54804,7 +54804,7 @@ begin
   begin
     sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
       'too many FROM clause terms, max: %d', [i32(SQLITE_MAX_SRCLIST)]));
-    Result := pSrc; { C returns 0; callers treat unchanged list + nErr as failure }
+    Result := nil; { build.c:4814 returns 0; callers (flatten/append) break on nil }
     Exit;
   end;
   nNew := pSrc^.nSrc + nExtra;
