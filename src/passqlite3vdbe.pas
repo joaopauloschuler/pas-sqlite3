@@ -12672,8 +12672,10 @@ begin
       Advance the cursor up to P1 steps; if key >= SeekGE key then handle
       the found/not-found branches without running SeekGE again. }
     OP_SeekScan: begin
-      { SeekScan is followed by SeekGE — use pOp[1] for the SeekGE info }
-      pCur := v^.apCsr[pOp^.p1];
+      { SeekScan is followed by SeekGE — use pOp[1] for the SeekGE info.
+        vdbe.c:5122 — the cursor index comes from the following SeekGE
+        (pOp[1].p1); pOp->p1 here is the nStep count, NOT a cursor index. }
+      pCur := v^.apCsr[pOp[1].p1];
       if pCur = nil then begin
         { cursor not valid: fall through to SeekGE }
         Inc(pOp); continue;
