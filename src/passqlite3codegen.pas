@@ -37151,7 +37151,9 @@ begin
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin     = nil) and (p^.pOrderBy = nil)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
+          or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Set))
   then
   begin
     v := sqlite3GetVdbe(pParse);
@@ -37225,8 +37227,38 @@ begin
         if r1 <> pDest^.iSdst + i then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
       end;
+      { Single-row dispatch by destination.  An aggregate with no GROUP BY
+        over an implicit (no-FROM) single row always produces exactly one
+        result row.  When this Select is materialised as a FROM-subquery /
+        IN-RHS / coroutine the eDest is SRT_EphemTab / SRT_Table /
+        SRT_Coroutine / SRT_Set rather than SRT_Output; emit the row the
+        same way selectInnerLoop's destination arms do (select.c:1349..1416),
+        otherwise the row is computed but never handed to the consumer and
+        the subquery yields zero rows. }
       if pDest^.eDest = SRT_Output then
-        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
+      else if pDest^.eDest = SRT_Coroutine then
+        sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+      else if pDest^.eDest = SRT_Set then
+      begin
+        r1 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1,
+                          pDest^.zAffSdst, nResultCol);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                             pDest^.iSdst, nResultCol);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else if (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table) then
+      begin
+        r1 := sqlite3GetTempReg(pParse);
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp2(v, OP_NewRowid,   pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert,     pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end;
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
       Exit;
     end;
