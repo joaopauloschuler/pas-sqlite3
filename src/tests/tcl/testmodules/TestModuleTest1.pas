@@ -187,7 +187,8 @@ begin
     Exit;
   end;
   p := PTestSqliteDb(cmdInfo.objClientData);
-  s := '0x' + LowerCase(IntToHex(PtrUInt(p^.db), 1));
+  { test1.c:104 sqlite3_snprintf("%p", p->db) — bare hex, no "0x" prefix. }
+  s := LowerCase(IntToHex(PtrUInt(p^.db), 1));
   FillChar(zBuf, SizeOf(zBuf), 0);
   Move(s[1], zBuf[0], Length(s));
   Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
@@ -946,10 +947,13 @@ begin
   Result := 0;
 end;
 
-{ Format a pointer as the "%p"-flavoured hex test1.c hands to Tcl. }
+{ Format a pointer as the "%p"-flavoured hex test1.c hands to Tcl.
+  sqlite3TestMakePointerStr uses sqlite3_snprintf("%p", p); SQLite's own
+  %p (printf.c etPOINTER, no prefix) renders bare lowercase hex with NO
+  "0x" prefix.  The tests regex-match this as /^[0-9A-Fa-f]+$/. }
 procedure ptrToHex(p: Pointer; out zBuf: AnsiString);
 begin
-  zBuf := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+  zBuf := LowerCase(IntToHex(PtrUInt(p), 1));
 end;
 
 { test1.c:419..460 — test_exec.
@@ -2009,13 +2013,14 @@ var
   t3_nRefSqlite3: cint = 0;
 
 { Render a pointer as test3.c does (sqlite3_snprintf "%p") and append it
-  to the interp result.  Mirrors btree_from_db's 0x-hex formatting. }
+  to the interp result.  SQLite's %p (printf.c etPOINTER) is bare lowercase
+  hex with NO "0x" prefix. }
 procedure t3AppendPtr(interp: PTclInterp; p: Pointer);
 var
   s:    AnsiString;
   zBuf: array[0..99] of AnsiChar;
 begin
-  s := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+  s := LowerCase(IntToHex(PtrUInt(p), 1));
   FillChar(zBuf, SizeOf(zBuf), 0);
   Move(s[1], zBuf[0], Length(s));
   Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
@@ -2334,7 +2339,8 @@ begin
   p := PTestSqliteDb(cmdInfo.objClientData);
   db := p^.db;
   pBt := db^.aDb[iDb].pBt;
-  s := '0x' + LowerCase(IntToHex(PtrUInt(pBt), 1));
+  { test3.c:73 sqlite3_snprintf("%p", pBt) — bare hex, no "0x" prefix. }
+  s := LowerCase(IntToHex(PtrUInt(pBt), 1));
   FillChar(zBuf, SizeOf(zBuf), 0);
   Move(s[1], zBuf[0], Length(s));
   Tcl_SetResult(interp, PChar(@zBuf[0]), TCL_VOLATILE);
@@ -7395,8 +7401,9 @@ begin
   pStmt := sqlite3_next_stmt(db, pStmt);
   if pStmt <> nil then
   begin
-    { C: sqlite3TestMakePointerStr → "0x%p". }
-    s := '0x' + LowerCase(IntToHex(PtrUInt(pStmt), 1));
+    { C: sqlite3TestMakePointerStr → sqlite3_snprintf("%p", p); bare hex,
+      no "0x" prefix (printf.c etPOINTER). }
+    s := LowerCase(IntToHex(PtrUInt(pStmt), 1));
     FillChar(zBuf, SizeOf(zBuf), 0);
     Move(s[1], zBuf[0], Length(s));
     Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
@@ -7883,10 +7890,11 @@ end;
   glue (test_blob.c:33..339). }
 
 { test_blob.c:33..37 — ptrToText.  Render a pointer as the "%p" text
-  sqlite3TestTextToPtr() can decode back ("0x" + lowercase hex). }
+  sqlite3TestTextToPtr() can decode back.  SQLite's %p is bare lowercase
+  hex with NO "0x" prefix (printf.c etPOINTER). }
 procedure blobPtrToText(p: Pointer; out zBuf: AnsiString);
 begin
-  zBuf := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+  zBuf := LowerCase(IntToHex(PtrUInt(p), 1));
 end;
 
 { test_blob.c:51..79 — blobHandleFromObj.  Extract an sqlite3_blob* from a
