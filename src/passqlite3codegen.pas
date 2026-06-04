@@ -31743,13 +31743,25 @@ begin
         for jj := 0 to nWrapCol - 1 do
         begin
           if NestedFromColIsRowid(pItem, jj) then Continue;
-          if NestedFromColNoExpand(pItem, jj) then Continue;
+          { select.c:6303 — a coalesced USING/NATURAL column is tagged
+            bNoExpand at the OUTER re-expansion because the wrapper's own
+            pSTab column carries COLFLAG_NOEXPAND (propagated from the inner
+            expandStar via sqlite3ColumnsFromExprList, select.c:2314).  Such a
+            column is exposed once and must NOT participate in the duplicate
+            ambiguity check.  The inner subquery's pEList bNoExpand bit is not
+            a reliable mirror here, so test the wrapper pSTab colFlags directly,
+            matching C exactly. }
+          if (NestedFromColNoExpand(pItem, jj)) or
+             ((PColumn(PByte(pTab^.aCol) + jj * SizeOf(TColumn))^.colFlags
+                and COLFLAG_NOEXPAND) <> 0) then Continue;
           zBaseJ := NestedFromColBaseName(pItem, jj);
           if zBaseJ = nil then Continue;
           for kk := 0 to jj - 1 do
           begin
             if NestedFromColIsRowid(pItem, kk) then Continue;
-            if NestedFromColNoExpand(pItem, kk) then Continue;
+            if (NestedFromColNoExpand(pItem, kk)) or
+               ((PColumn(PByte(pTab^.aCol) + kk * SizeOf(TColumn))^.colFlags
+                  and COLFLAG_NOEXPAND) <> 0) then Continue;
             zBaseK := NestedFromColBaseName(pItem, kk);
             if zBaseK = nil then Continue;
             if sqlite3StrICmp(zBaseJ, zBaseK) = 0 then
