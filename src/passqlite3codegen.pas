@@ -61768,8 +61768,8 @@ begin
     { pragma.c:1211 — PRAGMA table_info(t) / table_xinfo(t).  iArg=0 hides
       hidden/virtual/stored columns; iArg=1 (table_xinfo) shows them. }
     PragTyp_TABLE_INFO: if pValue <> nil then begin
-      sqlite3CodeVerifyNamedSchema(pParse, nil);
-      pTabA := sqlite3LocateTable(pParse, LOCATE_NOERR, PAnsiChar(zRight), nil);
+      sqlite3CodeVerifyNamedSchema(pParse, zDbFc);
+      pTabA := sqlite3LocateTable(pParse, LOCATE_NOERR, PAnsiChar(zRight), zDbFc);
       if pTabA <> nil then begin
         pPkIdx := sqlite3PrimaryKeyIndex(pTabA);
         pParse^.nMem := 7;
@@ -61812,7 +61812,7 @@ begin
               i - nHidden,
               Pointer(pColA^.zCnName),
               Pointer(sqlite3ColumnType(pColA, '')),
-              i32(pColA^.typeFlags and $0F),    { notNull bitfield: low 4 bits }
+              i32(ord((pColA^.typeFlags and $0F) <> 0)),  { notNull ? 1 : 0 }
               Pointer(zDfltTok),
               k,
               isHidden])
@@ -61821,7 +61821,7 @@ begin
               i - nHidden,
               Pointer(pColA^.zCnName),
               Pointer(sqlite3ColumnType(pColA, '')),
-              i32(pColA^.typeFlags and $0F),
+              i32(ord((pColA^.typeFlags and $0F) <> 0)),  { notNull ? 1 : 0 }
               Pointer(zDfltTok),
               k]);
           Inc(i);
@@ -61832,9 +61832,9 @@ begin
 
     { pragma.c:1369 — PRAGMA index_info(idx) / index_xinfo(idx). }
     PragTyp_INDEX_INFO: if pValue <> nil then begin
-      pIdxA := sqlite3FindIndex(db, PAnsiChar(zRight), nil);
+      pIdxA := sqlite3FindIndex(db, PAnsiChar(zRight), zDbFc);
       if pIdxA = nil then begin
-        pTabA := sqlite3LocateTable(pParse, LOCATE_NOERR, PAnsiChar(zRight), nil);
+        pTabA := sqlite3LocateTable(pParse, LOCATE_NOERR, PAnsiChar(zRight), zDbFc);
         if (pTabA <> nil) and (HasRowid(pTabA) = False) then
           pIdxA := sqlite3PrimaryKeyIndex(pTabA);
       end;
@@ -61871,7 +61871,7 @@ begin
 
     { pragma.c:1414 — PRAGMA index_list(t). }
     PragTyp_INDEX_LIST: if pValue <> nil then begin
-      pTabA := sqlite3FindTable(db, PAnsiChar(zRight), nil);
+      pTabA := sqlite3FindTable(db, PAnsiChar(zRight), zDbFc);
       if pTabA <> nil then begin
         pParse^.nMem := 5;
         sqlite3CodeVerifySchema(pParse,
@@ -62026,7 +62026,7 @@ begin
       (linked via FKEY_PNEXTFROM_OFFSET) emitting one row per (FK, column)
       pair: id, seq, table, from, to, on_update, on_delete, match. }
     PragTyp_FOREIGN_KEY_LIST: if pValue <> nil then begin
-      pTabA := sqlite3FindTable(db, PAnsiChar(zRight), nil);
+      pTabA := sqlite3FindTable(db, PAnsiChar(zRight), zDbFc);
       if (pTabA <> nil) and (pTabA^.eTabType = TABTYP_NORM) then begin
         pFKey := Pu8(pTabA^.u.tab.pFKey);
         if pFKey <> nil then begin
