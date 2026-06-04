@@ -37298,7 +37298,8 @@ begin
         nothing (insert2-1.2.x / 1.3.x). }
       if (pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
-         or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Set) then
+         or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Set)
+         or (pDest^.eDest = SRT_Upfrom) then
         obCandidate := True
       else if orderByGrp = 0 then
       begin
@@ -38103,6 +38104,29 @@ begin
           if pDest^.iSDParm2 > 0 then
             sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
                                  pDest^.iSdst, nResultCol);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
+        else if pDest^.eDest = SRT_Upfrom then
+        begin
+          { Sorter-drain disposal for SRT_Upfrom — UPDATE..FROM with
+            ORDER BY/LIMIT where the ORDER BY is not satisfied by the
+            synthesised GROUP BY on the target rowid/PK (orderByGrp=0).
+            Mirrors generateSortTail SRT_Upfrom arm (select.c:1849..1858):
+            MakeRecord of the SET columns and Insert (i2<0, rowid table) or
+            IdxInsert (i2>=0, WITHOUT ROWID PK key prefix of length i2).
+            upfrom2-2.x.4/7/8. }
+          iUF2 := pDest^.iSDParm2;
+          r1   := sqlite3GetTempReg(pParse);
+          if iUF2 < 0 then
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst + 1,
+                              nResultCol - 1, r1)
+          else
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+          if iUF2 < 0 then
+            sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, pDest^.iSdst)
+          else
+            sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                                 pDest^.iSdst, iUF2);
           sqlite3ReleaseTempReg(pParse, r1);
         end
         else
@@ -40648,6 +40672,8 @@ begin
               Result := SQLITE_ERROR; Exit;
             end;
             pParse^.addrExplain := ctAddrExplain;
+            { select.c:8115 — see the inline arm below. }
+            pItem^.pSTab^.nRowLogEst := pItem^.u4.pSubq^.pSelect^.nSelectRow;
             if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
             sqlite3VdbeAddOp2(v, OP_Return, pItem^.u4.pSubq^.regReturn,
                               ctTopAddr + 1);
@@ -40735,6 +40761,14 @@ begin
             begin
               Result := SQLITE_ERROR; Exit;
             end;
+            { select.c:8115 — propagate the materialised subquery's computed
+              row count to the ephemeral table the planner sees, so the auto-
+              index cost model (whereLoopAddBtree, rSize=pTab^.nRowLogEst) does
+              not treat a small VALUES/CTE source as a default ~1M-row table.
+              Without this the planner over-eagerly builds an automatic index
+              on a tiny UPDATE..FROM source and reverses the join order, which
+              breaks last-write-wins for duplicate target rows (upfrom2-1.x.10). }
+            pItem^.pSTab^.nRowLogEst := pItem^.u4.pSubq^.pSelect^.nSelectRow;
           end;
         end;
       end;
