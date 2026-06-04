@@ -37337,7 +37337,8 @@ begin
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine)
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
-          or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Upfrom))
+          or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Upfrom)
+          or (pDest^.eDest = SRT_Exists))
   then
   begin
     { 9.4.divbug.82 — SRT_Set admitted so IN-RHS subselect (sqlite3CodeRhsOfIN
@@ -38125,6 +38126,17 @@ begin
                                pDest^.iSdst, nResultCol);
         sqlite3ReleaseTempReg(pParse, r1);
       end
+      else if pDest^.eDest = SRT_Exists then
+      begin
+        { selectInnerLoop SRT_Exists arm (select.c:1410..1416): record that a
+          row exists by writing 1 into iSDParm; the injected LIMIT 1 (added by
+          sqlite3CodeSubselect) terminates the loop via the OP_DecrJumpZero
+          below.  Needed for `EXISTS(SELECT … GROUP BY … HAVING …)` used as a
+          value operand (aggnested-10.1): without this arm the GROUP BY scan
+          was skipped entirely and the EXISTS subquery collapsed to a bare
+          OP_Integer 0. }
+        sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+      end
       else if pDest^.eDest = SRT_Upfrom then
       begin
         { UPDATE..FROM .. LIMIT (rowid / WITHOUT-ROWID PK target) hands an
@@ -38413,7 +38425,8 @@ begin
       (window.c:1332 sqlite3WindowLink chain + select.c:7686 recursion). }
     if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab)
        and (pDest^.eDest <> SRT_Coroutine) and (pDest^.eDest <> SRT_Mem)
-       and (pDest^.eDest <> SRT_Set) and (pDest^.eDest <> SRT_Exists) then
+       and (pDest^.eDest <> SRT_Set) and (pDest^.eDest <> SRT_Exists)
+       and (pDest^.eDest <> SRT_Upfrom) and (pDest^.eDest <> SRT_Table) then
     begin Result := SQLITE_OK; Exit; end;
     { DISTINCT combined with ORDER BY needs OMITREF/sorter-key dedup that the
       simple inline arm here does not implement. }
@@ -38658,6 +38671,50 @@ begin
         the injected LIMIT 1 jumps out of the scan for us. }
       if p^.iOffset <> 0 then
         codeOffset(v, p^.iOffset, iContW);
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
+    end
+    else if (pDest^.eDest = SRT_Upfrom) or (pDest^.eDest = SRT_Table) then
+    begin
+      { rowvalue-30.1 — UPDATE…FROM whose synthesised FROM-driven SELECT
+        (updateFromSelect) carries a window function in the SET subquery,
+        e.g. `UPDATE t2 SET (a,b)=(SELECT max(x) OVER(PARTITION BY sum(y)),2)
+        FROM t1`.  Buffer each windowed result row into the UPDATE eph table
+        at iSDParm.  Mirrors selectInnerLoop SRT_Upfrom / SRT_Table arms
+        (select.c:1349..1377) and the agg-no-GROUP-BY arm at codegen.pas:39760.
+        SRT_Upfrom: first result col is the target rowid (iSDParm2<0) or the
+        WITHOUT-ROWID PK key prefix of length iSDParm2; skip rows whose first
+        col is NULL.  SRT_Table (VIEW / vtab target): MakeRecord + NewRowid +
+        Insert(APPEND). }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, iContW);
+      r1 := sqlite3GetTempReg(pParse);
+      if pDest^.eDest = SRT_Upfrom then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IsNull, pDest^.iSdst, iContW);
+        if pDest^.iSDParm2 < 0 then
+        begin
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst + 1,
+                            nResultCol - 1, r1);
+          sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, pDest^.iSdst);
+        end
+        else
+        begin
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                               pDest^.iSdst, pDest^.iSDParm2);
+        end;
+      end
+      else
+      begin
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+      end;
+      sqlite3ReleaseTempReg(pParse, r1);
       if p^.iLimit <> 0 then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
     end
@@ -39037,7 +39094,8 @@ begin
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_EphemTab)
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
-          or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue))
+          or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue)
+          or (pDest^.eDest = SRT_Upfrom) or (pDest^.eDest = SRT_Table))
   then
   begin
     canUseAgg := True;
@@ -39743,6 +39801,48 @@ begin
           sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
           sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
           sqlite3ReleaseTempReg(pParse, r2);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
+        else if (pDest^.eDest = SRT_Upfrom) or (pDest^.eDest = SRT_Table) then
+        begin
+          { rowvalue-30.1 — UPDATE…FROM whose synthesised FROM-driven SELECT
+            (updateFromSelect, update.c:236..255) is itself an aggregate with
+            no GROUP BY, e.g. `UPDATE t2 SET (a,b)=(SELECT max(t1.x),2) FROM t1`.
+            The single aggregate row must be buffered into the UPDATE eph table
+            at iSDParm so the update loop has something to apply.  Mirrors the
+            selectInnerLoop SRT_Upfrom / SRT_Table arms (select.c:1349..1377)
+            and the GROUP BY arm at codegen.pas:38094/38128.  Without this arm
+            the eph was opened but never populated, so the target stayed NULL.
+            SRT_Upfrom: first result col is the target rowid (or, for a
+            WITHOUT ROWID PK target, iSDParm2 holds the PK key length); skip the
+            empty-aggregate NULL-rowid row.  SRT_Table (VIEW / vtab target):
+            plain MakeRecord + NewRowid + Insert(APPEND). }
+          r1 := sqlite3GetTempReg(pParse);
+          if pDest^.eDest = SRT_Upfrom then
+          begin
+            sqlite3VdbeAddOp2(v, OP_IsNull, pDest^.iSdst, addrLimitEnd);
+            if pDest^.iSDParm2 < 0 then
+            begin
+              sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst + 1,
+                                nResultCol - 1, r1);
+              sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, pDest^.iSdst);
+            end
+            else
+            begin
+              sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+              sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                                   pDest^.iSdst, pDest^.iSDParm2);
+            end;
+          end
+          else
+          begin
+            r2 := sqlite3GetTempReg(pParse);
+            sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+            sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+            sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+            sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+            sqlite3ReleaseTempReg(pParse, r2);
+          end;
           sqlite3ReleaseTempReg(pParse, r1);
         end
         else if (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue) then
@@ -71769,6 +71869,18 @@ begin
   markAggregateInExprList(pParse, p^.pEList);
   markAggregateInExprList(pParse, p^.pOrderBy);
   markAggregateInExpr(pParse, p^.pHaving);
+  { rowvalue-30.1: aggregate functions can also appear inside a window's
+    PARTITION BY / ORDER BY (e.g. `max(x) OVER (PARTITION BY sum(y))`).  C's
+    resolver flips those to TK_AGG_FUNCTION at name-resolution time, so they
+    get pushed into the synthetic sub-SELECT's pEList (via the pSublist append
+    below) and computed by its aggregate machinery.  Pas defers the flip, so
+    mark them here too — otherwise the appended `sum(y)` stays TK_FUNCTION,
+    exprListHasAggFunc on pSub's pEList reports no aggregate, the window
+    materialise strips SF_Aggregate, and the partition aggregate is never
+    computed (UPDATE …(a,b)=(SELECT max(x) OVER(PARTITION BY sum(...)))
+    leaves the target NULL). }
+  markAggregateInExprList(pParse, pMWin^.pPartition);
+  markAggregateInExprList(pParse, pMWin^.pOrderBy);
 
   p^.pSrc     := nil;
   p^.pWhere   := nil;
