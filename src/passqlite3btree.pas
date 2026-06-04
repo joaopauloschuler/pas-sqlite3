@@ -7163,8 +7163,14 @@ begin
   sqlite3BtreeLeave(p);
   { No shared-cache list removal needed }
   sqlite3PagerClose(pBt^.pPager, p^.db);
-  if pBt^.xFreeSchema <> nil then
+  if (pBt^.xFreeSchema <> nil) and (pBt^.pSchema <> nil) then
     pBt^.xFreeSchema(pBt^.pSchema);
+  { btree.c:2960 — after clearing the schema contents, free the Schema
+    struct itself.  Omitting this leaked the per-Btree Schema record (and
+    its installed sqlite_schema Table/Column payloads) at every db close
+    (memsubsys2-3.x/4.x residual). }
+  sqlite3DbFree(nil, pBt^.pSchema);
+  pBt^.pSchema := nil;
   freeTempSpace(pBt);
   sqlite3_free(pBt);
   sqlite3_free(p);

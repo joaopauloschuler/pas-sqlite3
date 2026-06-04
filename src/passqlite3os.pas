@@ -948,10 +948,17 @@ function  unixGetTempname(nBuf: cint; zBuf: PAnsiChar): cint; forward;
   Section 0: Memory helpers
   ============================================================ }
 
-{ os.c ~400: sqlite3MallocZero — wraps calloc(1, n) }
+{ malloc.c:580 sqlite3MallocZero — route through sqlite3Malloc so the
+  allocation is tracked by the SQLITE_STATUS_MEMORY_USED / MALLOC_COUNT
+  accounting (and honours SQLITE_CONFIG_MALLOC), then zero it.  The prior
+  implementation called libc_calloc directly, bypassing sqlite3Malloc's
+  sqlite3StatusUp() while the matching sqlite3_free() still ran
+  sqlite3StatusDown(); that drove the memory counters negative
+  (memsubsys2-3.x / 4.x). }
 function sqlite3MallocZero(n: csize_t): Pointer;
 begin
-  Result := libc_calloc(1, n);
+  Result := sqlite3Malloc(i32(n));
+  if Result <> nil then FillChar(Result^, n, 0);
 end;
 
 { os.c ~410: sqlite3StrDup — duplicate a C string (caller frees with sqlite3_free) }

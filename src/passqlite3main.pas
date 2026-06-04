@@ -777,6 +777,19 @@ begin
   end;
   sqlite3HashClear(@db^.aCollSeq);
 
+  { main.c:1442..1447 — clear each registered virtual-table Module's
+    eponymous table and drop its reference (which frees the Module struct
+    allocated by sqlite3VtabCreateModule) before clearing the aModule hash.
+    sqlite3HashClear only frees the internal hash nodes, not the Module
+    payloads; omitting this loop leaked every registered module
+    (memsubsys2-3.x/4.x residual). }
+  pElem := db^.aModule.first;
+  while pElem <> nil do begin
+    pNextElem := passqlite3util.PHashElem(pElem^.next);
+    sqlite3VtabEponymousTableClear(db, PVtabModule(pElem^.data));
+    sqlite3VtabModuleUnref(db, PVtabModule(pElem^.data));
+    pElem := pNextElem;
+  end;
   sqlite3HashClear(@db^.aModule);
 
   { Deallocate the cached error string, if any. }
@@ -997,9 +1010,15 @@ begin
     goto opendb_out;
   end;
 
-  { Allocate stand-in schemas for main and temp.  Phase 8.1 stub:
-    sqlite3BtreeSchema is not ported, so we do not pull from BtShared. }
-  db^.aDb[0].pSchema := sqlite3SchemaGet(db, nil);
+  { main.c:3586..3591 — the MAIN schema must be fetched from (and owned by)
+    the main Btree so sqlite3BtreeClose's xFreeSchema/sqlite3DbFree path
+    tears it down at connection close; the temp schema (slot 1) is the
+    btree-less standalone schema freed explicitly in
+    sqlite3LeaveMutexAndCloseZombie.  Passing nil for slot 0 (the old
+    "sqlite3BtreeSchema not ported" stub) left the main schema — and the
+    bootstrapped sqlite_master Table installed into it — unreferenced by
+    any Btree, so it leaked at every db close (memsubsys2-3.x/4.x). }
+  db^.aDb[0].pSchema := sqlite3SchemaGet(db, db^.aDb[0].pBt);
   db^.aDb[1].pSchema := sqlite3SchemaGet(db, nil);
 
   db^.aDb[0].zDbSName     := 'main';
