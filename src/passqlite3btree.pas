@@ -8302,40 +8302,53 @@ begin
   sqlite3BtreeLeave(p);
 end;
 
-{ btree.c:3185 — simplified: only honours the call when iFix is non-zero
-  or BTS_PAGESIZE_FIXED is not yet set.  nReserve<0 means "leave unchanged". }
+{ btree.c:3069 — Change the default page size and the number of reserved
+  bytes per page.  Records the requested reserve in nReserveWanted so that
+  sqlite3BtreeGetRequestedReserve (and hence VACUUM / FCNTL_RESERVE_BYTES)
+  can carry it forward into the page-1 header byte 20. }
 function sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
                                  nReserve: i32; iFix: i32): i32;
 var
   pBt    : PBtShared;
   rc     : i32;
+  x      : i32;
   uPgsz  : u32;
 begin
   pBt := p^.pBt;
   rc  := SQLITE_OK;
+  Assert((nReserve >= 0) and (nReserve <= 255));
   sqlite3BtreeEnter(p);
-  if (pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0 then begin
+  pBt^.nReserveWanted := u8(nReserve);
+  x := i32(pBt^.pageSize) - i32(pBt^.usableSize);
+  if (x = nReserve) and ((iPageSize = 0) or (u32(iPageSize) = pBt^.pageSize)) then begin
     sqlite3BtreeLeave(p);
-    if i32(pBt^.pageSize) = iPageSize then Result := SQLITE_OK
-    else                                  Result := SQLITE_READONLY;
+    Result := SQLITE_OK;
     Exit;
   end;
-  if nReserve < 0 then
-    nReserve := i32(pBt^.pageSize - pBt^.usableSize);
+  if nReserve < x then nReserve := x;
+  if (pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0 then begin
+    sqlite3BtreeLeave(p);
+    Result := SQLITE_READONLY;
+    Exit;
+  end;
+  Assert((nReserve >= 0) and (nReserve <= 255));
   if (iPageSize >= 512) and (iPageSize <= SQLITE_MAX_PAGE_SIZE)
      and (((iPageSize - 1) and iPageSize) = 0) then
   begin
-    uPgsz := u32(iPageSize);
+    Assert((iPageSize and 7) = 0);
+    Assert(pBt^.pCursor = nil);
+    if (nReserve > 32) and (iPageSize = 512) then iPageSize := 1024;
     { btree.c:3092..3093 — adopt the new page size and discard the temp
       scratch buffer so it gets reallocated at the new (larger) page size.
       Without freeTempSpace the stale default-sized pTmpSpace is reused and
       sqlite3BtreeInsert's FillChar overruns it once page_size grows. }
-    pBt^.pageSize := uPgsz;
+    pBt^.pageSize := u32(iPageSize);
     freeTempSpace(pBt);
-    rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
-    pBt^.pageSize   := uPgsz;
-    pBt^.usableSize := uPgsz - u32(nReserve);
   end;
+  uPgsz := pBt^.pageSize;
+  rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
+  pBt^.pageSize   := uPgsz;
+  pBt^.usableSize := pBt^.pageSize - u32(nReserve);
   if iFix <> 0 then
     pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
   sqlite3BtreeLeave(p);
