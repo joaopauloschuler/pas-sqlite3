@@ -397,6 +397,13 @@ set ::sqlite_options(uri_00_error) 0
 # produces 8179 too.  Without pinning, the cap defaults to 1 below → func6 takes
 # the bNullTrim=1 branch and wrongly expects 8180.
 set ::sqlite_options(null_trim) 0
+# percentile.test wraps its WITHIN GROUP (ORDER BY x) ordered-set-aggregate
+# subtests in `ifcapable ordered_set_aggregates`.  The oracle build does NOT
+# define SQLITE_ENABLE_ORDERED_SET_AGGREGATES, so test_config.c:198-204 writes
+# ordered_set_aggregates=0 and the oracle SKIPS those blocks.  pas-sqlite3 does
+# not implement that syntax either (parity with the oracle).  Without this, the
+# cap defaults to 1 below → the blocks wrongly RUN and fail with near "(": syntax error.
+set ::sqlite_options(ordered_set_aggregates) 0
 # The oracle build (../sqlite3, verified via pragma_compile_options) does NOT
 # define these compile flags, so its test_config.c writes each capability = 0.
 # Our harness otherwise defaults unset caps to 1 (below), making ifcapable-gated
