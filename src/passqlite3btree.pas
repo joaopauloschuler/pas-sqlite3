@@ -3116,11 +3116,14 @@ moveto_table_next_layer:
       chldPg := get4byte(aData + (mskPage and u16(get2byteAligned(aCellI + 2*lwr))));
     pCur^.ix := u16(lwr);
     rc := moveToChild(pCur, chldPg);
-    if rc <> SQLITE_OK then begin
-      pRes^ := c;
-      Result := rc;
-      Exit;
-    end;
+    { btree.c:5945 `if( rc ) break;` — break the outer for(;;) and fall to
+      moveto_table_finish WITHOUT touching *pRes.  *pRes keeps the caller's
+      initial 0 so the OP_SeekRowid/OP_NotExists invariant `rc==SQLITE_OK ||
+      res==0` holds: a moveToChild corruption must surface as rc<>OK with
+      res=0, otherwise the VDBE's `if res<>0 then jump` swallows it
+      (corrupt2-8.1: SELECT ... WHERE rowid=N over a child page whose type
+      byte was flipped to index-leaf). }
+    if rc <> SQLITE_OK then goto moveto_table_finish;
   end;
 
 moveto_table_finish:

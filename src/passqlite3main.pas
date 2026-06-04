@@ -375,6 +375,18 @@ procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
   a full OP_ParseSchema → sqlite3_exec round trip on a btree that has
   no actual sqlite_master rows yet).
   ---------------------------------------------------------------------- }
+{ Port-local mInitFlags bit (above the C INITFLAG_AlterMask 0x0007 range):
+  set on the authoritative fresh schema load (sqlite3InitOne) so the
+  sqlite3InitCallback "already published" dedup guard — a workaround for the
+  dropped WHERE filter on the schema SELECT (see execParseSchemaImpl) — is
+  SUPPRESSED.  During InitOne the per-db schema was just reset, so a second
+  schema row whose object is already in the hash is a genuine duplicate that
+  must surface the same error C does (corrupt2-2.1: "index a3 already
+  exists").  Mid-statement OP_ParseSchema re-fires (execParseSchemaImpl) keep
+  the dedup because they legitimately re-enumerate already-published rows. }
+const
+  INITFLAG_FreshLoad = u32($00010000);
+
 type
   PInitData = ^TInitData;
   TInitData = record
@@ -3301,7 +3313,8 @@ begin
         such guard at all; it is a port-local workaround for the dropped WHERE
         filter on the schema SELECT (see execParseSchemaImpl banner), so it
         must skip a row only when an object of the SAME type already exists. }
-      if zArg1 <> nil then begin
+      if (zArg1 <> nil)
+         and ((pData^.mInitFlags and INITFLAG_FreshLoad) = 0) then begin
         alreadyPublished := False;
         if (zArg0 <> nil)
            and (sqlite3StrICmp(zArg0, PAnsiChar('trigger')) = 0) then begin
@@ -6276,6 +6289,10 @@ begin
   initData.iDb        := iDb;
   initData.rc         := SQLITE_OK;
   initData.pzErrMsg   := pzErrMsg;
+  { The synthetic bootstrap row re-prepares "CREATE TABLE x(...)" against the
+    already-installed sqlite_master; it relies on the dedup guard to no-op, so
+    do NOT set INITFLAG_FreshLoad here.  FreshLoad is applied below, only for
+    the on-disk schema-SELECT pass. }
   initData.mInitFlags := mFlags;
   initData.nInitRow   := 0;
   initData.mxPage     := 0;
@@ -6360,6 +6377,12 @@ begin
     db^.flags := db^.flags and (not SQLITE_LegacyFileFmt);
 
   Assert(db^.init.busy <> 0);
+  { Authoritative fresh load of the on-disk schema: this single pass walks
+    each sqlite_master row once over a schema that has no user objects yet, so
+    a row whose object is already in the hash is a genuine duplicate.  Enable
+    INITFLAG_FreshLoad to suppress the "already published" dedup so the same
+    "<obj> already exists" corruption C reports surfaces (corrupt2-2.1). }
+  initData.mInitFlags := initData.mInitFlags or INITFLAG_FreshLoad;
   initData.mxPage := sqlite3BtreeLastPage(pBt);
   zSql := sqlite3MPrintf(db,
             'SELECT*FROM"%w".%s ORDER BY rowid',
