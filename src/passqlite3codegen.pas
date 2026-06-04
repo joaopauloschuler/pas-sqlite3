@@ -12783,6 +12783,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     nWrapRowid: i32;       { joinH-9.2 — rowid candidate count within a wrapper }
     nWrapMatch: i32;       { joinH-16.x — real (non-rowid) matches in a wrapper }
     iWrapIdx:   i32;       { joinH-16.x — last matched pEList idx in a wrapper }
+    bMatchWrap: Boolean;   { join-26.1 — the qualified-DOT match was a wrapper }
+    matchWrapJ: i32;       { join-26.1 — wrapper pEList index of that match }
 
     { resolve.c:835..844 lookupname_end — when a column reference resolves
       successfully (cnt==1) and an authorizer is installed, invoke the
@@ -12904,10 +12906,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           (select1-6.8c).  Accumulate cnt / pMatch / matchCol over every
           source, then decide after the loop: cnt=1 binds, cnt>1 raises
           "ambiguous column name: A.f1". }
-        cnt      := 0;
-        pMatch   := nil;
-        matchCol := -1;
-        effCol   := 0;
+        cnt        := 0;
+        pMatch     := nil;
+        matchCol   := -1;
+        effCol     := 0;
+        bMatchWrap := False;
+        matchWrapJ := -1;
         for i := 0 to pSrc^.nSrc - 1 do
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
@@ -12930,7 +12934,24 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
              and (PSubquery(pItem^.u4.pSubq)^.pSelect <> nil)
              and (PSubquery(pItem^.u4.pSubq)^.pSelect^.pEList <> nil) then
           begin
-            if ResolveNestedFromDot(pItem, pE) then Exit;
+            { join-26.1 — resolve.c:351..416 nested-from arm of lookupName.
+              A qualified `tab.col` may match THIS wrapper's pEList (via the
+              inner table's name) AND another outer source carrying the same
+              table name (e.g. `t5 JOIN ((t4 JOIN (t5 JOIN t6)) t7)` where the
+              outer leaf t5 and the wrapper's inner t5 both answer `t5.a`).
+              C counts every such match in `cnt`; two-or-more is ambiguous
+              ("main.t5.a").  So DON'T bind+Exit on the first wrapper hit —
+              record it (pMatch/matchWrapJ) and Inc(cnt), then let the post-
+              scan cnt>1 tail raise the error or the cnt==1 tail bind it. }
+            if FindWrapperEListIdx(pItem, pE^.pLeft^.u.zToken,
+                 pE^.pRight^.u.zToken, iCol) then
+            begin
+              Inc(cnt);
+              pMatch      := pItem;
+              bMatchWrap  := True;
+              matchWrapJ  := iCol;
+              Continue;
+            end;
           end;
           if pItem^.zAlias <> nil then
           begin
@@ -12946,8 +12967,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               source can lift cnt above 1 (ambiguity).  Binding happens after
               the loop when cnt=1. }
             Inc(cnt);
-            pMatch   := pItem;
-            matchCol := iCol;
+            pMatch     := pItem;
+            matchCol   := iCol;
+            bMatchWrap := False;  { join-26.1 — this is a real-leaf match }
             { 9.4.divbug.30 — IPK alias to iColumn=-1 (resolve.c:466). }
             if pItem^.pSTab^.iPKey = iCol then
               effCol := i16(-1)
@@ -12995,6 +13017,26 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                       + AnsiString(pE^.pLeft^.u.zToken) + '.'
                       + AnsiString(pE^.pRight^.u.zToken)));
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          Exit;
+        end
+        else if (cnt = 1) and bMatchWrap and (pMatch <> nil) then
+        begin
+          { join-26.1 — the single match was a nested-from wrapper.  Bind to
+            (wrapper.iCursor, pEList-index) exactly as the old ResolveNestedFromDot
+            did (resolve.c:408..409 pMatch=pItem; pExpr->iColumn=j). }
+          pE^.op      := TK_COLUMN;
+          pE^.iTable  := pMatch^.iCursor;
+          pE^.iColumn := i16(matchWrapJ);
+          pE^.y.pTab  := pMatch^.pSTab;
+          pE^.pLeft   := nil;
+          pE^.pRight  := nil;
+          if matchWrapJ < BMS - 1 then
+            pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchWrapJ)
+          else
+            pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl (BMS - 1));
+          if (pMatch^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+            ExprSetProperty(pE, EP_CanBeNull);  { resolve.c:509 }
+          AuthReadCol(pE);
           Exit;
         end
         else if (cnt = 1) and (pMatch <> nil) then
@@ -31687,6 +31729,52 @@ begin
     Result := NestedFromColBaseName(pRef, iInnerCol);  { inner wrapper }
 end;
 
+{ join-26.1 — originating leaf table NAME (or alias) of pEList entry j of an
+  SF_NestedFrom wrapper.  C qualifies each re-expanded nested-from result
+  column by the originating table when the wrapper is unaliased (the column's
+  zEName is "db.tab.col"); two emitted columns that share BOTH that table name
+  and the column name resolve to the same qualified reference and lookupName
+  reports them ambiguous (`t5 JOIN ((t4 JOIN (t5 JOIN t6)) t7)` → the outer
+  leaf t5 and the wrapper's inner t5 both answer `t5.a`).  Returns the leaf
+  source's alias if present, else its table zName; recurses through nested
+  inner wrappers. }
+function NestedFromColTabName(pWrap: PSrcItem; j: i32): PAnsiChar;
+var
+  pSel:    PSelect;
+  pELst:   PExprList;
+  items_:  PExprListItem;
+  pE2:     PExpr;
+  pInnerS: PSrcList;
+  pRef:    PSrcItem;
+  k:       i32;
+begin
+  Result := nil;
+  if (pWrap = nil) or (pWrap^.u4.pSubq = nil) then Exit;
+  pSel := PSubquery(pWrap^.u4.pSubq)^.pSelect;
+  if pSel = nil then Exit;
+  pELst   := pSel^.pEList;
+  pInnerS := pSel^.pSrc;
+  if (pELst = nil) or (pInnerS = nil) then Exit;
+  if (j < 0) or (j >= pELst^.nExpr) then Exit;
+  items_ := ExprListItems(pELst);
+  pE2 := items_[j].pExpr;
+  if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Exit;
+  pRef := nil;
+  for k := 0 to pInnerS^.nSrc - 1 do
+  begin
+    pRef := PSrcItem(PByte(SrcListItems(pInnerS)) + k * SizeOf(TSrcItem));
+    if pRef^.iCursor = pE2^.iTable then Break;
+    pRef := nil;
+  end;
+  if pRef = nil then Exit;
+  if (pRef^.fg.fgBits2 and $40) <> 0 then            { inner wrapper }
+    Result := NestedFromColTabName(pRef, pE2^.iColumn)
+  else if pRef^.zAlias <> nil then
+    Result := pRef^.zAlias
+  else if pRef^.pSTab <> nil then
+    Result := pRef^.pSTab^.zName;
+end;
+
 { NestedFromColNoExpand — is pEList entry j of an SF_NestedFrom wrapper tagged
   bNoExpand (eBits2 bit 0)?  expandStar sets this on USING/NATURAL-coalesced
   duplicate columns (select.c:6300..6306).  Such columns must NOT participate in
@@ -31785,6 +31873,125 @@ var
   zBaseJ:    PAnsiChar;
   zBaseK:    PAnsiChar;
   nWrapCol:  i32;
+
+  { join-26.1 — cross-source `*`-expansion ambiguity precheck state. }
+  function StarColQual(pIt: PSrcItem; isWrap: Boolean; col: i32): PAnsiChar;
+  begin
+    { Qualifier C would attach to this emitted column.  An ALIASED source
+      qualifies every column by the alias; otherwise a leaf qualifies by its
+      table name and a nested-from wrapper qualifies each column by the
+      originating inner table (its zEName tab component). }
+    if pIt^.zAlias <> nil then
+      Result := pIt^.zAlias
+    else if isWrap then
+      Result := NestedFromColTabName(pIt, col)
+    else if pIt^.pSTab <> nil then
+      Result := pIt^.pSTab^.zName
+    else
+      Result := nil;
+  end;
+
+  function StarColName(pIt: PSrcItem; isWrap: Boolean; col: i32): PAnsiChar;
+  begin
+    if isWrap then
+      Result := NestedFromColBaseName(pIt, col)
+    else if (pIt^.pSTab <> nil) and (col >= 0) and (col < pIt^.pSTab^.nCol) then
+      Result := PColumn(PByte(pIt^.pSTab^.aCol) + col * SizeOf(TColumn))^.zCnName
+    else
+      Result := nil;
+  end;
+
+  function StarColSkip(pIt: PSrcItem; idx: i32; isWrap: Boolean; col: i32): Boolean;
+  var zNm: PAnsiChar;
+  begin
+    { Skip rowid / HIDDEN / USING-coalesced (NOEXPAND) columns — these never
+      participate in C's qualified-name ambiguity (resolve.c bRowid / select.c
+      6241..6246 / 6300..6306). }
+    if isWrap then
+    begin
+      Result := NestedFromColIsRowid(pIt, col) or NestedFromColNoExpand(pIt, col)
+                or ((PColumn(PByte(pIt^.pSTab^.aCol) + col * SizeOf(TColumn))^.colFlags
+                     and COLFLAG_NOEXPAND) <> 0);
+      Exit;
+    end;
+    if (pIt^.pSTab = nil) or (col < 0) or (col >= pIt^.pSTab^.nCol) then
+    begin Result := True; Exit; end;
+    if (PColumn(PByte(pIt^.pSTab^.aCol) + col * SizeOf(TColumn))^.colFlags
+         and (COLFLAG_NOEXPAND or COLFLAG_HIDDEN)) <> 0 then
+    begin Result := True; Exit; end;
+    { select.c:6251..6258 — a RIGHT-side (idx>0) leaf column whose name is in
+      its own USING() set is omitted from `*` (the LEFT side supplies it); a
+      NATURAL join lowers to USING, so this covers both.  Without this skip a
+      self-natural-join `t1 NATURAL JOIN t1` would be falsely flagged (join-11.4). }
+    Result := False;
+    if (idx > 0) and ((pIt^.fg.fgBits2 and $08) <> 0) and (pIt^.u3.pUsing <> nil) then
+    begin
+      zNm := PColumn(PByte(pIt^.pSTab^.aCol) + col * SizeOf(TColumn))^.zCnName;
+      if (zNm <> nil) and (sqlite3IdListIndex(pIt^.u3.pUsing, zNm) >= 0) then
+        Result := True;
+    end;
+  end;
+
+  { CrossSourceAmbiguous — mirror C's `*`-re-expansion ambiguity for a plain
+    (non-T.*) `*` over a multi-source FROM that contains at least one nested
+    wrapper.  C emits one `qual.col` reference per visible column; two columns
+    that share BOTH qualifier and name resolve to the same reference and
+    lookupName flags them ambiguous (join-26.1: outer leaf t5 and the inner t5
+    inside `(... (t5 JOIN t6)) t7` both produce `t5.a`).  This port binds the
+    `*` columns directly, so detect the collision here.  Returns the colliding
+    column name (for the error) or nil. }
+  function CrossSourceAmbiguous: PAnsiChar;
+  var
+    iA, iB, cA, cB, nA, nB: i32;
+    pItA, pItB: PSrcItem;
+    wA, wB: Boolean;
+    qA, qB, nmA, nmB: PAnsiChar;
+  begin
+    Result := nil;
+    for iA := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItA := PSrcItem(PByte(base) + iA * SizeOf(TSrcItem));
+      if pItA^.pSTab = nil then Continue;
+      wA := ((pItA^.fg.fgBits2 and $40) <> 0)
+            and ((pItA^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+            and (pItA^.u4.pSubq <> nil)
+            and (PSubquery(pItA^.u4.pSubq)^.pSelect <> nil);
+      nA := pItA^.pSTab^.nCol;
+      for cA := 0 to nA - 1 do
+      begin
+        if StarColSkip(pItA, iA, wA, cA) then Continue;
+        qA  := StarColQual(pItA, wA, cA);
+        nmA := StarColName(pItA, wA, cA);
+        if (qA = nil) or (nmA = nil) then Continue;
+        { Compare against every LATER (source,col) pair. }
+        for iB := iA to pSrc^.nSrc - 1 do
+        begin
+          pItB := PSrcItem(PByte(base) + iB * SizeOf(TSrcItem));
+          if pItB^.pSTab = nil then Continue;
+          wB := ((pItB^.fg.fgBits2 and $40) <> 0)
+                and ((pItB^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+                and (pItB^.u4.pSubq <> nil)
+                and (PSubquery(pItB^.u4.pSubq)^.pSelect <> nil);
+          nB := pItB^.pSTab^.nCol;
+          for cB := 0 to nB - 1 do
+          begin
+            if (iB = iA) and (cB <= cA) then Continue;
+            if StarColSkip(pItB, iB, wB, cB) then Continue;
+            qB  := StarColQual(pItB, wB, cB);
+            nmB := StarColName(pItB, wB, cB);
+            if (qB = nil) or (nmB = nil) then Continue;
+            if (sqlite3StrICmp(qA, qB) = 0)
+               and (sqlite3StrICmp(nmA, nmB) = 0) then
+            begin
+              Result := nmA;
+              Exit;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
@@ -31856,6 +32063,20 @@ begin
       or table name matches zTName contribute columns. }
     tableSeen := False;
     base := SrcListItems(pSrc);
+    { join-26.1 — for a plain `*` over a multi-source FROM, detect a
+      cross-source `qual.col` collision (e.g. an outer leaf table and the same
+      table nested inside a wrapper) and raise the same "ambiguous column name"
+      C does on re-resolving the emitted qualified references. }
+    if (zTName = nil) and (pSrc^.nSrc > 1) and (not InRenameObject(pParse)) then
+    begin
+      zBaseJ := CrossSourceAmbiguous;
+      if zBaseJ <> nil then
+      begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('ambiguous column name: ' + AnsiString(zBaseJ)));
+        Exit;
+      end;
+    end;
     for i := 0 to pSrc^.nSrc - 1 do
     begin
       pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
@@ -31904,8 +32125,26 @@ begin
         the collision here: if two emitted (non-rowid, non-bNoExpand) wrapper
         result columns share a base name, raise the same error.  USING/NATURAL
         joins coalesce the shared column (bNoExpand on the right side), so they
-        expose it once and are correctly accepted. }
-      if isNestedWrap and (zTName = nil) and (not InRenameObject(pParse)) then
+        expose it once and are correctly accepted.
+
+        joinH-16.2.1/joinC/joinI — the within-wrapper duplicate is only an
+        error when the wrapper is NOT a transparent single-source unaliased
+        nested join.  Two cases match C's behaviour:
+          * the wrapper carries an explicit alias (`(t5 JOIN t6) x`,
+            join-26.1's `(...) t7`): C re-resolves the alias-qualified columns
+            and lookupName reports the duplicate ambiguous; and
+          * the FROM clause has more than one source (join-26.1's outer
+            `t5 JOIN (...)`), where select.c:6261 emits QUALIFIED `tab.col`
+            refs that resolve ambiguously.
+        An UNALIASED single-source wrapper such as `SELECT * FROM (t0_a RIGHT
+        JOIN (t2 LEFT JOIN t0_b))` is transparent: it re-expands to bare TK_ID
+        nodes whose duplicate `c0` columns name-mangle to `c0:1` and are
+        accepted, exactly as `SELECT * FROM (t5 JOIN t6)` (no alias) yields two
+        columns rather than an error.  A USING/NATURAL clause that demands a
+        single coalesced column out of such duplicates is still reported
+        ambiguous, but via the USING-resolution path (16.3.1), not this scan. }
+      if isNestedWrap and (zTName = nil) and (not InRenameObject(pParse))
+         and (pItem^.zAlias <> nil) then
       begin
         nWrapCol := pTab^.nCol;
         for jj := 0 to nWrapCol - 1 do
