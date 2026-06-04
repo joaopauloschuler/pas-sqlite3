@@ -50416,9 +50416,9 @@ begin
   end;
   if db^.init.busy <> 0 then begin
     if (db^.init.azInit = nil)
-       or (sqlite3StrICmp(zType,    db^.init.azInit[0]) <> 0)
-       or (sqlite3StrICmp(zName,    db^.init.azInit[1]) <> 0)
-       or (sqlite3StrICmp(zTblName, db^.init.azInit[2]) <> 0) then begin
+       or (sqlite3_stricmp(zType,    db^.init.azInit[0]) <> 0)
+       or (sqlite3_stricmp(zName,    db^.init.azInit[1]) <> 0)
+       or (sqlite3_stricmp(zTblName, db^.init.azInit[2]) <> 0) then begin
       sqlite3ErrorMsg(pParse, '');  { corruptSchema() supplies the real msg }
       Result := SQLITE_ERROR; Exit;
     end;
