@@ -25522,6 +25522,9 @@ var
   pSrc:           PSrcItem;
   regBase:        i32;
   db:             PTsqlite3;
+  addrCounter:    i32;
+  regYield:       i32;
+  pSubqCoro:      PSubquery;
 begin
   db       := pParse^.db;
   v        := pParse^.pVdbe;
@@ -25691,11 +25694,27 @@ begin
     sqlite3VdbeAddOp2(v, OP_Blob, 10000, pLevel^.regFilter);
   end;
 
-  { Emit the fill-loop: Rewind inner table, push rows into the auto-index. }
-  Assert((pSrc^.fg.fgBits and u8($40)) = 0,
-         'constructAutomaticIndex: viaCoroutine not yet supported');
-  Assert(pLevel^.addrHalt <> 0);
-  addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrHalt);
+  { Emit the fill-loop.  For a viaCoroutine FROM subquery (where.c:1191) the
+    rows are produced by running the subquery coroutine (OP_InitCoroutine +
+    OP_Yield) rather than rewinding a real cursor; OP_Column refs into the
+    iTabCur are later rewritten to OP_Copy from the coroutine's regResult by
+    translateColumnToCopy.  Otherwise Rewind the materialised inner table. }
+  addrCounter := 0;
+  if (pSrc^.fg.fgBits and u8($40)) <> 0 then  { viaCoroutine }
+  begin
+    Assert(SrcItemIsSubquery(pSrc^.fg));
+    pSubqCoro := pSrc^.u4.pSubq;
+    Assert(pSubqCoro <> nil);
+    regYield := pSubqCoro^.regReturn;
+    addrCounter := sqlite3VdbeAddOp2(v, OP_Integer, 0, 0);
+    sqlite3VdbeAddOp3(v, OP_InitCoroutine, regYield, 0, pSubqCoro^.addrFillSub);
+    addrTop := sqlite3VdbeAddOp1(v, OP_Yield, regYield);
+  end
+  else
+  begin
+    Assert(pLevel^.addrHalt <> 0);
+    addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrHalt);
+  end;
 
   if pPartial <> nil then
   begin
@@ -25717,10 +25736,24 @@ begin
   if pPartial <> nil then
     sqlite3VdbeResolveLabel(v, iContinue);
 
-  sqlite3VdbeAddOp2(v, OP_Next, pLevel^.iTabCur, addrTop + 1);
-  sqlite3VdbeChangeP5(v, SQLITE_STMTSTATUS_AUTOINDEX);
-  if (pSrc^.fg.jointype and JT_LEFT) <> 0 then
+  if (pSrc^.fg.fgBits and u8($40)) <> 0 then  { viaCoroutine }
+  begin
+    Assert(SrcItemIsSubquery(pSrc^.fg) and (pSrc^.u4.pSubq <> nil));
+    sqlite3VdbeChangeP2(v, addrCounter, regBase + n);
+    Assert(pLevel^.iIdxCur > 0);
+    translateColumnToCopy(pParse, addrTop, pLevel^.iTabCur,
+                          pSrc^.u4.pSubq^.regResult, pLevel^.iIdxCur);
+    sqlite3VdbeGoto(v, addrTop);
+    pSrc^.fg.fgBits := pSrc^.fg.fgBits and (not u8($40));  { clear viaCoroutine }
     sqlite3VdbeJumpHere(v, addrTop);
+  end
+  else
+  begin
+    sqlite3VdbeAddOp2(v, OP_Next, pLevel^.iTabCur, addrTop + 1);
+    sqlite3VdbeChangeP5(v, SQLITE_STMTSTATUS_AUTOINDEX);
+    if (pSrc^.fg.jointype and JT_LEFT) <> 0 then
+      sqlite3VdbeJumpHere(v, addrTop);
+  end;
 
   sqlite3ReleaseTempReg(pParse, regRecord);
 
