@@ -2566,52 +2566,146 @@ begin
   Result := SQLITE_OK;
 end;
 
-{ os_unix.c ~7008: unixFullPathname — resolve to an absolute path.
-  Phase 1: getcwd (via libc) + concat; does not resolve symlinks.
-  Note: FPC's FpGetCwd on Linux returns path length (not pointer) on success
-  (the kernel getcwd syscall writes to the buffer and returns the length).
-  Use the libc getcwd directly to get the correct pointer semantics. }
+{ os_unix.c ~7008: unixFullPathname — resolve to an absolute path,
+  following symlinks so the canonical name is used to derive the
+  journal/WAL/shm filenames.  Faithful port of the DbPath /
+  appendOnePathElement / appendAllPathElements machinery. }
 function libc_getcwd(buf: PChar; size: csize_t): PChar;
   cdecl; external 'c' name 'getcwd';
+
+const
+  { os.h:46 — SQLITE_MAX_SYMLINK (the per-path resolution cap). }
+  SQLITE_MAX_SYMLINK    = 200;
+  { sqlite3.h — SQLITE_OK with the symlink-followed extended bit. }
+  OS_SQLITE_OK_SYMLINK  = SQLITE_OK or (2 shl 8);
+  { os_unix.c:39 — SQLITE_MAX_PATHLEN = FILENAME_MAX (4096 on Linux). }
+  SQLITE_MAX_PATHLEN    = 4096;
+
+type
+  { os_unix.c:6908 — DbPath. }
+  TDbPath = record
+    rc      : cint;     { Non-zero following any error               }
+    nSymlink: cint;     { Number of symlinks resolved                }
+    zOut    : PChar;    { Write the pathname here                    }
+    nOut    : cint;     { Bytes of space available to zOut[]         }
+    nUsed   : cint;     { Bytes of zOut[] currently being used       }
+  end;
+  PDbPath = ^TDbPath;
+
+{ Forward reference (appendOnePathElement <-> appendAllPathElements). }
+procedure appendAllPathElements(pPath: PDbPath; zPath: PChar); forward;
+
+{ os_unix.c:6923 — append a single (non zero-terminated) path element
+  zName of nName bytes to the DbPath under construction, resolving the
+  result if it turns out to be a symlink. }
+procedure appendOnePathElement(pPath: PDbPath; zName: PChar; nName: cint);
+var
+  zIn  : PChar;
+  buf  : Stat;
+  got  : ssize_t;
+  zLnk : array[0..SQLITE_MAX_PATHLEN+1] of char;
+begin
+  { assert( nName>0 ); assert( zName!=0 ); }
+  if zName[0] = '.' then begin
+    if nName = 1 then Exit;
+    if (zName[1] = '.') and (nName = 2) then begin
+      if pPath^.nUsed > 1 then begin
+        { assert( pPath->zOut[0]=='/' ); }
+        Dec(pPath^.nUsed);
+        while pPath^.zOut[pPath^.nUsed] <> '/' do
+          Dec(pPath^.nUsed);
+      end;
+      Exit;
+    end;
+  end;
+  if pPath^.nUsed + nName + 2 >= pPath^.nOut then begin
+    pPath^.rc := SQLITE_ERROR;
+    Exit;
+  end;
+  pPath^.zOut[pPath^.nUsed] := '/';
+  Inc(pPath^.nUsed);
+  Move(zName^, pPath^.zOut[pPath^.nUsed], nName);
+  Inc(pPath^.nUsed, nName);
+
+  { HAVE_READLINK && HAVE_LSTAT }
+  if pPath^.rc = SQLITE_OK then begin
+    pPath^.zOut[pPath^.nUsed] := #0;
+    zIn := pPath^.zOut;
+    if FpLstat(zIn, buf) <> 0 then begin
+      if fpgeterrno <> ESysENOENT then
+        pPath^.rc := SQLITE_CANTOPEN_BKPT;
+    end else if (buf.st_mode and S_IFMT) = S_IFLNK then begin
+      if pPath^.nSymlink > SQLITE_MAX_SYMLINK then begin
+        Inc(pPath^.nSymlink);
+        pPath^.rc := SQLITE_CANTOPEN_BKPT;
+        Exit;
+      end;
+      Inc(pPath^.nSymlink);
+      got := FpReadLink(zIn, @zLnk[0], SizeOf(zLnk) - 2);
+      if (got <= 0) or (got >= ssize_t(SizeOf(zLnk) - 2)) then begin
+        pPath^.rc := SQLITE_CANTOPEN_BKPT;
+        Exit;
+      end;
+      zLnk[got] := #0;
+      if zLnk[0] = '/' then
+        pPath^.nUsed := 0
+      else
+        Dec(pPath^.nUsed, nName + 1);
+      appendAllPathElements(pPath, @zLnk[0]);
+    end;
+  end;
+end;
+
+{ os_unix.c:6984 — append all '/'-separated path elements of the
+  zero-terminated zPath to the DbPath under construction. }
+procedure appendAllPathElements(pPath: PDbPath; zPath: PChar);
+var
+  i, j : cint;
+begin
+  i := 0;
+  j := 0;
+  repeat
+    while (zPath[i] <> #0) and (zPath[i] <> '/') do Inc(i);
+    if i > j then
+      appendOnePathElement(pPath, zPath + j, i - j);
+    j := i + 1;
+    { do{...}while( zPath[i++] ): test the char, then advance i. }
+    if zPath[i] = #0 then begin
+      Inc(i);
+      Break;
+    end;
+    Inc(i);
+  until False;
+end;
 
 function unixFullPathname(pVfs: Psqlite3_vfs; zPath: PChar;
                           nOut: cint; zOut: PChar): cint; cdecl;
 var
-  cwd    : array[0..MAX_PATHNAME+1] of char;
-  cwdPtr : PChar;
-  pathLen: SizeInt;
-  remLen : SizeInt;
+  path : TDbPath;
+  zPwd : array[0..SQLITE_MAX_PATHLEN+1] of char;
 begin
-  zOut[0] := #0;
-
-  if (zPath <> nil) and (zPath[0] = '/') then begin
-    { Already absolute — copy verbatim }
-    StrLCopy(zOut, zPath, nOut - 1);
-    zOut[nOut - 1] := #0;
-    Result := SQLITE_OK;
+  path.rc       := 0;
+  path.nUsed    := 0;
+  path.nSymlink := 0;
+  path.nOut     := nOut;
+  path.zOut     := zOut;
+  if zPath[0] <> '/' then begin
+    if libc_getcwd(@zPwd[0], SizeOf(zPwd) - 2) = nil then begin
+      Result := SQLITE_CANTOPEN_BKPT;
+      Exit;
+    end;
+    appendAllPathElements(@path, @zPwd[0]);
+  end;
+  appendAllPathElements(@path, zPath);
+  zOut[path.nUsed] := #0;
+  if (path.rc <> 0) or (path.nUsed < 2) then begin
+    Result := SQLITE_CANTOPEN_BKPT;
     Exit;
   end;
-
-  { Relative path — prepend current working directory via libc getcwd }
-  cwdPtr := libc_getcwd(@cwd[0], SizeOf(cwd) - 2);
-  if cwdPtr = nil then begin
-    Result := SQLITE_CANTOPEN;
+  if path.nSymlink <> 0 then begin
+    Result := OS_SQLITE_OK_SYMLINK;
     Exit;
   end;
-
-  pathLen := StrLen(cwdPtr);
-  remLen  := nOut - pathLen - 2;
-  if (zPath <> nil) and (SizeInt(StrLen(zPath)) > remLen) then begin
-    Result := SQLITE_CANTOPEN;
-    Exit;
-  end;
-
-  StrLCopy(zOut, cwdPtr, nOut - 1);
-  if zPath <> nil then begin
-    zOut[pathLen] := '/';
-    StrLCopy(zOut + pathLen + 1, zPath, remLen);
-  end;
-  zOut[nOut - 1] := #0;
   Result := SQLITE_OK;
 end;
 
