@@ -2970,7 +2970,7 @@ end;
 
 function sqlite3PagerIsMemdb(pPager: PPager): i32;
 begin
-  if pPager^.memDb <> 0 then Result := 1 else Result := 0;
+  if (pPager^.tempFile <> 0) or (pPager^.memVfs <> 0) then Result := 1 else Result := 0;
 end;
 
 { pager.c:7088 — sqlite3PagerFilename.  When nullIfMemDb is set, memory
