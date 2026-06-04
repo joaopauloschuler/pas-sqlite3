@@ -10931,6 +10931,46 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { Derive the result-column name an ExprList item would expose, mirroring
+    sqlite3ColumnsFromExprList (codegen.pas:31186..31215): an explicit AS
+    alias (ENAME_NAME) wins; otherwise descend past COLLATE/likely and TK_DOT
+    and use the underlying TK_COLUMN's schema column name or a bare TK_ID
+    token.  A plain `SELECT artist` carries eBits=ENAME_SPAN (1), so the
+    bare-alias-only test misses it; this recovers the real exposed name. }
+  function ELItemColName(itm: PExprListItem): PAnsiChar;
+  var
+    pColExpr: PExpr;
+    pTab: PTable2;
+    iCol: i32;
+  begin
+    Result := nil;
+    if itm = nil then Exit;
+    if (itm^.zEName <> nil) and ((itm^.fg.eBits and $03) = ENAME_NAME) then
+    begin Result := itm^.zEName; Exit; end;
+    pColExpr := sqlite3ExprSkipCollateAndLikely(itm^.pExpr);
+    while (pColExpr <> nil) and (pColExpr^.op = TK_DOT) do
+      pColExpr := pColExpr^.pRight;
+    if pColExpr = nil then Exit;
+    if pColExpr^.op = TK_COLUMN then
+    begin
+      pTab := PTable2(pColExpr^.y.pTab);
+      iCol := pColExpr^.iColumn;
+      if pTab <> nil then
+      begin
+        if iCol < 0 then iCol := pTab^.iPKey;
+        if (iCol >= 0) and (pTab^.aCol <> nil) then
+          Result := pTab^.aCol[iCol].zCnName
+        else
+          Result := 'rowid';
+      end;
+    end
+    else if pColExpr^.op = TK_ID then
+    begin
+      if not ExprHasProperty(pColExpr, EP_IntValue) then
+        Result := pColExpr^.u.zToken;
+    end;
+  end;
+
   function BareColMaybeInner(pSrc: PSrcList; zCol: PAnsiChar): Boolean;
   var
     base_: PSrcItem;
@@ -10965,9 +11005,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           itm := ExprListItems(pEL);
           for k_ := 0 to pEL^.nExpr - 1 do
           begin
-            zEn := itm[k_].zEName;
-            if (zEn <> nil) and ((itm[k_].fg.eBits and $03) = ENAME_NAME)
-               and (sqlite3StrICmp(zEn, zCol) = 0) then
+            zEn := ELItemColName(@itm[k_]);
+            if (zEn <> nil) and (sqlite3StrICmp(zEn, zCol) = 0) then
             begin Result := True; Exit; end;
           end;
         end
