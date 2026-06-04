@@ -4370,16 +4370,198 @@ begin
   sqlite3_mutex_leave(PTsqlite3(p^.db)^.mutex);
 end;
 
-{ vdbeapi.c:2172 — sqlite3_normalized_sql.  Return the normalized SQL
-  associated with a prepared statement.  The C reference is gated on
-  SQLITE_ENABLE_NORMALIZE which adds a zNormSql field to Vdbe and a
-  sqlite3Normalize() helper.  This port is built without
-  SQLITE_ENABLE_NORMALIZE (no zNormSql field on PVdbe), so we return nil
-  unconditionally — matching the symbol's exported-but-unsupported
-  behaviour expected by drivers that probe for it via dlsym. }
-function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
+{ tokenize.c:771 — addSpaceSeparator.  Insert a single space into pStr
+  if the current string ends with an identifier character. }
+procedure normAddSpaceSeparator(pStr: PSqlite3Str);
 begin
-  Result := nil;
+  if (pStr^.nChar <> 0)
+     and (sqlite3IsIdChar(u8((pStr^.zText + (pStr^.nChar - 1))^)) <> 0) then
+    sqlite3_str_append(pStr, ' ', 1);
+end;
+
+{ vdbeaux.c:103 — sqlite3VdbeUsesDoubleQuotedString.  zId is an already-
+  dequoted double-quoted identifier; return 1 if the prepared statement
+  recorded it (during resolve) as a string literal rather than a column
+  reference. }
+function normRawStrEq(a, b: PAnsiChar): i32;
+var
+  i: PtrInt;
+begin
+  i := 0;
+  while (a[i] = b[i]) do
+  begin
+    if a[i] = #0 then Exit(1);
+    Inc(i);
+  end;
+  Result := 0;
+end;
+
+function normUsesDoubleQuotedString(pVdbe: PVdbe; zId: PAnsiChar): i32;
+var
+  pStr: PDblquoteStr;
+begin
+  if pVdbe^.pDblStr = nil then Exit(0);
+  pStr := pVdbe^.pDblStr;
+  while pStr <> nil do
+  begin
+    if normRawStrEq(zId, PAnsiChar(@pStr^.z[0])) <> 0 then Exit(1);
+    pStr := pStr^.pNextStr;
+  end;
+  Result := 0;
+end;
+
+{ tokenize.c:782 — sqlite3Normalize.  Compute a normalization of zSql:
+  literals/variables -> '?', whitespace+comments collapsed, identifiers
+  lower-cased, keywords/punct upper-cased, and "IN (v1,v2,..)" lists
+  rewritten to "IN(?,?,?)".  Returns a sqlite3_free()-able buffer (here
+  via sqlite3_str_finish) or nil on OOM/tokenizer error. }
+function sqlite3Normalize(pVdbe: PVdbe; zSql: PAnsiChar): PAnsiChar;
+var
+  db: PTsqlite3;
+  i: i32;
+  n: i64;
+  tokenType: i32;
+  prevType: i32;
+  nParen: i32;
+  iStartIN: i32;
+  nParenAtIN: i32;
+  j: u32;
+  pStr: PSqlite3Str;
+  zId: PAnsiChar;
+  nId: i32;
+  eType: i32;
+begin
+  db := sqlite3VdbeDb(pVdbe);
+  tokenType := -1;
+  nParen := 0;
+  iStartIN := 0;
+  nParenAtIN := 0;
+  pStr := sqlite3_str_new(db);
+  i := 0;
+  while (zSql[i] <> #0) and (pStr^.accError = 0) do
+  begin
+    if tokenType <> TK_SPACE then
+      prevType := tokenType;
+    n := gGetTokenImpl(PByte(zSql + i), @tokenType);
+    if n <= 0 then Break;
+    case tokenType of
+      TK_COMMENT, TK_SPACE: ; { skip }
+      TK_NULL:
+        begin
+          if (prevType = TK_IS) or (prevType = TK_NOT) then
+            sqlite3_str_append(pStr, ' NULL', 5)
+          else
+          begin
+            { fall through to the literal arm }
+            sqlite3_str_append(pStr, '?', 1);
+          end;
+        end;
+      TK_STRING, TK_INTEGER, TK_FLOAT, TK_VARIABLE, TK_BLOB:
+        sqlite3_str_append(pStr, '?', 1);
+      TK_LP:
+        begin
+          Inc(nParen);
+          if prevType = TK_IN then
+          begin
+            iStartIN := i32(pStr^.nChar);
+            nParenAtIN := nParen;
+          end;
+          sqlite3_str_append(pStr, '(', 1);
+        end;
+      TK_RP:
+        begin
+          if (iStartIN > 0) and (nParen = nParenAtIN) then
+          begin
+            pStr^.nChar := u32(iStartIN + 1);
+            sqlite3_str_append(pStr, '?,?,?', 5);
+            iStartIN := 0;
+          end;
+          Dec(nParen);
+          sqlite3_str_append(pStr, ')', 1);
+        end;
+      TK_ID:
+        begin
+          iStartIN := 0;
+          j := pStr^.nChar;
+          if (sqlite3CtypeMap[u8(zSql[i])] and $80) <> 0 then
+          begin
+            zId := sqlite3DbStrNDup(db, zSql + i, u64(n));
+            if zId = nil then Break;
+            sqlite3Dequote(zId);
+            if (zSql[i] = '"') and (normUsesDoubleQuotedString(pVdbe, zId) <> 0) then
+            begin
+              sqlite3_str_append(pStr, '?', 1);
+              sqlite3DbFree(db, zId);
+            end
+            else
+            begin
+              nId := sqlite3Strlen30(zId);
+              eType := 0;
+              if (gGetTokenImpl(PByte(zId), @eType) = nId) and (eType = TK_ID) then
+              begin
+                normAddSpaceSeparator(pStr);
+                sqlite3_str_append(pStr, zId, nId);
+              end
+              else
+                sqlite3_str_appendf(pStr, '"%w"', [zId]);
+              sqlite3DbFree(db, zId);
+            end;
+          end
+          else
+          begin
+            normAddSpaceSeparator(pStr);
+            sqlite3_str_append(pStr, zSql + i, i32(n));
+          end;
+          while j < pStr^.nChar do
+          begin
+            (pStr^.zText + j)^ := AnsiChar(sqlite3Tolower(u8((pStr^.zText + j)^)));
+            Inc(j);
+          end;
+        end;
+      TK_SELECT:
+        begin
+          iStartIN := 0;
+          { deliberate fall-through to default }
+          if sqlite3IsIdChar(u8(zSql[i])) <> 0 then normAddSpaceSeparator(pStr);
+          j := pStr^.nChar;
+          sqlite3_str_append(pStr, zSql + i, i32(n));
+          while j < pStr^.nChar do
+          begin
+            (pStr^.zText + j)^ := AnsiChar(sqlite3Toupper(u8((pStr^.zText + j)^)));
+            Inc(j);
+          end;
+        end;
+    else
+      begin
+        if sqlite3IsIdChar(u8(zSql[i])) <> 0 then normAddSpaceSeparator(pStr);
+        j := pStr^.nChar;
+        sqlite3_str_append(pStr, zSql + i, i32(n));
+        while j < pStr^.nChar do
+        begin
+          (pStr^.zText + j)^ := AnsiChar(sqlite3Toupper(u8((pStr^.zText + j)^)));
+          Inc(j);
+        end;
+      end;
+    end;
+    Inc(i, i32(n));
+  end;
+  if tokenType <> TK_SEMI then sqlite3_str_append(pStr, ';', 1);
+  Result := sqlite3_str_finish(pStr);
+end;
+
+{ vdbeapi.c:2172 — sqlite3_normalized_sql.  Return the normalized SQL
+  associated with a prepared statement, computing it lazily on first
+  call (the SQLITE_PREPARE_NORMALIZE flag is ignored — the normalization
+  is derived on demand from the retained zSql text). }
+function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
+var
+  p: PVdbe;
+begin
+  p := PVdbe(pStmt);
+  if p = nil then Exit(nil);
+  if (p^.zNormSql = nil) and (p^.zSql <> nil) then
+    p^.zNormSql := sqlite3Normalize(p, p^.zSql);
+  Result := p^.zNormSql;
 end;
 
 { Phase 8.2.1 — sqlite3_stmt_scanstatus_* now reads the per-loop

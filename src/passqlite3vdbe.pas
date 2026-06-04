@@ -1186,6 +1186,7 @@ type
     lockMask:        yDbMask;        { subset of btreeMask requiring a lock }
     aCounter:        array[0..8] of u32; { sqlite3_stmt_status() counters }
     zSql:            PAnsiChar;      { SQL text that generated this stmt }
+    zNormSql:        PAnsiChar;      { Normalization of the associated SQL (lazy) }
     pFree:           Pointer;        { free this when deleting the Vdbe }
     pFrame:          PVdbeFrame;     { currently executing sub-frame (nil=main) }
     pDelFrame:       PVdbeFrame;     { sub-frames to free on VM reset }
@@ -1198,6 +1199,10 @@ type
       unconditional here so .scanstats works without a rebuild flag. }
     nScan:           i32;            { entries in aScan[] }
     aScan:           PScanStatus;    { per-loop scan definitions }
+    { SQLITE_ENABLE_NORMALIZE (vdbeInt.h) — list of double-quoted strings
+      that were resolved as string literals, so sqlite3Normalize can tell
+      them apart from real identifiers. }
+    pDblStr:         PDblquoteStr;   { all DQS literals seen during resolve }
   end;
 
   { -----------------------------------------------------------------------
@@ -5350,6 +5355,8 @@ var
   pNext:   PSubProgram;
   i:       i32;
   aliased: i32;
+  pThisDS: PDblquoteStr;
+  pNxtDS:  PDblquoteStr;
 begin
   { Free sub-programs.  Track whether any sub-program's aOp aliases the
     parent's aOp (a known-bug scenario in the trigger codegen path —
@@ -5406,6 +5413,18 @@ begin
   end;
   sqlite3DbFree(db, p^.zErrMsg);
   sqlite3DbFree(db, p^.zSql);
+  sqlite3DbFree(db, p^.zNormSql);   { vdbeaux.c:3755 }
+  { vdbeaux.c:3756..3762 — free the pDblStr list. }
+  begin
+    pThisDS := p^.pDblStr;
+    while pThisDS <> nil do
+    begin
+      pNxtDS := pThisDS^.pNextStr;
+      sqlite3DbFree(db, pThisDS);
+      pThisDS := pNxtDS;
+    end;
+    p^.pDblStr := nil;
+  end;
   sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);
   { Phase 8.2.1 — free scanstatus aScan[] array and its duped zName strings
     (vdbeaux.c:3765..3771). }
@@ -5528,6 +5547,9 @@ begin
   zTmp        := pA^.zSql;
   pA^.zSql    := pB^.zSql;
   pB^.zSql    := zTmp;
+  zTmp          := pA^.zNormSql;   { vdbeaux.c:144..146 }
+  pA^.zNormSql  := pB^.zNormSql;
+  pB^.zNormSql  := zTmp;
   pB^.expmask  := pA^.expmask;
   pB^.prepFlags := pA^.prepFlags;
   Move(pA^.aCounter, pB^.aCounter, SizeOf(pB^.aCounter));

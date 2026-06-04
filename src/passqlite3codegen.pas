@@ -4251,9 +4251,29 @@ end;
   The default upstream build (and our oracle) compiles without it, so all
   call sites in resolve.c are #ifdef-gated out and this routine is never
   reached.  The no-op below matches default-build behaviour exactly. }
+{ vdbeaux.c:84 — add a new element to the Vdbe->pDblStr list, recording
+  the dequoted value of a double-quoted string literal so that
+  sqlite3Normalize can later tell DQS literals apart from identifiers. }
 procedure sqlite3VdbeAddDblquoteStr(db: PTsqlite3; pVdbe: PVdbe;
   z: PAnsiChar);
+var
+  n: i32;
+  pStr: PDblquoteStr;
+  zDst: PAnsiChar;
 begin
+  if pVdbe = nil then Exit;
+  n := sqlite3Strlen30(z);
+  { sizeof(*pStr)+n+1-sizeof(pStr->z): the z field sits at the end of the
+    record, so allocate the fixed header (offset of z) plus n+1 bytes. }
+  pStr := PDblquoteStr(sqlite3DbMallocRawNN(db,
+            u64(PtrUInt(@PDblquoteStr(nil)^.z) + u64(n) + 1)));
+  if pStr <> nil then
+  begin
+    pStr^.pNextStr := pVdbe^.pDblStr;
+    pVdbe^.pDblStr := pStr;
+    zDst := PAnsiChar(@pStr^.z[0]);
+    Move(z^, zDst^, n + 1);
+  end;
 end;
 
 { Error reporting (used by expr.c, resolve.c).  Mirrors build.c
@@ -9405,6 +9425,9 @@ begin
         dqsOK := (dbFlags and u64($40000000)) <> 0;
       if dqsOK then
       begin
+        { resolve.c:741 — record the DQS literal so sqlite3Normalize can
+          distinguish it from a real identifier. }
+        sqlite3VdbeAddDblquoteStr(pParse^.db, pParse^.pVdbe, pE^.u.zToken);
         pE^.op := TK_STRING;
         FillChar(pE^.y, SizeOf(pE^.y), 0);
         Exit;
@@ -13427,6 +13450,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         if (pParse^.db^.init.busy <> 0)
            or ((pParse^.db^.flags and u64($40000000)) <> 0) then
         begin
+          sqlite3VdbeAddDblquoteStr(pParse^.db, pParse^.pVdbe, pE^.u.zToken);
           pE^.op := TK_STRING;
           FillChar(pE^.y, SizeOf(pE^.y), 0);
           Exit;
@@ -13473,6 +13497,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         if (pParse^.db^.init.busy <> 0)
            or ((pParse^.db^.flags and u64($40000000)) <> 0) then
         begin
+          sqlite3VdbeAddDblquoteStr(pParse^.db, pParse^.pVdbe, pE^.u.zToken);
           pE^.op := TK_STRING;
           FillChar(pE^.y, SizeOf(pE^.y), 0);
           Exit;
@@ -35979,6 +36004,12 @@ var
   ctAddrExplain: i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
+  { select.c:7603 — create (or fetch) the VDBE before name resolution so
+    that the DQS-literal recorder (sqlite3VdbeAddDblquoteStr, reached via
+    sqlite3SelectPrep -> lookupName) has a non-nil pParse^.pVdbe to append
+    to.  Mirrors C, where `v = sqlite3GetVdbe(pParse)` runs at the top of
+    sqlite3Select, before sqlite3SelectPrep. }
+  sqlite3GetVdbe(pParse);
   { select.c:7608 — top-of-sqlite3Select authorizer check.  Fires
     SQLITE_SELECT with an empty 6th-arg context for the outer query (and,
     via the recursive sqlite3Select calls, with the FROM-item name for
