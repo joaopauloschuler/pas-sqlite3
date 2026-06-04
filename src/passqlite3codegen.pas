@@ -40922,7 +40922,19 @@ begin
           leaving an OP_Column against the (covering, never-opened) table
           cursor → crash on indexA-1.2.  Falling back to sqlite3ExprCode keeps
           the existing bytecode shape whenever no substitution list is active. }
-        if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
+        { aggnested-6.1.2 — a TK_AGG_COLUMN that carries an AggInfo (a
+          correlated reference to an OUTER query's aggregate, e.g.
+          `SELECT (SELECT c FROM (SELECT t2.b AS c FROM t1) GROUP BY c ...)
+          FROM t2 GROUP BY ...`) must NOT take the OP_Column-direct
+          shortcut.  In directMode=0 such a column resolves to the outer
+          accumulator register (SCopy r[iFirstReg+iAgg], expr.c:4975); the
+          shortcut would instead emit OP_Column from the (mid-aggregation)
+          live cursor and read a stale/empty value.  Route it through
+          sqlite3ExprCode so the TK_AGG_COLUMN arm in sqlite3ExprCodeTarget
+          picks the accumulator register.  C always funnels every
+          selectInnerLoop result column through sqlite3ExprCodeExprList ->
+          sqlite3ExprCodeTarget, so this is the faithful path. }
+        if (pE^.op = TK_COLUMN)
            and (pE^.y.pTab <> nil)
            and (pParse^.pIdxPartExpr = nil)
            and (pParse^.pIdxEpr = nil) then
