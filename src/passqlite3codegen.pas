@@ -11571,6 +11571,71 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { PreBindNestedExprSubqOuterRefs{Expr,List} — descend pE/pList; at each NESTED
+    expression-subquery (EP_xIsSelect), pre-bind that subquery's interior
+    outer-correlated TK_DOT (ResolveOuterRefs) and bare TK_ID (ResolveOuterIDs)
+    against the OUTERmost pOuterSrc, using the nested subquery's OWN pSrc as the
+    inner scope, and recurse into deeper nesting / its FROM-subqueries.  This
+    must run BEFORE sqlite3SelectExpand on the first-level subquery: expand
+    recursively preps every nested expression-subquery's result columns
+    (codegen.pas:26617), and a doubly-nested correlated ref such as
+    SELECT (SELECT (SELECT out.j)) FROM out would otherwise abort that prep with
+    "no such column: out.j" before the post-expand ResolveOuterRefs ever runs
+    (aggnested-9.1).  WalkDeepFromSubqueries already covers FROM-subqueries; this
+    is its expression-subquery counterpart. }
+  procedure PreBindNestedExprSubqOuterRefs(pX: PExpr; pOuterSrc: PSrcList); forward;
+
+  procedure PreBindNestedExprSubqOuterRefsList(pList: PExprList;
+    pOuterSrc: PSrcList);
+  var k_: i32;
+  begin
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      PreBindNestedExprSubqOuterRefs(ExprListItems(pList)[k_].pExpr, pOuterSrc);
+  end;
+
+  procedure PreBindNestedExprSubqOuterRefs(pX: PExpr; pOuterSrc: PSrcList);
+  var
+    pSub: PSelect;
+  begin
+    if pX = nil then Exit;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if (pX^.flags and EP_xIsSelect) <> 0 then
+    begin
+      pSub := pX^.x.pSelect;
+      while pSub <> nil do
+      begin
+        if (pSub^.selFlags and SF_HasTypeInfo) = 0 then
+        begin
+          ResolveOuterRefsInList(pSub^.pEList,   pOuterSrc, pSub^.pSrc);
+          ResolveOuterRefs(pSub^.pWhere,         pOuterSrc, pSub^.pSrc);
+          ResolveOuterRefs(pSub^.pHaving,        pOuterSrc, pSub^.pSrc);
+          ResolveOuterRefsInList(pSub^.pGroupBy, pOuterSrc, pSub^.pSrc);
+          ResolveOuterRefsInList(pSub^.pOrderBy, pOuterSrc, pSub^.pSrc);
+          ResolveOuterIDsInList(pSub^.pEList,    pOuterSrc, pSub^.pSrc);
+          ResolveOuterIDs(pSub^.pWhere,          pOuterSrc, pSub^.pSrc);
+          ResolveOuterIDs(pSub^.pHaving,         pOuterSrc, pSub^.pSrc);
+          ResolveOuterIDsInList(pSub^.pGroupBy,  pOuterSrc, pSub^.pSrc);
+          ResolveOuterIDsInList(pSub^.pOrderBy,  pOuterSrc, pSub^.pSrc);
+          { FROM-subqueries one further level down may carry the same ref. }
+          WalkDeepFromSubqueries(pSub, pOuterSrc);
+          { Recurse into still-deeper expression-subqueries of this level. }
+          PreBindNestedExprSubqOuterRefsList(pSub^.pEList,   pOuterSrc);
+          PreBindNestedExprSubqOuterRefs(pSub^.pWhere,       pOuterSrc);
+          PreBindNestedExprSubqOuterRefs(pSub^.pHaving,      pOuterSrc);
+          PreBindNestedExprSubqOuterRefsList(pSub^.pGroupBy, pOuterSrc);
+          PreBindNestedExprSubqOuterRefsList(pSub^.pOrderBy, pOuterSrc);
+        end;
+        pSub := pSub^.pPrior;
+      end;
+      Exit;
+    end;
+    PreBindNestedExprSubqOuterRefs(pX^.pLeft,  pOuterSrc);
+    PreBindNestedExprSubqOuterRefs(pX^.pRight, pOuterSrc);
+    if pX^.x.pList <> nil then
+      PreBindNestedExprSubqOuterRefsList(pX^.x.pList, pOuterSrc);
+  end;
+
   { subquery2-1.1/1.2/1.21/1.22 — detect correlation that lives in a FROM
     subquery nested inside pInner.  After WalkDeepFromSubqueries rewrites a
     deeply-nested outer reference (e.g. `a` inside
@@ -13528,6 +13593,14 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           while pCompArm <> nil do
           begin
             WalkDeepFromSubqueries(pCompArm, p^.pSrc);
+            { aggnested-9.1 — also pre-bind correlated outer refs buried inside
+              nested expression-subqueries of this arm's clauses, before expand
+              recursively preps them. }
+            PreBindNestedExprSubqOuterRefsList(pCompArm^.pEList,   p^.pSrc);
+            PreBindNestedExprSubqOuterRefs(pCompArm^.pWhere,       p^.pSrc);
+            PreBindNestedExprSubqOuterRefs(pCompArm^.pHaving,      p^.pSrc);
+            PreBindNestedExprSubqOuterRefsList(pCompArm^.pGroupBy, p^.pSrc);
+            PreBindNestedExprSubqOuterRefsList(pCompArm^.pOrderBy, p^.pSrc);
             pCompArm := pCompArm^.pPrior;
           end;
         end;
