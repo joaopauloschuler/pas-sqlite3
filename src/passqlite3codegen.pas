@@ -7945,10 +7945,30 @@ begin
   Result := exprIsConst(pParse, p, 2);
 end;
 
+{ exprSelectWalkTableConstant — Walker xSelectCallback used by
+  sqlite3ExprIsTableConstant when bAllowSubq is true.  Faithful port of
+  expr.c:2672..2680.  An uncorrelated sub-SELECT is considered constant
+  (prune the walk); a correlated one disqualifies. }
+function exprSelectWalkTableConstant(pWalker: PWalker; pSelect: PSelect): i32; cdecl;
+begin
+  Assert(pSelect <> nil);
+  Assert((pWalker^.eCode = 3) or (pWalker^.eCode = 0));
+  if (pSelect^.selFlags and SF_Correlated) <> 0 then
+  begin
+    pWalker^.eCode := 0;
+    Result := WRC_Abort;
+    Exit;
+  end;
+  Result := WRC_Prune;
+end;
+
 { sqlite3ExprIsTableConstant — true when p references only cursor iCur.
   Faithful port of expr.c:2691..2707.  pParse=nil is intentional (the
-  Walker only walks for iCur, not for constant-function recognition). }
-function sqlite3ExprIsTableConstant(p: PExpr; iCur: i32): i32;
+  Walker only walks for iCur, not for constant-function recognition).
+  When bAllowSubq is true, uncorrelated subqueries (e.g. `x IN tbl`) are
+  treated as constant via exprSelectWalkTableConstant; otherwise any
+  sub-SELECT disqualifies (sqlite3SelectWalkFail). }
+function sqlite3ExprIsTableConstant(p: PExpr; iCur: i32; bAllowSubq: i32): i32;
 var
   w: TWalker;
 begin
@@ -7956,7 +7976,10 @@ begin
   w.eCode            := 3;
   w.pParse           := nil;
   w.xExprCallback    := @exprNodeIsConstant;
-  w.xSelectCallback  := @sqlite3SelectWalkFail;
+  if bAllowSubq <> 0 then
+    w.xSelectCallback := @exprSelectWalkTableConstant
+  else
+    w.xSelectCallback := @sqlite3SelectWalkFail;
   w.u.iCur           := iCur;
   sqlite3WalkExpr(@w, p);
   Result := i32(w.eCode);
@@ -8059,7 +8082,7 @@ begin
     end;
   end;
   { Rules 1, 2a, 2b: }
-  Result := sqlite3ExprIsTableConstant(pExpr, pSrc^.iCursor);
+  Result := sqlite3ExprIsTableConstant(pExpr, pSrc^.iCursor, bAllowSubq);
 end;
 
 { sqlite3ExprCodeRunJustOnce (expr.c:5777..5822) — factor a constant
@@ -36354,6 +36377,21 @@ begin
   end;
 
   selectMarkAggregate(pParse, p);
+  { resolve.c:1330 — for an aggregate query, flip every aggregate-function
+    call in the result list from TK_FUNCTION to TK_AGG_FUNCTION now, during
+    the analysis phase, exactly as C's resolveExprStep does during name
+    resolution.  C performs this flip eagerly so that downstream analysis
+    (notably countOfViewOptimization at select.c:7924, which tests
+    pExpr->op==TK_AGG_FUNCTION) sees the rewritten node.  This Pas port
+    otherwise defers the flip into the aggregate-codegen path
+    (markAggregateInExprList at codegen.pas:37411 etc.), which runs AFTER
+    count-of-view — so `SELECT count(*) FROM <compound-view>` never matched
+    the count-of-view shape (pushdown-3.8).  Gate on SF_Aggregate so that
+    non-aggregate queries are untouched (their deferred-flip path raises the
+    correct "misuse of aggregate" diagnostic via a NULL pAggInfo).  The
+    later markAggregateInExprList calls re-run idempotently. }
+  if (p^.selFlags and SF_Aggregate) <> 0 then
+    markAggregateInExprList(pParse, p^.pEList);
   { resolve.c:1980..1986 — HAVING without GROUP BY and without any aggregate
     function is an error.  C raises this during resolveSelectStep; Pas's
     resolver doesn't track NC_HasAgg, so do the check here after
@@ -36655,7 +36693,16 @@ begin
          and ((pSubFC^.selFlags and SF_Aggregate) = 0)
          and (pSubFC^.pGroupBy = nil)
          and (pSubFC^.pHaving = nil)
-         and ((pSubFC^.selFlags and SF_HasAgg) = 0);
+         and ((pSubFC^.selFlags and SF_HasAgg) = 0)
+         { When the inner is a compound, the late flatten enforces
+           restriction (17h): the corresponding result-set expressions in
+           all arms must share the same affinity (select.c:4209 /
+           codegen.pas:16761).  If they differ, flatten is blocked and the
+           subquery is coded as a CO-ROUTINE — in which case push-down of
+           the outer WHERE into each arm IS performed (pushdown-3.6).  Do
+           not over-predict flatten here, or push-down is wrongly skipped. }
+         and ((pSubFC^.pPrior = nil)
+              or (compoundHasDifferentAffinities(pSubFC) = 0));
       if (pSubFC <> nil)
          and (not bWillFlatten)
          { CTE eligibility gate (select.c:8005..8006). }
@@ -39024,7 +39071,8 @@ begin
        and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)   { isSimpleCount@select.c:5441 }
     then begin
       pE := ExprListItems(p^.pEList)[0].pExpr;
-      if (pE <> nil) and (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+      if (pE <> nil) and ((pE^.op = TK_AGG_FUNCTION) or (pE^.op = TK_FUNCTION))
+         and (pE^.u.zToken <> nil)
          and (sqlite3StrICmp(pE^.u.zToken, 'count') = 0)
          and ((not ExprUseXList(pE)) or (pE^.x.pList = nil))
          and ((pE^.flags and (EP_Distinct or EP_WinFunc)) = 0)
@@ -39122,7 +39170,8 @@ begin
        and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
     then begin
       pE := ExprListItems(p^.pEList)[0].pExpr;
-      if (pE <> nil) and (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+      if (pE <> nil) and ((pE^.op = TK_AGG_FUNCTION) or (pE^.op = TK_FUNCTION))
+         and (pE^.u.zToken <> nil)
          and (sqlite3StrICmp(pE^.u.zToken, 'count') = 0)
          and ((not ExprUseXList(pE)) or (pE^.x.pList = nil))
          and ((pE^.flags and (EP_Distinct or EP_WinFunc)) = 0)
@@ -40522,6 +40571,18 @@ begin
                             pItem^.u4.pSubq^.regReturn, 0, addrEnd);
         pItem^.u4.pSubq^.addrFillSub := addrEnd;
 
+        { EQP — port of select.c:8054.  C emits
+          ExplainQueryPlan((pParse,1,"CO-ROUTINE %!S",pItem)) immediately
+          before recursing into sqlite3Select for the co-routine body.  The
+          inner SELECT's plan nests under this CO-ROUTINE node, and the
+          outer Yield-driven scan is reported as a sibling SCAN node below
+          (mirroring the SCAN %!S that C's sqlite3WhereBegin emits for the
+          viaCoroutine FROM item).  sqlite3Select does not auto-pop the EQP
+          parent in this port, so save/restore addrExplain around the
+          recursion (same pattern as codegen.pas:39781). }
+        savedAddrExplainSub := pParse^.addrExplain;
+        sqlite3VdbeExplain(pParse, 1, 'CO-ROUTINE %!S', [Pointer(pItem)]);
+
         { Recursively code the inner with SRT_Coroutine.  Per-row OP_Yield
           comes from the disposal arm above; the inner's first OP_Yield
           transfers control back to the OP_Yield in the outer scan. }
@@ -40531,6 +40592,7 @@ begin
         begin
           Result := SQLITE_ERROR; Exit;
         end;
+        pParse^.addrExplain := savedAddrExplainSub;
         { fg.viaCoroutine bit — visible to other paths that walk SrcItems
           (e.g. the where-code viaCoroutine arm).  Not strictly required
           for this hot-path arm but keeps the SrcItem state consistent
@@ -40543,6 +40605,13 @@ begin
           coroutine body on first entry. }
         sqlite3VdbeChangeP2(v, addrTopOfLoop,
                             sqlite3VdbeCurrentAddr(v));
+
+        { Outer-scan EQP node — sibling SCAN %!S for the viaCoroutine FROM
+          item (wherecode.c sqlite3WhereExplainOneScan reports the
+          co-routine source as a plain SCAN).  Only emitted for the
+          freshly-coded co-routine; the SF_MultiValue / VALUES path above
+          emits its own "SCAN N-ROW VALUES CLAUSE" node. }
+        sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
       end;
 
       { Outer scan — alloc result-register block, OP_Yield to drive,
