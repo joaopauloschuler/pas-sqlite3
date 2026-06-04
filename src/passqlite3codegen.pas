@@ -2712,6 +2712,7 @@ function  sqlite3FindIndex(db: PTsqlite3; zName: PAnsiChar;
   zDb: PAnsiChar): PIndex2;
 function  sqlite3FindDbName(db: PTsqlite3; zName: PAnsiChar): i32;
 function  sqlite3FindDb(db: PTsqlite3; pName: PToken): i32;
+procedure sqlite3TokenInit(p: PToken; z: PAnsiChar);
 function  sqlite3TwoPartName(pParse: PParse; const pName1: PToken;
   const pName2: PToken; pUnqual: PPToken): i32;
 function  sqlite3WritableSchema(db: PTsqlite3): i32;

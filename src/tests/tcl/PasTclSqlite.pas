@@ -4774,6 +4774,33 @@ begin
   Result := TCL_OK;
 end;
 
+{ Tcl `sqlite3_test_control_pending_byte OFFSET`.  Pas port of
+  test_control_pending_byte (test1.c) which calls
+  sqlite3_test_control(SQLITE_TESTCTRL_PENDING_BYTE, offset).  tester.tcl:102
+  invokes this at load time with 0x0010000 so the locking page is reachable
+  in small test databases.  Returns the previous pending-byte value. }
+function TestControlPendingByte(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_TESTCTRL_PENDING_BYTE = 11;
+var
+  wv:  Int64;
+  old: i32;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('OFFSET'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, ObjvAt(objv, 1), @wv) <> TCL_OK then begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  old := sqlite3_test_control(SQLITE_TESTCTRL_PENDING_BYTE, i32(wv));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(cint(old)));
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -4784,6 +4811,9 @@ begin
     @DbMain, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('register_dbstat_vtab'),
     @TestRegisterDbstatVtab, nil, nil);
+  { tester.tcl:102 — move the locking page into reach of small test DBs. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_test_control_pending_byte'),
+    @TestControlPendingByte, nil, nil);
   { 9.4.divbug.88.012..020 — corrupt*.test prologue requires this. }
   Tcl_CreateObjCommand(interp, PChar('nonzero_reserved_bytes'),
     @NonzeroReservedBytes, nil, nil);

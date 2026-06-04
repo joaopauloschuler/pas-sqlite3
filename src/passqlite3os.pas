@@ -217,10 +217,20 @@ const
   These are the on-disk byte positions SQLite uses for advisory locks.
   PENDING_BYTE must match the C build exactly or .db files are incompatible.
   ============================================================ }
+{ C ref: sqlite3PendingByte (global.c) is a writable int that
+  SQLITE_TESTCTRL_PENDING_BYTE rewrites so the test harness can move the
+  locking page into reach of small databases (tester.tcl:102 sets
+  0x10000).  RESERVED_BYTE/SHARED_FIRST are PENDING_BYTE+1/+2 macros in C
+  (btreeInt.h); we keep them as writable globals kept in lock-step by
+  sqlite3SetPendingByte below.  Marked {$J+} so they are writable. }
+{$PUSH}
+{$J+}
 const
   PENDING_BYTE  : u32 = $40000000;       { first byte past 1 GB }
   RESERVED_BYTE : u32 = $40000001;       { PENDING_BYTE + 1      }
   SHARED_FIRST  : u32 = $40000002;       { PENDING_BYTE + 2      }
+{$POP}
+const
   SHARED_SIZE   : u32 = 510;
 
 { ============================================================
@@ -644,6 +654,10 @@ function  sqlite3DefaultMutex: Psqlite3_mutex_methods;
 { ============================================================
   Section 12: OS layer wrappers  (os.c)
   ============================================================ }
+
+{ Rewrite the PENDING_BYTE global (and the RESERVED_BYTE/SHARED_FIRST
+  derived values) — C: sqlite3PendingByte = newVal (main.c:4362). }
+procedure sqlite3SetPendingByte(newByte: u32);
 
 procedure sqlite3OsClose(pId: Psqlite3_file);
 function  sqlite3OsRead(id: Psqlite3_file; pBuf: Pointer;
@@ -1234,6 +1248,15 @@ end;
   Section 12: OS dispatcher wrappers  (os.c)
   These are thin wrappers that call through the pMethods vtable.
   ============================================================ }
+
+{$PUSH}{$J+}
+procedure sqlite3SetPendingByte(newByte: u32);
+begin
+  PENDING_BYTE  := newByte;
+  RESERVED_BYTE := newByte + 1;
+  SHARED_FIRST  := newByte + 2;
+end;
+{$POP}
 
 { os.c ~79: sqlite3OsClose }
 procedure sqlite3OsClose(pId: Psqlite3_file);

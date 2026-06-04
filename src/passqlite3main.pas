@@ -5461,10 +5461,11 @@ begin
     end;
 
     { main.c:4357 — PENDING_BYTE(unsigned int X).  Return existing
-      value; we do not actually rewrite a global since the pas pager
-      uses a compile-time PENDING_BYTE. }
+      value; if X>0 rewrite the (now writable) PENDING_BYTE global so the
+      test harness can move the locking page into reach of small DBs. }
     SQLITE_TESTCTRL_PENDING_BYTE_OP: begin
       Result := i32(PENDING_BYTE);
+      if iArg1 <> 0 then sqlite3SetPendingByte(u32(iArg1));
     end;
 
     { main.c:4379/4437 — ASSERT/ALWAYS just echo X. }

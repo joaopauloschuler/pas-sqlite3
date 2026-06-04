@@ -911,18 +911,24 @@ proc crashsql {args} {
 # C-side test_config.  Upstream tester.tcl:102 calls
 #   sqlite3_test_control_pending_byte 0x0010000
 # unconditionally at load time so the locking-page is reachable in tests
-# without creating multi-GiB database files.  Our pas-sqlite3 build does
-# not yet expose sqlite3_test_control_pending_byte as a Tcl command (the
-# engine PENDING_BYTE is a compile-time constant at 0x40000000) so we
-# cannot move the actual lock byte, but we MUST still mirror the Tcl-side
-# variable to 0x10000.  Otherwise upstream tests such as backup.test and
-# backup_ioerr.test do
+# without creating multi-GiB database files.  The pas-sqlite3 engine now
+# exposes sqlite3_test_control_pending_byte (PENDING_BYTE is a writable
+# global rewritten by SQLITE_TESTCTRL_PENDING_BYTE), so move the actual
+# lock byte to match upstream and mirror the Tcl-side variable.  Otherwise
+# upstream tests such as backup.test / backup_ioerr.test loop forever on
 #   while {[file size test.db] <= $::sqlite_pending_byte} { ... }
-# which, against a 1 GiB threshold, never terminates and looks to the
-# test driver like an engine-level deadlock (9.4.divbug.91.002 / .003).
+# against a 1 GiB threshold (9.4.divbug.91.002 / .003), and stat.test-2.2
+# never sees the page-64 locking-page gap.
 if {![info exists ::sqlite_pending_byte]} {
   set ::sqlite_pending_byte 0x0010000
 }
+catch { sqlite3_test_control_pending_byte $::sqlite_pending_byte }
+# Upstream binds ::sqlite_pending_byte to the C int sqlite3PendingByte via
+# Tcl_LinkVar(TCL_LINK_INT) (test2.c:753), so the variable reads back as a
+# *decimal integer* (65536), not the 0x.. literal.  Tests such as
+# autovacuum-9.3 compare `file size test.db` (an integer) directly against
+# it, so normalise to the integer form to match upstream's linked var.
+set ::sqlite_pending_byte [expr {$::sqlite_pending_byte}]
 
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
 # runs finish_test_precleanup (deregisters test VFSes), optionally
