@@ -3471,7 +3471,27 @@ begin
     reverse_unordered_selects=ON reverses the unordered schema scan and the
     sqlite_autoindex_<tab>_1 row is read first → "orphan index"
     (rowid-15.0). }
-  if iDb = 1 then
+  { vdbe.c:7152..7154 — honour the caller-supplied WHERE predicate so the
+    OP_ParseSchema re-fire after a CREATE re-prepares ONLY the just-written
+    row(s) (name=%Q AND sql=%Q), exactly as the reference does.  The
+    Select-with-WHERE codegen path is productive now (the old "drop WHERE"
+    banner above is stale), so we can stop iterating the entire schema and
+    drop reliance on the sqlite3InitCallback dedup guard for this path.
+    When zWhere matches a row whose name collides with an already-loaded
+    object (vtab2-5.3: two CREATE VIRTUAL TABLE statements whose lone-byte
+    names both fold to U+FFFD under UTF16), re-preparing the matched row hits
+    sqlite3StartTable's "table ... already exists" check, which prepare.c:50
+    wraps into "malformed database schema (...)" — the faithful C result. }
+  if zWhere <> nil then begin
+    if iDb = 1 then
+      zSql := sqlite3MPrintf(db,
+                'SELECT type,name,tbl_name,rootpage,sql FROM %s WHERE %s ORDER BY rowid',
+                [LEGACY_TEMP_SCHEMA_TABLE, zWhere])
+    else
+      zSql := sqlite3MPrintf(db,
+                'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s WHERE %s ORDER BY rowid',
+                [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE, zWhere]);
+  end else if iDb = 1 then
     zSql := sqlite3MPrintf(db,
               'SELECT type,name,tbl_name,rootpage,sql FROM %s ORDER BY rowid',
               [LEGACY_TEMP_SCHEMA_TABLE])
@@ -3487,7 +3507,15 @@ begin
   initData.iDb        := iDb;
   initData.pzErrMsg   := pzErrMsg;
   initData.rc         := SQLITE_OK;
-  initData.mInitFlags := 0;
+  { With the WHERE filter restored the SELECT visits only the targeted
+    row(s); re-preparing each matched row is the reference behaviour and
+    must not be suppressed by the port-local "already published" dedup
+    (which only exists to compensate for the dropped filter).  Set
+    INITFLAG_FreshLoad to turn that guard off for the filtered path. }
+  if zWhere <> nil then
+    initData.mInitFlags := INITFLAG_FreshLoad
+  else
+    initData.mInitFlags := 0;
   initData.nInitRow   := 0;
   initData.mxPage     := sqlite3BtreeLastPage(PBtree(db^.aDb[iDb].pBt));
 
