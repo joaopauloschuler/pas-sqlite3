@@ -16340,6 +16340,30 @@ begin
   Result := 0;
 end;
 
+{ compoundFlatten17abe — return 1 when every arm of compound subquery p
+  satisfies flatten restrictions (17a) all compound operators are UNION ALL,
+  (17b) no arm is DISTINCT or aggregate, and (17e) no arm has a window
+  function (select.c:4197..4205 / codegen.pas:16802..16805).  Used by the
+  push-down gate to predict whether the late single-source flatten will be
+  able to absorb a compound FROM-subquery.  A UNION/INTERSECT/EXCEPT (i.e.
+  non-UNION-ALL) compound is NOT flattenable, so push-down must still run. }
+function compoundFlatten17abe(p: PSelect): i32;
+var
+  pSub1: PSelect;
+begin
+  pSub1 := p;
+  while pSub1 <> nil do
+  begin
+    if ((pSub1^.selFlags and (SF_Distinct or SF_Aggregate)) <> 0)  { (17b) }
+       or ((pSub1^.pPrior <> nil) and (pSub1^.op <> TK_ALL))       { (17a) }
+       or (pSub1^.pWin <> nil)                                     { (17e) }
+    then
+    begin Result := 0; Exit; end;
+    pSub1 := pSub1^.pPrior;
+  end;
+  Result := 1;
+end;
+
 { selectEListHasWinFunc — return True when any expression in pList carries a
   window function (EP_WinFunc).  Used by pushDownWhereTerms to route a pushed
   WHERE term to the subquery's pWhere (not pHaving) for window queries, which
@@ -36814,9 +36838,14 @@ begin
            codegen.pas:16761).  If they differ, flatten is blocked and the
            subquery is coded as a CO-ROUTINE — in which case push-down of
            the outer WHERE into each arm IS performed (pushdown-3.6).  Do
-           not over-predict flatten here, or push-down is wrongly skipped. }
+           not over-predict flatten here, or push-down is wrongly skipped.
+           Likewise a UNION/INTERSECT/EXCEPT (non-UNION-ALL) compound, or any
+           arm that is DISTINCT/aggregate/windowed, fails flatten restriction
+           (17a/17b/17e); such a subquery is also coded as a CO-ROUTINE and
+           the outer WHERE must be pushed into each arm (bestindexE-2.2.2). }
          and ((pSubFC^.pPrior = nil)
-              or (compoundHasDifferentAffinities(pSubFC) = 0));
+              or ((compoundHasDifferentAffinities(pSubFC) = 0)
+                  and (compoundFlatten17abe(pSubFC) <> 0)));
       if (pSubFC <> nil)
          and (not bWillFlatten)
          { CTE eligibility gate (select.c:8005..8006). }
