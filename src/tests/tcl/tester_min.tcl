@@ -523,6 +523,13 @@ proc delete_all_data {} {
 # returning the value unchanged keeps those scripts source-able.
 proc expected {n exp} { return $exp }
 
+# isquick — tester.tcl:2340.  Returns $::G(isquick) if set, else 0.
+proc isquick {} {
+  set ret 0
+  catch {set ret $::G(isquick)}
+  set ret
+}
+
 # getFileRetries / getFileRetryDelay — upstream tester.tcl head (the
 # do_delete_file body at 276..311 reads them).  Upstream defaults to 50
 # retries with 100ms delay on Windows and 0/0 on Unix.  We target Linux

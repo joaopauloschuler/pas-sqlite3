@@ -9002,6 +9002,59 @@ begin
   if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
 end;
 
+{ test1.c:7787..7789 — struct LogCallback { Tcl_Interp*; Tcl_Obj*; } = {0,0}. }
+type
+  TLogCallback = record
+    pInterp: PTclInterp;
+    pObj:    PTclObj;
+  end;
+var
+  logcallback: TLogCallback = (pInterp: nil; pObj: nil);
+
+{ test1.c:7790..7799 — xLogcallback.  Duplicates the saved Tcl script,
+  appends the symbolic error-code name (sqlite3ErrName == t1ErrName here)
+  and the message, then evaluates it at global scope. }
+procedure xLogcallback(unused: Pointer; err: i32; zMsg: PAnsiChar); cdecl;
+var
+  pNew: PTclObj;
+begin
+  pNew := Tcl_DuplicateObj(logcallback.pObj);
+  Tcl_IncrRefCount(pNew);
+  Tcl_ListObjAppendElement(nil, pNew,
+    Tcl_NewStringObj(t1ErrName(err), -1));
+  Tcl_ListObjAppendElement(nil, pNew, Tcl_NewStringObj(zMsg, -1));
+  Tcl_EvalObjEx(logcallback.pInterp, pNew,
+    TCL_EVAL_GLOBAL or TCL_EVAL_DIRECT);
+  Tcl_DecrRefCount(pNew);
+  if unused = nil then ;
+end;
+
+{ test1.c:7800..7822 — tclcmd: test_sqlite3_log ?SCRIPT?
+  Registers (or deregisters with no/empty arg) a Tcl log callback via
+  SQLITE_CONFIG_LOG. }
+function test_sqlite3_log(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc > 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('SCRIPT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if logcallback.pObj <> nil then begin
+    Tcl_DecrRefCount(logcallback.pObj);
+    logcallback.pObj    := nil;
+    logcallback.pInterp := nil;
+    sqlite3_config(SQLITE_CONFIG_LOG, Tsqlite3_config_log_cb(nil), nil);
+  end;
+  if (objc > 1) and (Tcl_GetString(objv[1])[0] <> #0) then begin
+    logcallback.pObj := objv[1];
+    Tcl_IncrRefCount(logcallback.pObj);
+    logcallback.pInterp := interp;
+    sqlite3_config(SQLITE_CONFIG_LOG, @xLogcallback, nil);
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:7969..8009 — TCLCMD: strftime FORMAT UNIXTIMESTAMP
   Access to the C-library strftime() so its results can be compared against
   SQLite's internal strftime() SQL function. }
@@ -9051,6 +9104,9 @@ begin
   { date4.test — test1.c:9320 strftime. }
   Tcl_CreateObjCommand(interp, PChar('strftime'),
     @strftime_cmd, nil, nil);
+  { pragma4.test/pragma.test — test1.c:9290 test_sqlite3_log. }
+  Tcl_CreateObjCommand(interp, PChar('test_sqlite3_log'),
+    @test_sqlite3_log, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
   { misc8.test — test1.c:9187 dbconfig_maindbname_icecube. }
