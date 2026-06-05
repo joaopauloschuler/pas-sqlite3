@@ -226,7 +226,7 @@ pas-strict	../sqlite3/test/ctime.test	-
 pas-strict	../sqlite3/test/cursorhint.test	-
 pas-strict	../sqlite3/test/cursorhint2.test	-
 pas-strict	../sqlite3/test/dataversion1.test	-
-pas-skip	../sqlite3/test/date.test	unswept
+pas-soft	../sqlite3/test/date.test	harness-gap: 0/1219 result divergences (45 date.c bugs fixed); only `sqlite3_test_control` tcl cmd unported blocks full PASS
 pas-strict	../sqlite3/test/date2.test	-
 pas-strict	../sqlite3/test/date3.test	-
 pas-strict	../sqlite3/test/date4.test	-
@@ -813,7 +813,7 @@ pas-strict	../sqlite3/test/spellfix2.test	-
 pas-strict	../sqlite3/test/spellfix3.test	-
 pas-strict	../sqlite3/test/spellfix4.test	-
 pas-strict	../sqlite3/test/sqldiff1.test	-
-pas-soft	../sqlite3/test/sqllimits1.test	9.4.divbug.84 SQLITE_MAX_LENGTH-tclvar-unported
+pas-strict	../sqlite3/test/sqllimits1.test	-
 pas-strict	../sqlite3/test/sqllog.test	-
 pas-strict	../sqlite3/test/starschema1.test	-
 pas-strict	../sqlite3/test/stat.test	-
