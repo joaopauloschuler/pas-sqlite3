@@ -62890,9 +62890,15 @@ begin
   { PragTyp_INCREMENTAL_VACUUM (pragma.c:854).  Faithful port: loop
     OP_IncrVacuum up to iLimit steps, returning one result row per step. }
   if SameText(zName, 'incremental_vacuum') then begin
+    { C pragma.c: if( zRight==0 || !sqlite3GetInt32(zRight,&iLimit) || iLimit<=0 )
+        iLimit = 0x7fffffff;
+      zRight here is the already-dequoted, sign-restored string built at the
+      top of sqlite3Pragma (matches C's sqlite3NameFromToken result), NOT a
+      fresh SetString of the raw pValue token.  Using the raw token left
+      quotes on `'1'`/`"+3"` and dropped the minus split into minusFlag for
+      `= -1` (incrvacuum-10.4/10.5/10.6/10.8). }
     iVal := 0;
     if pValue <> nil then begin
-      SetString(zRight, pValue^.z, pValue^.n);
       if (sqlite3GetInt32(PChar(zRight), @iVal) = 0) or (iVal <= 0) then
         iVal := $7FFFFFFF;
     end else
