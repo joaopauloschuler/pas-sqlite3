@@ -187,6 +187,8 @@ type
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
     zBusy:    PAnsiChar;   { tclsqlite.c:199 — `busy` callback script,
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
+    zBindFallback: PAnsiChar; { tclsqlite.c:198 — `bind_fallback` callback
+                             script, Tcl_Alloc'd; freed in DbDeleteCmd. }
     zProgress: PAnsiChar;  { tclsqlite.c:204 — `progress` callback script,
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
     zCommit:   PAnsiChar;  { tclsqlite.c:200 — `commit_hook` callback script,
@@ -670,6 +672,12 @@ begin
     Tcl_Free(pDb^.zBusy);
     pDb^.zBusy := nil;
   end;
+  { Free bind_fallback callback script — tclsqlite.c:640..642. }
+  if pDb^.zBindFallback <> nil then
+  begin
+    Tcl_Free(pDb^.zBindFallback);
+    pDb^.zBindFallback := nil;
+  end;
   { Free progress callback script — tclsqlite.c:631..633. }
   if pDb^.zProgress <> nil then
   begin
@@ -737,7 +745,8 @@ end;
   DbSqlFunc auto-detect peek. }
 function DbBindOneParam(pDb: PSqliteDb; pStmt: Pointer; i: cint;
                         zParamName: PAnsiChar;
-                        pPS: PSqlPreparedStmt; iParm: pcint): Boolean;
+                        pPS: PSqlPreparedStmt; iParm: pcint;
+                        pNeedReset: pcint): cint;
 var
   pVarObj: PTclObj;
   zType:   PAnsiChar;
@@ -749,16 +758,44 @@ var
   pBlob:   PChar;
   pVarStr: PChar;
   xDel:    TxDelProc;
+  pCmd:    PTclObj;
+  rx:      cint;
 begin
-  Result := False;
+  { Returns TCL_OK normally; TCL_ERROR if a bind_fallback callback raised
+    an error (tclsqlite.c:1507..1509).  The param is silently skipped
+    (returns TCL_OK without binding) when the name doesn't match the
+    $/:/@ prefixes. }
+  Result := TCL_OK;
   if (zParamName = nil) or
      ((zParamName[0] <> '$') and (zParamName[0] <> ':')
       and (zParamName[0] <> '@')) then Exit;
-  Result := True;
   pVarObj := Tcl_GetVar2Ex(pDb^.interp, zParamName + 1, nil, 0);
+  { tclsqlite.c:1495..1513 — bind_fallback callback when the Tcl variable
+    is undefined and a fallback script is registered. }
+  if (pVarObj = nil) and (pDb^.zBindFallback <> nil) then
+  begin
+    pCmd := Tcl_NewStringObj(pDb^.zBindFallback, -1);
+    Tcl_IncrRefCount(pCmd);
+    Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+      Tcl_NewStringObj(zParamName, -1));
+    if pNeedReset^ <> 0 then Tcl_ResetResult(pDb^.interp);
+    pNeedReset^ := 1;
+    rx := Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(pCmd);
+    if rx = TCL_OK then
+      pVarObj := Tcl_GetObjResult(pDb^.interp)
+    else if rx = TCL_ERROR then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end
+    else
+      pVarObj := nil;
+  end;
   if pVarObj = nil then
   begin
     sqlite3_bind_null(pStmt, i);
+    if pNeedReset^ <> 0 then Tcl_ResetResult(pDb^.interp);
     Exit;
   end;
   zType := TclObjTypeName(pVarObj);
@@ -822,6 +859,8 @@ begin
       Inc(iParm^);
     end;
   end;
+  { tclsqlite.c:1554 — reset the interp result after a fallback eval. }
+  if pNeedReset^ <> 0 then Tcl_ResetResult(pDb^.interp);
 end;
 
 { DbPrepareAndBind — minimal port of dbPrepareAndBind
@@ -854,6 +893,7 @@ var
   nByte:      PtrUInt;
   zParamName: PAnsiChar;
   rc:         cint;
+  needReset:  cint;
 begin
   ppPS^ := nil;
   zSql := zIn;
@@ -929,18 +969,24 @@ begin
   Assert(pPS <> nil);
   nVar := sqlite3_bind_parameter_count(pStmt);
   iParm := 0;
+  needReset := 0;
+  rc := TCL_OK;
   { Walk bind parameters — tclsqlite.c:1491..1556 via DbBindOneParam
     helper (9.4.divbug.60).  apParm[] anchors incref'd Tcl_Obj refs for
     the BLOB / text branches so SQLITE_STATIC bytes stay live until
-    DbReleaseStmt drops them. }
+    DbReleaseStmt drops them.  A bind_fallback callback that raises an
+    error aborts the loop with TCL_ERROR (tclsqlite.c:1507..1509). }
   for i := 1 to nVar do
   begin
     zParamName := sqlite3_bind_parameter_name(pStmt, i);
-    DbBindOneParam(pDb, pStmt, i, zParamName, pPS, @iParm);
+    rc := DbBindOneParam(pDb, pStmt, i, zParamName, pPS, @iParm, @needReset);
+    if rc = TCL_ERROR then break;
   end;
   pPS^.nParm := iParm;
   ppPS^ := pPS;
-  Result := TCL_OK;
+  { tclsqlite.c:1559 — final result reset on a clean run. }
+  if (needReset <> 0) and (rc = TCL_OK) then Tcl_ResetResult(pDb^.interp);
+  Result := rc;
 end;
 
 { DbReleaseStmt — port of dbReleaseStmt (tclsqlite.c:1573..1614).
@@ -1254,11 +1300,20 @@ begin
     begin
       slot := PPTclObj(PtrUInt(apColName) + PtrUInt(i)*SizeOf(Pointer));
       pColName := slot^;
-      pColVal  := DbEvalColumnValueCtx(p, i);
       if pVarName = nil then
-        Tcl_ObjSetVar2(interp, pColName, nil, pColVal, 0)
+        Tcl_ObjSetVar2(interp, pColName, nil, DbEvalColumnValueCtx(p, i), 0)
+      else if ((p^.evalFlags and SQLITE_EVAL_WITHOUTNULLS) <> 0)
+           and (sqlite3_column_type(p^.pPreStmt^.pStmt, i) = SQLITE_NULL) then
+      begin
+        { tclsqlite.c:1938..1958 — drop the NULL column from the target.
+          Only the array form is ported (the -asdict dict path is not yet
+          wired through the Tcl bridge). }
+        if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+          Tcl_UnsetVar2(interp, Tcl_GetString(pVarName),
+                        Tcl_GetString(pColName), 0);
+      end
       else
-        Tcl_ObjSetVar2(interp, pVarName, pColName, pColVal, 0);
+        Tcl_ObjSetVar2(interp, pVarName, pColName, DbEvalColumnValueCtx(p, i), 0);
     end;
 
     { 9.4.divbug.28 — the NRE per-row continuation path crashes (Tcl
@@ -1292,14 +1347,14 @@ end;
   DbEvalArm path is used (callers gate on DbUseNre before invoking us).
   9.4.2.x.1.d. }
 function DbEvalScriptArm(pDb: PSqliteDb; interp: PTclInterp;
-  pSql, pVarName, pScript: PTclObj): cint;
+  pSql, pVarName, pScript: PTclObj; evalFlags: cint): cint;
 var
   p:   PDbEvalContext;
   cd2: array[0..1] of TClientData;  { tclsqlite.c:3340 — ClientData cd2[2] }
 begin
   p := PDbEvalContext(Tcl_Alloc(SizeOf(TDbEvalContext)));
   FillChar(p^, SizeOf(TDbEvalContext), 0);
-  DbEvalInit(p, pDb, pSql, pVarName, 0);
+  DbEvalInit(p, pDb, pSql, pVarName, evalFlags);
   Tcl_IncrRefCount(pScript);
   cd2[0] := TClientData(p);
   cd2[1] := TClientData(pScript);
@@ -1398,7 +1453,9 @@ var
   sEval:      TDbEvalContext;
   pRet:       PTclObj;
   zOpt:       PAnsiChar;
+  evalFlags:  cint;
 begin
+  evalFlags := 0;
   { Option-parsing loop — port of tclsqlite.c:3300..3318.  Consume any
     leading `-withoutnulls`/`-asdict` switches; an unknown `-` option is
     an error.  Each consumed switch shifts objv up by one and decrements
@@ -1409,10 +1466,10 @@ begin
     zOpt := Tcl_GetString(ObjvAt(objv, 2));
     if (zOpt = nil) or (zOpt^ <> '-') then
       Break;
-    if (StrComp(zOpt, '-withoutnulls') = 0) or (StrComp(zOpt, '-asdict') = 0) then
-    begin
-      { accepted; flags not yet wired }
-    end
+    if StrComp(zOpt, '-withoutnulls') = 0 then
+      evalFlags := evalFlags or SQLITE_EVAL_WITHOUTNULLS
+    else if StrComp(zOpt, '-asdict') = 0 then
+      evalFlags := evalFlags or SQLITE_EVAL_ASDICT
     else
     begin
       Tcl_AppendResult(interp, PChar('unknown option: "'), zOpt,
@@ -1460,7 +1517,7 @@ begin
       list form below stays on the existing direct prepare/step loop
       (tclsqlite.c:3320..3338). }
     Result := DbEvalScriptArm(pDb, interp, ObjvAt(objv, 2),
-                              pVarName, pScript);
+                              pVarName, pScript, evalFlags);
     Exit;
   end;
 
@@ -2522,6 +2579,45 @@ end;
 { DbBusyArm — `db busy ?CALLBACK?`  tclsqlite.c:2641..2670.
   2-arg form reports the current callback; 3-arg form replaces it and
   (re)registers via sqlite3_busy_handler (or clears it). }
+{ DbBindFallbackArm — port of the DB_BIND_FALLBACK arm of DbObjCmd
+  (tclsqlite.c:2611..2634).  Reads (objc==2) or sets (objc==3) the
+  zBindFallback callback script.  An empty callback reverts to the
+  default NULL-binding behaviour. }
+function DbBindFallbackArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:       PSqliteDb;
+  zCallback: PAnsiChar;
+  len:       cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zBindFallback <> nil then
+      Tcl_AppendResult(interp, pDb^.zBindFallback, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zBindFallback <> nil then
+      Tcl_Free(pDb^.zBindFallback);
+    zCallback := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zCallback <> nil) and (len > 0) then
+    begin
+      pDb^.zBindFallback := Tcl_Alloc(len + 1);
+      Move(zCallback^, pDb^.zBindFallback^, len + 1);
+    end
+    else
+      pDb^.zBindFallback := nil;
+  end;
+  Result := TCL_OK;
+end;
+
 function DbBusyArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
 var
@@ -4095,6 +4191,15 @@ begin
     Exit;
   end;
 
+  { bind_fallback — tclsqlite.c:2611 (DB_BIND_FALLBACK).  Stores a Tcl
+    callback script that DbPrepareAndBind invokes for unresolved bind
+    parameters. }
+  if (zSub <> nil) and (StrComp(zSub, 'bind_fallback') = 0) then
+  begin
+    Result := DbBindFallbackArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
   { busy — tclsqlite.c:2641 (DB_BUSY).  sqlite3_busy_handler shim. }
   if (zSub <> nil) and (StrComp(zSub, 'busy') = 0) then
   begin
@@ -4736,6 +4841,7 @@ begin
   pDb^.zProfile := nil;
   pDb^.zAuth    := nil;
   pDb^.zBusy        := nil;
+  pDb^.zBindFallback := nil;
   pDb^.zProgress    := nil;
   pDb^.zCommit      := nil;
   pDb^.pUpdateHook  := nil;
