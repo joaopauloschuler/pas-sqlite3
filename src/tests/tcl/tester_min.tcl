@@ -445,6 +445,50 @@ set ::sqlite_options(configslower) 1.0
 # run and hit "no such module: rtree".
 set ::sqlite_options(rtree) 0
 
+# Compile-time limit globals — mirror the LINKVAR(x) block in upstream
+# src/test_config.c:805..835 (Tcl_LinkVar "SQLITE_"#x as TCL_LINK_INT |
+# TCL_LINK_READ_ONLY).  bigrow.test and sqllimits1.test read these
+# $SQLITE_MAX_* / $SQLITE_DEFAULT_* globals directly and error
+# ("no such variable") before reaching their first assertion otherwise.
+#
+# The native sqlite3 Tcl package (src/tests/tcl/PasTclSqlite.pas ~4918)
+# already LinkVar's SQLITE_MAX_ATTACHED / MAX_COMPOUND_SELECT / MAX_COLUMN
+# read-only, and the block near tester_min.tcl:1836 already sets
+# TEMP_STORE / SQLITE_DEFAULT_{SYNCHRONOUS,WAL_SYNCHRONOUS,FILE_FORMAT,
+# CACHE_SIZE} / SQLITE_MAX_VARIABLE_NUMBER.  Set only the remaining
+# members here, guarding each with `info exists` so a read-only native
+# link (existing or future) is never clobbered.
+#
+# Values are this port's own compile-time constants, and MUST match the
+# engine's aHardLimit (src/passqlite3main.pas:675..689) because the tests
+# read each limit back via `sqlite3_limit db SQLITE_LIMIT_<x> -1` and
+# compare it to the matching $SQLITE_MAX_<x> global:
+#   MAX_FUNCTION_ARG=127 -> passqlite3main.pas:665 (this port caps it at
+#     127, diverging from the sqliteLimit.h default of 1000)
+#   MAX_WORKER_THREADS=8 -> passqlite3main.pas SQLITE_MAX_WORKER_THREADS_LIMIT
+#     (aHardLimit[11]); single-threaded build but the hard limit reports 8
+#   MAX_{LENGTH,SQL_LENGTH,EXPR_DEPTH,VDBE_OP,LIKE_PATTERN_LENGTH,
+#        TRIGGER_DEPTH,PAGE_SIZE,PAGE_COUNT,DEFAULT_PAGE_SIZE}
+#       -> sqliteLimit.h port, src/passqlite3types.pas:270..298
+#   DEFAULT_PAGE_SIZE=1024 -> passqlite3types.pas:291 (under -dSQLITE_TEST)
+foreach {_lv _val} {
+  SQLITE_MAX_LENGTH              1000000000
+  SQLITE_MAX_SQL_LENGTH          1000000000
+  SQLITE_MAX_EXPR_DEPTH          1000
+  SQLITE_MAX_VDBE_OP             250000000
+  SQLITE_MAX_FUNCTION_ARG        127
+  SQLITE_MAX_PAGE_SIZE           65536
+  SQLITE_MAX_PAGE_COUNT          4294967294
+  SQLITE_MAX_LIKE_PATTERN_LENGTH 50000
+  SQLITE_MAX_TRIGGER_DEPTH       1000
+  SQLITE_MAX_DEFAULT_PAGE_SIZE   8192
+  SQLITE_MAX_WORKER_THREADS      8
+  SQLITE_DEFAULT_PAGE_SIZE       1024
+} {
+  if {![info exists ::$_lv]} { set ::$_lv $_val }
+}
+unset -nocomplain _lv _val
+
 # sqlite3_exec_hex is provided natively by the sqlite3 test package
 # (TestModuleTest1.test_exec_hex, a faithful port of test1.c:test_exec_hex).
 # A pure-Tcl shim was previously defined here, but `[format %c $byte]` makes a
