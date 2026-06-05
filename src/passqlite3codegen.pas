@@ -36731,14 +36731,12 @@ begin
            faithfully (fts3join-4.2). }
       begin
         pSubFC := pItem^.u4.pSubq^.pSelect;
-        { Conservatively skip CTE-backed FROM items in this multi-source
-          flatten pass.  Flattening a CTE subquery (especially one whose own
-          FROM references other CTEs, e.g. with1-19.1b) interacts with the
-          pas CTE materialisation pass in ways the late single-source path
-          never exercised; the C result for those is reached via a different
-          code path.  8.3/8.6 use plain table subqueries, not CTEs. }
-        if ((pItem^.fg.fgBits2 and u8($02)) = 0)                { not isCte }
-           and not (((pItem^.fg.fgBits2 and u8($02)) <> 0)      { isCte fence }
+        { C flattens CTE-backed FROM subqueries in this pass too; the only CTE
+          skip is the MATERIALIZED (M10d_Yes) optimisation fence
+          (select.c:7785).  NOT MATERIALIZED nested CTEs must flatten so that
+          deeply-nested CTE joins accumulate FROM terms and trip the
+          "too many FROM clause terms" limit during prepare (with1-22.1). }
+        if not (((pItem^.fg.fgBits2 and u8($02)) <> 0)          { isCte fence }
                 and (pItem^.u2.pCteUse <> nil)
                 and (pItem^.u2.pCteUse^.eM10d = u8(0)))         { M10d_Yes }
            and ((pSubFC^.selFlags and SF_Aggregate) = 0)        { 7796 }
