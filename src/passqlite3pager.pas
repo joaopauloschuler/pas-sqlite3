@@ -1860,9 +1860,9 @@ begin
   rc := pagerLockDb(pPager, EXCLUSIVE_LOCK);
   if rc <> SQLITE_OK then
   begin
-    rc := pagerLockDb(pPager, PENDING_LOCK);
-    if rc = SQLITE_OK then
-      pagerUnlockDb(pPager, eOrigLock);
+    { If the attempt to grab the exclusive lock failed, release the
+      pending lock that may have been obtained instead. }
+    pagerUnlockDb(pPager, eOrigLock);
   end;
   Result := rc;
 end;
