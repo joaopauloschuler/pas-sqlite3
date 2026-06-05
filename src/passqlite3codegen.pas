@@ -39599,6 +39599,19 @@ begin
             does (select.c:8872).  WhereBegin opens the vtab cursor and
             drives whereLoopAddVirtual over the real WHERE terms, so the
             mandatory constraint reaches xFilter (closure01-1.10 / 2.1). }
+        else if (p^.pSrc^.nSrc > 1)
+           and (pTab <> nil)
+           and (pTab^.eTabType = TABTYP_VTAB)
+           and ((pItem[jAgg].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
+          { Multi-source FROM whose terms include a vtab / table-valued
+            function (e.g. `SELECT count(*) FROM t1, json_each('[..]')`).
+            Do NOT bail: the general sqlite3WhereBegin arm below codes the
+            join exactly as C does (select.c:8872) — it opens the vtab
+            cursor (VOpen/VFilter/VNext) nested inside the base-table
+            Rewind/Next loop, identical to the non-aggregate path.  Bailing
+            here dropped the entire SELECT to a 3-op stub, so the mandatory
+            single no-GROUP-BY aggregate row was never emitted (json106 /
+            tabfunc01: `count(*)` over a TVF join returned no row). }
         else if (pTab = nil)
            or (pTab^.eTabType = TABTYP_VTAB)
            or (pTab^.eTabType = TABTYP_VIEW)
