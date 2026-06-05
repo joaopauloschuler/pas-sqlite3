@@ -4200,6 +4200,7 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -4253,6 +4254,7 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
