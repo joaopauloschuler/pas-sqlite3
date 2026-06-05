@@ -4889,6 +4889,11 @@ begin
     is undefined → Tcl reads 0 → expected {4 3} comes back as {4 0}. }
   Tcl_LinkVar(interp, PChar('sqlite_search_count'),
               @sqlite3_search_count, TCL_LINK_INT);
+  { test1.c:9376..9377 Tcl_LinkVar( sqlite_interrupt_count ) — test-only
+    countdown decremented per VDBE op; fires sqlite3_interrupt(db) at 0.
+    interrupt.test section 3 sets it to simulate an interrupt after N steps. }
+  Tcl_LinkVar(interp, PChar('sqlite_interrupt_count'),
+              @sqlite3_interrupt_count, TCL_LINK_INT);
   { test1.c:9372 Tcl_LinkVar( sqlite3_max_blobsize ) — watermark of the
     largest string/blob materialised on the VDBE register stack.  zeroblob.test
     reads it to prove trailing zeroblobs are never instantiated. }

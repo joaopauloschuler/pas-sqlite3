@@ -2057,6 +2057,13 @@ var
 var
   sqlite3_search_count: i32 = 0;
 
+{ vdbe.c:68 — test-only countdown: when >0, decremented once per VDBE opcode
+  step (vdbe.c:961..971, #ifdef SQLITE_TEST) and, when it reaches 0, fires
+  sqlite3_interrupt(db).  Tcl-linked as `sqlite_interrupt_count` (test1.c:9376)
+  so interrupt.test section 3 can simulate an interrupt after N steps. }
+var
+  sqlite3_interrupt_count: Int32 = 0;
+
 { vdbe.c:90 — largest blob (MEM_Str|MEM_Blob, by Mem.n, excluding zero-padding)
   ever materialised on the VDBE register stack.  Test-only watermark read by the
   regression suite via the Tcl-linked `sqlite3_max_blobsize` variable
@@ -10081,6 +10088,16 @@ begin
         + Format('%d %s %d %d %d %.2x'#10,
                  [i32(pOp - aOp), sqlite3OpcodeName(pOp^.opcode),
                   pOp^.p1, pOp^.p2, pOp^.p3, pOp^.p5]);
+
+    {$IFDEF SQLITE_TEST}
+    { Check to see if we need to simulate an interrupt.  This only happens
+      if we have a special test build (vdbe.c:961..971). }
+    if sqlite3_interrupt_count > 0 then begin
+      Dec(sqlite3_interrupt_count);
+      if sqlite3_interrupt_count = 0 then
+        db^.u1.isInterrupted := 1;   { = sqlite3_interrupt(db); inlined to avoid uses cycle }
+    end;
+    {$ENDIF}
 
     { Dispatch }
     case pOp^.opcode of
