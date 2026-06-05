@@ -4382,6 +4382,7 @@ var
   bTranslateFileName: cint;
   ds:       TTclDString;
   zTrans:   PAnsiChar;
+  dqsCfg:   i32;
 
   function Usage: cint;
   begin
@@ -4580,6 +4581,18 @@ begin
       no auto-extension table, so we call Md5_Register directly here.
       Required by backup, backup_ioerr, fuzz3, interrupt, trans2 tests. }
     Md5_Register(pHandle, nil, nil);
+    { DQS=3 testfixture flavour: the upstream Tcl test harness links a
+      libsqlite3 built with the amalgamation default SQLITE_DQS=3 (both
+      DBCONFIG_DQS_DDL and DBCONFIG_DQS_DML on), whereas the standalone
+      shell oracle is built -DSQLITE_DQS=0.  pas-sqlite3 ships a single
+      library whose default is DQS=0 (to match the shell oracle for
+      .dbconfig parity), so re-enable the legacy double-quoted-string
+      behaviour here on every Tcl connection to mirror the testfixture
+      build.  Required by indexexpr1-2100..2140 (CREATE INDEX ON t1("y")
+      demotes the bare double-quoted identifier to a string literal). }
+    dqsCfg := 0;
+    sqlite3_db_config_int(pHandle, SQLITE_DBCONFIG_DQS_DDL, 1, @dqsCfg);
+    sqlite3_db_config_int(pHandle, SQLITE_DBCONFIG_DQS_DML, 1, @dqsCfg);
   end;
   if (rc <> SQLITE_OK) or (pHandle = nil) or
      (sqlite3_errcode(pHandle) <> SQLITE_OK) then

@@ -963,9 +963,21 @@ begin
     u64($00010000) or        { SQLITE_LoadExtension_Bit — main.c:3473 default-on }
     (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
     (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
-    u64($20000000) or        { SQLITE_DqsDDL — SQLITE_DQS=3 legacy default (main.c:3453..3462) }
-    u64($40000000) or        { SQLITE_DqsDML — SQLITE_DQS=3 legacy default }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
+    { NOTE: SQLITE_DqsDDL/SQLITE_DqsDML are intentionally NOT set here.
+      The reference oracle (../sqlite3/sqlite3) is compiled with
+      -DSQLITE_DQS=0 (verify: `PRAGMA compile_options` reports DQS=0), so
+      both DBCONFIG_DQS_DDL and DBCONFIG_DQS_DML default OFF (main.c
+      190531..190539, the #if (SQLITE_DQS&n) guards stay false at DQS=0).
+      The standalone shell must match that, otherwise `.dbconfig` reports
+      dqs_ddl/dqs_dml `on` vs the oracle's `off`.
+      The upstream Tcl *testfixture* is a separate build that defaults to
+      DQS=3 (the amalgamation default when SQLITE_DQS is not -D-overridden),
+      which is why indexexpr1-2100..2140 expect CREATE INDEX ON t1("y") to
+      demote the bare double-quoted identifier to a string.  That DQS=3
+      behaviour is re-enabled for the Tcl harness in PasTclSqlite.pas's
+      DbMain open path (sqlite3_db_config DQS_DDL/DQS_DML = 1), mirroring
+      the testfixture build flavour without disturbing shell parity. }
 
   sqlite3HashInit(@db^.aCollSeq);
   sqlite3HashInit(@db^.aModule);
