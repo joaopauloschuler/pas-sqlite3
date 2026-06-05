@@ -1824,7 +1824,8 @@ begin
   if (pList <> nil)
      and (pList^.nExpr > db^.aLimit[SQLITE_LIMIT_FUNCTION_ARG])
      and (pPse^.nested = 0) then
-    sqlite3ErrorMsg(pPse, 'too many arguments on function');
+    sqlite3ErrorMsg(pPse, sqlite3MPrintf(db,
+      'too many arguments on function %T', [pToken]));
   pNew^.x.pList := pList;
   pNew^.flags := pNew^.flags or EP_HasFunc;
   sqlite3ExprSetHeightAndFlags(pPse, pNew);

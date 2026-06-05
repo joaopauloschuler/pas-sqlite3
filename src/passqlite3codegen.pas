@@ -4419,7 +4419,8 @@ begin
         mxHeight := pParse^.db^.aLimit[SQLITE_LIMIT_EXPR_DEPTH];
       if nHeight > mxHeight then
       begin
-        sqlite3ErrorMsg(pParse, 'Expression tree is too large');
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+          'Expression tree is too large (maximum depth %d)', [mxHeight]));
         Result := SQLITE_ERROR;
       end;
     end;
