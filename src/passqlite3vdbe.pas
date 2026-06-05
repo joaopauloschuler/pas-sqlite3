@@ -3194,7 +3194,12 @@ begin
       { freeEphemeralFunction — defer to Phase 6 }
     end;
     P4_SUBRTNSIG: begin
-      { SubrtnSig has zAff heap string — defer to Phase 6 }
+      { vdbeaux.c:1421 — free the affinity string then the struct. }
+      if p4 <> nil then
+      begin
+        sqlite3DbFree(db, PSubrtnSig(p4)^.zAff);
+        sqlite3DbFree(db, p4);
+      end;
     end;
   end;
 end;
