@@ -2552,8 +2552,23 @@ begin
   pPage := pCur^.pPage;
   pBt   := pCur^.pBt;
 
+  if pCur^.ix >= pPage^.nCell then begin
+    Result := CORRUPT_PAGE(pPage);
+    Exit;
+  end;
+
   getCellInfo(pCur);
   aPayload := pCur^.info.pPayload;
+
+  { Trying to read or write past the end of the data is an error.  The
+    conditional below is really:
+       &aPayload[pCur->info.nLocal] > &pPage->aData[pBt->usableSize]
+    but is recast into its current form to avoid integer overflow problems. }
+  if NativeUInt(aPayload - pPage^.aData) >
+       (NativeUInt(pBt^.usableSize) - pCur^.info.nLocal) then begin
+    Result := CORRUPT_PAGE(pPage);
+    Exit;
+  end;
 
   { Check in-page data first }
   if offset < pCur^.info.nLocal then begin
@@ -2735,6 +2750,8 @@ end;
 function sqlite3BtreePayloadFetch(pCur: PBtCursor; out pAmt: u32): PAnsiChar;
 var
   pPage: PMemPage;
+  amt  : i32;
+  avail: i32;
 begin
   pPage := pCur^.pPage;
   if pPage = nil then begin
@@ -2748,7 +2765,14 @@ begin
     quirk did was wrong: in index cells nKey == nPayload (length),
     not an offset, so the previous code skipped past the entire record
     and OP_Column read NULL on every index-eph row. }
-  pAmt   := u32(pCur^.info.nLocal);
+  amt := i32(pCur^.info.nLocal);
+  avail := i32(pPage^.aDataEnd - pCur^.info.pPayload);
+  if amt > avail then begin
+    { There is too little space on the page for the expected amount
+      of local content. Database must be corrupt. (btree.c:5403) }
+    if avail > 0 then amt := avail else amt := 0;
+  end;
+  pAmt   := u32(amt);
   Result := PAnsiChar(pCur^.info.pPayload);
 end;
 
