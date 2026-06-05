@@ -100,6 +100,8 @@ const
   SQLITE_TESTCTRL_NEVER_CORRUPT_OP = 20;
   { sqlite3.h — opcode 29.  Mirrored locally (see comment above). }
   SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP = 29;
+  { sqlite3.h — opcode 8 (BITVEC_TEST).  Mirrored locally. }
+  SQLITE_TESTCTRL_BITVEC_TEST_OP = 8;
   SEEK_SET = 0;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -193,6 +195,37 @@ begin
   Move(s[1], zBuf[0], Length(s));
   Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
   Result := TCL_OK;
+end;
+
+{ test1.c:7831..7855 — runAsObjProc (Tcl command `tcl_objproc`).
+  Usage: tcl_objproc COMMANDNAME ARGS...
+  Run a TCL command via its objProc interface, erroring if the command
+  has none. }
+function runAsObjProc(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  cmdInfo: TTclCmdInfo;
+  xObj:    TTclObjCmdProc;
+begin
+  if objc < 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('COMMAND ...'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetCommandInfo(interp, Tcl_GetString(objv[1]), @cmdInfo) = 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('command not found: '),
+      Tcl_GetString(objv[1]), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if cmdInfo.objProc = nil then
+  begin
+    Tcl_AppendResult(interp, PChar('command has no objProc: '),
+      Tcl_GetString(objv[1]), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  xObj := TTclObjCmdProc(cmdInfo.objProc);
+  Result := xObj(cmdInfo.objClientData, interp, objc - 1, PPTclObj(@objv[1]));
 end;
 
 { test1.c:6191..6325 — fpnum_compare STRING1 STRING2.
@@ -2099,6 +2132,36 @@ begin
     t3_sDb.mutex := nil;
     t3_sDb.pVfs := nil;
   end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:548..575 — btree_ismemdb ID.
+  Return true if the B-Tree is currently stored entirely in memory
+  (i.e. its pager file has no installed IO methods). }
+function btree_ismemdb(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt:   PBtree;
+  res:   cint;
+  pFile: Psqlite3_file;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  { C: pBt->db->mutex.  In this port every test3 b-tree is opened against
+    the shared bogus connection t3_sDb (see btree_open), so pBt->db == &t3_sDb. }
+  sqlite3_mutex_enter(t3_sDb.mutex);
+  sqlite3BtreeEnter(pBt);
+  pFile := sqlite3PagerFile(sqlite3BtreePager(pBt));
+  res := cint(Ord(pFile^.pMethods = nil));
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(t3_sDb.mutex);
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(res));
   Result := TCL_OK;
   if clientData = nil then ;
 end;
@@ -6215,6 +6278,128 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.63 — test1.c:8469..8501 sorter_test_fakeheap BOOL.
+  Toggle a fake (non-NULL but invalid) global heap pointer so the sorter
+  takes its "heap configured" code path without an actual allocator.
+  SQLITE_INT_TO_PTR(-1) == Pointer(-1). }
+function sorter_test_fakeheap(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  bArg: cint;
+begin
+  bArg := 0;
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOL'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @bArg) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if bArg <> 0 then
+  begin
+    if sqlite3GlobalConfig.pHeap = nil then
+      sqlite3GlobalConfig.pHeap := Pointer(PtrInt(-1));
+  end
+  else
+  begin
+    if sqlite3GlobalConfig.pHeap = Pointer(PtrInt(-1)) then
+      sqlite3GlobalConfig.pHeap := nil;
+  end;
+  Tcl_ResetResult(interp);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.63 — test1.c:8503..8574 sorter_test_sort4_helper DB SQL1 NSTEP SQL2.
+  Step SQL1 up to NSTEP times; assert col[0]==col[last] are equal ints,
+  accumulate a checksum; then run SQL2 fully accumulating a second checksum
+  over col[0]; assert the two checksums match. }
+function sorter_test_sort4_helper(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zSql1, zSql2: PAnsiChar;
+  nStep, iStep: cint;
+  iCksum1, iCksum2: cuint32;
+  rc, iB, a: cint;
+  db: PTsqlite3;
+  pStmt: PVdbe;
+label sql_error;
+begin
+  db := nil;
+  nStep := 0;
+  iCksum1 := 0;
+  iCksum2 := 0;
+  pStmt := nil;
+  if objc <> 5 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB SQL1 NSTEP SQL2'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zSql1 := Tcl_GetString(objv[2]);
+  if Tcl_GetIntFromObj(interp, objv[3], @nStep) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zSql2 := Tcl_GetString(objv[4]);
+
+  rc := sqlite3_prepare_v2(db, zSql1, -1, @pStmt, nil);
+  if rc <> SQLITE_OK then goto sql_error;
+
+  iB := sqlite3_column_count(pStmt) - 1;
+  iStep := 0;
+  while (iStep < nStep) and (sqlite3_step(pStmt) = SQLITE_ROW) do
+  begin
+    a := sqlite3_column_int(pStmt, 0);
+    if a <> sqlite3_column_int(pStmt, iB) then
+    begin
+      Tcl_AppendResult(interp, PChar('data error: (a!=b)'), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    iCksum1 := iCksum1 + (iCksum1 shl 3) + cuint32(a);
+    Inc(iStep);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  pStmt := nil;
+  if rc <> SQLITE_OK then goto sql_error;
+
+  rc := sqlite3_prepare_v2(db, zSql2, -1, @pStmt, nil);
+  if rc <> SQLITE_OK then goto sql_error;
+  while sqlite3_step(pStmt) = SQLITE_ROW do
+  begin
+    a := sqlite3_column_int(pStmt, 0);
+    iCksum2 := iCksum2 + (iCksum2 shl 3) + cuint32(a);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  pStmt := nil;
+  if rc <> SQLITE_OK then goto sql_error;
+
+  if iCksum1 <> iCksum2 then
+  begin
+    Tcl_AppendResult(interp, PChar('checksum mismatch'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  Result := TCL_OK;
+  if clientData = nil then ;
+  Exit;
+sql_error:
+  Tcl_AppendResult(interp, PChar('sql error: '), sqlite3_errmsg(db), Pointer(nil));
+  Result := TCL_ERROR;
+end;
+
 { 9.4.divbug.88.006 — test1.c:6912..6941 file_control_chunksize_test
   DB DBNAME SIZE.  Thin Tcl wrapper over
   sqlite3_file_control(db, zDb, SQLITE_FCNTL_CHUNK_SIZE, &nSize).
@@ -8201,6 +8386,44 @@ begin
   Result := TCL_OK;
 end;
 
+{ test2.c:671..698 — testBitvecBuiltinTest (old-style argc/argv handler).
+  Usage: sqlite3BitvecBuiltinTest SIZE PROGRAM.
+  Invokes SQLITE_TESTCTRL_BITVEC_TEST and returns the integer result. }
+function testBitvecBuiltinTest(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  av:    PPAnsiCharArr;
+  sz, rc, nProg: cint;
+  aProg: array[0..99] of cint;
+  z:     PAnsiChar;
+begin
+  av := argv;
+  nProg := 0;
+  if argc <> 3 then
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' SIZE PROGRAM"'), Pointer(nil));
+  if Tcl_GetInt(interp, av[1], @sz) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  z := av[2];
+  while (nProg < 99) and (z^ <> #0) do begin
+    while (z^ <> #0) and not (z^ in ['0'..'9']) do Inc(z);
+    if z^ = #0 then Break;
+    { atoi over the digit run }
+    rc := 0;
+    while z^ in ['0'..'9'] do begin
+      rc := rc * 10 + (Ord(z^) - Ord('0'));
+      Inc(z);
+    end;
+    aProg[nProg] := rc;
+    Inc(nProg);
+  end;
+  aProg[nProg] := 0;
+  rc := sqlite3_test_control(SQLITE_TESTCTRL_BITVEC_TEST_OP, sz, Pu32(@aProg[0]));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+end;
+
 { test1.c:7685..7740 — test_wal_checkpoint_v2.
   Usage: sqlite3_wal_checkpoint_v2 db MODE ?NAME?. }
 function test_wal_checkpoint_v2(clientData: TClientData; interp: PTclInterp;
@@ -8849,6 +9072,8 @@ begin
     @btree_open, nil, nil);
   Tcl_CreateCommand(interp, PChar('btree_close'),
     @btree_close, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_ismemdb'),
+    @btree_ismemdb, nil, nil);
   Tcl_CreateCommand(interp, PChar('btree_begin_transaction'),
     @btree_begin_transaction, nil, nil);
   Tcl_CreateCommand(interp, PChar('btree_cursor'),
@@ -9160,6 +9385,12 @@ begin
   { 9.4.divbug.63.b — file_control_reservebytes (test1.c:9258 / 7249..7276). }
   Tcl_CreateObjCommand(interp, PChar('file_control_reservebytes'),
     @file_control_reservebytes, nil, nil);
+  { 9.4.divbug.63 — sorter_test_fakeheap / sorter_test_sort4_helper
+    (test1.c:9301..9302 / 8469..8574).  sort4.test helpers. }
+  Tcl_CreateObjCommand(interp, PChar('sorter_test_fakeheap'),
+    @sorter_test_fakeheap, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sorter_test_sort4_helper'),
+    @sorter_test_sort4_helper, nil, nil);
   { 9.4.divbug.88.006 — file_control_chunksize_test (test1.c:9247 / 6912..6941). }
   Tcl_CreateObjCommand(interp, PChar('file_control_chunksize_test'),
     @file_control_chunksize_test, nil, nil);
@@ -9242,6 +9473,13 @@ begin
     @tcl_test_carray_bind, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('bind_carray_intptr'),
     @tcl_bind_carray_intptr, nil, nil);
+  { test2.c:732 — sqlite3BitvecBuiltinTest (registered by Sqlitetest2_Init
+    in C; the pas Sqlitetest2_Init is a stub, so register it here). }
+  Tcl_CreateCommand(interp, PChar('sqlite3BitvecBuiltinTest'),
+    @testBitvecBuiltinTest, nil, nil);
+  { test1.c:9200 — tcl_objproc. }
+  Tcl_CreateObjCommand(interp, PChar('tcl_objproc'),
+    @runAsObjProc, nil, nil);
   Result := TCL_OK;
 end;
 

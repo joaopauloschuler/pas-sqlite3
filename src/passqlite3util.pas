@@ -717,6 +717,7 @@ function  sqlite3BitvecSet(p: PBitvec; i: u32): i32;
 procedure sqlite3BitvecClear(p: PBitvec; i: u32; pBuf: Pointer);
 procedure sqlite3BitvecDestroy(p: PBitvec);
 function  sqlite3BitvecSize(p: PBitvec): u32;
+function  sqlite3BitvecBuiltinTest(sz: i32; aOp: Pi32): i32;
 
 { Status (status.c) }
 function  sqlite3StatusValue(op: i32): i64;
@@ -2255,6 +2256,103 @@ end;
 function sqlite3BitvecSize(p: PBitvec): u32;
 begin
   Result := p^.iSize;
+end;
+
+{ bitvec.c:394 — sqlite3BitvecBuiltinTest(int sz, int *aOp).
+  Self-test driver used by SQLITE_TESTCTRL_BITVEC_TEST (Tcl command
+  `sqlite3BitvecBuiltinTest`).  aOp is an opcode program (see bitvec.c
+  comment block).  Returns 0 on success, the failing bit index / a
+  non-zero discrepancy on mismatch, or -1 on allocation failure.
+  The SQLITE_DEBUG-only opcodes 6/7 are state-output no-ops here. }
+function sqlite3BitvecBuiltinTest(sz: i32; aOp: Pi32): i32;
+label bitvec_end;
+var
+  pBv:   PBitvec;
+  pV:        Pu8;
+  rc:        i32;
+  i, nx, pc, op: i32;
+  pTmpSpace: Pointer;
+  idx:       u32;
+begin
+  pBv := nil;
+  pV      := nil;
+  rc      := -1;
+
+  { Allocate the Bitvec to be tested and a linear reference array. }
+  if sz <= 0 then begin
+    pBv := sqlite3BitvecCreate(2 * u32(-sz));
+    pV := nil;
+  end else begin
+    pBv := sqlite3BitvecCreate(u32(sz));
+    pV := Pu8(sqlite3MallocZero(((7 + i64(sz)) div 8) + 1));
+  end;
+  pTmpSpace := sqlite3_malloc64(BITVEC_SZ);
+  if (pBv = nil) or (pTmpSpace = nil) or ((pV = nil) and (sz > 0)) then
+    goto bitvec_end;
+
+  { NULL pBv tests }
+  sqlite3BitvecSet(nil, 1);
+  sqlite3BitvecClear(nil, 1, pTmpSpace);
+
+  { Run the program }
+  pc := 0; i := 0;
+  while aOp[pc] <> 0 do begin
+    op := aOp[pc];
+    if op >= 6 then begin
+      Inc(pc);
+      Continue;
+    end;
+    case op of
+      1, 2, 5: begin
+        nx := 4;
+        i := aOp[pc+2] - 1;
+        aOp[pc+2] := aOp[pc+2] + aOp[pc+3];
+      end;
+      else begin { 3, 4, default }
+        nx := 2;
+        sqlite3_randomness(SizeOf(i), @i);
+      end;
+    end;
+    aOp[pc+1] := aOp[pc+1] - 1;
+    if aOp[pc+1] > 0 then nx := 0;
+    pc := pc + nx;
+    i := (i and $7fffffff) mod sz;
+    if (op and 1) <> 0 then begin
+      idx := u32(i + 1);
+      if pV <> nil then
+        pV[idx shr 3] := pV[idx shr 3] or u8(1 shl (idx and 7));
+      if op <> 5 then
+        if sqlite3BitvecSet(pBv, idx) <> 0 then goto bitvec_end;
+    end else begin
+      idx := u32(i + 1);
+      if pV <> nil then
+        pV[idx shr 3] := pV[idx shr 3] and not u8(1 shl (idx and 7));
+      sqlite3BitvecClear(pBv, idx, pTmpSpace);
+    end;
+  end;
+
+  { Compare the linear array against the Bitvec object. }
+  if pV <> nil then begin
+    rc := sqlite3BitvecTest(nil, 0) + sqlite3BitvecTest(pBv, u32(sz)+1)
+            + sqlite3BitvecTest(pBv, 0)
+            + (i32(sqlite3BitvecSize(pBv)) - sz);
+    i := 1;
+    while i <= sz do begin
+      idx := u32(i);
+      if ( ((pV[idx shr 3] and (1 shl (idx and 7))) <> 0) <> (sqlite3BitvecTest(pBv, idx) <> 0) ) then begin
+        rc := i;
+        Break;
+      end;
+      Inc(i);
+    end;
+  end else
+    rc := 0;
+
+bitvec_end:
+  sqlite3_free(pTmpSpace);
+  sqlite3_free(pV);
+  sqlite3BitvecDestroy(pBv);
+  Result := rc;
 end;
 
 { ============================================================

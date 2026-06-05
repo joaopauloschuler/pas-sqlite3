@@ -5440,6 +5440,11 @@ begin
     SQLITE_TESTCTRL_PRNG_SAVE_OP:    sqlite3PrngSaveState;
     SQLITE_TESTCTRL_PRNG_RESTORE_OP: sqlite3PrngRestoreState;
 
+    { main.c:4327 — BITVEC_TEST(int sz, int *aProg).  Runs the bitvec
+      self-test program; returns its result code. }
+    SQLITE_TESTCTRL_BITVEC_TEST_OP:
+      Result := sqlite3BitvecBuiltinTest(iArg1, Pi32(pArg2));
+
     { main.c:4254 — PRNG_SEED(int x, sqlite3 *db).  If db has a schema
       cookie use it; else use x; then reset the PRNG. }
     SQLITE_TESTCTRL_PRNG_SEED_OP: begin

@@ -2006,6 +2006,16 @@ proc explain_no_trace {sql} {
   return [lrange $tr 7 end]
 }
 
+# 9.4.divbug.63 — do_test_with_ansi_output (tester.tcl:812..819).  Like
+# do_test except the upstream version skips the test when running in a
+# slave interpreter on Windows (ANSI/UTF8 I/O issues on Win11).  On this
+# Linux port we are never on Windows, so this always runs the test.
+proc do_test_with_ansi_output {name cmd expected} {
+  if {![info exists ::SLAVE] || $::tcl_platform(platform) ne "windows"} {
+    uplevel 1 [list do_test $name $cmd $expected]
+  }
+}
+
 # 9.4.divbug.63.a — faultsim_test_result (malloc_common.tcl:291..298,
 # 348..350).  In upstream this command is dynamically (re)defined by
 # do_one_faultsim_test with the per-test -injecterrlist baked in;
