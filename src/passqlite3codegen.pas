@@ -25813,6 +25813,8 @@ end;
   corpus. }
 procedure constructAutomaticIndex(pParse: PParse; pWC: PWhereClause;
   notReady: Bitmask; pLevel: PWhereLevel);
+type
+  TAutoIdxLogCallback = procedure(pArg: Pointer; iErrCode: i32; zMsg: PChar); cdecl;
 var
   nKeyCol:        i32;
   pTerm:          PWhereTerm;
@@ -25830,7 +25832,9 @@ var
   pLoop:          PWhereLoop;
   zNotUsed:       PAnsiChar;
   idxCols:        Bitmask;
+  cMask:          Bitmask;
   extraCols:      Bitmask;
+  zLog:           PAnsiChar;
   sentWarning:    u8;
   useBloomFilter: u8;
   pPartial:       PExpr;
@@ -25879,25 +25883,36 @@ begin
     begin
       i := i32(pTerm^.u.leftColumn);
       if i >= BMS then
-        idxCols := idxCols or (Bitmask(1) shl (BMS - 1))
+        cMask := Bitmask(1) shl (BMS - 1)
       else
+        cMask := Bitmask(1) shl i;
+      { Emit the one-time SQLITE_WARNING_AUTOINDEX log for the first driving
+        term, BEFORE the cMask dedup check (where.c:1055..1060). }
+      if sentWarning = 0 then
       begin
-        { Only count a column once — guard with idxCols (where.c:1061). }
-        if (idxCols and (Bitmask(1) shl i)) = 0 then
+        if sqlite3GlobalConfig.xLog <> nil then
         begin
-          idxCols := idxCols or (Bitmask(1) shl i);
-          if sentWarning = 0 then
-            sentWarning := 1;
-          { Resize aLTerm and record the driving term. }
-          if whereLoopResize(db, pLoop, nKeyCol + 1) <> SQLITE_OK then
-          begin
-            sqlite3ExprDelete(db, pPartial);
-            sqlite3VdbeJumpHere(v, addrInit);
-            Exit;
-          end;
-          pLoop^.aLTerm[nKeyCol] := pTerm;
-          Inc(nKeyCol);
+          zLog := sqlite3MPrintf(db, 'automatic index on %s(%s)',
+                    [pTable^.zName, pTable^.aCol[i].zCnName]);
+          TAutoIdxLogCallback(sqlite3GlobalConfig.xLog)(
+            sqlite3GlobalConfig.pLogArg, SQLITE_WARNING_AUTOINDEX, PChar(zLog));
+          if zLog <> nil then sqlite3DbFree(db, zLog);
         end;
+        sentWarning := 1;
+      end;
+      { Only count a column once — guard with idxCols (where.c:1061). }
+      if (idxCols and cMask) = 0 then
+      begin
+        idxCols := idxCols or cMask;
+        { Resize aLTerm and record the driving term. }
+        if whereLoopResize(db, pLoop, nKeyCol + 1) <> SQLITE_OK then
+        begin
+          sqlite3ExprDelete(db, pPartial);
+          sqlite3VdbeJumpHere(v, addrInit);
+          Exit;
+        end;
+        pLoop^.aLTerm[nKeyCol] := pTerm;
+        Inc(nKeyCol);
       end;
     end;
     Inc(pTerm);
