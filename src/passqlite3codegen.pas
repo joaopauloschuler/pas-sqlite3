@@ -61820,19 +61820,18 @@ begin
     if minusFlag <> 0 then zRight := '-' + zRight;
   end else
     zRight := '';
-  { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466).
-    `PRAGMA table_info("t")` and `PRAGMA table_info='t'` both arrive with
-    the surrounding quote chars still attached; strip a single matched
-    pair (per sqlite3Isquote: ", ', `, [) so downstream LocateTable /
-    FindIndex see the bare identifier. }
-  if (Length(zRight) >= 2)
-     and ((zRight[1] = '"') or (zRight[1] = '''')
-          or (zRight[1] = '`') or (zRight[1] = '[')) then
+  { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466),
+    which dups the raw token then calls sqlite3Dequote.  Unlike a naive
+    outer-pair strip, sqlite3Dequote also collapses doubled quote chars
+    (e.g. `"""1"` -> `"1`, util.c:298), so downstream LocateTable /
+    FindIndex see the correct bare identifier.  Dequote works in-place and
+    may shorten the buffer, so re-derive zRight from the NUL-terminated
+    result. }
+  if (pValue <> nil) and (Length(zRight) >= 1) then
   begin
-    if (zRight[1] = '[') and (zRight[Length(zRight)] = ']') then
-      zRight := Copy(zRight, 2, Length(zRight) - 2)
-    else if zRight[Length(zRight)] = zRight[1] then
-      zRight := Copy(zRight, 2, Length(zRight) - 2);
+    UniqueString(zRight);
+    sqlite3Dequote(PAnsiChar(zRight));
+    zRight := AnsiString(PAnsiChar(zRight));
   end;
 
   { pragma.c:469..473 — SQLITE_PRAGMA authorizer check.  zDb is the schema
@@ -62650,7 +62649,14 @@ begin
       if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-      sqlite3VdbeReusable(v);
+      { pragma.c:1153..1155 — the PragTyp_FLAG read arm (returnSingleInt) does
+        NOT mark the statement reusable.  The flag value is baked into OP_Integer
+        at prepare time, so the prologue OP_Expire (sqlite3VdbeRunOnlyOnce,
+        pragma.c:445) must stay live: the cached read self-expires and is
+        reprepared on each reuse, re-reading db->flags.  Calling
+        sqlite3VdbeReusable here NOPs that OP_Expire and serves a stale baked
+        value across COMMIT/ROLLBACK (which clear SQLITE_DeferFKs at runtime
+        without expiring) — fkey6-1.10.1 returned 1 1 1 1 instead of 1 0 1 0. }
     end;
     Exit;
   end;
