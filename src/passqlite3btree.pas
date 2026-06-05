@@ -6907,6 +6907,14 @@ begin
      (CompareMem(Pu8(pPage1^.aData) + 24, Pu8(pPage1^.aData) + 92, 4) = False) then
     nPage := u32(nPageFile);
 
+  { btree.c:3299..3301 — when SQLITE_DBCONFIG_RESET_DATABASE is in effect,
+    force nPage to 0 so the page-1 header validation below is skipped and the
+    (possibly corrupt) existing page 1 is treated as an empty database; the
+    following VACUUM/newDatabase then rebuilds a fresh page 1 (resetdb.test). }
+  if (pBt^.db <> nil) and
+     ((PTsqlite3(pBt^.db)^.flags and SQLITE_ResetDatabase) <> 0) then
+    nPage := 0;
+
   if nPage > 0 then begin
     page1 := pPage1^.aData;
     rc := SQLITE_NOTADB;
@@ -7321,6 +7329,14 @@ begin
     { already in requested mode }
     goto trans_begun;
   end;
+
+  { btree.c:3615..3619 — under SQLITE_DBCONFIG_RESET_DATABASE, clear the
+    BTS_READ_ONLY flag (set when page 1 was found corrupt) provided the
+    pager itself is writable, so the reset VACUUM can write a fresh db. }
+  if (p^.db <> nil) and
+     ((PTsqlite3(p^.db)^.flags and SQLITE_ResetDatabase) <> 0) and
+     (sqlite3PagerIsreadonly(pPgr) = 0) then
+    pBt^.btsFlags := pBt^.btsFlags and not BTS_READ_ONLY;
 
   { btree.c:3621..3625 — write transactions are not possible on a
     read-only database; reads ARE allowed.  Bug 9.2.divbug.A: the

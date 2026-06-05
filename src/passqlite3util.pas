@@ -273,11 +273,12 @@ const
   SQLITE_DeferFKs       = u64($00080000);
   SQLITE_QueryOnly      = u64($00100000);
   SQLITE_CellSizeCk     = u64($00200000);
-  SQLITE_CorruptRdOnly  = u64($02000000);  { internal flag }
+  SQLITE_ResetDatabase  = u64($02000000);  { Reset the database (sqliteInt.h:1856) }
   SQLITE_LegacyAlter    = u64($04000000);
   SQLITE_NoSchemaError  = u64($08000000);  { Do not report schema parse errors }
   { HI() flag bits — sqliteInt.h: HI(X) = u64(X)<<32 }
   SQLITE_CountRows      = u64($0000000100000000);  { HI(0x00001) }
+  SQLITE_CorruptRdOnly  = u64($0000000200000000);  { HI(0x00002) — Prohibit writes due to error }
   SQLITE_ReadUncommit   = u64($0000000400000000);  { HI(0x00004) }
   SQLITE_FkNoAction     = u64($0000000800000000);  { HI(0x00008) }
   SQLITE_VdbeListing    = u64($0000000100000000);
