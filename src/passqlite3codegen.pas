@@ -61506,6 +61506,62 @@ begin
   Result := nil;
 end;
 
+{ getTempStore (pragma.c:141..151).  Interpret the given string as a temp db
+  location.  Return 1 for file-backed, 2 for in-memory, 0 for the compile-time
+  default.  A leading digit '0'..'2' is taken verbatim. }
+function getTempStore(z: PAnsiChar): i32;
+begin
+  if (z <> nil) and (z[0] >= '0') and (z[0] <= '2') then
+    Result := Ord(z[0]) - Ord('0')
+  else if sqlite3StrICmp(z, 'file') = 0 then
+    Result := 1
+  else if sqlite3StrICmp(z, 'memory') = 0 then
+    Result := 2
+  else
+    Result := 0;
+end;
+
+{ invalidateTempStorage (pragma.c:159..174).  Close the open TEMP db and
+  reset all schemas, but refuse while a transaction is active or the TEMP db
+  has an open transaction. }
+function invalidateTempStorage(pParse: PParse): i32;
+var
+  db: PTsqlite3;
+begin
+  db := pParse^.db;
+  if db^.aDb[1].pBt <> nil then begin
+    if (db^.autoCommit = 0)
+       or (sqlite3BtreeTxnState(db^.aDb[1].pBt) <> SQLITE_TXN_NONE) then begin
+      sqlite3ErrorMsg(pParse,
+        'temporary storage cannot be changed from within a transaction');
+      Result := SQLITE_ERROR;
+      Exit;
+    end;
+    sqlite3BtreeClose(db^.aDb[1].pBt);
+    db^.aDb[1].pBt := nil;
+    sqlite3ResetAllSchemasOfConnection(db);
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ changeTempStorage (pragma.c:183..192).  Map the storage-type string to a
+  temp_store code and, if it differs, invalidate the current temp storage and
+  record the new code on the connection. }
+function changeTempStorage(pParse: PParse; zStorageType: PAnsiChar): i32;
+var
+  db: PTsqlite3;
+  ts: i32;
+begin
+  ts := getTempStore(zStorageType);
+  db := pParse^.db;
+  if db^.temp_store = ts then begin Result := SQLITE_OK; Exit; end;
+  if invalidateTempStorage(pParse) <> SQLITE_OK then begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+  db^.temp_store := u8(ts);
+  Result := SQLITE_OK;
+end;
+
 // ===========================================================================
 // Phase 6.5 / 6.12 — sqlite3Pragma
 // ===========================================================================
@@ -63221,6 +63277,19 @@ begin
     Exit;
   end;
 
+  { PragTyp_TEMP_STORE (pragma.c:982..998).  Read form returns the
+    per-connection db^.temp_store (u8); write form maps the storage-type
+    string via getTempStore and reconfigures via changeTempStorage, which
+    rejects the change while a temp db is open inside a transaction. }
+  if SameText(zName, 'temp_store') then begin
+    if pValue = nil then begin
+      sqlite3VdbeAddOp2(v, OP_Integer,   db^.temp_store, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,              1);
+    end else
+      changeTempStorage(pParse, PAnsiChar(zRight));
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -63228,8 +63297,7 @@ begin
     not preserved), matching the pre-port behaviour. }
   if pValue = nil then begin
     iVal := MaxInt; { sentinel "not handled" }
-    if      SameText(zName, 'temp_store')         then iVal := 0
-    else if SameText(zName, 'analysis_limit')     then iVal := 0;
+    if      SameText(zName, 'analysis_limit')     then iVal := 0;
     if iVal <> MaxInt then begin
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
