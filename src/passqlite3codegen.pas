@@ -61746,6 +61746,7 @@ var
   newEnc:    u8;  { 9.4.divbug.5 — PragTyp_ENCODING write arm }
   iValPragma: i64; { 9.4.divbug.87.067 — PRAGMA max_page_count=N parse }
   iPriorHeap: i64; { PRAGMA hard_heap_limit — prior limit (pragma.c:2685) }
+  resTsd:    cint; { PRAGMA temp_store_directory — sqlite3OsAccess result }
   { 9.4.divbug.88.068.a — locals for SQLITE_FCNTL_PRAGMA fallback
     (pragma.c:475..511).  aFcntlPragma is the four-slot char** argument
     handed to the VFS xFileControl. }
@@ -63311,6 +63312,44 @@ begin
       sqlite3VdbeAddOp2(v, OP_ResultRow, 1,              1);
     end else
       changeTempStorage(pParse, PAnsiChar(zRight));
+    Exit;
+  end;
+
+  { PragTyp_TEMP_STORE_DIRECTORY (pragma.c:1011..1042).  Read form returns the
+    process-global sqlite3_temp_directory (a single TEXT row, or no row when
+    nil — returnSingleText with NULL emits nothing).  Write form validates the
+    directory is writable via sqlite3OsAccess(ACCESS_READWRITE), invalidates
+    the open temp storage when applicable, then frees+replaces the global.
+    The STATIC_TEMPDIR mutex is a no-op here (this port does not split static
+    mutexes for codegen-time pragma handling).  SQLITE_TEMP_STORE==1 in this
+    build (passqlite3btree.pas:7064), so the invalidate condition
+      (SQLITE_TEMP_STORE==1 && db->temp_store<=1)
+    reduces to db^.temp_store <= 1. }
+  if SameText(zName, 'temp_store_directory') then begin
+    if pValue = nil then begin
+      { returnSingleText(v, sqlite3_temp_directory): emit a row only when
+        the global is non-nil. }
+      if sqlite3_temp_directory <> nil then begin
+        sqlite3VdbeLoadString(v, 1, sqlite3_temp_directory);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+      end;
+    end else begin
+      if zRight <> '' then begin
+        if (sqlite3OsAccess(db^.pVfs, PAnsiChar(zRight),
+              SQLITE_ACCESS_READWRITE, @resTsd) <> SQLITE_OK)
+           or (resTsd = 0) then begin
+          sqlite3ErrorMsg(pParse, 'not a writable directory');
+          Exit;
+        end;
+      end;
+      if db^.temp_store <= 1 then
+        invalidateTempStorage(pParse);
+      sqlite3_free(sqlite3_temp_directory);
+      if zRight <> '' then
+        sqlite3_temp_directory := sqlite3StrDup(PAnsiChar(zRight))
+      else
+        sqlite3_temp_directory := nil;
+    end;
     Exit;
   end;
 
