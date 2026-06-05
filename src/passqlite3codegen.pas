@@ -6731,6 +6731,21 @@ begin
             sqlite3VdbeAddOp1(v, OP_RealAffinity, target);
           done := True;
         end
+        else if (pExpr^.pAggInfo <> nil) and (pExpr^.iAgg >= 0)
+                and (pExpr^.iAgg < pExpr^.pAggInfo^.nColumn)
+                and (pExpr^.y.pTab = nil) then
+        begin
+          { expr.c:4993..4998 — directMode, non-sorting.  This case happens
+            when the argument to an aggregate function is rewritten by
+            aggregateConvertIndexedExprRefToColumn(): the node became a
+            TK_AGG_COLUMN with no backing Table (y.pTab=nil), reading the
+            precomputed value directly from the index cursor/column.  Without
+            this branch the code falls through to the final OP_Null arm and
+            the aggregate argument is read as NULL (in-23.1). }
+          sqlite3VdbeAddOp3(v, OP_Column, pExpr^.iTable, pExpr^.iColumn,
+                            target);
+          done := True;
+        end
         else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
         begin
           { expr.c:4999..5081 — TK_AGG_COLUMN in directMode falls through to
