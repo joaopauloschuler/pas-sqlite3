@@ -36015,6 +36015,59 @@ begin
   sqlite3ExprIfFalse(pParse, pX, dest, SQLITE_JUMPIFNULL);
 end;
 
+{ coroutineOutputSatisfiesOrderBy — decides whether a FROM-subquery whose
+  rows are produced by a co-routine (output already ordered by its own
+  ORDER BY pSubOB, carried on pSubq->pSelect->pOrderBy) makes the outer
+  pOrderBy redundant, so no separate sorter is needed.
+
+  This mirrors the C planner path: in C the FROM-subquery is coded as a
+  co-routine, then sqlite3WhereBegin builds a WhereLoop whose
+  u.btree.pOrderBy = subq->pSelect->pOrderBy (where.c:4179) and
+  wherePathMatchSubqueryOB (where.c:5077..5127) satisfies the leading
+  outer ORDER BY terms from it.  This port codes the co-routine + outer
+  scan in a single dedicated arm of sqlite3Select that bypasses the WHERE
+  planner, so it must reproduce that decision locally.
+
+  Because the consumer here is a co-routine that cannot be run backwards,
+  reverse matches are rejected (matches the WHERE_COROUTINE guard at
+  where.c:5104).  Returns 1 only when EVERY outer ORDER BY term is matched
+  in order by a leading subquery ORDER BY term in the same direction;
+  otherwise 0 (the caller then runs the sort tail as before). }
+function coroutineOutputSatisfiesOrderBy(pOrderBy: PExprList;
+  pSubOB: PExprList; iCur: i32): i32;
+var
+  iOB:    i32;
+  aOB:    PExprListItem;
+  aSub:   PExprListItem;
+  pOBExpr: PExpr;
+  sfOB, sfSub: u8;
+begin
+  Result := 0;
+  if (pOrderBy = nil) or (pSubOB = nil) then Exit;
+  if pSubOB^.nExpr < pOrderBy^.nExpr then Exit;
+  aOB  := ExprListItems(pOrderBy);
+  aSub := ExprListItems(pSubOB);
+  for iOB := 0 to pOrderBy^.nExpr - 1 do
+  begin
+    { The subquery ORDER BY term must reference an output column. }
+    if aSub[iOB].u.x.iOrderByCol = 0 then Exit;
+    { The outer ORDER BY term must be a bare column reference into the
+      subquery's co-routine cursor matching the same output column
+      (where.c:5096..5099). }
+    pOBExpr := aOB[iOB].pExpr;
+    if (pOBExpr^.op <> TK_COLUMN) and (pOBExpr^.op <> TK_AGG_COLUMN) then Exit;
+    if pOBExpr^.iTable <> iCur then Exit;
+    if pOBExpr^.iColumn <> i32(aSub[iOB].u.x.iOrderByCol) - 1 then Exit;
+    { Same NULL-ordering and same direction — a co-routine cannot run in
+      reverse (where.c:5100..5113). }
+    sfOB  := aOB[iOB].fg.sortFlags;
+    sfSub := aSub[iOB].fg.sortFlags;
+    if (sfSub and KEYINFO_ORDER_BIGNULL) <> (sfOB and KEYINFO_ORDER_BIGNULL) then Exit;
+    if (sfSub and KEYINFO_ORDER_DESC) <> (sfOB and KEYINFO_ORDER_DESC) then Exit;
+  end;
+  Result := 1;
+end;
+
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 var
@@ -40762,12 +40815,22 @@ begin
         ResultRow) and emit a generateSortTail (SorterSort + drain
         loop) after the Goto/break.  Mirrors C select.c:6800..6890
         which always runs the sort tail when pOrderBy is set on an
-        outer SRT_Output query. }
+        outer SRT_Output query.
+
+        Exception (select9-4.5): when the co-routine already emits rows in
+        the order the outer ORDER BY needs — e.g. a view over a
+        UNION/EXCEPT/INTERSECT whose merge machinery (multiSelectByMerge,
+        possibly via the synthesised ORDER BY at select.c:2988) produced
+        ordered output — the outer sort is redundant.  C reaches this
+        nosort plan via wherePathMatchSubqueryOB (where.c:5077); reproduce
+        that decision here since this arm bypasses the WHERE planner. }
       bSort := 0;
       iSorterCsr := -1;
       sortNKey := 0;
       if (p^.pOrderBy <> nil) and (p^.pHaving = nil)
-         and (p^.pGroupBy = nil) then
+         and (p^.pGroupBy = nil)
+         and (coroutineOutputSatisfiesOrderBy(p^.pOrderBy,
+                pItem^.u4.pSubq^.pSelect^.pOrderBy, iCsr) = 0) then
       begin
         bSort := 1;
         iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
