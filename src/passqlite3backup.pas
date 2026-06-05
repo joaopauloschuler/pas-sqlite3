@@ -42,10 +42,12 @@ unit passqlite3backup;
   freely between Pascal and (eventual) C consumers.
 
   Phase 8.7 scope and known gaps:
-    * The pager does not yet invoke sqlite3BackupUpdate / sqlite3BackupRestart
-      from its write path — those hooks land with Phase 9 (acceptance).  A
-      backup of a quiescent source therefore works end-to-end; concurrent
-      writes during a step will not yet replicate dirty pages.
+    * The pager invokes sqlite3BackupUpdate (pager.c:2436/3224/4496) and
+      sqlite3BackupRestart (pager.c:1774 etc.) from its write/playback paths
+      via the sqlite3PagerBackupUpdateFn / sqlite3PagerBackupRestartFn hooks
+      installed in this unit's initialization section (the hook indirection
+      breaks the otherwise-circular pager<->backup unit dependency).  Concurrent
+      writes during a backup step now replicate dirty pages to the destination.
     * sqlite3LeaveMutexAndCloseZombie is not invoked on backup_finish — the
       "destination database closed during backup" zombie path is not wired
       in this initial port.  finish() falls back to a plain rollback +
@@ -649,7 +651,13 @@ begin
   sqlite3BackupRestart(PSqlite3Backup(pHead));
 end;
 
+procedure pagerBackupUpdateHook(pHead: Pointer; iPage: Pgno; aData: Pu8);
+begin
+  sqlite3BackupUpdate(PSqlite3Backup(pHead), iPage, aData);
+end;
+
 initialization
   sqlite3PagerBackupRestartFn := @pagerBackupRestartHook;
+  sqlite3PagerBackupUpdateFn  := @pagerBackupUpdateHook;
 
 end.

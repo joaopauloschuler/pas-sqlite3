@@ -479,8 +479,10 @@ function  sqlite3PagerSetJournalMode(pPager: PPager; eMode: i32): i32;
   keeping behaviour identical to the C source. }
 type
   TPagerBackupRestartProc = procedure(pBackupHead: Pointer);
+  TPagerBackupUpdateProc  = procedure(pBackupHead: Pointer; iPage: Pgno; aData: Pu8);
 var
   sqlite3PagerBackupRestartFn: TPagerBackupRestartProc;
+  sqlite3PagerBackupUpdateFn : TPagerBackupUpdateProc;
 
 { SQLITE_DBSTATUS constants (sqlite.h.in:9194).  Public so that
   sqlite3_db_status / sqlite3_db_status64 callers can name the verbs. }
@@ -2075,6 +2077,14 @@ begin
   if pList^.pgno = 1 then pager_write_changecounter(pList);
   rc := sqlite3WalFrames(pPager^.pWal, pPager^.pageSize, pList,
                          nTruncate, isCommit, pPager^.walSyncFlags);
+  if (rc = SQLITE_OK) and (pPager^.pBackup <> nil) and
+     Assigned(sqlite3PagerBackupUpdateFn) then begin
+    p := pList;
+    while p <> nil do begin
+      sqlite3PagerBackupUpdateFn(pPager^.pBackup, p^.pgno, Pu8(p^.pData));
+      p := p^.pDirty;
+    end;
+  end;
   Result := rc;
 end;
 
@@ -3625,6 +3635,8 @@ begin
                          (i64(pg) - 1) * pPager^.pageSize);
     if pg > pPager^.dbFileSize then
       pPager^.dbFileSize := pg;
+    if (pPager^.pBackup <> nil) and Assigned(sqlite3PagerBackupUpdateFn) then
+      sqlite3PagerBackupUpdateFn(pPager^.pBackup, pg, Pu8(aData));
   end
   else if (isMainJrnl = 0) and (pPg = nil) then
   begin
@@ -4180,6 +4192,10 @@ begin
       if pg > pPager^.dbFileSize then
         pPager^.dbFileSize := pg;
       Inc(pPager^.aStat[PAGER_STAT_WRITE]);
+
+      { Update any backup objects copying the contents of this pager. }
+      if (pPager^.pBackup <> nil) and Assigned(sqlite3PagerBackupUpdateFn) then
+        sqlite3PagerBackupUpdateFn(pPager^.pBackup, pg, Pu8(pData));
     end;
     pList := pList^.pDirty;
   end;
