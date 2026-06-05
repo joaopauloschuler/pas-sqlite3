@@ -62736,6 +62736,11 @@ begin
       addrOp := sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, iCookie,
                                   sqlite3Atoi(PChar(zRight)));
       sqlite3VdbeChangeP5(v, 1);
+      { pragma.c:2342..2346 — PRAGMA schema_version=VALUE is a no-op in
+        DEFENSIVE mode: rewrite the OP_SetCookie into OP_Noop. }
+      if (iCookie = BTREE_SCHEMA_VERSION)
+         and ((db^.flags and u64($10000000)) <> 0) then  { SQLITE_Defensive, sqliteInt.h:1859 }
+        v^.aOp[addrOp].opcode := OP_Noop;
       if addrOp = 0 then ;
     end else begin
       { Read arm.  C's pragma.c:2326..2362 gates the write arm on
@@ -63447,7 +63452,7 @@ begin
     pObjTabIc := nil;
     if (pValue <> nil) and (Length(zRight) > 0) then
     begin
-      if sqlite3GetInt32(PAnsiChar(zRight), @mxErrIc) <> 0 then
+      if sqlite3GetInt32(pValue^.z, @mxErrIc) <> 0 then
       begin
         if mxErrIc <= 0 then mxErrIc := 100;
       end
