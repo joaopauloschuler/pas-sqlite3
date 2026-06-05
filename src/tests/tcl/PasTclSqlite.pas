@@ -37,7 +37,7 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleMd5, TestModuleTclvar, TestModuleBestindex,
      TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
-     TestModuleVfs, TestModuleFts3;
+     TestModuleVfs, TestModuleFts3, TestModuleSchema;
 
 const
   { tclsqlite.c:121..122 — default and hard cap on the LRU statement cache. }
@@ -4843,6 +4843,8 @@ begin
   Sqlitetesttcl_Init(interp);
   { 9.4.6.l.1 — test8.c: register_echo_module / sqlite3_declare_vtab. }
   Sqlitetest8_Init(interp);
+  { test_schema.c: register_schema_module (vtab2.test). }
+  Sqlitetestschema_Init(interp);
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
     atomic_batch_write / load_static_extension. }
   Sqlitetest1_Init(interp);
