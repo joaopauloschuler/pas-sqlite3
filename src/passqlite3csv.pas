@@ -446,6 +446,7 @@ var
   rc: i32;
   i, j: i32;
   b, nCol, iCol: i32;
+  tstFlags: u32;
   z, zValue: PAnsiChar;
   sRdr: TCsvReader;
   azParam: array[0..2] of PAnsiChar;
@@ -462,6 +463,7 @@ begin
   bHeader := -1;
   rc := SQLITE_OK;
   nCol := -99;
+  tstFlags := 0;
   hadError := False;
   azParam[0] := 'filename';
   azParam[1] := 'data';
@@ -489,6 +491,11 @@ begin
       end;
       bHeader := b;
     end else begin
+      { csv.c:536..539 — testflags=N (SQLITE_TEST). }
+      zValue := csvParameter('testflags', 9, z);
+      if zValue <> nil then begin
+        tstFlags := u32(StrToIntDef(StrPas(zValue), 0));
+      end else begin
       zValue := csvParameter('columns', 7, z);
       if zValue <> nil then begin
         if nCol > 0 then begin
@@ -503,6 +510,7 @@ begin
       end else begin
         csvErrmsg(@sRdr, AnsiString('bad parameter: ''') + z + '''');
         hadError := True; goto csvtab_connect_error;
+      end;
       end;
     end;
     Inc(i);
@@ -576,6 +584,7 @@ begin
 
   pNew^.zFilename := azPValue[0]; azPValue[0] := nil;
   pNew^.zData     := azPValue[1]; azPValue[1] := nil;
+  pNew^.tstFlags  := tstFlags;  { csv.c:621 }
 
   if bHeader <> 1 then
     pNew^.iStart := 0
@@ -785,19 +794,56 @@ begin
 end;
 
 { csv.c:843 — xBestIndex.  Always returns the same constant cost. }
+const
+  CSVTEST_FIDX = $0001;  { csv.c:322 — pretend constrained search costs less }
+
 function csvtabBestIndex(tab: PSqlite3Vtab;
   pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
+var
+  i, nConst: i32;
+  op: Byte;
+  pC: PSqlite3IndexConstraint;
+  pUse: PSqlite3IndexConstraintUsage;
 begin
   pIdxInfo^.estimatedCost := 1000000.0;
+  { csv.c:847..877 — SQLITE_TEST branch.  When testflags=1, mark any
+    ==, LIKE, or GLOB constraint as usable and lower the cost to 10. }
+  if (PCsvTable(tab)^.tstFlags and CSVTEST_FIDX) <> 0 then begin
+    nConst := 0;
+    for i := 0 to pIdxInfo^.nConstraint - 1 do begin
+      pC := pIdxInfo^.aConstraint; Inc(pC, i);
+      if pC^.usable = 0 then Continue;
+      op := pC^.op;
+      if (op = SQLITE_INDEX_CONSTRAINT_EQ)
+      or (op = SQLITE_INDEX_CONSTRAINT_LIKE)
+      or (op = SQLITE_INDEX_CONSTRAINT_GLOB) then begin
+        pIdxInfo^.estimatedCost := 10.0;
+        pUse := pIdxInfo^.aConstraintUsage; Inc(pUse, nConst);
+        pUse^.argvIndex := nConst + 1;
+        Inc(nConst);
+      end;
+    end;
+  end;
   Result := SQLITE_OK;
+end;
+
+{ csv.c:919..921 — xUpdate for the faux-write module; always read-only. }
+function csvtabUpdate(p: PSqlite3Vtab; n: i32; v: PPsqlite3_value;
+  x: Pi64): i32; cdecl;
+begin
+  Result := SQLITE_READONLY;
 end;
 
 var
   csvModule: Tsqlite3_module;
+  csvModuleFauxWrite: Tsqlite3_module;  { csv.c:923..944 }
 
 function sqlite3CsvInit(db: PTsqlite3): i32;
 begin
   Result := sqlite3_create_module(db, 'csv', @csvModule, nil);
+  { csv.c:967..971 — also register csv_wr (SQLITE_TEST). }
+  if Result = SQLITE_OK then
+    Result := sqlite3_create_module(db, 'csv_wr', @csvModuleFauxWrite, nil);
 end;
 
 initialization
@@ -815,4 +861,7 @@ initialization
   csvModule.xEof        := @csvtabEof;
   csvModule.xColumn     := @csvtabColumn;
   csvModule.xRowid      := @csvtabRowid;
+  { csv.c:923..944 — CsvModuleFauxWrite: identical except xUpdate. }
+  csvModuleFauxWrite := csvModule;
+  csvModuleFauxWrite.xUpdate := @csvtabUpdate;
 end.

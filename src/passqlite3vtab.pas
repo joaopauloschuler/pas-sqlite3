@@ -1676,6 +1676,12 @@ begin
                                   or passqlite3codegen.TF_NoVisibleRowid));
         pNew^.nCol := 0;
         pNew^.aCol := nil;
+        { vtab.c:880..888 — WITHOUT ROWID virtual tables must either be
+          read-only (xUpdate=0) or else have a single-column PRIMARY KEY. }
+        if (not passqlite3codegen.HasRowid(pNew))
+        and (PVtabModule(pCtx^.pVTbl^.pMod)^.pModule^.xUpdate <> nil)
+        and (passqlite3codegen.sqlite3PrimaryKeyIndex(pNew)^.nKeyCol <> 1) then
+          rc := SQLITE_ERROR;
         if pNew^.pIndex <> nil then begin
           pTab^.pIndex := pNew^.pIndex;
           pNew^.pIndex := nil;
