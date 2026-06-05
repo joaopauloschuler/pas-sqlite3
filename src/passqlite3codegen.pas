@@ -36890,6 +36890,55 @@ begin
   end;
   {$ENDIF}
 
+  { tag-select-0240 (single-source) — flatten a single-source FROM subquery
+    here, in the FROM-clause analysis phase, BEFORE the DISTINCT->GROUP BY
+    transform below.  C runs flattenSubquery for every FROM term at
+    select.c:7867, which precedes both "After all FROM-clause analysis"
+    (8144) and the DISTINCT->GROUP BY transform (8151).  The Pas port also
+    has a deferred single-source flatten in the per-FROM-item codegen path,
+    but that runs AFTER the transform has set SF_Aggregate, whose
+    (SF_Aggregate)=0 guard then blocks the flatten — so
+        SELECT DISTINCT y FROM (SELECT y FROM t1) WHERE y<5 ORDER BY y
+    materialised the inner subquery and silently dropped the outer WHERE
+    (select6-4.3).  Flattening here, before the transform, restores C's
+    ordering: the subquery is absorbed into the outer and the outer WHERE
+    is applied.  When the inner is already flattened the deferred path's
+    SrcItemIsSubquery guard fails and it is skipped, so existing bytecode
+    (TestExplainParity) is unchanged.  Preconditions mirror the deferred
+    block (codegen.pas:~40476). }
+  if (p^.pPrior = nil) and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
+     and ((p^.selFlags and SF_Aggregate) = 0)
+  then
+  begin
+    pItem := SrcListItems(p^.pSrc);
+    if (pItem^.pSTab <> nil)
+       and SrcItemIsSubquery(pItem^.fg)
+       and (pItem^.u4.pSubq <> nil)
+       and (pItem^.u4.pSubq^.pSelect <> nil) then
+      selectMarkAggregateCompound(pParse, pItem^.u4.pSubq^.pSelect);
+    if (pItem^.pSTab <> nil)
+       and SrcItemIsSubquery(pItem^.fg)
+       and (pItem^.u4.pSubq <> nil)
+       and (pItem^.u4.pSubq^.pSelect <> nil)
+       and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Aggregate) = 0)
+       and (pItem^.u4.pSubq^.pSelect^.pGroupBy = nil)
+       and (pItem^.u4.pSubq^.pSelect^.pHaving = nil)
+       and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_HasAgg) = 0)
+    then
+    begin
+      if flattenSubquery(pParse, p, 0, 0) <> 0 then
+      begin
+        if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+        pTabList := p^.pSrc;
+        if p^.pPrior <> nil then
+        begin
+          Result := sqlite3Select(pParse, p, pDest);
+          Exit;
+        end;
+      end;
+    end;
+  end;
+
   { 10.1.42.a.12 — Transform DISTINCT into GROUP BY when the result-set
     matches the ORDER BY (select.c:8151..8196, tag-select-0500).
         SELECT DISTINCT xyz FROM ... ORDER BY xyz
