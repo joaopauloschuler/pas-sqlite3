@@ -75660,6 +75660,8 @@ begin
         iAddr := sqlite3VdbeAddOp0(v, OP_Once);
         sqlite3OpenTable(pParse, iTab, iDb, pTab, OP_OpenRead);
         eType := IN_INDEX_ROWID;
+        sqlite3VdbeExplain(pParse, 0,
+              'USING ROWID SEARCH ON TABLE %s FOR IN-OPERATOR', [pTab^.zName]);
         sqlite3VdbeJumpHere(v, iAddr);
       end else begin
         affinity_ok := True;
@@ -75743,6 +75745,8 @@ begin
             if colUsed = ((Bitmask(1) shl nExpr) - 1) then begin
               { pIdx is usable. }
               iAddr := sqlite3VdbeAddOp0(v, OP_Once);
+              sqlite3VdbeExplain(pParse, 0,
+                    'USING INDEX %s FOR IN-OPERATOR', [pIdx^.zName]);
               sqlite3VdbeAddOp3(v, OP_OpenRead, iTab, i32(pIdx^.tnum), iDb);
               sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
               Assert(IN_INDEX_INDEX_DESC = IN_INDEX_INDEX_ASC + 1);
