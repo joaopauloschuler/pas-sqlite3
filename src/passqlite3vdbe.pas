@@ -12269,35 +12269,44 @@ begin
             v^.nStmtDefCons    := db^.nDeferredCons;
             v^.nStmtDefImmCons := db^.nDeferredImmCons;
           end;
-          { Schema cookie check — vdbe.c:4163..4198.
-            When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
-            P3 (cookie at prepare time) and pSchema->iGeneration against P4.i
-            (generation at prepare time).  Mismatch → SQLITE_SCHEMA so the
-            sqlite3_step() wrapper can reprepare via sqlite3Reprepare().
-            Without this gate, statements like SELECT against a table dropped
-            by a concurrent backup keep using stale schema and the cursor
-            decodes raw pages as the gone table — surfaces as bogus
-            SQLITE_CORRUPT (backup5-1.6).  C cite: vdbe.c:4163..4197. }
-          if (rc = SQLITE_OK) and (pOp^.p5 <> 0) then begin
-            if pDbb^.pSchema <> nil then begin
-              if (iMeta5g <> pOp^.p3) or
-                 (PSchema(pDbb^.pSchema)^.iGeneration <> pOp^.p4.i) then
-              begin
-                sqlite3DbFree(db, v^.zErrMsg);
-                v^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db,
-                  'database schema has changed'));
-                { Only reset the schema if the on-disk cookie has changed; a
-                  pure iGeneration mismatch (e.g. v-table reload) keeps the
-                  cached schema alive — vdbe.c:4187..4190. }
-                if PSchema(pDbb^.pSchema)^.schema_cookie <> iMeta5g then begin
-                  if Assigned(gResetOneSchema) then
-                    gResetOneSchema(db, pOp^.p1);
-                end;
-                v^.vdbeFlags :=
-                  (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
-                rc := SQLITE_SCHEMA;
-                v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_ChangeCntOn);
+        end;
+        { Schema cookie check — vdbe.c:4163..4198.
+          When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
+          P3 (cookie at prepare time) and pSchema->iGeneration against P4.i
+          (generation at prepare time).  Mismatch → SQLITE_SCHEMA so the
+          sqlite3_step() wrapper can reprepare via sqlite3Reprepare().
+          Without this gate, statements like SELECT against a table dropped
+          by a concurrent backup keep using stale schema and the cursor
+          decodes raw pages as the gone table — surfaces as bogus
+          SQLITE_CORRUPT (backup5-1.6).  C cite: vdbe.c:4163..4197.
+          NOTE: in C this check lives OUTSIDE the `if(pBt)` block (vdbe.c:4163
+          follows the closing brace at 4161), so it still fires when the btree
+          is null — e.g. the TEMP db (iDb=1) after `PRAGMA temp_store=…` ran
+          invalidateTempStorage (sqlite3BtreeClose + aDb[1].pBt:=nil +
+          sqlite3ResetAllSchemasOfConnection bumped the temp schema's
+          iGeneration).  iMeta stays 0 there, so the iGeneration mismatch
+          alone raises SQLITE_SCHEMA and the cached stmt reprepares instead of
+          falling through to OP_OpenRead and dereferencing the nil temp btree
+          (segfault). }
+        if (rc = SQLITE_OK) and (pOp^.p5 <> 0) then begin
+          if pDbb^.pSchema <> nil then begin
+            if (iMeta5g <> pOp^.p3) or
+               (PSchema(pDbb^.pSchema)^.iGeneration <> pOp^.p4.i) then
+            begin
+              sqlite3DbFree(db, v^.zErrMsg);
+              v^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db,
+                'database schema has changed'));
+              { Only reset the schema if the on-disk cookie has changed; a
+                pure iGeneration mismatch (e.g. v-table reload) keeps the
+                cached schema alive — vdbe.c:4187..4190. }
+              if PSchema(pDbb^.pSchema)^.schema_cookie <> iMeta5g then begin
+                if Assigned(gResetOneSchema) then
+                  gResetOneSchema(db, pOp^.p1);
               end;
+              v^.vdbeFlags :=
+                (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+              rc := SQLITE_SCHEMA;
+              v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_ChangeCntOn);
             end;
           end;
         end;
