@@ -63,7 +63,17 @@ uses
   SysUtils,
   strings,
   passqlite3types,
-  passqlite3os;
+  passqlite3os,
+  passqlite3util,
+  passqlite3main;
+
+type
+  { Mirror of the leading field of struct SqliteDb (tclsqlite.c:215) —
+    only the sqlite3* handle is needed to reach xShmLock. }
+  PVfsTestSqliteDb = ^TVfsTestSqliteDb;
+  TVfsTestSqliteDb = record
+    db: PTsqlite3;
+  end;
 
 const
   { test_vfs.c:114..135 — per-method mask bits. }
@@ -1403,15 +1413,96 @@ begin
   if clientData = nil then ; { suppress hint }
 end;
 
+{ Minimal sqlite3ErrName for the result codes xShmLock can return
+  (main.c:1533 — only the codes reachable here are mapped). }
+function vfsShmlockErrName(rc: cint): PAnsiChar;
+begin
+  case rc of
+    SQLITE_OK:            Result := 'SQLITE_OK';
+    SQLITE_BUSY:          Result := 'SQLITE_BUSY';
+    SQLITE_READONLY:      Result := 'SQLITE_READONLY';
+    SQLITE_NOMEM:         Result := 'SQLITE_NOMEM';
+    SQLITE_IOERR:         Result := 'SQLITE_IOERR';
+    SQLITE_IOERR_SHMLOCK: Result := 'SQLITE_IOERR_SHMLOCK';
+  else
+    Result := 'SQLITE_ERROR';
+  end;
+end;
+
 { test_vfs.c:1591..1635 — vfs_shmlock DB DBNAME (shared|exclusive)
-  (lock|unlock) OFFSET N.  Stub: returns SQLITE_OK without doing
-  anything (none of interrupt2/mjournal/e_wal/nolock use it). }
+  (lock|unlock) OFFSET N.  Grabs the sqlite3_file* via
+  SQLITE_FCNTL_FILE_POINTER and calls its xShmLock method directly. }
 function testVfsShmlock(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  azArg1 : array[0..2] of PAnsiChar = ('shared', 'exclusive', nil);
+  azArg2 : array[0..2] of PAnsiChar = ('lock', 'unlock', nil);
+var
+  cmdInfo : TTclCmdInfo;
+  db      : PTsqlite3;
+  pDb     : PVfsTestSqliteDb;
+  zDbname : PAnsiChar;
+  iArg1   : cint;
+  iArg2   : cint;
+  iOffset : cint;
+  n       : cint;
+  pFd     : Psqlite3_file;
+  rc      : cint;
+  shmFlags: cint;
 begin
-  Tcl_SetObjResult(interp, Tcl_NewStringObj('SQLITE_OK', -1));
+  if clientData = clientData then ;
+  iArg1 := 0; iArg2 := 0; iOffset := 0; n := 0;
+  pFd := nil;
+
+  if objc <> 7 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv,
+      PChar('DB DBNAME (shared|exclusive) (lock|unlock) OFFSET N'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  zDbname := Tcl_GetString(objAt(objv, 2));
+
+  { getDbPointer(interp, objv[1], &db) }
+  db := nil;
+  FillChar(cmdInfo, SizeOf(cmdInfo), 0);
+  if Tcl_GetCommandInfo(interp, Tcl_GetString(objAt(objv, 1)), @cmdInfo) <> 0 then
+  begin
+    pDb := PVfsTestSqliteDb(cmdInfo.objClientData);
+    if pDb <> nil then db := pDb^.db;
+  end;
+  if db = nil then
+  begin
+    Tcl_AppendResult(interp, PChar('expected database handle, got "'),
+      Tcl_GetString(objAt(objv, 1)), PChar('"'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  if (Tcl_GetIndexFromObj(interp, objAt(objv, 3), @azArg1[0], PChar('ARG'), 0, @iArg1) <> TCL_OK)
+   or (Tcl_GetIndexFromObj(interp, objAt(objv, 4), @azArg2[0], PChar('ARG'), 0, @iArg2) <> TCL_OK)
+   or (Tcl_GetIntFromObj(interp, objAt(objv, 5), @iOffset) <> TCL_OK)
+   or (Tcl_GetIntFromObj(interp, objAt(objv, 6), @n) <> TCL_OK) then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  sqlite3_file_control(db, zDbname, SQLITE_FCNTL_FILE_POINTER, @pFd);
+  if pFd = nil then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  if iArg1 = 0 then shmFlags := SQLITE_SHM_SHARED
+  else shmFlags := SQLITE_SHM_EXCLUSIVE;
+  if iArg2 = 0 then shmFlags := shmFlags or SQLITE_SHM_LOCK
+  else shmFlags := shmFlags or SQLITE_SHM_UNLOCK;
+  rc := pFd^.pMethods^.xShmLock(pFd, iOffset, n, shmFlags);
+  Tcl_SetObjResult(interp, Tcl_NewStringObj(vfsShmlockErrName(rc), -1));
   Result := TCL_OK;
-  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
 end;
 
 { test_vfs.c:1637..1688 — vfs_set_readmark DB DBNAME SLOT ?VALUE?.
