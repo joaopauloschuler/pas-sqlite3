@@ -3051,6 +3051,9 @@ type
   { 9.4.divbug.87.047 — wire sqlite3_busy_timeout (passqlite3main) into
     PragTyp_BUSY_TIMEOUT write arm without circular uses. }
   TBusyTimeoutFn = function(db: PTsqlite3; ms: i32): i32;
+  { PRAGMA threads (pragma.c:2708..2718) calls sqlite3_limit, which lives
+    in passqlite3main (circular uses).  Wired at unit init. }
+  TSqlite3LimitFn = function(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
   { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint (passqlite3main) and
     sqlite3WalDefaultHook pointer into PragTyp_WAL_AUTOCHECKPOINT without
     circular uses.  Both must be installed by passqlite3main at unit init. }
@@ -3092,6 +3095,7 @@ var
   gCreateTableStmt:  TCreateTableStmtFn;
   gSqlite3Init:      TSqlite3InitFn;
   gBusyTimeout:      TBusyTimeoutFn;
+  gSqlite3Limit:     TSqlite3LimitFn;
   gWalAutoCheckpoint: TWalAutoCheckpointFn;
   gDbReleaseMemory:  TDbReleaseMemoryFn;
   gWalDefaultHook:   Pointer;
@@ -63000,6 +63004,23 @@ begin
     Exit;
   end;
 
+  { PragTyp_THREADS (pragma.c:2708..2718).  Configure the maximum number of
+    worker threads via sqlite3_limit(db, SQLITE_LIMIT_WORKER_THREADS, ...),
+    which reads/writes db^.aLimit[] and clamps to the hard limit.  The write
+    arm only fires when zRight parses as a non-negative integer; both arms
+    return the (possibly clamped) current limit via returnSingleInt.  sort4
+    -init001/002. }
+  if SameText(zName, 'threads') then begin
+    if (zRight <> '')
+       and (sqlite3DecOrHexToI64(PAnsiChar(zRight), iValPragma) = 0)
+       and (iValPragma >= 0) then
+      gSqlite3Limit(db, SQLITE_LIMIT_WORKER_THREADS, i32(iValPragma and $7fffffff));
+    iVal := gSqlite3Limit(db, SQLITE_LIMIT_WORKER_THREADS, -1);
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
   { Constant-default integer pragmas — emit OP_Integer with the documented
     default value.  These do not yet maintain real per-connection state in
     the Pas port; reading the *default* matches the C reference so the
@@ -63008,7 +63029,6 @@ begin
   if pValue = nil then begin
     iVal := MaxInt; { sentinel "not handled" }
     if      SameText(zName, 'temp_store')         then iVal := 0
-    else if SameText(zName, 'threads')            then iVal := 0
     else if SameText(zName, 'analysis_limit')     then iVal := 0;
     if iVal <> MaxInt then begin
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);

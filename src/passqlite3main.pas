@@ -6667,6 +6667,9 @@ initialization
     write arm (codegen.pas can't `uses passqlite3main`). }
   passqlite3codegen.gBusyTimeout :=
     passqlite3codegen.TBusyTimeoutFn(@sqlite3_busy_timeout);
+  { PRAGMA threads (pragma.c:2708..2718) -> sqlite3_limit. }
+  passqlite3codegen.gSqlite3Limit :=
+    passqlite3codegen.TSqlite3LimitFn(@sqlite3_limit);
   { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint + sqlite3WalDefaultHook
     pointer for PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429). }
   passqlite3codegen.gWalAutoCheckpoint :=
