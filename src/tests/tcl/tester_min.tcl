@@ -44,6 +44,39 @@ set ::TC(errors) 0
 # itself, which is what `source` ends up using as [info script].
 set ::testdir [file dirname [file normalize [info script]]]
 
+# sqlite3 wrapper — port of upstream tester.tcl:114..144.  Renames the
+# C-implemented `sqlite3` command to `sqlite_orig` and installs a Tcl proc
+# in its place.  Required so that error messages from the constructor are
+# reported under the invoked name `sqlite_orig` (tcl-1.1/1.1.1), matching
+# the upstream harness, and so per-connection setup matches tester.tcl.
+if {[info command sqlite_orig]==""} {
+  rename sqlite3 sqlite_orig
+  proc sqlite3 {args} {
+    if {[llength $args]>=2 && [string index [lindex $args 0] 0]!="-"} {
+      # This command is opening a new database connection.
+      if {[info exists ::G(perm:sqlite3_args)]} {
+        set args [concat $args $::G(perm:sqlite3_args)]
+      }
+      if {[sqlite_orig -has-codec] && ![info exists ::do_not_use_codec]} {
+        lappend args -key {xyzzy}
+      }
+      set res [uplevel 1 sqlite_orig $args]
+      if {[info exists ::G(perm:presql)]} {
+        [lindex $args 0] eval $::G(perm:presql)
+      }
+      if {[info exists ::G(perm:dbconfig)]} {
+        set ::dbhandle [lindex $args 0]
+        uplevel #0 $::G(perm:dbconfig)
+      }
+      [lindex $args 0] cache size 3
+      set res
+    } else {
+      # Not opening a new database connection; pass through unchanged.
+      uplevel 1 sqlite_orig $args
+    }
+  }
+}
+
 # set_test_counter — upstream tester.tcl:583..588.
 # Getter when called with one arg; setter when called with two.
 proc set_test_counter {counter args} {

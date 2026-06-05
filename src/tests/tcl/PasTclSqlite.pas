@@ -1397,10 +1397,37 @@ var
   bDone:      Boolean;
   sEval:      TDbEvalContext;
   pRet:       PTclObj;
+  zOpt:       PAnsiChar;
 begin
+  { Option-parsing loop — port of tclsqlite.c:3300..3318.  Consume any
+    leading `-withoutnulls`/`-asdict` switches; an unknown `-` option is
+    an error.  Each consumed switch shifts objv up by one and decrements
+    objc, exactly as the C `objc--; objv++;` does.  (The eval flags are
+    accepted but their row-shaping semantics are not yet implemented.) }
+  while (objc > 3) and (ObjvAt(objv, 2) <> nil) do
+  begin
+    zOpt := Tcl_GetString(ObjvAt(objv, 2));
+    if (zOpt = nil) or (zOpt^ <> '-') then
+      Break;
+    if (StrComp(zOpt, '-withoutnulls') = 0) or (StrComp(zOpt, '-asdict') = 0) then
+    begin
+      { accepted; flags not yet wired }
+    end
+    else
+    begin
+      Tcl_AppendResult(interp, PChar('unknown option: "'), zOpt,
+        PChar('"'), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Dec(objc);
+    objv := PPTclObj(PtrUInt(objv) + SizeOf(Pointer));
+  end;
+
   if (objc < 3) or (objc > 5) then
   begin
-    Tcl_WrongNumArgs(interp, 2, objv, PChar('SQL ?ARRAY-NAME? ?SCRIPT?'));
+    Tcl_WrongNumArgs(interp, 2, objv,
+      PChar('?OPTIONS? SQL ?VAR-NAME? ?SCRIPT?'));
     Result := TCL_ERROR;
     Exit;
   end;
@@ -3866,6 +3893,27 @@ end;
   a stable "unknown subcommand" string so callers can grep it. }
 function DbObjCmdAdaptor(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  { Verbatim copy of the upstream DB_strs[] subcommand table
+    (tclsqlite.c:2439..2454), in the same order, NUL-terminated.  Used only
+    to synthesise C's `bad option "X": must be ...` error on a no-match
+    (tclsqlite.c:2479).  Keep in sync with the implemented method arms. }
+  DB_strs: array[0..43] of PAnsiChar = (
+    'authorizer', 'backup', 'bind_fallback',
+    'busy', 'cache', 'changes',
+    'close', 'collate', 'collation_needed',
+    'commit_hook', 'complete', 'config',
+    'copy', 'deserialize', 'enable_load_extension',
+    'errorcode', 'erroroffset', 'eval',
+    'exists', 'format', 'function',
+    'incrblob', 'interrupt', 'last_insert_rowid',
+    'nullvalue', 'onecolumn', 'preupdate',
+    'profile', 'progress', 'rekey',
+    'restore', 'rollback_hook', 'serialize',
+    'status', 'timeout', 'total_changes',
+    'trace', 'trace_v2', 'transaction',
+    'unlock_notify', 'update_hook', 'version',
+    'wal_hook', nil);
 var
   zSub:  PAnsiChar;
   zSelf: PAnsiChar;
@@ -4324,11 +4372,47 @@ begin
     Exit;
   end;
 
+  { erroroffset — tclsqlite.c:3247 (DB_ERROROFFSET). }
+  if (zSub <> nil) and (StrComp(zSub, 'erroroffset') = 0) then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewIntObj(sqlite3_error_offset(PSqliteDb(clientData)^.db)));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { rekey — tclsqlite.c:3659 (DB_REKEY).  No codec in this build, so the
+    only observable behaviour is the arg-count check. }
+  if (zSub <> nil) and (StrComp(zSub, 'rekey') = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('KEY'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { Fall-through: the subcommand matched none of the *implemented* method
+    arms above.  Run objv[1] through Tcl_GetIndexFromObj over the full
+    upstream DB_strs table (tclsqlite.c:2439..2454, 2479).  On no-match it
+    sets C's canonical `bad option "X": must be ...` error and returns
+    non-zero.  On a match (iBool>=0) the option IS a recognised upstream
+    method that this port has not yet ported (e.g. bind_fallback — the
+    sqlite3_bind_fallback engine API is not present); report it as such
+    rather than emit an empty error. }
+  iBool := -1;
+  if Tcl_GetIndexFromObj(interp, ObjvAt(objv, 1), @DB_strs[0],
+       PChar('option'), 0, @iBool) <> TCL_OK then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
   Tcl_AppendResult(interp,
-    PChar('unknown subcommand "'),
-    zSub,
-    PChar('" - implemented in 9.4.2.d..o'),
-    Pointer(nil));
+    PChar('subcommand not implemented in this build: "'),
+    zSub, PChar('"'), Pointer(nil));
   Result := TCL_ERROR;
 end;
 
