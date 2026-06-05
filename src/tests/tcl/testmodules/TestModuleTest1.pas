@@ -92,6 +92,33 @@ function fwrite(ptr: Pointer; size, nmemb: csize_t; stream: PFile): csize_t; cde
 function fseek(stream: PFile; offset: clong; whence: cint): cint; cdecl;
   external 'c' name 'fseek';
 
+{ test1.c:7969 strftime_cmd needs the C-library gmtime()/strftime() so the
+  test can compare SQLite's internal strftime() SQL function against the
+  byte-identical libc output.  FPC ships no portable struct tm binding here,
+  so mirror the libc decls directly (same approach as the stdio binds above). }
+type
+  PCTm = ^TCTm;
+  TCTm = record
+    tm_sec:   cint;
+    tm_min:   cint;
+    tm_hour:  cint;
+    tm_mday:  cint;
+    tm_mon:   cint;
+    tm_year:  cint;
+    tm_wday:  cint;
+    tm_yday:  cint;
+    tm_isdst: cint;
+    { glibc extensions — present in the on-disk struct, declared for layout. }
+    tm_gmtoff: clong;
+    tm_zone:   PAnsiChar;
+  end;
+  PTimeT = ^clong;
+function c_gmtime(timer: PTimeT): PCTm; cdecl;
+  external 'c' name 'gmtime';
+function c_strftime(s: PAnsiChar; maxsize: csize_t; format: PAnsiChar;
+  timeptr: PCTm): csize_t; cdecl;
+  external 'c' name 'strftime';
+
 const
   { sqliteInt.h — index 12, defined in C but not yet exposed in this port. }
   SQLITE_LIMIT_PARSER_DEPTH = 12;
@@ -102,6 +129,9 @@ const
   SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP = 29;
   { sqlite3.h — opcode 8 (BITVEC_TEST).  Mirrored locally. }
   SQLITE_TESTCTRL_BITVEC_TEST_OP = 8;
+  { sqlite3.h — opcodes 5/6 (PRNG_SAVE/PRNG_RESTORE).  Mirrored locally. }
+  SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
+  SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
   SEEK_SET = 0;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -8935,12 +8965,92 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:1727..1738 — Usage: sqlite3_libversion_number
+  Returns sqlite3_libversion_number() as an int. }
+function test_libversion_number(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_libversion_number()));
+  Result := TCL_OK;
+  if (clientData = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ test1.c:7436..7456 — tclcmd: save_prng_state
+  Save the state of the PRNG.  Also verifies sqlite3_test_control tolerates
+  out-of-range opcodes (returns 0). }
+function save_prng_state(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: cint;
+begin
+  rc := sqlite3_test_control(9999);
+  Assert(rc = 0);
+  rc := sqlite3_test_control(-1);
+  Assert(rc = 0);
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SAVE_OP);
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ test1.c:7458..7468 — tclcmd: reset_prng_state
+  Restore the previously-saved PRNG state. }
+function reset_prng_state(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_RESTORE_OP);
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ test1.c:7969..8009 — TCLCMD: strftime FORMAT UNIXTIMESTAMP
+  Access to the C-library strftime() so its results can be compared against
+  SQLite's internal strftime() SQL function. }
+function strftime_cmd(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  ts:   Int64;
+  t:    clong;
+  pTm:  PCTm;
+  zFmt: PAnsiChar;
+  n:    csize_t;
+  zBuf: array[0..999] of AnsiChar;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FORMAT UNIXTIMESTAMP'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, objv[2], @ts) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zFmt := Tcl_GetString(objv[1]);
+  t := clong(ts);
+  pTm := c_gmtime(@t);
+  n := c_strftime(@zBuf[0], SizeOf(zBuf) - 1, zFmt, pTm);
+  if n < csize_t(SizeOf(zBuf)) then begin
+    zBuf[n] := #0;
+    Tcl_SetResult(interp, @zBuf[0], TCL_VOLATILE);
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
 begin
   Tcl_CreateObjCommand(interp, PChar('sqlite3_connection_pointer'),
     @get_sqlite_pointer, nil, nil);
+  { tclsqlite.test — test1.c:1834 sqlite3_libversion_number. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_libversion_number'),
+    @test_libversion_number, nil, nil);
+  { fts3corrupt4.test — test1.c:9258/9260 save_prng_state/reset_prng_state. }
+  Tcl_CreateObjCommand(interp, PChar('save_prng_state'),
+    @save_prng_state, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('reset_prng_state'),
+    @reset_prng_state, nil, nil);
+  { date4.test — test1.c:9320 strftime. }
+  Tcl_CreateObjCommand(interp, PChar('strftime'),
+    @strftime_cmd, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
   { misc8.test — test1.c:9187 dbconfig_maindbname_icecube. }
