@@ -11537,8 +11537,6 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   procedure ResolveOuterAliasIDsDepth(pW: PExpr; pInnerSrc: PSrcList;
              pOuterEList: PExprList; nSub: i32);
   var
-    pInItem:           PSrcItem;
-    iInCol:            i32;
     j_:                i32;
     itemsE:            PExprListItem;
     pOrig:             PExpr;
@@ -11550,8 +11548,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       if (pW^.u.zToken = nil) or (pOuterEList = nil) then Exit;
       if (pW^.flags and EP_IntValue) <> 0 then Exit;
-      { Inner scope wins; an outer FROM column is handled by ResolveOuterIDs. }
-      if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
+      { Inner scope wins; an outer FROM column is handled by ResolveOuterIDs.
+        Mirror lookupName's `cnt==0` gate (resolve.c:658): the outer
+        result-set alias is consulted ONLY when the bare name matches no real
+        column in the inner FROM scope.  Use BareColMaybeInner (not
+        ColumnInSrcList) so an UNEXPANDED inner FROM-item — its pSTab still nil
+        because this pre-resolve pass runs before sqlite3ResolveSelectNames —
+        is matched by NAME via the schema / its result-column list.  Otherwise
+        e.g. `(SELECT b FROM t4)` nested in a HAVING subquery has t4 unexpanded,
+        ColumnInSrcList misses t4.b, and the outer alias `b` wrongly shadows the
+        inner table's real column (in-23.0). }
+      if BareColMaybeInner(pInnerSrc, pW^.u.zToken) then Exit;
       { resolve.c:664..698 — scan outer NC_UEList pEList for an ENAME_NAME
         alias match. }
       itemsE := ExprListItems(pOuterEList);
