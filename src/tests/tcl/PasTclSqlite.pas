@@ -4826,6 +4826,30 @@ begin
   Result := TCL_OK;
 end;
 
+{ Tcl `save_prng_state` / `restore_prng_state`.  Pas port of save_prng_state /
+  restore_prng_state (test1.c) which call
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SAVE) and
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_RESTORE) respectively.  Tests such
+  as rowid-12.x snapshot the PRNG, replay it across inserts, and rely on the
+  random-rowid guesser colliding deterministically to drive SQLITE_FULL. }
+function SavePrngState(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_TESTCTRL_PRNG_SAVE = 5;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SAVE);
+  Result := TCL_OK;
+end;
+
+function RestorePrngState(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_TESTCTRL_PRNG_RESTORE = 6;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_RESTORE);
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -4839,6 +4863,12 @@ begin
   { tester.tcl:102 — move the locking page into reach of small test DBs. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_test_control_pending_byte'),
     @TestControlPendingByte, nil, nil);
+  { rowid-12.x and friends snapshot/replay the PRNG to drive deterministic
+    random-rowid collisions; tester_min.tcl only shims these as no-ops. }
+  Tcl_CreateObjCommand(interp, PChar('save_prng_state'),
+    @SavePrngState, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('restore_prng_state'),
+    @RestorePrngState, nil, nil);
   { 9.4.divbug.88.012..020 — corrupt*.test prologue requires this. }
   Tcl_CreateObjCommand(interp, PChar('nonzero_reserved_bytes'),
     @NonzeroReservedBytes, nil, nil);
