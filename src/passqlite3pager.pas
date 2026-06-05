@@ -2754,11 +2754,21 @@ begin
   Inc(pPgr^.aStat[PAGER_STAT_SPILL]);
   pPg^.pDirty := nil;
 
-  { Rollback journal write path }
-  if (pPg^.flags and PGHDR_NEED_SYNC) <> 0 then
-    rc := syncJournal(pPgr, 1);
-  if rc = SQLITE_OK then
-    rc := pager_write_pagelist(pPgr, pPg);
+  if pagerUseWal(pPgr) <> 0 then
+  begin
+    { Write a single frame for this page to the log. }
+    rc := subjournalPageIfRequired(pPg);
+    if rc = SQLITE_OK then
+      rc := pagerWalFrames(pPgr, pPg, 0, 0);
+  end
+  else
+  begin
+    { Rollback journal write path }
+    if (pPg^.flags and PGHDR_NEED_SYNC) <> 0 then
+      rc := syncJournal(pPgr, 1);
+    if rc = SQLITE_OK then
+      rc := pager_write_pagelist(pPgr, pPg);
+  end;
   if rc = SQLITE_OK then
     sqlite3PcacheMakeClean(pPg);
   Result := pagerSetError(pPgr, rc);
