@@ -457,6 +457,7 @@ set ::sqlite_options(snapshot) 0       ;# no SQLITE_ENABLE_SNAPSHOT
 set ::sqlite_options(session) 0        ;# no SQLITE_ENABLE_SESSION
 set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
 set ::sqlite_options(scanstatus) 0     ;# no SQLITE_ENABLE_STMT_SCANSTATUS
+set ::sqlite_options(mmap) 0           ;# port treats SQLITE_MAX_MMAP_SIZE as 0 (mmap I/O not ported)
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
