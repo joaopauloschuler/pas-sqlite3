@@ -405,6 +405,16 @@ set ::sqlite_options(stat4) 0
 # oracle.  Without this, the cap defaults to 1 below and the section wrongly
 # RUNS, expecting {main tab1 colN} where the engine honestly returns {}.
 set ::sqlite_options(columnmetadata) 0
+# pragma-16.x / lock5 / lock6 — Apple proxy-locking pragmas.  The C reference
+# oracle build (Linux) does NOT define SQLITE_ENABLE_LOCKING_STYLE, so
+# test_config.c writes prefer_proxy_locking=0 and lock_proxy_pragmas=0, and
+# upstream SKIPS the `ifcapable lock_proxy_pragmas&&prefer_proxy_locking { ... }`
+# blocks (pragma.test:1620, lock6.test:81) and the lock_proxy_pragmas blocks
+# (lock5.test:29/245).  pas-sqlite3 likewise does not implement Apple proxy
+# locking, so without these the caps default to 1 and the sections wrongly RUN,
+# failing on the unimplemented PRAGMA lock_proxy_file / .test_control_file.
+set ::sqlite_options(prefer_proxy_locking) 0
+set ::sqlite_options(lock_proxy_pragmas) 0
 # cursorhint2.test is gated by `ifcapable !cursorhints {finish_test; return}`.
 # The C reference oracle build does NOT define SQLITE_ENABLE_CURSOR_HINTS
 # (verified: PRAGMA compile_options has no cursor/hint entry), so

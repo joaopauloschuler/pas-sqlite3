@@ -281,10 +281,13 @@ const
   SQLITE_CorruptRdOnly  = u64($0000000200000000);  { HI(0x00002) — Prohibit writes due to error }
   SQLITE_ReadUncommit   = u64($0000000400000000);  { HI(0x00004) }
   SQLITE_FkNoAction     = u64($0000000800000000);  { HI(0x00008) }
-  SQLITE_VdbeListing    = u64($0000000100000000);
-  SQLITE_VdbeTrace      = u64($0000000200000000);
-  SQLITE_VdbeEQP        = u64($0000001000000000);
-  SQLITE_SqlTrace       = u64($0000000400000000);
+  { sqliteInt.h:1875..1880 — DEBUG-only flag bits, HI(x) = u64(x) << 32. }
+  SQLITE_SqlTrace       = u64($0010000000000000);  { HI(0x0100000) }
+  SQLITE_VdbeListing    = u64($0020000000000000);  { HI(0x0200000) }
+  SQLITE_VdbeTrace      = u64($0040000000000000);  { HI(0x0400000) }
+  SQLITE_VdbeAddopTrace = u64($0080000000000000);  { HI(0x0800000) }
+  SQLITE_VdbeEQP        = u64($0100000000000000);  { HI(0x1000000) }
+  SQLITE_ParserTrace    = u64($0200000000000000);  { HI(0x2000000) }
 
   { Flags for sqlite3.mDbFlags }
   DBFLAG_SchemaChange   = $0002;

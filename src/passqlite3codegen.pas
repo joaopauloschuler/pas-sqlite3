@@ -61341,7 +61341,7 @@ const
     / vdbe_* (DEBUG/TEST only).  `stats` is DEBUG-gated upstream but kept
     here so autoanalyze1.test (which expects pragma_stats as an eponymous
     table-valued function) passes; shard-0 fix 8. }
-  aPragmaName: array[0..67] of TPragmaName = (
+  aPragmaName: array[0..74] of TPragmaName = (
     (zName: 'analysis_limit';            ePragTyp: PragTyp_ANALYSIS_LIMIT;
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'application_id';            ePragTyp: PragTyp_HEADER_VALUE;
@@ -61437,6 +61437,8 @@ const
      mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq;            iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'page_size';                 ePragTyp: PragTyp_PAGE_SIZE;
      mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;            iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'parser_trace';              ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_ParserTrace),
     (zName: 'pragma_list';               ePragTyp: PragTyp_PRAGMA_LIST;
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  9; nPragCName: 1; iArg: 0),
     (zName: 'query_only';                ePragTyp: PragTyp_FLAG;
@@ -61456,6 +61458,9 @@ const
      mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'short_column_names';        ePragTyp: PragTyp_FLAG;
      mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_ShortColNames),
+    { DEBUG-only flag pragma (mkpragmatab.tcl: IF defined(SQLITE_DEBUG)). }
+    (zName: 'sql_trace';                 ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_SqlTrace),
     (zName: 'shrink_memory';             ePragTyp: PragTyp_SHRINK_MEMORY;
      mPragFlg: PragFlg_NoColumns;                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'soft_heap_limit';           ePragTyp: PragTyp_SOFT_HEAP_LIMIT;
@@ -61484,6 +61489,17 @@ const
      mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_TrustedSchema),
     (zName: 'user_version';              ePragTyp: PragTyp_HEADER_VALUE;
      mPragFlg: PragFlg_NoColumns1 or PragFlg_Result0;                                 iPragCName:  0; nPragCName: 0; iArg: BTREE_USER_VERSION),
+    { DEBUG-only flag pragmas (mkpragmatab.tcl: IF defined(SQLITE_DEBUG)). }
+    (zName: 'vdbe_addoptrace';           ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_VdbeAddopTrace),
+    (zName: 'vdbe_debug';                ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_SqlTrace or SQLITE_VdbeListing or SQLITE_VdbeTrace),
+    (zName: 'vdbe_eqp';                  ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_VdbeEQP),
+    (zName: 'vdbe_listing';              ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_VdbeListing),
+    (zName: 'vdbe_trace';                ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_VdbeTrace),
     (zName: 'wal_autocheckpoint';        ePragTyp: PragTyp_WAL_AUTOCHECKPOINT;
      mPragFlg: 0;                                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
     (zName: 'wal_checkpoint';            ePragTyp: PragTyp_WAL_CHECKPOINT;
@@ -61583,7 +61599,7 @@ const
     flag bits).  Read arm emits ((db.flags & mask) <> 0); write arm
     sets/clears the bit at codegen time so a subsequent prepare picks up
     the new value. }
-  cFlagPragmas: array[0..16] of TFlagPragma = (
+  cFlagPragmas: array[0..23] of TFlagPragma = (
     (name: 'foreign_keys';             mask: SQLITE_ForeignKeys),
     (name: 'recursive_triggers';       mask: SQLITE_RecTriggers),
     (name: 'reverse_unordered_selects';mask: SQLITE_ReverseOrder),
@@ -61600,7 +61616,15 @@ const
     (name: 'query_only';               mask: SQLITE_QueryOnly),
     (name: 'count_changes';            mask: SQLITE_CountRows),
     (name: 'read_uncommitted';         mask: SQLITE_ReadUncommit),
-    (name: 'empty_result_callbacks';   mask: SQLITE_NullCallback)
+    (name: 'empty_result_callbacks';   mask: SQLITE_NullCallback),
+    { DEBUG-only flag pragmas (mkpragmatab.tcl: IF defined(SQLITE_DEBUG)). }
+    (name: 'sql_trace';                mask: SQLITE_SqlTrace),
+    (name: 'parser_trace';             mask: SQLITE_ParserTrace),
+    (name: 'vdbe_addoptrace';          mask: SQLITE_VdbeAddopTrace),
+    (name: 'vdbe_debug';               mask: SQLITE_SqlTrace or SQLITE_VdbeListing or SQLITE_VdbeTrace),
+    (name: 'vdbe_eqp';                 mask: SQLITE_VdbeEQP),
+    (name: 'vdbe_listing';             mask: SQLITE_VdbeListing),
+    (name: 'vdbe_trace';               mask: SQLITE_VdbeTrace)
   );
   cFlagPragmasTrusted: TFlagPragma =
     (name: 'trusted_schema'; mask: SQLITE_TrustedSchema);
