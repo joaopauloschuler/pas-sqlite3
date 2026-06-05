@@ -9860,6 +9860,23 @@ begin
               pIt^.colUsed := pIt^.colUsed or (Bitmask(1) shl iCol)
             else
               pIt^.colUsed := pIt^.colUsed or (Bitmask(1) shl (BMS - 1));
+          end
+          else if (sqlite3IsRowid(zCol) <> 0)
+                  and ((pIt^.pSTab^.tabFlags and TF_NoVisibleRowid) = 0) then
+          begin
+            { incrvacuum (line 283) — a qualified rowid alias (X.oid / X.rowid
+              / X._rowid_) against an OUTER UPDATE/SELECT source matched no real
+              column but the table has a VisibleRowid.  Mirror lookupName's
+              cntTab arm (resolve.c:471 `if(0==cnt && VisibleRowid(pTab))`) plus
+              the rowid finalisation (resolve.c:636 `pExpr->iColumn=-1`,
+              resolve.c:637 affExpr=SQLITE_AFF_INTEGER). }
+            pW^.op      := TK_COLUMN;
+            pW^.iTable  := pIt^.iCursor;
+            pW^.iColumn := i16(-1);
+            pW^.y.pTab  := pIt^.pSTab;
+            pW^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+            pW^.pLeft   := nil;
+            pW^.pRight  := nil;
           end;
           Break;
         end;
