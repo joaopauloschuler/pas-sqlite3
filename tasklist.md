@@ -952,6 +952,9 @@ Crash never fires without the explicit page_size PRAGMA after RESERVE_BYTES, nor
   - [X] **9.4.divbug.92.004** `gencol1-20.2` — UPSERT excluded.col with VIRTUAL gen col stored offset; resolveUpsertExcludedRefs now uses sqlite3TableColumnToStorage(pTab,iCol) not raw iCol (resolve.c:585, codegen.pas:9562).
   - [X] **9.4.divbug.92.005** `gencol1-8.20` — `generated column loop` error message now includes `on "<colname>"` (expr.c:4441, codegen.pas:42060).
   - [ ] **9.4.divbug.92.006** `gencol1-9.20/13.10` "internal query planner error" — bb-UNIQUE auto-index on a VIRTUAL gen col gets WHERE_IDX_ONLY because colNotIdxed bit for the virtual col is 0 (UNIQUE auto-index created BEFORE AS clause sets COLFLAG_VIRTUAL); whereIndexExprTrans then sees OP_Column for the base column on the table cursor and trips the planner-error gate (codegen.pas:26250). C exhibits same parse order yet picks table-scan — root-cause mechanism differs (cost / IPK preference); needs deeper trace before a faithful fix.
+  - [X] **9.4.divbug.92.007** `vtab2-5.3` — OP_ParseSchema re-fire dropped the vdbe.c:7152 WHERE filter (name/sql) + used a port-local dedup guard; UTF16 dup-name vtab create never tripped "already exists" → "vtable constructor failed: <U+FFFD>". Reinstated filter, INITFLAG_FreshLoad on filtered path (3242997).
+  - [X] **9.4.divbug.92.008** `with1-22.1` — flatten pass had blanket `not isCte` skip; NOT MATERIALIZED CTE-backed FROM subqueries now flatten (C fences only M10d_Yes, select.c:7785) so nested CTE joins trip SQLITE_MAX_SRCLIST=200 at prepare (cc4c3ca).
+  - [ ] **9.4.divbug.92.009** `with5-310` — recursive-CTE outer ORDER BY wrongly eliminated (dup outer SELECT binds result col iColumn=-1/rowid → WHERE_IPK ordered match drops sorter); pre-existing, deep materialise/dup fix. See memory project_with5_310_recursive_cte_orderby.
 
 ---
 
