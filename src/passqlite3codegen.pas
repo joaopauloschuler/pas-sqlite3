@@ -69656,26 +69656,34 @@ var
     time (1-based), so the caller can resume scanning (e.g. for a timezone). }
   function parseHhMmSs(pos: i32; out hh, mm: i32; out ss: Double;
                        out endPos: i32): Boolean;
-  var sv, fp: i32; frac: Double;
+  var sv, fp: i32; frac, msF: Double;
   begin
     Result := False;
-    hh := getN(pos, 2); if hh < 0 then Exit;
+    { date.c parseHhMmSs format "20c:20e": hour 'c'->aMx[2]=24,
+      minute 'e'->aMx[4]=59, second 'e'->aMx[4]=59 (getDigits per-field max). }
+    hh := getN(pos, 2); if (hh < 0) or (hh > 24) then Exit;
     if (pos+2 > Length(s)) or (s[pos+2] <> ':') then Exit;
-    mm := getN(pos+3, 2); if mm < 0 then Exit;
+    mm := getN(pos+3, 2); if (mm < 0) or (mm > 59) then Exit;
     ss := 0.0;
     endPos := pos + 5;
     if (pos+5 <= Length(s)) and (s[pos+5] = ':') then begin
-      sv := getN(pos+6, 2); if sv < 0 then Exit;
+      sv := getN(pos+6, 2); if (sv < 0) or (sv > 59) then Exit;
       ss := sv;
       endPos := pos + 8;
       if (pos+8 <= Length(s)) and (s[pos+8] = '.') and
          (pos+9 <= Length(s)) and isdig(s[pos+9]) then begin
-        frac := 0.1; fp := pos+9;
+        { date.c:220..231 — accumulate ms in [0,1), then truncate to 0.999
+          to avoid sub-millisecond rounding (forum/forumpost/766a2c9231).
+          ms = ms*10 + digit; rScale *= 10; ms /= rScale; cap at 0.999. }
+        msF := 0.0; frac := 1.0; fp := pos+9;
         while (fp <= Length(s)) and isdig(s[fp]) do begin
-          ss := ss + (Ord(s[fp]) - Ord('0')) * frac;
-          frac := frac * 0.1;
+          msF := msF * 10.0 + (Ord(s[fp]) - Ord('0'));
+          frac := frac * 10.0;
           Inc(fp);
         end;
+        msF := msF / frac;
+        if msF > 0.999 then msF := 0.999;
+        ss := ss + msF;
         endPos := fp;
       end;
     end;
@@ -69705,9 +69713,11 @@ var
     end
     else Exit;
     Inc(pos);
-    nHr := getN(pos, 2); if nHr < 0 then Exit;
+    { date.c parseTimezone format "20b:20e": hour 'b'->aMx[1]=14,
+      minute 'e'->aMx[4]=59 (getDigits per-field max). }
+    nHr := getN(pos, 2); if (nHr < 0) or (nHr > 14) then Exit;
     if (pos+2 > Length(s)) or (s[pos+2] <> ':') then Exit;
-    nMn := getN(pos+3, 2); if nMn < 0 then Exit;
+    nMn := getN(pos+3, 2); if (nMn < 0) or (nMn > 59) then Exit;
     pos := pos + 5;
     tzMin := sgn * (nMn + nHr * 60);
     while (pos <= Length(s)) and (s[pos] = ' ') do Inc(pos);
@@ -69784,11 +69794,14 @@ begin
     yNeg := 0; ymdBase := 1;
     if (Length(s) >= 1) and (s[1] = '-') then begin yNeg := 1; ymdBase := 2; end;
     if Length(s) < ymdBase + 9 then Exit;
-    y := getN(ymdBase, 4); if y < 0 then Exit;
+    { date.c getDigits enforces per-field max via aMx[]={12,14,24,31,59,14712}
+      and parseYyyyMmDd format "40f-21a-21d": year 'f'->aMx[5]=14712 (min 0),
+      month 'a'->aMx[0]=12 (min 1), day 'd'->aMx[3]=31 (min 1). }
+    y := getN(ymdBase, 4); if (y < 0) or (y > 14712) then Exit;
     if s[ymdBase+4] <> '-' then Exit;
-    m := getN(ymdBase+5, 2); if m < 1 then Exit;
+    m := getN(ymdBase+5, 2); if (m < 1) or (m > 12) then Exit;
     if s[ymdBase+7] <> '-' then Exit;
-    d := getN(ymdBase+8, 2); if d < 1 then Exit;
+    d := getN(ymdBase+8, 2); if (d < 1) or (d > 31) then Exit;
     if yNeg <> 0 then y := -y;
     { Optional time component: skip space or 'T', then parse HH:MM[:SS[.FFF]] }
     if Length(s) > ymdBase + 9 then begin
@@ -69961,7 +69974,7 @@ var
   zMod, unit_: PAnsiChar;
   buf: array[0..31] of AnsiChar;
   i, nUsed, nUnit, iVal, dadd, tzSgn: i32;
-  r, rScale, msFrac: Double;
+  r, rScale, msFrac, rXform: Double;
 begin
   Result := False;
   if z = nil then Exit;
@@ -70264,6 +70277,8 @@ begin
   while (unit_+nUnit)^ <> #0 do Inc(nUnit);
   if (nUnit > 1) and ((Upcase((unit_+nUnit-1)^)) = 'S') then Dec(nUnit);
 
+  rXform := 0.0;  { non-zero only for the month/year arms; gates the
+                    fractional-part add (date.c:1067/1078 r-=(int)r; 1083). }
   if (nUnit = 6) and (sqlite3_strnicmp(unit_, 'second', 6) = 0) then begin
     dt.jd := dt.jd + r/86400.0;
     fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
@@ -70281,9 +70296,13 @@ begin
       fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
     end;
   end else if (nUnit = 5) and (sqlite3_strnicmp(unit_, 'month', 5) = 0) then begin
+    { date.c:677 aXformType[4] rXform=2592000.0 (seconds per "month"). }
     dt.mo := dt.mo + iVal;
+    rXform := 2592000.0;
   end else if (nUnit = 4) and (sqlite3_strnicmp(unit_, 'year', 4) = 0) then begin
+    { date.c:678 aXformType[5] rXform=31536000.0 (seconds per "year"). }
     dt.yr := dt.yr + iVal;
+    rXform := 31536000.0;
   end else
     Exit;
 
@@ -70308,6 +70327,20 @@ begin
     dt.dy := dt.dy + daysInMonth(dt.yr, dt.mo);
   end;
   dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  { date.c:1067/1078/1083 — for "month"/"year" the integer part has been
+    applied above (via iVal); add the fractional remainder as scaled seconds.
+    rRounder = r<0 ? -0.5 : +0.5 ms.  e.g. "1.5 months" -> +1 month then
+    +0.5*2592000 s = +15 days, giving 2003-10-22 -> 2003-12-07. }
+  if rXform <> 0.0 then begin
+    { C works in integer milliseconds: iJD += (i64)(rFrac*1000*rXform+rRounder).
+      Mirror that: truncate the ms add toward zero, then fold into the JD. }
+    if r < 0.0 then
+      msFrac := Trunc((r - iVal) * 1000.0 * rXform - 0.5)
+    else
+      msFrac := Trunc((r - iVal) * 1000.0 * rXform + 0.5);
+    dt.jd := dt.jd + msFrac / 86400000.0;
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  end;
   dt.validJD := True;
   Result := True;
 end;
@@ -70319,10 +70352,12 @@ end;
   [-4713,9999] OR rawS is still set (a raw number that no modifier
   successfully reinterpreted).  validJulianDay (date.c:458) requires
   0 <= iJD <= 464269060799999.  Returns False to signal SQL NULL. }
-function finalizeDate(var dt: TDateTime2): Boolean;
+function finalizeDate(var dt: TDateTime2; noModifiers: Boolean = False): Boolean;
 var
   Y: i32;
   iJD: Int64;
+  th, tmn: i32;
+  ts: Double;
 begin
   Result := False;
   if dt.isError then Exit;
@@ -70336,6 +70371,13 @@ begin
   end;
   iJD := Round(dt.jd * 86400000.0);
   if (iJD < 0) or (iJD > Int64(464269060799999)) then Exit;
+  { date.c:isDate — after computeJD, a single-argument (no-modifier) YYYY-MM-DD
+    with D>28 has validYMD cleared so the rendered Y/M/D is recomputed from the
+    julian day, normalizing e.g. 2023-02-31 -> 2023-03-03.  This port keeps the
+    YMD fields always populated (no validYMD flag), so emulate the clear by
+    recomputing them from dt.jd here.  Only the date fields change; H:M:S stay. }
+  if noModifiers and (dt.dy > 28) then
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, th, tmn, ts);
   Result := True;
 end;
 
@@ -70418,7 +70460,7 @@ begin
   if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
     if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if not finalizeDate(dt) then begin
+  if not finalizeDate(dt, argc = 1) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   emitDateYMD(pCtx, dt.yr, dt.mo, dt.dy);
@@ -70449,7 +70491,7 @@ begin
   if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
     if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if not finalizeDate(dt) then begin
+  if not finalizeDate(dt, argc = 1) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   if dt.useSubsec then
@@ -70520,7 +70562,7 @@ begin
   if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
     if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if not finalizeDate(dt) then begin
+  if not finalizeDate(dt, argc = 1) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   emitDateTime(pCtx, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s, dt.useSubsec);
@@ -70543,7 +70585,7 @@ begin
   if (argc > 1) and (not applyModifiers(pCtx, argc, 1, argv, dt)) then begin
     if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
   end;
-  if not finalizeDate(dt) then begin
+  if not finalizeDate(dt, argc = 1) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   sqlite3_result_double(pCtx, dt.jd);
@@ -70622,7 +70664,7 @@ begin
     if (argc > 2) and (not applyModifiers(pCtx, argc, 2, argv, dt)) then begin
       if pCtx^.isError = 0 then sqlite3_result_null(pCtx); Exit;
     end;
-    if not finalizeDate(dt) then begin
+    if not finalizeDate(dt, argc = 2) then begin
       sqlite3_result_null(pCtx); Exit;
     end;
     jd := dt.jd;
@@ -70762,8 +70804,13 @@ begin
              end;
         '%': sqlite3_str_appendchar(pStr, 1, '%');
         else begin
-               sqlite3_str_appendchar(pStr, 1, '%');
-               sqlite3_str_appendchar(pStr, 1, c);
+               { date.c:1563..1566 default: sqlite3_str_reset(&sRes); return;
+                 An unknown %-specifier resets the accumulator and returns
+                 WITHOUT calling sqlite3ResultStrAccum, leaving the result
+                 NULL.  This port has no sqlite3_str_reset; free the StrAccum
+                 and Exit early so no sqlite3_result_* runs (default = NULL). }
+               sqlite3_str_free(pStr);
+               Exit;
              end;
       end;
     end;
