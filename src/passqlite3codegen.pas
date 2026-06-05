@@ -70588,9 +70588,9 @@ var
   dt: TDateTime2;
   jd, jan1: Double;
   buf: array[0..255] of AnsiChar;
-  out_: array[0..255] of AnsiChar;
+  pStr: PSqlite3Str;
+  db: PTsqlite3;
   p: PAnsiChar;
-  op: PAnsiChar;
   c: AnsiChar;
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
@@ -70628,36 +70628,44 @@ begin
     y2 := dt.yr; m2 := dt.mo; d2 := dt.dy;
     h2 := dt.hr; mn2 := dt.mi; s2 := dt.s;
   end;
+  { date.c:1422..1424 — accumulate into a length-capped StrAccum so a huge
+    format string raises SQLITE_TOOBIG instead of smashing a fixed buffer.
+    sqlite3_str_new(db) defaults mxAlloc to SQLITE_MAX_LENGTH_DEF (1e9); C
+    uses db->aLimit[SQLITE_LIMIT_LENGTH], so reset it to the connection
+    limit. }
+  db := sqlite3_context_db_handle(pCtx);
+  pStr := sqlite3_str_new(db);
+  if pStr = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  pStr^.mxAlloc := u32(db^.aLimit[SQLITE_LIMIT_LENGTH]);
   p  := zFmt;
-  op := out_;
   while p^ <> #0 do begin
     if p^ <> '%' then begin
-      op^ := p^; Inc(op);
+      sqlite3_str_appendchar(pStr, 1, p^);
     end else begin
       Inc(p);
       c := p^;
       case c of
-        'Y': begin snpFmt(8, op, '%04d', [y2]); while op^ <> #0 do Inc(op); end;
-        'm': begin snpFmt(4, op, '%02d', [m2]); while op^ <> #0 do Inc(op); end;
-        'd': begin snpFmt(4, op, '%02d', [d2]); while op^ <> #0 do Inc(op); end;
-        'H': begin snpFmt(4, op, '%02d', [h2]); while op^ <> #0 do Inc(op); end;
-        'M': begin snpFmt(4, op, '%02d', [mn2]); while op^ <> #0 do Inc(op); end;
-        'S': begin snpFmt(4, op, '%02d', [Trunc(s2)]); while op^ <> #0 do Inc(op); end;
-        'f': begin snpFmt(8, op, '%06.3f', [s2]); while op^ <> #0 do Inc(op); end;
+        'Y': begin snpFmt(8, buf, '%04d', [y2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'm': begin snpFmt(4, buf, '%02d', [m2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'd': begin snpFmt(4, buf, '%02d', [d2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'H': begin snpFmt(4, buf, '%02d', [h2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'M': begin snpFmt(4, buf, '%02d', [mn2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'S': begin snpFmt(4, buf, '%02d', [Trunc(s2)]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'f': begin snpFmt(8, buf, '%06.3f', [s2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
         'j': begin
                { Day of year 001-366 }
                jan1 := toJulianDay(y2,1,1,0,0,0.0);
-               snpFmt(5, op, '%03d', [Trunc(jd - jan1) + 1]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(5, buf, '%03d', [Trunc(jd - jan1) + 1]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
-        'J': begin snpFmt(24, op, '%.16g', [jd]); while op^ <> #0 do Inc(op); end;
+        'J': begin snpFmt(24, buf, '%.16g', [jd]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
         'w': begin
                { Day of week 0..6 (0=Sunday).  date.c:1379:
                    sqlite3_snprintf(3,zBuf,"%d", (((p->iJD+129600000)/86400000)%7) )
                  dt.jd here is JD at midnight (= JD_noon - 0.5), so
                  Trunc(jd + 1.5) = JD_noon + 1, and (... mod 7) = weekday. }
-               snpFmt(4, op, '%d', [Trunc(jd + 1.5) mod 7]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(4, buf, '%d', [Trunc(jd + 1.5) mod 7]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'u': begin
                { Day of week 1..7 (1=Monday).  date.c:1528..1533:
@@ -70665,8 +70673,8 @@ begin
                  daysAfterSunday(x) = (iJD/86400000 + 1.5) mod 7 in C, so
                  the Pas equivalent is Trunc(jd + 1.5) mod 7 (matches the
                  'w' case above).  Map 0 -> 7. }
-               snpFmt(4, op, '%d', [((Trunc(jd + 1.5) + 6) mod 7) + 1]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(4, buf, '%d', [((Trunc(jd + 1.5) + 6) mod 7) + 1]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         's': begin
                { date.c:1438 — iS = (i64)(iJD/1000 - 21086676*(i64)10000).
@@ -70675,41 +70683,41 @@ begin
                  whole-second values (e.g. 0.9999999... for 1s).  Round
                  to integer ms first, then floor-divide by 1000. }
                epoch := toJulianDay(1970,1,1,0,0,0.0);
-               snpFmt(24, op, '%lld',
+               snpFmt(24, buf, '%lld',
                  [Round((jd-epoch)*86400000.0) div Int64(1000)]);
-               while op^ <> #0 do Inc(op);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
-        'e': begin snpFmt(4, op, '%2d', [d2]); while op^ <> #0 do Inc(op); end;
-        'F': begin snpFmt(12, op, '%04d-%02d-%02d', [y2, m2, d2]); while op^ <> #0 do Inc(op); end;
-        'k': begin snpFmt(4, op, '%2d', [h2]); while op^ <> #0 do Inc(op); end;
+        'e': begin snpFmt(4, buf, '%2d', [d2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'F': begin snpFmt(12, buf, '%04d-%02d-%02d', [y2, m2, d2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'k': begin snpFmt(4, buf, '%2d', [h2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
         'I': begin
-               snpFmt(4, op, '%02d',
+               snpFmt(4, buf, '%02d',
                  [((h2 + 11) mod 12) + 1]);
-               while op^ <> #0 do Inc(op);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'l': begin
-               snpFmt(4, op, '%2d',
+               snpFmt(4, buf, '%2d',
                  [((h2 + 11) mod 12) + 1]);
-               while op^ <> #0 do Inc(op);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'p': begin
-               if h2 >= 12 then begin op^ := 'P'; Inc(op); op^ := 'M'; Inc(op); end
-               else begin op^ := 'A'; Inc(op); op^ := 'M'; Inc(op); end;
+               if h2 >= 12 then sqlite3_str_append(pStr, 'PM', 2)
+               else sqlite3_str_append(pStr, 'AM', 2);
              end;
         'P': begin
-               if h2 >= 12 then begin op^ := 'p'; Inc(op); op^ := 'm'; Inc(op); end
-               else begin op^ := 'a'; Inc(op); op^ := 'm'; Inc(op); end;
+               if h2 >= 12 then sqlite3_str_append(pStr, 'pm', 2)
+               else sqlite3_str_append(pStr, 'am', 2);
              end;
-        'R': begin snpFmt(8, op, '%02d:%02d', [h2, mn2]); while op^ <> #0 do Inc(op); end;
-        'T': begin snpFmt(12, op, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]); while op^ <> #0 do Inc(op); end;
+        'R': begin snpFmt(8, buf, '%02d:%02d', [h2, mn2]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
+        'T': begin snpFmt(12, buf, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]); sqlite3_str_append(pStr, buf, StrLen(buf)); end;
         'U': begin
                { Week num 00-53; first Sun of the year is week 01.
                  date.c:1535..1538: (daysAfterJan01 - daysAfterSunday + 7)/7. }
                jan1 := toJulianDay(y2,1,1,0,0,0.0);
                dayJan01 := Trunc(jd - jan1);
                daySun := Trunc(jd + 1.5) mod 7;
-               snpFmt(4, op, '%02d', [(dayJan01 - daySun + 7) div 7]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(4, buf, '%02d', [(dayJan01 - daySun + 7) div 7]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'W': begin
                { Week num 00-53; first Mon of the year is week 01.
@@ -70718,8 +70726,8 @@ begin
                dayJan01 := Trunc(jd - jan1);
                daySun := Trunc(jd + 1.5) mod 7;
                dayMon := (daySun + 6) mod 7;
-               snpFmt(4, op, '%02d', [(dayJan01 - dayMon + 7) div 7]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(4, buf, '%02d', [(dayJan01 - dayMon + 7) div 7]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'V': begin
                { ISO week num 01-53; first week with a Thur is week 01.
@@ -70731,8 +70739,8 @@ begin
                fromJulianDay(thursJD, ty, tm, td, th, tmn, ts);
                jan1 := toJulianDay(ty,1,1,0,0,0.0);
                dayJan01 := Trunc(thursJD - jan1);
-               snpFmt(4, op, '%02d', [(dayJan01 div 7) + 1]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(4, buf, '%02d', [(dayJan01 div 7) + 1]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'G': begin
                { ISO week-based year — year of the Thursday in same week. }
@@ -70740,25 +70748,39 @@ begin
                dayMon := (daySun + 6) mod 7;
                thursJD := jd + (3 - dayMon);
                fromJulianDay(thursJD, ty, tm, td, th, tmn, ts);
-               snpFmt(8, op, '%04d', [ty]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(8, buf, '%04d', [ty]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
         'g': begin
                daySun := Trunc(jd + 1.5) mod 7;
                dayMon := (daySun + 6) mod 7;
                thursJD := jd + (3 - dayMon);
                fromJulianDay(thursJD, ty, tm, td, th, tmn, ts);
-               snpFmt(4, op, '%02d', [ty mod 100]);
-               while op^ <> #0 do Inc(op);
+               snpFmt(4, buf, '%02d', [ty mod 100]);
+               sqlite3_str_append(pStr, buf, StrLen(buf));
              end;
-        '%': begin op^ := '%'; Inc(op); end;
-        else begin op^ := '%'; Inc(op); op^ := c; Inc(op); end;
+        '%': sqlite3_str_appendchar(pStr, 1, '%');
+        else begin
+               sqlite3_str_appendchar(pStr, 1, '%');
+               sqlite3_str_appendchar(pStr, 1, c);
+             end;
       end;
     end;
     Inc(p);
   end;
-  op^ := #0;
-  sqlite3_result_text(pCtx, out_, op - out_, SQLITE_TRANSIENT);
+  { sqlite3ResultStrAccum (printf.c:1223) — finish the accumulator.
+    On error emit the code; if a buffer was actually allocated return its
+    contents, else (empty/never-allocated) return the empty string. }
+  if sqlite3_str_errcode(pStr) = SQLITE_TOOBIG then
+    sqlite3_result_error_toobig(pCtx)
+  else if sqlite3_str_errcode(pStr) = SQLITE_NOMEM then
+    sqlite3_result_error_nomem(pCtx)
+  else if sqlite3_str_value(pStr) <> nil then
+    sqlite3_result_text(pCtx, sqlite3_str_value(pStr),
+                        sqlite3_str_length(pStr), SQLITE_TRANSIENT)
+  else
+    sqlite3_result_text(pCtx, '', 0, SQLITE_STATIC);
+  sqlite3_str_free(pStr);
 end;
 
 { timediffFunc — port of date.c:1618..1707.

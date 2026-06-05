@@ -1621,8 +1621,10 @@ begin
   szNew := u64(p^.nChar) + u64(N) + 1;
   if szNew + u64(p^.nChar) <= u64(p^.mxAlloc) then
     szNew := szNew + u64(p^.nChar);
-  if szNew > u64(p^.mxAlloc) then szNew := u64(p^.mxAlloc);
-  if szNew <= u64(p^.nChar) then begin
+  { printf.c:1103 — if the required size exceeds the cap, this is a hard
+    SQLITE_TOOBIG (reset + error + return 0); C does NOT clamp-and-truncate. }
+  if szNew > u64(p^.mxAlloc) then begin
+    sqlite3_str_reset(p);
     setStrError(p, SQLITE_TOOBIG);
     Result := 0; Exit;
   end;
