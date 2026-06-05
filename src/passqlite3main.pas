@@ -5308,8 +5308,10 @@ begin
   end;
   oldLimit := db^.aLimit[limitId];
   if newLimit >= 0 then begin
-    if newLimit > aHardLimit[limitId] then newLimit := aHardLimit[limitId];
-    if (limitId = 0) and (newLimit < 100) then newLimit := 100;  { SQLITE_LIMIT_LENGTH floor }
+    if newLimit > aHardLimit[limitId] then
+      newLimit := aHardLimit[limitId]
+    else if (newLimit < SQLITE_MIN_LENGTH) and (limitId = 0) then  { 0 = SQLITE_LIMIT_LENGTH }
+      newLimit := SQLITE_MIN_LENGTH;
     db^.aLimit[limitId] := newLimit;
   end;
   Result := oldLimit;
