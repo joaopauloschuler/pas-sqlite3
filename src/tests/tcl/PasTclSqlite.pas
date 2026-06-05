@@ -3933,6 +3933,12 @@ begin
   { changes — tclsqlite.c:2728.  We use sqlite3_changes64 (i64). }
   if (zSub <> nil) and (StrComp(zSub, 'changes') = 0) then
   begin
+    if objc <> 2 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar(''));
+      Result := TCL_ERROR;
+      Exit;
+    end;
     Tcl_SetObjResult(interp,
       Tcl_NewWideIntObj(sqlite3_changes64(PSqliteDb(clientData)^.db)));
     Result := TCL_OK;
@@ -3942,6 +3948,12 @@ begin
   { last_insert_rowid — tclsqlite.c:3552. }
   if (zSub <> nil) and (StrComp(zSub, 'last_insert_rowid') = 0) then
   begin
+    if objc <> 2 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar(''));
+      Result := TCL_ERROR;
+      Exit;
+    end;
     Tcl_SetObjResult(interp,
       Tcl_NewWideIntObj(sqlite3_last_insert_rowid(PSqliteDb(clientData)^.db)));
     Result := TCL_OK;
