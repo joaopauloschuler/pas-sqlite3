@@ -61708,6 +61708,13 @@ var
   zTypeTl: PAnsiChar;
   xTl:     passqlite3util.PHashElem;
   pTabTl:  PTable2;
+  { pragma.c:1290..1314 — nCol-init loop locals (save/restore error state). }
+  pHashTl:        passqlite3util.PHash;
+  initNColTl:     i32;
+  savedRcTl:      i32;
+  savedNErrTl:    i32;
+  savedErrMsgTl:  PAnsiChar;
+  savedErrCodeTl: i32;
   { pragma.c:566 — VdbeOp* aOp + int size for PRAGMA default_cache_size. }
   aOpDc:   PVdbeOp;
   sizeDc:  i32;
@@ -62291,15 +62298,65 @@ begin
         if db^.aDb[iiTl].pSchema = nil then Continue;
 
         { pragma.c:1285..1314 — ensure Table.nCol is initialised for every
-          view and virtual table.  The Pascal port resolves this in-place
-          via sqlite3ViewGetColumnNames (no re-prepare/hash-disrupt loop). }
-        xTl := db^.aDb[iiTl].pSchema^.tblHash.first;
-        while xTl <> nil do
+          view and virtual table.  C runs a THROWAWAY
+          sqlite3_prepare_v3("SELECT*FROM\"<name>\"", SQLITE_PREPARE_DONT_LOG)
+          and finalizes it, IGNORING any prepare error so that a corrupt view
+          (e.g. one referencing an unknown function) leaves nCol at 0 without
+          aborting the pragma.  This port cannot re-enter the full prepare
+          pipeline from codegen (passqlite3main depends on this unit, not the
+          reverse), so we resolve the columns in-place via
+          sqlite3ViewGetColumnNames but SAVE/RESTORE pParse's + db's error
+          state around it.  That reproduces C's observable semantics: nCol is
+          initialised on success, stays 0 on a broken view, and the view's
+          resolution error never poisons the surrounding pragma.  Preparing
+          (column init) can rehash tblHash, so re-fetch pHash and restart the
+          scan after each init (the initNCol countdown bounds the restarts).
+          Out-of-memory is the only failure propagated. }
+        pHashTl := @db^.aDb[iiTl].pSchema^.tblHash;
+        initNColTl := i32(pHashTl^.count);
+        while initNColTl > 0 do
         begin
-          pTabTl := PTable2(xTl^.data);
-          if (pTabTl <> nil) and (pTabTl^.nCol = 0) then
-            sqlite3ViewGetColumnNames(pParse, pTabTl);
-          xTl := xTl^.next;
+          Dec(initNColTl);
+          xTl := pHashTl^.first;
+          while True do
+          begin
+            if xTl = nil then begin initNColTl := 0; Break; end;
+            pTabTl := PTable2(xTl^.data);
+            if (pTabTl <> nil) and (pTabTl^.nCol = 0) then
+            begin
+              { Snapshot the error state. }
+              savedRcTl       := pParse^.rc;
+              savedNErrTl     := pParse^.nErr;
+              savedErrMsgTl   := pParse^.zErrMsg;
+              savedErrCodeTl  := db^.errCode;
+              pParse^.zErrMsg := nil;  { detach so ViewGetColumnNames' own
+                                         message goes to a fresh slot }
+              sqlite3ViewGetColumnNames(pParse, pTabTl);
+              { Discard any error message ViewGetColumnNames raised. }
+              if pParse^.zErrMsg <> nil then
+              begin
+                sqlite3DbFree(db, pParse^.zErrMsg);
+                pParse^.zErrMsg := nil;
+              end;
+              { Restore the surrounding pragma's error state.  Only OOM is
+                allowed to survive (matches C's db->mallocFailed check). }
+              if db^.mallocFailed <> 0 then
+              begin
+                sqlite3ErrorMsg(pParse, 'out of memory');
+                pParse^.rc := SQLITE_NOMEM;
+              end
+              else
+              begin
+                pParse^.rc      := savedRcTl;
+                pParse^.nErr    := savedNErrTl;
+                pParse^.zErrMsg := savedErrMsgTl;
+                db^.errCode     := savedErrCodeTl;
+              end;
+              pHashTl := @db^.aDb[iiTl].pSchema^.tblHash;
+              Break;
+            end;
+            xTl := xTl^.next;
+          end;
         end;
 
         xTl := db^.aDb[iiTl].pSchema^.tblHash.first;
