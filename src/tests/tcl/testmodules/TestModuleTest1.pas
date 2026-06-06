@@ -2629,6 +2629,133 @@ begin
   if clientData = nil then ;
 end;
 
+{ ============================================================
+  test_quota.c:254..320 — quotaStrglob(zGlob, z): pure glob matcher.
+  Faithful recursive port.  Reads a byte then advances the pointer to
+  mirror C's *(p++).  '*' '?' '[...]' '[^...]' supported; '/' matches
+  '/' or '\\'.  Returns 1 on match, 0 otherwise.
+  ============================================================ }
+function quotaStrglob(zGlob: PByte; z: PByte): cint;
+var
+  c, c2, cx: cint;
+  invert, seen, prior_c: cint;
+begin
+  while True do
+  begin
+    c := zGlob^; Inc(zGlob);
+    if c = 0 then Break;
+    if c = Ord('*') then
+    begin
+      c := zGlob^; Inc(zGlob);
+      while (c = Ord('*')) or (c = Ord('?')) do
+      begin
+        if c = Ord('?') then
+        begin
+          if z^ = 0 then begin Result := 0; Exit; end;
+          Inc(z);
+        end;
+        c := zGlob^; Inc(zGlob);
+      end;
+      if c = 0 then
+      begin
+        Result := 1; Exit;
+      end
+      else if c = Ord('[') then
+      begin
+        while (z^ <> 0) and (quotaStrglob(zGlob - 1, z) = 0) do
+          Inc(z);
+        if z^ <> 0 then Result := 1 else Result := 0;
+        Exit;
+      end;
+      if c = Ord('/') then cx := Ord('\') else cx := c;
+      c2 := z^; Inc(z);
+      while c2 <> 0 do
+      begin
+        while (c2 <> c) and (c2 <> cx) do
+        begin
+          c2 := z^; Inc(z);
+          if c2 = 0 then begin Result := 0; Exit; end;
+        end;
+        if quotaStrglob(zGlob, z) <> 0 then begin Result := 1; Exit; end;
+        c2 := z^; Inc(z);
+      end;
+      Result := 0; Exit;
+    end
+    else if c = Ord('?') then
+    begin
+      if z^ = 0 then begin Result := 0; Exit; end;
+      Inc(z);
+    end
+    else if c = Ord('[') then
+    begin
+      prior_c := 0;
+      seen := 0;
+      invert := 0;
+      c := z^; Inc(z);
+      if c = 0 then begin Result := 0; Exit; end;
+      c2 := zGlob^; Inc(zGlob);
+      if c2 = Ord('^') then
+      begin
+        invert := 1;
+        c2 := zGlob^; Inc(zGlob);
+      end;
+      if c2 = Ord(']') then
+      begin
+        if c = Ord(']') then seen := 1;
+        c2 := zGlob^; Inc(zGlob);
+      end;
+      while (c2 <> 0) and (c2 <> Ord(']')) do
+      begin
+        if (c2 = Ord('-')) and (zGlob[0] <> Ord(']')) and (zGlob[0] <> 0)
+           and (prior_c > 0) then
+        begin
+          c2 := zGlob^; Inc(zGlob);
+          if (c >= prior_c) and (c <= c2) then seen := 1;
+          prior_c := 0;
+        end
+        else
+        begin
+          if c = c2 then seen := 1;
+          prior_c := c2;
+        end;
+        c2 := zGlob^; Inc(zGlob);
+      end;
+      if (c2 = 0) or ((seen xor invert) = 0) then begin Result := 0; Exit; end;
+    end
+    else if c = Ord('/') then
+    begin
+      if (z[0] <> Ord('/')) and (z[0] <> Ord('\')) then
+        begin Result := 0; Exit; end;
+      Inc(z);
+    end
+    else
+    begin
+      if c <> z^ then begin Result := 0; Exit; end;
+      Inc(z);
+    end;
+  end;
+  if z^ = 0 then Result := 1 else Result := 0;
+end;
+
+{ test_quota.c:1859..1877 — tclcmd: sqlite3_quota_glob PATTERN TEXT.
+  Returns 1 if TEXT matches the glob PATTERN, else 0. }
+function test_quota_glob(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zPattern, zText: PChar;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('PATTERN TEXT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zPattern := Tcl_GetString(objv[1]);
+  zText := Tcl_GetString(objv[2]);
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(quotaStrglob(PByte(zPattern), PByte(zText))));
+  Result := TCL_OK;
+end;
+
 { test_malloc.c:884..915 — sqlite3_config_pagecache SIZE N.
   Sets the page-cache memory buffer.  The "static buf" trick from C is
   preserved via a unit-level var so successive calls do not leak.
@@ -10321,6 +10448,9 @@ begin
     @test_create_aggregate, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pagecache'),
     @test_config_pagecache, nil, nil);
+  { test_quota.c:1954 — sqlite3_quota_glob PATTERN TEXT (glob matcher only). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_quota_glob'),
+    @test_quota_glob, nil, nil);
   { test_mutex.c:337..372 — sqlite3_config OPTION. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config'),
     @test_config, nil, nil);

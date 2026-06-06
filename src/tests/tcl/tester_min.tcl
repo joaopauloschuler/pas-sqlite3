@@ -479,6 +479,8 @@ set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREA
 # instead of running against the unsupported feature path.
 set ::sqlite_options(shared_cache) 0   ;# SQLITE_OMIT_SHARED_CACHE (port omits shared cache)
 set ::sqlite_options(oversize_cell_check) 0 ;# no SQLITE_ENABLE_OVERSIZE_CELL_CHECK (oracle lacks it; mirrors test_config.c)
+set ::sqlite_options(mem5) 0           ;# no SQLITE_ENABLE_MEMSYS5 (oracle lacks memsys5)
+set ::sqlite_options(sqllog) 0         ;# no SQLITE_ENABLE_SQLLOG (oracle lacks sqllog)
 # integrityck: engine supports PRAGMA integrity_check (no SQLITE_OMIT_INTEGRITY_CHECK).
 # pragma.test reads $sqlite_options(integrityck) directly (not via ifcapable).
 set ::sqlite_options(integrityck) 1
