@@ -6965,9 +6965,17 @@ begin
       Exit;
     end;
     if nPage > u32(nPageFile) then begin
-      { nPage in header > actual file size → treat as corrupt }
-      rc := SQLITE_CORRUPT_BKPT;
-      goto page1_init_failed;
+      { btree.c:3401..3408 — header page-count exceeds the actual file size.
+        Normally this is corruption, but when PRAGMA writable_schema=ON
+        (SQLITE_WriteSchema) the reference clamps nPage to the file size and
+        proceeds, so a deliberately-truncated header can be repaired
+        (incrvacuum-17.1). }
+      if (pBt^.db = nil)
+         or ((PTsqlite3(pBt^.db)^.flags and SQLITE_WriteSchema) = 0) then begin
+        rc := SQLITE_CORRUPT_BKPT;
+        goto page1_init_failed;
+      end else
+        nPage := u32(nPageFile);
     end;
     if usableSize < 480 then goto page1_init_failed;
 
