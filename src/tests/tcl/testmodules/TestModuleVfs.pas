@@ -491,8 +491,82 @@ begin
 end;
 
 function tvfsFileControl(pFile: Psqlite3_file; op: cint; pArg: Pointer): cint; cdecl;
+type
+  TPCharArray = array[0..2] of PChar;
+  PPCharArray = ^TPCharArray;
+const
+  aFnctl: array[0..2] of cint = (
+    SQLITE_FCNTL_BEGIN_ATOMIC_WRITE,
+    SQLITE_FCNTL_COMMIT_ATOMIC_WRITE,
+    SQLITE_FCNTL_ZIPVFS);
+  aFnctlName: array[0..2] of PChar = (
+    'BEGIN_ATOMIC_WRITE',
+    'COMMIT_ATOMIC_WRITE',
+    'ZIPVFS');
+var
+  pFd : PTestvfsFd;
+  p   : PTestvfs;
+  argv: PPCharArray;
+  rc  : cint;
+  z   : PChar;
+  x   : cint;
+  i   : cint;
 begin
-  Result := sqlite3OsFileControl(PTestvfsFile(pFile)^.pFd^.pReal, op, pArg);
+  pFd := PTestvfsFile(pFile)^.pFd;
+  p := PTestvfs(pFd^.pVfs^.pAppData);
+  if op = SQLITE_FCNTL_PRAGMA then
+  begin
+    argv := PPCharArray(pArg);
+    if sqlite3_stricmp(argv^[1], 'error') = 0 then
+    begin
+      rc := SQLITE_ERROR;
+      if argv^[2] <> nil then
+      begin
+        z := argv^[2];
+        x := sqlite3Atoi(z);
+        if x <> 0 then
+        begin
+          rc := x;
+          while sqlite3Isdigit(u8(z[0])) <> 0 do Inc(z);
+          while sqlite3Isspace(u8(z[0])) <> 0 do Inc(z);
+        end;
+        if z[0] <> #0 then
+          argv^[0] := sqlite3_mprintf(z);
+      end;
+      Result := rc;
+      Exit;
+    end;
+    if sqlite3_stricmp(argv^[1], 'filename') = 0 then
+    begin
+      argv^[0] := sqlite3_mprintf(pFd^.zFilename);
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+  if (p^.pScript <> nil) and ((p^.mask and TESTVFS_FCNTL_MASK) <> 0) then
+  begin
+    i := 0;
+    while i < 3 do
+    begin
+      if op = aFnctl[i] then Break;
+      Inc(i);
+    end;
+    if i < 3 then
+    begin
+      rc := 0;
+      tvfsExecTcl(p, 'xFileControl',
+        Tcl_NewStringObj(pFd^.zFilename, -1),
+        Tcl_NewStringObj(aFnctlName[i], -1),
+        nil, nil);
+      tvfsResultCode(p, rc);
+      if rc <> 0 then
+      begin
+        if rc < 0 then Result := SQLITE_OK else Result := rc;
+        Exit;
+      end;
+    end;
+  end;
+  Result := sqlite3OsFileControl(pFd^.pReal, op, pArg);
 end;
 
 function tvfsSectorSize(pFile: Psqlite3_file): cint; cdecl;
