@@ -40149,8 +40149,16 @@ begin
             pParse^.addrExplain := savedAddrExplainSub;
             { Outer scan of the materialised result — ExplainQueryPlan
               "SCAN %!S" (where.c:6954 / wherecode.c sqlite3WhereExplainOneScan
-              for an ephemeral / co-routine source). }
-            sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
+              for an ephemeral / co-routine source).  C codes this outer
+              scan through sqlite3WhereBegin with minMaxFlag threaded into
+              wctrlFlags, so wherecode.c:145 isSearch forces "SEARCH" for a
+              min/max aggregate (e.g. `SELECT max(z) FROM <union-all view>`,
+              pushdown-6.3).  This Pas-only materialise path bypasses
+              WhereBegin, so reproduce that "SEARCH" selection here. }
+            if minMaxFlag <> WHERE_ORDERBY_NORMAL then
+              sqlite3VdbeExplain(pParse, 0, 'SEARCH %!S', [Pointer(pItem)])
+            else
+              sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
             addrEnd := sqlite3VdbeMakeLabel(pParse);
             addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
             if p^.pWhere <> nil then
