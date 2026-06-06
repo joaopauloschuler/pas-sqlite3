@@ -126,8 +126,13 @@ type
   ============================================================ }
 
 const
+  SQLITE_CONFIG_SINGLETHREAD_U = 1;
+  SQLITE_CONFIG_MULTITHREAD_U  = 2;
+  SQLITE_CONFIG_SERIALIZED_U   = 3;
   SQLITE_CONFIG_MALLOC     = 4;
   SQLITE_CONFIG_GETMALLOC  = 5;
+  SQLITE_CONFIG_MUTEX_U    = 10;  { sqlite3_config(SQLITE_CONFIG_MUTEX, &methods) }
+  SQLITE_CONFIG_GETMUTEX_U = 11;  { sqlite3_config(SQLITE_CONFIG_GETMUTEX, &methods) }
   SQLITE_CONFIG_PAGECACHE  = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
   SQLITE_CONFIG_PCACHE2    = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
   SQLITE_CONFIG_GETPCACHE2 = 19;
@@ -2410,9 +2415,45 @@ begin
 end;
 
 function sqlite3_config(op: i32; pArg: Pointer): i32; overload;
+const
+  SQLITE_CONFIG_LOG_U          = 16;
+  SQLITE_CONFIG_PCACHE_HDRSZ_U = 24;
 begin
   Result := SQLITE_OK;
+  { sqlite3_config() normally returns SQLITE_MISUSE if invoked while the
+    library is in use.  Except a few selected opcodes are allowed at any
+    time (main.c:434..444). }
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    if (op <> SQLITE_CONFIG_LOG_U)
+       and (op <> SQLITE_CONFIG_PCACHE_HDRSZ_U) then begin
+      Result := SQLITE_MISUSE;
+      Exit;
+    end;
+  end;
   case op of
+    { Mutex/threading configuration options (this port is always threadsafe,
+      i.e. SQLITE_THREADSAFE>0, so these are always available). }
+    SQLITE_CONFIG_SINGLETHREAD_U:  { 1 }
+      begin
+        sqlite3GlobalConfig.bCoreMutex := 0;
+        sqlite3GlobalConfig.bFullMutex := 0;
+      end;
+    SQLITE_CONFIG_MULTITHREAD_U:   { 2 }
+      begin
+        sqlite3GlobalConfig.bCoreMutex := 1;
+        sqlite3GlobalConfig.bFullMutex := 0;
+      end;
+    SQLITE_CONFIG_SERIALIZED_U:    { 3 }
+      begin
+        sqlite3GlobalConfig.bCoreMutex := 1;
+        sqlite3GlobalConfig.bFullMutex := 1;
+      end;
+    SQLITE_CONFIG_MUTEX_U:         { 10 }
+      if pArg <> nil then
+        sqlite3MutexSetMethods(Psqlite3_mutex_methods(pArg));
+    SQLITE_CONFIG_GETMUTEX_U:      { 11 }
+      if pArg <> nil then
+        sqlite3MutexGetMethods(Psqlite3_mutex_methods(pArg));
     SQLITE_CONFIG_MALLOC:        { 4 }
       if pArg <> nil then
         sqlite3GlobalConfig.m := PTsqlite3_mem_methods(pArg)^;

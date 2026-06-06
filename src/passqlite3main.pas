@@ -4009,6 +4009,9 @@ var
   zSql8: PAnsiChar;
   rc: i32;
 begin
+  { complete.c — autoinit then bail on failure (mutex2-2.3). }
+  rc := sqlite3_initialize;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
   pVal := sqlite3ValueNew(nil);
   if pVal = nil then begin Result := SQLITE_NOMEM; Exit; end;
   sqlite3ValueSetStr(pVal, -1, zSql, SQLITE_UTF16NATIVE, SQLITE_STATIC);
@@ -6701,6 +6704,10 @@ begin
 end;
 
 initialization
+  { Wire the auto-init hook so sqlite3_mutex_alloc (passqlite3os.pas) can
+    call sqlite3_initialize() for dynamic mutexes (mutex.c:292) without a
+    uses-cycle (os is lower-level than this unit). }
+  passqlite3os.gAutoInitHook := @sqlite3_initialize;
   vdbeParseSchemaExec := @execParseSchemaImpl;
   vdbeSqlExec := @execSqlExecImpl;
   vdbeRunVacuum := @runVacuumImpl;

@@ -642,6 +642,13 @@ procedure sqlite3_mutex_leave(p: Psqlite3_mutex);
 function  sqlite3_mutex_held(p: Psqlite3_mutex): cint;
 function  sqlite3_mutex_notheld(p: Psqlite3_mutex): cint;
 
+{ Auto-initialise hook.  This unit cannot reference sqlite3_initialize
+  directly (it lives in passqlite3main, which uses this unit), so the main
+  unit wires this hook to @sqlite3_initialize at startup.  Used by
+  sqlite3_mutex_alloc to honour SQLITE_OMIT_AUTOINIT semantics (mutex.c:290). }
+var
+  gAutoInitHook: function: cint = nil;
+
 { Internal mutex helpers }
 function  sqlite3MutexAlloc(id: cint): Psqlite3_mutex;
 function  sqlite3MutexInit: cint;
@@ -650,6 +657,12 @@ procedure sqlite3MemoryBarrier;
 
 { Default mutex implementation (pthread) }
 function  sqlite3DefaultMutex: Psqlite3_mutex_methods;
+
+{ Accessors for the active mutex method table (gMutexMethods). Used by
+  sqlite3_config(SQLITE_CONFIG_GETMUTEX/SQLITE_CONFIG_MUTEX). In C this table
+  is sqlite3GlobalConfig.mutex; this port keeps it in gMutexMethods. }
+procedure sqlite3MutexGetMethods(pTo: Psqlite3_mutex_methods);
+procedure sqlite3MutexSetMethods(pFrom: Psqlite3_mutex_methods);
 
 { ============================================================
   Section 12: OS layer wrappers  (os.c)
@@ -847,10 +860,11 @@ const
   ---------------------------------------------------------------- }
 function sqlite3_malloc(n: i32): Pointer; cdecl;
 begin
-  { malloc.c:316 — n<=0 short-circuit then sqlite3Malloc.
-    (autoinit elided: shell calls sqlite3_initialize before allocating,
-    and this unit cannot reference sqlite3_initialize without a
-    circular dependency on passqlite3main.) }
+  { malloc.c:316 — autoinit then n<=0 short-circuit then sqlite3Malloc.
+    Autoinit runs through gAutoInitHook (wired by passqlite3main to
+    sqlite3_initialize) to avoid a circular unit dependency. }
+  if Assigned(gAutoInitHook) and (gAutoInitHook() <> SQLITE_OK) then
+    Exit(nil);
   if n <= 0 then Exit(nil);
   Result := sqlite3Malloc(n);
 end;
@@ -864,7 +878,9 @@ end;
 
 function sqlite3_realloc(p: Pointer; n: i32): Pointer; cdecl;
 begin
-  { malloc.c:562 — n<0 -> 0, then sqlite3Realloc. }
+  { malloc.c:562 — autoinit then n<0 -> 0, then sqlite3Realloc. }
+  if Assigned(gAutoInitHook) and (gAutoInitHook() <> SQLITE_OK) then
+    Exit(nil);
   if n < 0 then n := 0;
   Result := sqlite3Realloc(p, u64(n));
 end;
@@ -1144,6 +1160,21 @@ end;
   Section 11b: Mutex public API  (mutex.c)
   ============================================================ }
 
+{ Accessors for gMutexMethods (the active mutex table). }
+procedure sqlite3MutexGetMethods(pTo: Psqlite3_mutex_methods);
+begin
+  { Ensure defaults are installed before handing the table out, matching the
+    lazy population done by sqlite3MutexInit. }
+  if not Assigned(gMutexMethods.xMutexAlloc) then
+    gMutexMethods := sqlite3DefaultMutex()^;
+  pTo^ := gMutexMethods;
+end;
+
+procedure sqlite3MutexSetMethods(pFrom: Psqlite3_mutex_methods);
+begin
+  gMutexMethods := pFrom^;
+end;
+
 { mutex.c ~170: sqlite3MutexInit }
 function sqlite3MutexInit: cint;
 var
@@ -1165,11 +1196,28 @@ begin
     Result := SQLITE_OK;
 end;
 
-{ mutex.c ~202: sqlite3_mutex_alloc (public API) }
+{ mutex.c:290..297: sqlite3_mutex_alloc (public API) }
 function sqlite3_mutex_alloc(id: cint): Psqlite3_mutex;
 begin
-  if not Assigned(gMutexMethods.xMutexAlloc) then begin
-    sqlite3MutexInit;
+  { SQLITE_OMIT_AUTOINIT is NOT defined for this build, so auto-initialise
+    (mutex.c:291..294).  For dynamic (FAST/RECURSIVE) mutexes a full
+    sqlite3_initialize() is required; for static mutexes only the mutex
+    subsystem need be up. }
+  if id <= SQLITE_MUTEX_RECURSIVE then begin
+    if Assigned(gAutoInitHook) then begin
+      if gAutoInitHook() <> SQLITE_OK then begin
+        Result := nil;
+        Exit;
+      end;
+    end else begin
+      if not Assigned(gMutexMethods.xMutexAlloc) then
+        sqlite3MutexInit;
+    end;
+  end else begin
+    if sqlite3MutexInit <> SQLITE_OK then begin
+      Result := nil;
+      Exit;
+    end;
   end;
   Result := gMutexMethods.xMutexAlloc(id);
 end;
@@ -1553,6 +1601,9 @@ var
   pVfs  : Psqlite3_vfs;
   mutex : Psqlite3_mutex;
 begin
+  { os.c — autoinit then bail on failure (mutex2-2.10). }
+  if Assigned(gAutoInitHook) and (gAutoInitHook() <> SQLITE_OK) then
+    Exit(nil);
   mutex := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
   sqlite3_mutex_enter(mutex);
   pVfs := vfsList;

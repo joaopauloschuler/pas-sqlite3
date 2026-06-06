@@ -2683,6 +2683,454 @@ begin
   Result := TCL_OK;
 end;
 
+{ ============================================================
+  test_autoext.c — the "sqr" auto-extension + its Tcl command.
+  Used by mutex2-2.5 to prove sqlite3_auto_extension() honours a failing
+  sqlite3_initialize().  Only the sqr variant is needed here.
+  ============================================================ }
+
+{ test_autoext.c:23..30 — sqr() SQL function: returns x*x. }
+procedure sqrFunc(context: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  r: Double;
+  pArg: PPsqlite3_value;
+begin
+  pArg := argv;
+  r := sqlite3_value_double(pArg[0]);
+  sqlite3_result_double(context, r * r);
+  if argc = 0 then ;
+end;
+
+{ test_autoext.c:35..43 — sqr_init: extension entry point registering sqr(). }
+function sqr_init(db: PTsqlite3; pzErrMsg: PPAnsiChar; pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3_create_function(db, PAnsiChar('sqr'), 1,
+    SQLITE_ANY, nil, @sqrFunc, nil, nil);
+  if (pzErrMsg = nil) or (pApi = nil) then ;
+end;
+
+{ test_autoext.c:90..99 — sqlite3_auto_extension_sqr.  Register sqr_init as
+  an auto-extension; return the rc (mutex2-2.5 expects 7 when init fails). }
+function test_auto_extension_sqr(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var rc: cint;
+begin
+  rc := sqlite3_auto_extension(Tsqlite3_loadext_fn(Pointer(@sqr_init)));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ ============================================================
+  test_mutex.c — the countable mutex layer + Tcl bindings.
+
+  This is a faithful port of ../sqlite3/src/test_mutex.c.  A counting
+  wrapper is installed over the engine's real mutex methods (retrieved
+  via sqlite3_config(SQLITE_CONFIG_GETMUTEX) and re-installed via
+  SQLITE_CONFIG_MUTEX).  Every counterMutexEnter / counterMutexTry bumps
+  a per-type counter that mutex1.test / mutex2.test read back.
+
+  Note on calling convention: the wrapper functions are stored in
+  gMutexMethods (the engine's sqlite3_mutex_methods table, os-type, plain
+  register convention) — NOT the cdecl util-type — so they are declared
+  WITHOUT cdecl to match how the engine invokes them.
+  ============================================================ }
+
+const
+  MAX_MUTEXES    = SQLITE_MUTEX_STATIC_VFS3 + 1;                  { 14 }
+  STATIC_MUTEXES = MAX_MUTEXES - (SQLITE_MUTEX_RECURSIVE + 1);    { 12 }
+
+  { aName[] — MAX_MUTEXES entries followed by a nil terminator (for
+    Tcl_GetIndexFromObj).  test_mutex.c:27..32. }
+  mutexAName: array[0..MAX_MUTEXES] of PAnsiChar = (
+    'fast',        'recursive',   'static_main',   'static_mem',
+    'static_open', 'static_prng', 'static_lru',    'static_pmem',
+    'static_app1', 'static_app2', 'static_app3',   'static_vfs1',
+    'static_vfs2', 'static_vfs3', nil
+  );
+
+type
+  { A countable mutex — test_mutex.c:35..38. }
+  PTestCountMutex = ^TTestCountMutex;
+  TTestCountMutex = record
+    pReal: Psqlite3_mutex;
+    eType: cint;
+  end;
+
+  { test_mutex_globals — test_mutex.c:41..49. }
+  TTestMutexGlobals = record
+    isInstalled: cint;                          { True if installed }
+    disableInit: cint;                          { True → sqlite3_initialize() fails }
+    disableTry:  cint;                          { True → sqlite3_mutex_try() fails }
+    isInit:      cint;                          { True if initialized }
+    m:           sqlite3_mutex_methods;         { Interface to "real" mutex system }
+    aCounter:    array[0..MAX_MUTEXES - 1] of cint; { Grabs of each type }
+    aStatic:     array[0..STATIC_MUTEXES - 1] of TTestCountMutex;
+  end;
+
+var
+  mutexG: TTestMutexGlobals;
+
+{ test_mutex.c:52..54 — counterMutexHeld. }
+function counterMutexHeld(p: Psqlite3_mutex): cint;
+begin
+  Result := mutexG.m.xMutexHeld(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:57..59 — counterMutexNotheld. }
+function counterMutexNotheld(p: Psqlite3_mutex): cint;
+begin
+  Result := mutexG.m.xMutexNotheld(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:66..72 — counterMutexInit. }
+function counterMutexInit: cint;
+begin
+  if mutexG.disableInit <> 0 then
+  begin
+    Result := mutexG.disableInit;
+    Exit;
+  end;
+  Result := mutexG.m.xMutexInit();
+  mutexG.isInit := 1;
+end;
+
+{ test_mutex.c:77..80 — counterMutexEnd. }
+function counterMutexEnd: cint;
+begin
+  mutexG.isInit := 0;
+  Result := mutexG.m.xMutexEnd();
+end;
+
+{ test_mutex.c:85..108 — counterMutexAlloc. }
+function counterMutexAlloc(eType: cint): Psqlite3_mutex;
+var
+  pReal: Psqlite3_mutex;
+  pRet:  PTestCountMutex;
+  eStaticType: cint;
+begin
+  pRet := nil;
+  Assert(mutexG.isInit <> 0);
+  Assert(eType >= SQLITE_MUTEX_FAST);
+  Assert(eType <= SQLITE_MUTEX_STATIC_VFS3);
+
+  pReal := mutexG.m.xMutexAlloc(eType);
+  if pReal = nil then
+  begin
+    Result := nil;
+    Exit;
+  end;
+
+  if (eType = SQLITE_MUTEX_FAST) or (eType = SQLITE_MUTEX_RECURSIVE) then
+    pRet := PTestCountMutex(GetMem(SizeOf(TTestCountMutex)))
+  else
+  begin
+    eStaticType := eType - (MAX_MUTEXES - STATIC_MUTEXES);
+    Assert(eStaticType >= 0);
+    Assert(eStaticType < STATIC_MUTEXES);
+    pRet := @mutexG.aStatic[eStaticType];
+  end;
+
+  pRet^.eType := eType;
+  pRet^.pReal := pReal;
+  Result := Psqlite3_mutex(pRet);
+end;
+
+{ test_mutex.c:113..119 — counterMutexFree. }
+procedure counterMutexFree(p: Psqlite3_mutex);
+begin
+  Assert(mutexG.isInit <> 0);
+  mutexG.m.xMutexFree(PTestCountMutex(p)^.pReal);
+  if (PTestCountMutex(p)^.eType = SQLITE_MUTEX_FAST)
+     or (PTestCountMutex(p)^.eType = SQLITE_MUTEX_RECURSIVE) then
+    FreeMem(Pointer(p));
+end;
+
+{ test_mutex.c:124..130 — counterMutexEnter. }
+procedure counterMutexEnter(p: Psqlite3_mutex);
+begin
+  Assert(mutexG.isInit <> 0);
+  Assert(PTestCountMutex(p)^.eType >= 0);
+  Assert(PTestCountMutex(p)^.eType < MAX_MUTEXES);
+  Inc(mutexG.aCounter[PTestCountMutex(p)^.eType]);
+  mutexG.m.xMutexEnter(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:135..142 — counterMutexTry. }
+function counterMutexTry(p: Psqlite3_mutex): cint;
+begin
+  Assert(mutexG.isInit <> 0);
+  Assert(PTestCountMutex(p)^.eType >= 0);
+  Assert(PTestCountMutex(p)^.eType < MAX_MUTEXES);
+  Inc(mutexG.aCounter[PTestCountMutex(p)^.eType]);
+  if mutexG.disableTry <> 0 then
+  begin
+    Result := SQLITE_BUSY;
+    Exit;
+  end;
+  Result := mutexG.m.xMutexTry(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:146..149 — counterMutexLeave. }
+procedure counterMutexLeave(p: Psqlite3_mutex);
+begin
+  Assert(mutexG.isInit <> 0);
+  mutexG.m.xMutexLeave(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:196..252 — install_mutex_counters BOOLEAN. }
+function test_install_mutex_counters(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc, isInstall: cint;
+  counter_methods: sqlite3_mutex_methods;
+begin
+  rc := SQLITE_OK;
+  counter_methods.xMutexInit    := @counterMutexInit;
+  counter_methods.xMutexEnd     := @counterMutexEnd;
+  counter_methods.xMutexAlloc   := @counterMutexAlloc;
+  counter_methods.xMutexFree    := @counterMutexFree;
+  counter_methods.xMutexEnter   := @counterMutexEnter;
+  counter_methods.xMutexTry     := @counterMutexTry;
+  counter_methods.xMutexLeave   := @counterMutexLeave;
+  counter_methods.xMutexHeld    := @counterMutexHeld;
+  counter_methods.xMutexNotheld := @counterMutexNotheld;
+
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @isInstall) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  Assert((isInstall = 0) or (isInstall = 1));
+  Assert((mutexG.isInstalled = 0) or (mutexG.isInstalled = 1));
+  if isInstall = mutexG.isInstalled then
+  begin
+    Tcl_AppendResult(interp, PChar('mutex counters are '), nil);
+    if isInstall <> 0 then
+      Tcl_AppendResult(interp, PChar('already installed'), nil)
+    else
+      Tcl_AppendResult(interp, PChar('not installed'), nil);
+    Result := TCL_ERROR; Exit;
+  end;
+
+  if isInstall <> 0 then
+  begin
+    Assert(not Assigned(mutexG.m.xMutexAlloc));
+    rc := sqlite3_config(SQLITE_CONFIG_GETMUTEX_U, @mutexG.m);
+    if rc = SQLITE_OK then
+      sqlite3_config(SQLITE_CONFIG_MUTEX_U, @counter_methods);
+    mutexG.disableTry := 0;
+  end
+  else
+  begin
+    Assert(Assigned(mutexG.m.xMutexAlloc));
+    rc := sqlite3_config(SQLITE_CONFIG_MUTEX_U, @mutexG.m);
+    FillChar(mutexG.m, SizeOf(sqlite3_mutex_methods), 0);
+  end;
+
+  if rc = SQLITE_OK then
+    mutexG.isInstalled := isInstall;
+
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:257..281 — read_mutex_counters. }
+function test_read_mutex_counters(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pRet: PTclObj;
+  ii:   cint;
+begin
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  pRet := Tcl_NewObj();
+  Tcl_IncrRefCount(pRet);
+  for ii := 0 to MAX_MUTEXES - 1 do
+  begin
+    Tcl_ListObjAppendElement(interp, pRet, Tcl_NewStringObj(mutexAName[ii], -1));
+    Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(mutexG.aCounter[ii]));
+  end;
+  Tcl_SetObjResult(interp, pRet);
+  Tcl_DecrRefCount(pRet);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:286..303 — clear_mutex_counters. }
+function test_clear_mutex_counters(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  ii: cint;
+begin
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  for ii := 0 to MAX_MUTEXES - 1 do
+    mutexG.aCounter[ii] := 0;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:310..324 — alloc_dealloc_mutex.  Allocate then free a FAST
+  mutex; return the (now stale) pointer so the caller can check it was
+  non-NULL. }
+function test_alloc_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  p:    Psqlite3_mutex;
+  zBuf: AnsiString;
+begin
+  p := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+  sqlite3_mutex_free(p);
+  { C uses sqlite3_snprintf(...,"%p",p).  SQLite's printf renders %p as a
+    bare hexadecimal integer (no 0x prefix), so a NULL pointer prints "0"
+    (mutex2-2.9 expects exactly "0"). }
+  if p = nil then
+    zBuf := '0'
+  else
+    zBuf := AnsiString(Format('%x', [PtrUInt(p)]));
+  Tcl_AppendResult(interp, PChar(zBuf), nil);
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ test_mutex.c:387..397 — getStaticMutexPointer. }
+function getStaticMutexPointer(pInterp: PTclInterp; pObj: PTclObj): Psqlite3_mutex;
+var
+  iMutex: cint;
+begin
+  if Tcl_GetIndexFromObj(pInterp, pObj, @mutexAName[0], PChar('mutex name'),
+       0, @iMutex) <> 0 then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  Assert((iMutex <> SQLITE_MUTEX_FAST) and (iMutex <> SQLITE_MUTEX_RECURSIVE));
+  Result := counterMutexAlloc(iMutex);
+end;
+
+{ test_mutex.c:399..416 — enter_static_mutex NAME. }
+function test_enter_static_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pMtx: Psqlite3_mutex;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pMtx := getStaticMutexPointer(interp, objv[1]);
+  if pMtx = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_enter(pMtx);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:418..435 — leave_static_mutex NAME. }
+function test_leave_static_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pMtx: Psqlite3_mutex;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pMtx := getStaticMutexPointer(interp, objv[1]);
+  if pMtx = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_leave(pMtx);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:437..454 — enter_db_mutex DB. }
+function test_enter_db_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if db = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_enter(Psqlite3_mutex(sqlite3_db_mutex(db)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:456..473 — leave_db_mutex DB. }
+function test_leave_db_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if db = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_leave(Psqlite3_mutex(sqlite3_db_mutex(db)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:6726..6746 — vfs_initfail_test.  Verifies that vfs_find /
+  vfs_register all fail while sqlite3_initialize() is failing. }
+function vfs_initfail_test(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  one: sqlite3_vfs;
+begin
+  FillChar(one, SizeOf(one), 0);
+  one.zName := PChar('__one');
+
+  if sqlite3_vfs_find(nil) <> nil then begin Result := TCL_ERROR; Exit; end;
+  sqlite3_vfs_register(@one, 0);
+  if sqlite3_vfs_find(nil) <> nil then begin Result := TCL_ERROR; Exit; end;
+  sqlite3_vfs_register(@one, 1);
+  if sqlite3_vfs_find(nil) <> nil then begin Result := TCL_ERROR; Exit; end;
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
 { test_mutex.c:337..372 — sqlite3_config OPTION.
   OPTION is one of the keywords singlethread/multithread/serialized
   (mapped to SQLITE_CONFIG_SINGLETHREAD/MULTITHREAD/SERIALIZED = 1/2/3)
@@ -2773,20 +3221,37 @@ end;
 
 { test_config.c / tclsqlite.c — thin wrappers around the engine
   lifecycle entry points; used by test_set_config_pagecache. }
+{ test_mutex.c:175..191 — sqlite3_initialize.  Returns sqlite3ErrName(rc)
+  (mutex1.test reads back SQLITE_OK / the disable_mutex_init failure code). }
 function test_initialize(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var rc: cint;
 begin
-  sqlite3_initialize;
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_initialize;
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
   Result := TCL_OK;
-  if (interp = nil) or (objc < 0) or (objv = nil) then ;
+  if clientData = nil then ;
 end;
 
+{ test_mutex.c:154..170 — sqlite3_shutdown.  Returns sqlite3ErrName(rc). }
 function test_shutdown(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var rc: cint;
 begin
-  sqlite3_shutdown;
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_shutdown;
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
   Result := TCL_OK;
-  if (interp = nil) or (objc < 0) or (objv = nil) then ;
+  if clientData = nil then ;
 end;
 
 { ----------------------------------------------------------------------
@@ -2848,6 +3313,11 @@ begin
     if Tcl_GetInt(interp, av[i], @a[i-2]) <> 0 then begin
       Result := TCL_ERROR; Exit;
     end;
+  { test1.c:1419 calls the public sqlite3_mprintf, which autoinits and
+    returns NULL when sqlite3_initialize() is failing (mutex2-2.4). }
+  if sqlite3_initialize <> SQLITE_OK then begin
+    Result := TCL_OK; Exit;
+  end;
   z := sqlite3PfMprintf(av[1], [a[0], a[1], a[2]]);
   Tcl_AppendResult(interp, z, Pointer(nil));
   sqlite3_free(z);
@@ -9854,6 +10324,36 @@ begin
   { test_mutex.c:337..372 — sqlite3_config OPTION. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config'),
     @test_config, nil, nil);
+  { test_mutex.c:475..504 — Sqlitetest_mutex_Init command table
+    (mutex1.test / mutex2.test).  sqlite3_config / _initialize / _shutdown
+    are already registered above. }
+  Tcl_CreateObjCommand(interp, PChar('enter_static_mutex'),
+    @test_enter_static_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('leave_static_mutex'),
+    @test_leave_static_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('enter_db_mutex'),
+    @test_enter_db_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('leave_db_mutex'),
+    @test_leave_db_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('alloc_dealloc_mutex'),
+    @test_alloc_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('install_mutex_counters'),
+    @test_install_mutex_counters, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('read_mutex_counters'),
+    @test_read_mutex_counters, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('clear_mutex_counters'),
+    @test_clear_mutex_counters, nil, nil);
+  { test_mutex.c:500..503 — Tcl_LinkVar the failure-injection switches. }
+  Tcl_LinkVar(interp, PChar('disable_mutex_init'),
+    @mutexG.disableInit, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('disable_mutex_try'),
+    @mutexG.disableTry, TCL_LINK_INT);
+  { test1.c:6726..6746 — vfs_initfail_test (mutex2-2.10). }
+  Tcl_CreateObjCommand(interp, PChar('vfs_initfail_test'),
+    @vfs_initfail_test, nil, nil);
+  { test_autoext.c:205..206 — sqlite3_auto_extension_sqr (mutex2-2.5). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_auto_extension_sqr'),
+    @test_auto_extension_sqr, nil, nil);
   { 9.4.divbug.88.050/051 — test_malloc.c:1494..1495 sqlite3_config_memstatus
     and sqlite3_config_lookaside. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_memstatus'),
