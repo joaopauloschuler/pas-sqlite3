@@ -2395,6 +2395,56 @@ begin
   if clientData = nil then ;
 end;
 
+{ test3.c:609..654 — btree_insert CSR ?KEY? VALUE.
+  ObjCommand: with KEY (objc=4) inserts an integer-key/table row whose rowid
+  is KEY and whose data is VALUE; without KEY (objc=3) inserts an index/blob
+  key whose bytes are VALUE. }
+function btree_insert(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pCur: PBtCursor;
+  rc:   cint;
+  x:    TBtreePayload;
+  n:    cint;
+begin
+  if (objc <> 4) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?-intkey? CSR KEY VALUE'));
+    Result := TCL_ERROR; Exit;
+  end;
+
+  FillChar(x, SizeOf(x), 0);
+  if objc = 4 then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[2], @rc) <> 0 then
+    begin Result := TCL_ERROR; Exit; end;
+    x.nKey := rc;
+    x.pData := Pointer(Tcl_GetByteArrayFromObj(objv[3], @n));
+    x.nData := cint(n);
+  end
+  else
+  begin
+    x.pKey := Pointer(Tcl_GetByteArrayFromObj(objv[2], @n));
+    x.nKey := cint(n);
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+
+  sqlite3_mutex_enter(PTsqlite3(pCur^.pBtree^.db)^.mutex);
+  sqlite3BtreeEnter(pCur^.pBtree);
+  rc := sqlite3BtreeInsert(pCur, @x, 0, 0);
+  sqlite3BtreeLeave(pCur^.pBtree);
+  sqlite3_mutex_leave(PTsqlite3(pCur^.pBtree^.db)^.mutex);
+
+  Tcl_ResetResult(interp);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test3.c:504..546 — btree_from_db DB-HANDLE ?N?.
   Returns the Btree* pointer for database iDb (default 0) of the SQLite
   connection bound to the Tcl `db` command.  Rendered as "%p" hex.
@@ -9362,6 +9412,9 @@ begin
   { 9.4.divbug.88.062 — btree_varint_test.  test3.c:675. }
   Tcl_CreateCommand(interp, PChar('btree_varint_test'),
     @btree_varint_test, nil, nil);
+  { test3.c:686 — btree_insert (ObjCommand). }
+  Tcl_CreateObjCommand(interp, PChar('btree_insert'),
+    @btree_insert, nil, nil);
   { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
     test1.c:9082 / test_malloc.c:1487. }
   Tcl_CreateCommand(interp, PChar('sqlite3_create_aggregate'),
