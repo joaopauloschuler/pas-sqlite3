@@ -32477,7 +32477,8 @@ begin
       cross-source `qual.col` collision (e.g. an outer leaf table and the same
       table nested inside a wrapper) and raise the same "ambiguous column name"
       C does on re-resolving the emitted qualified references. }
-    if (zTName = nil) and (pSrc^.nSrc > 1) and (not InRenameObject(pParse)) then
+    if (zTName = nil) and (pSrc^.nSrc > 1) and (not InRenameObject(pParse))
+       and ((p^.selFlags and SF_NestedFrom) = 0) then
     begin
       zBaseJ := CrossSourceAmbiguous;
       if zBaseJ <> nil then
@@ -32554,7 +32555,8 @@ begin
         single coalesced column out of such duplicates is still reported
         ambiguous, but via the USING-resolution path (16.3.1), not this scan. }
       if isNestedWrap and (zTName = nil) and (not InRenameObject(pParse))
-         and (pItem^.zAlias <> nil) then
+         and (pItem^.zAlias <> nil)
+         and ((p^.selFlags and SF_NestedFrom) = 0) then
       begin
         nWrapCol := pTab^.nCol;
         for jj := 0 to nWrapCol - 1 do
