@@ -129,7 +129,8 @@ procedure sqlite3DebugPrintf(zFormat: PAnsiChar;
   Used by every public entry above plus internal callers that prefer to
   stay in Pascal-string land. }
 function sqlite3FormatStr(fmt: PAnsiChar;
-  const args: array of const): AnsiString;
+  const args: array of const;
+  useExtended: Boolean = True): AnsiString;
 
 { Render a finite IEEE-754 double into zBuf using SQLite's own %!.*g
   algorithm (printf.c:528..738 + util.c:1380 sqlite3FpDecode).  Matches
@@ -291,6 +292,22 @@ begin
 end;
 
 { Apply width/precision/flags to a base value-string and append to a. }
+{ printf.c:505..518 — insert a thousands separator (',') every three digits
+  from the right of an unsigned digit string (no sign/prefix). }
+function insertThousands(const digits: AnsiString): AnsiString;
+var n, i, grp: i32;
+begin
+  n := Length(digits);
+  if n <= 3 then begin Result := digits; Exit; end;
+  Result := '';
+  grp := ((n - 1) mod 3) + 1;
+  for i := 1 to n do begin
+    Result := Result + digits[i];
+    Dec(grp);
+    if (grp = 0) and (i < n) then begin Result := Result + ','; grp := 3; end;
+  end;
+end;
+
 procedure emitField(var a: TAccum; const body: AnsiString;
   const prefix: AnsiString;
   width, prec: i32; leftAlign, zeroPad: Boolean;
@@ -948,7 +965,8 @@ end;
 procedure renderFloat(var dec: TFpDecode;
   isFloat, isGeneric: Boolean; eChar: AnsiChar;
   precision: i32; flagAlt, flagAlt2: Boolean;
-  out body: AnsiString; out usePrefix: Boolean);
+  out body: AnsiString; out usePrefix: Boolean;
+  flagThousand: Boolean = False);
 var
   flag_rtz, flag_dp: Boolean;
   exp, e2, j, nn: i32;
@@ -1000,7 +1018,19 @@ begin
   j := 0;
   if e2 < 0 then
     Put('0')
-  else begin
+  else if flagThousand then begin
+    { printf.c:641..646 — emit each integer-part digit, inserting a comma
+      after every group of three (when more than one digit remains). }
+    while e2 >= 0 do begin
+      if j < dec.n then begin
+        Put(PAnsiChar(dec.z)[j]);
+        Inc(j);
+      end else
+        Put('0');
+      if ((e2 mod 3) = 0) and (e2 > 1) then Put(',');
+      e2 := e2 - 1;
+    end;
+  end else begin
     j := e2 + 1;
     if j > dec.n then j := dec.n;
     PutS(dec.z, j);
@@ -1085,7 +1115,8 @@ end;
   ============================================================ }
 
 function sqlite3FormatStr(fmt: PAnsiChar;
-  const args: array of const): AnsiString;
+  const args: array of const;
+  useExtended: Boolean = True): AnsiString;
 var
   a:           TAccum;
   p:           PAnsiChar;
@@ -1098,6 +1129,7 @@ var
   spaceFlag:   Boolean;
   altFlag:     Boolean;
   altForm2:    Boolean;
+  thousand:    Boolean;
   longCount:   i32;
   iv:          i64;
   uv:          u64;
@@ -1173,8 +1205,16 @@ begin
     end;
     Inc(p); { past '%' }
 
+    { printf.c:256..259 — a trailing '%' at end of string emits a literal
+      '%' and stops. }
+    if p^ = #0 then begin
+      accumPutChar(a, '%');
+      Break;
+    end;
+
     leftAlign := False; zeroPad := False; plusFlag := False;
     spaceFlag := False; altFlag := False; altForm2 := False;
+    thousand := False;
     while True do begin
       case p^ of
         '-': leftAlign := True;
@@ -1183,6 +1223,7 @@ begin
         ' ': spaceFlag := True;
         '#': altFlag   := True;
         '!': altForm2  := True;
+        ',': thousand  := True;   { printf.c:274 cThousand }
       else
         Break;
       end;
@@ -1193,7 +1234,12 @@ begin
     width := 0;
     if p^ = '*' then begin
       NextArgI64(iv);
-      if iv < 0 then begin leftAlign := True; iv := -iv; end;
+      { printf.c:312..315 — negative '*' width sets left-justify and uses
+        the magnitude (INT_MIN clamps to 0). }
+      if iv < 0 then begin
+        leftAlign := True;
+        if iv >= -2147483647 then iv := -iv else iv := 0;
+      end;
       width := i32(iv);
       Inc(p);
     end else begin
@@ -1210,6 +1256,11 @@ begin
       prec := 0;
       if p^ = '*' then begin
         NextArgI64(iv);
+        { printf.c:334..337 — negative '*' precision becomes its magnitude
+          (INT_MIN clamps to -1). }
+        if iv < 0 then begin
+          if iv >= -2147483647 then iv := -iv else iv := -1;
+        end;
         prec := i32(iv);
         Inc(p);
       end else begin
@@ -1244,6 +1295,11 @@ begin
           else if plusFlag then prefix := '+'
           else if spaceFlag then prefix := ' '
           else prefix := '';
+          if thousand then begin
+            while Length(body) < prec do body := '0' + body;
+            body := insertThousands(body);
+            prec := -1;
+          end;
           emitField(a, body, prefix, width, prec, leftAlign, zeroPad, False);
           Inc(p);
         end;
@@ -1256,6 +1312,11 @@ begin
             l/ll widen to `unsigned long int`/u64 (64-bit on this target). }
           if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 10, False);
+          if thousand then begin
+            while Length(body) < prec do body := '0' + body;
+            body := insertThousands(body);
+            prec := -1;
+          end;
           emitField(a, body, '', width, prec, leftAlign, zeroPad, False);
           Inc(p);
         end;
@@ -1266,6 +1327,11 @@ begin
           if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 16, False);
           if altFlag and (uv <> 0) then prefix := '0x' else prefix := '';
+          if thousand then begin
+            while Length(body) < prec do body := '0' + body;
+            body := insertThousands(body);
+            prec := -1;
+          end;
           emitField(a, body, prefix, width, prec, leftAlign, zeroPad, False);
           Inc(p);
         end;
@@ -1276,6 +1342,11 @@ begin
           if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 16, True);
           if altFlag and (uv <> 0) then prefix := '0X' else prefix := '';
+          if thousand then begin
+            while Length(body) < prec do body := '0' + body;
+            body := insertThousands(body);
+            prec := -1;
+          end;
           emitField(a, body, prefix, width, prec, leftAlign, zeroPad, False);
           Inc(p);
         end;
@@ -1287,6 +1358,11 @@ begin
           body := renderUint(uv, 8, False);
           if altFlag and (Length(body) > 0) and (body[1] <> '0') then
             prefix := '0' else prefix := '';
+          if thousand then begin
+            while Length(body) < prec do body := '0' + body;
+            body := insertThousands(body);
+            prec := -1;
+          end;
           emitField(a, body, prefix, width, prec, leftAlign, zeroPad, False);
           Inc(p);
         end;
@@ -1350,10 +1426,14 @@ begin
             escape, and pass prec=-1 to emitField so width-padding does
             not re-truncate. }
           NextArgStr(s, wasNil);
-          if wasNil then s := '';
-          if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
-          body := escQ(s);
-          emitField(a, body, '', width, -1, leftAlign, False, True);
+          if wasNil then begin
+            { printf.c:872..875 — %q of a NULL pointer emits "(NULL)". }
+            emitField(a, '(NULL)', '', width, -1, leftAlign, False, True);
+          end else begin
+            if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
+            body := escQ(s);
+            emitField(a, body, '', width, -1, leftAlign, False, True);
+          end;
           Inc(p);
         end;
       'Q':
@@ -1372,14 +1452,22 @@ begin
       'w':
         begin
           NextArgStr(s, wasNil);
-          if wasNil then s := '';
-          if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
-          body := escW(s);
-          emitField(a, body, '', width, -1, leftAlign, False, True);
+          if wasNil then begin
+            { printf.c:872..875 — %w of a NULL pointer emits "(NULL)". }
+            emitField(a, '(NULL)', '', width, -1, leftAlign, False, True);
+          end else begin
+            if (prec >= 0) and (Length(s) > prec) then SetLength(s, prec);
+            body := escW(s);
+            emitField(a, body, '', width, -1, leftAlign, False, True);
+          end;
           Inc(p);
         end;
       'T':
         begin
+          { printf.c:954..955 — etTOKEN is only valid with
+            SQLITE_PRINTF_INTERNAL; otherwise it is an unknown specifier
+            and formatting stops. }
+          if not useExtended then Break;
           NextArgPtr(Pointer(uv));
           body := emitToken(Pointer(uv));
           emitField(a, body, '', width, prec, leftAlign, False, True);
@@ -1392,6 +1480,9 @@ begin
             subquery descriptor.  The `!` flag (altForm2) suppresses the
             zAlias-takes-priority rule so callers can force the underlying
             zName to be shown even when an alias is set. }
+          { printf.c:975..977 — etSRCITEM is only valid with
+            SQLITE_PRINTF_INTERNAL. }
+          if not useExtended then Break;
           NextArgPtr(Pointer(uv));
           body := emitSrcItem(Pointer(uv), altForm2);
           emitField(a, body, '', width, prec, leftAlign, False, True);
@@ -1512,7 +1603,7 @@ begin
             end;
 
             renderFloat(fpDec, fIsFloat, fIsGeneric, fEChar, prec,
-                        altFlag, altForm2, body, fNeedSign);
+                        altFlag, altForm2, body, fNeedSign, thousand);
           end;
 
           { Width / pad.  emitField with isString=False handles zero-pad
@@ -1520,10 +1611,21 @@ begin
           emitField(a, body, prefix, width, -1, leftAlign, zeroPad, False);
           Inc(p);
         end;
+      'n':
+        begin
+          { printf.c:740..749 — etSIZE.  %n stores the count-so-far through a
+            writable int*; in this array-of-const renderer there is no live
+            pointer to write, so consume the arg and emit nothing (matching
+            the bArgList branch which is a no-op).  This is a VALID specifier,
+            so it must not fall into the unknown-specifier Break below. }
+          NextArgPtr(Pointer(uv));
+          Inc(p);
+        end;
     else
-      { Unknown conversion — emit verbatim, keep going. }
-      accumPutChar(a, '%');
-      if p^ <> #0 then begin accumPutChar(a, p^); Inc(p); end;
+      { printf.c:1009..1011 — unknown conversion specifier (xtype==etINVALID):
+        SQLite stops formatting immediately, emitting nothing for the bad
+        specifier and discarding the rest of the format string. }
+      Break;
     end;
   end;
 
@@ -1564,7 +1666,9 @@ end;
 function sqlite3PfMprintf(fmt: PAnsiChar;
   const args: array of const): PAnsiChar;
 begin
-  Result := strDupLibc(sqlite3FormatStr(fmt, args));
+  { printf.c:1364 sqlite3_mprintf sets printfFlags=0 (no INTERNAL), so the
+    %T/%S extensions are NOT recognised here. }
+  Result := strDupLibc(sqlite3FormatStr(fmt, args, False));
 end;
 
 function sqlite3PfSnprintf(n: i32; zBuf: PAnsiChar; fmt: PAnsiChar;
@@ -1573,7 +1677,8 @@ var s: AnsiString; copy: i32;
 begin
   Result := zBuf;
   if (zBuf = nil) or (n <= 0) then Exit;
-  s := sqlite3FormatStr(fmt, args);
+  { printf.c — sqlite3_snprintf likewise uses printfFlags=0. }
+  s := sqlite3FormatStr(fmt, args, False);
   copy := Length(s);
   if copy > n - 1 then copy := n - 1;
   if copy > 0 then Move(PAnsiChar(s)^, zBuf^, copy);

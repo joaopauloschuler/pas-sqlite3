@@ -3451,6 +3451,67 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:542..560 — sqlite3_snprintf_int  SIZE FORMAT INT.
+  Prefill a 100-byte buffer with the alphabet, then snprintf(n,...). }
+function tcl_snprintf_int(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  zStr: array[0..99] of AnsiChar;
+  n:    cint;
+  a1:   cint;
+  v:    Int64;
+  code: Integer;
+  av:   PPAnsiCharArr;
+begin
+  av := argv;
+  Val(AnsiString(av[1]), v, code); if code <> 0 then v := 0;
+  n := cint(v);
+  Val(AnsiString(av[3]), v, code); if code <> 0 then v := 0;
+  a1 := cint(v);
+  if n > SizeOf(zStr) then n := SizeOf(zStr);
+  sqlite3PfSnprintf(SizeOf(zStr), @zStr[0],
+    PAnsiChar('abcdefghijklmnopqrstuvwxyz'), []);
+  sqlite3PfSnprintf(n, @zStr[0], av[2], [a1]);
+  Tcl_AppendResult(interp, @zStr[0], Pointer(nil));
+  Result := TCL_OK;
+end;
+
+{ test1.c:1518..1546 — sqlite3_snprintf_str  INT FORMAT INT INT ?STRING?. }
+function tcl_snprintf_str(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  a:    array[0..1] of cint;
+  i:    cint;
+  n:    cint;
+  z:    PAnsiChar;
+  zStr: PAnsiChar;
+  av:   PPAnsiCharArr;
+begin
+  av := argv;
+  if (argc < 5) or (argc > 6) then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' INT FORMAT INT INT ?STRING?"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetInt(interp, av[1], @n) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if n < 0 then begin
+    Tcl_AppendResult(interp, PChar('N must be non-negative'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 3 to 4 do
+    if Tcl_GetInt(interp, av[i], @a[i-3]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  if argc > 5 then zStr := av[5] else zStr := nil;
+  z := PAnsiChar(sqlite3_malloc(n + 1));
+  sqlite3PfSnprintf(n, z, av[2], [a[0], a[1], zStr]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
 { test1.c:1427..1451 — sqlite3_mprintf_int64. }
 function tcl_mprintf_int64(clientData: TClientData; interp: PTclInterp;
   argc: cint; argv: PPAnsiCharArr): cint; cdecl;
@@ -10518,6 +10579,10 @@ begin
     @tcl_mprintf_z_test, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_n_test'),
     @tcl_mprintf_n_test, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_snprintf_str'),
+    @tcl_snprintf_str, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_snprintf_int'),
+    @tcl_snprintf_int, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_step'),
     @tcl_test_step, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_finalize'),

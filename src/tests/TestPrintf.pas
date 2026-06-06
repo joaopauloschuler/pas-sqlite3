@@ -136,7 +136,9 @@ end;
 
 procedure TestUnknownConv;
 begin
-  CheckEq('T28 unknown %y', sqlite3FormatStr('a%yb', [42]), 'a%yb');
+  { printf.c:1009 — an unknown conversion specifier stops formatting; SQLite
+    emits only what was accumulated before the bad '%'. }
+  CheckEq('T28 unknown %y', sqlite3FormatStr('a%yb', [42]), 'a');
 end;
 
 procedure TestHeapWrappers;
