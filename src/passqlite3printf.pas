@@ -185,30 +185,55 @@ uses
   ============================================================ }
 type
   TAccum = record
-    buf:   AnsiString; { Pascal-managed; may be empty }
-    used:  PtrInt;     { count of bytes actually written (1..Length(buf)) }
+    buf:    AnsiString; { Pascal-managed; may be empty }
+    used:   PtrInt;     { count of bytes actually written (1..Length(buf)) }
+    tooBig: Boolean;    { set once a grow would exceed mxAlloc (SQLITE_TOOBIG) }
   end;
+
+{ Mirror SQLITE_MAX_LENGTH (printf.c StrAccum.mxAlloc for sqlite3_mprintf).
+  A request that would push the buffer beyond this is rejected as TOOBIG, so
+  e.g. a width of 2147483647 does not attempt a 2 GB pad+loop (printf-1.17). }
+const ACCUM_MAX = 1000000000;
 
 procedure accumInit(out a: TAccum);
 begin
   SetLength(a.buf, 64);
   a.used := 0;
+  a.tooBig := False;
 end;
 
-procedure accumGrow(var a: TAccum; need: PtrInt);
+{ Returns False (and sets tooBig) if used+need would exceed ACCUM_MAX. }
+function accumGrow(var a: TAccum; need: PtrInt): Boolean;
 var newCap: PtrInt;
 begin
+  if a.tooBig then begin Result := False; Exit; end;
+  if a.used + need > ACCUM_MAX then begin
+    a.tooBig := True; Result := False; Exit;
+  end;
   newCap := Length(a.buf);
   if newCap < 64 then newCap := 64;
   while newCap - a.used < need do newCap := newCap * 2;
   if newCap <> Length(a.buf) then SetLength(a.buf, newCap);
+  Result := True;
 end;
 
 procedure accumPutChar(var a: TAccum; c: AnsiChar); inline;
 begin
-  if a.used >= Length(a.buf) then accumGrow(a, 1);
+  if a.used >= Length(a.buf) then
+    if not accumGrow(a, 1) then Exit;
   a.buf[a.used + 1] := c;
   Inc(a.used);
+end;
+
+{ Append N copies of c.  Mirrors sqlite3_str_appendchar: one enlarge for the
+  whole run, and on TOOBIG nothing is appended (no per-char spin). }
+procedure accumPutCharN(var a: TAccum; n: PtrInt; c: AnsiChar);
+begin
+  if n <= 0 then Exit;
+  if a.used + n > Length(a.buf) then
+    if not accumGrow(a, n) then Exit;
+  FillChar(a.buf[a.used + 1], n, Byte(c));
+  Inc(a.used, n);
 end;
 
 procedure accumPut(var a: TAccum; const s: AnsiString); inline;
@@ -216,7 +241,8 @@ var n: PtrInt;
 begin
   n := Length(s);
   if n = 0 then Exit;
-  if a.used + n > Length(a.buf) then accumGrow(a, n);
+  if a.used + n > Length(a.buf) then
+    if not accumGrow(a, n) then Exit;
   Move(PAnsiChar(s)^, a.buf[a.used + 1], n);
   Inc(a.used, n);
 end;
@@ -224,13 +250,17 @@ end;
 procedure accumPutPC(var a: TAccum; z: PAnsiChar; n: PtrInt); inline;
 begin
   if (z = nil) or (n <= 0) then Exit;
-  if a.used + n > Length(a.buf) then accumGrow(a, n);
+  if a.used + n > Length(a.buf) then
+    if not accumGrow(a, n) then Exit;
   Move(z^, a.buf[a.used + 1], n);
   Inc(a.used, n);
 end;
 
 function accumFinish(var a: TAccum): AnsiString; inline;
 begin
+  { On TOOBIG C's sqlite3StrAccumFinish discards everything and returns NULL;
+    the Pascal callers map an empty result to NULL / "". }
+  if a.tooBig then begin Result := ''; Exit; end;
   SetLength(a.buf, a.used);
   Result := a.buf;
 end;
@@ -284,13 +314,13 @@ begin
   if leftAlign then begin
     accumPut(a, pre);
     accumPut(a, use);
-    while padN > 0 do begin accumPutChar(a, ' '); Dec(padN); end;
+    accumPutCharN(a, padN, ' ');
   end else if zeroPad and (not isString) then begin
     accumPut(a, pre);
-    while padN > 0 do begin accumPutChar(a, '0'); Dec(padN); end;
+    accumPutCharN(a, padN, '0');
     accumPut(a, use);
   end else begin
-    while padN > 0 do begin accumPutChar(a, ' '); Dec(padN); end;
+    accumPutCharN(a, padN, ' ');
     accumPut(a, pre);
     accumPut(a, use);
   end;
@@ -1080,6 +1110,7 @@ var
   fMxRound:    i32;
   fNeedSign:   Boolean;
   fSpecial:    Boolean;
+  szBufNeeded: i64;
   isNeg:       Boolean;
   body:        AnsiString;
   prefix:      AnsiString;
@@ -1220,6 +1251,10 @@ begin
         begin
           NextArgI64(iv);
           uv := u64(iv);
+          { printf.c:443..454 — without an l/ll length modifier the varargs
+            path reads `unsigned int` (32-bit), so mask the upper word.
+            l/ll widen to `unsigned long int`/u64 (64-bit on this target). }
+          if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 10, False);
           emitField(a, body, '', width, prec, leftAlign, zeroPad, False);
           Inc(p);
@@ -1228,6 +1263,7 @@ begin
         begin
           NextArgI64(iv);
           uv := u64(iv);
+          if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 16, False);
           if altFlag and (uv <> 0) then prefix := '0x' else prefix := '';
           emitField(a, body, prefix, width, prec, leftAlign, zeroPad, False);
@@ -1237,6 +1273,7 @@ begin
         begin
           NextArgI64(iv);
           uv := u64(iv);
+          if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 16, True);
           if altFlag and (uv <> 0) then prefix := '0X' else prefix := '';
           emitField(a, body, prefix, width, prec, leftAlign, zeroPad, False);
@@ -1246,6 +1283,7 @@ begin
         begin
           NextArgI64(iv);
           uv := u64(iv);
+          if longCount = 0 then uv := uv and u64($FFFFFFFF);
           body := renderUint(uv, 8, False);
           if altFlag and (Length(body) > 0) and (body[1] <> '0') then
             prefix := '0' else prefix := '';
@@ -1403,6 +1441,10 @@ begin
           if (p^ = 'E') or (p^ = 'G') then fEChar := 'E' else fEChar := 'e';
 
           if prec < 0 then prec := 6;
+          { printf.c:542..545 — SQLITE_FP_PRECISION_LIMIT hard cap so a rogue
+            precision (e.g. %.*f with 1e9) cannot drive a billion-digit
+            conversion (printf-2.1.2.10). }
+          if prec > 100000000 then prec := 100000000;
           if fIsFloat then        fIRound := -prec
           else if fIsGeneric then begin
             if prec = 0 then prec := 1;
@@ -1453,6 +1495,21 @@ begin
             end else if plusFlag then prefix := '+'
             else if spaceFlag then prefix := ' '
             else prefix := '';
+
+            { printf.c:624..629 — szBufNeeded folds the field width in, and a
+              request that cannot fit (vs mxAlloc) sets TOOBIG and bails BEFORE
+              rendering.  Without this guard a rogue width/precision (e.g.
+              %*.*f with width 2e9) would O(n^2)-render then pad (printf-2.1.2.10).
+              MAX(iDP-1,0) bounds the integer-part digit count; doubles cap iDP
+              near 340 so this never spuriously trips. }
+            if fpDec.iDP - 1 > 0 then szBufNeeded := fpDec.iDP - 1
+            else szBufNeeded := 0;
+            szBufNeeded := szBufNeeded + i64(prec) + i64(width) + 10;
+            if a.used + szBufNeeded > ACCUM_MAX then begin
+              a.tooBig := True;
+              Inc(p);
+              Continue;
+            end;
 
             renderFloat(fpDec, fIsFloat, fIsGeneric, fEChar, prec,
                         altFlag, altForm2, body, fNeedSign);
