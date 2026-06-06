@@ -40545,6 +40545,37 @@ begin
       if ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
          and (pItem^.u1.pFuncArg <> nil) then
         nFuncArg := pItem^.u1.pFuncArg^.nExpr;
+
+      { Table-valued-function arg-count validation.  This Pas-only
+        eponymous-vtab fast arm bypasses sqlite3WhereBegin, and therefore
+        bypasses sqlite3WhereTabFuncArgs (whereexpr.c:1899).  Mirror that
+        function's too-many-args guard here so a bare single-source TVF
+        scan with more args than hidden columns errors exactly as C does
+        (and as the WHERE/ORDER BY/LIMIT-bearing path already does via
+        WhereBegin).  Match the C loop: scan past hidden columns, one per
+        arg; when the args outrun the hidden columns, raise the error with
+        j = the number of args matched so far. }
+      if nFuncArg > 0 then
+      begin
+        kHC := 0;
+        jHC := 0;
+        while jHC < nFuncArg do
+        begin
+          while (kHC < pTab^.nCol)
+                and ((pTab^.aCol[kHC].colFlags and COLFLAG_HIDDEN) = 0) do
+            Inc(kHC);
+          if kHC >= pTab^.nCol then
+          begin
+            sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString(
+              Format('too many arguments on %s() - max %d',
+                [string(pTab^.zName), jHC]))));
+            Result := SQLITE_ERROR; Exit;
+          end;
+          Inc(kHC);
+          Inc(jHC);
+        end;
+      end;
+
       Inc(pParse^.nMem); regAgg := pParse^.nMem;
       Inc(pParse^.nMem);
       for iFA := 0 to nFuncArg - 1 do Inc(pParse^.nMem);
