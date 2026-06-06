@@ -64260,6 +64260,11 @@ begin
     sqlite3VdbeAddOp4(v, OP_String8, 0, 3, 0,
       sqlite3ErrStr(SQLITE_CORRUPT), P4_STATIC);         { 5 }
     sqlite3VdbeAddOp2(v, OP_Goto, 0, addrIc + 3);        { 6: goto ResultRow at slot 3 }
+    { pragma.c:2216 — point OP_Init (op 0) p3 at the "database disk image
+      is malformed" String8 (slot 5).  op_column_corrupt (vdbe.c:3260)
+      uses aOp[0].p3 to recover from a corrupt record by emitting that
+      message row instead of failing the whole PRAGMA. }
+    sqlite3VdbeChangeP3(v, 0, sqlite3VdbeCurrentAddr(v) - 2);
     Exit;
   end;
 end;
