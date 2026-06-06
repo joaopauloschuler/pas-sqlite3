@@ -33492,6 +33492,8 @@ var
   pVwWith:    PWith;         { BUG-2 — view body's own bView-marked With }
   zVwMsg:     PAnsiChar;     { BUG-1 — column-count mismatch message buffer }
   db:         PTsqlite3;
+  pVT:        passqlite3vtab.PVTable;  { select.c:6055 — vtab risk gate }
+  riskThreshold: u8;                   { 1 if SQLITE_TrustedSchema else 0 }
 begin
   db := pParse^.db;
   FillChar(w, SizeOf(w), 0);
@@ -33711,6 +33713,28 @@ begin
                 'access to view "%s" prohibited', [pTab^.zName]));
           sqlite3SrcItemAttachSubquery(pParse, pItem,
                                        pTab^.u.view_pSelect, 1);
+        end
+        { select.c:6054..6064 — else if( IsVirtual(pTab) ... ).  A VIRTUAL
+          table referenced from a DDL context (fg.fromDDL set, bit 0 of
+          fgBits2, or prepFlags & SQLITE_PREPARE_FROM_DDL) is unsafe when its
+          eVtabRisk exceeds the trusted-schema threshold (1 if
+          SQLITE_TrustedSchema set, else 0).  Mirrors vtabIsReadOnly. }
+        else if (pTab^.eTabType = TABTYP_VTAB)
+           and (((pItem^.fg.fgBits2 and u8($01)) <> 0)
+                or ((pParse^.prepFlags and SQLITE_PREPARE_FROM_DDL) <> 0)) then
+        begin
+          pVT := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab));
+          if pVT <> nil then
+          begin
+            if (pParse^.db^.flags and u64($00000080)) <> 0 then  { SQLITE_TrustedSchema }
+              riskThreshold := 1
+            else
+              riskThreshold := 0;
+            if pVT^.eVtabRisk > riskThreshold then
+              sqlite3ErrorMsg(pParse,
+                sqlite3MPrintf(pParse^.db,
+                  'unsafe use of virtual table "%s"', [pTab^.zName]));
+          end;
         end;
         if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
         begin
