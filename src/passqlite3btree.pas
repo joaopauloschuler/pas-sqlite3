@@ -7177,8 +7177,10 @@ begin
   else
     pBt^.max1bytePayload := u8(pBt^.maxLocal);
 
-  rc := allocateTempSpace(pBt);
-  if rc <> SQLITE_OK then goto btree_open_out;
+  { NB: C's sqlite3BtreeOpen does NOT allocate pTmpSpace here; it is
+    allocated lazily by btreeCursor() when the first WRITE cursor is
+    opened (btree.c:4746). Allocating eagerly here adds one extra
+    SQLITE_STATUS_PAGECACHE_USED page per connection (pcache2-1.2). }
 
   ppBtree^ := p;
   Result := SQLITE_OK;
