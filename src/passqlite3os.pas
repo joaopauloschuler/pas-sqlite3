@@ -2849,7 +2849,12 @@ var
   fd  : cint;
   got : ssize_t;
 begin
+  { os_unix.c:7104..7116 — always zero-fill first.  When the unit is compiled
+    -dSQLITE_TEST, os_unix.c #if's out the /dev/urandom read entirely so the
+    seed is all zeros and the PRNG sequence is repeatable across runs (the
+    fts3corrupt4-25.x corruption verdict depends on this determinism). }
   FillChar(zOut^, nByte, 0);
+  {$ifndef SQLITE_TEST}
   fd := FpOpen('/dev/urandom', O_RDONLY, 0);
   if fd >= 0 then begin
     repeat
@@ -2861,6 +2866,7 @@ begin
       Exit;
     end;
   end;
+  {$endif}
   Result := nByte;  { fallback: return nByte (zOut filled with zeros) }
 end;
 
