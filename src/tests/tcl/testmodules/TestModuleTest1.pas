@@ -7530,18 +7530,448 @@ begin
   if clientData = nil then ;
 end;
 
-{ 9.4.divbug.62.e — test_devsym.c:1095 devSymObjCmd stub.
-  The full device-simulation VFS (test_devsym.c) is NOT ported; tests
-  that rely on observable I/O-error injection through this VFS will
-  still mis-behave.  This shim accepts the upstream arg shape and
-  returns OK so tests that merely *register* a simulated device (or
-  toggle it back off) don't abort with `invalid command name`. }
+{ ============================================================
+  test_devsym.c — device-characteristics simulation VFS.
+  A thin pass-through VFS wrapping the default ("real") VFS that
+  overrides xDeviceCharacteristics()/xSectorSize() to report the
+  values set via `sqlite3_simulate_device`.  test6.c:716..1025
+  provides the Tcl glue (processDevSymArgs / devSymObjCmd /
+  dsUnregisterObjCmd).  Used by tkt-9d68c883.test.
+  ============================================================ }
+
+const
+  DEVSYM_MAX_PATHNAME = 512;
+  DEVSYM_VFS_NAME     = 'devsym';
+  WRITECRASH_NAME     = 'writecrash';
+
+type
+  { test_devsym.c:33..37 — devsym_file.  Must start with sqlite3_file
+    so a Psqlite3_file cast works; the real underlying sqlite3_file
+    lives immediately after this record (p->pReal = &p[1]). }
+  Pdevsym_file = ^Tdevsym_file;
+  Tdevsym_file = record
+    base  : sqlite3_file;
+    pReal : Psqlite3_file;
+  end;
+
+  { test_devsym.c:76..81 — struct DevsymGlobal g = {0, 0, 512, 0}. }
+  TDevsymGlobal = record
+    pVfs        : Psqlite3_vfs;
+    iDeviceChar : cint;
+    iSectorSize : cint;
+    nWriteCrash : cint;
+  end;
+
+var
+  devsym_g: TDevsymGlobal = (pVfs: nil; iDeviceChar: 0; iSectorSize: 512; nWriteCrash: 0);
+  devsym_vfs: sqlite3_vfs;
+  writecrash_vfs: sqlite3_vfs;
+  devsym_io_methods: sqlite3_io_methods;
+  writecrash_io_methods: sqlite3_io_methods;
+
+{ ----- io_methods (test_devsym.c:87..213) ----- }
+
+function devsymClose(pFile: Psqlite3_file): cint; cdecl;
+begin
+  sqlite3OsClose(Pdevsym_file(pFile)^.pReal);
+  Result := SQLITE_OK;
+end;
+
+function devsymRead(pFile: Psqlite3_file; zBuf: Pointer; iAmt: cint; iOfst: i64): cint; cdecl;
+begin
+  Result := sqlite3OsRead(Pdevsym_file(pFile)^.pReal, zBuf, iAmt, iOfst);
+end;
+
+function devsymWrite(pFile: Psqlite3_file; zBuf: Pointer; iAmt: cint; iOfst: i64): cint; cdecl;
+begin
+  Result := sqlite3OsWrite(Pdevsym_file(pFile)^.pReal, zBuf, iAmt, iOfst);
+end;
+
+function devsymTruncate(pFile: Psqlite3_file; size: i64): cint; cdecl;
+begin
+  Result := sqlite3OsTruncate(Pdevsym_file(pFile)^.pReal, size);
+end;
+
+function devsymSync(pFile: Psqlite3_file; flags: cint): cint; cdecl;
+begin
+  Result := sqlite3OsSync(Pdevsym_file(pFile)^.pReal, flags);
+end;
+
+function devsymFileSize(pFile: Psqlite3_file; pSize: Pi64): cint; cdecl;
+begin
+  Result := sqlite3OsFileSize(Pdevsym_file(pFile)^.pReal, pSize);
+end;
+
+function devsymLock(pFile: Psqlite3_file; eLock: cint): cint; cdecl;
+begin
+  Result := sqlite3OsLock(Pdevsym_file(pFile)^.pReal, eLock);
+end;
+
+function devsymUnlock(pFile: Psqlite3_file; eLock: cint): cint; cdecl;
+begin
+  Result := sqlite3OsUnlock(Pdevsym_file(pFile)^.pReal, eLock);
+end;
+
+function devsymCheckReservedLock(pFile: Psqlite3_file; pResOut: PcInt): cint; cdecl;
+begin
+  Result := sqlite3OsCheckReservedLock(Pdevsym_file(pFile)^.pReal, pResOut);
+end;
+
+function devsymFileControl(pFile: Psqlite3_file; op: cint; pArg: Pointer): cint; cdecl;
+begin
+  Result := sqlite3OsFileControl(Pdevsym_file(pFile)^.pReal, op, pArg);
+end;
+
+function devsymSectorSize(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := devsym_g.iSectorSize;
+  if pFile = nil then ;
+end;
+
+function devsymDeviceCharacteristics(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := devsym_g.iDeviceChar;
+  if pFile = nil then ;
+end;
+
+{ Shared-memory methods are all pass-throughs (test_devsym.c:190..213). }
+function devsymShmLock(pFile: Psqlite3_file; ofst: cint; n: cint; flags: cint): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  Result := p^.pReal^.pMethods^.xShmLock(p^.pReal, ofst, n, flags);
+end;
+
+function devsymShmMap(pFile: Psqlite3_file; iRegion: cint; szRegion: cint;
+  isWrite: cint; pp: PPointer): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  Result := p^.pReal^.pMethods^.xShmMap(p^.pReal, iRegion, szRegion, isWrite, pp);
+end;
+
+procedure devsymShmBarrier(pFile: Psqlite3_file); cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  p^.pReal^.pMethods^.xShmBarrier(p^.pReal);
+end;
+
+function devsymShmUnmap(pFile: Psqlite3_file; delFlag: cint): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  Result := p^.pReal^.pMethods^.xShmUnmap(p^.pReal, delFlag);
+end;
+
+{ ----- writecrash io_methods (test_devsym.c:351..379) ----- }
+
+function writecrashSectorSize(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := sqlite3OsSectorSize(Pdevsym_file(pFile)^.pReal);
+end;
+
+function writecrashDeviceCharacteristics(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := sqlite3OsDeviceCharacteristics(Pdevsym_file(pFile)^.pReal);
+end;
+
+function writecrashWrite(pFile: Psqlite3_file; zBuf: Pointer; iAmt: cint; iOfst: i64): cint; cdecl;
+begin
+  if devsym_g.nWriteCrash > 0 then begin
+    Dec(devsym_g.nWriteCrash);
+    if devsym_g.nWriteCrash = 0 then Halt(134);  { C calls abort() }
+  end;
+  Result := sqlite3OsWrite(Pdevsym_file(pFile)^.pReal, zBuf, iAmt, iOfst);
+end;
+
+{ ----- sqlite3_vfs methods (test_devsym.c:220..346) ----- }
+
+function devsymOpen(pVfs: Psqlite3_vfs; zName: sqlite3_filename;
+  pFile: Psqlite3_file; flags: cint; pOutFlags: PcInt): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  p^.pReal := Psqlite3_file(PtrUInt(p) + SizeOf(Tdevsym_file));
+  Result := sqlite3OsOpen(devsym_g.pVfs, zName, p^.pReal, flags, pOutFlags);
+  if p^.pReal^.pMethods <> nil then
+    pFile^.pMethods := @devsym_io_methods;
+  if pVfs = nil then ;
+end;
+
+function writecrashOpen(pVfs: Psqlite3_vfs; zName: sqlite3_filename;
+  pFile: Psqlite3_file; flags: cint; pOutFlags: PcInt): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  p^.pReal := Psqlite3_file(PtrUInt(p) + SizeOf(Tdevsym_file));
+  Result := sqlite3OsOpen(devsym_g.pVfs, zName, p^.pReal, flags, pOutFlags);
+  if p^.pReal^.pMethods <> nil then
+    pFile^.pMethods := @writecrash_io_methods;
+  if pVfs = nil then ;
+end;
+
+function devsymDelete(pVfs: Psqlite3_vfs; zPath: PChar; dirSync: cint): cint; cdecl;
+begin
+  Result := sqlite3OsDelete(devsym_g.pVfs, zPath, dirSync);
+  if pVfs = nil then ;
+end;
+
+function devsymAccess(pVfs: Psqlite3_vfs; zPath: PChar; flags: cint; pResOut: PcInt): cint; cdecl;
+begin
+  Result := sqlite3OsAccess(devsym_g.pVfs, zPath, flags, pResOut);
+  if pVfs = nil then ;
+end;
+
+function devsymFullPathname(pVfs: Psqlite3_vfs; zPath: PChar; nOut: cint; zOut: PChar): cint; cdecl;
+begin
+  Result := sqlite3OsFullPathname(devsym_g.pVfs, zPath, nOut, zOut);
+  if pVfs = nil then ;
+end;
+
+function devsymRandomness(pVfs: Psqlite3_vfs; nByte: cint; zBufOut: PChar): cint; cdecl;
+var pP: Psqlite3_vfs;
+begin
+  pP := devsym_g.pVfs;
+  Result := pP^.xRandomness(pP, nByte, zBufOut);
+  if pVfs = nil then ;
+end;
+
+function devsymSleep(pVfs: Psqlite3_vfs; nMicro: cint): cint; cdecl;
+begin
+  Result := sqlite3OsSleep(devsym_g.pVfs, nMicro);
+  if pVfs = nil then ;
+end;
+
+function devsymCurrentTime(pVfs: Psqlite3_vfs; pTimeOut: PDouble): cint; cdecl;
+begin
+  Result := devsym_g.pVfs^.xCurrentTime(devsym_g.pVfs, pTimeOut);
+  if pVfs = nil then ;
+end;
+
+procedure InitDevsymTables;
+begin
+  { devsym io_methods (test_devsym.c:227..245) — iVersion 2. }
+  FillChar(devsym_io_methods, SizeOf(devsym_io_methods), 0);
+  devsym_io_methods.iVersion              := 2;
+  devsym_io_methods.xClose                := @devsymClose;
+  devsym_io_methods.xRead                 := @devsymRead;
+  devsym_io_methods.xWrite                := @devsymWrite;
+  devsym_io_methods.xTruncate             := @devsymTruncate;
+  devsym_io_methods.xSync                 := @devsymSync;
+  devsym_io_methods.xFileSize             := @devsymFileSize;
+  devsym_io_methods.xLock                 := @devsymLock;
+  devsym_io_methods.xUnlock               := @devsymUnlock;
+  devsym_io_methods.xCheckReservedLock    := @devsymCheckReservedLock;
+  devsym_io_methods.xFileControl          := @devsymFileControl;
+  devsym_io_methods.xSectorSize           := @devsymSectorSize;
+  devsym_io_methods.xDeviceCharacteristics:= @devsymDeviceCharacteristics;
+  devsym_io_methods.xShmMap               := @devsymShmMap;
+  devsym_io_methods.xShmLock              := @devsymShmLock;
+  devsym_io_methods.xShmBarrier           := @devsymShmBarrier;
+  devsym_io_methods.xShmUnmap             := @devsymShmUnmap;
+
+  { writecrash io_methods (test_devsym.c:391..409). }
+  writecrash_io_methods := devsym_io_methods;
+  writecrash_io_methods.xWrite                  := @writecrashWrite;
+  writecrash_io_methods.xSectorSize             := @writecrashSectorSize;
+  writecrash_io_methods.xDeviceCharacteristics  := @writecrashDeviceCharacteristics;
+
+  { devsym_vfs (test_devsym.c:421..448) — iVersion 2.  Dl* slots are nil
+    because this build is SQLITE_OMIT_LOAD_EXTENSION. }
+  FillChar(devsym_vfs, SizeOf(devsym_vfs), 0);
+  devsym_vfs.iVersion      := 2;
+  devsym_vfs.szOsFile      := SizeOf(Tdevsym_file);
+  devsym_vfs.mxPathname    := DEVSYM_MAX_PATHNAME;
+  devsym_vfs.zName         := DEVSYM_VFS_NAME;
+  devsym_vfs.xOpen         := @devsymOpen;
+  devsym_vfs.xDelete       := @devsymDelete;
+  devsym_vfs.xAccess       := @devsymAccess;
+  devsym_vfs.xFullPathname := @devsymFullPathname;
+  devsym_vfs.xRandomness   := @devsymRandomness;
+  devsym_vfs.xSleep        := @devsymSleep;
+  devsym_vfs.xCurrentTime  := @devsymCurrentTime;
+
+  { writecrash_vfs (test_devsym.c:450..477). }
+  writecrash_vfs := devsym_vfs;
+  writecrash_vfs.zName := WRITECRASH_NAME;
+  writecrash_vfs.xOpen := @writecrashOpen;
+end;
+
+{ test_devsym.c:485..504 — devsym_register. }
+procedure devsym_register(iDeviceChar: cint; iSectorSize: cint);
+begin
+  if devsym_g.pVfs = nil then begin
+    InitDevsymTables;
+    devsym_g.pVfs := sqlite3_vfs_find(nil);
+    Inc(devsym_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    Inc(writecrash_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    sqlite3_vfs_register(@devsym_vfs, 0);
+    sqlite3_vfs_register(@writecrash_vfs, 0);
+  end;
+  if iDeviceChar >= 0 then devsym_g.iDeviceChar := iDeviceChar
+  else devsym_g.iDeviceChar := 0;
+  if iSectorSize >= 0 then devsym_g.iSectorSize := iSectorSize
+  else devsym_g.iSectorSize := 512;
+end;
+
+{ test_devsym.c:506..512 — devsym_unregister. }
+procedure devsym_unregister;
+begin
+  sqlite3_vfs_unregister(@devsym_vfs);
+  sqlite3_vfs_unregister(@writecrash_vfs);
+  devsym_g.pVfs := nil;
+  devsym_g.iDeviceChar := 0;
+  devsym_g.iSectorSize := 0;
+end;
+
+{ test_devsym.c:514..523 — devsym_crash_on_write. }
+procedure devsym_crash_on_write(nWrite: cint);
+begin
+  if devsym_g.pVfs = nil then begin
+    InitDevsymTables;
+    devsym_g.pVfs := sqlite3_vfs_find(nil);
+    Inc(devsym_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    Inc(writecrash_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    sqlite3_vfs_register(@devsym_vfs, 0);
+    sqlite3_vfs_register(@writecrash_vfs, 0);
+  end;
+  devsym_g.nWriteCrash := nWrite;
+end;
+
+{ test6.c:716..808 — processDevSymArgs.  Parses ?-sectorsize N?
+  ?-characteristics FLAGLIST? option pairs. }
+function processDevSymArgs(interp: PTclInterp; objc: cint; objv: PPTclObj;
+  piDeviceChar: PcInt; piSectorSize: PcInt): cint;
+type
+  TDeviceFlag = record zName: PChar; iValue: cint; end;
+const
+  aFlag: array[0..12] of TDeviceFlag = (
+    (zName: 'atomic';              iValue: SQLITE_IOCAP_ATOMIC),
+    (zName: 'atomic512';           iValue: SQLITE_IOCAP_ATOMIC512),
+    (zName: 'atomic1k';            iValue: SQLITE_IOCAP_ATOMIC1K),
+    (zName: 'atomic2k';            iValue: SQLITE_IOCAP_ATOMIC2K),
+    (zName: 'atomic4k';            iValue: SQLITE_IOCAP_ATOMIC4K),
+    (zName: 'atomic8k';            iValue: SQLITE_IOCAP_ATOMIC8K),
+    (zName: 'atomic16k';           iValue: SQLITE_IOCAP_ATOMIC16K),
+    (zName: 'atomic32k';           iValue: SQLITE_IOCAP_ATOMIC32K),
+    (zName: 'atomic64k';           iValue: SQLITE_IOCAP_ATOMIC64K),
+    (zName: 'sequential';          iValue: SQLITE_IOCAP_SEQUENTIAL),
+    (zName: 'safe_append';         iValue: SQLITE_IOCAP_SAFE_APPEND),
+    (zName: 'powersafe_overwrite'; iValue: SQLITE_IOCAP_POWERSAFE_OVERWRITE),
+    (zName: 'batch-atomic';        iValue: SQLITE_IOCAP_BATCH_ATOMIC)
+  );
+var
+  i, j, k        : cint;
+  nOpt           : cint;
+  zOpt           : PChar;
+  iDc, iSectorSize : cint;
+  setSectorsize, setDeviceChar : cint;
+  apObj          : PPTclObj;
+  nObj           : cint;
+  zFlag          : PChar;
+  s              : AnsiString;
+  found          : cint;
+begin
+  iDc := 0; iSectorSize := 0;
+  setSectorsize := 0; setDeviceChar := 0;
+  i := 0;
+  while i < objc do begin
+    nOpt := 0;
+    zOpt := Tcl_GetStringFromObj(objv[i], @nOpt);
+    if ((nOpt > 11) or (nOpt < 2) or (StrLComp('-sectorsize', zOpt, nOpt) <> 0))
+       and ((nOpt > 16) or (nOpt < 2) or (StrLComp('-characteristics', zOpt, nOpt) <> 0)) then
+    begin
+      Tcl_AppendResult(interp, PChar('Bad option: "'), zOpt,
+        PChar('" - must be "-characteristics" or "-sectorsize"'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    if i = objc - 1 then begin
+      Tcl_AppendResult(interp, PChar('Option requires an argument: "'),
+        zOpt, PChar('"'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    if zOpt[1] = 's' then begin
+      if Tcl_GetIntFromObj(interp, objv[i+1], @iSectorSize) <> 0 then begin
+        Result := TCL_ERROR; Exit;
+      end;
+      setSectorsize := 1;
+    end else begin
+      apObj := nil; nObj := 0;
+      if Tcl_ListObjGetElements(interp, objv[i+1], @nObj, @apObj) <> 0 then begin
+        Result := TCL_ERROR; Exit;
+      end;
+      for j := 0 to nObj - 1 do begin
+        zFlag := Tcl_GetString(PPTclObj(PtrUInt(apObj) + PtrUInt(j) * SizeOf(Pointer))^);
+        s := LowerCase(AnsiString(zFlag));
+        found := 0;
+        for k := 0 to High(aFlag) do
+          if s = AnsiString(aFlag[k].zName) then begin
+            iDc := iDc or aFlag[k].iValue;
+            found := 1;
+            Break;
+          end;
+        if found = 0 then begin
+          Tcl_AppendResult(interp, PChar('no such flag "'), zFlag,
+            PChar('"'), Pointer(nil));
+          Result := TCL_ERROR; Exit;
+        end;
+      end;
+      setDeviceChar := 1;
+    end;
+    Inc(i, 2);
+  end;
+
+  if setDeviceChar <> 0 then piDeviceChar^ := iDc;
+  if setSectorsize <> 0 then piSectorSize^ := iSectorSize;
+  Result := TCL_OK;
+end;
+
+{ test6.c:964..981 — devSymObjCmd.  tclcmd: sqlite3_simulate_device. }
 function tcl_test_simulate_device(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  iDc, iSectorSize: cint;
 begin
+  iDc := -1;
+  iSectorSize := -1;
+  if processDevSymArgs(interp, objc - 1, PPTclObj(@objv[1]), @iDc, @iSectorSize) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  devsym_register(iDc, iSectorSize);
   Result := TCL_OK;
-  if (clientData = nil) or (interp = nil) or (objc < 0) or
-     (objv = nil) then ;
+  if clientData = nil then ;
+end;
+
+{ test6.c:986..1005 — writeCrashObjCmd.  tclcmd: sqlite3_crash_on_write N. }
+function tcl_test_crash_on_write(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var nWrite: cint;
+begin
+  nWrite := 0;
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NWRITE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @nWrite) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  devsym_crash_on_write(nWrite);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test6.c:1010..1025 — dsUnregisterObjCmd.  tclcmd: unregister_devsim. }
+function tcl_test_unregister_devsim(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc <> 1 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  devsym_unregister;
+  Result := TCL_OK;
+  if clientData = nil then ;
 end;
 
 { 9.4.divbug.62.e — `sqlite3_user_version` has no upstream Tcl-command
@@ -9762,6 +10192,10 @@ begin
     @tcl_test_load_extension, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_simulate_device'),
     @tcl_test_simulate_device, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_crash_on_write'),
+    @tcl_test_crash_on_write, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('unregister_devsim'),
+    @tcl_test_unregister_devsim, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_user_version'),
     @tcl_test_user_version, nil, nil);
   { 9.4.divbug.87.005 — sqlite3_table_column_metadata (test1.c:9279). }
