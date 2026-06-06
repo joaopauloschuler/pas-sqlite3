@@ -33,6 +33,7 @@ uses
   TestModuleVfs,
   TestModuleFts3,
   TestModuleFs,
+  TestModuleIntarray,
   PasTclSqlite;
 
 exports
