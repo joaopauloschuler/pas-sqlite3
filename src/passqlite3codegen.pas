@@ -33627,6 +33627,20 @@ begin
         bit is set) would otherwise skip LocateTableItem and leave pSTab
         nil, breaking column resolution. }
       if pItem^.zName = nil then Continue;
+      { select.c:6036 — `if( !IsVirtual(pTab) && cannotBeFunction(...) )`.
+        In C this fires inside the ordinary-table arm, which always re-locates
+        the table (pSTab asserted 0).  This port may have pre-populated pSTab
+        in an earlier resolve pass (ResolveOuterIDs / WalkDeepFromSubqueries),
+        in which case the locate block below (gated on `pSTab = nil`) is
+        skipped and the cannotBeFunction guard there never runs — a plain
+        table/view used with `name(args)` syntax then leaks through to
+        sqlite3WhereTabFuncArgs and reports the wrong "too many arguments"
+        error (or, for a view, silently returns rows).  Mirror C here when
+        pSTab is already known and is not a virtual table. }
+      if (pItem^.pSTab <> nil)
+         and (pItem^.pSTab^.eTabType <> TABTYP_VTAB)
+         and (cannotBeFunction(pParse, pItem) <> 0) then
+        Exit;
       if pItem^.pSTab = nil then
       begin
         { CTE-resolution arm (select.c:6019) — try to bind pItem to an
@@ -33667,6 +33681,14 @@ begin
           Exit;
         end;
         Inc(pTab^.nTabRef);
+        { select.c:6037 — `if( !IsVirtual(pTab) && cannotBeFunction(...) )`.
+          A non-virtual table or view referenced with table-valued-function
+          syntax `name(args)` (isTabFunc bit set) is not a function: abort
+          with "'name' is not a function". Virtual tables legitimately use
+          this syntax (eponymous table-valued functions) and are exempt. }
+        if (pTab^.eTabType <> TABTYP_VTAB)
+           and (cannotBeFunction(pParse, pItem) <> 0) then
+          Exit;
         { fg.notCte = bit 2 of fgBits2. }
         pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $04;
       end;
@@ -34024,6 +34046,23 @@ begin
         pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
         pCur^.selFlags := pCur^.selFlags or SF_OnToWhere;
       end;
+
+      { select.c:663..664 — a table-valued function (virtual table) on the
+        RHS of an OUTER join carries its function-argument expressions under
+        the same "no forward table reference" rule as an ON clause.  Flag the
+        SELECT with SF_OnToWhere so sqlite3SelectCheckOnClauses later walks
+        pRight->u1.pFuncArg (via the bFuncArg loop) and errors with
+        "table-function argument references tables to its right".  Without
+        this the forward reference (e.g. generate_series(t2.y,5) JOIN t2 to
+        its right) slips through to the planner, which fails far less
+        helpfully with "no query solution". }
+      if (i > 0)
+         and (pItem^.pSTab <> nil)
+         and (pItem^.pSTab^.eTabType = TABTYP_VTAB)
+         and ((pItem^.fg.jointype and JT_OUTER) <> 0)
+         and ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+         and (pItem^.u1.pFuncArg <> nil) then
+        pCur^.selFlags := pCur^.selFlags or SF_OnToWhere;
     end;
   end;
   pCur := pCur^.pPrior;
