@@ -15993,6 +15993,40 @@ begin
   Result := WRC_Continue;
 end;
 
+{ renumberSelIdCallback / sqlite3RenumberSelId — port of the forum-fix
+  https://sqlite.org/forum/forumpost/0b9ded2f8428ac00 (select.c:5976..5979).
+  When a view body SELECT is COPIED (sqlite3SelectDup) and subsequently
+  modified, the copy's Select.selId is identical to the original.  The
+  SubrtnSig / findCompatibleInRhsSubrtn IN-RHS reuse logic (expr.c:3531..3673)
+  keys cached IN-list subroutines on selId, so two distinct copies that share
+  a selId would wrongly reuse each other's already-computed IN list (in7-3.3:
+  `SELECT * FROM v2 UNION ALL SELECT * FROM v1` returned v2's IN list twice).
+  C handles this in selectExpander by renumbering selId on every SELECT it
+  visits while expanding a view-body copy (Walker.eCode==1).  This port has a
+  minimum-viable expander, so we replicate the renumbering with an explicit
+  walk over the just-attached view-body copy. }
+function renumberSelIdCallback(pWalker: PWalker; pSel: PSelect): i32; cdecl;
+begin
+  if (pSel^.selFlags and SF_Expanded) = 0 then
+  begin
+    Inc(pWalker^.pParse^.nSelect);
+    pSel^.selId := u32(pWalker^.pParse^.nSelect);
+  end;
+  Result := WRC_Continue;
+end;
+
+procedure sqlite3RenumberSelId(pParse: PParse; p: PSelect);
+var
+  w: TWalker;
+begin
+  if p = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.pParse          := pParse;
+  w.xExprCallback   := @sqlite3ExprWalkNoop;
+  w.xSelectCallback := @renumberSelIdCallback;
+  sqlite3WalkSelect(@w, p);
+end;
+
 { sqlite3SelectWalkFail — abort walk and clear pWalker^.eCode (expr.c:2308).
   Used by every walker that wants to refuse to descend into sub-selects;
   exprIsDeterministic() below is one such caller. }
@@ -33681,6 +33715,13 @@ begin
         if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
         begin
           pVwBody := pItem^.u4.pSubq^.pSelect;
+          { Forum fix 0b9ded2f8428ac00 (select.c:5976..5979) — the view body
+            is a COPY (sqlite3SelectDup in sqlite3SrcItemAttachSubquery) that
+            keeps the original's selId.  Renumber selId on every SELECT in the
+            copy BEFORE it is expanded/prepped so the SubrtnSig IN-RHS reuse
+            logic treats distinct view-body copies as distinct (in7-3.3). }
+          if (pVwBody^.selFlags and SF_Expanded) = 0 then
+            sqlite3RenumberSelId(pParse, pVwBody);
           { BUG-2 / select.c:5982..5991 — a view body is a closed scope: it
             must NOT see CTEs defined by the WITH of the query that USES the
             view.  C marks the view body's With with bView=1 and pushes it,
