@@ -2455,6 +2455,7 @@ var
   z              : PChar;
   nTotal         : SizeInt;
   pPgrBack       : PPager;
+  ii             : u32;
 begin
   ppPager        := nil;
   rc             := SQLITE_OK;
@@ -2635,6 +2636,15 @@ begin
             szPageDflt := SQLITE_MAX_DEFAULT_PAGE_SIZE
           else
             szPageDflt := pPgr^.sectorSize;
+        end;
+        { SQLITE_ENABLE_ATOMIC_WRITE: grow default page size to largest
+        ** size for which the device advertises atomic writes. }
+        ii := szPageDflt;
+        while ii <= SQLITE_MAX_DEFAULT_PAGE_SIZE do
+        begin
+          if (iDc and (SQLITE_IOCAP_ATOMIC or (i32(ii) shr 8))) <> 0 then
+            szPageDflt := ii;
+          ii := ii * 2;
         end;
       end;
       if sqlite3_uri_boolean(pPgr^.zFilename, 'nolock', 0) <> 0 then
@@ -3147,11 +3157,28 @@ begin
     Result := 0;
 end;
 
-{ pager.c ~1194: jrnlBufferSize -- 0 for our build (no ATOMIC_WRITE) }
+{ pager.c ~1194: jrnlBufferSize (SQLITE_ENABLE_ATOMIC_WRITE) }
 function jrnlBufferSize(pPager: PPager): i32;
+var
+  dc      : i32;   { Device characteristics }
+  nSector : i32;
+  szPage  : i32;
 begin
-  Result := 0;
-  if pPager = nil then;
+  Assert(isOpen(pPager^.fd) <> 0, 'jrnlBufferSize: fd open');
+  dc := sqlite3OsDeviceCharacteristics(pPager^.fd);
+
+  nSector := i32(pPager^.sectorSize);
+  szPage  := i32(pPager^.pageSize);
+
+  { C: if( 0==(dc&(SQLITE_IOCAP_ATOMIC|(szPage>>8)) || nSector>szPage) )
+    i.e. 0 == ( (dc & mask) || (nSector>szPage) ) -- true when both terms are zero. }
+  if ((dc and (SQLITE_IOCAP_ATOMIC or (szPage shr 8))) = 0) and (nSector <= szPage) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+
+  Result := i32(JOURNAL_HDR_SZ(pPager) + JOURNAL_PG_SZ(pPager));
 end;
 
 { pager.c ~1981: pagerFlushOnCommit }
@@ -4485,30 +4512,60 @@ begin
   end;
 end;
 
-{ pager.c: pager_incr_changecounter -- increment change counter (non-atomic mode) }
+{ pager.c ~6317: pager_incr_changecounter (SQLITE_ENABLE_ATOMIC_WRITE) }
 function pager_incr_changecounter(pPager: PPager; isDirectMode: i32): i32;
 var
   rc: i32;
-  pHdr: PPgHdr;
+  pPg1: PPgHdr;
+  zBuf: Pointer;
+  pCopy: Pointer;
 begin
+  { DIRECT_MODE := isDirectMode (atomic-write enabled) }
   rc := SQLITE_OK;
-  pHdr := nil;
+  pPg1 := nil;
   if (pPager^.changeCountDone = 0) and (pPager^.dbSize > 0) then
   begin
-    rc := sqlite3PagerGet(pPager, 1, @pHdr, 0);
+    { Open page 1 of the file for writing. }
+    rc := sqlite3PagerGet(pPager, 1, @pPg1, 0);
+
+    { If page one was fetched successfully, and this function is not
+    ** operating in direct-mode, make page 1 writable. }
+    if (isDirectMode = 0) and (rc = SQLITE_OK) then
+      rc := sqlite3PagerWrite(pPg1);
+
     if rc = SQLITE_OK then
     begin
-      rc := sqlite3PagerWrite(pHdr);
-      if rc = SQLITE_OK then
+      { Actually do the update of the change counter }
+      pager_write_changecounter(pPg1);
+
+      { If running in direct mode, write the contents of page 1 to the file. }
+      if isDirectMode <> 0 then
       begin
-        pager_write_changecounter(pHdr);
+        Assert(pPager^.dbFileSize > 0, 'pager_incr_changecounter: dbFileSize>0');
+        zBuf := pPg1^.pData;
+        if rc = SQLITE_OK then
+        begin
+          rc := sqlite3OsWrite(pPager^.fd, zBuf, i32(pPager^.pageSize), 0);
+          Inc(pPager^.aStat[PAGER_STAT_WRITE]);
+        end;
+        if rc = SQLITE_OK then
+        begin
+          { Update the pager's copy of the change-counter. Otherwise, the
+          ** next time a read transaction is opened the cache will be
+          ** flushed (as the change-counter values will not match). }
+          pCopy := Pointer(PByte(zBuf) + 24);
+          Move(pCopy^, pPager^.dbFileVers, SizeOf(pPager^.dbFileVers));
+          pPager^.changeCountDone := 1;
+        end;
+      end
+      else
         pPager^.changeCountDone := 1;
-      end;
-      sqlite3PagerUnref(pHdr);
     end;
+
+    { Release the page reference. }
+    sqlite3PagerUnref(pPg1);
   end;
   Result := rc;
-  if isDirectMode = 0 then; { suppress unused warning }
 end;
 
 { pager.c: sqlite3PagerSync -- sync the database file }
@@ -4549,6 +4606,7 @@ var
   rc       : i32;
   pList    : PPgHdr;
   pPageOne : PPgHdr;
+  pPg      : PPgHdr;
 begin
   rc := SQLITE_OK;
   pPageOne := nil;
@@ -4578,8 +4636,28 @@ begin
   end
   else
   begin
-    { Non-WAL rollback path }
-    rc := pager_incr_changecounter(pPager, 0);
+    { Non-WAL rollback path.
+    ** Update the change-counter. If the atomic-write optimization is
+    ** applicable to this transaction (no super-journal, journal is open,
+    ** exactly one page modified and stored in the journal, and the db is
+    ** not growing), update the change-counter via the direct-write method;
+    ** the journal file is never created in that case. Otherwise create the
+    ** journal file and update the change-counter in indirect mode. }
+    pPg := sqlite3PcacheDirtyList(pPager^.pPCache);
+    if (zSuper = nil) and (isOpen(pPager^.jfd) <> 0)
+       and (pPager^.journalOff = jrnlBufferSize(pPager))
+       and (pPager^.dbSize >= pPager^.dbOrigSize)
+       and ((pPg = nil) or (pPg^.pDirty = nil)) then
+    begin
+      { Update the db file change counter via the direct-write method. }
+      rc := pager_incr_changecounter(pPager, 1);
+    end
+    else
+    begin
+      rc := sqlite3JournalCreate(pPager^.jfd);
+      if rc = SQLITE_OK then
+        rc := pager_incr_changecounter(pPager, 0);
+    end;
     if rc <> SQLITE_OK then goto commit_phase_one_exit;
 
     rc := writeSuperJournal(pPager, zSuper);

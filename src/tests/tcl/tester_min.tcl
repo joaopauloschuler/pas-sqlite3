@@ -461,13 +461,12 @@ set ::sqlite_options(mmap) 0           ;# port treats SQLITE_MAX_MMAP_SIZE as 0 
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
-# pas-sqlite3's unixSync_impl (passqlite3os.pas) does NOT port the os_unix.c
-# UNIXFILE_DIRSYNC arm (no openDirectory + dirfd fsync after the journal sync);
-# directory fsyncs are effectively disabled, matching a SQLITE_DISABLE_DIRSYNC
-# build (test_config.c:116..119).  Pin dirsync=0 so sync.test / sync2.test /
-# wal2.test's cond_incr_sync_count adjusts the expected count to match the
-# engine's actual fsync tally.
-set ::sqlite_options(dirsync) 0        ;# unixSync omits the dir-fsync arm
+# pas-sqlite3's unixSync_impl (passqlite3os.pas) now ports the os_unix.c
+# UNIXFILE_DIRSYNC arm (openDirectory + dirfd fsync after a newly-created
+# journal/wal is synced), matching a build WITHOUT SQLITE_DISABLE_DIRSYNC.
+# Faithful value is 1 (test_config.c:119); io.test / sync.test count this
+# directory fsync via $sqlite_sync_count.
+set ::sqlite_options(dirsync) 1        ;# unixSync performs the dir-fsync arm
 set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
 # pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
 # behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its

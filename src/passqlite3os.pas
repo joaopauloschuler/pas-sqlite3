@@ -919,6 +919,8 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+function c_close_early(fd: cint): cint; cdecl;
+  external 'c' name 'close';
 { posix_fallocate(3): pre-allocate disk space for an open file.
   Returns 0 on success or an error number directly (NOT -1/errno).
   Used early by fcntlSizeHint; the matching binding in the later
@@ -969,6 +971,7 @@ function  unixWrite_impl(pFile: Psqlite3_file; pBuf: Pointer;
             iAmt: cint; iOfst: i64): cint; cdecl; forward;
 function  unixTruncate_impl(pFile: Psqlite3_file; size: i64): cint; cdecl; forward;
 function  unixSync_impl(pFile: Psqlite3_file; flags: cint): cint; cdecl; forward;
+function  pas_openDirectory(zPath: PChar; pFd: PcInt): cint; cdecl; forward;
 function  unixFileSize_impl(pFile: Psqlite3_file; pSize: Pi64): cint; cdecl; forward;
 function  unixLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
 function  unixUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
@@ -1950,6 +1953,7 @@ function unixSync_impl(pFile: Psqlite3_file; flags: cint): cint; cdecl;
 var
   pf : PunixFile;
   rc : cint;
+  dirfd : cint;
 begin
   pf := PunixFile(pFile);
   {$ifdef SQLITE_TEST}
@@ -1974,8 +1978,24 @@ begin
   if rc <> 0 then begin
     pf^.lastErrno := fpgeterrno;
     Result := SQLITE_IOERR_FSYNC;
-  end else
-    Result := SQLITE_OK;
+    Exit;
+  end;
+  Result := SQLITE_OK;
+
+  { os_unix.c:3937..3954 — also fsync the directory containing the file if
+    the DIRSYNC flag is set.  This is a one-time occurrence.  Many systems
+    are unable to fsync a directory, so ignore errors on the fsync. }
+  if (pf^.ctrlFlags and UNIXFILE_DIRSYNC) <> 0 then begin
+    if pas_openDirectory(pf^.zPath, @dirfd) = SQLITE_OK then begin
+      { full_fsync(dirfd,0,0) — bumps sqlite3_sync_count unconditionally. }
+      {$ifdef SQLITE_TEST}
+      Inc(sqlite3_sync_count);
+      {$endif}
+      c_fsync(dirfd);
+      c_close_early(dirfd);
+    end;
+    pf^.ctrlFlags := pf^.ctrlFlags and (not UNIXFILE_DIRSYNC);
+  end;
 end;
 
 { os_unix.c ~4011: unixFileSize_impl — return current file size in bytes }
@@ -2559,6 +2579,12 @@ begin
   if isReadonly then ctrlFlags := ctrlFlags or UNIXFILE_RDONLY;
   if eType <> SQLITE_OPEN_MAIN_DB then
     ctrlFlags := ctrlFlags or UNIXFILE_NOLOCK;
+  { os_unix.c:6569/6777 — a newly-created journal/wal needs its containing
+    directory fsync'd once (UNIXFILE_DIRSYNC). }
+  if isCreate and ((eType = SQLITE_OPEN_SUPER_JOURNAL)
+                or (eType = SQLITE_OPEN_MAIN_JOURNAL)
+                or (eType = SQLITE_OPEN_WAL)) then
+    ctrlFlags := ctrlFlags or UNIXFILE_DIRSYNC;
   if (flags and SQLITE_OPEN_URI) <> 0 then
     ctrlFlags := ctrlFlags or UNIXFILE_URI;
   { 9.4.divbug.34 — POWERSAFE_OVERWRITE on by default (os_unix.c:6098..6106).
@@ -2668,6 +2694,10 @@ begin
       sep^ := #0;
     dfd := FpOpen(@dir[0], O_RDONLY, 0);
     if dfd >= 0 then begin
+      { os_unix.c:6858 full_fsync(fd,0,0) — bumps sqlite3_sync_count. }
+      {$ifdef SQLITE_TEST}
+      Inc(sqlite3_sync_count);
+      {$endif}
       c_fsync(dfd);
       FpClose(dfd);
     end;
