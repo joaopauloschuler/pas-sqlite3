@@ -1060,6 +1060,19 @@ const
   SQLITE_EVAL_WITHOUTNULLS = $00001;  { tclsqlite.c:1638 }
   SQLITE_EVAL_ASDICT       = $00002;  { tclsqlite.c:1639 }
 
+{ Tcl_BounceRefCount — port of the tclsqlite.c:52 helper macro
+  `Tcl_IncrRefCount(X); Tcl_DecrRefCount(X)`.  Frees an unowned Tcl_Obj
+  (refcount 0) by bumping then dropping its reference; a no-op for an
+  object that is still referenced elsewhere. }
+procedure Tcl_BounceRefCount(objPtr: PTclObj); inline;
+begin
+  if objPtr <> nil then
+  begin
+    Tcl_IncrRefCount(objPtr);
+    Tcl_DecrRefCount(objPtr);
+  end;
+end;
+
 procedure DbReleaseColumnNames(p: PDbEvalContext);
 var
   i: cint;
@@ -1104,6 +1117,8 @@ var
   slot:      PPTclObj;
   pColList:  PTclObj;
   pStar:     PTclObj;
+  pDict:     PTclObj;
+  pInterp:   PTclInterp;
 begin
   if p^.apColName = nil then
   begin
@@ -1122,21 +1137,32 @@ begin
       end;
       p^.apColName := apColName;
     end;
-    { Populate target(*) — tclsqlite.c:1718..1744 (array form only;
-      dict form is identical in spec but unused by the smoke gates). }
-    if (p^.pVarName <> nil) and (apColName <> nil) and
-       ((p^.evalFlags and SQLITE_EVAL_ASDICT) = 0) then
+    { Populate target(*) / dict(*) — tclsqlite.c:1716..1744. }
+    if p^.pVarName <> nil then
     begin
-      pColList := Tcl_NewListObj(0, nil);
+      pInterp  := p^.pDb^.interp;
+      pColList := Tcl_NewObj;
       pStar    := Tcl_NewStringObj('*', -1);
       Tcl_IncrRefCount(pColList);
       Tcl_IncrRefCount(pStar);
       for i := 0 to nCol - 1 do
       begin
         slot := PPTclObj(PtrUInt(apColName) + PtrUInt(i)*SizeOf(Pointer));
-        Tcl_ListObjAppendElement(p^.pDb^.interp, pColList, slot^);
+        Tcl_ListObjAppendElement(pInterp, pColList, slot^);
       end;
-      Tcl_ObjSetVar2(p^.pDb^.interp, p^.pVarName, pStar, pColList, 0);
+      if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+        Tcl_ObjSetVar2(pInterp, p^.pVarName, pStar, pColList, 0)
+      else
+      begin
+        pDict := Tcl_ObjGetVar2(pInterp, p^.pVarName, nil, 0);
+        if pDict = nil then
+          pDict := Tcl_NewDictObj
+        else if Tcl_IsShared(pDict) <> 0 then
+          pDict := Tcl_DuplicateObj(pDict);
+        if Tcl_DictObjPut(pInterp, pDict, pStar, pColList) = TCL_OK then
+          Tcl_ObjSetVar2(pInterp, p^.pVarName, nil, pDict, 0);
+        Tcl_BounceRefCount(pDict);
+      end;
       Tcl_DecrRefCount(pStar);
       Tcl_DecrRefCount(pColList);
     end;
@@ -1283,6 +1309,7 @@ var
   slot:      PPTclObj;
   pColName:  PTclObj;
   pColVal:   PTclObj;
+  pDict:     PTclObj;
   data1:     PClientDataArray;
 begin
   rc := bodyRc;
@@ -1300,20 +1327,47 @@ begin
     begin
       slot := PPTclObj(PtrUInt(apColName) + PtrUInt(i)*SizeOf(Pointer));
       pColName := slot^;
+      { tclsqlite.c:1929..1977 — per-column target population, four arms. }
       if pVarName = nil then
         Tcl_ObjSetVar2(interp, pColName, nil, DbEvalColumnValueCtx(p, i), 0)
       else if ((p^.evalFlags and SQLITE_EVAL_WITHOUTNULLS) <> 0)
            and (sqlite3_column_type(p^.pPreStmt^.pStmt, i) = SQLITE_NULL) then
       begin
-        { tclsqlite.c:1938..1958 — drop the NULL column from the target.
-          Only the array form is ported (the -asdict dict path is not yet
-          wired through the Tcl bridge). }
+        { Remove NULL-containing column from the target container. }
         if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+          { Target is an array. }
           Tcl_UnsetVar2(interp, Tcl_GetString(pVarName),
-                        Tcl_GetString(pColName), 0);
+                        Tcl_GetString(pColName), 0)
+        else
+        begin
+          { Target is a dict. }
+          pDict := Tcl_ObjGetVar2(interp, pVarName, nil, 0);
+          if pDict <> nil then
+          begin
+            if Tcl_IsShared(pDict) <> 0 then
+              pDict := Tcl_DuplicateObj(pDict);
+            if Tcl_DictObjRemove(interp, pDict, pColName) = TCL_OK then
+              Tcl_ObjSetVar2(interp, pVarName, nil, pDict, 0);
+            Tcl_BounceRefCount(pDict);
+          end;
+        end;
       end
+      else if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+        { Target is an array: set target(colName) = colValue. }
+        Tcl_ObjSetVar2(interp, pVarName, pColName, DbEvalColumnValueCtx(p, i), 0)
       else
-        Tcl_ObjSetVar2(interp, pVarName, pColName, DbEvalColumnValueCtx(p, i), 0);
+      begin
+        { Target is a dict: set target(colName) = colValue. }
+        pDict := Tcl_ObjGetVar2(interp, pVarName, nil, 0);
+        if pDict = nil then
+          pDict := Tcl_NewDictObj
+        else if Tcl_IsShared(pDict) <> 0 then
+          pDict := Tcl_DuplicateObj(pDict);
+        if Tcl_DictObjPut(interp, pDict, pColName,
+                          DbEvalColumnValueCtx(p, i)) = TCL_OK then
+          Tcl_ObjSetVar2(interp, pVarName, nil, pDict, 0);
+        Tcl_BounceRefCount(pDict);
+      end;
     end;
 
     { 9.4.divbug.28 — the NRE per-row continuation path crashes (Tcl
@@ -1459,8 +1513,8 @@ begin
   { Option-parsing loop — port of tclsqlite.c:3300..3318.  Consume any
     leading `-withoutnulls`/`-asdict` switches; an unknown `-` option is
     an error.  Each consumed switch shifts objv up by one and decrements
-    objc, exactly as the C `objc--; objv++;` does.  (The eval flags are
-    accepted but their row-shaping semantics are not yet implemented.) }
+    objc, exactly as the C `objc--; objv++;` does.  The flags drive the
+    row-shaping done in DbEvalRowInfo / DbEvalNextCmd. }
   while (objc > 3) and (ObjvAt(objv, 2) <> nil) do
   begin
     zOpt := Tcl_GetString(ObjvAt(objv, 2));
@@ -3187,6 +3241,10 @@ begin
     sqlite3_exec(pDb^.db, PChar('ROLLBACK'), nil, nil, nil);
   end;
 
+  { tclsqlite.c:1346 — release the reference taken in DbTransactionArm.
+    If `db close` ran inside the body, this drops nRef to 0 and finally
+    closes/frees the connection here. }
+  DelDatabaseRef(pDb);
   Result := rc;
 end;
 
@@ -3262,6 +3320,10 @@ begin
     continuation and hand the body off to Tcl_NREvalObj so nested vwait
     can unwind cleanly; otherwise fall back to the recursive form. }
   pDb^.interp := interp;
+  { tclsqlite.c:4001 — DbTransPostCmd() calls delDatabaseRef().  Pin the
+    SqliteDb across the body so a `db close` inside SCRIPT only schedules
+    the teardown (drops the cmd's ref) instead of freeing us mid-commit. }
+  AddDatabaseRef(pDb);
   if DbUseNre then
   begin
     Tcl_NRAddCallback(interp, @DbTransPostCmdNRE,
