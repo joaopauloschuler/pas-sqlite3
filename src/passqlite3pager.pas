@@ -3719,6 +3719,8 @@ begin
   if (pSavepoint <> nil) then
   begin
     offset := i64(pSavepoint^.iSubRec) * (4 + pPager^.pageSize);
+    if pagerUseWal(pPager) <> 0 then
+      rc := sqlite3WalSavepointUndo(pPager^.pWal, @pSavepoint^.aWalData[0]);
     ii := pSavepoint^.iSubRec;
     while (rc = SQLITE_OK) and (ii < pPager^.nSubRec) do
     begin
@@ -4747,14 +4749,14 @@ begin
       end
       else
       begin
-        if nNew > 0 then
-          pSavepoint := PPagerSavepoint(PByte(pPager^.aSavepoint) + (nNew - 1) * SizeOf(PagerSavepoint))
-        else
-          pSavepoint := nil;
-        if (pSavepoint <> nil) and (pagerUseWal(pPager) <> 0) then
-          rc := sqlite3WalSavepointUndo(pPager^.pWal, @pSavepoint^.aWalData[0]);
-        if (rc = SQLITE_OK) and (isOpen(pPager^.jfd) <> 0) then
+        if (pagerUseWal(pPager) <> 0) or (isOpen(pPager^.jfd) <> 0) then
+        begin
+          if nNew > 0 then
+            pSavepoint := PPagerSavepoint(PByte(pPager^.aSavepoint) + (nNew - 1) * SizeOf(PagerSavepoint))
+          else
+            pSavepoint := nil;
           rc := pagerPlaybackSavepoint(pPager, pSavepoint);
+        end;
       end;
     end;
   end;
