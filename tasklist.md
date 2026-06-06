@@ -547,6 +547,17 @@ regressions without human triage.
   - [X] **9.4.8.d** Coverage check
   - [X] **9.4.8.e** Regression archive
 
+#### 9.4 — Missing routines still to port (engine + harness gaps)
+
+> First-class list of the genuinely-unported code behind the remaining
+> live FAILs. The `divbug.*` bullets below track *symptoms*; these track
+> the *routine to port*. (See also: fts5 `divbug.68.a`, QRF `divbug.91`,
+> FTS3/4 merge perf `12.4`.)
+
+- [ ] **9.4.port.coroutine-from** Coroutine FROM-subquery materialization — port C's up-front FROM-subquery coroutine codegen (select.c:7945..8120) + `constructAutomaticIndex` viaCoroutine arm (where.c:1191..1234) + `gatherSelectWindows` (expr.c:1987). The port eager-materializes into eph tables and misses correlated / scalar-subquery / windowed cases. **ROOT of 4 live FAILs**: divbug.19 (autoindex5), divbug.92.009 (with5-310), pushdown-6.x, update-21.12. Highest-leverage engine port — clears all four at once.
+- [ ] **9.4.port.intarray-addr** Register `intarray_addr` Tcl test command (test1.c:3836 `test_intarray_addr`, table entry test1.c:9110) in TestModuleTest1 — the only thing failing tabfunc01 (engine subtests all PASS; the file aborts on the missing command). One-line harness registration; the `test_intarray` module itself is already ported.
+- [ ] **9.4.port.fs-schema-vtab** Port the `fs` / `schema` test vtab modules — `register_fs_module` (test_fs.c, ~920 L; blocks fts4content) + `register_schema_module` (test_schema.c, ~367 L). Carved out of the `6.40.4` [~] prose into an actionable bullet.
+
 #### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
 
 - [X] **9.4.divbug.1** `select1.test select1-4.4`
@@ -567,7 +578,7 @@ regressions without human triage.
 - [X] **9.4.divbug.16** `affinity3.test` segfault
 - [X] **9.4.divbug.17** Subquery-nested aggregate evaluated row-wise
 - [X] **9.4.divbug.18** WITHOUT ROWID vtab `xUpdate`
-- [ ] **9.4.divbug.19** autoindex5 live FAIL — correlated-subquery FROM materialised as SRT_Mem misses coroutine + auto-index (needs select.c:7945 up-front FROM codegen + constructAutomaticIndex viaCoroutine arm). Same architectural root as pushdown/with1/with5.
+- [ ] **9.4.divbug.19** autoindex5 live FAIL — correlated-subquery FROM materialised as SRT_Mem misses coroutine + auto-index. ROOT → **9.4.port.coroutine-from**.
 - [X] **9.4.divbug.20** BETWEEN-on-indexed-column planner
 - [X] **9.4.divbug.21** Cross-connection EXCLUSIVE lock detection +
 - [X] **9.4.divbug.22** page_size=65536 overflow — bigrow+btree01 PASS
@@ -643,7 +654,7 @@ regressions without human triage.
 - [X] **9.4.divbug.78** Wide-table SCAN+predicate mis-count
 - [X] **9.4.divbug.79** windowE ROWS-framing permute — windowE PASS
 - [X] **9.4.divbug.80** `ORDER BY without LIMIT on DELETE/UPDATE` not detected
-- [ ] **9.4.divbug.80.a** update live FAIL — DELETE/UPDATE LIMIT/ORDER BY codegen (SQLITE_ENABLE_UPDATE_DELETE_LIMIT); needs lemon parse-table regen (rules 152/159).
+- [ ] **9.4.divbug.80.a** DELETE/UPDATE LIMIT/ORDER BY codegen unported (SQLITE_ENABLE_UPDATE_DELETE_LIMIT; needs lemon parse-table regen, rules 152/159). LATENT — no live-failing test (update.test's real fail is update-21.12, the materialization class → **9.4.port.coroutine-from**).
 - [X] **9.4.divbug.80.b** wherelimit3 planner EQP — wherelimit3 PASS
 - [X] **9.4.divbug.81** Attached / `query_only` DB readonly enforcement
 - [X] **9.4.divbug.82** INSERT…RETURNING / scalar-function eval returns empty
@@ -854,7 +865,7 @@ regressions without human triage.
   - [X] **9.4.divbug.92.006** gencol1 virtual-gencol auto-index — gencol1 PASS
   - [X] **9.4.divbug.92.007** `vtab2-5.3`
   - [X] **9.4.divbug.92.008** `with1-22.1`
-  - [ ] **9.4.divbug.92.009** with5 live FAIL — recursive-CTE outer ORDER BY wrongly eliminated (dup outer SELECT binds result col iColumn=-1/rowid → WHERE_IPK ordered match drops sorter). Deep materialise/dup fix.
+  - [ ] **9.4.divbug.92.009** with5-310 live FAIL — recursive-CTE outer ORDER BY wrongly eliminated (dup outer SELECT binds result col iColumn=-1/rowid → WHERE_IPK ordered match drops sorter). ROOT → **9.4.port.coroutine-from**.p materialise/dup fix.
 
 ---
 
