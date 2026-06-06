@@ -59590,6 +59590,8 @@ var
   pTgt:  PDb;
   pBt:   PBtree;
   zErr:  AnsiString;
+  pEntry: passqlite3util.PHashElem;
+  pTrig:  PTrigger;
   label detach_error;
 begin
   zName := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
@@ -59624,8 +59626,17 @@ begin
     goto detach_error;
   end;
 
-  { TEMP-trigger pTabSchema rewrite (attach.c:322..330) is gated on full
-    TTrigger layout settling — deferred. }
+  { If any TEMP triggers reference the schema being detached, move those
+    triggers to reference the TEMP schema itself.  attach.c:322..330. }
+  AssertH(db^.aDb[1].pSchema <> nil, 'detachFunc temp schema');
+  pEntry := db^.aDb[1].pSchema^.trigHash.first;
+  while pEntry <> nil do
+  begin
+    pTrig := PTrigger(pEntry^.data);
+    if pTrig^.pTabSchema = pTgt^.pSchema then
+      pTrig^.pTabSchema := pTrig^.pSchema;
+    pEntry := passqlite3util.PHashElem(pEntry^.next);
+  end;
 
   sqlite3BtreeClose(pBt);
   pTgt^.pBt     := nil;
