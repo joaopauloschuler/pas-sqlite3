@@ -74,6 +74,7 @@ uses
   passqlite3pager,
   passqlite3pcache,
   passqlite3vtab,
+  passqlite3fts3,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -4638,6 +4639,75 @@ begin
   aNum[3] := Byte(val);
   t1BinToHex(@aNum[0], 4);
   Tcl_SetObjResult(interp, Tcl_NewStringObj(PAnsiChar(@aNum[0]), 8));
+  Result := TCL_OK;
+end;
+
+{ test_hexio.c:391..449 — make_fts3record LIST.
+  Builds a byte blob: each list element that parses as a wide integer is
+  appended as an fts3 varint (sqlite3Fts3PutVarint), otherwise the raw
+  string bytes are appended.  Returns a Tcl byte-array. }
+function make_fts3record(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  aArg: PPTclObj;
+  nArg: cint;
+  aOut: PByte;
+  nOut: sqlite3_int64;
+  nAlloc: sqlite3_int64;
+  i: cint;
+  iVal: Int64;
+  zVal: PChar;
+  nVal: cint;
+  nNew: sqlite3_int64;
+  aNew: PByte;
+begin
+  aArg := nil;
+  nArg := 0;
+  aOut := nil;
+  nOut := 0;
+  nAlloc := 0;
+
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('LIST'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_ListObjGetElements(interp, objv[1], @nArg, @aArg) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  for i := 0 to nArg - 1 do begin
+    if Tcl_GetWideIntFromObj(nil, PPTclObj(aArg)[i], @iVal) = TCL_OK then begin
+      if nOut + 10 > nAlloc then begin
+        if nAlloc <> 0 then nNew := nAlloc * 2 else nNew := 128;
+        aNew := PByte(sqlite3_realloc(aOut, cint(nNew)));
+        if aNew = nil then begin
+          sqlite3_free(aOut);
+          Result := TCL_ERROR; Exit;
+        end;
+        aOut := aNew;
+        nAlloc := nNew;
+      end;
+      nOut := nOut + sqlite3Fts3PutVarint(PChar(@aOut[nOut]), iVal);
+    end else begin
+      nVal := 0;
+      zVal := Tcl_GetStringFromObj(PPTclObj(aArg)[i], @nVal);
+      while (nOut + nVal) > nAlloc do begin
+        if nAlloc <> 0 then nNew := nAlloc * 2 else nNew := 128;
+        aNew := PByte(sqlite3_realloc(aOut, cint(nNew)));
+        if aNew = nil then begin
+          sqlite3_free(aOut);
+          Result := TCL_ERROR; Exit;
+        end;
+        aOut := aNew;
+        nAlloc := nNew;
+      end;
+      Move(zVal^, aOut[nOut], nVal);
+      nOut := nOut + nVal;
+    end;
+  end;
+
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(aOut, cint(nOut)));
+  sqlite3_free(aOut);
   Result := TCL_OK;
 end;
 
@@ -9633,6 +9703,9 @@ begin
     @test_mmap_warm, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('utf8_to_utf8'),
     @utf8_to_utf8, nil, nil);
+  { test_hexio.c:468 make_fts3record. }
+  Tcl_CreateObjCommand(interp, PChar('make_fts3record'),
+    @make_fts3record, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_interrupt'),
     @test_interrupt, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_is_interrupted'),
