@@ -38,7 +38,7 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
      TestModuleVfs, TestModuleFts3, TestModuleSchema, TestModuleFs,
-     TestModuleIntarray;
+     TestModuleIntarray, TestModuleAutoext;
 
 const
   { tclsqlite.c:121..122 — default and hard cap on the LRU statement cache. }
@@ -5147,6 +5147,12 @@ begin
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
     atomic_batch_write / load_static_extension. }
   Sqlitetest1_Init(interp);
+  { test_autoext.c: sqlite3_auto_extension_sqr/_cube/_broken + cancel/reset
+    (loadext2.test).  MUST run after Sqlitetest1_Init — Test1 registers a
+    partial sqlite3_auto_extension_sqr backed by its own sqr_init; running
+    last makes the complete module own both the register and cancel commands
+    so loadext2's pointer-identity register/cancel pairing matches. }
+  Sqlitetest_autoext_Init(interp);
   { 9.4.6.l.4 — test_func.c: autoinstall_test_functions. }
   Sqlitetestfunc_Init(interp);
   { 9.4.6.n / 9.4.7.b — test_malloc.c: the malloc fault-injection layer
