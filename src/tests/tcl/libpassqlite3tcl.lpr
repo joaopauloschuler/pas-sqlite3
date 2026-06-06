@@ -32,6 +32,7 @@ uses
   TestModuleCrash,
   TestModuleVfs,
   TestModuleFts3,
+  TestModuleFs,
   PasTclSqlite;
 
 exports
