@@ -451,6 +451,7 @@ acceptance gate for this section.
     - [X] **9.4.2.x.1.b** Port `AddDatabaseRef` / `DelDatabaseRef` (tclsqlite.c:601..666) — landed at `src/tests/tcl/PasTclSqlite.pas:680..708`.
     - [X] **9.4.2.x.1.c** `TDbEvalContext` record (tclsqlite.c:1626) + split DbEvalArm into DbEvalInit/Step/RowInfo/Finalize/ColumnValueCtx (tclsqlite.c:1669..1876).
     - [X] **9.4.2.x.1.d** Implement `DbEvalNextCmd: TTclNRPostProc` (tclsqlite.c:1915..2005) and wire the 3/4/5-arg script-body branch of `DbEvalArm` (tclsqlite.c:3340..3360) through `Tcl_NRAddCallback` + `Tcl_NREvalObj`.
+    - [X] **9.4.2.x.1.e** Closed 2026-06-05 (ecdd818) — ported `-asdict`/`-withoutnulls` dict/array row-shaping (tclsqlite.c:1716..1977) + addDatabaseRef/delDatabaseRef pin in `db transaction` body (tclsqlite.c:4001/1346); tclsqlite.test 4 errs → 0/131.
 
 - [~] **9.4.3** Driver `src/tests/TclTestDriver.pas`.  Spawns
   `tclsh` against each manifest entry with the port's shim
