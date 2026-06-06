@@ -63684,11 +63684,20 @@ begin
       and the banner / first-error result-row block. }
     for iDbIc := 0 to db^.nDb - 1 do
     begin
+      { pragma.c:1738..1739 — C has only the OMIT_TEMPDB && i==1 skip (a
+        no-op here since OMIT_TEMPDB is 0) and the explicit-iDb filter.
+        It does NOT guard on pBt/pSchema being nil: sqlite3CodeVerifySchema
+        is called FIRST and for the temp db (i==1) that opens the temp
+        database via sqlite3OpenTempDatabase (build.c:5365), which both
+        allocates the temp pager pTmpSpace and makes aDb[1].pBt non-nil.
+        Skipping i==1 here (as a stray pBt=nil guard did) means the temp
+        database is never opened, pinning one fewer page-cache slot
+        (memsubsys1-3.2.4). }
       if (iDb >= 0) and (iDbIc <> iDb) then Continue;
-      if db^.aDb[iDbIc].pBt = nil then Continue;
-      if db^.aDb[iDbIc].pSchema = nil then Continue;
 
       sqlite3CodeVerifySchema(pParse, iDbIc);
+      if db^.aDb[iDbIc].pBt = nil then Continue;
+      if db^.aDb[iDbIc].pSchema = nil then Continue;
       { tag-20230327-1 — clear okConstFactor for this arm (Pas port
         stores the flag in parseFlags rather than as a dedicated u8). }
       pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
