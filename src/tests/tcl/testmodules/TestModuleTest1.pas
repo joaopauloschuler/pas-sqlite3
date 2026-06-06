@@ -2633,6 +2633,38 @@ begin
   Result := TCL_OK;
 end;
 
+{ test_mutex.c:337..372 — sqlite3_config OPTION.
+  OPTION is one of the keywords singlethread/multithread/serialized
+  (mapped to SQLITE_CONFIG_SINGLETHREAD/MULTITHREAD/SERIALIZED = 1/2/3)
+  or a raw integer.  Calls sqlite3_config(i) and returns sqlite3ErrName(rc). }
+function test_config(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i, rc: cint;
+  z:     PAnsiChar;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  z := Tcl_GetString(objv[1]);
+  if StrComp(z, PChar('singlethread')) = 0 then
+    i := SQLITE_CONFIG_SINGLETHREAD
+  else if StrComp(z, PChar('multithread')) = 0 then
+    i := SQLITE_CONFIG_MULTITHREAD
+  else if StrComp(z, PChar('serialized')) = 0 then
+    i := SQLITE_CONFIG_SERIALIZED
+  else if Tcl_GetIntFromObj(interp, objv[1], @i) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_config(i, 0);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test_malloc.c:968..983 — sqlite3_config_memstatus BOOLEAN.
   Enable/disable memory status reporting via SQLITE_CONFIG_MEMSTATUS.
   Returns the rc from sqlite3_config. }
@@ -9336,6 +9368,9 @@ begin
     @test_create_aggregate, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pagecache'),
     @test_config_pagecache, nil, nil);
+  { test_mutex.c:337..372 — sqlite3_config OPTION. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config'),
+    @test_config, nil, nil);
   { 9.4.divbug.88.050/051 — test_malloc.c:1494..1495 sqlite3_config_memstatus
     and sqlite3_config_lookaside. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_memstatus'),
