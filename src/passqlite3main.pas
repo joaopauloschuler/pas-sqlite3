@@ -847,6 +847,19 @@ begin
       db^.trace.xV2(SQLITE_TRACE_CLOSE, db^.pTraceArg, db, nil);
   end;
 
+  { main.c:1269 — force xDisconnect calls on all virtual tables.  This
+    finalizes any prepared statements the v-table modules cache internally
+    (e.g. fts3's aStmt[]/pSeekStmt) so the connectionIsBusy check below does
+    not see them as outstanding statements (which would leave the connection
+    a zombie with an unrolled-back transaction and a hot journal). }
+  passqlite3vtab.disconnectAllVtab(db);
+
+  { main.c:1278 — if a transaction is open, disconnectAllVtab() above will not
+    have called xDisconnect on vtabs in db^.aVTrans[].  sqlite3VtabRollback
+    does so; it must run before the active-statement check below because the
+    v-table implementation may store prepared statements internally. }
+  passqlite3vtab.sqlite3VtabRollback(db);
+
   { Legacy sqlite3_close() refuses if statements still pending. }
   if (forceZombie = 0) and (connectionIsBusy(db) <> 0) then begin
     sqlite3ErrorWithMsg(db, SQLITE_BUSY,
