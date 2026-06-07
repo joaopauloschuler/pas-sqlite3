@@ -2476,7 +2476,16 @@ begin
     Inc(pMm);
   end;
   if (d > u32(nKey)) and (u <> 0) then begin
+    { In a corrupt record entry, the last pMm might have been set up using
+      uninitialised memory. Overwrite its value with NULL.  C: vdbeaux.c:4280
+      sqlite3VdbeMemSetNull(pMem-(u<p->nField)); the subtracted term is the
+      C boolean (0 or 1): when u<nField the loop did NOT advance past this
+      cell so the previously-filled cell (pMm-1) is the suspect one; when
+      u>=nField the loop broke after filling pMm without advancing, so pMm
+      itself is the suspect cell. }
     if u < u16(nAllField) then
+      sqlite3VdbeMemSetNull(PMem(PtrUInt(pMm) - SizeOf(TMem)))
+    else
       sqlite3VdbeMemSetNull(pMm);
   end;
   pUR^.nField := i32(u);
