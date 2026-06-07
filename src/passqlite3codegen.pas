@@ -3119,6 +3119,15 @@ var
     sqlite3ResolveSelectNames so recursive sub-SELECT resolution is isolated. }
   gNcAllowAggWin: i32;
 
+  { with1-23.1 — eCode-equivalent for selId renumbering.  Set (>0) while
+    expanding a COPIED view body (sqlite3SelectExpand's view-body prep at
+    ~34060), mirroring C's Walker.eCode (select.c:5976).  When >0,
+    resolveFromTermToCte renumbers the just-attached CTE-body copy's selIds
+    so two distinct same-named CTEs from different view scopes (v2.t4 vs
+    v3.t4) never share a selId — without this, isSelfJoinView (select.c:7083)
+    cannot tell them apart and wrongly emits OP_OpenDup reuse. }
+  gViewBodyExpandDepth: i32;
+
   { with2-5.x — Tcl_LinkVar-exposed counter for INSERT-from-SELECT xfer
     optimization invocations.  C reference: insert.c:2935 + 3235. }
   sqlite3_xferopt_count: i32 = 0;
@@ -33273,6 +33282,18 @@ begin
   pFrom^.fg.fgBits2 := pFrom^.fg.fgBits2 or u8($02);
   pFrom^.u2.pCteUse := pCtUse;
   Inc(pCtUse^.nUse);
+  { with1-23.1 — when this CTE reference is being resolved while expanding a
+    COPIED view body (gViewBodyExpandDepth>0, C's Walker.eCode), the attached
+    CTE body `pSel` is a sqlite3SelectDup copy that retains the original CTE
+    definition's selId.  C renumbers it via the walker (sqlite3WalkSelect under
+    eCode, select.c:5976/5810).  This port has no walker-driven CTE descent, so
+    renumber here explicitly.  Without this, two distinct same-named CTEs from
+    different view scopes (v2.t4 1-col vs v3.t4 3-col) keep the same selId,
+    isSelfJoinView (select.c:7083) fails to distinguish them, and codegen emits
+    a single MATERIALIZE + OP_OpenDup reuse — the second ref reads the first's
+    rows (wrong columns).  Top-level CTE bodies (eCode==0) keep parse selIds. }
+  if gViewBodyExpandDepth > 0 then
+    sqlite3RenumberSelId(pParse, pSel);
 
   { Recursive-CTE detection (select.c:5760..5791).  Walk the compound
     chain looking for self-references; mark each as isRecursive and
@@ -34085,7 +34106,13 @@ begin
           zSavedAuthCtx := pParse^.zAuthContext;
           if pItem^.zName <> nil then
             pParse^.zAuthContext := pItem^.zName;
+          { with1-23.1 — mark "copied view body expansion" (C Walker.eCode)
+            for the duration of the body prep so CTE bodies attached during it
+            (resolveFromTermToCte) get their selIds renumbered, matching C's
+            renumber-on-walk under eCode. }
+          Inc(gViewBodyExpandDepth);
           sqlite3SelectPrep(pParse, pVwBody, nil);
+          Dec(gViewBodyExpandDepth);
           pParse^.zAuthContext := zSavedAuthCtx;
           pParse^.pWith := pSavedWith;
           if pParse^.nErr <> 0 then Exit;
@@ -36778,6 +36805,7 @@ var
     eM10d<>M10d_No) is materialised into a once-run subroutine on the first
     reference; later references reuse the result via OP_Gosub + OP_OpenDup. }
   pCteUseLoc:   PCteUse;
+  bDidSingleFlatten: Boolean;  { with1-19.1b — single-source flatten fired }
   ctTopAddr:    i32;
   ctOnceAddr:   i32;
   ctAddrExplain: i32;
@@ -37409,6 +37437,7 @@ begin
     SrcItemIsSubquery guard fails and it is skipped, so existing bytecode
     (TestExplainParity) is unchanged.  Preconditions mirror the deferred
     block (codegen.pas:~40476). }
+  bDidSingleFlatten := False;
   if (p^.pPrior = nil) and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Aggregate) = 0)
   then
@@ -37432,6 +37461,7 @@ begin
       if flattenSubquery(pParse, p, 0, 0) <> 0 then
       begin
         if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+        bDidSingleFlatten := True;
         pTabList := p^.pSrc;
         if p^.pPrior <> nil then
         begin
@@ -37439,6 +37469,69 @@ begin
           Exit;
         end;
       end;
+    end;
+  end;
+
+  { tag-select-0240 (restart) — C's FROM-clause optimisation loop
+    (select.c:7708..7884) does a single pass over ALL FROM terms with an
+    `i = -1` restart after each successful flatten, so a single-source flatten
+    that EXPOSES a new multi-source FROM (e.g. flattening a view whose body is
+    itself a multi-source join, or the wrapper subquery in with1-19.1b) re-offers
+    every newly-exposed FROM term to the flattener in the same pass.  This Pas
+    port split that single C loop into TWO sites: the multi-source loop above
+    (which ran BEFORE the single-source flatten) and the single-source flatten
+    just above.  So when the single-source flatten newly exposes a multi-source
+    FROM, those terms were never re-offered to the flattener (with1-19.1b kept
+    its trivial pass-through CTE `x2` as a separate CO-ROUTINE instead of reusing
+    `x1`'s materialisation).  Re-run the multi-source flatten scan here, with the
+    exact same gates as the loop above, until no further flatten succeeds. }
+  pTabList := p^.pSrc;
+  if bDidSingleFlatten
+     and (p^.pPrior = nil) and (pTabList <> nil) and (pTabList^.nSrc > 1) then
+  begin
+    i := 0;
+    while (p^.pPrior = nil) and (i < pTabList^.nSrc) do
+    begin
+      pItem := @SrcListItems(pTabList)[i];
+      if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil)
+         and (pItem^.u4.pSubq^.pSelect <> nil)
+         and (pItem^.u4.pSubq^.pSelect^.pPrior = nil) then
+      begin
+        pSubFC := pItem^.u4.pSubq^.pSelect;
+        { Mark nested aggregate/window state (this port resolves it late) so
+          the SF_Aggregate/SF_HasAgg guards below see it (with2-9.2: a CTE
+          body with min()/WINDOW must NOT be flattened by this restart pass —
+          flattening it strips the aggregate context and min() resolves as a
+          plain scalar -> "unknown function: min()"). }
+        selectMarkAggregateCompound(pParse, pSubFC);
+        if not (((pItem^.fg.fgBits2 and u8($02)) <> 0)          { isCte fence }
+                and (pItem^.u2.pCteUse <> nil)
+                and (pItem^.u2.pCteUse^.eM10d = u8(0)))         { M10d_Yes }
+           and ((pSubFC^.selFlags and SF_Aggregate) = 0)
+           and (pSubFC^.pGroupBy = nil)
+           and (pSubFC^.pHaving = nil)
+           and ((pSubFC^.selFlags and SF_HasAgg) = 0)
+           and (pSubFC^.pWin = nil)
+           and not ((pSubFC^.pOrderBy <> nil)
+                    and (i = 0)
+                    and ((p^.selFlags and SF_ComplexResult) <> 0)
+                    and ((pTabList^.nSrc = 1)
+                         or ((SrcListItems(pTabList)[1].fg.jointype
+                              and (JT_OUTER or JT_CROSS)) <> 0)))
+        then
+        begin
+          if flattenSubquery(pParse, p, i,
+               i32(Ord((p^.selFlags and SF_Aggregate) <> 0))) <> 0 then
+          begin
+            if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+            pTabList := p^.pSrc;
+            i := 0;    { C: i = -1 then for-loop i++ -> restart scan at 0 }
+            Continue;
+          end;
+          pTabList := p^.pSrc;
+        end;
+      end;
+      Inc(i);
     end;
   end;
 
