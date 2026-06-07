@@ -38,7 +38,7 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
      TestModuleVfs, TestModuleFts3, TestModuleSchema, TestModuleFs,
-     TestModuleIntarray, TestModuleAutoext;
+     TestModuleIntarray, TestModuleAutoext, PasQrf;
 
 const
   { tclsqlite.c:121..122 — default and hard cap on the LRU statement cache. }
@@ -4047,6 +4047,303 @@ begin
     sqlite3_file_control(pDb^.db, zSchema, SQLITE_FCNTL_SIZE_LIMIT, @mxSize);
 end;
 
+{ DbFormatArm — port of dbQrf (tclsqlite.c:2111).  Parses the `db format`
+  option set into a TQrfSpec and runs each statement of the SQL through the
+  ported QRF (PasQrf.sqlite3_format_query_result).  9.4.divbug.91.011/.012. }
+function DbFormatArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  azAlign: array[0..16] of PChar = (
+    'auto','bottom','c','center','e','left','middle','n','ne','nw','right',
+    's','se','sw','top','w', nil);
+  aAlignMap: array[0..15] of Byte = (
+    QRF_ALIGN_Auto, QRF_ALIGN_Bottom, QRF_ALIGN_C, QRF_ALIGN_Center,
+    QRF_ALIGN_E, QRF_ALIGN_Left, QRF_ALIGN_Middle, QRF_ALIGN_N, QRF_ALIGN_NE,
+    QRF_ALIGN_NW, QRF_ALIGN_Right, QRF_ALIGN_S, QRF_ALIGN_SE, QRF_ALIGN_SW,
+    QRF_ALIGN_Top, QRF_ALIGN_W);
+  azStyles: array[0..19] of PChar = (
+    'auto','box','column','count','csv','eqp','explain','html','insert',
+    'jobject','json','line','list','markdown','quote','stats','stats-est',
+    'stats-vm','table', nil);
+  aStyleMap: array[0..18] of Byte = (
+    QRF_STYLE_Auto, QRF_STYLE_Box, QRF_STYLE_Column, QRF_STYLE_Count,
+    QRF_STYLE_Csv, QRF_STYLE_Eqp, QRF_STYLE_Explain, QRF_STYLE_Html,
+    QRF_STYLE_Insert, QRF_STYLE_JObject, QRF_STYLE_Json, QRF_STYLE_Line,
+    QRF_STYLE_List, QRF_STYLE_Markdown, QRF_STYLE_Quote, QRF_STYLE_Stats,
+    QRF_STYLE_StatsEst, QRF_STYLE_StatsVm, QRF_STYLE_Table);
+  azEsc: array[0..4] of PChar = ('ascii','auto','off','symbol', nil);
+  aEscMap: array[0..3] of Byte = (QRF_ESC_Ascii, QRF_ESC_Auto, QRF_ESC_Off, QRF_ESC_Symbol);
+  azText: array[0..10] of PChar = (
+    'off','on','auto','csv','html','json','plain','relaxed','sql','tcl', nil);
+  aTextMap: array[0..7] of Byte = (
+    QRF_TEXT_Auto, QRF_TEXT_Csv, QRF_TEXT_Html, QRF_TEXT_Json,
+    QRF_TEXT_Plain, QRF_TEXT_Relaxed, QRF_TEXT_Sql, QRF_TEXT_Tcl);
+  azBlob: array[0..7] of PChar = (
+    'auto','hex','json','tcl','text','sql','size', nil);
+  aBlobMap: array[0..6] of Byte = (
+    QRF_BLOB_Auto, QRF_BLOB_Hex, QRF_BLOB_Json, QRF_BLOB_Tcl,
+    QRF_BLOB_Text, QRF_BLOB_Sql, QRF_BLOB_Size);
+  azBool: array[0..5] of PChar = ('auto','yes','no','on','off', nil);
+  aBoolMap: array[0..4] of Byte = (0, 2, 1, 2, 1);
+label format_failed;
+var
+  pDb:     PSqliteDb;
+  zResult: PAnsiChar;
+  zSql:    PAnsiChar;
+  i, rc, style, esc, txt, blob, v, k, ax, jj, nlist: cint;
+  qrf:     TQrfSpec;
+  zArg:    PChar;
+  pTerm:   PTclObj;
+  pStmtPtr: Pointer;
+  pPS:     PSqlPreparedStmt;
+  zErr:    PAnsiChar;
+
+  procedure FreeAndReturn(r: cint);
+  begin
+    sqlite3_free(qrf.aWidth);
+    sqlite3_free(qrf.aAlign);
+    sqlite3_free(zResult);
+    rc := r;
+  end;
+
+begin
+  pDb := PSqliteDb(clientData);
+  zResult := nil;
+  zSql := nil;
+  FillChar(qrf, SizeOf(qrf), 0);
+  qrf.iVersion := 1;
+  qrf.pzOutput := @zResult;
+
+  i := 2;
+  while i < objc do
+  begin
+    zArg := Tcl_GetString(ObjvAt(objv, i));
+    if zArg[0] <> '-' then
+    begin
+      if zSql <> nil then
+      begin
+        Tcl_AppendResult(interp, PChar('unknown argument: '), zArg, Pointer(nil));
+        FreeAndReturn(TCL_ERROR); goto format_failed;
+      end;
+      zSql := zArg;
+    end
+    else if i = objc - 1 then
+    begin
+      Tcl_AppendResult(interp, PChar('option has no argument: '), zArg, Pointer(nil));
+      FreeAndReturn(TCL_ERROR); goto format_failed;
+    end
+    else if StrComp(zArg, '-style') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azStyles[0],
+                                'format style (-style)', 0, @style);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.eStyle := aStyleMap[style];
+      Inc(i);
+    end
+    else if StrComp(zArg, '-esc') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azEsc[0],
+                                'control character escape (-esc)', 0, @esc);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.eEsc := aEscMap[esc];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-text') = 0) or (StrComp(zArg, '-title') = 0) then
+    begin
+      { -title can be off/on; -text may not.  Search starts at element k*2. }
+      k := Ord(zArg[2] = 'e');
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azText[k*2], zArg,
+                                0, @txt);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if k <> 0 then
+        qrf.eText := aTextMap[txt]
+      else if txt <= 1 then
+      begin
+        if txt <> 0 then qrf.bTitles := QRF_Yes else qrf.bTitles := QRF_No;
+        qrf.eTitle := QRF_TEXT_Auto;
+      end
+      else
+      begin
+        qrf.bTitles := QRF_Yes;
+        qrf.eTitle := aTextMap[txt-2];
+      end;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-blob') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azBlob[0],
+                                'BLOB encoding (-blob)', 0, @blob);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.eBlob := aBlobMap[blob];
+      Inc(i);
+    end
+    else if StrComp(zArg, '-wordwrap') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azBool[0],
+                                '-wordwrap', 0, @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.bWordWrap := aBoolMap[v];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-textjsonb') = 0) or (StrComp(zArg, '-splitcolumn') = 0)
+         or (StrComp(zArg, '-border') = 0) then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azBool[0],
+                                zArg, 0, @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if zArg[1] = 't' then qrf.bTextJsonb := aBoolMap[v]
+      else if zArg[1] = 'b' then qrf.bBorder := aBoolMap[v]
+      else qrf.bSplitColumn := aBoolMap[v];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-defaultalign') = 0) or (StrComp(zArg, '-titlealign') = 0) then
+    begin
+      if zArg[1] = 'd' then
+        rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azAlign[0],
+                                  'default alignment (-defaultalign)', 0, @ax)
+      else
+        rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azAlign[0],
+                                  'title alignment (-titlealign)', 0, @ax);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if zArg[1] = 'd' then qrf.eDfltAlign := aAlignMap[ax]
+      else qrf.eTitleAlign := aAlignMap[ax];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-wrap') = 0) or (StrComp(zArg, '-screenwidth') = 0)
+         or (StrComp(zArg, '-linelimit') = 0) or (StrComp(zArg, '-titlelimit') = 0) then
+    begin
+      v := 0;
+      rc := Tcl_GetIntFromObj(interp, ObjvAt(objv, i+1), @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if v < QRF_MIN_WIDTH then v := QRF_MIN_WIDTH
+      else if v > QRF_MAX_WIDTH then v := QRF_MAX_WIDTH;
+      if zArg[1] = 'w' then qrf.nWrap := v
+      else if zArg[1] = 's' then qrf.nScreenWidth := v
+      else if zArg[1] = 't' then qrf.nTitleLimit := v
+      else qrf.nLineLimit := v;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-charlimit') = 0 then
+    begin
+      v := 0;
+      rc := Tcl_GetIntFromObj(interp, ObjvAt(objv, i+1), @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if v < 0 then v := 0;
+      qrf.nCharLimit := v;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-multiinsert') = 0 then
+    begin
+      v := 0;
+      rc := Tcl_GetIntFromObj(interp, ObjvAt(objv, i+1), @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if v < 0 then v := 0;
+      qrf.nMultiInsert := u32(v);
+      Inc(i);
+    end
+    else if StrComp(zArg, '-align') = 0 then
+    begin
+      nlist := 0;
+      rc := Tcl_ListObjLength(interp, ObjvAt(objv, i+1), @nlist);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      sqlite3_free(qrf.aAlign);
+      qrf.aAlign := PByte(sqlite3_malloc64(u64(nlist + 1)));
+      if qrf.aAlign = nil then
+      begin
+        Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+        FreeAndReturn(TCL_ERROR); goto format_failed;
+      end;
+      FillChar(qrf.aAlign^, nlist + 1, 0);
+      qrf.nAlign := nlist;
+      for jj := 0 to nlist - 1 do
+      begin
+        rc := Tcl_ListObjIndex(interp, ObjvAt(objv, i+1), jj, @pTerm);
+        if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+        rc := Tcl_GetIndexFromObj(interp, pTerm, @azAlign[0],
+                                  'column alignment (-align)', 0, @ax);
+        if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+        qrf.aAlign[jj] := aAlignMap[ax];
+      end;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-widths') = 0 then
+    begin
+      nlist := 0;
+      rc := Tcl_ListObjLength(interp, ObjvAt(objv, i+1), @nlist);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      sqlite3_free(qrf.aWidth);
+      qrf.aWidth := PSmallInt(sqlite3_malloc64(u64(nlist + 1) * SizeOf(SmallInt)));
+      if qrf.aWidth = nil then
+      begin
+        Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+        FreeAndReturn(TCL_ERROR); goto format_failed;
+      end;
+      FillChar(qrf.aWidth^, (nlist + 1) * SizeOf(SmallInt), 0);
+      qrf.nWidth := nlist;
+      for jj := 0 to nlist - 1 do
+      begin
+        rc := Tcl_ListObjIndex(interp, ObjvAt(objv, i+1), jj, @pTerm);
+        if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+        v := 0;
+        Tcl_GetIntFromObj(interp, pTerm, @v);
+        if v < -QRF_MAX_WIDTH then v := -QRF_MAX_WIDTH
+        else if v > QRF_MAX_WIDTH then v := QRF_MAX_WIDTH;
+        qrf.aWidth[jj] := SmallInt(v);
+      end;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-columnsep') = 0 then
+    begin
+      qrf.zColumnSep := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-rowsep') = 0 then
+    begin
+      qrf.zRowSep := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-tablename') = 0 then
+    begin
+      qrf.zTableName := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-null') = 0 then
+    begin
+      qrf.zNull := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-version') = 0 then
+    begin
+      qrf.iVersion := StrToIntDef(Tcl_GetString(ObjvAt(objv, i+1)), 0); Inc(i);
+    end
+    else
+    begin
+      Tcl_AppendResult(interp, PChar('unknown option: '), zArg, Pointer(nil));
+      FreeAndReturn(TCL_ERROR); goto format_failed;
+    end;
+    Inc(i);
+  end;
+
+  while (zSql <> nil) and (zSql[0] <> #0) do
+  begin
+    pStmtPtr := nil;
+    zErr := nil;
+    rc := DbPrepareAndBind(pDb, zSql, @zSql, @pStmtPtr);
+    if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+    if pStmtPtr = nil then continue;
+    pPS := PSqlPreparedStmt(pStmtPtr);
+    rc := sqlite3_format_query_result(pPS^.pStmt, @qrf, @zErr);
+    DbReleaseStmt(pDb, pPS, 0);
+    if rc <> 0 then
+    begin
+      Tcl_SetResult(interp, zErr, TCL_VOLATILE);
+      sqlite3_free(zErr);
+      FreeAndReturn(TCL_ERROR); goto format_failed;
+    end;
+  end;
+  Tcl_SetResult(interp, zResult, TCL_VOLATILE);
+  FreeAndReturn(TCL_OK);
+
+format_failed:
+  Result := rc;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
@@ -4216,9 +4513,7 @@ begin
     9.4.divbug.64. }
   if (zSub <> nil) and (StrComp(zSub, 'format') = 0) then
   begin
-    Tcl_SetResult(interp, PChar('QRF not available in this build'),
-                  TCL_VOLATILE);
-    Result := TCL_ERROR;
+    Result := DbFormatArm(clientData, interp, objc, objv);
     Exit;
   end;
 
