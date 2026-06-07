@@ -12829,6 +12829,8 @@ begin
       pCur  := v^.apCsr[pOp^.p1];
       sqlite3VdbeIncrWriteCounter(v, pCur);
       pIn2  := @aMem[pOp^.p2];
+      rc := sqlite3VdbeMemExpandBlob(pIn2);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
       rc := sqlite3VdbeSorterWrite(pCur, pIn2);
       if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
