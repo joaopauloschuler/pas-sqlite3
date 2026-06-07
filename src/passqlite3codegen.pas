@@ -62430,6 +62430,8 @@ end;
 
 procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
   const pId2: PToken; pValue: PToken; minusFlag: i32);
+const
+  SQLITE_Defensive_FLAG = u64($10000000);  { sqliteInt.h:1859 — db.flags bit }
 var
   v:        PVdbe;
   zName:    AnsiString;
@@ -63474,10 +63476,21 @@ begin
         (9.4.divbug.38.b — e_fkey-6.1..6.3.) }
       if (db^.autoCommit = 0) and (flagMask = SQLITE_ForeignKeys) then
         flagMask := 0;
-      if bSet <> 0 then
-        db^.flags := db^.flags or flagMask
+      if bSet <> 0 then begin
+        { pragma.c:1164..1169 — refuse to clear writable_schema while the
+          connection is in defensive mode. }
+        if ((flagMask and SQLITE_WriteSchema) = 0)
+           or ((db^.flags and SQLITE_Defensive_FLAG) = 0) then
+          db^.flags := db^.flags or flagMask;
+      end
       else begin
         db^.flags := db^.flags and (not flagMask);
+        { pragma.c:1171..1175 — clearing SQLITE_DeferFKs releases any
+          deferred FK constraints that were waiting. }
+        if flagMask = SQLITE_DeferFKs then begin
+          db^.nDeferredImmCons := 0;
+          db^.nDeferredCons := 0;
+        end;
         { pragma.c:1176..1183 — IMP: R-60817-01178.  `PRAGMA
           writable_schema=RESET` disables schema writing (handled by the
           mask-clear above) and, in addition, reloads the schema so any
@@ -63496,6 +63509,9 @@ begin
         `SELECT` reused after `PRAGMA reverse_unordered_selects=1` keeps the
         stale plan (whereA-2.2/3.2). }
       sqlite3VdbeAddOp0(v, OP_Expire);
+      { pragma.c:1193 — propagate the updated db->flags safety bits to every
+        pager's syncFlags (fullfsync, checkpoint_fullfsync, …). }
+      setAllPagerFlags(db);
     end else begin
       if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
       sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
