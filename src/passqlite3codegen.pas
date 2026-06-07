@@ -12244,8 +12244,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  function ExprListRefsOuterCursor(pList: PExprList;
+                                   pOuterSrc: PSrcList): Boolean; forward;
+
   function ExprRefsOuterCursor(pW: PExpr; pOuterSrc: PSrcList): Boolean;
-  var k_: i32;
+  var k_: i32; pSubW: PSelect;
   begin
     Result := False;
     if pW = nil then Exit;
@@ -12261,6 +12264,29 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           if ExprRefsOuterCursor(ExprListItems(pW^.x.pList)[k_].pExpr,
                                  pOuterSrc) then
           begin Result := True; Exit; end;
+    end
+    else
+    begin
+      { subquery-3.3.4 — descend into a nested expression-subquery
+        (TK_SELECT/TK_EXISTS/TK_IN-subselect) so an outer-cursor reference
+        buried one (or more) scalar-subquery levels deeper still marks the
+        enclosing subquery correlated.  C achieves this via the nRef bubble
+        up that increments EVERY NameContext from the matching column up to
+        the binding scope (resolve.c:845..852), so each intervening scalar
+        subquery gets EP_VarSelect.  Without this recursion the middle
+        `(SELECT (SELECT d FROM t2 WHERE a=c))` of a doubly-nested
+        correlated scalar subquery was Once-gated and reused a stale value
+        across outer groups. }
+      pSubW := pW^.x.pSelect;
+      while pSubW <> nil do
+      begin
+        if ExprListRefsOuterCursor(pSubW^.pEList,   pOuterSrc) then Exit(True);
+        if ExprRefsOuterCursor    (pSubW^.pWhere,   pOuterSrc) then Exit(True);
+        if ExprRefsOuterCursor    (pSubW^.pHaving,  pOuterSrc) then Exit(True);
+        if ExprListRefsOuterCursor(pSubW^.pGroupBy, pOuterSrc) then Exit(True);
+        if ExprListRefsOuterCursor(pSubW^.pOrderBy, pOuterSrc) then Exit(True);
+        pSubW := pSubW^.pPrior;
+      end;
     end;
   end;
 
@@ -12316,6 +12342,61 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         pDeep_ := pDeep_^.pPrior;
       end;
     end;
+  end;
+
+  { subquery-3.3.4 — propagate the correlated-subquery flag to EVERY nested
+    expression-subquery whose body references an outer cursor.  C's name
+    resolver bumps nRef on every NameContext from the matching column up to
+    its binding scope (resolve.c:845..852), so each intervening scalar / IN /
+    EXISTS subquery picks up EP_VarSelect at resolve.c:1385..1388.  The Pas
+    per-Select walker only marks the immediately-enclosing subquery node; a
+    deeper nested subquery (e.g. the inner-inner `(SELECT d FROM t2 WHERE a=c)`
+    of `(SELECT (SELECT d ...))`) whose outer ref was already rebound by the
+    pre-bind pass would otherwise stay Once-gated and reuse a stale value
+    across outer rows.  Walk the expression tree; at each nested subquery node
+    that references a cursor in pOuterSrc, set EP_VarSelect + SF_Correlated and
+    recurse so the marking reaches every level. }
+  procedure MarkNestedExprSubqCorrelated(pX: PExpr; pOuterSrc: PSrcList); forward;
+
+  procedure MarkNestedExprSubqCorrelatedList(pList: PExprList;
+    pOuterSrc: PSrcList);
+  var k_: i32;
+  begin
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      MarkNestedExprSubqCorrelated(ExprListItems(pList)[k_].pExpr, pOuterSrc);
+  end;
+
+  procedure MarkNestedExprSubqCorrelated(pX: PExpr; pOuterSrc: PSrcList);
+  var pSubM: PSelect;
+  begin
+    if pX = nil then Exit;
+    if ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then Exit;
+    if (pX^.flags and EP_xIsSelect) <> 0 then
+    begin
+      pSubM := pX^.x.pSelect;
+      { Only flag (and descend) when this subquery actually references an
+        outer cursor — matches C's nRef!=nRef gate. }
+      if ExprRefsOuterCursor(pX, pOuterSrc) then
+      begin
+        ExprSetProperty(pX, EP_VarSelect);
+        while pSubM <> nil do
+        begin
+          pSubM^.selFlags := pSubM^.selFlags or SF_Correlated;
+          MarkNestedExprSubqCorrelatedList(pSubM^.pEList,   pOuterSrc);
+          MarkNestedExprSubqCorrelated    (pSubM^.pWhere,   pOuterSrc);
+          MarkNestedExprSubqCorrelated    (pSubM^.pHaving,  pOuterSrc);
+          MarkNestedExprSubqCorrelatedList(pSubM^.pGroupBy, pOuterSrc);
+          MarkNestedExprSubqCorrelatedList(pSubM^.pOrderBy, pOuterSrc);
+          pSubM := pSubM^.pPrior;
+        end;
+      end;
+      Exit;
+    end;
+    MarkNestedExprSubqCorrelated(pX^.pLeft,  pOuterSrc);
+    MarkNestedExprSubqCorrelated(pX^.pRight, pOuterSrc);
+    if pX^.x.pList <> nil then
+      MarkNestedExprSubqCorrelatedList(pX^.x.pList, pOuterSrc);
   end;
 
   { 9.4.divbug.17 — nested-aggregate outward binding.  Mirrors the
@@ -14446,6 +14527,22 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               (resolve.c:1384..1388).  Without this the enclosing IN/scalar
               subquery is materialised once instead of recomputed per row. }
             if SelectDeepRefsOuterCursor(pCompArm, p^.pSrc) then bCorr := True;
+            { subquery-3.3.4 — correlation may also live inside a nested
+              EXPRESSION-subquery (scalar/IN/EXISTS) of this arm's clauses,
+              e.g. the middle `(SELECT (SELECT d FROM t2 WHERE a=c))` whose
+              EList holds the inner-inner subquery referencing outer `a`.
+              The pre-bind pass already rewrote that `a` to an outer
+              TK_COLUMN; scanning every clause through ExprRefsOuterCursor
+              (which now recurses into expression-subqueries) detects it so
+              this enclosing scalar subquery is flagged EP_VarSelect and
+              recomputed per outer group instead of Once-cached.  Mirrors
+              C's nRef bubble-up across every intervening NameContext
+              (resolve.c:845..852). }
+            if ExprListRefsOuterCursor(pCompArm^.pEList,   p^.pSrc) then bCorr := True;
+            if ExprRefsOuterCursor    (pCompArm^.pWhere,   p^.pSrc) then bCorr := True;
+            if ExprRefsOuterCursor    (pCompArm^.pHaving,  p^.pSrc) then bCorr := True;
+            if ExprListRefsOuterCursor(pCompArm^.pGroupBy, p^.pSrc) then bCorr := True;
+            if ExprListRefsOuterCursor(pCompArm^.pOrderBy, p^.pSrc) then bCorr := True;
             { whereF-6.x — outer ref inside a TVF arg of pCompArm^.pSrc
               (`json_each(t.json)` etc.) is a correlation too. }
             if pCompArm^.pSrc <> nil then
@@ -14591,6 +14688,23 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           ExprSetProperty(pE, EP_VarSelect);
           pInner^.selFlags := pInner^.selFlags or SF_Correlated;
+          { subquery-3.3.4 — also flag any deeper nested expression-subquery
+            whose body references the outer cursor, so a doubly-nested
+            correlated scalar subquery's inner-inner level is recomputed per
+            outer row rather than Once-cached (mirrors C's nRef bubble-up). }
+          if p^.pSrc <> nil then
+          begin
+            pCompArm := pInner;
+            while pCompArm <> nil do
+            begin
+              MarkNestedExprSubqCorrelatedList(pCompArm^.pEList,   p^.pSrc);
+              MarkNestedExprSubqCorrelated    (pCompArm^.pWhere,   p^.pSrc);
+              MarkNestedExprSubqCorrelated    (pCompArm^.pHaving,  p^.pSrc);
+              MarkNestedExprSubqCorrelatedList(pCompArm^.pGroupBy, p^.pSrc);
+              MarkNestedExprSubqCorrelatedList(pCompArm^.pOrderBy, p^.pSrc);
+              pCompArm := pCompArm^.pPrior;
+            end;
+          end;
         end;
         { 9.4.divbug.17 — resolve.c:1337..1352 pNC2 outward-binding.
           An aggregate function textually inside this subquery whose
@@ -27059,6 +27173,15 @@ var
     if pTrm^.pExpr = nil then Exit;
     if pTrm^.pExpr^.op <> TK_IN then Exit;
     if ExprHasProperty(pTrm^.pExpr, EP_Subrtn) then Exit;
+    { subquery-6.2 — a CORRELATED subselect IN-RHS (EP_VarSelect) must be
+      re-materialised per outer row, so it must NOT be hoisted into the
+      WHERE pre-loop preamble.  sqlite3CodeRhsOfIN already declines the
+      Once gate for EP_VarSelect terms (codegen.pas:76404), and the per-row
+      sqlite3ExprCodeIN path re-codes the RHS inside the loop; hoisting it
+      as well coded the inner aggregate scan twice (callcnt = 8 instead of
+      4 for `1 IN (SELECT count(*) FROM t5 WHERE a=y)`).  C never emits a
+      pre-loop materialisation for a correlated IN-RHS. }
+    if ExprHasProperty(pTrm^.pExpr, EP_VarSelect) then Exit;
     { Subselect IN-RHS: always hoist (Case-1 sqlite3CodeRhsOfIN
       materialises via SRT_Set into an eph cursor, sub-progress 23). }
     if ExprUseXSelect(pTrm^.pExpr) then
@@ -40472,6 +40595,7 @@ begin
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
           or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_EphemTab)
+          or (pDest^.eDest = SRT_Set)
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
           or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue)
           or (pDest^.eDest = SRT_Upfrom) or (pDest^.eDest = SRT_Table))
@@ -41158,6 +41282,27 @@ begin
             via OP_Yield.  Match select.c's selectInnerLoop SRT_Coroutine
             branch (select.c:1438..1442). }
           sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else if pDest^.eDest = SRT_Set then
+        begin
+          { subquery-6.x (ticket #1380) — IN-RHS subselect (sqlite3CodeRhsOfIN
+            Case-1) whose body is an aggregate with no GROUP BY, e.g.
+            `1 IN (SELECT count(*) FROM t5 WHERE a=y)`.  The single aggregate
+            row must be hashed into the eph IN-set cursor at iSDParm, otherwise
+            the parent IN test always returns 0 (the eph set stays empty).
+            Mirrors the GROUP BY arm at codegen.pas:39486 and the C
+            selectInnerLoop SRT_Set branch (select.c:1384..1407): MakeRecord
+            with per-row affinity zAffSdst, then OP_IdxInsert into iSDParm.
+            Bloom-filter side-write at iSDParm2 included for parity. }
+          r1 := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1,
+                            pDest^.zAffSdst, nResultCol);
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                               pDest^.iSdst, nResultCol);
+          if pDest^.iSDParm2 > 0 then
+            sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+                                 pDest^.iSdst, nResultCol);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
         else if pDest^.eDest = SRT_EphemTab then
         begin
           { e_select-2.2.1.8/9 — when this aggregate-no-GROUP-BY arm is
