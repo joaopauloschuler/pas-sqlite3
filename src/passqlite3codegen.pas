@@ -42620,14 +42620,7 @@ begin
   begin
     { fall through with the inherited registers; no new emission }
   end
-  else if isExists and (p^.pLimit <> nil) then
-  begin
-    Inc(pParse^.nMem);
-    iLimitReg := pParse^.nMem;
-    p^.iLimit  := iLimitReg;
-    sqlite3VdbeAddOp2(v, OP_Integer, 1, iLimitReg);
-  end
-  else if (not isExists) and (p^.pLimit <> nil) then
+  else if (p^.pLimit <> nil) then
   begin
     { 9.4.divbug.72 — reject row-value LIMIT / OFFSET vectors here too;
       this inline pre-WHERE arm bypasses computeLimitRegisters' guard.
@@ -42640,7 +42633,14 @@ begin
       Result := 1;
       Exit;
     end;
-    { Non-Exists LIMIT — mirrors computeLimitRegisters (select.c:2523..2543).
+    { LIMIT — mirrors computeLimitRegisters (select.c:2523..2543).  This arm
+      now also serves EXISTS subqueries: sqlite3CodeSubselect (expr.c:3933)
+      rewrites the EXISTS LIMIT so the synthetic default is integer 1 (→ this
+      integer arm emits OP_Integer 1), a user LIMIT 0 stays integer 0 (→ the
+      LIMIT-0 short-circuit Goto fires, EXISTS yields no rows: existsexpr-8.0),
+      and a user LIMIT >1 becomes the `X<>0` expr (→ the non-integer arm).
+      Previously a dedicated isExists arm hardcoded OP_Integer 1, clobbering
+      the user's LIMIT 0.
       The constant-integer case emits OP_Integer N, iLimit and (for N=0) a
       short-circuit Goto over the WHERE loop; DecrJumpZero is emitted in the
       inner loop after OP_ResultRow.  Any non-integer-literal LIMIT (a
