@@ -9378,6 +9378,14 @@ begin
       end else begin
         if sqlite3StrICmp(pItem^.pSTab^.zName, pE^.pLeft^.u.zToken) <> 0 then Continue;
       end;
+      { resolve.c:432..434 — when the matched FROM source carries an ALIAS,
+        the table-qualifier token in the SQL is that alias, NOT the real
+        table name; under PARSE_MODE_RENAME discard (remap to NULL) the
+        rename token recorded against @pE^.y.pTab so that an ALTER TABLE
+        ... RENAME never rewrites the alias into the new table name
+        (altertab-3.2.2/3.3.2: `one.b` must stay `one.b`). }
+      if (pParse <> nil) and InRenameObject(pParse) and (pItem^.zAlias <> nil) then
+        sqlite3RenameTokenRemap(pParse, nil, @pE^.y.pTab);
       iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.u.zToken);
       if iCol >= 0 then
       begin
@@ -13796,6 +13804,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             pE^.iTable  := pItem^.iCursor;
             pE^.iColumn := i16(-1);
             pE^.y.pTab  := pItem^.pSTab;
+            { resolve.c:432..434 — aliased source: discard the rename token on
+              @pE^.y.pTab so the alias qualifier is preserved across RENAME. }
+            if InRenameObject(pParse) and (pItem^.zAlias <> nil) then
+              sqlite3RenameTokenRemap(pParse, nil, @pE^.y.pTab);
             pE^.pLeft   := nil;
             pE^.pRight  := nil;
             pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
@@ -13847,6 +13859,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           if effCol = i16(-1) then
             pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
           pE^.y.pTab  := pMatch^.pSTab;
+          { resolve.c:432..434 — the matched FROM source carries an ALIAS, so
+            the table-qualifier token in the SQL is the alias and must NOT be
+            rewritten when the table is renamed; discard (remap to NULL) the
+            rename token recorded against @pE^.y.pTab at 13701..13702 above
+            (altertab-3.2.2/3.3.2: `main.one.a` must keep the alias `one`). }
+          if InRenameObject(pParse) and (pMatch^.zAlias <> nil) then
+            sqlite3RenameTokenRemap(pParse, nil, @pE^.y.pTab);
           pE^.pLeft   := nil;
           pE^.pRight  := nil;
           { resolve.c:826..832 — gate on POST-substitution iColumn:
@@ -55768,6 +55787,13 @@ begin
           [Pointer(pFromItems[i].zEName)]));
         goto fk_end;
       end;
+      { build.c:3694..3696 — under PARSE_MODE_RENAME remap the FROM-column's
+        existing rename token onto the colmap entry &pFKey->aCol[i] so that
+        renameColumnFunc can rewrite the constituent column name in the
+        child table's FOREIGN KEY(...) clause. }
+      if InRenameObject(pParse) then
+        sqlite3RenameTokenRemap(pParse, Pointer(pColmap + SizeInt(i) * COLMAP_SIZE),
+          Pointer(pFromItems[i].zEName));
     end;
   end;
 
@@ -55777,6 +55803,13 @@ begin
     begin
       nameLen := sqlite3Strlen30(pToItems[i].zEName);
       PPointer(pColmap + SizeInt(i) * COLMAP_SIZE + COLMAP_ZCOL_OFFSET)^ := z;
+      { build.c:3702..3704 — under PARSE_MODE_RENAME remap the existing
+        rename token for the pToCol column-name expr onto the FK referenced
+        column-name buffer (zCol) so renameColumnFunc can rewrite
+        REFERENCES tab(col) when the parent column is renamed
+        (altercol-4.2/4.4). }
+      if InRenameObject(pParse) then
+        sqlite3RenameTokenRemap(pParse, Pointer(z), Pointer(pToItems[i].zEName));
       Move(pToItems[i].zEName^, z^, nameLen);
       z[nameLen] := #0;
       Inc(z, nameLen + 1);
