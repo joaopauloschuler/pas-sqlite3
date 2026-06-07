@@ -10265,6 +10265,16 @@ begin
   if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
   resolveOuterDotInExpr(pW^.pLeft,  pOuterSrc, pInnerSrc);
   resolveOuterDotInExpr(pW^.pRight, pOuterSrc, pInnerSrc);
+  { window1-10.8 — descend into a window function's PARTITION BY / ORDER BY /
+    FILTER sub-expressions (off pW^.y.pWin) so a correlated outer TK_DOT inside
+    FILTER (WHERE ...) gets bound to the outer cursor.  Mirrors resolve.c:
+    1321..1323 walking pWin->pPartition/pOrderBy/pFilter. }
+  if ExprHasProperty(pW, EP_WinFunc) and (pW^.y.pWin <> nil) then
+  begin
+    resolveOuterDotInList(pW^.y.pWin^.pPartition, pOuterSrc, pInnerSrc);
+    resolveOuterDotInList(pW^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc);
+    resolveOuterDotInExpr(pW^.y.pWin^.pFilter,    pOuterSrc, pInnerSrc);
+  end;
   if (pW^.flags and EP_xIsSelect) = 0 then
   begin
     if pW^.x.pList <> nil then
@@ -10423,6 +10433,20 @@ begin
   if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
   if exprHasOuterDot(pE^.pLeft,  pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
   if exprHasOuterDot(pE^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+  { window1-10.8 — a window function's PARTITION BY / ORDER BY / FILTER
+    expressions hang off pE^.y.pWin, not x.pList, so the arg-walk below never
+    reaches them.  resolve.c:1321..1323 walks pWin->pPartition/pOrderBy/pFilter
+    with the outer-chained NameContext, so a correlated `outer.emp` inside
+    FILTER (WHERE ...) makes the subquery correlated. }
+  if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil) then
+  begin
+    if exprListHasOuterDot(pE^.y.pWin^.pPartition, pOuterSrc, pInnerSrc) then
+    begin Result := True; Exit; end;
+    if exprListHasOuterDot(pE^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc) then
+    begin Result := True; Exit; end;
+    if exprHasOuterDot    (pE^.y.pWin^.pFilter,    pOuterSrc, pInnerSrc) then
+    begin Result := True; Exit; end;
+  end;
   if (pE^.flags and EP_xIsSelect) = 0 then
   begin
     if exprListHasOuterDot(pE^.x.pList, pOuterSrc, pInnerSrc) then
@@ -11095,6 +11119,27 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       if ExprRefsOuterTable(pW^.pLeft, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
       if ExprRefsOuterTable(pW^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+      { window1-10.8 — a window function's PARTITION BY / ORDER BY / FILTER
+        sub-expressions (off pW^.y.pWin) can hold a correlated outer TK_DOT
+        (e.g. FILTER (WHERE x!=outer.emp)); resolve.c:1321..1323 walks them, so
+        a ref there must mark the enclosing subquery correlated.  Without this
+        the Step-3 ResolveOuterRefs rewrite is never triggered and the inner
+        resolver raises "no such column: outer.emp". }
+      if ExprHasProperty(pW, EP_WinFunc) and (pW^.y.pWin <> nil) then
+      begin
+        if pW^.y.pWin^.pPartition <> nil then
+          for j := 0 to pW^.y.pWin^.pPartition^.nExpr - 1 do
+            if ExprRefsOuterTable(ExprListItems(pW^.y.pWin^.pPartition)[j].pExpr,
+                                  pOuterSrc, pInnerSrc) then
+            begin Result := True; Exit; end;
+        if pW^.y.pWin^.pOrderBy <> nil then
+          for j := 0 to pW^.y.pWin^.pOrderBy^.nExpr - 1 do
+            if ExprRefsOuterTable(ExprListItems(pW^.y.pWin^.pOrderBy)[j].pExpr,
+                                  pOuterSrc, pInnerSrc) then
+            begin Result := True; Exit; end;
+        if ExprRefsOuterTable(pW^.y.pWin^.pFilter, pOuterSrc, pInnerSrc) then
+        begin Result := True; Exit; end;
+      end;
       if (pW^.flags and EP_xIsSelect) = 0 then
       begin
         if pW^.x.pList <> nil then
@@ -11221,6 +11266,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         ResolveOuterRefsInList(pW^.y.pWin^.pPartition, pOuterSrc, pInnerSrc);
         ResolveOuterRefsInList(pW^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc);
+        { window1-10.8 — resolve.c:1323 walks pWin->pFilter through the
+          outer-chained NameContext too, so a correlated outer column inside
+          FILTER (WHERE ...) pre-binds to the outer cursor. }
+        ResolveOuterRefs(pW^.y.pWin^.pFilter, pOuterSrc, pInnerSrc);
       end;
       if (pW^.flags and EP_xIsSelect) = 0 then
       begin
@@ -11750,6 +11799,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       ResolveOuterIDsInList(pW^.y.pWin^.pPartition, pOuterSrc, pInnerSrc);
       ResolveOuterIDsInList(pW^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc);
+      { window1-10.8 — see ResolveOuterRefs companion: resolve.c:1323 also
+        walks pWin->pFilter for outer correlation. }
+      ResolveOuterIDs(pW^.y.pWin^.pFilter, pOuterSrc, pInnerSrc);
     end;
     if (pW^.flags and EP_xIsSelect) = 0 then
       ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc)
