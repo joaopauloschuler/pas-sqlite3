@@ -998,7 +998,14 @@ type
     nVtabLock:       i32;           { 304: virtual tables to lock }
     nHeight:         i32;           { 308: expression tree height }
     addrExplain:     i32;           { 312: address of current OP_Explain }
-    _pad316:         i32;           { 316: padding }
+    nMultiValueSuppress: i32;       { 316: transient — when >0, suppress the
+                                      compound-dispatch structural EQP nodes and
+                                      per-arm "SCAN CONSTANT ROW" for an
+                                      SF_MultiValue (VALUES) compound; the
+                                      multiSelectValues arm emits one
+                                      "SCAN N CONSTANT ROWS" node instead.
+                                      Reuses the former _pad316 slot (no layout
+                                      change). }
     pVList:          Pointer;       { 320: variable name-number mapping }
     pReprepare:      PVdbe;         { 328: VM being reprepared }
     zTail:           PAnsiChar;     { 336: SQL text past last semicolon }
@@ -36498,6 +36505,10 @@ var
   ctOnceAddr:   i32;
   ctAddrExplain: i32;
   pSelfPrior:   PSrcItem;   { with1-24.1 — isSelfJoinView prior reference }
+  msvRow:       i32;        { multiSelectValues — number of CONSTANT ROWS }
+  msvShowAll:   i32;        { multiSelectValues — bShowAll (pLimit=0) }
+  msvWalk:      PSelect;    { multiSelectValues — pPrior walker }
+  vMsv:         PVdbe;      { multiSelectValues — vdbe handle }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   fCoroFallThru := False;
@@ -37306,6 +37317,45 @@ begin
       Result := SQLITE_OK;
       Exit;
     end;
+    { multiSelectValues (select.c:2853..2885, dispatched at select.c:2963) —
+      a compound that originates from a VALUES clause (SF_MultiValue on the
+      right-most term) is narrated as ONE "SCAN N CONSTANT ROWS" node, NOT
+      as the generic COMPOUND QUERY / LEFT-MOST SUBQUERY / UNION ALL tree
+      with a per-arm "SCAN CONSTANT ROW".  The row-producing bytecode is
+      byte-identical between the generic compound dispatch and C's
+      multiSelectValues for a VALUES clause (no LIMIT → no inter-arm IfNot
+      gate), so rather than re-implement selectInnerLoop here we (a) emit the
+      single SCAN node, then (b) raise pParse^.nMultiValueSuppress so the
+      generic dispatch below skips its structural EQP nodes and each arm's
+      "SCAN CONSTANT ROW", and (c) run the generic dispatch for the codegen.
+      Counting: bShowAll = (pLimit=0); for the scalar `(VALUES(1),(2))` case
+      C adds LIMIT 1 and shows just 1 row.  pParse^.eParseMode<>NORMAL view
+      bodies still carry SF_MultiValue (sqlite3MultiValues:48040). }
+    if ((p^.selFlags and SF_MultiValue) <> 0)
+       and (pParse^.nMultiValueSuppress = 0) then
+    begin
+      msvRow := 1;
+      msvShowAll := Ord(p^.pLimit = nil);
+      msvWalk := p;
+      while msvWalk^.pPrior <> nil do
+      begin
+        msvWalk := msvWalk^.pPrior;
+        Inc(msvRow, msvShowAll);
+      end;
+      vMsv := sqlite3GetVdbe(pParse);
+      if vMsv <> nil then
+      begin
+        if msvRow = 1 then
+          sqlite3VdbeExplain(pParse, 0, 'SCAN %d CONSTANT ROW', [PtrInt(msvRow)])
+        else
+          sqlite3VdbeExplain(pParse, 0, 'SCAN %d CONSTANT ROWS', [PtrInt(msvRow)]);
+      end;
+      Inc(pParse^.nMultiValueSuppress);
+      rcSel := sqlite3Select(pParse, p, pDest);
+      Dec(pParse^.nMultiValueSuppress);
+      Result := rcSel;
+      Exit;
+    end;
     { Compound-SELECT — UNION ALL arm of multiSelect (select.c:2998..3050).
       TK_ALL / no-ORDER-BY / non-recursive.  Optional LIMIT/OFFSET
       propagated to the left arm by duplicating p^.pLimit onto pPrior;
@@ -37368,7 +37418,8 @@ begin
         node so every arm's SCAN nests under the compound tree.  The push order
         and the per-arm "UNION ALL" node + final pop mirror C exactly; the
         emission self-gates on EXPLAIN QUERY PLAN mode inside sqlite3VdbeExplain. }
-      if pPriorSel^.pPrior = nil then
+      if (pPriorSel^.pPrior = nil)
+         and (pParse^.nMultiValueSuppress = 0) then
       begin
         sqlite3VdbeExplain(pParse, 1, 'COMPOUND QUERY', []);
         sqlite3VdbeExplain(pParse, 1, 'LEFT-MOST SUBQUERY', []);
@@ -37391,7 +37442,8 @@ begin
         sqlite3Select has no such trailing pop, so it must be issued here.
         Gate on the same condition that pushed LEFT-MOST (pPriorSel^.pPrior =
         nil) so nested multi-arm compounds don't over-pop. }
-      if pPriorSel^.pPrior = nil then
+      if (pPriorSel^.pPrior = nil)
+         and (pParse^.nMultiValueSuppress = 0) then
         sqlite3VdbeExplainPop(pParse);
 
       { Drop the duplicated LIMIT Expr (select.c:3013..3014). }
@@ -37419,7 +37471,8 @@ begin
         { ExplainQueryPlan((pParse, 1, "UNION ALL")) — select.c:3029.  Pushed
           before recursing into the right arm so its SCAN nests under the
           UNION ALL node. }
-        sqlite3VdbeExplain(pParse, 1, 'UNION ALL', []);
+        if pParse^.nMultiValueSuppress = 0 then
+          sqlite3VdbeExplain(pParse, 1, 'UNION ALL', []);
         {$IFDEF SQLITE_DEBUG}
         { 10.1.42.a.1 — TREETRACE(0x200) "multiSelect UNION ALL right..."
           (select.c:3030).  Pairs with the "left" breadcrumb; printed
@@ -37432,7 +37485,8 @@ begin
         { Pop the "UNION ALL" node coded above.  In C this is done by the
           right-arm's own sqlite3Select tail (select.c:8962); replicated here
           because this port's sqlite3Select does not auto-pop. }
-        sqlite3VdbeExplainPop(pParse);
+        if pParse^.nMultiValueSuppress = 0 then
+          sqlite3VdbeExplainPop(pParse);
         if addrLimJmp <> 0 then
         begin
           vdbeUA := sqlite3GetVdbe(pParse);
@@ -37441,7 +37495,8 @@ begin
       end;
       { ExplainQueryPlanPop (select.c:3045..3048) — pop the "COMPOUND QUERY"
         node once the right-most arm has been coded (p^.pNext = nil). }
-      if p^.pNext = nil then
+      if (p^.pNext = nil)
+         and (pParse^.nMultiValueSuppress = 0) then
         sqlite3VdbeExplainPop(pParse);
       p^.selFlags         := savedFlagsP;
       pPriorSel^.selFlags := savedFlagsPP;
@@ -37581,7 +37636,8 @@ begin
       coroutine (SF_MultiValue set by sqlite3MultiValues recursion).  C
       mirrors the suppression — multiSelectValues emits a single SCAN
       Explain at the consumer level, not inside each coroutine body. }
-    if (p^.selFlags and SF_MultiValue) = 0 then
+    if ((p^.selFlags and SF_MultiValue) = 0)
+       and (pParse^.nMultiValueSuppress = 0) then
       { 7.4b.1 — match the C oracle's narrator on no-FROM SELECT.  C
         runs sqlite3WhereBegin even for an empty FROM clause and emits
         ExplainQueryPlan(("SCAN CONSTANT ROW")) at where.c:6954.  The
@@ -40871,7 +40927,7 @@ begin
      and ((p^.selFlags and SF_Distinct) = 0)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
           or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Mem)
-          or (pDest^.eDest = SRT_Exists))
+          or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -40898,6 +40954,7 @@ begin
          opened (fuzz-1.5 / fuzz-1.11 AV at vdbe.c OP_Rewind). }
        and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
             or (pDest^.eDest = SRT_Mem) or (pDest^.eDest = SRT_Exists)
+            or (pDest^.eDest = SRT_Set)
             or ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0))
     then
     begin
@@ -40913,6 +40970,90 @@ begin
         Inc(pParse^.nTab);
       end;
       iCsr := pItem^.iCursor;
+
+      { fromClauseTermCanBeCoroutine restriction (2) (select.c:7265..7267) —
+        a CTE that is referenced more than once and is not declared NOT
+        MATERIALIZED must be MATERIALIZED, not coded as a co-routine.  The
+        multi-source pre-materialise loop below (tag-select-0488) already
+        handles this for nSrc>1; replicate it here for the single-source
+        FROM-subquery path (e.g. the IN-RHS `SELECT n FROM k` where k is a
+        CTE used 3 times — pushdown-6.1).  Emit the once-run materialisation
+        subroutine + MATERIALIZE EQP node, invoke it via OP_Gosub, mark the
+        item fg.isMaterialized, then fall through to the generic
+        sqlite3WhereBegin consumer (which scans the now-populated eph cursor
+        and builds the CREATE BLOOM FILTER for the IN-RHS). }
+      pCteUseLoc := nil;
+      if ((pItem^.fg.fgBits2 and u8($02)) <> 0)        { isCte }
+         and (pItem^.u2.pCteUse <> nil) then
+      begin
+        pCteUseLoc := pItem^.u2.pCteUse;
+        if not ((pCteUseLoc^.nUse >= 2)
+                and (pCteUseLoc^.eM10d <> u8(2))) then  { M10d_No }
+          pCteUseLoc := nil;
+      end;
+      if pCteUseLoc <> nil then
+      begin
+        if pCteUseLoc^.addrM9e > 0 then
+        begin
+          { tag-select-0484 — materialisation already coded by a prior
+            reference: Gosub then OpenDup this cursor off the shared one. }
+          sqlite3VdbeAddOp2(v, OP_Gosub, pCteUseLoc^.regRtn,
+                            pCteUseLoc^.addrM9e);
+          if pItem^.iCursor <> pCteUseLoc^.iCur then
+            sqlite3VdbeAddOp2(v, OP_OpenDup, pItem^.iCursor,
+                              pCteUseLoc^.iCur);
+          pItem^.u4.pSubq^.pSelect^.nSelectRow := pCteUseLoc^.nRowEst;
+        end
+        else
+        begin
+          Inc(pParse^.nMem);
+          pItem^.u4.pSubq^.regReturn := pParse^.nMem;
+          ctTopAddr := sqlite3VdbeAddOp0(v, OP_Goto);
+          pItem^.u4.pSubq^.addrFillSub := ctTopAddr + 1;
+          pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_MATERIALIZED;
+          ctOnceAddr := 0;
+          if (pItem^.fg.fgBits and u8($10)) = 0 then  { not isCorrelated }
+            ctOnceAddr := sqlite3VdbeAddOp0(v, OP_Once);
+          sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
+                            pItem^.pSTab^.nCol);
+          sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
+          ctAddrExplain := pParse^.addrExplain;
+          sqlite3VdbeExplain(pParse, 1, 'MATERIALIZE %!S', [Pointer(pItem)]);
+          if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+          begin
+            Result := SQLITE_ERROR; Exit;
+          end;
+          pParse^.addrExplain := ctAddrExplain;
+          pItem^.pSTab^.nRowLogEst := pItem^.u4.pSubq^.pSelect^.nSelectRow;
+          if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
+          sqlite3VdbeAddOp2(v, OP_Return, pItem^.u4.pSubq^.regReturn,
+                            ctTopAddr + 1);
+          sqlite3VdbeJumpHere(v, ctTopAddr);
+          pCteUseLoc^.addrM9e := pItem^.u4.pSubq^.addrFillSub;
+          pCteUseLoc^.regRtn  := pItem^.u4.pSubq^.regReturn;
+          pCteUseLoc^.iCur    := pItem^.iCursor;
+          pCteUseLoc^.nRowEst := pItem^.u4.pSubq^.pSelect^.nSelectRow;
+          ctOnceAddr := 0;
+          if (pItem^.fg.fgBits and u8($10)) = 0 then  { not isCorrelated }
+            ctOnceAddr := sqlite3VdbeAddOp0(v, OP_Once);
+          sqlite3VdbeAddOp2(v, OP_Gosub, pItem^.u4.pSubq^.regReturn,
+                            pItem^.u4.pSubq^.addrFillSub);
+          if ctOnceAddr <> 0 then sqlite3VdbeJumpHere(v, ctOnceAddr);
+        end;
+        { Fall through to the generic sqlite3WhereBegin consumer for the
+          covered destinations (it scans the materialised eph + builds the
+          IN-RHS bloom).  For destinations the generic consumer does not
+          serve, fall back to the single-source materialise/scan arm below
+          (fCoroFallThru stays False). }
+        if (pDest^.eDest = SRT_Output)
+           or (pDest^.eDest = SRT_Mem)
+           or (pDest^.eDest = SRT_Exists)
+           or (pDest^.eDest = SRT_EphemTab)
+           or (pDest^.eDest = SRT_Coroutine)
+           or (pDest^.eDest = SRT_Set) then
+          fCoroFallThru := True;
+      end
+      else
 
       { 10.1.bug.19 — when sqlite3MultiValues already emitted the
         coroutine body during parse (VALUES(1),(2),(3) wrapper), the
@@ -41022,7 +41163,8 @@ begin
            or (pDest^.eDest = SRT_Mem)
            or (pDest^.eDest = SRT_Exists)
            or (pDest^.eDest = SRT_EphemTab)
-           or (pDest^.eDest = SRT_Coroutine) then
+           or (pDest^.eDest = SRT_Coroutine)
+           or (pDest^.eDest = SRT_Set) then
           fCoroFallThru := True
         else
           { Outer-scan EQP node — sibling SCAN %!S for the viaCoroutine FROM
