@@ -12767,7 +12767,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     pSTab is built from its pEList so the inner index becomes the iColumn
     referenced by the outer pEList entry. }
   function FindWrapperEListIdx(pWrap: PSrcItem; zTab_, zCol_: PAnsiChar;
-    out idx_: i32): Boolean;
+    pDbSchema_: Pointer; out idx_: i32): Boolean;
   var
     pSel:    PSelect;
     pInnerS: PSrcList;
@@ -12809,6 +12809,15 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
          or ((pRef^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
       begin
         if pRef^.pSTab = nil then Continue;
+        { resolve.c:420..421 — when a db qualifier was supplied (db.tab.col),
+          the inner leaf table must live in that schema.  The port's wrapper
+          pEList carries bare (ENAME_NAME) names rather than C's
+          "db.tab.col" zEName triple, so sqlite3MatchEName cannot apply the
+          zDb test; enforce it structurally against the leaf's real schema
+          (selectD-1.2.4: `(main.t4 JOIN aux1.t4 ...)` — main.t4.a must bind
+          the main leaf, not the same-named aux1 leaf). }
+        if (pDbSchema_ <> nil) and (pRef^.pSTab^.pSchema <> PSchema(pDbSchema_)) then
+          Continue;
         { Match by alias-or-name on the leaf table. }
         if pRef^.zAlias <> nil then
         begin
@@ -12856,7 +12865,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         { Inner item is itself a nested-from wrapper.  Its pSTab^.aCol[k]
           is the k-th entry of its own pEList; recurse to find whether the
           (zTab, zCol) maps to that k. }
-        if not FindWrapperEListIdx(pRef, zTab_, zCol_, subIdx) then Continue;
+        if not FindWrapperEListIdx(pRef, zTab_, zCol_, pDbSchema_, subIdx) then Continue;
         if subIdx <> iInnerCol then Continue;
         idx_ := j;
         Result := True;
@@ -13145,7 +13154,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     zCol_  := pE^.pRight^.u.zToken;
     zTab_  := pE^.pLeft^.u.zToken;
     j := -1;
-    if not FindWrapperEListIdx(pItem, zTab_, zCol_, j) then Exit;
+    if not FindWrapperEListIdx(pItem, zTab_, zCol_, nil, j) then Exit;
     pEList_ := pSel^.pEList;
     if (pEList_ = nil) or (j < 0) or (j >= pEList_^.nExpr) then Exit;
     items := ExprListItems(pEList_);
@@ -13329,10 +13338,6 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
           if pItem^.pSTab = nil then Continue;
-          { 9.4.divbug.87.058 — when zDb was supplied, skip sources whose
-            table belongs to a different schema (resolve.c:420..425). }
-          if (pDbSchema <> nil) and (pItem^.pSTab^.pSchema <> pDbSchema) then
-            Continue;
           { 9.4.divbug.59 — nested-from arm (resolve.c:351..417).
             When a parenthesised FROM-clause subset becomes one SrcItem with
             SF_NestedFrom (e.g. `t1 JOIN (t2 JOIN t3 USING(a)) USING(a)`),
@@ -13357,7 +13362,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               record it (pMatch/matchWrapJ) and Inc(cnt), then let the post-
               scan cnt>1 tail raise the error or the cnt==1 tail bind it. }
             if FindWrapperEListIdx(pItem, pE^.pLeft^.u.zToken,
-                 pE^.pRight^.u.zToken, iCol) then
+                 pE^.pRight^.u.zToken, pDbSchema, iCol) then
             begin
               Inc(cnt);
               pMatch      := pItem;
@@ -13366,6 +13371,15 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               Continue;
             end;
           end;
+          { 9.4.divbug.87.058 — when zDb was supplied, skip non-nested sources
+            whose table belongs to a different schema (resolve.c:419..422; the
+            schema filter is part of the leaf `if(zTab)` arm, AFTER the
+            nested-from block's `if(hit||zTab==0) continue`).  A nested-from
+            wrapper carries a synthetic pSTab whose pSchema is NOT the queried
+            db, so this filter must NOT apply to it — the zDb constraint is
+            instead threaded into FindWrapperEListIdx above (selectD-1.2.4). }
+          if (pDbSchema <> nil) and (pItem^.pSTab^.pSchema <> pDbSchema) then
+            Continue;
           if pItem^.zAlias <> nil then
           begin
             if sqlite3StrICmp(pItem^.zAlias, pE^.pLeft^.u.zToken) <> 0 then Continue;
