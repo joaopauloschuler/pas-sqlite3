@@ -36228,6 +36228,7 @@ var
   pTabList:    PSrcList;
   pEList:      PExprList;
   pItem:       PSrcItem;
+  fCoroFallThru: Boolean;  { fresh single-source coroutine → generic WhereBegin consumer }
   p0:          PSrcItem;   { UPDATE...FROM target (SF_UFSrcCheck) }
   zUFMsg:      PAnsiChar;  { SF_UFSrcCheck error message }
   pTab:        PTable2;
@@ -36499,6 +36500,7 @@ var
   pSelfPrior:   PSrcItem;   { with1-24.1 — isSelfJoinView prior reference }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
+  fCoroFallThru := False;
   { select.c:7603 — create (or fetch) the VDBE before name resolution so
     that the DQS-literal recorder (sqlite3VdbeAddDblquoteStr, reached via
     sqlite3SelectPrep -> lookupName) has a non-nil pParse^.pVdbe to append
@@ -40899,6 +40901,7 @@ begin
             or ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0))
     then
     begin
+      fCoroFallThru := False;
       v := sqlite3GetVdbe(pParse);
       if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
       if pDest^.eDest = SRT_Output then
@@ -40997,13 +41000,45 @@ begin
         sqlite3VdbeChangeP2(v, addrTopOfLoop,
                             sqlite3VdbeCurrentAddr(v));
 
-        { Outer-scan EQP node — sibling SCAN %!S for the viaCoroutine FROM
-          item (wherecode.c sqlite3WhereExplainOneScan reports the
-          co-routine source as a plain SCAN).  Only emitted for the
-          freshly-coded co-routine; the SF_MultiValue / VALUES path above
-          emits its own "SCAN N-ROW VALUES CLAUSE" node. }
-        sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
+        { Phase: route the freshly-coded co-routine CONSUMER through the
+          generic sqlite3WhereBegin path (select.c structure: code the
+          FROM-subquery co-routine at select.c:8043..8062, set
+          fg.viaCoroutine, then FALL THROUGH to the generic consumer at
+          select.c:8265 which calls sqlite3WhereBegin).  The hand-rolled
+          OP_Yield scan loop below never invoked the WHERE planner, so a
+          WHERE term over the co-routine's columns (e.g. a correlated
+          scalar subquery `(SELECT v.c FROM v WHERE v.d=?)` over a
+          DISTINCT/ORDER-BY view) could not build an AUTOMATIC COVERING
+          INDEX + BLOOM FILTER.  sqlite3WhereBegin already handles
+          viaCoroutine items (forces the full planner via
+          fSingleTabCoroutine, emits the SCAN/SEARCH EQP via
+          sqlite3WhereExplainOneScan, and drives the consumer with
+          InitCoroutine/Yield in the wherecode viaCoroutine arm).
+
+          Gated to the destinations the generic consumer (selectInnerLoop
+          dispatch) covers and that the inline block targeted, so the
+          hand-roll remains for cases the fall-through cannot serve. }
+        if (pDest^.eDest = SRT_Output)
+           or (pDest^.eDest = SRT_Mem)
+           or (pDest^.eDest = SRT_Exists)
+           or (pDest^.eDest = SRT_EphemTab)
+           or (pDest^.eDest = SRT_Coroutine) then
+          fCoroFallThru := True
+        else
+          { Outer-scan EQP node — sibling SCAN %!S for the viaCoroutine FROM
+            item (wherecode.c sqlite3WhereExplainOneScan reports the
+            co-routine source as a plain SCAN). }
+          sqlite3VdbeExplain(pParse, 0, 'SCAN %!S', [Pointer(pItem)]);
       end;
+
+      if fCoroFallThru then
+      begin
+        { Skip the hand-rolled OP_Yield consumer below; fall through to the
+          generic sqlite3WhereBegin consumer.  Restore pItem/pTab so the
+          generic path's pre-loop sees the same first source. }
+      end
+      else
+      begin
 
       { Outer scan — alloc result-register block, OP_Yield to drive,
         emit pEList, translateColumnToCopy to redirect OP_Columns at
@@ -41242,6 +41277,7 @@ begin
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR
                           else Result := SQLITE_OK;
       Exit;
+      end;  { close the "else begin" guarding the hand-rolled consumer }
     end;
   end;
 
@@ -41256,6 +41292,7 @@ begin
     always works.  pSTab is non-nil here because piece 2's selectExpander
     subquery hook already ran sqlite3ExpandSubquery on this item. }
   if (p^.pSrc^.nSrc = 1)
+     and (not fCoroFallThru)
      and ((p^.selFlags and SF_Distinct) = 0)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
           or (pDest^.eDest = SRT_Set)
@@ -41266,6 +41303,7 @@ begin
     pTab  := pItem^.pSTab;
     if (pTab <> nil)
        and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+       and ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0)
        and (pItem^.u4.pSubq <> nil)
        and (pItem^.u4.pSubq^.pSelect <> nil)
     then
