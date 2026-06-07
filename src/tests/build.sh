@@ -211,6 +211,7 @@ compile_test TestFts3Vtab
 compile_test TestFts3Snippet
 compile_test TestFts3Aux
 compile_test TestFts3DescUpdate
+compile_test TestFts3BuildPerf
 compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable

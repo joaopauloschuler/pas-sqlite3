@@ -350,7 +350,7 @@ pas-strict	../sqlite3/test/fts3corrupt2.test	-
 pas-strict	../sqlite3/test/fts3corrupt3.test	-
 pas-soft	../sqlite3/test/fts3corrupt4.test	6.40.1.o.3.1: 1/76 residual at 24.7 — FTS control-insert (INSERT INTO t1(t1)) over a corrupt segment image returns malformed where C returns OK
 pas-strict	../sqlite3/test/fts3corrupt5.test	-
-pas-soft	../sqlite3/test/fts3corrupt6.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-soft	../sqlite3/test/fts3corrupt6.test	12.4: timeout-only (30001ms, 0 correctness errors); fsync/autocommit-bound heavy build, oracle equally slow (1533-row prefix build oracle 109s vs port 120s ~1.1x; 30040-row build both >200s) — not a port perf bug (port <=3x oracle per TestFts3BuildPerf), needs txn/sync change not engine fix
 pas-strict	../sqlite3/test/fts3corrupt7.test	-
 pas-skip	../sqlite3/test/fts3cov.test	unswept
 pas-strict	../sqlite3/test/fts3d.test	-
@@ -392,16 +392,16 @@ pas-strict	../sqlite3/test/fts3tok1.test	-
 pas-skip	../sqlite3/test/fts3tok_err.test	unswept
 pas-strict	../sqlite3/test/fts3varint.test	-
 pas-strict	../sqlite3/test/fts4aa.test	-
-pas-soft	../sqlite3/test/fts4check.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-soft	../sqlite3/test/fts4check.test	12.4: timeout-only (30001ms, 0 correctness errors); fsync/autocommit-bound heavy build, oracle equally slow (1533-row prefix build oracle 109s vs port 120s ~1.1x; 30040-row build both >200s) — not a port perf bug (port <=3x oracle per TestFts3BuildPerf), needs txn/sync change not engine fix
 pas-soft	../sqlite3/test/fts4content.test	6.40.1.o.3.4: external-content edge cases (3.2.x empty rows) + 'fs' vtab (register_fs_module, test_fs.c ~900 LOC) unported
 pas-strict	../sqlite3/test/fts4docid.test	-
 pas-strict	../sqlite3/test/fts4growth.test	-
-pas-soft	../sqlite3/test/fts4growth2.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-soft	../sqlite3/test/fts4growth2.test	12.4: timeout-only (30001ms, 0 correctness errors); fsync/autocommit-bound heavy build, oracle equally slow (1533-row prefix build oracle 109s vs port 120s ~1.1x; 30040-row build both >200s) — not a port perf bug (port <=3x oracle per TestFts3BuildPerf), needs txn/sync change not engine fix
 pas-strict	../sqlite3/test/fts4incr.test	-
 pas-strict	../sqlite3/test/fts4intck1.test	-
 pas-strict	../sqlite3/test/fts4langid.test	-
 pas-strict	../sqlite3/test/fts4lastrowid.test	-
-pas-soft	../sqlite3/test/fts4merge.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-soft	../sqlite3/test/fts4merge.test	12.4: timeout-only (30001ms, 0 correctness errors); fsync/autocommit-bound heavy build, oracle equally slow (1533-row prefix build oracle 109s vs port 120s ~1.1x; 30040-row build both >200s) — not a port perf bug (port <=3x oracle per TestFts3BuildPerf), needs txn/sync change not engine fix
 pas-skip	../sqlite3/test/fts4merge2.test	unswept
 pas-skip	../sqlite3/test/fts4merge3.test	unswept
 pas-strict	../sqlite3/test/fts4merge4.test	-
@@ -409,7 +409,7 @@ pas-strict	../sqlite3/test/fts4merge5.test	-
 pas-soft	../sqlite3/test/fts4min.test	6.40.1.o.3.4: 2/6 — fts vtab min/max optimisation idxStr plan comment (/*VIRTUAL TABLE INDEX 0:DESC*/) not emitted
 pas-strict	../sqlite3/test/fts4noti.test	-
 pas-strict	../sqlite3/test/fts4onepass.test	-
-pas-soft	../sqlite3/test/fts4opt.test	6.40.1.o residual: hangs/slow on order=desc doclist or heavy segment-merge; see 6.40.1.o.1/.2
+pas-soft	../sqlite3/test/fts4opt.test	12.4: timeout-only (30001ms, 0 correctness errors); fsync/autocommit-bound heavy build, oracle equally slow (1533-row prefix build oracle 109s vs port 120s ~1.1x; 30040-row build both >200s) — not a port perf bug (port <=3x oracle per TestFts3BuildPerf), needs txn/sync change not engine fix
 pas-soft	../sqlite3/test/fts4record.test	6.40.1.o.3.4: make_fts3record (test_hexio.c) unported; 1 result residual at 1.3.2 besides
 pas-strict	../sqlite3/test/fts4rename.test	-
 pas-strict	../sqlite3/test/fts4umlaut.test	-
