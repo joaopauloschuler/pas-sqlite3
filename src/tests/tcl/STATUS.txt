@@ -671,7 +671,7 @@ pas-skip	../sqlite3/test/printf.test	9.4.divbug.86
 pas-strict	../sqlite3/test/printf2.test	-
 pas-strict	../sqlite3/test/progress.test	-
 pas-strict	../sqlite3/test/ptrchng.test	-
-pas-soft	../sqlite3/test/pushdown.test	9.4.divbug.64
+pas-strict	../sqlite3/test/pushdown.test	-
 pas-soft	../sqlite3/test/qrf01.test	9.4.divbug.91
 pas-soft	../sqlite3/test/qrf02.test	9.4.divbug.91
 pas-soft	../sqlite3/test/qrf03.test	9.4.divbug.64
@@ -1044,7 +1044,7 @@ pas-strict	../sqlite3/test/unique.test	-
 pas-strict	../sqlite3/test/unique2.test	-
 pas-skip	../sqlite3/test/unixexcl.test	unswept
 pas-strict	../sqlite3/test/unordered.test	-
-pas-soft	../sqlite3/test/update.test	9.4.divbug.64
+pas-strict	../sqlite3/test/update.test	-
 pas-strict	../sqlite3/test/update2.test	-
 pas-strict	../sqlite3/test/upfrom1.test	-
 pas-soft	../sqlite3/test/upfrom2.test	9.4.divbug.62
