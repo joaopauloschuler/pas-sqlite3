@@ -9014,6 +9014,67 @@ begin
   sqlite3RecordErrorOffsetOfExpr(pParse^.db, pError);
 end;
 
+{ exprIsWindowFunc — mirror sqliteInt.h:3205 IsWindowFunc(p): a TK_FUNCTION
+  node carrying EP_WinFunc whose attached window is not a bare FILTER clause
+  (eFrmType<>TK_FILTER).  resolve.c:1123 binds `pWin` from this predicate, and
+  the misuse arm (resolve.c:1251) reports "window" (rather than "aggregate")
+  whenever pWin is set. }
+function exprIsWindowFunc(pE: PExpr): Boolean;
+begin
+  Result := (pE <> nil) and ExprHasProperty(pE, EP_WinFunc)
+            and (pE^.y.pWin <> nil) and (pE^.y.pWin^.eFrmType <> TK_FILTER);
+end;
+
+{ reportWindowMisuse — walk pE; on the first window-function TK_FUNCTION node
+  (per exprIsWindowFunc) emit "misuse of window function NAME()" and return
+  True.  Faithful to the resolve.c:1248..1257 misuse arm for the contexts that
+  clear NC_AllowWin (WHERE / GROUP BY / HAVING of a non-windowed query, and the
+  CREATE INDEX partial-WHERE / index-expression DDL walks).  resolve.c reports
+  this error LAST in resolveExprStep (after the non-deterministic-function
+  check at resolve.c:1209), and sqlite3ErrorMsg overwrites the prior message
+  (util.c:262), so the window-misuse wording wins. }
+function reportWindowMisuse(pParse: PParse; pE: PExpr): Boolean;
+var
+  items: PExprListItem;
+  i: i32;
+begin
+  Result := False;
+  if (pE = nil) or (pParse = nil) then Exit;
+  if (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+     and exprIsWindowFunc(pE) then
+  begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'misuse of window function %s()', [pE^.u.zToken]));
+    sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+    Result := True;
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if reportWindowMisuse(pParse, pE^.pLeft)  then begin Result := True; Exit; end;
+  if reportWindowMisuse(pParse, pE^.pRight) then begin Result := True; Exit; end;
+  if ((pE^.flags and EP_xIsSelect) = 0)
+     and ExprUseXList(pE) and (pE^.x.pList <> nil) then
+  begin
+    items := ExprListItems(pE^.x.pList);
+    for i := 0 to pE^.x.pList^.nExpr - 1 do
+      if reportWindowMisuse(pParse, items[i].pExpr) then
+      begin Result := True; Exit; end;
+  end;
+end;
+
+function reportWindowMisuseList(pParse: PParse; pList: PExprList): Boolean;
+var
+  items: PExprListItem;
+  i: i32;
+begin
+  Result := False;
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+    if reportWindowMisuse(pParse, items[i].pExpr) then
+    begin Result := True; Exit; end;
+end;
+
 { Minimal sqlite3ResolveExprNames — walk pExpr resolving TK_ID (and rowid
   pseudo-column) against pNC^.pSrcList.  Mirrors the bare-identifier arm of
   sqlite3ResolveSelectNames (resolve.c lookupName), enough for the DELETE /
@@ -10584,6 +10645,9 @@ begin
 end;
 
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
+var
+  nErrSweep: i32;   { window1-7.1.5 — nErr snapshot to tell a fresh bad-column
+                      sweep error apart from a pre-existing one }
 begin
   if (pNC <> nil) and (pExpr <> nil) then
   begin
@@ -10655,8 +10719,24 @@ begin
        and (((pNC^.pSrcList <> nil) and (pNC^.pSrcList^.nSrc > 0))
             or (pNC^.pNext = nil)) then
     begin
+      nErrSweep := pNC^.pParse^.nErr;
       flagUnresolvedTKID(pNC^.pParse, pExpr,
         (pNC^.ncFlags and NC_IsDDL) <> 0);
+      { resolve.c:1248..1257 window-misuse arm — none of the contexts that drive
+        this lean resolver (UPDATE/DELETE WHERE & SET, CREATE INDEX partial-WHERE
+        / index-expression, CHECK, generated columns, LIMIT/OFFSET) set
+        NC_AllowWin, so a window-function call here is "misuse of window function
+        NAME()".  In C resolveExprStep this arm (resolve.c:1256) OVERWRITES the
+        same-node non-deterministic-function error (resolve.c:1209, emitted in
+        resolveExprAgainstSrcList above) but is itself OVERWRITTEN by an argument
+        error (sqlite3ErrorMsg keeps the last message — util.c:262).  flagUnre-
+        solvedTKID no-ops when nErr was already set (e.g. the non-deterministic
+        message), so on CREATE INDEX (nErr unchanged here) we still emit and
+        override; but when it raises a FRESH "no such column" for a bad argument
+        (the empty LIMIT NameContext, window1-7.1.5 — nErr advanced) that message
+        wins and we skip the misuse. }
+      if (pNC^.pParse^.nErr = nErrSweep) then
+        reportWindowMisuse(pNC^.pParse, pExpr);
       if pNC^.pParse^.nErr > 0 then
       begin
         Result := SQLITE_ERROR; Exit;
@@ -15520,6 +15600,13 @@ begin
     `0==1` constant-folds to FALSE during planning). }
   if (pParse^.nErr = 0) and (p^.pWhere <> nil) then
     ApplyNotNullStrengthReductionWhere(pParse, p^.pWhere);
+  { resolve.c:1954/1248..1257 — WHERE is resolved with NC_AllowWin cleared, so
+    a window-function call here is "misuse of window function NAME()".  Check
+    before the aggregate-misuse pass so the window wording wins (a window func
+    is also an aggregate, but C's pWin!=0 selects zType="window").
+    window1-3.1. }
+  if (pParse^.nErr = 0) and (p^.pWhere <> nil) then
+    reportWindowMisuse(pParse, p^.pWhere);
   { resolve.c:1112..1266 — an aggregate-function call resolved in WHERE is
     illegal.  In an aggregate query (NC_AllowAgg set) rewrite it to
     TK_AGG_FUNCTION so codegen emits "misuse of aggregate: NAME()"
@@ -15542,8 +15629,19 @@ begin
     below rewrites the term into a copy of the matching result-set expr. }
   if p^.pGroupBy <> nil then
     ResolveAliasOrderByCol(p^.pGroupBy, True);
-  ResolveExprList(p^.pGroupBy);
-  if p^.pHaving <> nil then
+  { resolve.c:1954/2049/1248..1257 — GROUP BY is resolved with NC_AllowWin
+    cleared; a window-function term is "misuse of window function NAME()".
+    window1-3.2. }
+  if (pParse^.nErr = 0) and (p^.pGroupBy <> nil) then
+    reportWindowMisuseList(pParse, p^.pGroupBy);
+  if pParse^.nErr = 0 then
+    ResolveExprList(p^.pGroupBy);
+  { resolve.c:1954/1248..1257 — HAVING is resolved with NC_AllowWin cleared;
+    a window-function call is "misuse of window function NAME()".
+    window1-3.3. }
+  if (pParse^.nErr = 0) and (p^.pHaving <> nil) then
+    reportWindowMisuse(pParse, p^.pHaving);
+  if (pParse^.nErr = 0) and (p^.pHaving <> nil) then
     ResolveAliasInHaving(p^.pHaving);
   { 9.4.divbug.70.c — skip ResolveExpr when ResolveAliasInHaving already
     raised "misuse of aliased aggregate <m>", otherwise a stale TK_ID
