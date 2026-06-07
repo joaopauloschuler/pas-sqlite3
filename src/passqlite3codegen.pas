@@ -9797,59 +9797,219 @@ begin
   end;
 end;
 
+{ bindExprToTriggerCol — rewrite pE into a TK_REGISTER reference against the
+  RETURNING modified table (pParse^.pTriggerTab) for the given resolved column
+  index iCol.  Mirrors resolve.c:589..596 (the pParse->bReturning arm of
+  lookupName, where eNewExprOp=TK_REGISTER, op2=TK_COLUMN, and iTable points at
+  the new/old base register). }
+procedure bindExprToTriggerCol(pParse: PParse; iBaseReg: i32; pE: PExpr;
+  iCol: i32);
+var
+  pTab:    PTable2;
+  iTable:  i32;
+  storCol: i32;
+begin
+  pTab := PTable2(pParse^.pTriggerTab);
+  { resolve.c:534 — pExpr->iTable = op!=TK_DELETE (1 for INSERT/UPDATE, 0 for
+    DELETE), giving the NEW (1) vs OLD (0) sub-record offset. }
+  if pParse^.eTriggerOp = TK_DELETE then iTable := 0 else iTable := 1;
+  { resolve.c:595 — sqlite3TableColumnToStorage maps the logical column index
+    to its storage slot (VIRTUAL generated columns are shifted to the end), so
+    a table with a virtual column (returning1-5.4 `t2(a AS (1+1), b)`) reads
+    the right NEW/OLD register. }
+  storCol := sqlite3TableColumnToStorage(pTab, i16(iCol));
+  pE^.y.pTab  := pTab;
+  pE^.op      := TK_REGISTER;
+  pE^.op2     := TK_COLUMN;
+  pE^.iColumn := i16(iCol);
+  pE^.iTable  := iBaseReg + (i32(pTab^.nCol) + 1) * iTable + storCol + 1;
+  if iCol < 0 then pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+  if iTable = 0 then begin
+    if iCol >= 0 then
+      pParse^.oldmask := pParse^.oldmask or (u32(1) shl (iCol and 31))
+    else
+      pParse^.oldmask := $FFFFFFFF;
+  end else begin
+    if iCol >= 0 then
+      pParse^.newmask := pParse^.newmask or (u32(1) shl (iCol and 31))
+    else
+      pParse^.newmask := $FFFFFFFF;
+  end;
+end;
+
+{ triggerColIndex — return the resolved column index of zCol in the RETURNING
+  modified table, or -2 if it does not resolve there.  Folds in the rowid
+  alias (-1) and the INTEGER-PRIMARY-KEY collapse to -1, matching
+  resolve.c:560..569. }
+function triggerColIndex(pTab: PTable2; zCol: PAnsiChar): i32;
+begin
+  Result := sqlite3ColumnIndex(pTab, zCol);
+  if Result >= 0 then
+  begin
+    if pTab^.iPKey = Result then Result := -1;
+  end
+  else
+  begin
+    if sqlite3IsRowid(zCol) <> 0 then Result := -1
+    else Result := -2;  { not found and not the rowid alias }
+  end;
+  if Result >= pTab^.nCol then Result := -2;
+end;
+
+{ srcItemMatchesName — True if any source in pSrc is named zName (by alias
+  when aliased, otherwise by table name). }
+function srcItemMatchesName(pSrc: PSrcList; zName: PAnsiChar;
+  out pItemOut: PSrcItem): Boolean;
+var
+  base, pIt: PSrcItem;
+  j: i32;
+begin
+  Result := False; pItemOut := nil;
+  if (pSrc = nil) or (zName = nil) then Exit;
+  base := SrcListItems(pSrc);
+  for j := 0 to pSrc^.nSrc - 1 do
+  begin
+    pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+    if pIt^.zAlias <> nil then begin
+      if sqlite3StrICmp(pIt^.zAlias, zName) = 0 then
+      begin pItemOut := pIt; Result := True; Exit; end;
+    end else if pIt^.pSTab <> nil then begin
+      if sqlite3StrICmp(pIt^.pSTab^.zName, zName) = 0 then
+      begin pItemOut := pIt; Result := True; Exit; end;
+    end;
+  end;
+end;
+
+procedure resolveTriggerRefsInSelect(pParse: PParse; iBaseReg: i32;
+  p: PSelect); forward;
+
+function bareColInSrcList(pSrc: PSrcList; zCol: PAnsiChar;
+  out pMatch: PSrcItem; out iColOut: i32): Boolean; forward;
+
 { resolveBareIdToTrigger — RETURNING context companion to
   resolveTriggerNewOld.  When NC_UBaseReg is set (codeReturningTrigger /
-  upsertDoUpdate path) and pTriggerTab is bound, bare TK_ID column refs
-  are treated as NEW.x (INSERT/UPDATE) or OLD.x (DELETE), matching
-  resolve.c lookupName's bareword fallback. }
-procedure resolveBareIdToTrigger(pParse: PParse; iBaseReg: i32; pE: PExpr);
+  upsertDoUpdate path) and pTriggerTab is bound, column refs are resolved
+  against the table being modified, matching resolve.c lookupName's
+  pParse->bReturning arm (resolve.c:522..616):
+
+    * a bare TK_ID column resolves to NEW.x (INSERT/UPDATE) or OLD.x (DELETE);
+    * a TABLE.col TK_DOT whose qualifier equals the modified table's real
+      name (NOT an alias — returning1-7.7) also resolves there;
+
+  References inside RETURNING subqueries that fail to bind against the
+  subquery's own FROM but match the modified table likewise resolve to it
+  (the C name resolver reaches pParse->pTriggerTab via the pNC->pNext climb).
+  pInnerSrc is the innermost subquery FROM currently being descended (nil at
+  the RETURNING top level); a ref is only bound to the modified table when it
+  does not already resolve against that subquery's own sources. }
+procedure resolveBareIdToTrigger(pParse: PParse; iBaseReg: i32; pE: PExpr;
+  pInnerSrc: PSrcList);
 var
   pTab:    PTable2;
   iCol:    i32;
-  iTable:  i32;
-  storCol: i32;
   i:       i32;
   pList_:  PExprList;
+  zTab, zCol: PAnsiChar;
+  pSubItem, pBareItem: PSrcItem;
+  iDummy:  i32;
 begin
   if (pE = nil) or (pParse = nil) or (pParse^.pTriggerTab = nil) then Exit;
+  pTab := PTable2(pParse^.pTriggerTab);
   if pE^.op = TK_ID then
   begin
     if (pE^.u.zToken = nil) or (pE^.u.zToken^ = #0) then Exit;
-    pTab := PTable2(pParse^.pTriggerTab);
-    iCol := sqlite3ColumnIndex(pTab, pE^.u.zToken);
-    if (iCol < 0) and (sqlite3IsRowid(pE^.u.zToken) <> 0) then iCol := -1;
-    if (iCol >= 0) and (pTab^.iPKey = iCol) then iCol := -1;
-    if (iCol < -1) or (iCol >= pTab^.nCol) then Exit;
-    if pParse^.eTriggerOp = TK_DELETE then iTable := 0 else iTable := 1;
-    storCol := iCol;  { sqlite3TableColumnToStorage simplified — no GENERATED }
-    pE^.y.pTab  := pTab;
-    pE^.op      := TK_REGISTER;
-    pE^.op2     := TK_COLUMN;
-    pE^.iColumn := i16(iCol);
-    pE^.iTable  := iBaseReg + (i32(pTab^.nCol) + 1) * iTable + storCol + 1;
-    if iCol < 0 then pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
-    if iTable = 0 then begin
-      if iCol >= 0 then
-        pParse^.oldmask := pParse^.oldmask or (u32(1) shl (iCol and 31))
-      else
-        pParse^.oldmask := $FFFFFFFF;
-    end else begin
-      if iCol >= 0 then
-        pParse^.newmask := pParse^.newmask or (u32(1) shl (iCol and 31))
-      else
-        pParse^.newmask := $FFFFFFFF;
-    end;
+    { Inside a subquery, a bare column that matches the subquery's own FROM
+      must bind there, not to the modified table. }
+    if (pInnerSrc <> nil)
+       and bareColInSrcList(pInnerSrc, pE^.u.zToken, pBareItem, iDummy) then
+      Exit;
+    iCol := triggerColIndex(pTab, pE^.u.zToken);
+    if iCol = -2 then Exit;
+    bindExprToTriggerCol(pParse, iBaseReg, pE, iCol);
     Exit;
   end;
+  if pE^.op = TK_DOT then
+  begin
+    { TABLE.col — bind to the modified table when the qualifier is its real
+      name and (inside a subquery) the qualifier does not name one of the
+      subquery's own sources (returning1-8.4: t1.a binds to trigger, t2.b to
+      the subquery FROM). }
+    if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+       and (pE^.pLeft^.u.zToken <> nil)
+       and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
+       and (pE^.pRight^.u.zToken <> nil) then
+    begin
+      zTab := pE^.pLeft^.u.zToken;
+      zCol := pE^.pRight^.u.zToken;
+      { Bind only when the qualifier is the modified table's real name and
+        (inside a subquery) does NOT also name one of the subquery's own
+        sources — in which case the normal subquery resolver handles it. }
+      if (pTab^.zName <> nil) and (sqlite3StrICmp(zTab, pTab^.zName) = 0)
+         and not ((pInnerSrc <> nil)
+                  and srcItemMatchesName(pInnerSrc, zTab, pSubItem)) then
+      begin
+        iCol := triggerColIndex(pTab, zCol);
+        if iCol <> -2 then
+        begin
+          bindExprToTriggerCol(pParse, iBaseReg, pE, iCol);
+          pE^.pLeft  := nil;
+          pE^.pRight := nil;
+          Exit;
+        end;
+      end;
+    end;
+  end;
   if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
-  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pLeft);
-  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pRight);
-  if (pE^.flags and EP_xIsSelect) = 0 then
+  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pLeft, pInnerSrc);
+  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pRight, pInnerSrc);
+  if (pE^.flags and EP_xIsSelect) <> 0 then
+  begin
+    { Descend into a RETURNING subquery so correlated references to the
+      modified table resolve (returning1-5.x/8.4).  Track the subquery's own
+      FROM so locally-resolvable columns are left for the subquery resolver. }
+    if pE^.x.pSelect <> nil then
+      resolveTriggerRefsInSelect(pParse, iBaseReg, pE^.x.pSelect);
+  end
+  else
   begin
     pList_ := pE^.x.pList;
     if pList_ <> nil then
       for i := 0 to pList_^.nExpr - 1 do
-        resolveBareIdToTrigger(pParse, iBaseReg, ExprListItems(pList_)[i].pExpr);
+        resolveBareIdToTrigger(pParse, iBaseReg,
+          ExprListItems(pList_)[i].pExpr, pInnerSrc);
+  end;
+end;
+
+{ resolveTriggerRefsInSelect — descend a RETURNING subquery binding any column
+  reference that fails to match the subquery's own FROM but matches the
+  modified table to that table.  Walks every compound arm and the standard
+  expression slots, passing the arm's own pSrc as pInnerSrc so locally
+  resolvable columns are left for the normal subquery resolver. }
+procedure resolveTriggerRefsInSelect(pParse: PParse; iBaseReg: i32;
+  p: PSelect);
+var
+  pArm: PSelect;
+
+  procedure walkList(lst: PExprList; src: PSrcList);
+  var k: i32;
+  begin
+    if lst = nil then Exit;
+    for k := 0 to lst^.nExpr - 1 do
+      resolveBareIdToTrigger(pParse, iBaseReg,
+        ExprListItems(lst)[k].pExpr, src);
+  end;
+
+begin
+  pArm := p;
+  while pArm <> nil do
+  begin
+    resolveBareIdToTrigger(pParse, iBaseReg, pArm^.pWhere, pArm^.pSrc);
+    resolveBareIdToTrigger(pParse, iBaseReg, pArm^.pHaving, pArm^.pSrc);
+    resolveBareIdToTrigger(pParse, iBaseReg, pArm^.pLimit, pArm^.pSrc);
+    walkList(pArm^.pEList, pArm^.pSrc);
+    walkList(pArm^.pGroupBy, pArm^.pSrc);
+    walkList(pArm^.pOrderBy, pArm^.pSrc);
+    pArm := pArm^.pPrior;
   end;
 end;
 
@@ -10666,7 +10826,7 @@ begin
     if pNC^.pParse <> nil then
       resolveTriggerNewOld(pNC^.pParse, pExpr);
     if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
-      resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
+      resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr, nil);
     if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
       resolveUpsertExcludedRefs(pNC, pExpr);
     resolveExprAgainstSrcList(pNC^.pParse, pNC^.pSrcList, pExpr, pNC^.ncFlags);
