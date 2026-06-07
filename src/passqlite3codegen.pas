@@ -9031,6 +9031,8 @@ var
   nArgU:  i32;
   pDefCF: PTFuncDef;
   nArgCF: i32;
+  pDbSchema: PSchema;
+  zDb3:   PAnsiChar;
 
   { resolve.c:835..844 lookupname_end — when a column reference resolves
     successfully and an authorizer is installed, fire the column-read auth
@@ -9195,6 +9197,100 @@ begin
   begin
     pE^.pLeft  := pE^.pRight^.pLeft;
     pE^.pRight := pE^.pRight^.pRight;
+  end;
+  { triggerA-2.11 — three-part qualifier `db.tab.col` in a NORMAL (non-
+    PartIdx/non-Check) UPDATE SET / WHERE or DELETE WHERE expression.  The
+    PartIdx/Check collapse above already handled those contexts (zDb ignored);
+    here the db qualifier is significant.  resolve.c:313..336 translate the db
+    token to a pSchema (case-insensitive scan of db->aDb[i].zDbSName, with the
+    SQLITE_DBCONFIG_MAINDBNAME "main" fallback to aDb[0]); if it names no
+    attached database pSchema stays nil and nothing matches.  resolve.c:418..431
+    then requires pTab->pSchema==pSchema before the name/alias match.  We mirror
+    the 2-part arm below but add the schema guard.  On no-match we fall through
+    so the existing "no such column" diagnostics fire. }
+  if (pE^.op = TK_DOT) and (pSrc <> nil)
+     and ((ncFlags and (NC_PartIdx or NC_IsCheck)) = 0)
+     and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+     and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_DOT)
+     and (pE^.pRight^.pLeft <> nil) and (pE^.pRight^.pLeft^.op = TK_ID)
+     and (pE^.pRight^.pRight <> nil) and (pE^.pRight^.pRight^.op = TK_ID) then
+  begin
+    { resolve.c:313..336 — db token → pSchema. }
+    pDbSchema := nil;
+    zDb3 := pE^.pLeft^.u.zToken;
+    if zDb3 <> nil then
+    begin
+      for i := 0 to pParse^.db^.nDb - 1 do
+      begin
+        if (pParse^.db^.aDb[i].zDbSName <> nil)
+           and (sqlite3StrICmp(pParse^.db^.aDb[i].zDbSName, zDb3) = 0) then
+        begin
+          pDbSchema := pParse^.db^.aDb[i].pSchema;
+          Break;
+        end;
+      end;
+      if (pDbSchema = nil) and (sqlite3StrICmp(zDb3, 'main') = 0)
+         and (pParse^.db^.nDb > 0) then
+        pDbSchema := pParse^.db^.aDb[0].pSchema;
+    end;
+    { When pDbSchema is nil the db name matched nothing; the loop below finds
+      no source and we fall through to "no such column" (resolve.c tail). }
+    base := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+      if pItem^.pSTab = nil then Continue;
+      { resolve.c:421 — schema guard on the qualified table. }
+      if pItem^.pSTab^.pSchema <> pDbSchema then Continue;
+      if pItem^.zAlias <> nil then begin
+        if sqlite3StrICmp(pItem^.zAlias, pE^.pRight^.pLeft^.u.zToken) <> 0 then Continue;
+      end else begin
+        if sqlite3StrICmp(pItem^.pSTab^.zName, pE^.pRight^.pLeft^.u.zToken) <> 0 then Continue;
+      end;
+      iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.pRight^.u.zToken);
+      if iCol >= 0 then
+      begin
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pItem^.iCursor;
+        if pItem^.pSTab^.iPKey = iCol then
+          pE^.iColumn := i16(-1)
+        else
+          pE^.iColumn := i16(iCol);
+        pE^.y.pTab  := pItem^.pSTab;
+        pE^.pLeft   := nil;
+        pE^.pRight  := nil;
+        if pE^.iColumn >= 0 then
+        begin
+          if iCol < BMS - 1 then
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+          else
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        end;
+        if pE^.iColumn = -1 then
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        AuthReadBound(pE);
+        Exit;
+      end;
+      { qualified rowid alias (db.tab.rowid / .oid / ._rowid_) — mirrors the
+        2-part rowid block (resolve.c:471..503 + 623..638). }
+      if (sqlite3IsRowid(pE^.pRight^.pRight^.u.zToken) <> 0)
+         and HasRowid(pItem^.pSTab)
+         and ((ncFlags and (NC_IdxExpr or NC_GenCol)) = 0) then
+      begin
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pItem^.iCursor;
+        pE^.iColumn := i16(-1);
+        pE^.y.pTab  := pItem^.pSTab;
+        pE^.pLeft   := nil;
+        pE^.pRight  := nil;
+        pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        AuthReadBound(pE);
+        Exit;
+      end;
+    end;
+    { no source matched — fall through to generic recursion so the inner
+      TK_DOT(tab,col) and the surrounding "no such column" path behave as
+      before for a bogus db qualifier. }
   end;
   if (pE^.op = TK_DOT) and (pSrc <> nil)
      and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
