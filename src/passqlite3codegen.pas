@@ -51265,6 +51265,14 @@ var
 begin
   db := pParse^.db;
   if (pName2 <> nil) and (pName2^.n > 0) then begin
+    { build.c:986..990 — a qualified name is impossible in a sqlite_schema
+      CREATE row.  When re-parsing the on-disk schema (db->init.busy), a
+      two-part name means the row text is corrupt; emit "corrupt database"
+      (not "unknown database") and bail.  Must run BEFORE sqlite3FindDb. }
+    if db^.init.busy <> 0 then begin
+      sqlite3ErrorMsg(pParse, PAnsiChar('corrupt database'));
+      Result := -1; Exit;
+    end;
     { Two-part name: pName1 is the database, pName2 is the object }
     pUnqual^ := pName2;
     iDb := sqlite3FindDb(db, pName1);
