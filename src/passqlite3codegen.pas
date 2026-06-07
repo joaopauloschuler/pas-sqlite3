@@ -17711,6 +17711,68 @@ begin
   Result := 1;
 end;
 
+{ existsToJoinSelectIsAggregate — top-level analog of the nested
+  SelectIsAggregate helper, usable from the top-level existsToJoin.
+  C sets SF_Aggregate on a SELECT at resolve time (resolve.c:1964 when
+  pGroupBy or NC_HasAgg); this port does NOT track NC_HasAgg and instead
+  re-derives aggregate-ness on demand.  So at existsToJoin time the inner
+  `SELECT count(*)` subquery has selFlags & SF_Aggregate == 0 and the C
+  guard `(pSub->selFlags & SF_Aggregate)==0` (select.c:7341) would wrongly
+  pass.  This mirrors the SF_Aggregate intent by checking for a GROUP BY
+  or any aggregate function call in the result set / HAVING. }
+function existsToJoinExprHasAgg(pParse: PParse; pX: PExpr): Boolean;
+var
+  pDef: PTFuncDef;
+  db:   PTsqlite3;
+  n:    i32;
+  items: PExprListItem;
+  i:    i32;
+begin
+  Result := False;
+  if pX = nil then Exit;
+  if pX^.op = TK_AGG_FUNCTION then begin Result := True; Exit; end;
+  if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil) then
+  begin
+    if ExprUseXList(pX) and (pX^.x.pList <> nil) then
+      n := pX^.x.pList^.nExpr
+    else
+      n := 0;
+    db := pParse^.db;
+    pDef := sqlite3FindFunction(db, pX^.u.zToken, n, db^.enc, 0);
+    if (pDef = nil) and (n <> 0) then
+      pDef := sqlite3FindFunction(db, pX^.u.zToken, -1, db^.enc, 0);
+    if (pDef <> nil) and Assigned(pDef^.xFinalize) then begin Result := True; Exit; end;
+  end;
+  if not ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then
+  begin
+    if existsToJoinExprHasAgg(pParse, pX^.pLeft) then begin Result := True; Exit; end;
+    if existsToJoinExprHasAgg(pParse, pX^.pRight) then begin Result := True; Exit; end;
+    if not ExprHasProperty(pX, EP_xIsSelect) and (pX^.x.pList <> nil) then
+    begin
+      items := ExprListItems(pX^.x.pList);
+      for i := 0 to pX^.x.pList^.nExpr - 1 do
+        if existsToJoinExprHasAgg(pParse, items[i].pExpr) then begin Result := True; Exit; end;
+    end;
+  end;
+end;
+
+function existsToJoinSelectIsAggregate(pParse: PParse; pSel: PSelect): Boolean;
+var
+  items: PExprListItem;
+  i:     i32;
+begin
+  Result := True;
+  if pSel^.pGroupBy <> nil then Exit;
+  if (pSel^.pHaving <> nil) and existsToJoinExprHasAgg(pParse, pSel^.pHaving) then Exit;
+  if pSel^.pEList <> nil then
+  begin
+    items := ExprListItems(pSel^.pEList);
+    for i := 0 to pSel^.pEList^.nExpr - 1 do
+      if existsToJoinExprHasAgg(pParse, items[i].pExpr) then Exit;
+  end;
+  Result := False;
+end;
+
 { existsToJoin — port of select.c:7317..7378 (SQLite 3.53.0).
   Walks a WHERE clause for TK_EXISTS subqueries that match a tight
   eligibility profile, and rewrites them as additional FROM clause
@@ -17747,6 +17809,7 @@ begin
 
   if (pSub^.pSrc^.nSrc <> 1)
      or ((pSub^.selFlags and SF_Aggregate) <> 0)
+     or existsToJoinSelectIsAggregate(pParse, pSub)  { port re-derives SF_Aggregate }
      or ((pSubItem^.fg.fgBits and u8($04)) <> 0)  { isSubquery }
      or (pSub^.pLimit <> nil)
      or (pSub^.pPrior <> nil) then Exit;
@@ -40594,6 +40657,7 @@ begin
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_Exists)
           or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_EphemTab)
           or (pDest^.eDest = SRT_Set)
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
@@ -41261,6 +41325,17 @@ begin
           so result columns read directly from accumulators. }
         nResultCol     := p^.pEList^.nExpr;
         pDest^.nSdst   := nResultCol;
+        { SRT_Exists (TK_EXISTS subquery) — selectInnerLoop select.c:1410..1414.
+          The aggregate-no-GROUP-BY query always produces exactly one row, so
+          EXISTS is unconditionally true: emit OP_Integer 1 into iSDParm.  The
+          result columns themselves are irrelevant (C never codes them for
+          SRT_Exists), so skip the column-emit loop entirely. }
+        if pDest^.eDest = SRT_Exists then
+        begin
+          sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+        end
+        else
+        begin
         if pDest^.iSdst = 0 then
         begin
           pDest^.iSdst := pParse^.nMem + 1;
@@ -41273,7 +41348,17 @@ begin
           if r1 <> pDest^.iSdst + i then
             sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
         end;
-        if pDest^.eDest = SRT_Output then
+        if pDest^.eDest = SRT_Mem then
+        begin
+          { SRT_Mem (scalar TK_SELECT subquery) — selectInnerLoop
+            select.c:1422..1435.  Move the single aggregate result row into
+            the caller's result register(s); the LIMIT clause terminates the
+            loop.  iSdst==iSDParm in the common case, so the copy is elided. }
+          if pDest^.iSdst <> pDest^.iSDParm then
+            sqlite3VdbeAddOp3(v, OP_Copy, pDest^.iSdst, pDest^.iSDParm,
+                              nResultCol - 1);
+        end
+        else if pDest^.eDest = SRT_Output then
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
         else if pDest^.eDest = SRT_Coroutine then
           { filter1-1.8 — when this aggregate-no-GROUP-BY arm is invoked
@@ -41429,6 +41514,7 @@ begin
             sqlite3ReleaseTempRange(pParse, r2, nKeyNF + 2);
           end;
         end;
+        end;  { close the non-SRT_Exists column-emit + dest dispatch block }
         { LIMIT gate — selectInnerLoop OP_DecrJumpZero (select.c:1522).
           Decrement the limit counter; the single aggregate row is the
           only row, so this matters only for the constant LIMIT 0 case,
