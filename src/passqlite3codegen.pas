@@ -33398,6 +33398,152 @@ begin
   Result := 1;
 end;
 
+{ fromSubqueryIsCorrelated — post-resolution analogue of resolve.c:1929..1937.
+  Returns True iff the (already name-resolved) FROM sub-query pSel references
+  a column from a cursor OUTSIDE its own FROM scope, i.e. it is correlated to
+  an enclosing query.  C tracks this via pOuterNC->nRef during name resolution
+  and stamps SrcItem.fg.isCorrelated; this port resolves FROM-subquery bodies
+  in selectExpander, so the equivalent is computed here by collecting every
+  cursor that belongs to pSel (and its compound arms / nested FROM subqueries)
+  and then walking pSel's expressions for any TK_COLUMN whose iTable is not in
+  that set.  A correlated source must NOT get a once-gated AUTOMATIC INDEX /
+  BLOOM FILTER (where.c:4070, tkt-54844eea3f-1.2). }
+function fromSubqueryIsCorrelated(pSel: PSelect): Boolean;
+var
+  aOwn:  array[0..255] of i32;   { own-scope cursors }
+  nOwn:  i32;
+  bHit:  Boolean;
+
+  procedure addCursor(iCur: i32);
+  begin
+    if (iCur < 0) or (nOwn >= 256) then Exit;
+    aOwn[nOwn] := iCur; Inc(nOwn);
+  end;
+
+  procedure collectScope(p: PSelect); forward;
+
+  procedure collectSrc(pSrc: PSrcList);
+  var
+    items: PSrcItem;
+    i:     i32;
+  begin
+    if pSrc = nil then Exit;
+    items := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      addCursor(items[i].iCursor);
+      if ((items[i].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+         and (items[i].u4.pSubq <> nil)
+         and (items[i].u4.pSubq^.pSelect <> nil) then
+        collectScope(items[i].u4.pSubq^.pSelect);
+    end;
+  end;
+
+  procedure collectScope(p: PSelect);
+  var
+    pX: PSelect;
+  begin
+    pX := p;
+    while pX <> nil do
+    begin
+      collectSrc(pX^.pSrc);
+      pX := pX^.pPrior;
+    end;
+  end;
+
+  function inOwn(iCur: i32): Boolean;
+  var
+    k: i32;
+  begin
+    Result := False;
+    for k := 0 to nOwn - 1 do
+      if aOwn[k] = iCur then begin Result := True; Exit; end;
+  end;
+
+  procedure walkExpr(pE: PExpr); forward;
+
+  procedure walkList(pList: PExprList);
+  var
+    i: i32;
+  begin
+    if (pList = nil) or bHit then Exit;
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      walkExpr(ExprListItems(pList)[i].pExpr);
+      if bHit then Exit;
+    end;
+  end;
+
+  procedure walkSelectExprs(p: PSelect); forward;
+
+  procedure walkExpr(pE: PExpr);
+  begin
+    if (pE = nil) or bHit then Exit;
+    if (pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN) then
+    begin
+      if not inOwn(pE^.iTable) then begin bHit := True; Exit; end;
+    end;
+    if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+    if (pE^.flags and EP_xIsSelect) <> 0 then
+    begin
+      { Descend into expression-subqueries: their own FROM cursors are
+        local to them (already collected if reachable), but a column ref to
+        OUR outer cursor still counts as a reference outside this nested
+        select but inside pSel's scope — handled because aOwn holds pSel's
+        cursors and any cursor not in aOwn (incl. truly-outer) trips bHit.
+        To avoid false positives from the expr-subquery's OWN cursors, add
+        them to scope first. }
+      collectScope(pE^.x.pSelect);
+      walkSelectExprs(pE^.x.pSelect);
+      Exit;
+    end;
+    walkExpr(pE^.pLeft);
+    walkExpr(pE^.pRight);
+    if (pE^.flags and EP_xIsSelect) = 0 then
+      walkList(pE^.x.pList);
+  end;
+
+  procedure walkSelectExprs(p: PSelect);
+  var
+    pX:    PSelect;
+    items: PSrcItem;
+    i:     i32;
+  begin
+    pX := p;
+    while (pX <> nil) and not bHit do
+    begin
+      walkList(pX^.pEList);
+      walkExpr(pX^.pWhere);
+      walkExpr(pX^.pHaving);
+      walkList(pX^.pGroupBy);
+      walkList(pX^.pOrderBy);
+      if pX^.pSrc <> nil then
+      begin
+        items := SrcListItems(pX^.pSrc);
+        for i := 0 to pX^.pSrc^.nSrc - 1 do
+        begin
+          if (items[i].fg.fgBits2 and u8($08)) = 0 then  { u3 holds pOn (not pUsing) }
+            walkExpr(items[i].u3.pOn);  { ON-clause expr, if any }
+          if ((items[i].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+             and (items[i].u4.pSubq <> nil)
+             and (items[i].u4.pSubq^.pSelect <> nil) then
+            walkSelectExprs(items[i].u4.pSubq^.pSelect);
+        end;
+      end;
+      pX := pX^.pPrior;
+    end;
+  end;
+
+begin
+  Result := False;
+  if pSel = nil then Exit;
+  nOwn := 0;
+  bHit := False;
+  collectScope(pSel);
+  walkSelectExprs(pSel);
+  Result := bHit;
+end;
+
 { select.c:5513 — convertCompoundSelectToSubquery.  When a compound SELECT
   has an ORDER BY whose terms include an explicit COLLATE clause, rewrite
   the whole compound into `SELECT * FROM (compound) ORDER BY ...` so the
@@ -33616,6 +33762,19 @@ begin
             sqlite3SelectPrep(pParse, pSubSel, nil);
           pParse^.zAuthContext := zSavedAuthCtx;
           if pParse^.nErr <> 0 then Exit;
+          { resolve.c:1929..1938 — if resolving the FROM sub-query's names
+            registered a reference to an outer context, the sub-query is
+            correlated.  C tracks this through pOuterNC->nRef; this port
+            resolves the body here in selectExpander instead of inside the
+            resolver's FROM loop, and the body's outer references are flagged
+            on the sub-SELECT as SF_Correlated (by the pre-resolve passes and
+            ResolveOuterIDs).  Propagate that to the SrcItem's isCorrelated
+            bit so the WHERE planner does NOT build a once-gated AUTOMATIC
+            INDEX / BLOOM FILTER over a per-outer-row correlated source
+            (where.c:4070, tkt-54844eea3f-1.2). }
+          if ((pSubSel^.selFlags and SF_Correlated) <> 0)
+             or fromSubqueryIsCorrelated(pSubSel) then
+            pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_CORRELATED;
         end;
         if pItem^.pSTab = nil then
         begin
