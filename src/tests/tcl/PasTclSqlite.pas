@@ -5153,22 +5153,32 @@ begin
     sqlite3_db_config_int(pHandle, SQLITE_DBCONFIG_DQS_DDL, 1, @dqsCfg);
     sqlite3_db_config_int(pHandle, SQLITE_DBCONFIG_DQS_DML, 1, @dqsCfg);
   end;
-  if (rc <> SQLITE_OK) or (pHandle = nil) or
-     (sqlite3_errcode(pHandle) <> SQLITE_OK) then
+  { Port of tclsqlite.c:4383..4399 error arm.  Note: the error message is
+    built with sqlite3_mprintf and reported via Tcl_SetResult, NOT copied
+    directly.  This matters under a forced init failure (e.g. mutex2.test
+    `disable_mutex_init 7`): sqlite3_mprintf allocates through
+    sqlite3_malloc, which returns NULL when sqlite3_initialize() fails with
+    NOMEM, so zErrMsg ends up NULL and Tcl_SetResult sets an EMPTY result
+    (mutex2-2.1 expects `{1 {}}`, not `{1 {out of memory}}`). }
+  { sqlite3_mprintf("%s", x) is a malloc-backed copy of x; sqlite3StrDup is
+    the faithful equivalent (allocates via sqlite3_malloc, returns NULL when
+    sqlite3_initialize() has failed with NOMEM). }
+  zErr := nil;
+  if pHandle <> nil then
   begin
-    { Port of tclsqlite.c:4384..4397 error arm: prefer sqlite3_errmsg
-      when a handle exists, else fall back to sqlite3_errstr. }
-    if pHandle <> nil then
+    if sqlite3_errcode(pHandle) <> SQLITE_OK then
     begin
-      zErr := sqlite3_errmsg(pHandle);
-      Tcl_AppendResult(interp, zErr, Pointer(nil));
+      zErr := sqlite3StrDup(sqlite3_errmsg(pHandle));
       sqlite3_close_v2(pHandle);
-    end
-    else
-    begin
-      zErr := sqlite3_errstr(rc);
-      Tcl_AppendResult(interp, zErr, Pointer(nil));
+      pHandle := nil;
     end;
+  end
+  else
+    zErr := sqlite3StrDup(sqlite3_errstr(rc));
+  if pHandle = nil then
+  begin
+    Tcl_SetResult(interp, zErr, TCL_VOLATILE);
+    sqlite3_free(zErr);
     Result := TCL_ERROR;
     Exit;
   end;

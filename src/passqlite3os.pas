@@ -938,6 +938,16 @@ var
   { Head of the VFS linked list (os.c: static sqlite3_vfs *vfsList) }
   vfsList : Psqlite3_vfs = nil;
 
+  { One-time guard for the static aVfs[] objects in sqlite3_os_init.  In C
+    (os_unix.c:8501) aVfs[] is a `static` array initialized once at load
+    time; its pNext fields are then owned/mutated by the VFS list.  Re-
+    initializing those objects (FillChar + record copies) on a subsequent
+    sqlite3_os_init call (which happens after a sqlite3_shutdown /
+    sqlite3_initialize cycle, e.g. mutex2.test) would clobber the pNext of
+    siblings that are still linked into vfsList, corrupting the list and
+    crashing the next vfsUnlink walk.  Mirror C's static-once semantics. }
+  unixVfsObjInitDone : Boolean = False;
+
   { Static mutexes for SQLITE_MUTEX_STATIC_MAIN(2) .. SQLITE_MUTEX_STATIC_VFS3(13).
     Index 0 = id 2, index 11 = id 13.
     On Linux, PTHREAD_MUTEX_INITIALIZER is all-zeros, so zero-initialised records
@@ -3274,6 +3284,25 @@ end;
 { os_unix.c ~8448: sqlite3_os_init — register the unix VFS as the default }
 function sqlite3_os_init: cint;
 begin
+  { C os_unix.c:8501 declares aVfs[] as a `static` array — initialized once
+    at load time, NOT on each sqlite3_os_init call.  The per-call work in C
+    is only the registration loop below (which is idempotent because
+    sqlite3_vfs_register unlinks-then-relinks each object).  Re-running the
+    field initialization / record copies on a re-init would clobber the
+    pNext links of siblings still in vfsList (mutex2.test SIGSEGV), so gate
+    the object setup behind a one-time flag. }
+  if unixVfsObjInitDone then
+  begin
+    { Re-register (idempotent unlink+relink), matching C's per-call loop. }
+    sqlite3_vfs_register(@unixVfsObj, 1);
+    sqlite3_vfs_register(@unixVfsObjNone, 0);
+    sqlite3_vfs_register(@unixVfsObjDotfile, 0);
+    sqlite3_vfs_register(@unixVfsObjExcl, 0);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+  unixVfsObjInitDone := True;
+
   { Fill in the singleton unixVfsObj (declared in interface section) }
   FillChar(unixVfsObj, SizeOf(unixVfsObj), 0);
   unixVfsObj.iVersion        := 3;    { v3: xSetSystemCall et al. wired below }
