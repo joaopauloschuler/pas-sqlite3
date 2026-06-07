@@ -32205,6 +32205,15 @@ begin
   if (pELst = nil) or (pInnerS = nil) then Exit;
   if (j < 0) or (j >= pELst^.nExpr) then Exit;
   items_ := ExprListItems(pELst);
+  { select.c:6227 / resolve.c:125 — a USING/NATURAL-coalesced result column is
+    stored as a bUsingTerm entry whose zEName is "..col" (empty db+tab parts);
+    sqlite3MatchEName(...,zTName,...) rejects it for ANY table name.  Such an
+    entry resolves (post-name-resolution) to the left-side table's cursor, so a
+    structural iTable test would wrongly attribute it to that table and emit it
+    twice (once as the coalesced term, once as the leaf column) under T.*
+    (selectD-1.7).  Honour the same rule C does: a bUsingTerm never matches a
+    specific zTab. }
+  if (items_[j].fg.eBits and u8($80)) <> 0 then Exit;
   pE2 := items_[j].pExpr;
   if (pE2 = nil) or (pE2^.op <> TK_COLUMN) then Exit;
   { Locate the inner SrcItem this column reads from. }
