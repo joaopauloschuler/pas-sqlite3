@@ -5124,6 +5124,44 @@ begin
   Result := pNew;
 end;
 
+{ gatherSelectWindows (expr.c:1778..1806) — scan all expressions of a newly
+  duplicated SELECT and gather the Window objects found there onto Select->pWin.
+  Used by sqlite3SelectDup so that a duplicated windowed SELECT keeps its pWin
+  list pointing at the duplicated Expr nodes; without this, the dup's pWin is
+  nil at codegen and row_number()/etc. is emitted as a scalar OP_Function →
+  "misuse of aggregate function" (autoindex5-3.0). }
+function gatherSelectWindowsCallback(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pSelGW: PSelect;
+  pWinGW: PWindow;
+begin
+  if (pExpr^.op = TK_FUNCTION) and ExprHasProperty(pExpr, EP_WinFunc) then
+  begin
+    pSelGW := pWalker^.u.pSelect;
+    pWinGW := pExpr^.y.pWin;
+    sqlite3WindowLink(pSelGW, pWinGW);
+  end;
+  Result := WRC_Continue;
+end;
+
+function gatherSelectWindowsSelectCallback(pWalker: PWalker; p: PSelect): i32; cdecl;
+begin
+  if p = pWalker^.u.pSelect then Result := WRC_Continue
+  else Result := WRC_Prune;
+end;
+
+procedure gatherSelectWindows(p: PSelect);
+var w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback    := @gatherSelectWindowsCallback;
+  w.xSelectCallback  := @gatherSelectWindowsSelectCallback;
+  w.xSelectCallback2 := nil;
+  w.pParse           := nil;
+  w.u.pSelect        := p;
+  sqlite3WalkSelect(@w, p);
+end;
+
 function sqlite3SelectDup(db: PTsqlite3; const pDup: PSelect; flags: i32): PSelect;
 var
   pRet:  PSelect;
@@ -5163,6 +5201,8 @@ begin
     pNew^.pWith    := sqlite3WithDup(db, p^.pWith);
     pNew^.pWin     := nil;
     pNew^.pWinDefn := sqlite3WindowListDup(db, p^.pWinDefn);
+    if (p^.pWin <> nil) and (db^.mallocFailed = 0) then
+      gatherSelectWindows(pNew);
     pNew^.selId    := p^.selId;
     if db^.mallocFailed <> 0 then
     begin
@@ -16441,6 +16481,53 @@ begin
     if exprHasWin(items[i].pExpr) then begin Result := True; Exit; end;
 end;
 
+{ firstEListWindow — return the first Window object referenced by any
+  EP_WinFunc expression in pList, or nil.  Used by pushDownWhereTerms to
+  recover the window's PARTITION BY list for restriction (6c) when this
+  port's resolver has not linked the window onto Select->pWin (the
+  FROM-subquery resolution path leaves pSubq^.pWin = nil even though the
+  result-set expression carries y.pWin). }
+function firstEListWindow(pList: PExprList): PWindow;
+
+  function exprWin(pE: PExpr): PWindow;
+  var
+    items: PExprListItem;
+    i: i32;
+  begin
+    Result := nil;
+    if pE = nil then Exit;
+    if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil) then
+    begin Result := pE^.y.pWin; Exit; end;
+    Result := exprWin(pE^.pLeft);
+    if Result <> nil then Exit;
+    Result := exprWin(pE^.pRight);
+    if Result <> nil then Exit;
+    if ((pE^.flags and EP_xIsSelect) = 0)
+       and ExprUseXList(pE) and (pE^.x.pList <> nil) then
+    begin
+      items := ExprListItems(pE^.x.pList);
+      for i := 0 to pE^.x.pList^.nExpr - 1 do
+      begin
+        Result := exprWin(items[i].pExpr);
+        if Result <> nil then Exit;
+      end;
+    end;
+  end;
+
+var
+  items: PExprListItem;
+  i: i32;
+begin
+  Result := nil;
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+  begin
+    Result := exprWin(items[i].pExpr);
+    if Result <> nil then Exit;
+  end;
+end;
+
 { exprListHasAggFunc — True if any expression in pList contains a genuine
   aggregate-function call (TK_AGG_FUNCTION).  Used by the window arm to decide
   whether the window-rewrite sub-SELECT must keep SF_Aggregate so its
@@ -16513,6 +16600,9 @@ var
   pList:       PExprList;
   pColl:       Pointer;
   x:           TSubstContext;
+  pWinChk:     PWindow;        { restriction (6b/6c) window — pSubq^.pWin or, when
+                                 this port's resolver left it unlinked, the first
+                                 window recovered from the result-set EList }
 begin
   nChng := 0;
   pSrc := @SrcListItems(pSrcList)[iSrc];
@@ -16537,7 +16627,10 @@ begin
           or (op = TK_UNION) or (op = TK_INTERSECT) or (op = TK_EXCEPT));
       if (op <> TK_ALL) and (op <> TK_SELECT) then
         notUnionAll := 1;
-      if pSel^.pWin <> nil then begin Result := 0; Exit; end;  { restriction (6b) }
+      { restriction (6b) — no push-down into a compound arm that has a window
+        function (recover from the EList when the resolver left pWin unlinked). }
+      if (pSel^.pWin <> nil) or selectEListHasWinFunc(pSel^.pEList) then
+      begin Result := 0; Exit; end;
       pSel := pSel^.pPrior;
     end;
     if notUnionAll <> 0 then
@@ -16563,11 +16656,15 @@ begin
   end
   else
   begin
-    { Non-compound subquery: skip push-down when there is a window function
-      without a PARTITION BY (the optimistic pushDownWindowCheck arm of C
-      isn't ported, so we approximate restriction (6c) by bailing on any
-      partition-less window). }
-    if (pSubq^.pWin <> nil) and (pSubq^.pWin^.pPartition = nil) then
+    { Non-compound subquery: restriction (6c) front gate — select.c:5176.
+      Skip push-down entirely when there is a window function with no
+      PARTITION BY (such a window's value depends on the whole input, so no
+      pushed term can be constant within a partition).  pWinChk recovers the
+      window even when this port's resolver left pSubq^.pWin unlinked. }
+    pWinChk := pSubq^.pWin;
+    if (pWinChk = nil) and selectEListHasWinFunc(pSubq^.pEList) then
+      pWinChk := firstEListWindow(pSubq^.pEList);
+    if (pWinChk <> nil) and (pWinChk^.pPartition = nil) then
     begin
       Result := 0; Exit;
     end;
@@ -16615,6 +16712,27 @@ begin
         Assert(ExprUseXSelect(pWhere));
         Assert(pWhere^.x.pSelect <> nil);
         pWhere^.x.pSelect^.selFlags := pWhere^.x.pSelect^.selFlags or SF_ClonedRhsIn;
+      end;
+      { Restriction (6c) — select.c:5270..5276.  A windowed subquery may only
+        absorb a pushed-down term if, after substitution, the term consists
+        entirely of constants and partition-by expressions (so it has a fixed
+        value within each window partition).  pushDownWindowCheck reduces to
+        sqlite3ExprIsConstantOrGroupBy over pSubq^.pWin^.pPartition.  Without
+        this, a term like `x>0` (where x = an aliased window function) is
+        pushed down as `row_number()>0` and the inner per-Select resolver then
+        rejects the window call in WHERE as "misuse of aggregate function"
+        (autoindex5-3.0).  When the check fails, drop the duplicated term,
+        undo the nChng increment, and stop (mirrors C's break). }
+      pWinChk := pSubq^.pWin;
+      if (pWinChk = nil) and selectEListHasWinFunc(pSubq^.pEList) then
+        pWinChk := firstEListWindow(pSubq^.pEList);
+      if (pWinChk <> nil)
+         and (sqlite3ExprIsConstantOrGroupBy(pParse, pNew,
+                pWinChk^.pPartition) = 0) then
+      begin
+        sqlite3ExprDelete(pParse^.db, pNew);
+        Dec(nChng);
+        Break;
       end;
       { windowD-1.4 / 2.6 — route the pushed-down term to HAVING only for a
         genuine aggregate subquery, not a window-function one.  C never sets
