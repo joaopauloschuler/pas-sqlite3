@@ -67890,7 +67890,14 @@ begin
     minmaxSkipLoad(pCtx);
 end;
 
-procedure minMaxFinal(pCtx: Psqlite3_context); cdecl;
+{ Faithful port of func.c:2128 minMaxValueFinalize.  bValue=0 (xFinal) releases
+  the accumulator; bValue=1 (xValue, window context) leaves it intact so the
+  next OP_AggValue still sees the running min/max.  An earlier port released
+  unconditionally, so in a window the accumulator's Mem was freed after the
+  first OP_AggValue and every subsequent row restarted from a cleared
+  accumulator → min/max OVER (ORDER BY ..) returned only the current row's
+  value (window1-9.1.x). }
+procedure minMaxValueFinalize(pCtx: Psqlite3_context; bValue: i32);
 var
   pAgg: PMem;
 begin
@@ -67898,8 +67905,18 @@ begin
   if pAgg <> nil then begin
     if pAgg^.flags <> 0 then
       sqlite3_result_value(pCtx, Psqlite3_value(pAgg));
-    sqlite3VdbeMemRelease(pAgg);
+    if bValue = 0 then sqlite3VdbeMemRelease(pAgg);
   end;
+end;
+
+procedure minMaxFinal(pCtx: Psqlite3_context); cdecl;
+begin
+  minMaxValueFinalize(pCtx, 0);
+end;
+
+procedure minMaxValue(pCtx: Psqlite3_context); cdecl;
+begin
+  minMaxValueFinalize(pCtx, 1);
 end;
 
 { TGroupConcatCtx — port of func.c:2163 GroupConcatCtx.  Holds the running
@@ -69018,9 +69035,9 @@ begin
   MakeAgg(aBuiltinAgg[3], 1, AGG_ENC, @sumStep,  @totalFinal, 'total', @sumInverse);
   MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @sumStep,  @avgFinal,   'avg',   @sumInverse);
   MakeAgg(aBuiltinAgg[5], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
-          @minStep, @minMaxFinal, 'min');
+          @minStep, @minMaxFinal, 'min', nil, @minMaxValue);
   MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
-          @maxStep, @minMaxFinal, 'max');
+          @maxStep, @minMaxFinal, 'max', nil, @minMaxValue);
   MakeAgg(aBuiltinAgg[7], 1, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat',
           @groupConcatInverse, @groupConcatValue);
   MakeAgg(aBuiltinAgg[8], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat',
