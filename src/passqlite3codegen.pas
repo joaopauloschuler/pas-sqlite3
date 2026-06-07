@@ -56759,7 +56759,19 @@ end;
 
 procedure sqlite3Error(db: PTsqlite3; err_code: i32);
 begin
+  { util.c:130 — set errCode and clear any prior error message.  When
+    err_code is non-zero OR a stale pErr is present, run the
+    sqlite3ErrorFinish path (clear pErr + record iSysErrno); otherwise
+    just reset errByteOffset.  Without the pErr clear, a stale message
+    from a previous failure (e.g. "vtable constructor failed: e2") leaks
+    out of sqlite3_errmsg in place of the new code's static string. }
+  Assert(db <> nil, 'sqlite3Error db nil');
   db^.errCode := err_code;
+  if (err_code <> 0) or (db^.pErr <> nil) then begin
+    if db^.pErr <> nil then sqlite3ValueSetNull(Psqlite3_value(db^.pErr));
+    sqlite3SystemError(db, err_code);
+  end else
+    db^.errByteOffset := -1;
 end;
 
 { util.c:273 — sqlite3ErrorToParser.  If db has a current Parse stack
