@@ -139,6 +139,15 @@ function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
 
 implementation
 
+{ test1.c:3835.. — static buffers for the *array_addr test commands
+  (each overwritten/freed on the next call). }
+var
+  intarrayAddrP   : Pointer = nil;
+  int64arrayAddrP : Pointer = nil;
+  doublearrayAddrP: Pointer = nil;
+  textarrayAddrP  : Pointer = nil;
+  textarrayAddrN  : cint    = 0;
+
 { test1.c:39..41 — the first part of the SqliteDb struct from tclsqlite.c.
   The Tcl `db` command's objClientData points at a SqliteDb whose first
   field is the sqlite3* handle. }
@@ -4177,6 +4186,139 @@ begin
   Tcl_SetObjResult(interp, Tcl_NewIntObj(res));
   Result := TCL_OK;
   if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ test1.c:3836..3859 — test_intarray_addr.  Usage:  intarray_addr  INT ...
+  Returns (as a wide-int) the address of a malloc'd C array of 32-bit ints
+  holding the supplied values.  Call with no args to release the memory;
+  each call overwrites the previous array. }
+function tcl_test_intarray_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+  p: PInteger;
+begin
+  sqlite3_free(intarrayAddrP);
+  intarrayAddrP := nil;
+  if objc > 1 then
+  begin
+    p := PInteger(sqlite3_malloc(SizeOf(cint) * (objc - 1)));
+    if p = nil then begin Result := TCL_ERROR; Exit; end;
+    intarrayAddrP := p;
+    for i := 0 to objc - 2 do
+    begin
+      if Tcl_GetIntFromObj(interp, objv[1 + i],
+           @PInteger(PByte(p) + i * SizeOf(cint))^) <> 0 then
+      begin
+        sqlite3_free(intarrayAddrP);
+        intarrayAddrP := nil;
+        Result := TCL_ERROR;
+        Exit;
+      end;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(intarrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:3861..3897 — test_int64array_addr.  As intarray_addr but the C
+  array holds 64-bit integers. }
+function tcl_test_int64array_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+  p: PInt64;
+  v: Int64;
+begin
+  sqlite3_free(int64arrayAddrP);
+  int64arrayAddrP := nil;
+  if objc > 1 then
+  begin
+    p := PInt64(sqlite3_malloc(SizeOf(Int64) * (objc - 1)));
+    if p = nil then begin Result := TCL_ERROR; Exit; end;
+    int64arrayAddrP := p;
+    for i := 0 to objc - 2 do
+    begin
+      if Tcl_GetWideIntFromObj(interp, objv[1 + i], @v) <> 0 then
+      begin
+        sqlite3_free(int64arrayAddrP);
+        int64arrayAddrP := nil;
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      PInt64(PByte(p) + i * SizeOf(Int64))^ := v;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(int64arrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:3899..3930 — test_doublearray_addr.  As intarray_addr but the C
+  array holds doubles. }
+function tcl_test_doublearray_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+  p: PDouble;
+begin
+  sqlite3_free(doublearrayAddrP);
+  doublearrayAddrP := nil;
+  if objc > 1 then
+  begin
+    p := PDouble(sqlite3_malloc(SizeOf(Double) * (objc - 1)));
+    if p = nil then begin Result := TCL_ERROR; Exit; end;
+    doublearrayAddrP := p;
+    for i := 0 to objc - 2 do
+    begin
+      if Tcl_GetDoubleFromObj(interp, objv[1 + i],
+           PDouble(PByte(p) + i * SizeOf(Double))) <> 0 then
+      begin
+        sqlite3_free(doublearrayAddrP);
+        doublearrayAddrP := nil;
+        Result := TCL_ERROR;
+        Exit;
+      end;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(doublearrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:3932..3962 — test_textarray_addr.  Returns the address of a
+  malloc'd C array of malloc'd strings (char**). }
+function tcl_test_textarray_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i, n: cint;
+  pp: PPAnsiChar;
+  z, zDup: PAnsiChar;
+begin
+  pp := PPAnsiChar(textarrayAddrP);
+  for i := 0 to textarrayAddrN - 1 do
+    sqlite3_free(PPAnsiChar(PByte(pp) + i * SizeOf(Pointer))^);
+  sqlite3_free(textarrayAddrP);
+  textarrayAddrP := nil;
+  if objc > 1 then
+  begin
+    pp := PPAnsiChar(sqlite3_malloc(SizeOf(Pointer) * (objc - 1)));
+    if pp = nil then begin Result := TCL_ERROR; Exit; end;
+    textarrayAddrP := pp;
+    for i := 0 to objc - 2 do
+    begin
+      z := Tcl_GetString(objv[1 + i]);
+      n := StrLen(z);
+      zDup := sqlite3_malloc(n + 1);
+      if zDup <> nil then Move(z^, zDup^, n + 1);
+      PPAnsiChar(PByte(pp) + i * SizeOf(Pointer))^ := zDup;
+    end;
+  end;
+  textarrayAddrN := objc - 1;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(textarrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
 end;
 
 { 9.4.divbug.88.068 — sqlite3_register_cksumvfs.  test1.c:8795..8814.
@@ -10931,6 +11073,16 @@ begin
     @tcl_test_carray_bind, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('bind_carray_intptr'),
     @tcl_bind_carray_intptr, nil, nil);
+  { test1.c:9110..9113 — intarray_addr / int64array_addr /
+    doublearray_addr / textarray_addr (carray-binding helpers). }
+  Tcl_CreateObjCommand(interp, PChar('intarray_addr'),
+    @tcl_test_intarray_addr, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('int64array_addr'),
+    @tcl_test_int64array_addr, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('doublearray_addr'),
+    @tcl_test_doublearray_addr, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('textarray_addr'),
+    @tcl_test_textarray_addr, nil, nil);
   { test2.c:732 — sqlite3BitvecBuiltinTest (registered by Sqlitetest2_Init
     in C; the pas Sqlitetest2_Init is a stub, so register it here). }
   Tcl_CreateCommand(interp, PChar('sqlite3BitvecBuiltinTest'),
