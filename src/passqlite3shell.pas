@@ -931,6 +931,17 @@ end;
   p->pAuxDb->zDbFilename); the in-script `.open --hexdb` from a `.read`
   context routes through the same path since the shell injects the
   filename on its way in. }
+function hexDigit(c: AnsiChar): i32;
+begin
+  case c of
+    '0'..'9': Result := Ord(c) - Ord('0');
+    'a'..'f': Result := Ord(c) - Ord('a') + 10;
+    'A'..'F': Result := Ord(c) - Ord('A') + 10;
+  else
+    Result := -1;
+  end;
+end;
+
 function shellReadHexDb(p: PShellState; pnData: Pi32): PAnsiChar;
 var
   h:       THandle;
@@ -958,6 +969,61 @@ var
     zLine := Copy(zText, pos, nlPos - pos);
     pos := nlPos + 1;
     Result := True;
+  end;
+  { Hand-rolled equivalent of sscanf(s,"| %d: %x %x ... %x",&jj,&v[0..15]).
+    Returns the number of successfully converted fields (1 + nHex), so a
+    fully-parsed data row returns 17.  Mirrors C sscanf's whitespace
+    skipping and "stop at first non-matching field" semantics. }
+  function parseHexLine(const s: AnsiString; out jj: i32;
+                        var v: array of u32): i32;
+  var
+    q, L, cnt: SizeInt;
+    val, dig: i32;
+    c: AnsiChar;
+    function skipSpace: Boolean;
+    begin
+      while (q <= L) and (s[q] in [' ', #9]) do Inc(q);
+      Result := q <= L;
+    end;
+  begin
+    Result := 0;
+    jj := 0;
+    q := 1; L := Length(s);
+    if not skipSpace then Exit;
+    if s[q] <> '|' then Exit;
+    Inc(q);
+    if not skipSpace then Exit;
+    { decimal offset }
+    if (q > L) or not (s[q] in ['0'..'9']) then Exit;
+    val := 0;
+    while (q <= L) and (s[q] in ['0'..'9']) do begin
+      val := val * 10 + (Ord(s[q]) - Ord('0'));
+      Inc(q);
+    end;
+    jj := val;
+    Result := 1;
+    if (q > L) or (s[q] <> ':') then Exit;
+    Inc(q);
+    cnt := 0;
+    while cnt < 16 do begin
+      if not skipSpace then Exit;
+      if (q > L) then Exit;
+      c := s[q];
+      dig := hexDigit(c);
+      if dig < 0 then Exit;
+      val := dig;
+      Inc(q);
+      { sscanf %x reads as many hex digits as present }
+      while (q <= L) do begin
+        dig := hexDigit(s[q]);
+        if dig < 0 then Break;
+        val := val * 16 + dig;
+        Inc(q);
+      end;
+      v[cnt] := u32(val);
+      Inc(cnt);
+      Inc(Result);
+    end;
   end;
   label readHexDb_error;
 begin
@@ -991,7 +1057,12 @@ begin
   sz := (Int64(n) + pgsz - 1) and not Int64(pgsz - 1);
   if sz = 0 then a := PAnsiChar(sqlite3_malloc64(1))
   else a := PAnsiChar(sqlite3_malloc64(u64(sz)));
-  if a = nil then goto readHexDb_error;
+  { shell.c.in:4324 readHexDb — shell_check_oom(a): a NULL allocation is a
+    hard out-of-memory exit, NOT a parse error. }
+  if a = nil then begin
+    shellEPutZ('Error: out of memory'#10);
+    Halt(1);
+  end;
   FillChar(a^, sz, 0);
   iOffset := 0;
   Inc(errLine);
@@ -1001,10 +1072,10 @@ begin
     rcSscanf := SScanf(zLine, '| page %d offset %d', [@j, @iOffset]);
     if rcSscanf >= 2 then Continue;
     if Copy(zLine, 1, 6) = '| end ' then Break;
-    rcSscanf := SScanf(zLine,
-      '| %d: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x',
-      [@j, @x[0], @x[1], @x[2], @x[3], @x[4], @x[5], @x[6], @x[7],
-       @x[8], @x[9], @x[10], @x[11], @x[12], @x[13], @x[14], @x[15]]);
+    { Parse `| %d: %x %x ... %x` (16 hex bytes).  FPC's RTL SScanf does
+      not support the %x conversion (it raises EFormatError), so the C
+      sscanf at shell.c.in:4324 is hand-rolled here. }
+    rcSscanf := parseHexLine(zLine, j, x);
     if rcSscanf = 17 then begin
       iOff := iOffset + j;
       if (iOff + 16 <= sz) and (iOff >= 0) then
@@ -1025,6 +1096,9 @@ end;
   open_db (shell.c.in:6745..) at the level needed by the dispatcher
   skeleton: --readonly / --create / default SQLITE_OPEN_READWRITE|
   SQLITE_OPEN_CREATE. }
+function safeModeAuth(pClientData: Pointer; op: i32;
+  zA1, zA2, zA3, zA4: PAnsiChar): i32; cdecl; forward;
+
 procedure openDb(p: PShellState; keepAlive: i32);
 var
   flags:  i32;
@@ -1300,6 +1374,11 @@ begin
       end;
     end;
   end;
+  { shell.c.in:4646..4651 — install the safe-mode authorizer at db-open
+    time when running under -safe (bSafeModePersist), so prohibited
+    functions (writefile/readfile/edit/...) and ATTACH are rejected. }
+  if (p^.db <> nil) and (p^.bSafeModePersist <> 0) then
+    sqlite3_set_authorizer(p^.db, @safeModeAuth, p);
 end;
 
 procedure closeDb(db: PTsqlite3);
@@ -3309,10 +3388,14 @@ end;
 
 function parseOnOff(const z: AnsiString; defaultVal: i32): i32;
 { booleanValue (shell.c.in:1340..) — recognises on/off, yes/no, true/false,
-  numeric 0/1.  Falls back to defaultVal on unrecognised input. }
+  numeric 0/1.  Falls back to defaultVal on unrecognised input.  Upstream
+  booleanValue compares with sqlite3_stricmp (case-insensitive), so e.g.
+  `.echo OFF` must match. }
+var zl: AnsiString;
 begin
-  if (z = 'on') or (z = 'yes') or (z = 'true') or (z = '1') then Result := 1
-  else if (z = 'off') or (z = 'no') or (z = 'false') or (z = '0') then Result := 0
+  zl := LowerCase(z);
+  if (zl = 'on') or (zl = 'yes') or (zl = 'true') or (zl = '1') then Result := 1
+  else if (zl = 'off') or (zl = 'no') or (zl = 'false') or (zl = '0') then Result := 0
   else Result := defaultVal;
 end;
 
@@ -10878,7 +10961,11 @@ begin
   if zCmd = 'trace'     then begin Result := cmdTrace(p, args, nArg); Exit; end;
   if zCmd = 'show'      then begin Result := cmdShow(p, nArg); Exit; end;
   if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;
-  if zCmd = 'headers'   then begin cmdHeaders(p, args, nArg); Exit; end;
+  { shell.c.in:9752 dispatches headers via cli_strncmp(azArg[0],"headers",n),
+    so any non-empty prefix of "headers" (e.g. ".header") matches. }
+  if (zCmd <> '') and (Length(zCmd) <= 7)
+     and (Copy('headers', 1, Length(zCmd)) = zCmd) then
+  begin cmdHeaders(p, args, nArg); Exit; end;
   if (zCmd = 'separator') or (zCmd = 'sep') then begin cmdSeparator(p, args, nArg); Exit; end;
   if zCmd = 'nullvalue' then begin cmdNullvalue(p, args, nArg); Exit; end;
   if zCmd = 'echo'      then begin cmdEcho(p, args, nArg); Exit; end;
@@ -11636,7 +11723,12 @@ begin
     end else if z = '-unsafe-testing' then
       state.shellFlgs := state.shellFlgs or SHFLG_TestingMode
     else if z = '-safe' then begin
-      { handled in pass 2 }
+      { shell.c.in:13207 — -safe is handled in the FIRST arg pass, before
+        open_db, so the safe-mode authorizer is installed at db-open time.
+        Set both flags here (pass 1) rather than pass 2 (which runs after
+        openDb) so ATTACH / prohibited-function rejection actually fires. }
+      state.bSafeMode := 1;
+      state.bSafeModePersist := 1;
     end else if z = '-escape' then begin
       Inc(i);
       if not cmdlineOptionValue(n, i, optVal) then Exit(1);

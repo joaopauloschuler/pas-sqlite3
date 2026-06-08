@@ -74,6 +74,7 @@ uses
   passqlite3pager,
   passqlite3pcache,
   passqlite3vtab,
+  passqlite3fts3,
   passqlite3main;
 
 { 9.4.divbug.66 — local stdio extern decls (FPC ships no portable stdio
@@ -92,6 +93,33 @@ function fwrite(ptr: Pointer; size, nmemb: csize_t; stream: PFile): csize_t; cde
 function fseek(stream: PFile; offset: clong; whence: cint): cint; cdecl;
   external 'c' name 'fseek';
 
+{ test1.c:7969 strftime_cmd needs the C-library gmtime()/strftime() so the
+  test can compare SQLite's internal strftime() SQL function against the
+  byte-identical libc output.  FPC ships no portable struct tm binding here,
+  so mirror the libc decls directly (same approach as the stdio binds above). }
+type
+  PCTm = ^TCTm;
+  TCTm = record
+    tm_sec:   cint;
+    tm_min:   cint;
+    tm_hour:  cint;
+    tm_mday:  cint;
+    tm_mon:   cint;
+    tm_year:  cint;
+    tm_wday:  cint;
+    tm_yday:  cint;
+    tm_isdst: cint;
+    { glibc extensions — present in the on-disk struct, declared for layout. }
+    tm_gmtoff: clong;
+    tm_zone:   PAnsiChar;
+  end;
+  PTimeT = ^clong;
+function c_gmtime(timer: PTimeT): PCTm; cdecl;
+  external 'c' name 'gmtime';
+function c_strftime(s: PAnsiChar; maxsize: csize_t; format: PAnsiChar;
+  timeptr: PCTm): csize_t; cdecl;
+  external 'c' name 'strftime';
+
 const
   { sqliteInt.h — index 12, defined in C but not yet exposed in this port. }
   SQLITE_LIMIT_PARSER_DEPTH = 12;
@@ -100,11 +128,25 @@ const
   SQLITE_TESTCTRL_NEVER_CORRUPT_OP = 20;
   { sqlite3.h — opcode 29.  Mirrored locally (see comment above). }
   SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP = 29;
+  { sqlite3.h — opcode 8 (BITVEC_TEST).  Mirrored locally. }
+  SQLITE_TESTCTRL_BITVEC_TEST_OP = 8;
+  { sqlite3.h — opcodes 5/6 (PRNG_SAVE/PRNG_RESTORE).  Mirrored locally. }
+  SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
+  SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
   SEEK_SET = 0;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
 
 implementation
+
+{ test1.c:3835.. — static buffers for the *array_addr test commands
+  (each overwritten/freed on the next call). }
+var
+  intarrayAddrP   : Pointer = nil;
+  int64arrayAddrP : Pointer = nil;
+  doublearrayAddrP: Pointer = nil;
+  textarrayAddrP  : Pointer = nil;
+  textarrayAddrN  : cint    = 0;
 
 { test1.c:39..41 — the first part of the SqliteDb struct from tclsqlite.c.
   The Tcl `db` command's objClientData points at a SqliteDb whose first
@@ -187,11 +229,43 @@ begin
     Exit;
   end;
   p := PTestSqliteDb(cmdInfo.objClientData);
-  s := '0x' + LowerCase(IntToHex(PtrUInt(p^.db), 1));
+  { test1.c:104 sqlite3_snprintf("%p", p->db) — bare hex, no "0x" prefix. }
+  s := LowerCase(IntToHex(PtrUInt(p^.db), 1));
   FillChar(zBuf, SizeOf(zBuf), 0);
   Move(s[1], zBuf[0], Length(s));
   Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
   Result := TCL_OK;
+end;
+
+{ test1.c:7831..7855 — runAsObjProc (Tcl command `tcl_objproc`).
+  Usage: tcl_objproc COMMANDNAME ARGS...
+  Run a TCL command via its objProc interface, erroring if the command
+  has none. }
+function runAsObjProc(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  cmdInfo: TTclCmdInfo;
+  xObj:    TTclObjCmdProc;
+begin
+  if objc < 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('COMMAND ...'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetCommandInfo(interp, Tcl_GetString(objv[1]), @cmdInfo) = 0 then
+  begin
+    Tcl_AppendResult(interp, PChar('command not found: '),
+      Tcl_GetString(objv[1]), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if cmdInfo.objProc = nil then
+  begin
+    Tcl_AppendResult(interp, PChar('command has no objProc: '),
+      Tcl_GetString(objv[1]), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  xObj := TTclObjCmdProc(cmdInfo.objProc);
+  Result := xObj(cmdInfo.objClientData, interp, objc - 1, PPTclObj(@objv[1]));
 end;
 
 { test1.c:6191..6325 — fpnum_compare STRING1 STRING2.
@@ -946,10 +1020,13 @@ begin
   Result := 0;
 end;
 
-{ Format a pointer as the "%p"-flavoured hex test1.c hands to Tcl. }
+{ Format a pointer as the "%p"-flavoured hex test1.c hands to Tcl.
+  sqlite3TestMakePointerStr uses sqlite3_snprintf("%p", p); SQLite's own
+  %p (printf.c etPOINTER, no prefix) renders bare lowercase hex with NO
+  "0x" prefix.  The tests regex-match this as /^[0-9A-Fa-f]+$/. }
 procedure ptrToHex(p: Pointer; out zBuf: AnsiString);
 begin
-  zBuf := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+  zBuf := LowerCase(IntToHex(PtrUInt(p), 1));
 end;
 
 { test1.c:419..460 — test_exec.
@@ -2002,6 +2079,381 @@ begin
   Result := TCL_OK;
 end;
 
+{ test3.c:25..28 — a bogus sqlite3 connection used by the [btree_open]
+  family.  Only pVfs and mutex are ever touched. }
+var
+  t3_sDb: Tsqlite3;
+  t3_nRefSqlite3: cint = 0;
+
+{ Render a pointer as test3.c does (sqlite3_snprintf "%p") and append it
+  to the interp result.  SQLite's %p (printf.c etPOINTER) is bare lowercase
+  hex with NO "0x" prefix. }
+procedure t3AppendPtr(interp: PTclInterp; p: Pointer);
+var
+  s:    AnsiString;
+  zBuf: array[0..99] of AnsiChar;
+begin
+  s := LowerCase(IntToHex(PtrUInt(p), 1));
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+end;
+
+{ test3.c:30..77 — btree_open FILENAME NCACHE.  Open a new database at the
+  raw b-tree level against the bogus sDb connection. }
+function btree_open(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt:       PBtree;
+  rc:        cint;
+  nCache:    cint;
+  n:         cint;
+  zFilename: PAnsiChar;
+begin
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' FILENAME NCACHE FLAGS"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetInt(interp, argv[2], @nCache) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  Inc(t3_nRefSqlite3);
+  if t3_nRefSqlite3 = 1 then
+  begin
+    t3_sDb.pVfs := sqlite3_vfs_find(nil);
+    t3_sDb.mutex := sqlite3MutexAlloc(SQLITE_MUTEX_RECURSIVE);
+    sqlite3_mutex_enter(t3_sDb.mutex);
+  end;
+  n := StrLen(argv[1]);
+  zFilename := sqlite3_malloc(n + 2);
+  if zFilename = nil then begin Result := TCL_ERROR; Exit; end;
+  Move(argv[1]^, zFilename^, n + 1);
+  zFilename[n + 1] := #0;
+  pBt := nil;
+  rc := sqlite3BtreeOpen(t3_sDb.pVfs, zFilename, @t3_sDb, @pBt, 0,
+          SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or SQLITE_OPEN_MAIN_DB);
+  sqlite3_free(zFilename);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3BtreeSetCacheSize(pBt, nCache);
+  t3AppendPtr(interp, pBt);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:83..110 — btree_close ID. }
+function btree_close(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt: PBtree;
+  rc:  cint;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  rc := sqlite3BtreeClose(pBt);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Dec(t3_nRefSqlite3);
+  if t3_nRefSqlite3 = 0 then
+  begin
+    sqlite3_mutex_leave(t3_sDb.mutex);
+    sqlite3_mutex_free(t3_sDb.mutex);
+    t3_sDb.mutex := nil;
+    t3_sDb.pVfs := nil;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:548..575 — btree_ismemdb ID.
+  Return true if the B-Tree is currently stored entirely in memory
+  (i.e. its pager file has no installed IO methods). }
+function btree_ismemdb(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt:   PBtree;
+  res:   cint;
+  pFile: Psqlite3_file;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  { C: pBt->db->mutex.  In this port every test3 b-tree is opened against
+    the shared bogus connection t3_sDb (see btree_open), so pBt->db == &t3_sDb. }
+  sqlite3_mutex_enter(t3_sDb.mutex);
+  sqlite3BtreeEnter(pBt);
+  pFile := sqlite3PagerFile(sqlite3BtreePager(pBt));
+  res := cint(Ord(pFile^.pMethods = nil));
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(t3_sDb.mutex);
+  Tcl_SetObjResult(interp, Tcl_NewBooleanObj(res));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:118..143 — btree_begin_transaction ID. }
+function btree_begin_transaction(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt: PBtree;
+  rc:  cint;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pBt);
+  rc := sqlite3BtreeBeginTrans(pBt, 1, nil);
+  sqlite3BtreeLeave(pBt);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:197..244 — btree_cursor ID TABLENUM WRITEABLE. }
+function btree_cursor(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pBt:    PBtree;
+  iTable: cint;
+  pCur:   PBtCursor;
+  rc:     cint;
+  wrFlag: cint;
+begin
+  rc := SQLITE_OK;
+  if argc <> 4 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID TABLENUM WRITEABLE"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(argv[1]));
+  if Tcl_GetInt(interp, argv[2], @iTable) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if Tcl_GetBoolean(interp, argv[3], @wrFlag) <> 0 then begin Result := TCL_ERROR; Exit; end;
+  if wrFlag <> 0 then wrFlag := BTREE_WRCSR;
+  pCur := PBtCursor(sqlite3_malloc(sqlite3BtreeCursorSize()));
+  FillChar(pCur^, sqlite3BtreeCursorSize(), 0);
+  sqlite3_mutex_enter(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3BtreeEnter(pBt);
+  rc := sqlite3BtreeLockTable(pBt, iTable, Ord(wrFlag <> 0));
+  if rc = SQLITE_OK then
+    rc := sqlite3BtreeCursor(pBt, iTable, wrFlag, nil, pCur);
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(PTsqlite3(pBt^.db)^.mutex);
+  if rc <> 0 then
+  begin
+    sqlite3_free(pCur);
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  t3AppendPtr(interp, pCur);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:246..286 — btree_close_cursor ID. }
+function btree_close_cursor(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  pBt:  PBtree;
+  rc:   cint;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  pBt := pCur^.pBtree;
+  sqlite3_mutex_enter(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3BtreeEnter(pBt);
+  rc := sqlite3BtreeCloseCursor(pCur);
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3_free(pCur);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:288..325 — btree_next ID.  0 on success, 1 if at/past last. }
+function btree_next(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  rc:   cint;
+  res:  cint;
+  zBuf: array[0..99] of AnsiChar;
+  s:    AnsiString;
+begin
+  res := 0;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pCur^.pBtree);
+  rc := sqlite3BtreeNext(pCur, 0);
+  if rc = SQLITE_DONE then
+  begin
+    res := 1;
+    rc := SQLITE_OK;
+  end;
+  sqlite3BtreeLeave(pCur^.pBtree);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  s := IntToStr(res);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:327..361 — btree_first ID.  0 if positioned, 1 if table empty. }
+function btree_first(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  rc:   cint;
+  res:  cint;
+  zBuf: array[0..99] of AnsiChar;
+  s:    AnsiString;
+begin
+  res := 0;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pCur^.pBtree);
+  rc := sqlite3BtreeFirst(pCur, @res);
+  sqlite3BtreeLeave(pCur^.pBtree);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  s := IntToStr(res);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:391..417 — btree_payload_size ID. }
+function btree_payload_size(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  pCur: PBtCursor;
+  n:    u32;
+  zBuf: array[0..99] of AnsiChar;
+  s:    AnsiString;
+begin
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      argv[0], PChar(' ID"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(argv[1]));
+  sqlite3BtreeEnter(pCur^.pBtree);
+  n := sqlite3BtreePayloadSize(pCur);
+  sqlite3BtreeLeave(pCur^.pBtree);
+  s := IntToStr(n);
+  FillChar(zBuf, SizeOf(zBuf), 0);
+  Move(s[1], zBuf[0], Length(s));
+  Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test3.c:609..654 — btree_insert CSR ?KEY? VALUE.
+  ObjCommand: with KEY (objc=4) inserts an integer-key/table row whose rowid
+  is KEY and whose data is VALUE; without KEY (objc=3) inserts an index/blob
+  key whose bytes are VALUE. }
+function btree_insert(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pCur: PBtCursor;
+  rc:   cint;
+  x:    TBtreePayload;
+  n:    cint;
+begin
+  if (objc <> 4) and (objc <> 3) then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('?-intkey? CSR KEY VALUE'));
+    Result := TCL_ERROR; Exit;
+  end;
+
+  FillChar(x, SizeOf(x), 0);
+  if objc = 4 then
+  begin
+    if Tcl_GetIntFromObj(interp, objv[2], @rc) <> 0 then
+    begin Result := TCL_ERROR; Exit; end;
+    x.nKey := rc;
+    x.pData := Pointer(Tcl_GetByteArrayFromObj(objv[3], @n));
+    x.nData := cint(n);
+  end
+  else
+  begin
+    x.pKey := Pointer(Tcl_GetByteArrayFromObj(objv[2], @n));
+    x.nKey := cint(n);
+  end;
+  pCur := PBtCursor(sqlite3TestTextToPtr(Tcl_GetString(objv[1])));
+
+  sqlite3_mutex_enter(PTsqlite3(pCur^.pBtree^.db)^.mutex);
+  sqlite3BtreeEnter(pCur^.pBtree);
+  rc := sqlite3BtreeInsert(pCur, @x, 0, 0);
+  sqlite3BtreeLeave(pCur^.pBtree);
+  sqlite3_mutex_leave(PTsqlite3(pCur^.pBtree^.db)^.mutex);
+
+  Tcl_ResetResult(interp);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test3.c:504..546 — btree_from_db DB-HANDLE ?N?.
   Returns the Btree* pointer for database iDb (default 0) of the SQLite
   connection bound to the Tcl `db` command.  Rendered as "%p" hex.
@@ -2040,7 +2492,8 @@ begin
   p := PTestSqliteDb(cmdInfo.objClientData);
   db := p^.db;
   pBt := db^.aDb[iDb].pBt;
-  s := '0x' + LowerCase(IntToHex(PtrUInt(pBt), 1));
+  { test3.c:73 sqlite3_snprintf("%p", pBt) — bare hex, no "0x" prefix. }
+  s := LowerCase(IntToHex(PtrUInt(pBt), 1));
   FillChar(zBuf, SizeOf(zBuf), 0);
   Move(s[1], zBuf[0], Length(s));
   Tcl_SetResult(interp, PChar(@zBuf[0]), TCL_VOLATILE);
@@ -2185,6 +2638,133 @@ begin
   if clientData = nil then ;
 end;
 
+{ ============================================================
+  test_quota.c:254..320 — quotaStrglob(zGlob, z): pure glob matcher.
+  Faithful recursive port.  Reads a byte then advances the pointer to
+  mirror C's *(p++).  '*' '?' '[...]' '[^...]' supported; '/' matches
+  '/' or '\\'.  Returns 1 on match, 0 otherwise.
+  ============================================================ }
+function quotaStrglob(zGlob: PByte; z: PByte): cint;
+var
+  c, c2, cx: cint;
+  invert, seen, prior_c: cint;
+begin
+  while True do
+  begin
+    c := zGlob^; Inc(zGlob);
+    if c = 0 then Break;
+    if c = Ord('*') then
+    begin
+      c := zGlob^; Inc(zGlob);
+      while (c = Ord('*')) or (c = Ord('?')) do
+      begin
+        if c = Ord('?') then
+        begin
+          if z^ = 0 then begin Result := 0; Exit; end;
+          Inc(z);
+        end;
+        c := zGlob^; Inc(zGlob);
+      end;
+      if c = 0 then
+      begin
+        Result := 1; Exit;
+      end
+      else if c = Ord('[') then
+      begin
+        while (z^ <> 0) and (quotaStrglob(zGlob - 1, z) = 0) do
+          Inc(z);
+        if z^ <> 0 then Result := 1 else Result := 0;
+        Exit;
+      end;
+      if c = Ord('/') then cx := Ord('\') else cx := c;
+      c2 := z^; Inc(z);
+      while c2 <> 0 do
+      begin
+        while (c2 <> c) and (c2 <> cx) do
+        begin
+          c2 := z^; Inc(z);
+          if c2 = 0 then begin Result := 0; Exit; end;
+        end;
+        if quotaStrglob(zGlob, z) <> 0 then begin Result := 1; Exit; end;
+        c2 := z^; Inc(z);
+      end;
+      Result := 0; Exit;
+    end
+    else if c = Ord('?') then
+    begin
+      if z^ = 0 then begin Result := 0; Exit; end;
+      Inc(z);
+    end
+    else if c = Ord('[') then
+    begin
+      prior_c := 0;
+      seen := 0;
+      invert := 0;
+      c := z^; Inc(z);
+      if c = 0 then begin Result := 0; Exit; end;
+      c2 := zGlob^; Inc(zGlob);
+      if c2 = Ord('^') then
+      begin
+        invert := 1;
+        c2 := zGlob^; Inc(zGlob);
+      end;
+      if c2 = Ord(']') then
+      begin
+        if c = Ord(']') then seen := 1;
+        c2 := zGlob^; Inc(zGlob);
+      end;
+      while (c2 <> 0) and (c2 <> Ord(']')) do
+      begin
+        if (c2 = Ord('-')) and (zGlob[0] <> Ord(']')) and (zGlob[0] <> 0)
+           and (prior_c > 0) then
+        begin
+          c2 := zGlob^; Inc(zGlob);
+          if (c >= prior_c) and (c <= c2) then seen := 1;
+          prior_c := 0;
+        end
+        else
+        begin
+          if c = c2 then seen := 1;
+          prior_c := c2;
+        end;
+        c2 := zGlob^; Inc(zGlob);
+      end;
+      if (c2 = 0) or ((seen xor invert) = 0) then begin Result := 0; Exit; end;
+    end
+    else if c = Ord('/') then
+    begin
+      if (z[0] <> Ord('/')) and (z[0] <> Ord('\')) then
+        begin Result := 0; Exit; end;
+      Inc(z);
+    end
+    else
+    begin
+      if c <> z^ then begin Result := 0; Exit; end;
+      Inc(z);
+    end;
+  end;
+  if z^ = 0 then Result := 1 else Result := 0;
+end;
+
+{ test_quota.c:1859..1877 — tclcmd: sqlite3_quota_glob PATTERN TEXT.
+  Returns 1 if TEXT matches the glob PATTERN, else 0. }
+function test_quota_glob(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zPattern, zText: PChar;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('PATTERN TEXT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  zPattern := Tcl_GetString(objv[1]);
+  zText := Tcl_GetString(objv[2]);
+  Tcl_SetObjResult(interp,
+    Tcl_NewIntObj(quotaStrglob(PByte(zPattern), PByte(zText))));
+  Result := TCL_OK;
+end;
+
 { test_malloc.c:884..915 — sqlite3_config_pagecache SIZE N.
   Sets the page-cache memory buffer.  The "static buf" trick from C is
   preserved via a unit-level var so successive calls do not leak.
@@ -2237,6 +2817,486 @@ begin
       sqlite3_config(SQLITE_CONFIG_PAGECACHE, Pointer(nil), sz, N);
   end;
   Result := TCL_OK;
+end;
+
+{ ============================================================
+  test_autoext.c — the "sqr" auto-extension + its Tcl command.
+  Used by mutex2-2.5 to prove sqlite3_auto_extension() honours a failing
+  sqlite3_initialize().  Only the sqr variant is needed here.
+  ============================================================ }
+
+{ test_autoext.c:23..30 — sqr() SQL function: returns x*x. }
+procedure sqrFunc(context: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  r: Double;
+  pArg: PPsqlite3_value;
+begin
+  pArg := argv;
+  r := sqlite3_value_double(pArg[0]);
+  sqlite3_result_double(context, r * r);
+  if argc = 0 then ;
+end;
+
+{ test_autoext.c:35..43 — sqr_init: extension entry point registering sqr(). }
+function sqr_init(db: PTsqlite3; pzErrMsg: PPAnsiChar; pApi: Pointer): cint; cdecl;
+begin
+  Result := sqlite3_create_function(db, PAnsiChar('sqr'), 1,
+    SQLITE_ANY, nil, @sqrFunc, nil, nil);
+  if (pzErrMsg = nil) or (pApi = nil) then ;
+end;
+
+{ test_autoext.c:90..99 — sqlite3_auto_extension_sqr.  Register sqr_init as
+  an auto-extension; return the rc (mutex2-2.5 expects 7 when init fails). }
+function test_auto_extension_sqr(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var rc: cint;
+begin
+  rc := sqlite3_auto_extension(Tsqlite3_loadext_fn(Pointer(@sqr_init)));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ ============================================================
+  test_mutex.c — the countable mutex layer + Tcl bindings.
+
+  This is a faithful port of ../sqlite3/src/test_mutex.c.  A counting
+  wrapper is installed over the engine's real mutex methods (retrieved
+  via sqlite3_config(SQLITE_CONFIG_GETMUTEX) and re-installed via
+  SQLITE_CONFIG_MUTEX).  Every counterMutexEnter / counterMutexTry bumps
+  a per-type counter that mutex1.test / mutex2.test read back.
+
+  Note on calling convention: the wrapper functions are stored in
+  gMutexMethods (the engine's sqlite3_mutex_methods table, os-type, plain
+  register convention) — NOT the cdecl util-type — so they are declared
+  WITHOUT cdecl to match how the engine invokes them.
+  ============================================================ }
+
+const
+  MAX_MUTEXES    = SQLITE_MUTEX_STATIC_VFS3 + 1;                  { 14 }
+  STATIC_MUTEXES = MAX_MUTEXES - (SQLITE_MUTEX_RECURSIVE + 1);    { 12 }
+
+  { aName[] — MAX_MUTEXES entries followed by a nil terminator (for
+    Tcl_GetIndexFromObj).  test_mutex.c:27..32. }
+  mutexAName: array[0..MAX_MUTEXES] of PAnsiChar = (
+    'fast',        'recursive',   'static_main',   'static_mem',
+    'static_open', 'static_prng', 'static_lru',    'static_pmem',
+    'static_app1', 'static_app2', 'static_app3',   'static_vfs1',
+    'static_vfs2', 'static_vfs3', nil
+  );
+
+type
+  { A countable mutex — test_mutex.c:35..38. }
+  PTestCountMutex = ^TTestCountMutex;
+  TTestCountMutex = record
+    pReal: Psqlite3_mutex;
+    eType: cint;
+  end;
+
+  { test_mutex_globals — test_mutex.c:41..49. }
+  TTestMutexGlobals = record
+    isInstalled: cint;                          { True if installed }
+    disableInit: cint;                          { True → sqlite3_initialize() fails }
+    disableTry:  cint;                          { True → sqlite3_mutex_try() fails }
+    isInit:      cint;                          { True if initialized }
+    m:           sqlite3_mutex_methods;         { Interface to "real" mutex system }
+    aCounter:    array[0..MAX_MUTEXES - 1] of cint; { Grabs of each type }
+    aStatic:     array[0..STATIC_MUTEXES - 1] of TTestCountMutex;
+  end;
+
+var
+  mutexG: TTestMutexGlobals;
+
+{ test_mutex.c:52..54 — counterMutexHeld. }
+function counterMutexHeld(p: Psqlite3_mutex): cint;
+begin
+  Result := mutexG.m.xMutexHeld(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:57..59 — counterMutexNotheld. }
+function counterMutexNotheld(p: Psqlite3_mutex): cint;
+begin
+  Result := mutexG.m.xMutexNotheld(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:66..72 — counterMutexInit. }
+function counterMutexInit: cint;
+begin
+  if mutexG.disableInit <> 0 then
+  begin
+    Result := mutexG.disableInit;
+    Exit;
+  end;
+  Result := mutexG.m.xMutexInit();
+  mutexG.isInit := 1;
+end;
+
+{ test_mutex.c:77..80 — counterMutexEnd. }
+function counterMutexEnd: cint;
+begin
+  mutexG.isInit := 0;
+  Result := mutexG.m.xMutexEnd();
+end;
+
+{ test_mutex.c:85..108 — counterMutexAlloc. }
+function counterMutexAlloc(eType: cint): Psqlite3_mutex;
+var
+  pReal: Psqlite3_mutex;
+  pRet:  PTestCountMutex;
+  eStaticType: cint;
+begin
+  pRet := nil;
+  Assert(mutexG.isInit <> 0);
+  Assert(eType >= SQLITE_MUTEX_FAST);
+  Assert(eType <= SQLITE_MUTEX_STATIC_VFS3);
+
+  pReal := mutexG.m.xMutexAlloc(eType);
+  if pReal = nil then
+  begin
+    Result := nil;
+    Exit;
+  end;
+
+  if (eType = SQLITE_MUTEX_FAST) or (eType = SQLITE_MUTEX_RECURSIVE) then
+    pRet := PTestCountMutex(GetMem(SizeOf(TTestCountMutex)))
+  else
+  begin
+    eStaticType := eType - (MAX_MUTEXES - STATIC_MUTEXES);
+    Assert(eStaticType >= 0);
+    Assert(eStaticType < STATIC_MUTEXES);
+    pRet := @mutexG.aStatic[eStaticType];
+  end;
+
+  pRet^.eType := eType;
+  pRet^.pReal := pReal;
+  Result := Psqlite3_mutex(pRet);
+end;
+
+{ test_mutex.c:113..119 — counterMutexFree. }
+procedure counterMutexFree(p: Psqlite3_mutex);
+begin
+  Assert(mutexG.isInit <> 0);
+  mutexG.m.xMutexFree(PTestCountMutex(p)^.pReal);
+  if (PTestCountMutex(p)^.eType = SQLITE_MUTEX_FAST)
+     or (PTestCountMutex(p)^.eType = SQLITE_MUTEX_RECURSIVE) then
+    FreeMem(Pointer(p));
+end;
+
+{ test_mutex.c:124..130 — counterMutexEnter. }
+procedure counterMutexEnter(p: Psqlite3_mutex);
+begin
+  Assert(mutexG.isInit <> 0);
+  Assert(PTestCountMutex(p)^.eType >= 0);
+  Assert(PTestCountMutex(p)^.eType < MAX_MUTEXES);
+  Inc(mutexG.aCounter[PTestCountMutex(p)^.eType]);
+  mutexG.m.xMutexEnter(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:135..142 — counterMutexTry. }
+function counterMutexTry(p: Psqlite3_mutex): cint;
+begin
+  Assert(mutexG.isInit <> 0);
+  Assert(PTestCountMutex(p)^.eType >= 0);
+  Assert(PTestCountMutex(p)^.eType < MAX_MUTEXES);
+  Inc(mutexG.aCounter[PTestCountMutex(p)^.eType]);
+  if mutexG.disableTry <> 0 then
+  begin
+    Result := SQLITE_BUSY;
+    Exit;
+  end;
+  Result := mutexG.m.xMutexTry(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:146..149 — counterMutexLeave. }
+procedure counterMutexLeave(p: Psqlite3_mutex);
+begin
+  Assert(mutexG.isInit <> 0);
+  mutexG.m.xMutexLeave(PTestCountMutex(p)^.pReal);
+end;
+
+{ test_mutex.c:196..252 — install_mutex_counters BOOLEAN. }
+function test_install_mutex_counters(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc, isInstall: cint;
+  counter_methods: sqlite3_mutex_methods;
+begin
+  rc := SQLITE_OK;
+  counter_methods.xMutexInit    := @counterMutexInit;
+  counter_methods.xMutexEnd     := @counterMutexEnd;
+  counter_methods.xMutexAlloc   := @counterMutexAlloc;
+  counter_methods.xMutexFree    := @counterMutexFree;
+  counter_methods.xMutexEnter   := @counterMutexEnter;
+  counter_methods.xMutexTry     := @counterMutexTry;
+  counter_methods.xMutexLeave   := @counterMutexLeave;
+  counter_methods.xMutexHeld    := @counterMutexHeld;
+  counter_methods.xMutexNotheld := @counterMutexNotheld;
+
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @isInstall) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  Assert((isInstall = 0) or (isInstall = 1));
+  Assert((mutexG.isInstalled = 0) or (mutexG.isInstalled = 1));
+  if isInstall = mutexG.isInstalled then
+  begin
+    Tcl_AppendResult(interp, PChar('mutex counters are '), nil);
+    if isInstall <> 0 then
+      Tcl_AppendResult(interp, PChar('already installed'), nil)
+    else
+      Tcl_AppendResult(interp, PChar('not installed'), nil);
+    Result := TCL_ERROR; Exit;
+  end;
+
+  if isInstall <> 0 then
+  begin
+    Assert(not Assigned(mutexG.m.xMutexAlloc));
+    rc := sqlite3_config(SQLITE_CONFIG_GETMUTEX_U, @mutexG.m);
+    if rc = SQLITE_OK then
+      sqlite3_config(SQLITE_CONFIG_MUTEX_U, @counter_methods);
+    mutexG.disableTry := 0;
+  end
+  else
+  begin
+    Assert(Assigned(mutexG.m.xMutexAlloc));
+    rc := sqlite3_config(SQLITE_CONFIG_MUTEX_U, @mutexG.m);
+    FillChar(mutexG.m, SizeOf(sqlite3_mutex_methods), 0);
+  end;
+
+  if rc = SQLITE_OK then
+    mutexG.isInstalled := isInstall;
+
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:257..281 — read_mutex_counters. }
+function test_read_mutex_counters(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pRet: PTclObj;
+  ii:   cint;
+begin
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  pRet := Tcl_NewObj();
+  Tcl_IncrRefCount(pRet);
+  for ii := 0 to MAX_MUTEXES - 1 do
+  begin
+    Tcl_ListObjAppendElement(interp, pRet, Tcl_NewStringObj(mutexAName[ii], -1));
+    Tcl_ListObjAppendElement(interp, pRet, Tcl_NewIntObj(mutexG.aCounter[ii]));
+  end;
+  Tcl_SetObjResult(interp, pRet);
+  Tcl_DecrRefCount(pRet);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:286..303 — clear_mutex_counters. }
+function test_clear_mutex_counters(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  ii: cint;
+begin
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  for ii := 0 to MAX_MUTEXES - 1 do
+    mutexG.aCounter[ii] := 0;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:310..324 — alloc_dealloc_mutex.  Allocate then free a FAST
+  mutex; return the (now stale) pointer so the caller can check it was
+  non-NULL. }
+function test_alloc_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  p:    Psqlite3_mutex;
+  zBuf: AnsiString;
+begin
+  p := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+  sqlite3_mutex_free(p);
+  { C uses sqlite3_snprintf(...,"%p",p).  SQLite's printf renders %p as a
+    bare hexadecimal integer (no 0x prefix), so a NULL pointer prints "0"
+    (mutex2-2.9 expects exactly "0"). }
+  if p = nil then
+    zBuf := '0'
+  else
+    zBuf := AnsiString(Format('%x', [PtrUInt(p)]));
+  Tcl_AppendResult(interp, PChar(zBuf), nil);
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ test_mutex.c:387..397 — getStaticMutexPointer. }
+function getStaticMutexPointer(pInterp: PTclInterp; pObj: PTclObj): Psqlite3_mutex;
+var
+  iMutex: cint;
+begin
+  if Tcl_GetIndexFromObj(pInterp, pObj, @mutexAName[0], PChar('mutex name'),
+       0, @iMutex) <> 0 then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  Assert((iMutex <> SQLITE_MUTEX_FAST) and (iMutex <> SQLITE_MUTEX_RECURSIVE));
+  Result := counterMutexAlloc(iMutex);
+end;
+
+{ test_mutex.c:399..416 — enter_static_mutex NAME. }
+function test_enter_static_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pMtx: Psqlite3_mutex;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pMtx := getStaticMutexPointer(interp, objv[1]);
+  if pMtx = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_enter(pMtx);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:418..435 — leave_static_mutex NAME. }
+function test_leave_static_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pMtx: Psqlite3_mutex;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NAME'));
+    Result := TCL_ERROR; Exit;
+  end;
+  pMtx := getStaticMutexPointer(interp, objv[1]);
+  if pMtx = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_leave(pMtx);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:437..454 — enter_db_mutex DB. }
+function test_enter_db_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if db = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_enter(Psqlite3_mutex(sqlite3_db_mutex(db)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test_mutex.c:456..473 — leave_db_mutex DB. }
+function test_leave_db_mutex(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db: PTsqlite3;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if db = nil then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_mutex_leave(Psqlite3_mutex(sqlite3_db_mutex(db)));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:6726..6746 — vfs_initfail_test.  Verifies that vfs_find /
+  vfs_register all fail while sqlite3_initialize() is failing. }
+function vfs_initfail_test(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  one: sqlite3_vfs;
+begin
+  FillChar(one, SizeOf(one), 0);
+  one.zName := PChar('__one');
+
+  if sqlite3_vfs_find(nil) <> nil then begin Result := TCL_ERROR; Exit; end;
+  sqlite3_vfs_register(@one, 0);
+  if sqlite3_vfs_find(nil) <> nil then begin Result := TCL_ERROR; Exit; end;
+  sqlite3_vfs_register(@one, 1);
+  if sqlite3_vfs_find(nil) <> nil then begin Result := TCL_ERROR; Exit; end;
+  Result := TCL_OK;
+  if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ test_mutex.c:337..372 — sqlite3_config OPTION.
+  OPTION is one of the keywords singlethread/multithread/serialized
+  (mapped to SQLITE_CONFIG_SINGLETHREAD/MULTITHREAD/SERIALIZED = 1/2/3)
+  or a raw integer.  Calls sqlite3_config(i) and returns sqlite3ErrName(rc). }
+function test_config(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i, rc: cint;
+  z:     PAnsiChar;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  z := Tcl_GetString(objv[1]);
+  if StrComp(z, PChar('singlethread')) = 0 then
+    i := SQLITE_CONFIG_SINGLETHREAD
+  else if StrComp(z, PChar('multithread')) = 0 then
+    i := SQLITE_CONFIG_MULTITHREAD
+  else if StrComp(z, PChar('serialized')) = 0 then
+    i := SQLITE_CONFIG_SERIALIZED
+  else if Tcl_GetIntFromObj(interp, objv[1], @i) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_config(i, 0);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
 end;
 
 { test_malloc.c:968..983 — sqlite3_config_memstatus BOOLEAN.
@@ -2297,20 +3357,37 @@ end;
 
 { test_config.c / tclsqlite.c — thin wrappers around the engine
   lifecycle entry points; used by test_set_config_pagecache. }
+{ test_mutex.c:175..191 — sqlite3_initialize.  Returns sqlite3ErrName(rc)
+  (mutex1.test reads back SQLITE_OK / the disable_mutex_init failure code). }
 function test_initialize(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var rc: cint;
 begin
-  sqlite3_initialize;
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_initialize;
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
   Result := TCL_OK;
-  if (interp = nil) or (objc < 0) or (objv = nil) then ;
+  if clientData = nil then ;
 end;
 
+{ test_mutex.c:154..170 — sqlite3_shutdown.  Returns sqlite3ErrName(rc). }
 function test_shutdown(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+var rc: cint;
 begin
-  sqlite3_shutdown;
+  if objc <> 1 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_shutdown;
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
   Result := TCL_OK;
-  if (interp = nil) or (objc < 0) or (objv = nil) then ;
+  if clientData = nil then ;
 end;
 
 { ----------------------------------------------------------------------
@@ -2372,7 +3449,73 @@ begin
     if Tcl_GetInt(interp, av[i], @a[i-2]) <> 0 then begin
       Result := TCL_ERROR; Exit;
     end;
+  { test1.c:1419 calls the public sqlite3_mprintf, which autoinits and
+    returns NULL when sqlite3_initialize() is failing (mutex2-2.4). }
+  if sqlite3_initialize <> SQLITE_OK then begin
+    Result := TCL_OK; Exit;
+  end;
   z := sqlite3PfMprintf(av[1], [a[0], a[1], a[2]]);
+  Tcl_AppendResult(interp, z, Pointer(nil));
+  sqlite3_free(z);
+  Result := TCL_OK;
+end;
+
+{ test1.c:542..560 — sqlite3_snprintf_int  SIZE FORMAT INT.
+  Prefill a 100-byte buffer with the alphabet, then snprintf(n,...). }
+function tcl_snprintf_int(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  zStr: array[0..99] of AnsiChar;
+  n:    cint;
+  a1:   cint;
+  v:    Int64;
+  code: Integer;
+  av:   PPAnsiCharArr;
+begin
+  av := argv;
+  Val(AnsiString(av[1]), v, code); if code <> 0 then v := 0;
+  n := cint(v);
+  Val(AnsiString(av[3]), v, code); if code <> 0 then v := 0;
+  a1 := cint(v);
+  if n > SizeOf(zStr) then n := SizeOf(zStr);
+  sqlite3PfSnprintf(SizeOf(zStr), @zStr[0],
+    PAnsiChar('abcdefghijklmnopqrstuvwxyz'), []);
+  sqlite3PfSnprintf(n, @zStr[0], av[2], [a1]);
+  Tcl_AppendResult(interp, @zStr[0], Pointer(nil));
+  Result := TCL_OK;
+end;
+
+{ test1.c:1518..1546 — sqlite3_snprintf_str  INT FORMAT INT INT ?STRING?. }
+function tcl_snprintf_str(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  a:    array[0..1] of cint;
+  i:    cint;
+  n:    cint;
+  z:    PAnsiChar;
+  zStr: PAnsiChar;
+  av:   PPAnsiCharArr;
+begin
+  av := argv;
+  if (argc < 5) or (argc > 6) then begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' INT FORMAT INT INT ?STRING?"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetInt(interp, av[1], @n) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if n < 0 then begin
+    Tcl_AppendResult(interp, PChar('N must be non-negative'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  for i := 3 to 4 do
+    if Tcl_GetInt(interp, av[i], @a[i-3]) <> 0 then begin
+      Result := TCL_ERROR; Exit;
+    end;
+  if argc > 5 then zStr := av[5] else zStr := nil;
+  z := PAnsiChar(sqlite3_malloc(n + 1));
+  sqlite3PfSnprintf(n, z, av[2], [a[0], a[1], zStr]);
   Tcl_AppendResult(interp, z, Pointer(nil));
   sqlite3_free(z);
   Result := TCL_OK;
@@ -3043,6 +4186,139 @@ begin
   Tcl_SetObjResult(interp, Tcl_NewIntObj(res));
   Result := TCL_OK;
   if (clientData = nil) and (objc = 0) and (objv = nil) then ;
+end;
+
+{ test1.c:3836..3859 — test_intarray_addr.  Usage:  intarray_addr  INT ...
+  Returns (as a wide-int) the address of a malloc'd C array of 32-bit ints
+  holding the supplied values.  Call with no args to release the memory;
+  each call overwrites the previous array. }
+function tcl_test_intarray_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+  p: PInteger;
+begin
+  sqlite3_free(intarrayAddrP);
+  intarrayAddrP := nil;
+  if objc > 1 then
+  begin
+    p := PInteger(sqlite3_malloc(SizeOf(cint) * (objc - 1)));
+    if p = nil then begin Result := TCL_ERROR; Exit; end;
+    intarrayAddrP := p;
+    for i := 0 to objc - 2 do
+    begin
+      if Tcl_GetIntFromObj(interp, objv[1 + i],
+           @PInteger(PByte(p) + i * SizeOf(cint))^) <> 0 then
+      begin
+        sqlite3_free(intarrayAddrP);
+        intarrayAddrP := nil;
+        Result := TCL_ERROR;
+        Exit;
+      end;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(intarrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:3861..3897 — test_int64array_addr.  As intarray_addr but the C
+  array holds 64-bit integers. }
+function tcl_test_int64array_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+  p: PInt64;
+  v: Int64;
+begin
+  sqlite3_free(int64arrayAddrP);
+  int64arrayAddrP := nil;
+  if objc > 1 then
+  begin
+    p := PInt64(sqlite3_malloc(SizeOf(Int64) * (objc - 1)));
+    if p = nil then begin Result := TCL_ERROR; Exit; end;
+    int64arrayAddrP := p;
+    for i := 0 to objc - 2 do
+    begin
+      if Tcl_GetWideIntFromObj(interp, objv[1 + i], @v) <> 0 then
+      begin
+        sqlite3_free(int64arrayAddrP);
+        int64arrayAddrP := nil;
+        Result := TCL_ERROR;
+        Exit;
+      end;
+      PInt64(PByte(p) + i * SizeOf(Int64))^ := v;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(int64arrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:3899..3930 — test_doublearray_addr.  As intarray_addr but the C
+  array holds doubles. }
+function tcl_test_doublearray_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i: cint;
+  p: PDouble;
+begin
+  sqlite3_free(doublearrayAddrP);
+  doublearrayAddrP := nil;
+  if objc > 1 then
+  begin
+    p := PDouble(sqlite3_malloc(SizeOf(Double) * (objc - 1)));
+    if p = nil then begin Result := TCL_ERROR; Exit; end;
+    doublearrayAddrP := p;
+    for i := 0 to objc - 2 do
+    begin
+      if Tcl_GetDoubleFromObj(interp, objv[1 + i],
+           PDouble(PByte(p) + i * SizeOf(Double))) <> 0 then
+      begin
+        sqlite3_free(doublearrayAddrP);
+        doublearrayAddrP := nil;
+        Result := TCL_ERROR;
+        Exit;
+      end;
+    end;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(doublearrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:3932..3962 — test_textarray_addr.  Returns the address of a
+  malloc'd C array of malloc'd strings (char**). }
+function tcl_test_textarray_addr(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i, n: cint;
+  pp: PPAnsiChar;
+  z, zDup: PAnsiChar;
+begin
+  pp := PPAnsiChar(textarrayAddrP);
+  for i := 0 to textarrayAddrN - 1 do
+    sqlite3_free(PPAnsiChar(PByte(pp) + i * SizeOf(Pointer))^);
+  sqlite3_free(textarrayAddrP);
+  textarrayAddrP := nil;
+  if objc > 1 then
+  begin
+    pp := PPAnsiChar(sqlite3_malloc(SizeOf(Pointer) * (objc - 1)));
+    if pp = nil then begin Result := TCL_ERROR; Exit; end;
+    textarrayAddrP := pp;
+    for i := 0 to objc - 2 do
+    begin
+      z := Tcl_GetString(objv[1 + i]);
+      n := StrLen(z);
+      zDup := sqlite3_malloc(n + 1);
+      if zDup <> nil then Move(z^, zDup^, n + 1);
+      PPAnsiChar(PByte(pp) + i * SizeOf(Pointer))^ := zDup;
+    end;
+  end;
+  textarrayAddrN := objc - 1;
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(Int64(PtrUInt(textarrayAddrP))));
+  Result := TCL_OK;
+  if clientData = nil then ;
 end;
 
 { 9.4.divbug.88.068 — sqlite3_register_cksumvfs.  test1.c:8795..8814.
@@ -3807,6 +5083,7 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -3860,6 +5137,7 @@ begin
     Result := TCL_ERROR; Exit;
   end;
   if rc <> SQLITE_OK then begin
+    Tcl_AppendResult(interp, t1ErrName(rc), Pointer(nil));
     Result := TCL_ERROR; Exit;
   end;
   Result := TCL_OK;
@@ -4246,6 +5524,75 @@ begin
   Result := TCL_OK;
 end;
 
+{ test_hexio.c:391..449 — make_fts3record LIST.
+  Builds a byte blob: each list element that parses as a wide integer is
+  appended as an fts3 varint (sqlite3Fts3PutVarint), otherwise the raw
+  string bytes are appended.  Returns a Tcl byte-array. }
+function make_fts3record(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  aArg: PPTclObj;
+  nArg: cint;
+  aOut: PByte;
+  nOut: sqlite3_int64;
+  nAlloc: sqlite3_int64;
+  i: cint;
+  iVal: Int64;
+  zVal: PChar;
+  nVal: cint;
+  nNew: sqlite3_int64;
+  aNew: PByte;
+begin
+  aArg := nil;
+  nArg := 0;
+  aOut := nil;
+  nOut := 0;
+  nAlloc := 0;
+
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('LIST'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_ListObjGetElements(interp, objv[1], @nArg, @aArg) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  for i := 0 to nArg - 1 do begin
+    if Tcl_GetWideIntFromObj(nil, PPTclObj(aArg)[i], @iVal) = TCL_OK then begin
+      if nOut + 10 > nAlloc then begin
+        if nAlloc <> 0 then nNew := nAlloc * 2 else nNew := 128;
+        aNew := PByte(sqlite3_realloc(aOut, cint(nNew)));
+        if aNew = nil then begin
+          sqlite3_free(aOut);
+          Result := TCL_ERROR; Exit;
+        end;
+        aOut := aNew;
+        nAlloc := nNew;
+      end;
+      nOut := nOut + sqlite3Fts3PutVarint(PChar(@aOut[nOut]), iVal);
+    end else begin
+      nVal := 0;
+      zVal := Tcl_GetStringFromObj(PPTclObj(aArg)[i], @nVal);
+      while (nOut + nVal) > nAlloc do begin
+        if nAlloc <> 0 then nNew := nAlloc * 2 else nNew := 128;
+        aNew := PByte(sqlite3_realloc(aOut, cint(nNew)));
+        if aNew = nil then begin
+          sqlite3_free(aOut);
+          Result := TCL_ERROR; Exit;
+        end;
+        aOut := aNew;
+        nAlloc := nNew;
+      end;
+      Move(zVal^, aOut[nOut], nVal);
+      nOut := nOut + nVal;
+    end;
+  end;
+
+  Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(aOut, cint(nOut)));
+  sqlite3_free(aOut);
+  Result := TCL_OK;
+end;
+
 { ----------------------------------------------------------------------
   9.4.divbug.62.c — additional test1.c / test_malloc.c Tcl commands:
   sqlite3_status, sqlite3_release_memory, sqlite3_limit, sqlite3_rekey,
@@ -4343,6 +5690,28 @@ begin
     N := -1;
   amt := sqlite3_release_memory(N);
   Tcl_SetObjResult(interp, Tcl_NewIntObj(amt));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:6359..6381 — sqlite3_db_release_memory DB. }
+function tcl_test_db_release_memory(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:  PTsqlite3;
+  rc:  cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_db_release_memory(db);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
   Result := TCL_OK;
   if clientData = nil then ;
 end;
@@ -5893,6 +7262,128 @@ begin
   if clientData = nil then ;
 end;
 
+{ 9.4.divbug.63 — test1.c:8469..8501 sorter_test_fakeheap BOOL.
+  Toggle a fake (non-NULL but invalid) global heap pointer so the sorter
+  takes its "heap configured" code path without an actual allocator.
+  SQLITE_INT_TO_PTR(-1) == Pointer(-1). }
+function sorter_test_fakeheap(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  bArg: cint;
+begin
+  bArg := 0;
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOL'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @bArg) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if bArg <> 0 then
+  begin
+    if sqlite3GlobalConfig.pHeap = nil then
+      sqlite3GlobalConfig.pHeap := Pointer(PtrInt(-1));
+  end
+  else
+  begin
+    if sqlite3GlobalConfig.pHeap = Pointer(PtrInt(-1)) then
+      sqlite3GlobalConfig.pHeap := nil;
+  end;
+  Tcl_ResetResult(interp);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ 9.4.divbug.63 — test1.c:8503..8574 sorter_test_sort4_helper DB SQL1 NSTEP SQL2.
+  Step SQL1 up to NSTEP times; assert col[0]==col[last] are equal ints,
+  accumulate a checksum; then run SQL2 fully accumulating a second checksum
+  over col[0]; assert the two checksums match. }
+function sorter_test_sort4_helper(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  zSql1, zSql2: PAnsiChar;
+  nStep, iStep: cint;
+  iCksum1, iCksum2: cuint32;
+  rc, iB, a: cint;
+  db: PTsqlite3;
+  pStmt: PVdbe;
+label sql_error;
+begin
+  db := nil;
+  nStep := 0;
+  iCksum1 := 0;
+  iCksum2 := 0;
+  pStmt := nil;
+  if objc <> 5 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB SQL1 NSTEP SQL2'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zSql1 := Tcl_GetString(objv[2]);
+  if Tcl_GetIntFromObj(interp, objv[3], @nStep) <> 0 then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  zSql2 := Tcl_GetString(objv[4]);
+
+  rc := sqlite3_prepare_v2(db, zSql1, -1, @pStmt, nil);
+  if rc <> SQLITE_OK then goto sql_error;
+
+  iB := sqlite3_column_count(pStmt) - 1;
+  iStep := 0;
+  while (iStep < nStep) and (sqlite3_step(pStmt) = SQLITE_ROW) do
+  begin
+    a := sqlite3_column_int(pStmt, 0);
+    if a <> sqlite3_column_int(pStmt, iB) then
+    begin
+      Tcl_AppendResult(interp, PChar('data error: (a!=b)'), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    iCksum1 := iCksum1 + (iCksum1 shl 3) + cuint32(a);
+    Inc(iStep);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  pStmt := nil;
+  if rc <> SQLITE_OK then goto sql_error;
+
+  rc := sqlite3_prepare_v2(db, zSql2, -1, @pStmt, nil);
+  if rc <> SQLITE_OK then goto sql_error;
+  while sqlite3_step(pStmt) = SQLITE_ROW do
+  begin
+    a := sqlite3_column_int(pStmt, 0);
+    iCksum2 := iCksum2 + (iCksum2 shl 3) + cuint32(a);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  pStmt := nil;
+  if rc <> SQLITE_OK then goto sql_error;
+
+  if iCksum1 <> iCksum2 then
+  begin
+    Tcl_AppendResult(interp, PChar('checksum mismatch'), Pointer(nil));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+
+  Result := TCL_OK;
+  if clientData = nil then ;
+  Exit;
+sql_error:
+  Tcl_AppendResult(interp, PChar('sql error: '), sqlite3_errmsg(db), Pointer(nil));
+  Result := TCL_ERROR;
+end;
+
 { 9.4.divbug.88.006 — test1.c:6912..6941 file_control_chunksize_test
   DB DBNAME SIZE.  Thin Tcl wrapper over
   sqlite3_file_control(db, zDb, SQLITE_FCNTL_CHUNK_SIZE, &nSize).
@@ -6839,18 +8330,448 @@ begin
   if clientData = nil then ;
 end;
 
-{ 9.4.divbug.62.e — test_devsym.c:1095 devSymObjCmd stub.
-  The full device-simulation VFS (test_devsym.c) is NOT ported; tests
-  that rely on observable I/O-error injection through this VFS will
-  still mis-behave.  This shim accepts the upstream arg shape and
-  returns OK so tests that merely *register* a simulated device (or
-  toggle it back off) don't abort with `invalid command name`. }
+{ ============================================================
+  test_devsym.c — device-characteristics simulation VFS.
+  A thin pass-through VFS wrapping the default ("real") VFS that
+  overrides xDeviceCharacteristics()/xSectorSize() to report the
+  values set via `sqlite3_simulate_device`.  test6.c:716..1025
+  provides the Tcl glue (processDevSymArgs / devSymObjCmd /
+  dsUnregisterObjCmd).  Used by tkt-9d68c883.test.
+  ============================================================ }
+
+const
+  DEVSYM_MAX_PATHNAME = 512;
+  DEVSYM_VFS_NAME     = 'devsym';
+  WRITECRASH_NAME     = 'writecrash';
+
+type
+  { test_devsym.c:33..37 — devsym_file.  Must start with sqlite3_file
+    so a Psqlite3_file cast works; the real underlying sqlite3_file
+    lives immediately after this record (p->pReal = &p[1]). }
+  Pdevsym_file = ^Tdevsym_file;
+  Tdevsym_file = record
+    base  : sqlite3_file;
+    pReal : Psqlite3_file;
+  end;
+
+  { test_devsym.c:76..81 — struct DevsymGlobal g = {0, 0, 512, 0}. }
+  TDevsymGlobal = record
+    pVfs        : Psqlite3_vfs;
+    iDeviceChar : cint;
+    iSectorSize : cint;
+    nWriteCrash : cint;
+  end;
+
+var
+  devsym_g: TDevsymGlobal = (pVfs: nil; iDeviceChar: 0; iSectorSize: 512; nWriteCrash: 0);
+  devsym_vfs: sqlite3_vfs;
+  writecrash_vfs: sqlite3_vfs;
+  devsym_io_methods: sqlite3_io_methods;
+  writecrash_io_methods: sqlite3_io_methods;
+
+{ ----- io_methods (test_devsym.c:87..213) ----- }
+
+function devsymClose(pFile: Psqlite3_file): cint; cdecl;
+begin
+  sqlite3OsClose(Pdevsym_file(pFile)^.pReal);
+  Result := SQLITE_OK;
+end;
+
+function devsymRead(pFile: Psqlite3_file; zBuf: Pointer; iAmt: cint; iOfst: i64): cint; cdecl;
+begin
+  Result := sqlite3OsRead(Pdevsym_file(pFile)^.pReal, zBuf, iAmt, iOfst);
+end;
+
+function devsymWrite(pFile: Psqlite3_file; zBuf: Pointer; iAmt: cint; iOfst: i64): cint; cdecl;
+begin
+  Result := sqlite3OsWrite(Pdevsym_file(pFile)^.pReal, zBuf, iAmt, iOfst);
+end;
+
+function devsymTruncate(pFile: Psqlite3_file; size: i64): cint; cdecl;
+begin
+  Result := sqlite3OsTruncate(Pdevsym_file(pFile)^.pReal, size);
+end;
+
+function devsymSync(pFile: Psqlite3_file; flags: cint): cint; cdecl;
+begin
+  Result := sqlite3OsSync(Pdevsym_file(pFile)^.pReal, flags);
+end;
+
+function devsymFileSize(pFile: Psqlite3_file; pSize: Pi64): cint; cdecl;
+begin
+  Result := sqlite3OsFileSize(Pdevsym_file(pFile)^.pReal, pSize);
+end;
+
+function devsymLock(pFile: Psqlite3_file; eLock: cint): cint; cdecl;
+begin
+  Result := sqlite3OsLock(Pdevsym_file(pFile)^.pReal, eLock);
+end;
+
+function devsymUnlock(pFile: Psqlite3_file; eLock: cint): cint; cdecl;
+begin
+  Result := sqlite3OsUnlock(Pdevsym_file(pFile)^.pReal, eLock);
+end;
+
+function devsymCheckReservedLock(pFile: Psqlite3_file; pResOut: PcInt): cint; cdecl;
+begin
+  Result := sqlite3OsCheckReservedLock(Pdevsym_file(pFile)^.pReal, pResOut);
+end;
+
+function devsymFileControl(pFile: Psqlite3_file; op: cint; pArg: Pointer): cint; cdecl;
+begin
+  Result := sqlite3OsFileControl(Pdevsym_file(pFile)^.pReal, op, pArg);
+end;
+
+function devsymSectorSize(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := devsym_g.iSectorSize;
+  if pFile = nil then ;
+end;
+
+function devsymDeviceCharacteristics(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := devsym_g.iDeviceChar;
+  if pFile = nil then ;
+end;
+
+{ Shared-memory methods are all pass-throughs (test_devsym.c:190..213). }
+function devsymShmLock(pFile: Psqlite3_file; ofst: cint; n: cint; flags: cint): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  Result := p^.pReal^.pMethods^.xShmLock(p^.pReal, ofst, n, flags);
+end;
+
+function devsymShmMap(pFile: Psqlite3_file; iRegion: cint; szRegion: cint;
+  isWrite: cint; pp: PPointer): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  Result := p^.pReal^.pMethods^.xShmMap(p^.pReal, iRegion, szRegion, isWrite, pp);
+end;
+
+procedure devsymShmBarrier(pFile: Psqlite3_file); cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  p^.pReal^.pMethods^.xShmBarrier(p^.pReal);
+end;
+
+function devsymShmUnmap(pFile: Psqlite3_file; delFlag: cint): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  Result := p^.pReal^.pMethods^.xShmUnmap(p^.pReal, delFlag);
+end;
+
+{ ----- writecrash io_methods (test_devsym.c:351..379) ----- }
+
+function writecrashSectorSize(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := sqlite3OsSectorSize(Pdevsym_file(pFile)^.pReal);
+end;
+
+function writecrashDeviceCharacteristics(pFile: Psqlite3_file): cint; cdecl;
+begin
+  Result := sqlite3OsDeviceCharacteristics(Pdevsym_file(pFile)^.pReal);
+end;
+
+function writecrashWrite(pFile: Psqlite3_file; zBuf: Pointer; iAmt: cint; iOfst: i64): cint; cdecl;
+begin
+  if devsym_g.nWriteCrash > 0 then begin
+    Dec(devsym_g.nWriteCrash);
+    if devsym_g.nWriteCrash = 0 then Halt(134);  { C calls abort() }
+  end;
+  Result := sqlite3OsWrite(Pdevsym_file(pFile)^.pReal, zBuf, iAmt, iOfst);
+end;
+
+{ ----- sqlite3_vfs methods (test_devsym.c:220..346) ----- }
+
+function devsymOpen(pVfs: Psqlite3_vfs; zName: sqlite3_filename;
+  pFile: Psqlite3_file; flags: cint; pOutFlags: PcInt): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  p^.pReal := Psqlite3_file(PtrUInt(p) + SizeOf(Tdevsym_file));
+  Result := sqlite3OsOpen(devsym_g.pVfs, zName, p^.pReal, flags, pOutFlags);
+  if p^.pReal^.pMethods <> nil then
+    pFile^.pMethods := @devsym_io_methods;
+  if pVfs = nil then ;
+end;
+
+function writecrashOpen(pVfs: Psqlite3_vfs; zName: sqlite3_filename;
+  pFile: Psqlite3_file; flags: cint; pOutFlags: PcInt): cint; cdecl;
+var p: Pdevsym_file;
+begin
+  p := Pdevsym_file(pFile);
+  p^.pReal := Psqlite3_file(PtrUInt(p) + SizeOf(Tdevsym_file));
+  Result := sqlite3OsOpen(devsym_g.pVfs, zName, p^.pReal, flags, pOutFlags);
+  if p^.pReal^.pMethods <> nil then
+    pFile^.pMethods := @writecrash_io_methods;
+  if pVfs = nil then ;
+end;
+
+function devsymDelete(pVfs: Psqlite3_vfs; zPath: PChar; dirSync: cint): cint; cdecl;
+begin
+  Result := sqlite3OsDelete(devsym_g.pVfs, zPath, dirSync);
+  if pVfs = nil then ;
+end;
+
+function devsymAccess(pVfs: Psqlite3_vfs; zPath: PChar; flags: cint; pResOut: PcInt): cint; cdecl;
+begin
+  Result := sqlite3OsAccess(devsym_g.pVfs, zPath, flags, pResOut);
+  if pVfs = nil then ;
+end;
+
+function devsymFullPathname(pVfs: Psqlite3_vfs; zPath: PChar; nOut: cint; zOut: PChar): cint; cdecl;
+begin
+  Result := sqlite3OsFullPathname(devsym_g.pVfs, zPath, nOut, zOut);
+  if pVfs = nil then ;
+end;
+
+function devsymRandomness(pVfs: Psqlite3_vfs; nByte: cint; zBufOut: PChar): cint; cdecl;
+var pP: Psqlite3_vfs;
+begin
+  pP := devsym_g.pVfs;
+  Result := pP^.xRandomness(pP, nByte, zBufOut);
+  if pVfs = nil then ;
+end;
+
+function devsymSleep(pVfs: Psqlite3_vfs; nMicro: cint): cint; cdecl;
+begin
+  Result := sqlite3OsSleep(devsym_g.pVfs, nMicro);
+  if pVfs = nil then ;
+end;
+
+function devsymCurrentTime(pVfs: Psqlite3_vfs; pTimeOut: PDouble): cint; cdecl;
+begin
+  Result := devsym_g.pVfs^.xCurrentTime(devsym_g.pVfs, pTimeOut);
+  if pVfs = nil then ;
+end;
+
+procedure InitDevsymTables;
+begin
+  { devsym io_methods (test_devsym.c:227..245) — iVersion 2. }
+  FillChar(devsym_io_methods, SizeOf(devsym_io_methods), 0);
+  devsym_io_methods.iVersion              := 2;
+  devsym_io_methods.xClose                := @devsymClose;
+  devsym_io_methods.xRead                 := @devsymRead;
+  devsym_io_methods.xWrite                := @devsymWrite;
+  devsym_io_methods.xTruncate             := @devsymTruncate;
+  devsym_io_methods.xSync                 := @devsymSync;
+  devsym_io_methods.xFileSize             := @devsymFileSize;
+  devsym_io_methods.xLock                 := @devsymLock;
+  devsym_io_methods.xUnlock               := @devsymUnlock;
+  devsym_io_methods.xCheckReservedLock    := @devsymCheckReservedLock;
+  devsym_io_methods.xFileControl          := @devsymFileControl;
+  devsym_io_methods.xSectorSize           := @devsymSectorSize;
+  devsym_io_methods.xDeviceCharacteristics:= @devsymDeviceCharacteristics;
+  devsym_io_methods.xShmMap               := @devsymShmMap;
+  devsym_io_methods.xShmLock              := @devsymShmLock;
+  devsym_io_methods.xShmBarrier           := @devsymShmBarrier;
+  devsym_io_methods.xShmUnmap             := @devsymShmUnmap;
+
+  { writecrash io_methods (test_devsym.c:391..409). }
+  writecrash_io_methods := devsym_io_methods;
+  writecrash_io_methods.xWrite                  := @writecrashWrite;
+  writecrash_io_methods.xSectorSize             := @writecrashSectorSize;
+  writecrash_io_methods.xDeviceCharacteristics  := @writecrashDeviceCharacteristics;
+
+  { devsym_vfs (test_devsym.c:421..448) — iVersion 2.  Dl* slots are nil
+    because this build is SQLITE_OMIT_LOAD_EXTENSION. }
+  FillChar(devsym_vfs, SizeOf(devsym_vfs), 0);
+  devsym_vfs.iVersion      := 2;
+  devsym_vfs.szOsFile      := SizeOf(Tdevsym_file);
+  devsym_vfs.mxPathname    := DEVSYM_MAX_PATHNAME;
+  devsym_vfs.zName         := DEVSYM_VFS_NAME;
+  devsym_vfs.xOpen         := @devsymOpen;
+  devsym_vfs.xDelete       := @devsymDelete;
+  devsym_vfs.xAccess       := @devsymAccess;
+  devsym_vfs.xFullPathname := @devsymFullPathname;
+  devsym_vfs.xRandomness   := @devsymRandomness;
+  devsym_vfs.xSleep        := @devsymSleep;
+  devsym_vfs.xCurrentTime  := @devsymCurrentTime;
+
+  { writecrash_vfs (test_devsym.c:450..477). }
+  writecrash_vfs := devsym_vfs;
+  writecrash_vfs.zName := WRITECRASH_NAME;
+  writecrash_vfs.xOpen := @writecrashOpen;
+end;
+
+{ test_devsym.c:485..504 — devsym_register. }
+procedure devsym_register(iDeviceChar: cint; iSectorSize: cint);
+begin
+  if devsym_g.pVfs = nil then begin
+    InitDevsymTables;
+    devsym_g.pVfs := sqlite3_vfs_find(nil);
+    Inc(devsym_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    Inc(writecrash_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    sqlite3_vfs_register(@devsym_vfs, 0);
+    sqlite3_vfs_register(@writecrash_vfs, 0);
+  end;
+  if iDeviceChar >= 0 then devsym_g.iDeviceChar := iDeviceChar
+  else devsym_g.iDeviceChar := 0;
+  if iSectorSize >= 0 then devsym_g.iSectorSize := iSectorSize
+  else devsym_g.iSectorSize := 512;
+end;
+
+{ test_devsym.c:506..512 — devsym_unregister. }
+procedure devsym_unregister;
+begin
+  sqlite3_vfs_unregister(@devsym_vfs);
+  sqlite3_vfs_unregister(@writecrash_vfs);
+  devsym_g.pVfs := nil;
+  devsym_g.iDeviceChar := 0;
+  devsym_g.iSectorSize := 0;
+end;
+
+{ test_devsym.c:514..523 — devsym_crash_on_write. }
+procedure devsym_crash_on_write(nWrite: cint);
+begin
+  if devsym_g.pVfs = nil then begin
+    InitDevsymTables;
+    devsym_g.pVfs := sqlite3_vfs_find(nil);
+    Inc(devsym_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    Inc(writecrash_vfs.szOsFile, devsym_g.pVfs^.szOsFile);
+    sqlite3_vfs_register(@devsym_vfs, 0);
+    sqlite3_vfs_register(@writecrash_vfs, 0);
+  end;
+  devsym_g.nWriteCrash := nWrite;
+end;
+
+{ test6.c:716..808 — processDevSymArgs.  Parses ?-sectorsize N?
+  ?-characteristics FLAGLIST? option pairs. }
+function processDevSymArgs(interp: PTclInterp; objc: cint; objv: PPTclObj;
+  piDeviceChar: PcInt; piSectorSize: PcInt): cint;
+type
+  TDeviceFlag = record zName: PChar; iValue: cint; end;
+const
+  aFlag: array[0..12] of TDeviceFlag = (
+    (zName: 'atomic';              iValue: SQLITE_IOCAP_ATOMIC),
+    (zName: 'atomic512';           iValue: SQLITE_IOCAP_ATOMIC512),
+    (zName: 'atomic1k';            iValue: SQLITE_IOCAP_ATOMIC1K),
+    (zName: 'atomic2k';            iValue: SQLITE_IOCAP_ATOMIC2K),
+    (zName: 'atomic4k';            iValue: SQLITE_IOCAP_ATOMIC4K),
+    (zName: 'atomic8k';            iValue: SQLITE_IOCAP_ATOMIC8K),
+    (zName: 'atomic16k';           iValue: SQLITE_IOCAP_ATOMIC16K),
+    (zName: 'atomic32k';           iValue: SQLITE_IOCAP_ATOMIC32K),
+    (zName: 'atomic64k';           iValue: SQLITE_IOCAP_ATOMIC64K),
+    (zName: 'sequential';          iValue: SQLITE_IOCAP_SEQUENTIAL),
+    (zName: 'safe_append';         iValue: SQLITE_IOCAP_SAFE_APPEND),
+    (zName: 'powersafe_overwrite'; iValue: SQLITE_IOCAP_POWERSAFE_OVERWRITE),
+    (zName: 'batch-atomic';        iValue: SQLITE_IOCAP_BATCH_ATOMIC)
+  );
+var
+  i, j, k        : cint;
+  nOpt           : cint;
+  zOpt           : PChar;
+  iDc, iSectorSize : cint;
+  setSectorsize, setDeviceChar : cint;
+  apObj          : PPTclObj;
+  nObj           : cint;
+  zFlag          : PChar;
+  s              : AnsiString;
+  found          : cint;
+begin
+  iDc := 0; iSectorSize := 0;
+  setSectorsize := 0; setDeviceChar := 0;
+  i := 0;
+  while i < objc do begin
+    nOpt := 0;
+    zOpt := Tcl_GetStringFromObj(objv[i], @nOpt);
+    if ((nOpt > 11) or (nOpt < 2) or (StrLComp('-sectorsize', zOpt, nOpt) <> 0))
+       and ((nOpt > 16) or (nOpt < 2) or (StrLComp('-characteristics', zOpt, nOpt) <> 0)) then
+    begin
+      Tcl_AppendResult(interp, PChar('Bad option: "'), zOpt,
+        PChar('" - must be "-characteristics" or "-sectorsize"'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    if i = objc - 1 then begin
+      Tcl_AppendResult(interp, PChar('Option requires an argument: "'),
+        zOpt, PChar('"'), Pointer(nil));
+      Result := TCL_ERROR; Exit;
+    end;
+    if zOpt[1] = 's' then begin
+      if Tcl_GetIntFromObj(interp, objv[i+1], @iSectorSize) <> 0 then begin
+        Result := TCL_ERROR; Exit;
+      end;
+      setSectorsize := 1;
+    end else begin
+      apObj := nil; nObj := 0;
+      if Tcl_ListObjGetElements(interp, objv[i+1], @nObj, @apObj) <> 0 then begin
+        Result := TCL_ERROR; Exit;
+      end;
+      for j := 0 to nObj - 1 do begin
+        zFlag := Tcl_GetString(PPTclObj(PtrUInt(apObj) + PtrUInt(j) * SizeOf(Pointer))^);
+        s := LowerCase(AnsiString(zFlag));
+        found := 0;
+        for k := 0 to High(aFlag) do
+          if s = AnsiString(aFlag[k].zName) then begin
+            iDc := iDc or aFlag[k].iValue;
+            found := 1;
+            Break;
+          end;
+        if found = 0 then begin
+          Tcl_AppendResult(interp, PChar('no such flag "'), zFlag,
+            PChar('"'), Pointer(nil));
+          Result := TCL_ERROR; Exit;
+        end;
+      end;
+      setDeviceChar := 1;
+    end;
+    Inc(i, 2);
+  end;
+
+  if setDeviceChar <> 0 then piDeviceChar^ := iDc;
+  if setSectorsize <> 0 then piSectorSize^ := iSectorSize;
+  Result := TCL_OK;
+end;
+
+{ test6.c:964..981 — devSymObjCmd.  tclcmd: sqlite3_simulate_device. }
 function tcl_test_simulate_device(clientData: TClientData;
   interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  iDc, iSectorSize: cint;
 begin
+  iDc := -1;
+  iSectorSize := -1;
+  if processDevSymArgs(interp, objc - 1, PPTclObj(@objv[1]), @iDc, @iSectorSize) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  devsym_register(iDc, iSectorSize);
   Result := TCL_OK;
-  if (clientData = nil) or (interp = nil) or (objc < 0) or
-     (objv = nil) then ;
+  if clientData = nil then ;
+end;
+
+{ test6.c:986..1005 — writeCrashObjCmd.  tclcmd: sqlite3_crash_on_write N. }
+function tcl_test_crash_on_write(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+var nWrite: cint;
+begin
+  nWrite := 0;
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('NWRITE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetIntFromObj(interp, objv[1], @nWrite) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  devsym_crash_on_write(nWrite);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test6.c:1010..1025 — dsUnregisterObjCmd.  tclcmd: unregister_devsim. }
+function tcl_test_unregister_devsim(clientData: TClientData;
+  interp: PTclInterp; objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc <> 1 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar(''));
+    Result := TCL_ERROR; Exit;
+  end;
+  devsym_unregister;
+  Result := TCL_OK;
+  if clientData = nil then ;
 end;
 
 { 9.4.divbug.62.e — `sqlite3_user_version` has no upstream Tcl-command
@@ -7079,8 +9000,9 @@ begin
   pStmt := sqlite3_next_stmt(db, pStmt);
   if pStmt <> nil then
   begin
-    { C: sqlite3TestMakePointerStr → "0x%p". }
-    s := '0x' + LowerCase(IntToHex(PtrUInt(pStmt), 1));
+    { C: sqlite3TestMakePointerStr → sqlite3_snprintf("%p", p); bare hex,
+      no "0x" prefix (printf.c etPOINTER). }
+    s := LowerCase(IntToHex(PtrUInt(pStmt), 1));
     FillChar(zBuf, SizeOf(zBuf), 0);
     Move(s[1], zBuf[0], Length(s));
     Tcl_AppendResult(interp, PChar(@zBuf[0]), Pointer(nil));
@@ -7567,10 +9489,11 @@ end;
   glue (test_blob.c:33..339). }
 
 { test_blob.c:33..37 — ptrToText.  Render a pointer as the "%p" text
-  sqlite3TestTextToPtr() can decode back ("0x" + lowercase hex). }
+  sqlite3TestTextToPtr() can decode back.  SQLite's %p is bare lowercase
+  hex with NO "0x" prefix (printf.c etPOINTER). }
 procedure blobPtrToText(p: Pointer; out zBuf: AnsiString);
 begin
-  zBuf := '0x' + LowerCase(IntToHex(PtrUInt(p), 1));
+  zBuf := LowerCase(IntToHex(PtrUInt(p), 1));
 end;
 
 { test_blob.c:51..79 — blobHandleFromObj.  Extract an sqlite3_blob* from a
@@ -7874,6 +9797,44 @@ begin
     Tcl_AppendResult(interp, PChar('1'), Pointer(nil))
   else
     Tcl_AppendResult(interp, PChar('0'), Pointer(nil));
+  Result := TCL_OK;
+end;
+
+{ test2.c:671..698 — testBitvecBuiltinTest (old-style argc/argv handler).
+  Usage: sqlite3BitvecBuiltinTest SIZE PROGRAM.
+  Invokes SQLITE_TESTCTRL_BITVEC_TEST and returns the integer result. }
+function testBitvecBuiltinTest(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  av:    PPAnsiCharArr;
+  sz, rc, nProg: cint;
+  aProg: array[0..99] of cint;
+  z:     PAnsiChar;
+begin
+  av := argv;
+  nProg := 0;
+  if argc <> 3 then
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' SIZE PROGRAM"'), Pointer(nil));
+  if Tcl_GetInt(interp, av[1], @sz) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  z := av[2];
+  while (nProg < 99) and (z^ <> #0) do begin
+    while (z^ <> #0) and not (z^ in ['0'..'9']) do Inc(z);
+    if z^ = #0 then Break;
+    { atoi over the digit run }
+    rc := 0;
+    while z^ in ['0'..'9'] do begin
+      rc := rc * 10 + (Ord(z^) - Ord('0'));
+      Inc(z);
+    end;
+    aProg[nProg] := rc;
+    Inc(nProg);
+  end;
+  aProg[nProg] := 0;
+  rc := sqlite3_test_control(SQLITE_TESTCTRL_BITVEC_TEST_OP, sz, Pu32(@aProg[0]));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
   Result := TCL_OK;
 end;
 
@@ -8388,12 +10349,148 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:1727..1738 — Usage: sqlite3_libversion_number
+  Returns sqlite3_libversion_number() as an int. }
+function test_libversion_number(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_libversion_number()));
+  Result := TCL_OK;
+  if (clientData = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ test1.c:7436..7456 — tclcmd: save_prng_state
+  Save the state of the PRNG.  Also verifies sqlite3_test_control tolerates
+  out-of-range opcodes (returns 0). }
+function save_prng_state(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc: cint;
+begin
+  rc := sqlite3_test_control(9999);
+  Assert(rc = 0);
+  rc := sqlite3_test_control(-1);
+  Assert(rc = 0);
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SAVE_OP);
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ test1.c:7458..7468 — tclcmd: reset_prng_state
+  Restore the previously-saved PRNG state. }
+function reset_prng_state(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_RESTORE_OP);
+  Result := TCL_OK;
+  if (clientData = nil) or (interp = nil) or (objc < 0) or (objv = nil) then ;
+end;
+
+{ test1.c:7787..7789 — struct LogCallback { Tcl_Interp*; Tcl_Obj*; } = {0,0}. }
+type
+  TLogCallback = record
+    pInterp: PTclInterp;
+    pObj:    PTclObj;
+  end;
+var
+  logcallback: TLogCallback = (pInterp: nil; pObj: nil);
+
+{ test1.c:7790..7799 — xLogcallback.  Duplicates the saved Tcl script,
+  appends the symbolic error-code name (sqlite3ErrName == t1ErrName here)
+  and the message, then evaluates it at global scope. }
+procedure xLogcallback(unused: Pointer; err: i32; zMsg: PAnsiChar); cdecl;
+var
+  pNew: PTclObj;
+begin
+  pNew := Tcl_DuplicateObj(logcallback.pObj);
+  Tcl_IncrRefCount(pNew);
+  Tcl_ListObjAppendElement(nil, pNew,
+    Tcl_NewStringObj(t1ErrName(err), -1));
+  Tcl_ListObjAppendElement(nil, pNew, Tcl_NewStringObj(zMsg, -1));
+  Tcl_EvalObjEx(logcallback.pInterp, pNew,
+    TCL_EVAL_GLOBAL or TCL_EVAL_DIRECT);
+  Tcl_DecrRefCount(pNew);
+  if unused = nil then ;
+end;
+
+{ test1.c:7800..7822 — tclcmd: test_sqlite3_log ?SCRIPT?
+  Registers (or deregisters with no/empty arg) a Tcl log callback via
+  SQLITE_CONFIG_LOG. }
+function test_sqlite3_log(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+begin
+  if objc > 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('SCRIPT'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if logcallback.pObj <> nil then begin
+    Tcl_DecrRefCount(logcallback.pObj);
+    logcallback.pObj    := nil;
+    logcallback.pInterp := nil;
+    sqlite3_config(SQLITE_CONFIG_LOG, Tsqlite3_config_log_cb(nil), nil);
+  end;
+  if (objc > 1) and (Tcl_GetString(objv[1])[0] <> #0) then begin
+    logcallback.pObj := objv[1];
+    Tcl_IncrRefCount(logcallback.pObj);
+    logcallback.pInterp := interp;
+    sqlite3_config(SQLITE_CONFIG_LOG, @xLogcallback, nil);
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:7969..8009 — TCLCMD: strftime FORMAT UNIXTIMESTAMP
+  Access to the C-library strftime() so its results can be compared against
+  SQLite's internal strftime() SQL function. }
+function strftime_cmd(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  ts:   Int64;
+  t:    clong;
+  pTm:  PCTm;
+  zFmt: PAnsiChar;
+  n:    csize_t;
+  zBuf: array[0..999] of AnsiChar;
+begin
+  if objc <> 3 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('FORMAT UNIXTIMESTAMP'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, objv[2], @ts) <> 0 then begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zFmt := Tcl_GetString(objv[1]);
+  t := clong(ts);
+  pTm := c_gmtime(@t);
+  n := c_strftime(@zBuf[0], SizeOf(zBuf) - 1, zFmt, pTm);
+  if n < csize_t(SizeOf(zBuf)) then begin
+    zBuf[n] := #0;
+    Tcl_SetResult(interp, @zBuf[0], TCL_VOLATILE);
+  end;
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
 begin
   Tcl_CreateObjCommand(interp, PChar('sqlite3_connection_pointer'),
     @get_sqlite_pointer, nil, nil);
+  { tclsqlite.test — test1.c:1834 sqlite3_libversion_number. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_libversion_number'),
+    @test_libversion_number, nil, nil);
+  { fts3corrupt4.test — test1.c:9258/9260 save_prng_state/reset_prng_state. }
+  Tcl_CreateObjCommand(interp, PChar('save_prng_state'),
+    @save_prng_state, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('reset_prng_state'),
+    @reset_prng_state, nil, nil);
+  { date4.test — test1.c:9320 strftime. }
+  Tcl_CreateObjCommand(interp, PChar('strftime'),
+    @strftime_cmd, nil, nil);
+  { pragma4.test/pragma.test — test1.c:9290 test_sqlite3_log. }
+  Tcl_CreateObjCommand(interp, PChar('test_sqlite3_log'),
+    @test_sqlite3_log, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
   { misc8.test — test1.c:9187 dbconfig_maindbname_icecube. }
@@ -8520,18 +10617,76 @@ begin
   { 9.4.divbug.88.011 — btree_from_db.  test3.c:676. }
   Tcl_CreateCommand(interp, PChar('btree_from_db'),
     @btree_from_db, nil, nil);
+  { types.test — raw b-tree harness commands.  test3.c:664..674. }
+  Tcl_CreateCommand(interp, PChar('btree_open'),
+    @btree_open, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_close'),
+    @btree_close, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_ismemdb'),
+    @btree_ismemdb, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_begin_transaction'),
+    @btree_begin_transaction, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_cursor'),
+    @btree_cursor, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_close_cursor'),
+    @btree_close_cursor, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_next'),
+    @btree_next, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_first'),
+    @btree_first, nil, nil);
+  Tcl_CreateCommand(interp, PChar('btree_payload_size'),
+    @btree_payload_size, nil, nil);
   { 6.40.6 (HARNESS) — btree_pager_stats.  test3.c:668. }
   Tcl_CreateCommand(interp, PChar('btree_pager_stats'),
     @btree_pager_stats, nil, nil);
   { 9.4.divbug.88.062 — btree_varint_test.  test3.c:675. }
   Tcl_CreateCommand(interp, PChar('btree_varint_test'),
     @btree_varint_test, nil, nil);
+  { test3.c:686 — btree_insert (ObjCommand). }
+  Tcl_CreateObjCommand(interp, PChar('btree_insert'),
+    @btree_insert, nil, nil);
   { 9.4.6.q.2 — aggregate UDF registration + pagecache config + lifecycle.
     test1.c:9082 / test_malloc.c:1487. }
   Tcl_CreateCommand(interp, PChar('sqlite3_create_aggregate'),
     @test_create_aggregate, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pagecache'),
     @test_config_pagecache, nil, nil);
+  { test_quota.c:1954 — sqlite3_quota_glob PATTERN TEXT (glob matcher only). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_quota_glob'),
+    @test_quota_glob, nil, nil);
+  { test_mutex.c:337..372 — sqlite3_config OPTION. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config'),
+    @test_config, nil, nil);
+  { test_mutex.c:475..504 — Sqlitetest_mutex_Init command table
+    (mutex1.test / mutex2.test).  sqlite3_config / _initialize / _shutdown
+    are already registered above. }
+  Tcl_CreateObjCommand(interp, PChar('enter_static_mutex'),
+    @test_enter_static_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('leave_static_mutex'),
+    @test_leave_static_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('enter_db_mutex'),
+    @test_enter_db_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('leave_db_mutex'),
+    @test_leave_db_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('alloc_dealloc_mutex'),
+    @test_alloc_mutex, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('install_mutex_counters'),
+    @test_install_mutex_counters, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('read_mutex_counters'),
+    @test_read_mutex_counters, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('clear_mutex_counters'),
+    @test_clear_mutex_counters, nil, nil);
+  { test_mutex.c:500..503 — Tcl_LinkVar the failure-injection switches. }
+  Tcl_LinkVar(interp, PChar('disable_mutex_init'),
+    @mutexG.disableInit, TCL_LINK_INT);
+  Tcl_LinkVar(interp, PChar('disable_mutex_try'),
+    @mutexG.disableTry, TCL_LINK_INT);
+  { test1.c:6726..6746 — vfs_initfail_test (mutex2-2.10). }
+  Tcl_CreateObjCommand(interp, PChar('vfs_initfail_test'),
+    @vfs_initfail_test, nil, nil);
+  { test_autoext.c:205..206 — sqlite3_auto_extension_sqr (mutex2-2.5). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_auto_extension_sqr'),
+    @test_auto_extension_sqr, nil, nil);
   { 9.4.divbug.88.050/051 — test_malloc.c:1494..1495 sqlite3_config_memstatus
     and sqlite3_config_lookaside. }
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_memstatus'),
@@ -8566,6 +10721,10 @@ begin
     @tcl_mprintf_z_test, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_mprintf_n_test'),
     @tcl_mprintf_n_test, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_snprintf_str'),
+    @tcl_snprintf_str, nil, nil);
+  Tcl_CreateCommand(interp, PChar('sqlite3_snprintf_int'),
+    @tcl_snprintf_int, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_step'),
     @tcl_test_step, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_finalize'),
@@ -8705,6 +10864,8 @@ begin
     @tcl_test_status, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_release_memory'),
     @tcl_test_release_memory, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_db_release_memory'),
+    @tcl_test_db_release_memory, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_limit'),
     @tcl_test_limit, nil, nil);
   { 9.4.divbug.62.d — sqlite3_db_status / _soft_heap_limit[64] /
@@ -8817,6 +10978,12 @@ begin
   { 9.4.divbug.63.b — file_control_reservebytes (test1.c:9258 / 7249..7276). }
   Tcl_CreateObjCommand(interp, PChar('file_control_reservebytes'),
     @file_control_reservebytes, nil, nil);
+  { 9.4.divbug.63 — sorter_test_fakeheap / sorter_test_sort4_helper
+    (test1.c:9301..9302 / 8469..8574).  sort4.test helpers. }
+  Tcl_CreateObjCommand(interp, PChar('sorter_test_fakeheap'),
+    @sorter_test_fakeheap, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sorter_test_sort4_helper'),
+    @sorter_test_sort4_helper, nil, nil);
   { 9.4.divbug.88.006 — file_control_chunksize_test (test1.c:9247 / 6912..6941). }
   Tcl_CreateObjCommand(interp, PChar('file_control_chunksize_test'),
     @file_control_chunksize_test, nil, nil);
@@ -8862,6 +11029,10 @@ begin
     @tcl_test_load_extension, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_simulate_device'),
     @tcl_test_simulate_device, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_crash_on_write'),
+    @tcl_test_crash_on_write, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('unregister_devsim'),
+    @tcl_test_unregister_devsim, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_user_version'),
     @tcl_test_user_version, nil, nil);
   { 9.4.divbug.87.005 — sqlite3_table_column_metadata (test1.c:9279). }
@@ -8891,6 +11062,9 @@ begin
     @test_mmap_warm, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('utf8_to_utf8'),
     @utf8_to_utf8, nil, nil);
+  { test_hexio.c:468 make_fts3record. }
+  Tcl_CreateObjCommand(interp, PChar('make_fts3record'),
+    @make_fts3record, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_interrupt'),
     @test_interrupt, nil, nil);
   Tcl_CreateCommand(interp, PChar('sqlite3_is_interrupted'),
@@ -8899,6 +11073,23 @@ begin
     @tcl_test_carray_bind, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('bind_carray_intptr'),
     @tcl_bind_carray_intptr, nil, nil);
+  { test1.c:9110..9113 — intarray_addr / int64array_addr /
+    doublearray_addr / textarray_addr (carray-binding helpers). }
+  Tcl_CreateObjCommand(interp, PChar('intarray_addr'),
+    @tcl_test_intarray_addr, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('int64array_addr'),
+    @tcl_test_int64array_addr, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('doublearray_addr'),
+    @tcl_test_doublearray_addr, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('textarray_addr'),
+    @tcl_test_textarray_addr, nil, nil);
+  { test2.c:732 — sqlite3BitvecBuiltinTest (registered by Sqlitetest2_Init
+    in C; the pas Sqlitetest2_Init is a stub, so register it here). }
+  Tcl_CreateCommand(interp, PChar('sqlite3BitvecBuiltinTest'),
+    @testBitvecBuiltinTest, nil, nil);
+  { test1.c:9200 — tcl_objproc. }
+  Tcl_CreateObjCommand(interp, PChar('tcl_objproc'),
+    @runAsObjProc, nil, nil);
   Result := TCL_OK;
 end;
 

@@ -1186,6 +1186,7 @@ type
     lockMask:        yDbMask;        { subset of btreeMask requiring a lock }
     aCounter:        array[0..8] of u32; { sqlite3_stmt_status() counters }
     zSql:            PAnsiChar;      { SQL text that generated this stmt }
+    zNormSql:        PAnsiChar;      { Normalization of the associated SQL (lazy) }
     pFree:           Pointer;        { free this when deleting the Vdbe }
     pFrame:          PVdbeFrame;     { currently executing sub-frame (nil=main) }
     pDelFrame:       PVdbeFrame;     { sub-frames to free on VM reset }
@@ -1198,6 +1199,10 @@ type
       unconditional here so .scanstats works without a rebuild flag. }
     nScan:           i32;            { entries in aScan[] }
     aScan:           PScanStatus;    { per-loop scan definitions }
+    { SQLITE_ENABLE_NORMALIZE (vdbeInt.h) — list of double-quoted strings
+      that were resolved as string literals, so sqlite3Normalize can tell
+      them apart from real identifiers. }
+    pDblStr:         PDblquoteStr;   { all DQS literals seen during resolve }
   end;
 
   { -----------------------------------------------------------------------
@@ -2052,6 +2057,13 @@ var
 var
   sqlite3_search_count: i32 = 0;
 
+{ vdbe.c:68 — test-only countdown: when >0, decremented once per VDBE opcode
+  step (vdbe.c:961..971, #ifdef SQLITE_TEST) and, when it reaches 0, fires
+  sqlite3_interrupt(db).  Tcl-linked as `sqlite_interrupt_count` (test1.c:9376)
+  so interrupt.test section 3 can simulate an interrupt after N steps. }
+var
+  sqlite3_interrupt_count: Int32 = 0;
+
 { vdbe.c:90 — largest blob (MEM_Str|MEM_Blob, by Mem.n, excluding zero-padding)
   ever materialised on the VDBE register stack.  Test-only watermark read by the
   regression suite via the Tcl-linked `sqlite3_max_blobsize` variable
@@ -2464,7 +2476,16 @@ begin
     Inc(pMm);
   end;
   if (d > u32(nKey)) and (u <> 0) then begin
+    { In a corrupt record entry, the last pMm might have been set up using
+      uninitialised memory. Overwrite its value with NULL.  C: vdbeaux.c:4280
+      sqlite3VdbeMemSetNull(pMem-(u<p->nField)); the subtracted term is the
+      C boolean (0 or 1): when u<nField the loop did NOT advance past this
+      cell so the previously-filled cell (pMm-1) is the suspect one; when
+      u>=nField the loop broke after filling pMm without advancing, so pMm
+      itself is the suspect cell. }
     if u < u16(nAllField) then
+      sqlite3VdbeMemSetNull(PMem(PtrUInt(pMm) - SizeOf(TMem)))
+    else
       sqlite3VdbeMemSetNull(pMm);
   end;
   pUR^.nField := i32(u);
@@ -3182,7 +3203,12 @@ begin
       { freeEphemeralFunction — defer to Phase 6 }
     end;
     P4_SUBRTNSIG: begin
-      { SubrtnSig has zAff heap string — defer to Phase 6 }
+      { vdbeaux.c:1421 — free the affinity string then the struct. }
+      if p4 <> nil then
+      begin
+        sqlite3DbFree(db, PSubrtnSig(p4)^.zAff);
+        sqlite3DbFree(db, p4);
+      end;
     end;
   end;
 end;
@@ -5350,6 +5376,8 @@ var
   pNext:   PSubProgram;
   i:       i32;
   aliased: i32;
+  pThisDS: PDblquoteStr;
+  pNxtDS:  PDblquoteStr;
 begin
   { Free sub-programs.  Track whether any sub-program's aOp aliases the
     parent's aOp (a known-bug scenario in the trigger codegen path —
@@ -5406,6 +5434,18 @@ begin
   end;
   sqlite3DbFree(db, p^.zErrMsg);
   sqlite3DbFree(db, p^.zSql);
+  sqlite3DbFree(db, p^.zNormSql);   { vdbeaux.c:3755 }
+  { vdbeaux.c:3756..3762 — free the pDblStr list. }
+  begin
+    pThisDS := p^.pDblStr;
+    while pThisDS <> nil do
+    begin
+      pNxtDS := pThisDS^.pNextStr;
+      sqlite3DbFree(db, pThisDS);
+      pThisDS := pNxtDS;
+    end;
+    p^.pDblStr := nil;
+  end;
   sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);
   { Phase 8.2.1 — free scanstatus aScan[] array and its duped zName strings
     (vdbeaux.c:3765..3771). }
@@ -5528,6 +5568,9 @@ begin
   zTmp        := pA^.zSql;
   pA^.zSql    := pB^.zSql;
   pB^.zSql    := zTmp;
+  zTmp          := pA^.zNormSql;   { vdbeaux.c:144..146 }
+  pA^.zNormSql  := pB^.zNormSql;
+  pB^.zNormSql  := zTmp;
   pB^.expmask  := pA^.expmask;
   pB^.prepFlags := pA^.prepFlags;
   Move(pA^.aCounter, pB^.aCounter, SizeOf(pB^.aCounter));
@@ -10060,6 +10103,16 @@ begin
                  [i32(pOp - aOp), sqlite3OpcodeName(pOp^.opcode),
                   pOp^.p1, pOp^.p2, pOp^.p3, pOp^.p5]);
 
+    {$IFDEF SQLITE_TEST}
+    { Check to see if we need to simulate an interrupt.  This only happens
+      if we have a special test build (vdbe.c:961..971). }
+    if sqlite3_interrupt_count > 0 then begin
+      Dec(sqlite3_interrupt_count);
+      if sqlite3_interrupt_count = 0 then
+        db^.u1.isInterrupted := 1;   { = sqlite3_interrupt(db); inlined to avoid uses cycle }
+    end;
+    {$ENDIF}
+
     { Dispatch }
     case pOp^.opcode of
 
@@ -12230,35 +12283,44 @@ begin
             v^.nStmtDefCons    := db^.nDeferredCons;
             v^.nStmtDefImmCons := db^.nDeferredImmCons;
           end;
-          { Schema cookie check — vdbe.c:4163..4198.
-            When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
-            P3 (cookie at prepare time) and pSchema->iGeneration against P4.i
-            (generation at prepare time).  Mismatch → SQLITE_SCHEMA so the
-            sqlite3_step() wrapper can reprepare via sqlite3Reprepare().
-            Without this gate, statements like SELECT against a table dropped
-            by a concurrent backup keep using stale schema and the cursor
-            decodes raw pages as the gone table — surfaces as bogus
-            SQLITE_CORRUPT (backup5-1.6).  C cite: vdbe.c:4163..4197. }
-          if (rc = SQLITE_OK) and (pOp^.p5 <> 0) then begin
-            if pDbb^.pSchema <> nil then begin
-              if (iMeta5g <> pOp^.p3) or
-                 (PSchema(pDbb^.pSchema)^.iGeneration <> pOp^.p4.i) then
-              begin
-                sqlite3DbFree(db, v^.zErrMsg);
-                v^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db,
-                  'database schema has changed'));
-                { Only reset the schema if the on-disk cookie has changed; a
-                  pure iGeneration mismatch (e.g. v-table reload) keeps the
-                  cached schema alive — vdbe.c:4187..4190. }
-                if PSchema(pDbb^.pSchema)^.schema_cookie <> iMeta5g then begin
-                  if Assigned(gResetOneSchema) then
-                    gResetOneSchema(db, pOp^.p1);
-                end;
-                v^.vdbeFlags :=
-                  (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
-                rc := SQLITE_SCHEMA;
-                v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_ChangeCntOn);
+        end;
+        { Schema cookie check — vdbe.c:4163..4198.
+          When P5≠0, compare iMeta (BeginTrans-returned file cookie) against
+          P3 (cookie at prepare time) and pSchema->iGeneration against P4.i
+          (generation at prepare time).  Mismatch → SQLITE_SCHEMA so the
+          sqlite3_step() wrapper can reprepare via sqlite3Reprepare().
+          Without this gate, statements like SELECT against a table dropped
+          by a concurrent backup keep using stale schema and the cursor
+          decodes raw pages as the gone table — surfaces as bogus
+          SQLITE_CORRUPT (backup5-1.6).  C cite: vdbe.c:4163..4197.
+          NOTE: in C this check lives OUTSIDE the `if(pBt)` block (vdbe.c:4163
+          follows the closing brace at 4161), so it still fires when the btree
+          is null — e.g. the TEMP db (iDb=1) after `PRAGMA temp_store=…` ran
+          invalidateTempStorage (sqlite3BtreeClose + aDb[1].pBt:=nil +
+          sqlite3ResetAllSchemasOfConnection bumped the temp schema's
+          iGeneration).  iMeta stays 0 there, so the iGeneration mismatch
+          alone raises SQLITE_SCHEMA and the cached stmt reprepares instead of
+          falling through to OP_OpenRead and dereferencing the nil temp btree
+          (segfault). }
+        if (rc = SQLITE_OK) and (pOp^.p5 <> 0) then begin
+          if pDbb^.pSchema <> nil then begin
+            if (iMeta5g <> pOp^.p3) or
+               (PSchema(pDbb^.pSchema)^.iGeneration <> pOp^.p4.i) then
+            begin
+              sqlite3DbFree(db, v^.zErrMsg);
+              v^.zErrMsg := PAnsiChar(sqlite3DbStrDup(db,
+                'database schema has changed'));
+              { Only reset the schema if the on-disk cookie has changed; a
+                pure iGeneration mismatch (e.g. v-table reload) keeps the
+                cached schema alive — vdbe.c:4187..4190. }
+              if PSchema(pDbb^.pSchema)^.schema_cookie <> iMeta5g then begin
+                if Assigned(gResetOneSchema) then
+                  gResetOneSchema(db, pOp^.p1);
               end;
+              v^.vdbeFlags :=
+                (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+              rc := SQLITE_SCHEMA;
+              v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_ChangeCntOn);
             end;
           end;
         end;
@@ -12650,8 +12712,10 @@ begin
       Advance the cursor up to P1 steps; if key >= SeekGE key then handle
       the found/not-found branches without running SeekGE again. }
     OP_SeekScan: begin
-      { SeekScan is followed by SeekGE — use pOp[1] for the SeekGE info }
-      pCur := v^.apCsr[pOp^.p1];
+      { SeekScan is followed by SeekGE — use pOp[1] for the SeekGE info.
+        vdbe.c:5122 — the cursor index comes from the following SeekGE
+        (pOp[1].p1); pOp->p1 here is the nStep count, NOT a cursor index. }
+      pCur := v^.apCsr[pOp[1].p1];
       if pCur = nil then begin
         { cursor not valid: fall through to SeekGE }
         Inc(pOp); continue;
@@ -12774,6 +12838,8 @@ begin
       pCur  := v^.apCsr[pOp^.p1];
       sqlite3VdbeIncrWriteCounter(v, pCur);
       pIn2  := @aMem[pOp^.p2];
+      rc := sqlite3VdbeMemExpandBlob(pIn2);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
       rc := sqlite3VdbeSorterWrite(pCur, pIn2);
       if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
@@ -13446,10 +13512,13 @@ begin
       aMem[pOp^.p1+1]; the remaining-error counter is decremented in
       aMem[pOp^.p1] by (nErr-1). }
     OP_IntegrityCk: begin
-      icRoot := PPgno(pOp^.p4.ai);
       icnRoot := pOp^.p2;
+      { aRoot[0] holds the count; the roots are aRoot[1..nRoot].  Pass
+        &aRoot[1] to sqlite3BtreeIntegrityCheck (vdbe.c:7284). }
+      icRoot := @PPgno(pOp^.p4.ai)[1];
       Assert(icnRoot > 0);
-      Assert(icRoot <> nil);
+      Assert(PPgno(pOp^.p4.ai) <> nil);
+      Assert(PPgno(pOp^.p4.ai)[0] = Pgno(icnRoot));
       icpnErr := @aMem[pOp^.p1];
       icpzOut := nil;
       icnErr  := 0;
@@ -16320,6 +16389,13 @@ end;
 
 initialization
   FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
+  { vdbeapi.c:1295 — the static nullMem returned by columnNullValue() is a
+    const Mem with flags=MEM_Null.  Without MEM_Null set here, a column read
+    of an out-of-range / post-reset statement returns @gNullMem with flags=0,
+    which sqlite3ValueText() then treats as a real value and mutates/caches
+    (leaking a stale "0.0" etc. into every later null-column access). }
+  FillChar(gNullMem, SizeOf(gNullMem), 0);
+  gNullMem.flags := MEM_Null;
   SQLITE_DYNAMIC   := @sqlite3FreeXDel;
   SQLITE_TRANSIENT := TxDelProc(Pointer(-1));
   btreeMovetoIndexHook   := @btreeMovetoIndexImpl;

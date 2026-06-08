@@ -126,8 +126,13 @@ type
   ============================================================ }
 
 const
+  SQLITE_CONFIG_SINGLETHREAD_U = 1;
+  SQLITE_CONFIG_MULTITHREAD_U  = 2;
+  SQLITE_CONFIG_SERIALIZED_U   = 3;
   SQLITE_CONFIG_MALLOC     = 4;
   SQLITE_CONFIG_GETMALLOC  = 5;
+  SQLITE_CONFIG_MUTEX_U    = 10;  { sqlite3_config(SQLITE_CONFIG_MUTEX, &methods) }
+  SQLITE_CONFIG_GETMUTEX_U = 11;  { sqlite3_config(SQLITE_CONFIG_GETMUTEX, &methods) }
   SQLITE_CONFIG_PAGECACHE  = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
   SQLITE_CONFIG_PCACHE2    = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
   SQLITE_CONFIG_GETPCACHE2 = 19;
@@ -273,17 +278,21 @@ const
   SQLITE_DeferFKs       = u64($00080000);
   SQLITE_QueryOnly      = u64($00100000);
   SQLITE_CellSizeCk     = u64($00200000);
-  SQLITE_CorruptRdOnly  = u64($02000000);  { internal flag }
+  SQLITE_ResetDatabase  = u64($02000000);  { Reset the database (sqliteInt.h:1856) }
   SQLITE_LegacyAlter    = u64($04000000);
   SQLITE_NoSchemaError  = u64($08000000);  { Do not report schema parse errors }
   { HI() flag bits — sqliteInt.h: HI(X) = u64(X)<<32 }
   SQLITE_CountRows      = u64($0000000100000000);  { HI(0x00001) }
+  SQLITE_CorruptRdOnly  = u64($0000000200000000);  { HI(0x00002) — Prohibit writes due to error }
   SQLITE_ReadUncommit   = u64($0000000400000000);  { HI(0x00004) }
   SQLITE_FkNoAction     = u64($0000000800000000);  { HI(0x00008) }
-  SQLITE_VdbeListing    = u64($0000000100000000);
-  SQLITE_VdbeTrace      = u64($0000000200000000);
-  SQLITE_VdbeEQP        = u64($0000001000000000);
-  SQLITE_SqlTrace       = u64($0000000400000000);
+  { sqliteInt.h:1875..1880 — DEBUG-only flag bits, HI(x) = u64(x) << 32. }
+  SQLITE_SqlTrace       = u64($0010000000000000);  { HI(0x0100000) }
+  SQLITE_VdbeListing    = u64($0020000000000000);  { HI(0x0200000) }
+  SQLITE_VdbeTrace      = u64($0040000000000000);  { HI(0x0400000) }
+  SQLITE_VdbeAddopTrace = u64($0080000000000000);  { HI(0x0800000) }
+  SQLITE_VdbeEQP        = u64($0100000000000000);  { HI(0x1000000) }
+  SQLITE_ParserTrace    = u64($0200000000000000);  { HI(0x2000000) }
 
   { Flags for sqlite3.mDbFlags }
   DBFLAG_SchemaChange   = $0002;
@@ -717,6 +726,7 @@ function  sqlite3BitvecSet(p: PBitvec; i: u32): i32;
 procedure sqlite3BitvecClear(p: PBitvec; i: u32; pBuf: Pointer);
 procedure sqlite3BitvecDestroy(p: PBitvec);
 function  sqlite3BitvecSize(p: PBitvec): u32;
+function  sqlite3BitvecBuiltinTest(sz: i32; aOp: Pi32): i32;
 
 { Status (status.c) }
 function  sqlite3StatusValue(op: i32): i64;
@@ -2257,6 +2267,103 @@ begin
   Result := p^.iSize;
 end;
 
+{ bitvec.c:394 — sqlite3BitvecBuiltinTest(int sz, int *aOp).
+  Self-test driver used by SQLITE_TESTCTRL_BITVEC_TEST (Tcl command
+  `sqlite3BitvecBuiltinTest`).  aOp is an opcode program (see bitvec.c
+  comment block).  Returns 0 on success, the failing bit index / a
+  non-zero discrepancy on mismatch, or -1 on allocation failure.
+  The SQLITE_DEBUG-only opcodes 6/7 are state-output no-ops here. }
+function sqlite3BitvecBuiltinTest(sz: i32; aOp: Pi32): i32;
+label bitvec_end;
+var
+  pBv:   PBitvec;
+  pV:        Pu8;
+  rc:        i32;
+  i, nx, pc, op: i32;
+  pTmpSpace: Pointer;
+  idx:       u32;
+begin
+  pBv := nil;
+  pV      := nil;
+  rc      := -1;
+
+  { Allocate the Bitvec to be tested and a linear reference array. }
+  if sz <= 0 then begin
+    pBv := sqlite3BitvecCreate(2 * u32(-sz));
+    pV := nil;
+  end else begin
+    pBv := sqlite3BitvecCreate(u32(sz));
+    pV := Pu8(sqlite3MallocZero(((7 + i64(sz)) div 8) + 1));
+  end;
+  pTmpSpace := sqlite3_malloc64(BITVEC_SZ);
+  if (pBv = nil) or (pTmpSpace = nil) or ((pV = nil) and (sz > 0)) then
+    goto bitvec_end;
+
+  { NULL pBv tests }
+  sqlite3BitvecSet(nil, 1);
+  sqlite3BitvecClear(nil, 1, pTmpSpace);
+
+  { Run the program }
+  pc := 0; i := 0;
+  while aOp[pc] <> 0 do begin
+    op := aOp[pc];
+    if op >= 6 then begin
+      Inc(pc);
+      Continue;
+    end;
+    case op of
+      1, 2, 5: begin
+        nx := 4;
+        i := aOp[pc+2] - 1;
+        aOp[pc+2] := aOp[pc+2] + aOp[pc+3];
+      end;
+      else begin { 3, 4, default }
+        nx := 2;
+        sqlite3_randomness(SizeOf(i), @i);
+      end;
+    end;
+    aOp[pc+1] := aOp[pc+1] - 1;
+    if aOp[pc+1] > 0 then nx := 0;
+    pc := pc + nx;
+    i := (i and $7fffffff) mod sz;
+    if (op and 1) <> 0 then begin
+      idx := u32(i + 1);
+      if pV <> nil then
+        pV[idx shr 3] := pV[idx shr 3] or u8(1 shl (idx and 7));
+      if op <> 5 then
+        if sqlite3BitvecSet(pBv, idx) <> 0 then goto bitvec_end;
+    end else begin
+      idx := u32(i + 1);
+      if pV <> nil then
+        pV[idx shr 3] := pV[idx shr 3] and not u8(1 shl (idx and 7));
+      sqlite3BitvecClear(pBv, idx, pTmpSpace);
+    end;
+  end;
+
+  { Compare the linear array against the Bitvec object. }
+  if pV <> nil then begin
+    rc := sqlite3BitvecTest(nil, 0) + sqlite3BitvecTest(pBv, u32(sz)+1)
+            + sqlite3BitvecTest(pBv, 0)
+            + (i32(sqlite3BitvecSize(pBv)) - sz);
+    i := 1;
+    while i <= sz do begin
+      idx := u32(i);
+      if ( ((pV[idx shr 3] and (1 shl (idx and 7))) <> 0) <> (sqlite3BitvecTest(pBv, idx) <> 0) ) then begin
+        rc := i;
+        Break;
+      end;
+      Inc(i);
+    end;
+  end else
+    rc := 0;
+
+bitvec_end:
+  sqlite3_free(pTmpSpace);
+  sqlite3_free(pV);
+  sqlite3BitvecDestroy(pBv);
+  Result := rc;
+end;
+
 { ============================================================
   Section: Status counters  (status.c)
   ============================================================ }
@@ -2308,9 +2415,45 @@ begin
 end;
 
 function sqlite3_config(op: i32; pArg: Pointer): i32; overload;
+const
+  SQLITE_CONFIG_LOG_U          = 16;
+  SQLITE_CONFIG_PCACHE_HDRSZ_U = 24;
 begin
   Result := SQLITE_OK;
+  { sqlite3_config() normally returns SQLITE_MISUSE if invoked while the
+    library is in use.  Except a few selected opcodes are allowed at any
+    time (main.c:434..444). }
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    if (op <> SQLITE_CONFIG_LOG_U)
+       and (op <> SQLITE_CONFIG_PCACHE_HDRSZ_U) then begin
+      Result := SQLITE_MISUSE;
+      Exit;
+    end;
+  end;
   case op of
+    { Mutex/threading configuration options (this port is always threadsafe,
+      i.e. SQLITE_THREADSAFE>0, so these are always available). }
+    SQLITE_CONFIG_SINGLETHREAD_U:  { 1 }
+      begin
+        sqlite3GlobalConfig.bCoreMutex := 0;
+        sqlite3GlobalConfig.bFullMutex := 0;
+      end;
+    SQLITE_CONFIG_MULTITHREAD_U:   { 2 }
+      begin
+        sqlite3GlobalConfig.bCoreMutex := 1;
+        sqlite3GlobalConfig.bFullMutex := 0;
+      end;
+    SQLITE_CONFIG_SERIALIZED_U:    { 3 }
+      begin
+        sqlite3GlobalConfig.bCoreMutex := 1;
+        sqlite3GlobalConfig.bFullMutex := 1;
+      end;
+    SQLITE_CONFIG_MUTEX_U:         { 10 }
+      if pArg <> nil then
+        sqlite3MutexSetMethods(Psqlite3_mutex_methods(pArg));
+    SQLITE_CONFIG_GETMUTEX_U:      { 11 }
+      if pArg <> nil then
+        sqlite3MutexGetMethods(Psqlite3_mutex_methods(pArg));
     SQLITE_CONFIG_MALLOC:        { 4 }
       if pArg <> nil then
         sqlite3GlobalConfig.m := PTsqlite3_mem_methods(pArg)^;

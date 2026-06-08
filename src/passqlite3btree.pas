@@ -352,6 +352,13 @@ function  btreeGetPage(pBt: PBtShared; pgno: Pgno; out ppPage: PMemPage; flags: 
 function  btreePageLookup(pBt: PBtShared; pgno: Pgno): PMemPage;
 function  btreePagecount(pBt: PBtShared): Pgno; inline;
 
+{ Ptrmap helpers (defined later in this unit) — forward-declared so the
+  autoVacuum branch of getOverflowPage can use them. }
+function  PENDING_BYTE_PAGE(pBt: PBtShared): Pgno; inline;
+function  PTRMAP_ISPAGE(pBt: PBtShared; pg: Pgno): Boolean; inline;
+function  ptrmapGet(pBt: PBtShared; key: Pgno; out pEType: u8;
+                    out pPgno: Pgno): i32;
+
 { Cell insert / drop }
 procedure dropCell(pPage: PMemPage; idx: i32; sz: i32; pRC: Pi32);
 function  insertCell(pPage: PMemPage; i: i32; pCell: Pu8; sz: i32;
@@ -2463,17 +2470,49 @@ end;
 function getOverflowPage(pBt: PBtShared; ovfl: Pgno;
                          ppPage: PPMemPage; pPgnoNext: PPgno): i32;
 var
-  next  : Pgno;
-  pPage : PMemPage;
-  rc    : i32;
+  next   : Pgno;
+  pPage  : PMemPage;
+  rc     : i32;
+  pg     : Pgno;        { btree.c:5024 (renamed from 'pgno' to avoid type collision) }
+  iGuess : Pgno;
+  eType  : u8;
+  flags  : i32;
 begin
   next  := 0;
   pPage := nil;
   rc    := SQLITE_OK;
 
-  rc := btreeGetPage(pBt, ovfl, pPage, PAGER_GET_READONLY);
-  if rc = SQLITE_OK then
-    next := get4byte(pPage^.aData);
+{$IFNDEF SQLITE_OMIT_AUTOVACUUM}
+  { Try to find the next page in the overflow list using the autovacuum
+    pointer-map pages. Guess that the next page in the overflow list is
+    page number (ovfl+1). If that guess turns out to be wrong, fall back
+    to loading the data of page number ovfl to determine the next page
+    number.  btree.c:5016..5040 }
+  if pBt^.autoVacuum <> 0 then begin
+    iGuess := ovfl + 1;
+
+    while PTRMAP_ISPAGE(pBt, iGuess) or (iGuess = PENDING_BYTE_PAGE(pBt)) do
+      Inc(iGuess);
+
+    if iGuess <= btreePagecount(pBt) then begin
+      rc := ptrmapGet(pBt, iGuess, eType, pg);
+      if (rc = SQLITE_OK) and (eType = PTRMAP_OVERFLOW2) and (pg = ovfl) then
+      begin
+        next := iGuess;
+        rc   := SQLITE_DONE;
+      end;
+    end;
+  end;
+{$ENDIF}
+
+  Assert((next = 0) or (rc = SQLITE_DONE));
+  if rc = SQLITE_OK then begin
+    if ppPage = nil then flags := PAGER_GET_READONLY else flags := 0;
+    rc := btreeGetPage(pBt, ovfl, pPage, flags);
+    Assert((rc = SQLITE_OK) or (pPage = nil));
+    if rc = SQLITE_OK then
+      next := get4byte(pPage^.aData);
+  end;
   { btreeGetPage uses 'out ppPage: PMemPage' so pPage is already assigned }
 
   pPgnoNext^ := next;
@@ -2482,7 +2521,10 @@ begin
   else
     releasePage(pPage);
 
-  Result := rc;
+  if rc = SQLITE_DONE then
+    Result := SQLITE_OK
+  else
+    Result := rc;
 end;
 
 { ---------------------------------------------------------------------------
@@ -2510,8 +2552,23 @@ begin
   pPage := pCur^.pPage;
   pBt   := pCur^.pBt;
 
+  if pCur^.ix >= pPage^.nCell then begin
+    Result := CORRUPT_PAGE(pPage);
+    Exit;
+  end;
+
   getCellInfo(pCur);
   aPayload := pCur^.info.pPayload;
+
+  { Trying to read or write past the end of the data is an error.  The
+    conditional below is really:
+       &aPayload[pCur->info.nLocal] > &pPage->aData[pBt->usableSize]
+    but is recast into its current form to avoid integer overflow problems. }
+  if NativeUInt(aPayload - pPage^.aData) >
+       (NativeUInt(pBt^.usableSize) - pCur^.info.nLocal) then begin
+    Result := CORRUPT_PAGE(pPage);
+    Exit;
+  end;
 
   { Check in-page data first }
   if offset < pCur^.info.nLocal then begin
@@ -2693,6 +2750,8 @@ end;
 function sqlite3BtreePayloadFetch(pCur: PBtCursor; out pAmt: u32): PAnsiChar;
 var
   pPage: PMemPage;
+  amt  : i32;
+  avail: i32;
 begin
   pPage := pCur^.pPage;
   if pPage = nil then begin
@@ -2706,7 +2765,14 @@ begin
     quirk did was wrong: in index cells nKey == nPayload (length),
     not an offset, so the previous code skipped past the entire record
     and OP_Column read NULL on every index-eph row. }
-  pAmt   := u32(pCur^.info.nLocal);
+  amt := i32(pCur^.info.nLocal);
+  avail := i32(pPage^.aDataEnd - pCur^.info.pPayload);
+  if amt > avail then begin
+    { There is too little space on the page for the expected amount
+      of local content. Database must be corrupt. (btree.c:5403) }
+    if avail > 0 then amt := avail else amt := 0;
+  end;
+  pAmt   := u32(amt);
   Result := PAnsiChar(pCur^.info.pPayload);
 end;
 
@@ -3074,11 +3140,14 @@ moveto_table_next_layer:
       chldPg := get4byte(aData + (mskPage and u16(get2byteAligned(aCellI + 2*lwr))));
     pCur^.ix := u16(lwr);
     rc := moveToChild(pCur, chldPg);
-    if rc <> SQLITE_OK then begin
-      pRes^ := c;
-      Result := rc;
-      Exit;
-    end;
+    { btree.c:5945 `if( rc ) break;` — break the outer for(;;) and fall to
+      moveto_table_finish WITHOUT touching *pRes.  *pRes keeps the caller's
+      initial 0 so the OP_SeekRowid/OP_NotExists invariant `rc==SQLITE_OK ||
+      res==0` holds: a moveToChild corruption must surface as rc<>OK with
+      res=0, otherwise the VDBE's `if res<>0 then jump` swallows it
+      (corrupt2-8.1: SELECT ... WHERE rowid=N over a child page whose type
+      byte was flipped to index-leaf). }
+    if rc <> SQLITE_OK then goto moveto_table_finish;
   end;
 
 moveto_table_finish:
@@ -6838,6 +6907,14 @@ begin
      (CompareMem(Pu8(pPage1^.aData) + 24, Pu8(pPage1^.aData) + 92, 4) = False) then
     nPage := u32(nPageFile);
 
+  { btree.c:3299..3301 — when SQLITE_DBCONFIG_RESET_DATABASE is in effect,
+    force nPage to 0 so the page-1 header validation below is skipped and the
+    (possibly corrupt) existing page 1 is treated as an empty database; the
+    following VACUUM/newDatabase then rebuilds a fresh page 1 (resetdb.test). }
+  if (pBt^.db <> nil) and
+     ((PTsqlite3(pBt^.db)^.flags and SQLITE_ResetDatabase) <> 0) then
+    nPage := 0;
+
   if nPage > 0 then begin
     page1 := pPage1^.aData;
     rc := SQLITE_NOTADB;
@@ -6888,18 +6965,30 @@ begin
       Exit;
     end;
     if nPage > u32(nPageFile) then begin
-      { nPage in header > actual file size → treat as corrupt }
-      rc := SQLITE_CORRUPT_BKPT;
-      goto page1_init_failed;
+      { btree.c:3401..3408 — header page-count exceeds the actual file size.
+        Normally this is corruption, but when PRAGMA writable_schema=ON
+        (SQLITE_WriteSchema) the reference clamps nPage to the file size and
+        proceeds, so a deliberately-truncated header can be repaired
+        (incrvacuum-17.1). }
+      if (pBt^.db = nil)
+         or ((PTsqlite3(pBt^.db)^.flags and SQLITE_WriteSchema) = 0) then begin
+        rc := SQLITE_CORRUPT_BKPT;
+        goto page1_init_failed;
+      end else
+        nPage := u32(nPageFile);
     end;
     if usableSize < 480 then goto page1_init_failed;
 
     pBt^.btsFlags   := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
     pBt^.pageSize   := pageSize;
     pBt^.usableSize := usableSize;
-    { autovacuum flags from header meta[4] / meta[7] }
-    pBt^.autoVacuum := u8(get4byte(page1 + 36 + 4*4));
-    pBt^.incrVacuum := u8(get4byte(page1 + 36 + 7*4));
+    { autovacuum flags from header meta[4] / meta[7].  C btree.c:2727..2728
+      coerces each to a 0/1 boolean (`get4byte(...)?1:0`); meta[4] holds the
+      LARGEST ROOT PAGE number (e.g. 3), not a flag, so without the ?1:0 the
+      raw page number would land in autoVacuum and break the
+      sqlite3BtreeSetAutoVacuum readonly gate `(av?1:0)!=pBt->autoVacuum`. }
+    pBt^.autoVacuum := u8(Ord(get4byte(page1 + 36 + 4*4) <> 0));
+    pBt^.incrVacuum := u8(Ord(get4byte(page1 + 36 + 7*4) <> 0));
   end;
 
   { Recompute page-size-dependent limits }
@@ -7088,8 +7177,10 @@ begin
   else
     pBt^.max1bytePayload := u8(pBt^.maxLocal);
 
-  rc := allocateTempSpace(pBt);
-  if rc <> SQLITE_OK then goto btree_open_out;
+  { NB: C's sqlite3BtreeOpen does NOT allocate pTmpSpace here; it is
+    allocated lazily by btreeCursor() when the first WRITE cursor is
+    opened (btree.c:4746). Allocating eagerly here adds one extra
+    SQLITE_STATUS_PAGECACHE_USED page per connection (pcache2-1.2). }
 
   ppBtree^ := p;
   Result := SQLITE_OK;
@@ -7121,8 +7212,14 @@ begin
   sqlite3BtreeLeave(p);
   { No shared-cache list removal needed }
   sqlite3PagerClose(pBt^.pPager, p^.db);
-  if pBt^.xFreeSchema <> nil then
+  if (pBt^.xFreeSchema <> nil) and (pBt^.pSchema <> nil) then
     pBt^.xFreeSchema(pBt^.pSchema);
+  { btree.c:2960 — after clearing the schema contents, free the Schema
+    struct itself.  Omitting this leaked the per-Btree Schema record (and
+    its installed sqlite_schema Table/Column payloads) at every db close
+    (memsubsys2-3.x/4.x residual). }
+  sqlite3DbFree(nil, pBt^.pSchema);
+  pBt^.pSchema := nil;
   freeTempSpace(pBt);
   sqlite3_free(pBt);
   sqlite3_free(p);
@@ -7242,6 +7339,14 @@ begin
     { already in requested mode }
     goto trans_begun;
   end;
+
+  { btree.c:3615..3619 — under SQLITE_DBCONFIG_RESET_DATABASE, clear the
+    BTS_READ_ONLY flag (set when page 1 was found corrupt) provided the
+    pager itself is writable, so the reset VACUUM can write a fresh db. }
+  if (p^.db <> nil) and
+     ((PTsqlite3(p^.db)^.flags and SQLITE_ResetDatabase) <> 0) and
+     (sqlite3PagerIsreadonly(pPgr) = 0) then
+    pBt^.btsFlags := pBt^.btsFlags and not BTS_READ_ONLY;
 
   { btree.c:3621..3625 — write transactions are not possible on a
     read-only database; reads ARE allowed.  Bug 9.2.divbug.A: the
@@ -8254,40 +8359,53 @@ begin
   sqlite3BtreeLeave(p);
 end;
 
-{ btree.c:3185 — simplified: only honours the call when iFix is non-zero
-  or BTS_PAGESIZE_FIXED is not yet set.  nReserve<0 means "leave unchanged". }
+{ btree.c:3069 — Change the default page size and the number of reserved
+  bytes per page.  Records the requested reserve in nReserveWanted so that
+  sqlite3BtreeGetRequestedReserve (and hence VACUUM / FCNTL_RESERVE_BYTES)
+  can carry it forward into the page-1 header byte 20. }
 function sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
                                  nReserve: i32; iFix: i32): i32;
 var
   pBt    : PBtShared;
   rc     : i32;
+  x      : i32;
   uPgsz  : u32;
 begin
   pBt := p^.pBt;
   rc  := SQLITE_OK;
+  Assert((nReserve >= 0) and (nReserve <= 255));
   sqlite3BtreeEnter(p);
-  if (pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0 then begin
+  pBt^.nReserveWanted := u8(nReserve);
+  x := i32(pBt^.pageSize) - i32(pBt^.usableSize);
+  if (x = nReserve) and ((iPageSize = 0) or (u32(iPageSize) = pBt^.pageSize)) then begin
     sqlite3BtreeLeave(p);
-    if i32(pBt^.pageSize) = iPageSize then Result := SQLITE_OK
-    else                                  Result := SQLITE_READONLY;
+    Result := SQLITE_OK;
     Exit;
   end;
-  if nReserve < 0 then
-    nReserve := i32(pBt^.pageSize - pBt^.usableSize);
+  if nReserve < x then nReserve := x;
+  if (pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0 then begin
+    sqlite3BtreeLeave(p);
+    Result := SQLITE_READONLY;
+    Exit;
+  end;
+  Assert((nReserve >= 0) and (nReserve <= 255));
   if (iPageSize >= 512) and (iPageSize <= SQLITE_MAX_PAGE_SIZE)
      and (((iPageSize - 1) and iPageSize) = 0) then
   begin
-    uPgsz := u32(iPageSize);
+    Assert((iPageSize and 7) = 0);
+    Assert(pBt^.pCursor = nil);
+    if (nReserve > 32) and (iPageSize = 512) then iPageSize := 1024;
     { btree.c:3092..3093 — adopt the new page size and discard the temp
       scratch buffer so it gets reallocated at the new (larger) page size.
       Without freeTempSpace the stale default-sized pTmpSpace is reused and
       sqlite3BtreeInsert's FillChar overruns it once page_size grows. }
-    pBt^.pageSize := uPgsz;
+    pBt^.pageSize := u32(iPageSize);
     freeTempSpace(pBt);
-    rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
-    pBt^.pageSize   := uPgsz;
-    pBt^.usableSize := uPgsz - u32(nReserve);
   end;
+  uPgsz := pBt^.pageSize;
+  rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
+  pBt^.pageSize   := uPgsz;
+  pBt^.usableSize := pBt^.pageSize - u32(nReserve);
   if iFix <> 0 then
     pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
   sqlite3BtreeLeave(p);

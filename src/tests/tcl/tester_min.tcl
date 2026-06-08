@@ -44,6 +44,39 @@ set ::TC(errors) 0
 # itself, which is what `source` ends up using as [info script].
 set ::testdir [file dirname [file normalize [info script]]]
 
+# sqlite3 wrapper — port of upstream tester.tcl:114..144.  Renames the
+# C-implemented `sqlite3` command to `sqlite_orig` and installs a Tcl proc
+# in its place.  Required so that error messages from the constructor are
+# reported under the invoked name `sqlite_orig` (tcl-1.1/1.1.1), matching
+# the upstream harness, and so per-connection setup matches tester.tcl.
+if {[info command sqlite_orig]==""} {
+  rename sqlite3 sqlite_orig
+  proc sqlite3 {args} {
+    if {[llength $args]>=2 && [string index [lindex $args 0] 0]!="-"} {
+      # This command is opening a new database connection.
+      if {[info exists ::G(perm:sqlite3_args)]} {
+        set args [concat $args $::G(perm:sqlite3_args)]
+      }
+      if {[sqlite_orig -has-codec] && ![info exists ::do_not_use_codec]} {
+        lappend args -key {xyzzy}
+      }
+      set res [uplevel 1 sqlite_orig $args]
+      if {[info exists ::G(perm:presql)]} {
+        [lindex $args 0] eval $::G(perm:presql)
+      }
+      if {[info exists ::G(perm:dbconfig)]} {
+        set ::dbhandle [lindex $args 0]
+        uplevel #0 $::G(perm:dbconfig)
+      }
+      [lindex $args 0] cache size 3
+      set res
+    } else {
+      # Not opening a new database connection; pass through unchanged.
+      uplevel 1 sqlite_orig $args
+    }
+  }
+}
+
 # set_test_counter — upstream tester.tcl:583..588.
 # Getter when called with one arg; setter when called with two.
 proc set_test_counter {counter args} {
@@ -372,6 +405,16 @@ set ::sqlite_options(stat4) 0
 # oracle.  Without this, the cap defaults to 1 below and the section wrongly
 # RUNS, expecting {main tab1 colN} where the engine honestly returns {}.
 set ::sqlite_options(columnmetadata) 0
+# pragma-16.x / lock5 / lock6 — Apple proxy-locking pragmas.  The C reference
+# oracle build (Linux) does NOT define SQLITE_ENABLE_LOCKING_STYLE, so
+# test_config.c writes prefer_proxy_locking=0 and lock_proxy_pragmas=0, and
+# upstream SKIPS the `ifcapable lock_proxy_pragmas&&prefer_proxy_locking { ... }`
+# blocks (pragma.test:1620, lock6.test:81) and the lock_proxy_pragmas blocks
+# (lock5.test:29/245).  pas-sqlite3 likewise does not implement Apple proxy
+# locking, so without these the caps default to 1 and the sections wrongly RUN,
+# failing on the unimplemented PRAGMA lock_proxy_file / .test_control_file.
+set ::sqlite_options(prefer_proxy_locking) 0
+set ::sqlite_options(lock_proxy_pragmas) 0
 # cursorhint2.test is gated by `ifcapable !cursorhints {finish_test; return}`.
 # The C reference oracle build does NOT define SQLITE_ENABLE_CURSOR_HINTS
 # (verified: PRAGMA compile_options has no cursor/hint entry), so
@@ -397,6 +440,13 @@ set ::sqlite_options(uri_00_error) 0
 # produces 8179 too.  Without pinning, the cap defaults to 1 below → func6 takes
 # the bNullTrim=1 branch and wrongly expects 8180.
 set ::sqlite_options(null_trim) 0
+# percentile.test wraps its WITHIN GROUP (ORDER BY x) ordered-set-aggregate
+# subtests in `ifcapable ordered_set_aggregates`.  The oracle build does NOT
+# define SQLITE_ENABLE_ORDERED_SET_AGGREGATES, so test_config.c:198-204 writes
+# ordered_set_aggregates=0 and the oracle SKIPS those blocks.  pas-sqlite3 does
+# not implement that syntax either (parity with the oracle).  Without this, the
+# cap defaults to 1 below → the blocks wrongly RUN and fail with near "(": syntax error.
+set ::sqlite_options(ordered_set_aggregates) 0
 # The oracle build (../sqlite3, verified via pragma_compile_options) does NOT
 # define these compile flags, so its test_config.c writes each capability = 0.
 # Our harness otherwise defaults unset caps to 1 (below), making ifcapable-gated
@@ -406,16 +456,17 @@ set ::sqlite_options(preupdate) 0      ;# no SQLITE_ENABLE_PREUPDATE_HOOK
 set ::sqlite_options(snapshot) 0       ;# no SQLITE_ENABLE_SNAPSHOT
 set ::sqlite_options(session) 0        ;# no SQLITE_ENABLE_SESSION
 set ::sqlite_options(memorymanage) 0   ;# no SQLITE_ENABLE_MEMORY_MANAGEMENT
+set ::sqlite_options(scanstatus) 0     ;# no SQLITE_ENABLE_STMT_SCANSTATUS
+set ::sqlite_options(mmap) 0           ;# port treats SQLITE_MAX_MMAP_SIZE as 0 (mmap I/O not ported)
 set ::sqlite_options(unlock_notify) 0  ;# no SQLITE_ENABLE_UNLOCK_NOTIFY
 set ::sqlite_options(icu) 0            ;# no SQLITE_ENABLE_ICU (oracle lacks libicu)
 set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
-# pas-sqlite3's unixSync_impl (passqlite3os.pas) does NOT port the os_unix.c
-# UNIXFILE_DIRSYNC arm (no openDirectory + dirfd fsync after the journal sync);
-# directory fsyncs are effectively disabled, matching a SQLITE_DISABLE_DIRSYNC
-# build (test_config.c:116..119).  Pin dirsync=0 so sync.test / sync2.test /
-# wal2.test's cond_incr_sync_count adjusts the expected count to match the
-# engine's actual fsync tally.
-set ::sqlite_options(dirsync) 0        ;# unixSync omits the dir-fsync arm
+# pas-sqlite3's unixSync_impl (passqlite3os.pas) now ports the os_unix.c
+# UNIXFILE_DIRSYNC arm (openDirectory + dirfd fsync after a newly-created
+# journal/wal is synced), matching a build WITHOUT SQLITE_DISABLE_DIRSYNC.
+# Faithful value is 1 (test_config.c:119); io.test / sync.test count this
+# directory fsync via $sqlite_sync_count.
+set ::sqlite_options(dirsync) 1        ;# unixSync performs the dir-fsync arm
 set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
 # pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
 # behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its
@@ -426,6 +477,9 @@ set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREA
 # connection PRAGMA data_version bumps that only occur with a shared cache) SKIP
 # instead of running against the unsupported feature path.
 set ::sqlite_options(shared_cache) 0   ;# SQLITE_OMIT_SHARED_CACHE (port omits shared cache)
+set ::sqlite_options(oversize_cell_check) 0 ;# no SQLITE_ENABLE_OVERSIZE_CELL_CHECK (oracle lacks it; mirrors test_config.c)
+set ::sqlite_options(mem5) 0           ;# no SQLITE_ENABLE_MEMSYS5 (oracle lacks memsys5)
+set ::sqlite_options(sqllog) 0         ;# no SQLITE_ENABLE_SQLLOG (oracle lacks sqllog)
 # integrityck: engine supports PRAGMA integrity_check (no SQLITE_OMIT_INTEGRITY_CHECK).
 # pragma.test reads $sqlite_options(integrityck) directly (not via ifcapable).
 set ::sqlite_options(integrityck) 1
@@ -436,6 +490,50 @@ set ::sqlite_options(configslower) 1.0
 # `ifcapable rtree { ... }` blocks (alterlegacy-14.x etc.) SKIP rather than
 # run and hit "no such module: rtree".
 set ::sqlite_options(rtree) 0
+
+# Compile-time limit globals — mirror the LINKVAR(x) block in upstream
+# src/test_config.c:805..835 (Tcl_LinkVar "SQLITE_"#x as TCL_LINK_INT |
+# TCL_LINK_READ_ONLY).  bigrow.test and sqllimits1.test read these
+# $SQLITE_MAX_* / $SQLITE_DEFAULT_* globals directly and error
+# ("no such variable") before reaching their first assertion otherwise.
+#
+# The native sqlite3 Tcl package (src/tests/tcl/PasTclSqlite.pas ~4918)
+# already LinkVar's SQLITE_MAX_ATTACHED / MAX_COMPOUND_SELECT / MAX_COLUMN
+# read-only, and the block near tester_min.tcl:1836 already sets
+# TEMP_STORE / SQLITE_DEFAULT_{SYNCHRONOUS,WAL_SYNCHRONOUS,FILE_FORMAT,
+# CACHE_SIZE} / SQLITE_MAX_VARIABLE_NUMBER.  Set only the remaining
+# members here, guarding each with `info exists` so a read-only native
+# link (existing or future) is never clobbered.
+#
+# Values are this port's own compile-time constants, and MUST match the
+# engine's aHardLimit (src/passqlite3main.pas:675..689) because the tests
+# read each limit back via `sqlite3_limit db SQLITE_LIMIT_<x> -1` and
+# compare it to the matching $SQLITE_MAX_<x> global:
+#   MAX_FUNCTION_ARG=127 -> passqlite3main.pas:665 (this port caps it at
+#     127, diverging from the sqliteLimit.h default of 1000)
+#   MAX_WORKER_THREADS=8 -> passqlite3main.pas SQLITE_MAX_WORKER_THREADS_LIMIT
+#     (aHardLimit[11]); single-threaded build but the hard limit reports 8
+#   MAX_{LENGTH,SQL_LENGTH,EXPR_DEPTH,VDBE_OP,LIKE_PATTERN_LENGTH,
+#        TRIGGER_DEPTH,PAGE_SIZE,PAGE_COUNT,DEFAULT_PAGE_SIZE}
+#       -> sqliteLimit.h port, src/passqlite3types.pas:270..298
+#   DEFAULT_PAGE_SIZE=1024 -> passqlite3types.pas:291 (under -dSQLITE_TEST)
+foreach {_lv _val} {
+  SQLITE_MAX_LENGTH              1000000000
+  SQLITE_MAX_SQL_LENGTH          1000000000
+  SQLITE_MAX_EXPR_DEPTH          1000
+  SQLITE_MAX_VDBE_OP             250000000
+  SQLITE_MAX_FUNCTION_ARG        127
+  SQLITE_MAX_PAGE_SIZE           65536
+  SQLITE_MAX_PAGE_COUNT          4294967294
+  SQLITE_MAX_LIKE_PATTERN_LENGTH 50000
+  SQLITE_MAX_TRIGGER_DEPTH       1000
+  SQLITE_MAX_DEFAULT_PAGE_SIZE   8192
+  SQLITE_MAX_WORKER_THREADS      8
+  SQLITE_DEFAULT_PAGE_SIZE       1024
+} {
+  if {![info exists ::$_lv]} { set ::$_lv $_val }
+}
+unset -nocomplain _lv _val
 
 # sqlite3_exec_hex is provided natively by the sqlite3 test package
 # (TestModuleTest1.test_exec_hex, a faithful port of test1.c:test_exec_hex).
@@ -514,6 +612,13 @@ proc delete_all_data {} {
 # of community .test files call `expected $n $val` to label assertions;
 # returning the value unchanged keeps those scripts source-able.
 proc expected {n exp} { return $exp }
+
+# isquick — tester.tcl:2340.  Returns $::G(isquick) if set, else 0.
+proc isquick {} {
+  set ret 0
+  catch {set ret $::G(isquick)}
+  set ret
+}
 
 # getFileRetries / getFileRetryDelay — upstream tester.tcl head (the
 # do_delete_file body at 276..311 reads them).  Upstream defaults to 50
@@ -778,6 +883,10 @@ proc db_delete_and_reopen {{file test.db}} {
 # `sqlite3_db_config_lookaside db 0 0 0`; those test commands are not
 # yet ported, so they are omitted here (they only tune fault-injection
 # behaviour, which is not exercised without the malloc machinery).
+proc faultsim_integrity_check {{db db}} {
+  set ic [$db eval { PRAGMA integrity_check }]
+  if {$ic != "ok"} { error "Integrity check: $ic" }
+}
 proc faultsim_save {args} { uplevel db_save $args }
 proc faultsim_save_and_close {args} { uplevel db_save_and_close $args }
 proc faultsim_restore {args} { uplevel db_restore $args }
@@ -911,18 +1020,24 @@ proc crashsql {args} {
 # C-side test_config.  Upstream tester.tcl:102 calls
 #   sqlite3_test_control_pending_byte 0x0010000
 # unconditionally at load time so the locking-page is reachable in tests
-# without creating multi-GiB database files.  Our pas-sqlite3 build does
-# not yet expose sqlite3_test_control_pending_byte as a Tcl command (the
-# engine PENDING_BYTE is a compile-time constant at 0x40000000) so we
-# cannot move the actual lock byte, but we MUST still mirror the Tcl-side
-# variable to 0x10000.  Otherwise upstream tests such as backup.test and
-# backup_ioerr.test do
+# without creating multi-GiB database files.  The pas-sqlite3 engine now
+# exposes sqlite3_test_control_pending_byte (PENDING_BYTE is a writable
+# global rewritten by SQLITE_TESTCTRL_PENDING_BYTE), so move the actual
+# lock byte to match upstream and mirror the Tcl-side variable.  Otherwise
+# upstream tests such as backup.test / backup_ioerr.test loop forever on
 #   while {[file size test.db] <= $::sqlite_pending_byte} { ... }
-# which, against a 1 GiB threshold, never terminates and looks to the
-# test driver like an engine-level deadlock (9.4.divbug.91.002 / .003).
+# against a 1 GiB threshold (9.4.divbug.91.002 / .003), and stat.test-2.2
+# never sees the page-64 locking-page gap.
 if {![info exists ::sqlite_pending_byte]} {
   set ::sqlite_pending_byte 0x0010000
 }
+catch { sqlite3_test_control_pending_byte $::sqlite_pending_byte }
+# Upstream binds ::sqlite_pending_byte to the C int sqlite3PendingByte via
+# Tcl_LinkVar(TCL_LINK_INT) (test2.c:753), so the variable reads back as a
+# *decimal integer* (65536), not the 0x.. literal.  Tests such as
+# autovacuum-9.3 compare `file size test.db` (an integer) directly against
+# it, so normalise to the integer form to match upstream's linked var.
+set ::sqlite_pending_byte [expr {$::sqlite_pending_byte}]
 
 # finish_test — upstream tester.tcl:1237..1255.  Real implementation
 # runs finish_test_precleanup (deregisters test VFSes), optionally
@@ -1991,6 +2106,16 @@ proc do_faultsim_test {name args} {
 proc explain_no_trace {sql} {
   set tr [db eval "EXPLAIN $sql"]
   return [lrange $tr 7 end]
+}
+
+# 9.4.divbug.63 — do_test_with_ansi_output (tester.tcl:812..819).  Like
+# do_test except the upstream version skips the test when running in a
+# slave interpreter on Windows (ANSI/UTF8 I/O issues on Win11).  On this
+# Linux port we are never on Windows, so this always runs the test.
+proc do_test_with_ansi_output {name cmd expected} {
+  if {![info exists ::SLAVE] || $::tcl_platform(platform) ne "windows"} {
+    uplevel 1 [list do_test $name $cmd $expected]
+  }
 }
 
 # 9.4.divbug.63.a — faultsim_test_result (malloc_common.tcl:291..298,

@@ -90,3 +90,22 @@ package ifneeded sqlite3 $PKG_VERSION \\
 EOF
 echo "+ wrote $PKG_INDEX (sqlite3 $PKG_VERSION)"
 cat "$PKG_INDEX"
+
+# Emit a Tcl autoload index so a plain tclsh on this dir's TCLLIBPATH auto-loads
+# the bare `sqlite3` command the first time it is used. pragma3.test spawns a
+# child interpreter via `exec [info nameofexecutable] script.txt` that calls
+# `sqlite3` with no preceding `package require` (it relies on the upstream
+# testfixture having sqlite3 built in); this index gives the same behaviour.
+AUTOLOAD="$BIN_DIR/sqlite3_autoload.tcl"
+cat > "$AUTOLOAD" <<EOF
+# Auto-loaded by tclIndex the first time the bare \`sqlite3\` command is used in
+# a child interpreter. Loads the passqlite3 Tcl package, which registers the
+# real \`sqlite3\` command; Tcl's auto_load then re-dispatches the original call.
+package require sqlite3
+EOF
+TCL_INDEX="$BIN_DIR/tclIndex"
+cat > "$TCL_INDEX" <<'EOF'
+# Tcl autoload index file, version 2.0
+set auto_index(sqlite3) [list source [file join $dir sqlite3_autoload.tcl]]
+EOF
+echo "+ wrote $TCL_INDEX + $AUTOLOAD"

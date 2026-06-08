@@ -147,8 +147,12 @@ begin
   Expect(u2 <> u1,             'UpsertDup: different pointer');
   Expect(u2^.isDoUpdate = 0,   'UpsertDup: isDoUpdate preserved');
 
-  { T19: sqlite3UpsertNextIsIPK: u1.pNextUpsert=nil → 0 }
-  Expect(sqlite3UpsertNextIsIPK(u1) = 0, 'UpsertNextIsIPK: no next → 0');
+  { T19: sqlite3UpsertNextIsIPK: u1.pNextUpsert=nil → 1.
+    Per upsert.c:227-239 the function returns true when pUpsert is the LAST
+    ON CONFLICT clause with a conflict target (pNext==0 → return 1). The old
+    assertion (→0) predated upstream forum fix 919c6579c8 / port commit
+    670c9cd and asserted the now-removed wrong behaviour. }
+  Expect(sqlite3UpsertNextIsIPK(u1) = 1, 'UpsertNextIsIPK: no next → 1');
 
   { T20: chain two upserts, second has pUpsertIdx=nil (= IPK) → NextIsIPK=1 }
   u3 := sqlite3UpsertNew(nil, nil, nil, nil, nil, nil);

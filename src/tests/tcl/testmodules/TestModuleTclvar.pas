@@ -488,17 +488,42 @@ end;
 { test_tclvar.c:494..496 — getDbPointer.  Recover the sqlite3* behind a
   `db` Tcl command.  TSqliteDb's first field is the sqlite3* handle
   (tclsqlite.c:216), so objClientData dereferenced as a pointer yields
-  it directly.  The raw-pointer-string fallback (sqlite3TestTextToPtr)
-  is not needed by the .test corpus paths that drive this module. }
+  it directly.  vtab2.test drives this module via
+  `register_tclvar_module [sqlite3_connection_pointer db]`, which hands a
+  hex "%p" string rather than the `db` command — so the raw-pointer-string
+  fallback (test1.c:57..76 sqlite3TestTextToPtr) IS required here; without
+  it db came back nil and register_tclvar_module aborted with no message. }
 function getDbPointer(interp: PTclInterp; zA: PAnsiChar;
   ppDb: PPTsqlite3): cint;
 var
-  cmdInfo: TTclCmdInfo;
+  cmdInfo : TTclCmdInfo;
+  z       : PAnsiChar;
+  v       : QWord;
+  c       : cint;
 begin
   if Tcl_GetCommandInfo(interp, PChar(zA), @cmdInfo) <> 0 then
     ppDb^ := PPTsqlite3(cmdInfo.objClientData)^
   else
-    ppDb^ := nil;
+  begin
+    z := zA;
+    if (z <> nil) and (z[0] = '0') and (z[1] = 'x') then
+      Inc(z, 2);
+    v := 0;
+    while (z <> nil) and (z^ <> #0) do
+    begin
+      c := Ord(z^);
+      if (c >= Ord('0')) and (c <= Ord('9')) then
+        v := (v shl 4) + QWord(c - Ord('0'))
+      else if (c >= Ord('a')) and (c <= Ord('f')) then
+        v := (v shl 4) + QWord(c - Ord('a') + 10)
+      else if (c >= Ord('A')) and (c <= Ord('F')) then
+        v := (v shl 4) + QWord(c - Ord('A') + 10)
+      else
+        Break;
+      Inc(z);
+    end;
+    ppDb^ := PTsqlite3(PtrUInt(v));
+  end;
   Result := TCL_OK;
 end;
 

@@ -217,10 +217,20 @@ const
   These are the on-disk byte positions SQLite uses for advisory locks.
   PENDING_BYTE must match the C build exactly or .db files are incompatible.
   ============================================================ }
+{ C ref: sqlite3PendingByte (global.c) is a writable int that
+  SQLITE_TESTCTRL_PENDING_BYTE rewrites so the test harness can move the
+  locking page into reach of small databases (tester.tcl:102 sets
+  0x10000).  RESERVED_BYTE/SHARED_FIRST are PENDING_BYTE+1/+2 macros in C
+  (btreeInt.h); we keep them as writable globals kept in lock-step by
+  sqlite3SetPendingByte below.  Marked {$J+} so they are writable. }
+{$PUSH}
+{$J+}
 const
   PENDING_BYTE  : u32 = $40000000;       { first byte past 1 GB }
   RESERVED_BYTE : u32 = $40000001;       { PENDING_BYTE + 1      }
   SHARED_FIRST  : u32 = $40000002;       { PENDING_BYTE + 2      }
+{$POP}
+const
   SHARED_SIZE   : u32 = 510;
 
 { ============================================================
@@ -632,6 +642,13 @@ procedure sqlite3_mutex_leave(p: Psqlite3_mutex);
 function  sqlite3_mutex_held(p: Psqlite3_mutex): cint;
 function  sqlite3_mutex_notheld(p: Psqlite3_mutex): cint;
 
+{ Auto-initialise hook.  This unit cannot reference sqlite3_initialize
+  directly (it lives in passqlite3main, which uses this unit), so the main
+  unit wires this hook to @sqlite3_initialize at startup.  Used by
+  sqlite3_mutex_alloc to honour SQLITE_OMIT_AUTOINIT semantics (mutex.c:290). }
+var
+  gAutoInitHook: function: cint = nil;
+
 { Internal mutex helpers }
 function  sqlite3MutexAlloc(id: cint): Psqlite3_mutex;
 function  sqlite3MutexInit: cint;
@@ -641,9 +658,19 @@ procedure sqlite3MemoryBarrier;
 { Default mutex implementation (pthread) }
 function  sqlite3DefaultMutex: Psqlite3_mutex_methods;
 
+{ Accessors for the active mutex method table (gMutexMethods). Used by
+  sqlite3_config(SQLITE_CONFIG_GETMUTEX/SQLITE_CONFIG_MUTEX). In C this table
+  is sqlite3GlobalConfig.mutex; this port keeps it in gMutexMethods. }
+procedure sqlite3MutexGetMethods(pTo: Psqlite3_mutex_methods);
+procedure sqlite3MutexSetMethods(pFrom: Psqlite3_mutex_methods);
+
 { ============================================================
   Section 12: OS layer wrappers  (os.c)
   ============================================================ }
+
+{ Rewrite the PENDING_BYTE global (and the RESERVED_BYTE/SHARED_FIRST
+  derived values) — C: sqlite3PendingByte = newVal (main.c:4362). }
+procedure sqlite3SetPendingByte(newByte: u32);
 
 procedure sqlite3OsClose(pId: Psqlite3_file);
 function  sqlite3OsRead(id: Psqlite3_file; pBuf: Pointer;
@@ -833,10 +860,11 @@ const
   ---------------------------------------------------------------- }
 function sqlite3_malloc(n: i32): Pointer; cdecl;
 begin
-  { malloc.c:316 — n<=0 short-circuit then sqlite3Malloc.
-    (autoinit elided: shell calls sqlite3_initialize before allocating,
-    and this unit cannot reference sqlite3_initialize without a
-    circular dependency on passqlite3main.) }
+  { malloc.c:316 — autoinit then n<=0 short-circuit then sqlite3Malloc.
+    Autoinit runs through gAutoInitHook (wired by passqlite3main to
+    sqlite3_initialize) to avoid a circular unit dependency. }
+  if Assigned(gAutoInitHook) and (gAutoInitHook() <> SQLITE_OK) then
+    Exit(nil);
   if n <= 0 then Exit(nil);
   Result := sqlite3Malloc(n);
 end;
@@ -850,7 +878,9 @@ end;
 
 function sqlite3_realloc(p: Pointer; n: i32): Pointer; cdecl;
 begin
-  { malloc.c:562 — n<0 -> 0, then sqlite3Realloc. }
+  { malloc.c:562 — autoinit then n<0 -> 0, then sqlite3Realloc. }
+  if Assigned(gAutoInitHook) and (gAutoInitHook() <> SQLITE_OK) then
+    Exit(nil);
   if n < 0 then n := 0;
   Result := sqlite3Realloc(p, u64(n));
 end;
@@ -889,6 +919,8 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+function c_close_early(fd: cint): cint; cdecl;
+  external 'c' name 'close';
 { posix_fallocate(3): pre-allocate disk space for an open file.
   Returns 0 on success or an error number directly (NOT -1/errno).
   Used early by fcntlSizeHint; the matching binding in the later
@@ -906,6 +938,16 @@ var
   { Head of the VFS linked list (os.c: static sqlite3_vfs *vfsList) }
   vfsList : Psqlite3_vfs = nil;
 
+  { One-time guard for the static aVfs[] objects in sqlite3_os_init.  In C
+    (os_unix.c:8501) aVfs[] is a `static` array initialized once at load
+    time; its pNext fields are then owned/mutated by the VFS list.  Re-
+    initializing those objects (FillChar + record copies) on a subsequent
+    sqlite3_os_init call (which happens after a sqlite3_shutdown /
+    sqlite3_initialize cycle, e.g. mutex2.test) would clobber the pNext of
+    siblings that are still linked into vfsList, corrupting the list and
+    crashing the next vfsUnlink walk.  Mirror C's static-once semantics. }
+  unixVfsObjInitDone : Boolean = False;
+
   { Static mutexes for SQLITE_MUTEX_STATIC_MAIN(2) .. SQLITE_MUTEX_STATIC_VFS3(13).
     Index 0 = id 2, index 11 = id 13.
     On Linux, PTHREAD_MUTEX_INITIALIZER is all-zeros, so zero-initialised records
@@ -918,6 +960,12 @@ var
     function-pointer fields can reference functions that appear later in this
     compilation unit. }
   unixIoMethods : sqlite3_io_methods;
+
+  { nolock ("unix-none") and dotlock ("unix-dotfile") I/O method tables.
+    Share xRead/xWrite/etc. with unixIoMethods but override the locking
+    quartet (os_unix.c:5853..5882). Filled by InitUnixIoMethods. }
+  nolockIoMethods   : sqlite3_io_methods;
+  dotlockIoMethods  : sqlite3_io_methods;
 
   { Per-file pthreadMutexMethods table returned by sqlite3DefaultMutex }
   pthreadMutexMethodsData : sqlite3_mutex_methods;
@@ -933,6 +981,7 @@ function  unixWrite_impl(pFile: Psqlite3_file; pBuf: Pointer;
             iAmt: cint; iOfst: i64): cint; cdecl; forward;
 function  unixTruncate_impl(pFile: Psqlite3_file; size: i64): cint; cdecl; forward;
 function  unixSync_impl(pFile: Psqlite3_file; flags: cint): cint; cdecl; forward;
+function  pas_openDirectory(zPath: PChar; pFd: PcInt): cint; cdecl; forward;
 function  unixFileSize_impl(pFile: Psqlite3_file; pSize: Pi64): cint; cdecl; forward;
 function  unixLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
 function  unixUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
@@ -944,14 +993,33 @@ function  unixSectorSize_impl(pFile: Psqlite3_file): cint; cdecl; forward;
 function  unixDeviceCharacteristics_impl(pFile: Psqlite3_file): cint; cdecl; forward;
 function  unixGetTempname(nBuf: cint; zBuf: PAnsiChar): cint; forward;
 
+{ nolock / dotlock locking-style methods (os_unix.c:2390..2591) }
+function  nolockClose_impl(pFile: Psqlite3_file): cint; cdecl; forward;
+function  nolockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  nolockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  nolockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl; forward;
+function  dotlockClose_impl(pFile: Psqlite3_file): cint; cdecl; forward;
+function  dotlockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  dotlockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl; forward;
+function  dotlockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl; forward;
+
 { ============================================================
   Section 0: Memory helpers
   ============================================================ }
 
-{ os.c ~400: sqlite3MallocZero — wraps calloc(1, n) }
+{ malloc.c:580 sqlite3MallocZero — route through sqlite3Malloc so the
+  allocation is tracked by the SQLITE_STATUS_MEMORY_USED / MALLOC_COUNT
+  accounting (and honours SQLITE_CONFIG_MALLOC), then zero it.  The prior
+  implementation called libc_calloc directly, bypassing sqlite3Malloc's
+  sqlite3StatusUp() while the matching sqlite3_free() still ran
+  sqlite3StatusDown(); that drove the memory counters negative
+  (memsubsys2-3.x / 4.x). }
 function sqlite3MallocZero(n: csize_t): Pointer;
 begin
-  Result := libc_calloc(1, n);
+  Result := sqlite3Malloc(i32(n));
+  if Result <> nil then FillChar(Result^, n, 0);
 end;
 
 { os.c ~410: sqlite3StrDup — duplicate a C string (caller frees with sqlite3_free) }
@@ -1105,6 +1173,21 @@ end;
   Section 11b: Mutex public API  (mutex.c)
   ============================================================ }
 
+{ Accessors for gMutexMethods (the active mutex table). }
+procedure sqlite3MutexGetMethods(pTo: Psqlite3_mutex_methods);
+begin
+  { Ensure defaults are installed before handing the table out, matching the
+    lazy population done by sqlite3MutexInit. }
+  if not Assigned(gMutexMethods.xMutexAlloc) then
+    gMutexMethods := sqlite3DefaultMutex()^;
+  pTo^ := gMutexMethods;
+end;
+
+procedure sqlite3MutexSetMethods(pFrom: Psqlite3_mutex_methods);
+begin
+  gMutexMethods := pFrom^;
+end;
+
 { mutex.c ~170: sqlite3MutexInit }
 function sqlite3MutexInit: cint;
 var
@@ -1126,11 +1209,28 @@ begin
     Result := SQLITE_OK;
 end;
 
-{ mutex.c ~202: sqlite3_mutex_alloc (public API) }
+{ mutex.c:290..297: sqlite3_mutex_alloc (public API) }
 function sqlite3_mutex_alloc(id: cint): Psqlite3_mutex;
 begin
-  if not Assigned(gMutexMethods.xMutexAlloc) then begin
-    sqlite3MutexInit;
+  { SQLITE_OMIT_AUTOINIT is NOT defined for this build, so auto-initialise
+    (mutex.c:291..294).  For dynamic (FAST/RECURSIVE) mutexes a full
+    sqlite3_initialize() is required; for static mutexes only the mutex
+    subsystem need be up. }
+  if id <= SQLITE_MUTEX_RECURSIVE then begin
+    if Assigned(gAutoInitHook) then begin
+      if gAutoInitHook() <> SQLITE_OK then begin
+        Result := nil;
+        Exit;
+      end;
+    end else begin
+      if not Assigned(gMutexMethods.xMutexAlloc) then
+        sqlite3MutexInit;
+    end;
+  end else begin
+    if sqlite3MutexInit <> SQLITE_OK then begin
+      Result := nil;
+      Exit;
+    end;
   end;
   Result := gMutexMethods.xMutexAlloc(id);
 end;
@@ -1209,6 +1309,15 @@ end;
   Section 12: OS dispatcher wrappers  (os.c)
   These are thin wrappers that call through the pMethods vtable.
   ============================================================ }
+
+{$PUSH}{$J+}
+procedure sqlite3SetPendingByte(newByte: u32);
+begin
+  PENDING_BYTE  := newByte;
+  RESERVED_BYTE := newByte + 1;
+  SHARED_FIRST  := newByte + 2;
+end;
+{$POP}
 
 { os.c ~79: sqlite3OsClose }
 procedure sqlite3OsClose(pId: Psqlite3_file);
@@ -1505,6 +1614,9 @@ var
   pVfs  : Psqlite3_vfs;
   mutex : Psqlite3_mutex;
 begin
+  { os.c — autoinit then bail on failure (mutex2-2.10). }
+  if Assigned(gAutoInitHook) and (gAutoInitHook() <> SQLITE_OK) then
+    Exit(nil);
   mutex := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
   sqlite3_mutex_enter(mutex);
   pVfs := vfsList;
@@ -1851,6 +1963,7 @@ function unixSync_impl(pFile: Psqlite3_file; flags: cint): cint; cdecl;
 var
   pf : PunixFile;
   rc : cint;
+  dirfd : cint;
 begin
   pf := PunixFile(pFile);
   {$ifdef SQLITE_TEST}
@@ -1875,8 +1988,24 @@ begin
   if rc <> 0 then begin
     pf^.lastErrno := fpgeterrno;
     Result := SQLITE_IOERR_FSYNC;
-  end else
-    Result := SQLITE_OK;
+    Exit;
+  end;
+  Result := SQLITE_OK;
+
+  { os_unix.c:3937..3954 — also fsync the directory containing the file if
+    the DIRSYNC flag is set.  This is a one-time occurrence.  Many systems
+    are unable to fsync a directory, so ignore errors on the fsync. }
+  if (pf^.ctrlFlags and UNIXFILE_DIRSYNC) <> 0 then begin
+    if pas_openDirectory(pf^.zPath, @dirfd) = SQLITE_OK then begin
+      { full_fsync(dirfd,0,0) — bumps sqlite3_sync_count unconditionally. }
+      {$ifdef SQLITE_TEST}
+      Inc(sqlite3_sync_count);
+      {$endif}
+      c_fsync(dirfd);
+      c_close_early(dirfd);
+    end;
+    pf^.ctrlFlags := pf^.ctrlFlags and (not UNIXFILE_DIRSYNC);
+  end;
 end;
 
 { os_unix.c ~4011: unixFileSize_impl — return current file size in bytes }
@@ -2367,6 +2496,9 @@ var
   pInode     : PunixInodeInfo;
   ctrlFlags  : u16;
   tmpNameBuf : array[0..MAX_PATHNAME+1] of char;
+  pLockMethods : Psqlite3_io_methods;
+  zLockFile  : PChar;
+  nFilename  : cint;
 begin
   p := PunixFile(pFile);
   FillChar(p^, SizeOf(unixFile), 0);
@@ -2457,6 +2589,12 @@ begin
   if isReadonly then ctrlFlags := ctrlFlags or UNIXFILE_RDONLY;
   if eType <> SQLITE_OPEN_MAIN_DB then
     ctrlFlags := ctrlFlags or UNIXFILE_NOLOCK;
+  { os_unix.c:6569/6777 — a newly-created journal/wal needs its containing
+    directory fsync'd once (UNIXFILE_DIRSYNC). }
+  if isCreate and ((eType = SQLITE_OPEN_SUPER_JOURNAL)
+                or (eType = SQLITE_OPEN_MAIN_JOURNAL)
+                or (eType = SQLITE_OPEN_WAL)) then
+    ctrlFlags := ctrlFlags or UNIXFILE_DIRSYNC;
   if (flags and SQLITE_OPEN_URI) <> 0 then
     ctrlFlags := ctrlFlags or UNIXFILE_URI;
   { 9.4.divbug.34 — POWERSAFE_OVERWRITE on by default (os_unix.c:6098..6106).
@@ -2481,8 +2619,39 @@ begin
     Exit;
   end;
 
-  { Fill in the unixFile record (os_unix.c: fillInUnixFile) }
-  p^.pMethod   := @unixIoMethods;
+  { Fill in the unixFile record (os_unix.c: fillInUnixFile).
+    Select the locking style (os_unix.c:6120..6207).  Non-MAIN_DB files
+    (journal/wal/temp) carry UNIXFILE_NOLOCK and always use nolock.
+    Otherwise the VFS name picks the finder: unix-none -> nolock,
+    unix-dotfile -> dotlock (with a ".lock" lockingContext path), and
+    unix / unix-excl -> posix (the default unixIoMethods). }
+  pLockMethods := @unixIoMethods;
+  if (ctrlFlags and UNIXFILE_NOLOCK) <> 0 then
+    pLockMethods := @nolockIoMethods
+  else if (pVfs <> nil) and (pVfs^.zName <> nil) then begin
+    if StrComp(pVfs^.zName, 'unix-none') = 0 then
+      pLockMethods := @nolockIoMethods
+    else if StrComp(pVfs^.zName, 'unix-dotfile') = 0 then begin
+      { Dotfile locking caches the "<db>.lock" path as lockingContext
+        (os_unix.c:6192..6207). }
+      nFilename := cint(StrLen(zName)) + 6;
+      zLockFile := PChar(sqlite3_malloc64(nFilename));
+      if zLockFile = nil then begin
+        FpClose(fd);
+        p^.h := -1;
+        if p^.pPreallocatedUnused <> nil then
+          sqlite3_free(p^.pPreallocatedUnused);
+        Result := SQLITE_NOMEM;
+        Exit;
+      end;
+      StrLCopy(zLockFile, zName, nFilename - 1);
+      StrLCat(zLockFile, '.lock', nFilename - 1);
+      p^.lockingContext := zLockFile;
+      pLockMethods := @dotlockIoMethods;
+    end;
+  end;
+
+  p^.pMethod   := pLockMethods;
   p^.pVfs      := pVfs;
   p^.pInode    := pInode;
   p^.h         := fd;
@@ -2535,6 +2704,10 @@ begin
       sep^ := #0;
     dfd := FpOpen(@dir[0], O_RDONLY, 0);
     if dfd >= 0 then begin
+      { os_unix.c:6858 full_fsync(fd,0,0) — bumps sqlite3_sync_count. }
+      {$ifdef SQLITE_TEST}
+      Inc(sqlite3_sync_count);
+      {$endif}
       c_fsync(dfd);
       FpClose(dfd);
     end;
@@ -2566,52 +2739,146 @@ begin
   Result := SQLITE_OK;
 end;
 
-{ os_unix.c ~7008: unixFullPathname — resolve to an absolute path.
-  Phase 1: getcwd (via libc) + concat; does not resolve symlinks.
-  Note: FPC's FpGetCwd on Linux returns path length (not pointer) on success
-  (the kernel getcwd syscall writes to the buffer and returns the length).
-  Use the libc getcwd directly to get the correct pointer semantics. }
+{ os_unix.c ~7008: unixFullPathname — resolve to an absolute path,
+  following symlinks so the canonical name is used to derive the
+  journal/WAL/shm filenames.  Faithful port of the DbPath /
+  appendOnePathElement / appendAllPathElements machinery. }
 function libc_getcwd(buf: PChar; size: csize_t): PChar;
   cdecl; external 'c' name 'getcwd';
+
+const
+  { os.h:46 — SQLITE_MAX_SYMLINK (the per-path resolution cap). }
+  SQLITE_MAX_SYMLINK    = 200;
+  { sqlite3.h — SQLITE_OK with the symlink-followed extended bit. }
+  OS_SQLITE_OK_SYMLINK  = SQLITE_OK or (2 shl 8);
+  { os_unix.c:39 — SQLITE_MAX_PATHLEN = FILENAME_MAX (4096 on Linux). }
+  SQLITE_MAX_PATHLEN    = 4096;
+
+type
+  { os_unix.c:6908 — DbPath. }
+  TDbPath = record
+    rc      : cint;     { Non-zero following any error               }
+    nSymlink: cint;     { Number of symlinks resolved                }
+    zOut    : PChar;    { Write the pathname here                    }
+    nOut    : cint;     { Bytes of space available to zOut[]         }
+    nUsed   : cint;     { Bytes of zOut[] currently being used       }
+  end;
+  PDbPath = ^TDbPath;
+
+{ Forward reference (appendOnePathElement <-> appendAllPathElements). }
+procedure appendAllPathElements(pPath: PDbPath; zPath: PChar); forward;
+
+{ os_unix.c:6923 — append a single (non zero-terminated) path element
+  zName of nName bytes to the DbPath under construction, resolving the
+  result if it turns out to be a symlink. }
+procedure appendOnePathElement(pPath: PDbPath; zName: PChar; nName: cint);
+var
+  zIn  : PChar;
+  buf  : Stat;
+  got  : ssize_t;
+  zLnk : array[0..SQLITE_MAX_PATHLEN+1] of char;
+begin
+  { assert( nName>0 ); assert( zName!=0 ); }
+  if zName[0] = '.' then begin
+    if nName = 1 then Exit;
+    if (zName[1] = '.') and (nName = 2) then begin
+      if pPath^.nUsed > 1 then begin
+        { assert( pPath->zOut[0]=='/' ); }
+        Dec(pPath^.nUsed);
+        while pPath^.zOut[pPath^.nUsed] <> '/' do
+          Dec(pPath^.nUsed);
+      end;
+      Exit;
+    end;
+  end;
+  if pPath^.nUsed + nName + 2 >= pPath^.nOut then begin
+    pPath^.rc := SQLITE_ERROR;
+    Exit;
+  end;
+  pPath^.zOut[pPath^.nUsed] := '/';
+  Inc(pPath^.nUsed);
+  Move(zName^, pPath^.zOut[pPath^.nUsed], nName);
+  Inc(pPath^.nUsed, nName);
+
+  { HAVE_READLINK && HAVE_LSTAT }
+  if pPath^.rc = SQLITE_OK then begin
+    pPath^.zOut[pPath^.nUsed] := #0;
+    zIn := pPath^.zOut;
+    if FpLstat(zIn, buf) <> 0 then begin
+      if fpgeterrno <> ESysENOENT then
+        pPath^.rc := SQLITE_CANTOPEN_BKPT;
+    end else if (buf.st_mode and S_IFMT) = S_IFLNK then begin
+      if pPath^.nSymlink > SQLITE_MAX_SYMLINK then begin
+        Inc(pPath^.nSymlink);
+        pPath^.rc := SQLITE_CANTOPEN_BKPT;
+        Exit;
+      end;
+      Inc(pPath^.nSymlink);
+      got := FpReadLink(zIn, @zLnk[0], SizeOf(zLnk) - 2);
+      if (got <= 0) or (got >= ssize_t(SizeOf(zLnk) - 2)) then begin
+        pPath^.rc := SQLITE_CANTOPEN_BKPT;
+        Exit;
+      end;
+      zLnk[got] := #0;
+      if zLnk[0] = '/' then
+        pPath^.nUsed := 0
+      else
+        Dec(pPath^.nUsed, nName + 1);
+      appendAllPathElements(pPath, @zLnk[0]);
+    end;
+  end;
+end;
+
+{ os_unix.c:6984 — append all '/'-separated path elements of the
+  zero-terminated zPath to the DbPath under construction. }
+procedure appendAllPathElements(pPath: PDbPath; zPath: PChar);
+var
+  i, j : cint;
+begin
+  i := 0;
+  j := 0;
+  repeat
+    while (zPath[i] <> #0) and (zPath[i] <> '/') do Inc(i);
+    if i > j then
+      appendOnePathElement(pPath, zPath + j, i - j);
+    j := i + 1;
+    { do{...}while( zPath[i++] ): test the char, then advance i. }
+    if zPath[i] = #0 then begin
+      Inc(i);
+      Break;
+    end;
+    Inc(i);
+  until False;
+end;
 
 function unixFullPathname(pVfs: Psqlite3_vfs; zPath: PChar;
                           nOut: cint; zOut: PChar): cint; cdecl;
 var
-  cwd    : array[0..MAX_PATHNAME+1] of char;
-  cwdPtr : PChar;
-  pathLen: SizeInt;
-  remLen : SizeInt;
+  path : TDbPath;
+  zPwd : array[0..SQLITE_MAX_PATHLEN+1] of char;
 begin
-  zOut[0] := #0;
-
-  if (zPath <> nil) and (zPath[0] = '/') then begin
-    { Already absolute — copy verbatim }
-    StrLCopy(zOut, zPath, nOut - 1);
-    zOut[nOut - 1] := #0;
-    Result := SQLITE_OK;
+  path.rc       := 0;
+  path.nUsed    := 0;
+  path.nSymlink := 0;
+  path.nOut     := nOut;
+  path.zOut     := zOut;
+  if zPath[0] <> '/' then begin
+    if libc_getcwd(@zPwd[0], SizeOf(zPwd) - 2) = nil then begin
+      Result := SQLITE_CANTOPEN_BKPT;
+      Exit;
+    end;
+    appendAllPathElements(@path, @zPwd[0]);
+  end;
+  appendAllPathElements(@path, zPath);
+  zOut[path.nUsed] := #0;
+  if (path.rc <> 0) or (path.nUsed < 2) then begin
+    Result := SQLITE_CANTOPEN_BKPT;
     Exit;
   end;
-
-  { Relative path — prepend current working directory via libc getcwd }
-  cwdPtr := libc_getcwd(@cwd[0], SizeOf(cwd) - 2);
-  if cwdPtr = nil then begin
-    Result := SQLITE_CANTOPEN;
+  if path.nSymlink <> 0 then begin
+    Result := OS_SQLITE_OK_SYMLINK;
     Exit;
   end;
-
-  pathLen := StrLen(cwdPtr);
-  remLen  := nOut - pathLen - 2;
-  if (zPath <> nil) and (SizeInt(StrLen(zPath)) > remLen) then begin
-    Result := SQLITE_CANTOPEN;
-    Exit;
-  end;
-
-  StrLCopy(zOut, cwdPtr, nOut - 1);
-  if zPath <> nil then begin
-    zOut[pathLen] := '/';
-    StrLCopy(zOut + pathLen + 1, zPath, remLen);
-  end;
-  zOut[nOut - 1] := #0;
   Result := SQLITE_OK;
 end;
 
@@ -2622,7 +2889,12 @@ var
   fd  : cint;
   got : ssize_t;
 begin
+  { os_unix.c:7104..7116 — always zero-fill first.  When the unit is compiled
+    -dSQLITE_TEST, os_unix.c #if's out the /dev/urandom read entirely so the
+    seed is all zeros and the PRNG sequence is repeatable across runs (the
+    fts3corrupt4-25.x corruption verdict depends on this determinism). }
   FillChar(zOut^, nByte, 0);
+  {$ifndef SQLITE_TEST}
   fd := FpOpen('/dev/urandom', O_RDONLY, 0);
   if fd >= 0 then begin
     repeat
@@ -2634,6 +2906,7 @@ begin
       Exit;
     end;
   end;
+  {$endif}
   Result := nByte;  { fallback: return nByte (zOut filled with zeros) }
 end;
 
@@ -2796,6 +3069,11 @@ function  c_close(fd: cint): cint;
   cdecl; external 'c' name 'close';
 function  c_access(zPath: PChar; mode: cint): cint;
   cdecl; external 'c' name 'access';
+{ Raw libc errno location.  The `c_*` externals below set the C library's
+  errno, which FPC's fpgeterrno (its own internal copy) does not observe;
+  read it directly so dotlock can distinguish EEXIST/ENOENT. }
+function  c_errno_location: pcint;
+  cdecl; external 'c' name '__errno_location';
 function  c_getcwd(buf: PChar; size: csize_t): PChar;
   cdecl; external 'c' name 'getcwd';
 function  c_stat(zPath: PChar; buf: Pointer): cint;
@@ -3006,6 +3284,25 @@ end;
 { os_unix.c ~8448: sqlite3_os_init — register the unix VFS as the default }
 function sqlite3_os_init: cint;
 begin
+  { C os_unix.c:8501 declares aVfs[] as a `static` array — initialized once
+    at load time, NOT on each sqlite3_os_init call.  The per-call work in C
+    is only the registration loop below (which is idempotent because
+    sqlite3_vfs_register unlinks-then-relinks each object).  Re-running the
+    field initialization / record copies on a re-init would clobber the
+    pNext links of siblings still in vfsList (mutex2.test SIGSEGV), so gate
+    the object setup behind a one-time flag. }
+  if unixVfsObjInitDone then
+  begin
+    { Re-register (idempotent unlink+relink), matching C's per-call loop. }
+    sqlite3_vfs_register(@unixVfsObj, 1);
+    sqlite3_vfs_register(@unixVfsObjNone, 0);
+    sqlite3_vfs_register(@unixVfsObjDotfile, 0);
+    sqlite3_vfs_register(@unixVfsObjExcl, 0);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+  unixVfsObjInitDone := True;
+
   { Fill in the singleton unixVfsObj (declared in interface section) }
   FillChar(unixVfsObj, SizeOf(unixVfsObj), 0);
   unixVfsObj.iVersion        := 3;    { v3: xSetSystemCall et al. wired below }
@@ -3617,6 +3914,180 @@ begin
 end;
 
 { ============================================================
+  Section 14c: nolock / dotlock locking-style methods (os_unix.c)
+  ============================================================ }
+
+{ os_unix.c:2410 nolockClose — closeUnixFile only (no lock to drop). }
+function nolockClose_impl(pFile: Psqlite3_file): cint; cdecl;
+var
+  pf : PunixFile;
+begin
+  pf := PunixFile(pFile);
+  { closeUnixFile: drop inode ref, close fd, zero struct.  Mirror the tail
+    of unixClose_impl but without unixUnlock (no-op lock). }
+  if pf^.pInode <> nil then begin
+    unixEnterMutex;
+    unixReleaseInodeInfo(pf);
+    unixLeaveMutex;
+  end;
+  if pf^.pPreallocatedUnused <> nil then
+    sqlite3_free(pf^.pPreallocatedUnused);
+  if pf^.h >= 0 then
+    FpClose(pf^.h);
+  {$ifdef SQLITE_TEST}
+  Dec(sqlite3_open_file_count);
+  {$endif}
+  FillChar(pf^, SizeOf(unixFile), 0);
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2397 nolockLock — no-op. }
+function nolockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2401 nolockUnlock — no-op. }
+function nolockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2393 nolockCheckReservedLock — never reserved. }
+function nolockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl;
+begin
+  pResOut^ := 0;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2452 dotlockCheckReservedLock. }
+function dotlockCheckReservedLock_impl(pFile: Psqlite3_file;
+            pResOut: PcInt): cint; cdecl;
+var
+  pf : PunixFile;
+begin
+  pf := PunixFile(pFile);
+  {$ifdef SQLITE_TEST}
+  if SimulateIOError then begin
+    Result := SQLITE_IOERR_CHECKRESERVEDLOCK;
+    Exit;
+  end;
+  {$endif}
+  if pf^.eFileLock >= SHARED_LOCK then
+    pResOut^ := 0
+  else begin
+    if c_access(PChar(pf^.lockingContext), 0) = 0 then
+      pResOut^ := 1
+    else
+      pResOut^ := 0;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2492 dotlockLock. }
+function dotlockLock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+var
+  pf        : PunixFile;
+  zLockFile : PChar;
+  rc        : cint;
+  tErrno    : cint;
+begin
+  pf := PunixFile(pFile);
+  zLockFile := PChar(pf^.lockingContext);
+  rc := SQLITE_OK;
+
+  { If we already hold a lock, just adjust the internal level + touch file. }
+  if pf^.eFileLock > NO_LOCK then begin
+    pf^.eFileLock := eFileLock;
+    libc_utimes(zLockFile, nil);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Grab an exclusive lock by creating the lock directory. }
+  if c_mkdir(zLockFile, &777) < 0 then begin
+    tErrno := c_errno_location^;
+    if tErrno = ESysEEXIST then
+      rc := SQLITE_BUSY
+    else begin
+      rc := SQLITE_IOERR_LOCK;
+      pf^.lastErrno := tErrno;
+    end;
+    Result := rc;
+    Exit;
+  end;
+
+  pf^.eFileLock := eFileLock;
+  Result := rc;
+end;
+
+{ os_unix.c:2542 dotlockUnlock. }
+function dotlockUnlock_impl(pFile: Psqlite3_file; eFileLock: cint): cint; cdecl;
+var
+  pf        : PunixFile;
+  zLockFile : PChar;
+  tErrno    : cint;
+begin
+  pf := PunixFile(pFile);
+  zLockFile := PChar(pf^.lockingContext);
+
+  { no-op if possible }
+  if pf^.eFileLock = eFileLock then begin
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Downgrade to shared: only update internal state. }
+  if eFileLock = SHARED_LOCK then begin
+    pf^.eFileLock := SHARED_LOCK;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Fully unlock: delete the lock directory. }
+  if c_rmdir(zLockFile) < 0 then begin
+    tErrno := c_errno_location^;
+    if tErrno = ESysENOENT then
+      Result := SQLITE_OK
+    else begin
+      Result := SQLITE_IOERR_UNLOCK;
+      pf^.lastErrno := tErrno;
+    end;
+    Exit;
+  end;
+  pf^.eFileLock := NO_LOCK;
+  Result := SQLITE_OK;
+end;
+
+{ os_unix.c:2585 dotlockClose — release lock, free context, closeUnixFile. }
+function dotlockClose_impl(pFile: Psqlite3_file): cint; cdecl;
+var
+  pf : PunixFile;
+begin
+  pf := PunixFile(pFile);
+  dotlockUnlock_impl(pFile, NO_LOCK);
+  if pf^.lockingContext <> nil then
+    sqlite3_free(pf^.lockingContext);
+  pf^.lockingContext := nil;
+  { closeUnixFile }
+  if pf^.pInode <> nil then begin
+    unixEnterMutex;
+    unixReleaseInodeInfo(pf);
+    unixLeaveMutex;
+  end;
+  if pf^.pPreallocatedUnused <> nil then
+    sqlite3_free(pf^.pPreallocatedUnused);
+  if pf^.h >= 0 then
+    FpClose(pf^.h);
+  {$ifdef SQLITE_TEST}
+  Dec(sqlite3_open_file_count);
+  {$endif}
+  FillChar(pf^, SizeOf(unixFile), 0);
+  Result := SQLITE_OK;
+end;
+
+{ ============================================================
   InitUnixIoMethods — build the unixIoMethods vtable.
   Called from the initialization section once all functions are known.
   ============================================================ }
@@ -3643,6 +4114,32 @@ begin
   unixIoMethods.xShmUnmap   := @unixShmUnmap_impl;
   unixIoMethods.xFetch      := nil;
   unixIoMethods.xUnfetch    := nil;
+
+  { nolock ("unix-none"): same as unix but locking quartet is a no-op
+    (os_unix.c:5853..5867).  iVersion 1 — no SHM/WAL under nolock. }
+  nolockIoMethods := unixIoMethods;
+  nolockIoMethods.iVersion           := 1;
+  nolockIoMethods.xClose             := @nolockClose_impl;
+  nolockIoMethods.xLock              := @nolockLock_impl;
+  nolockIoMethods.xUnlock            := @nolockUnlock_impl;
+  nolockIoMethods.xCheckReservedLock := @nolockCheckReservedLock_impl;
+  nolockIoMethods.xShmMap     := nil;
+  nolockIoMethods.xShmLock    := nil;
+  nolockIoMethods.xShmBarrier := nil;
+  nolockIoMethods.xShmUnmap   := nil;
+
+  { dotlock ("unix-dotfile"): dotfile locking quartet (os_unix.c:5869..5882).
+    iVersion 1 — no SHM/WAL under dotlock. }
+  dotlockIoMethods := unixIoMethods;
+  dotlockIoMethods.iVersion           := 1;
+  dotlockIoMethods.xClose             := @dotlockClose_impl;
+  dotlockIoMethods.xLock              := @dotlockLock_impl;
+  dotlockIoMethods.xUnlock            := @dotlockUnlock_impl;
+  dotlockIoMethods.xCheckReservedLock := @dotlockCheckReservedLock_impl;
+  dotlockIoMethods.xShmMap     := nil;
+  dotlockIoMethods.xShmLock    := nil;
+  dotlockIoMethods.xShmBarrier := nil;
+  dotlockIoMethods.xShmUnmap   := nil;
 end;
 
 { ============================================================

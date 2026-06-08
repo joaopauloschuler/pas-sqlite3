@@ -358,6 +358,7 @@ var
   rc:   i32;
   iDb:  i32;
   zDb:  PAnsiChar;
+  nm:   TToken;
   argvArr: ^PAnsiChar;
 begin
   pTab := nil;
@@ -366,7 +367,10 @@ begin
   if argc >= 4 then begin
     argvArr := Pointer(argv);
     zDb := (argvArr + 3)^;
-    iDb := sqlite3FindDbName(db, zDb);
+    { dbstat.c:169..171 — build a Token from argv[3] and resolve via
+      sqlite3FindDb, which dequotes the (possibly quoted) schema name. }
+    sqlite3TokenInit(@nm, zDb);
+    iDb := sqlite3FindDb(db, @nm);
     if iDb < 0 then begin
       pzErr^ := sqlite3VtabFmtMsg1Libc('no such database: %s', AnsiString(zDb));
       Result := SQLITE_ERROR; Exit;

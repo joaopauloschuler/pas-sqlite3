@@ -37,7 +37,8 @@ uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      TestModuleMd5, TestModuleTclvar, TestModuleBestindex,
      TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
-     TestModuleVfs, TestModuleFts3;
+     TestModuleVfs, TestModuleFts3, TestModuleSchema, TestModuleFs,
+     TestModuleIntarray, TestModuleAutoext, PasQrf;
 
 const
   { tclsqlite.c:121..122 — default and hard cap on the LRU statement cache. }
@@ -187,6 +188,8 @@ type
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
     zBusy:    PAnsiChar;   { tclsqlite.c:199 — `busy` callback script,
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
+    zBindFallback: PAnsiChar; { tclsqlite.c:198 — `bind_fallback` callback
+                             script, Tcl_Alloc'd; freed in DbDeleteCmd. }
     zProgress: PAnsiChar;  { tclsqlite.c:204 — `progress` callback script,
                              Tcl_Alloc'd; freed in DbDeleteCmd. }
     zCommit:   PAnsiChar;  { tclsqlite.c:200 — `commit_hook` callback script,
@@ -670,6 +673,12 @@ begin
     Tcl_Free(pDb^.zBusy);
     pDb^.zBusy := nil;
   end;
+  { Free bind_fallback callback script — tclsqlite.c:640..642. }
+  if pDb^.zBindFallback <> nil then
+  begin
+    Tcl_Free(pDb^.zBindFallback);
+    pDb^.zBindFallback := nil;
+  end;
   { Free progress callback script — tclsqlite.c:631..633. }
   if pDb^.zProgress <> nil then
   begin
@@ -737,7 +746,8 @@ end;
   DbSqlFunc auto-detect peek. }
 function DbBindOneParam(pDb: PSqliteDb; pStmt: Pointer; i: cint;
                         zParamName: PAnsiChar;
-                        pPS: PSqlPreparedStmt; iParm: pcint): Boolean;
+                        pPS: PSqlPreparedStmt; iParm: pcint;
+                        pNeedReset: pcint): cint;
 var
   pVarObj: PTclObj;
   zType:   PAnsiChar;
@@ -749,16 +759,44 @@ var
   pBlob:   PChar;
   pVarStr: PChar;
   xDel:    TxDelProc;
+  pCmd:    PTclObj;
+  rx:      cint;
 begin
-  Result := False;
+  { Returns TCL_OK normally; TCL_ERROR if a bind_fallback callback raised
+    an error (tclsqlite.c:1507..1509).  The param is silently skipped
+    (returns TCL_OK without binding) when the name doesn't match the
+    $/:/@ prefixes. }
+  Result := TCL_OK;
   if (zParamName = nil) or
      ((zParamName[0] <> '$') and (zParamName[0] <> ':')
       and (zParamName[0] <> '@')) then Exit;
-  Result := True;
   pVarObj := Tcl_GetVar2Ex(pDb^.interp, zParamName + 1, nil, 0);
+  { tclsqlite.c:1495..1513 — bind_fallback callback when the Tcl variable
+    is undefined and a fallback script is registered. }
+  if (pVarObj = nil) and (pDb^.zBindFallback <> nil) then
+  begin
+    pCmd := Tcl_NewStringObj(pDb^.zBindFallback, -1);
+    Tcl_IncrRefCount(pCmd);
+    Tcl_ListObjAppendElement(pDb^.interp, pCmd,
+      Tcl_NewStringObj(zParamName, -1));
+    if pNeedReset^ <> 0 then Tcl_ResetResult(pDb^.interp);
+    pNeedReset^ := 1;
+    rx := Tcl_EvalObjEx(pDb^.interp, pCmd, TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(pCmd);
+    if rx = TCL_OK then
+      pVarObj := Tcl_GetObjResult(pDb^.interp)
+    else if rx = TCL_ERROR then
+    begin
+      Result := TCL_ERROR;
+      Exit;
+    end
+    else
+      pVarObj := nil;
+  end;
   if pVarObj = nil then
   begin
     sqlite3_bind_null(pStmt, i);
+    if pNeedReset^ <> 0 then Tcl_ResetResult(pDb^.interp);
     Exit;
   end;
   zType := TclObjTypeName(pVarObj);
@@ -822,6 +860,8 @@ begin
       Inc(iParm^);
     end;
   end;
+  { tclsqlite.c:1554 — reset the interp result after a fallback eval. }
+  if pNeedReset^ <> 0 then Tcl_ResetResult(pDb^.interp);
 end;
 
 { DbPrepareAndBind — minimal port of dbPrepareAndBind
@@ -854,6 +894,7 @@ var
   nByte:      PtrUInt;
   zParamName: PAnsiChar;
   rc:         cint;
+  needReset:  cint;
 begin
   ppPS^ := nil;
   zSql := zIn;
@@ -929,18 +970,24 @@ begin
   Assert(pPS <> nil);
   nVar := sqlite3_bind_parameter_count(pStmt);
   iParm := 0;
+  needReset := 0;
+  rc := TCL_OK;
   { Walk bind parameters — tclsqlite.c:1491..1556 via DbBindOneParam
     helper (9.4.divbug.60).  apParm[] anchors incref'd Tcl_Obj refs for
     the BLOB / text branches so SQLITE_STATIC bytes stay live until
-    DbReleaseStmt drops them. }
+    DbReleaseStmt drops them.  A bind_fallback callback that raises an
+    error aborts the loop with TCL_ERROR (tclsqlite.c:1507..1509). }
   for i := 1 to nVar do
   begin
     zParamName := sqlite3_bind_parameter_name(pStmt, i);
-    DbBindOneParam(pDb, pStmt, i, zParamName, pPS, @iParm);
+    rc := DbBindOneParam(pDb, pStmt, i, zParamName, pPS, @iParm, @needReset);
+    if rc = TCL_ERROR then break;
   end;
   pPS^.nParm := iParm;
   ppPS^ := pPS;
-  Result := TCL_OK;
+  { tclsqlite.c:1559 — final result reset on a clean run. }
+  if (needReset <> 0) and (rc = TCL_OK) then Tcl_ResetResult(pDb^.interp);
+  Result := rc;
 end;
 
 { DbReleaseStmt — port of dbReleaseStmt (tclsqlite.c:1573..1614).
@@ -1014,6 +1061,19 @@ const
   SQLITE_EVAL_WITHOUTNULLS = $00001;  { tclsqlite.c:1638 }
   SQLITE_EVAL_ASDICT       = $00002;  { tclsqlite.c:1639 }
 
+{ Tcl_BounceRefCount — port of the tclsqlite.c:52 helper macro
+  `Tcl_IncrRefCount(X); Tcl_DecrRefCount(X)`.  Frees an unowned Tcl_Obj
+  (refcount 0) by bumping then dropping its reference; a no-op for an
+  object that is still referenced elsewhere. }
+procedure Tcl_BounceRefCount(objPtr: PTclObj); inline;
+begin
+  if objPtr <> nil then
+  begin
+    Tcl_IncrRefCount(objPtr);
+    Tcl_DecrRefCount(objPtr);
+  end;
+end;
+
 procedure DbReleaseColumnNames(p: PDbEvalContext);
 var
   i: cint;
@@ -1058,6 +1118,8 @@ var
   slot:      PPTclObj;
   pColList:  PTclObj;
   pStar:     PTclObj;
+  pDict:     PTclObj;
+  pInterp:   PTclInterp;
 begin
   if p^.apColName = nil then
   begin
@@ -1076,21 +1138,32 @@ begin
       end;
       p^.apColName := apColName;
     end;
-    { Populate target(*) — tclsqlite.c:1718..1744 (array form only;
-      dict form is identical in spec but unused by the smoke gates). }
-    if (p^.pVarName <> nil) and (apColName <> nil) and
-       ((p^.evalFlags and SQLITE_EVAL_ASDICT) = 0) then
+    { Populate target(*) / dict(*) — tclsqlite.c:1716..1744. }
+    if p^.pVarName <> nil then
     begin
-      pColList := Tcl_NewListObj(0, nil);
+      pInterp  := p^.pDb^.interp;
+      pColList := Tcl_NewObj;
       pStar    := Tcl_NewStringObj('*', -1);
       Tcl_IncrRefCount(pColList);
       Tcl_IncrRefCount(pStar);
       for i := 0 to nCol - 1 do
       begin
         slot := PPTclObj(PtrUInt(apColName) + PtrUInt(i)*SizeOf(Pointer));
-        Tcl_ListObjAppendElement(p^.pDb^.interp, pColList, slot^);
+        Tcl_ListObjAppendElement(pInterp, pColList, slot^);
       end;
-      Tcl_ObjSetVar2(p^.pDb^.interp, p^.pVarName, pStar, pColList, 0);
+      if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+        Tcl_ObjSetVar2(pInterp, p^.pVarName, pStar, pColList, 0)
+      else
+      begin
+        pDict := Tcl_ObjGetVar2(pInterp, p^.pVarName, nil, 0);
+        if pDict = nil then
+          pDict := Tcl_NewDictObj
+        else if Tcl_IsShared(pDict) <> 0 then
+          pDict := Tcl_DuplicateObj(pDict);
+        if Tcl_DictObjPut(pInterp, pDict, pStar, pColList) = TCL_OK then
+          Tcl_ObjSetVar2(pInterp, p^.pVarName, nil, pDict, 0);
+        Tcl_BounceRefCount(pDict);
+      end;
       Tcl_DecrRefCount(pStar);
       Tcl_DecrRefCount(pColList);
     end;
@@ -1237,6 +1310,7 @@ var
   slot:      PPTclObj;
   pColName:  PTclObj;
   pColVal:   PTclObj;
+  pDict:     PTclObj;
   data1:     PClientDataArray;
 begin
   rc := bodyRc;
@@ -1254,11 +1328,47 @@ begin
     begin
       slot := PPTclObj(PtrUInt(apColName) + PtrUInt(i)*SizeOf(Pointer));
       pColName := slot^;
-      pColVal  := DbEvalColumnValueCtx(p, i);
+      { tclsqlite.c:1929..1977 — per-column target population, four arms. }
       if pVarName = nil then
-        Tcl_ObjSetVar2(interp, pColName, nil, pColVal, 0)
+        Tcl_ObjSetVar2(interp, pColName, nil, DbEvalColumnValueCtx(p, i), 0)
+      else if ((p^.evalFlags and SQLITE_EVAL_WITHOUTNULLS) <> 0)
+           and (sqlite3_column_type(p^.pPreStmt^.pStmt, i) = SQLITE_NULL) then
+      begin
+        { Remove NULL-containing column from the target container. }
+        if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+          { Target is an array. }
+          Tcl_UnsetVar2(interp, Tcl_GetString(pVarName),
+                        Tcl_GetString(pColName), 0)
+        else
+        begin
+          { Target is a dict. }
+          pDict := Tcl_ObjGetVar2(interp, pVarName, nil, 0);
+          if pDict <> nil then
+          begin
+            if Tcl_IsShared(pDict) <> 0 then
+              pDict := Tcl_DuplicateObj(pDict);
+            if Tcl_DictObjRemove(interp, pDict, pColName) = TCL_OK then
+              Tcl_ObjSetVar2(interp, pVarName, nil, pDict, 0);
+            Tcl_BounceRefCount(pDict);
+          end;
+        end;
+      end
+      else if (p^.evalFlags and SQLITE_EVAL_ASDICT) = 0 then
+        { Target is an array: set target(colName) = colValue. }
+        Tcl_ObjSetVar2(interp, pVarName, pColName, DbEvalColumnValueCtx(p, i), 0)
       else
-        Tcl_ObjSetVar2(interp, pVarName, pColName, pColVal, 0);
+      begin
+        { Target is a dict: set target(colName) = colValue. }
+        pDict := Tcl_ObjGetVar2(interp, pVarName, nil, 0);
+        if pDict = nil then
+          pDict := Tcl_NewDictObj
+        else if Tcl_IsShared(pDict) <> 0 then
+          pDict := Tcl_DuplicateObj(pDict);
+        if Tcl_DictObjPut(interp, pDict, pColName,
+                          DbEvalColumnValueCtx(p, i)) = TCL_OK then
+          Tcl_ObjSetVar2(interp, pVarName, nil, pDict, 0);
+        Tcl_BounceRefCount(pDict);
+      end;
     end;
 
     { 9.4.divbug.28 — the NRE per-row continuation path crashes (Tcl
@@ -1292,14 +1402,14 @@ end;
   DbEvalArm path is used (callers gate on DbUseNre before invoking us).
   9.4.2.x.1.d. }
 function DbEvalScriptArm(pDb: PSqliteDb; interp: PTclInterp;
-  pSql, pVarName, pScript: PTclObj): cint;
+  pSql, pVarName, pScript: PTclObj; evalFlags: cint): cint;
 var
   p:   PDbEvalContext;
   cd2: array[0..1] of TClientData;  { tclsqlite.c:3340 — ClientData cd2[2] }
 begin
   p := PDbEvalContext(Tcl_Alloc(SizeOf(TDbEvalContext)));
   FillChar(p^, SizeOf(TDbEvalContext), 0);
-  DbEvalInit(p, pDb, pSql, pVarName, 0);
+  DbEvalInit(p, pDb, pSql, pVarName, evalFlags);
   Tcl_IncrRefCount(pScript);
   cd2[0] := TClientData(p);
   cd2[1] := TClientData(pScript);
@@ -1397,10 +1507,39 @@ var
   bDone:      Boolean;
   sEval:      TDbEvalContext;
   pRet:       PTclObj;
+  zOpt:       PAnsiChar;
+  evalFlags:  cint;
 begin
+  evalFlags := 0;
+  { Option-parsing loop — port of tclsqlite.c:3300..3318.  Consume any
+    leading `-withoutnulls`/`-asdict` switches; an unknown `-` option is
+    an error.  Each consumed switch shifts objv up by one and decrements
+    objc, exactly as the C `objc--; objv++;` does.  The flags drive the
+    row-shaping done in DbEvalRowInfo / DbEvalNextCmd. }
+  while (objc > 3) and (ObjvAt(objv, 2) <> nil) do
+  begin
+    zOpt := Tcl_GetString(ObjvAt(objv, 2));
+    if (zOpt = nil) or (zOpt^ <> '-') then
+      Break;
+    if StrComp(zOpt, '-withoutnulls') = 0 then
+      evalFlags := evalFlags or SQLITE_EVAL_WITHOUTNULLS
+    else if StrComp(zOpt, '-asdict') = 0 then
+      evalFlags := evalFlags or SQLITE_EVAL_ASDICT
+    else
+    begin
+      Tcl_AppendResult(interp, PChar('unknown option: "'), zOpt,
+        PChar('"'), Pointer(nil));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Dec(objc);
+    objv := PPTclObj(PtrUInt(objv) + SizeOf(Pointer));
+  end;
+
   if (objc < 3) or (objc > 5) then
   begin
-    Tcl_WrongNumArgs(interp, 2, objv, PChar('SQL ?ARRAY-NAME? ?SCRIPT?'));
+    Tcl_WrongNumArgs(interp, 2, objv,
+      PChar('?OPTIONS? SQL ?VAR-NAME? ?SCRIPT?'));
     Result := TCL_ERROR;
     Exit;
   end;
@@ -1433,7 +1572,7 @@ begin
       list form below stays on the existing direct prepare/step loop
       (tclsqlite.c:3320..3338). }
     Result := DbEvalScriptArm(pDb, interp, ObjvAt(objv, 2),
-                              pVarName, pScript);
+                              pVarName, pScript, evalFlags);
     Exit;
   end;
 
@@ -2495,6 +2634,45 @@ end;
 { DbBusyArm — `db busy ?CALLBACK?`  tclsqlite.c:2641..2670.
   2-arg form reports the current callback; 3-arg form replaces it and
   (re)registers via sqlite3_busy_handler (or clears it). }
+{ DbBindFallbackArm — port of the DB_BIND_FALLBACK arm of DbObjCmd
+  (tclsqlite.c:2611..2634).  Reads (objc==2) or sets (objc==3) the
+  zBindFallback callback script.  An empty callback reverts to the
+  default NULL-binding behaviour. }
+function DbBindFallbackArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  pDb:       PSqliteDb;
+  zCallback: PAnsiChar;
+  len:       cint;
+begin
+  pDb := PSqliteDb(clientData);
+  if objc > 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 2, objv, PChar('?CALLBACK?'));
+    Result := TCL_ERROR;
+    Exit;
+  end
+  else if objc = 2 then
+  begin
+    if pDb^.zBindFallback <> nil then
+      Tcl_AppendResult(interp, pDb^.zBindFallback, Pointer(nil));
+  end
+  else
+  begin
+    if pDb^.zBindFallback <> nil then
+      Tcl_Free(pDb^.zBindFallback);
+    zCallback := Tcl_GetStringFromObj(ObjvAt(objv, 2), @len);
+    if (zCallback <> nil) and (len > 0) then
+    begin
+      pDb^.zBindFallback := Tcl_Alloc(len + 1);
+      Move(zCallback^, pDb^.zBindFallback^, len + 1);
+    end
+    else
+      pDb^.zBindFallback := nil;
+  end;
+  Result := TCL_OK;
+end;
+
 function DbBusyArm(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
 var
@@ -3064,6 +3242,10 @@ begin
     sqlite3_exec(pDb^.db, PChar('ROLLBACK'), nil, nil, nil);
   end;
 
+  { tclsqlite.c:1346 — release the reference taken in DbTransactionArm.
+    If `db close` ran inside the body, this drops nRef to 0 and finally
+    closes/frees the connection here. }
+  DelDatabaseRef(pDb);
   Result := rc;
 end;
 
@@ -3139,6 +3321,10 @@ begin
     continuation and hand the body off to Tcl_NREvalObj so nested vwait
     can unwind cleanly; otherwise fall back to the recursive form. }
   pDb^.interp := interp;
+  { tclsqlite.c:4001 — DbTransPostCmd() calls delDatabaseRef().  Pin the
+    SqliteDb across the body so a `db close` inside SCRIPT only schedules
+    the teardown (drops the cmd's ref) instead of freeing us mid-commit. }
+  AddDatabaseRef(pDb);
   if DbUseNre then
   begin
     Tcl_NRAddCallback(interp, @DbTransPostCmdNRE,
@@ -3861,11 +4047,329 @@ begin
     sqlite3_file_control(pDb^.db, zSchema, SQLITE_FCNTL_SIZE_LIMIT, @mxSize);
 end;
 
+{ DbFormatArm — port of dbQrf (tclsqlite.c:2111).  Parses the `db format`
+  option set into a TQrfSpec and runs each statement of the SQL through the
+  ported QRF (PasQrf.sqlite3_format_query_result).  9.4.divbug.91.011/.012. }
+function DbFormatArm(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  azAlign: array[0..16] of PChar = (
+    'auto','bottom','c','center','e','left','middle','n','ne','nw','right',
+    's','se','sw','top','w', nil);
+  aAlignMap: array[0..15] of Byte = (
+    QRF_ALIGN_Auto, QRF_ALIGN_Bottom, QRF_ALIGN_C, QRF_ALIGN_Center,
+    QRF_ALIGN_E, QRF_ALIGN_Left, QRF_ALIGN_Middle, QRF_ALIGN_N, QRF_ALIGN_NE,
+    QRF_ALIGN_NW, QRF_ALIGN_Right, QRF_ALIGN_S, QRF_ALIGN_SE, QRF_ALIGN_SW,
+    QRF_ALIGN_Top, QRF_ALIGN_W);
+  azStyles: array[0..19] of PChar = (
+    'auto','box','column','count','csv','eqp','explain','html','insert',
+    'jobject','json','line','list','markdown','quote','stats','stats-est',
+    'stats-vm','table', nil);
+  aStyleMap: array[0..18] of Byte = (
+    QRF_STYLE_Auto, QRF_STYLE_Box, QRF_STYLE_Column, QRF_STYLE_Count,
+    QRF_STYLE_Csv, QRF_STYLE_Eqp, QRF_STYLE_Explain, QRF_STYLE_Html,
+    QRF_STYLE_Insert, QRF_STYLE_JObject, QRF_STYLE_Json, QRF_STYLE_Line,
+    QRF_STYLE_List, QRF_STYLE_Markdown, QRF_STYLE_Quote, QRF_STYLE_Stats,
+    QRF_STYLE_StatsEst, QRF_STYLE_StatsVm, QRF_STYLE_Table);
+  azEsc: array[0..4] of PChar = ('ascii','auto','off','symbol', nil);
+  aEscMap: array[0..3] of Byte = (QRF_ESC_Ascii, QRF_ESC_Auto, QRF_ESC_Off, QRF_ESC_Symbol);
+  azText: array[0..10] of PChar = (
+    'off','on','auto','csv','html','json','plain','relaxed','sql','tcl', nil);
+  aTextMap: array[0..7] of Byte = (
+    QRF_TEXT_Auto, QRF_TEXT_Csv, QRF_TEXT_Html, QRF_TEXT_Json,
+    QRF_TEXT_Plain, QRF_TEXT_Relaxed, QRF_TEXT_Sql, QRF_TEXT_Tcl);
+  azBlob: array[0..7] of PChar = (
+    'auto','hex','json','tcl','text','sql','size', nil);
+  aBlobMap: array[0..6] of Byte = (
+    QRF_BLOB_Auto, QRF_BLOB_Hex, QRF_BLOB_Json, QRF_BLOB_Tcl,
+    QRF_BLOB_Text, QRF_BLOB_Sql, QRF_BLOB_Size);
+  azBool: array[0..5] of PChar = ('auto','yes','no','on','off', nil);
+  aBoolMap: array[0..4] of Byte = (0, 2, 1, 2, 1);
+label format_failed;
+var
+  pDb:     PSqliteDb;
+  zResult: PAnsiChar;
+  zSql:    PAnsiChar;
+  i, rc, style, esc, txt, blob, v, k, ax, jj, nlist: cint;
+  qrf:     TQrfSpec;
+  zArg:    PChar;
+  pTerm:   PTclObj;
+  pStmtPtr: Pointer;
+  pPS:     PSqlPreparedStmt;
+  zErr:    PAnsiChar;
+
+  procedure FreeAndReturn(r: cint);
+  begin
+    sqlite3_free(qrf.aWidth);
+    sqlite3_free(qrf.aAlign);
+    sqlite3_free(zResult);
+    rc := r;
+  end;
+
+begin
+  pDb := PSqliteDb(clientData);
+  zResult := nil;
+  zSql := nil;
+  FillChar(qrf, SizeOf(qrf), 0);
+  qrf.iVersion := 1;
+  qrf.pzOutput := @zResult;
+
+  i := 2;
+  while i < objc do
+  begin
+    zArg := Tcl_GetString(ObjvAt(objv, i));
+    if zArg[0] <> '-' then
+    begin
+      if zSql <> nil then
+      begin
+        Tcl_AppendResult(interp, PChar('unknown argument: '), zArg, Pointer(nil));
+        FreeAndReturn(TCL_ERROR); goto format_failed;
+      end;
+      zSql := zArg;
+    end
+    else if i = objc - 1 then
+    begin
+      Tcl_AppendResult(interp, PChar('option has no argument: '), zArg, Pointer(nil));
+      FreeAndReturn(TCL_ERROR); goto format_failed;
+    end
+    else if StrComp(zArg, '-style') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azStyles[0],
+                                'format style (-style)', 0, @style);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.eStyle := aStyleMap[style];
+      Inc(i);
+    end
+    else if StrComp(zArg, '-esc') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azEsc[0],
+                                'control character escape (-esc)', 0, @esc);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.eEsc := aEscMap[esc];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-text') = 0) or (StrComp(zArg, '-title') = 0) then
+    begin
+      { -title can be off/on; -text may not.  Search starts at element k*2. }
+      k := Ord(zArg[2] = 'e');
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azText[k*2], zArg,
+                                0, @txt);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if k <> 0 then
+        qrf.eText := aTextMap[txt]
+      else if txt <= 1 then
+      begin
+        if txt <> 0 then qrf.bTitles := QRF_Yes else qrf.bTitles := QRF_No;
+        qrf.eTitle := QRF_TEXT_Auto;
+      end
+      else
+      begin
+        qrf.bTitles := QRF_Yes;
+        qrf.eTitle := aTextMap[txt-2];
+      end;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-blob') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azBlob[0],
+                                'BLOB encoding (-blob)', 0, @blob);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.eBlob := aBlobMap[blob];
+      Inc(i);
+    end
+    else if StrComp(zArg, '-wordwrap') = 0 then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azBool[0],
+                                '-wordwrap', 0, @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      qrf.bWordWrap := aBoolMap[v];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-textjsonb') = 0) or (StrComp(zArg, '-splitcolumn') = 0)
+         or (StrComp(zArg, '-border') = 0) then
+    begin
+      rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azBool[0],
+                                zArg, 0, @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if zArg[1] = 't' then qrf.bTextJsonb := aBoolMap[v]
+      else if zArg[1] = 'b' then qrf.bBorder := aBoolMap[v]
+      else qrf.bSplitColumn := aBoolMap[v];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-defaultalign') = 0) or (StrComp(zArg, '-titlealign') = 0) then
+    begin
+      if zArg[1] = 'd' then
+        rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azAlign[0],
+                                  'default alignment (-defaultalign)', 0, @ax)
+      else
+        rc := Tcl_GetIndexFromObj(interp, ObjvAt(objv, i+1), @azAlign[0],
+                                  'title alignment (-titlealign)', 0, @ax);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if zArg[1] = 'd' then qrf.eDfltAlign := aAlignMap[ax]
+      else qrf.eTitleAlign := aAlignMap[ax];
+      Inc(i);
+    end
+    else if (StrComp(zArg, '-wrap') = 0) or (StrComp(zArg, '-screenwidth') = 0)
+         or (StrComp(zArg, '-linelimit') = 0) or (StrComp(zArg, '-titlelimit') = 0) then
+    begin
+      v := 0;
+      rc := Tcl_GetIntFromObj(interp, ObjvAt(objv, i+1), @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if v < QRF_MIN_WIDTH then v := QRF_MIN_WIDTH
+      else if v > QRF_MAX_WIDTH then v := QRF_MAX_WIDTH;
+      if zArg[1] = 'w' then qrf.nWrap := v
+      else if zArg[1] = 's' then qrf.nScreenWidth := v
+      else if zArg[1] = 't' then qrf.nTitleLimit := v
+      else qrf.nLineLimit := v;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-charlimit') = 0 then
+    begin
+      v := 0;
+      rc := Tcl_GetIntFromObj(interp, ObjvAt(objv, i+1), @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if v < 0 then v := 0;
+      qrf.nCharLimit := v;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-multiinsert') = 0 then
+    begin
+      v := 0;
+      rc := Tcl_GetIntFromObj(interp, ObjvAt(objv, i+1), @v);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      if v < 0 then v := 0;
+      qrf.nMultiInsert := u32(v);
+      Inc(i);
+    end
+    else if StrComp(zArg, '-align') = 0 then
+    begin
+      nlist := 0;
+      rc := Tcl_ListObjLength(interp, ObjvAt(objv, i+1), @nlist);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      sqlite3_free(qrf.aAlign);
+      qrf.aAlign := PByte(sqlite3_malloc64(u64(nlist + 1)));
+      if qrf.aAlign = nil then
+      begin
+        Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+        FreeAndReturn(TCL_ERROR); goto format_failed;
+      end;
+      FillChar(qrf.aAlign^, nlist + 1, 0);
+      qrf.nAlign := nlist;
+      for jj := 0 to nlist - 1 do
+      begin
+        rc := Tcl_ListObjIndex(interp, ObjvAt(objv, i+1), jj, @pTerm);
+        if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+        rc := Tcl_GetIndexFromObj(interp, pTerm, @azAlign[0],
+                                  'column alignment (-align)', 0, @ax);
+        if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+        qrf.aAlign[jj] := aAlignMap[ax];
+      end;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-widths') = 0 then
+    begin
+      nlist := 0;
+      rc := Tcl_ListObjLength(interp, ObjvAt(objv, i+1), @nlist);
+      if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+      sqlite3_free(qrf.aWidth);
+      qrf.aWidth := PSmallInt(sqlite3_malloc64(u64(nlist + 1) * SizeOf(SmallInt)));
+      if qrf.aWidth = nil then
+      begin
+        Tcl_AppendResult(interp, PChar('out of memory'), Pointer(nil));
+        FreeAndReturn(TCL_ERROR); goto format_failed;
+      end;
+      FillChar(qrf.aWidth^, (nlist + 1) * SizeOf(SmallInt), 0);
+      qrf.nWidth := nlist;
+      for jj := 0 to nlist - 1 do
+      begin
+        rc := Tcl_ListObjIndex(interp, ObjvAt(objv, i+1), jj, @pTerm);
+        if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+        v := 0;
+        Tcl_GetIntFromObj(interp, pTerm, @v);
+        if v < -QRF_MAX_WIDTH then v := -QRF_MAX_WIDTH
+        else if v > QRF_MAX_WIDTH then v := QRF_MAX_WIDTH;
+        qrf.aWidth[jj] := SmallInt(v);
+      end;
+      Inc(i);
+    end
+    else if StrComp(zArg, '-columnsep') = 0 then
+    begin
+      qrf.zColumnSep := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-rowsep') = 0 then
+    begin
+      qrf.zRowSep := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-tablename') = 0 then
+    begin
+      qrf.zTableName := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-null') = 0 then
+    begin
+      qrf.zNull := Tcl_GetString(ObjvAt(objv, i+1)); Inc(i);
+    end
+    else if StrComp(zArg, '-version') = 0 then
+    begin
+      qrf.iVersion := StrToIntDef(Tcl_GetString(ObjvAt(objv, i+1)), 0); Inc(i);
+    end
+    else
+    begin
+      Tcl_AppendResult(interp, PChar('unknown option: '), zArg, Pointer(nil));
+      FreeAndReturn(TCL_ERROR); goto format_failed;
+    end;
+    Inc(i);
+  end;
+
+  while (zSql <> nil) and (zSql[0] <> #0) do
+  begin
+    pStmtPtr := nil;
+    zErr := nil;
+    rc := DbPrepareAndBind(pDb, zSql, @zSql, @pStmtPtr);
+    if rc <> 0 then begin FreeAndReturn(rc); goto format_failed; end;
+    if pStmtPtr = nil then continue;
+    pPS := PSqlPreparedStmt(pStmtPtr);
+    rc := sqlite3_format_query_result(pPS^.pStmt, @qrf, @zErr);
+    DbReleaseStmt(pDb, pPS, 0);
+    if rc <> 0 then
+    begin
+      Tcl_SetResult(interp, zErr, TCL_VOLATILE);
+      sqlite3_free(zErr);
+      FreeAndReturn(TCL_ERROR); goto format_failed;
+    end;
+  end;
+  Tcl_SetResult(interp, zResult, TCL_VOLATILE);
+  FreeAndReturn(TCL_OK);
+
+format_failed:
+  Result := rc;
+end;
+
 { DbObjCmdAdaptor — the per-connection dispatcher.  In 9.4.2.c only
   the "close" arm is wired; everything else returns TCL_ERROR with
   a stable "unknown subcommand" string so callers can grep it. }
 function DbObjCmdAdaptor(clientData: TClientData; interp: PTclInterp;
   objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  { Verbatim copy of the upstream DB_strs[] subcommand table
+    (tclsqlite.c:2439..2454), in the same order, NUL-terminated.  Used only
+    to synthesise C's `bad option "X": must be ...` error on a no-match
+    (tclsqlite.c:2479).  Keep in sync with the implemented method arms. }
+  DB_strs: array[0..43] of PAnsiChar = (
+    'authorizer', 'backup', 'bind_fallback',
+    'busy', 'cache', 'changes',
+    'close', 'collate', 'collation_needed',
+    'commit_hook', 'complete', 'config',
+    'copy', 'deserialize', 'enable_load_extension',
+    'errorcode', 'erroroffset', 'eval',
+    'exists', 'format', 'function',
+    'incrblob', 'interrupt', 'last_insert_rowid',
+    'nullvalue', 'onecolumn', 'preupdate',
+    'profile', 'progress', 'rekey',
+    'restore', 'rollback_hook', 'serialize',
+    'status', 'timeout', 'total_changes',
+    'trace', 'trace_v2', 'transaction',
+    'unlock_notify', 'update_hook', 'version',
+    'wal_hook', nil);
 var
   zSub:  PAnsiChar;
   zSelf: PAnsiChar;
@@ -3933,6 +4437,12 @@ begin
   { changes — tclsqlite.c:2728.  We use sqlite3_changes64 (i64). }
   if (zSub <> nil) and (StrComp(zSub, 'changes') = 0) then
   begin
+    if objc <> 2 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar(''));
+      Result := TCL_ERROR;
+      Exit;
+    end;
     Tcl_SetObjResult(interp,
       Tcl_NewWideIntObj(sqlite3_changes64(PSqliteDb(clientData)^.db)));
     Result := TCL_OK;
@@ -3942,6 +4452,12 @@ begin
   { last_insert_rowid — tclsqlite.c:3552. }
   if (zSub <> nil) and (StrComp(zSub, 'last_insert_rowid') = 0) then
   begin
+    if objc <> 2 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar(''));
+      Result := TCL_ERROR;
+      Exit;
+    end;
     Tcl_SetObjResult(interp,
       Tcl_NewWideIntObj(sqlite3_last_insert_rowid(PSqliteDb(clientData)^.db)));
     Result := TCL_OK;
@@ -3997,9 +4513,7 @@ begin
     9.4.divbug.64. }
   if (zSub <> nil) and (StrComp(zSub, 'format') = 0) then
   begin
-    Tcl_SetResult(interp, PChar('QRF not available in this build'),
-                  TCL_VOLATILE);
-    Result := TCL_ERROR;
+    Result := DbFormatArm(clientData, interp, objc, objv);
     Exit;
   end;
 
@@ -4032,6 +4546,15 @@ begin
                     or  (StrComp(zSub, 'auth') = 0)) then
   begin
     Result := DbAuthorizerArm(clientData, interp, objc, objv);
+    Exit;
+  end;
+
+  { bind_fallback — tclsqlite.c:2611 (DB_BIND_FALLBACK).  Stores a Tcl
+    callback script that DbPrepareAndBind invokes for unresolved bind
+    parameters. }
+  if (zSub <> nil) and (StrComp(zSub, 'bind_fallback') = 0) then
+  begin
+    Result := DbBindFallbackArm(clientData, interp, objc, objv);
     Exit;
   end;
 
@@ -4312,11 +4835,47 @@ begin
     Exit;
   end;
 
+  { erroroffset — tclsqlite.c:3247 (DB_ERROROFFSET). }
+  if (zSub <> nil) and (StrComp(zSub, 'erroroffset') = 0) then
+  begin
+    Tcl_SetObjResult(interp,
+      Tcl_NewIntObj(sqlite3_error_offset(PSqliteDb(clientData)^.db)));
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { rekey — tclsqlite.c:3659 (DB_REKEY).  No codec in this build, so the
+    only observable behaviour is the arg-count check. }
+  if (zSub <> nil) and (StrComp(zSub, 'rekey') = 0) then
+  begin
+    if objc <> 3 then
+    begin
+      Tcl_WrongNumArgs(interp, 2, objv, PChar('KEY'));
+      Result := TCL_ERROR;
+      Exit;
+    end;
+    Result := TCL_OK;
+    Exit;
+  end;
+
+  { Fall-through: the subcommand matched none of the *implemented* method
+    arms above.  Run objv[1] through Tcl_GetIndexFromObj over the full
+    upstream DB_strs table (tclsqlite.c:2439..2454, 2479).  On no-match it
+    sets C's canonical `bad option "X": must be ...` error and returns
+    non-zero.  On a match (iBool>=0) the option IS a recognised upstream
+    method that this port has not yet ported (e.g. bind_fallback — the
+    sqlite3_bind_fallback engine API is not present); report it as such
+    rather than emit an empty error. }
+  iBool := -1;
+  if Tcl_GetIndexFromObj(interp, ObjvAt(objv, 1), @DB_strs[0],
+       PChar('option'), 0, @iBool) <> TCL_OK then
+  begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
   Tcl_AppendResult(interp,
-    PChar('unknown subcommand "'),
-    zSub,
-    PChar('" - implemented in 9.4.2.d..o'),
-    Pointer(nil));
+    PChar('subcommand not implemented in this build: "'),
+    zSub, PChar('"'), Pointer(nil));
   Result := TCL_ERROR;
 end;
 
@@ -4382,6 +4941,7 @@ var
   bTranslateFileName: cint;
   ds:       TTclDString;
   zTrans:   PAnsiChar;
+  dqsCfg:   i32;
 
   function Usage: cint;
   begin
@@ -4580,23 +5140,45 @@ begin
       no auto-extension table, so we call Md5_Register directly here.
       Required by backup, backup_ioerr, fuzz3, interrupt, trans2 tests. }
     Md5_Register(pHandle, nil, nil);
+    { DQS=3 testfixture flavour: the upstream Tcl test harness links a
+      libsqlite3 built with the amalgamation default SQLITE_DQS=3 (both
+      DBCONFIG_DQS_DDL and DBCONFIG_DQS_DML on), whereas the standalone
+      shell oracle is built -DSQLITE_DQS=0.  pas-sqlite3 ships a single
+      library whose default is DQS=0 (to match the shell oracle for
+      .dbconfig parity), so re-enable the legacy double-quoted-string
+      behaviour here on every Tcl connection to mirror the testfixture
+      build.  Required by indexexpr1-2100..2140 (CREATE INDEX ON t1("y")
+      demotes the bare double-quoted identifier to a string literal). }
+    dqsCfg := 0;
+    sqlite3_db_config_int(pHandle, SQLITE_DBCONFIG_DQS_DDL, 1, @dqsCfg);
+    sqlite3_db_config_int(pHandle, SQLITE_DBCONFIG_DQS_DML, 1, @dqsCfg);
   end;
-  if (rc <> SQLITE_OK) or (pHandle = nil) or
-     (sqlite3_errcode(pHandle) <> SQLITE_OK) then
+  { Port of tclsqlite.c:4383..4399 error arm.  Note: the error message is
+    built with sqlite3_mprintf and reported via Tcl_SetResult, NOT copied
+    directly.  This matters under a forced init failure (e.g. mutex2.test
+    `disable_mutex_init 7`): sqlite3_mprintf allocates through
+    sqlite3_malloc, which returns NULL when sqlite3_initialize() fails with
+    NOMEM, so zErrMsg ends up NULL and Tcl_SetResult sets an EMPTY result
+    (mutex2-2.1 expects `{1 {}}`, not `{1 {out of memory}}`). }
+  { sqlite3_mprintf("%s", x) is a malloc-backed copy of x; sqlite3StrDup is
+    the faithful equivalent (allocates via sqlite3_malloc, returns NULL when
+    sqlite3_initialize() has failed with NOMEM). }
+  zErr := nil;
+  if pHandle <> nil then
   begin
-    { Port of tclsqlite.c:4384..4397 error arm: prefer sqlite3_errmsg
-      when a handle exists, else fall back to sqlite3_errstr. }
-    if pHandle <> nil then
+    if sqlite3_errcode(pHandle) <> SQLITE_OK then
     begin
-      zErr := sqlite3_errmsg(pHandle);
-      Tcl_AppendResult(interp, zErr, Pointer(nil));
+      zErr := sqlite3StrDup(sqlite3_errmsg(pHandle));
       sqlite3_close_v2(pHandle);
-    end
-    else
-    begin
-      zErr := sqlite3_errstr(rc);
-      Tcl_AppendResult(interp, zErr, Pointer(nil));
+      pHandle := nil;
     end;
+  end
+  else
+    zErr := sqlite3StrDup(sqlite3_errstr(rc));
+  if pHandle = nil then
+  begin
+    Tcl_SetResult(interp, zErr, TCL_VOLATILE);
+    sqlite3_free(zErr);
     Result := TCL_ERROR;
     Exit;
   end;
@@ -4627,6 +5209,7 @@ begin
   pDb^.zProfile := nil;
   pDb^.zAuth    := nil;
   pDb^.zBusy        := nil;
+  pDb^.zBindFallback := nil;
   pDb^.zProgress    := nil;
   pDb^.zCommit      := nil;
   pDb^.pUpdateHook  := nil;
@@ -4774,6 +5357,57 @@ begin
   Result := TCL_OK;
 end;
 
+{ Tcl `sqlite3_test_control_pending_byte OFFSET`.  Pas port of
+  test_control_pending_byte (test1.c) which calls
+  sqlite3_test_control(SQLITE_TESTCTRL_PENDING_BYTE, offset).  tester.tcl:102
+  invokes this at load time with 0x0010000 so the locking page is reachable
+  in small test databases.  Returns the previous pending-byte value. }
+function TestControlPendingByte(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_TESTCTRL_PENDING_BYTE = 11;
+var
+  wv:  Int64;
+  old: i32;
+begin
+  if objc <> 2 then begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('OFFSET'));
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  if Tcl_GetWideIntFromObj(interp, ObjvAt(objv, 1), @wv) <> TCL_OK then begin
+    Result := TCL_ERROR;
+    Exit;
+  end;
+  old := sqlite3_test_control(SQLITE_TESTCTRL_PENDING_BYTE, i32(wv));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(cint(old)));
+  Result := TCL_OK;
+end;
+
+{ Tcl `save_prng_state` / `restore_prng_state`.  Pas port of save_prng_state /
+  restore_prng_state (test1.c) which call
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SAVE) and
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_RESTORE) respectively.  Tests such
+  as rowid-12.x snapshot the PRNG, replay it across inserts, and rely on the
+  random-rowid guesser colliding deterministically to drive SQLITE_FULL. }
+function SavePrngState(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_TESTCTRL_PRNG_SAVE = 5;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_SAVE);
+  Result := TCL_OK;
+end;
+
+function RestorePrngState(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  SQLITE_TESTCTRL_PRNG_RESTORE = 6;
+begin
+  sqlite3_test_control(SQLITE_TESTCTRL_PRNG_RESTORE);
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -4784,6 +5418,15 @@ begin
     @DbMain, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('register_dbstat_vtab'),
     @TestRegisterDbstatVtab, nil, nil);
+  { tester.tcl:102 — move the locking page into reach of small test DBs. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_test_control_pending_byte'),
+    @TestControlPendingByte, nil, nil);
+  { rowid-12.x and friends snapshot/replay the PRNG to drive deterministic
+    random-rowid collisions; tester_min.tcl only shims these as no-ops. }
+  Tcl_CreateObjCommand(interp, PChar('save_prng_state'),
+    @SavePrngState, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('restore_prng_state'),
+    @RestorePrngState, nil, nil);
   { 9.4.divbug.88.012..020 — corrupt*.test prologue requires this. }
   Tcl_CreateObjCommand(interp, PChar('nonzero_reserved_bytes'),
     @NonzeroReservedBytes, nil, nil);
@@ -4800,9 +5443,21 @@ begin
   Sqlitetesttcl_Init(interp);
   { 9.4.6.l.1 — test8.c: register_echo_module / sqlite3_declare_vtab. }
   Sqlitetest8_Init(interp);
+  { test_schema.c: register_schema_module (vtab2.test). }
+  Sqlitetestschema_Init(interp);
+  { test_fs.c: register_fs_module (vtabH.test, fts4content.test). }
+  Sqlitetestfs_Init(interp);
+  { test_intarray.c: sqlite3_intarray_create / _bind (intarray.test). }
+  Sqlitetestintarray_Init(interp);
   { 9.4.6.q — test1.c: sqlite3_connection_pointer / sqlite3_db_config /
     atomic_batch_write / load_static_extension. }
   Sqlitetest1_Init(interp);
+  { test_autoext.c: sqlite3_auto_extension_sqr/_cube/_broken + cancel/reset
+    (loadext2.test).  MUST run after Sqlitetest1_Init — Test1 registers a
+    partial sqlite3_auto_extension_sqr backed by its own sqr_init; running
+    last makes the complete module own both the register and cancel commands
+    so loadext2's pointer-identity register/cancel pairing matches. }
+  Sqlitetest_autoext_Init(interp);
   { 9.4.6.l.4 — test_func.c: autoinstall_test_functions. }
   Sqlitetestfunc_Init(interp);
   { 9.4.6.n / 9.4.7.b — test_malloc.c: the malloc fault-injection layer
@@ -4832,6 +5487,11 @@ begin
     is undefined → Tcl reads 0 → expected {4 3} comes back as {4 0}. }
   Tcl_LinkVar(interp, PChar('sqlite_search_count'),
               @sqlite3_search_count, TCL_LINK_INT);
+  { test1.c:9376..9377 Tcl_LinkVar( sqlite_interrupt_count ) — test-only
+    countdown decremented per VDBE op; fires sqlite3_interrupt(db) at 0.
+    interrupt.test section 3 sets it to simulate an interrupt after N steps. }
+  Tcl_LinkVar(interp, PChar('sqlite_interrupt_count'),
+              @sqlite3_interrupt_count, TCL_LINK_INT);
   { test1.c:9372 Tcl_LinkVar( sqlite3_max_blobsize ) — watermark of the
     largest string/blob materialised on the VDBE register stack.  zeroblob.test
     reads it to prove trailing zeroblobs are never instantiated. }

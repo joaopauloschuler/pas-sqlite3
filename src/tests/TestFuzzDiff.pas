@@ -347,6 +347,16 @@ var
   ok: Boolean;
 
 begin
+  { No-argument invocation is a graceful SKIP (rc=0), not a failure.  The
+    regression gate (src/tests/run_regression.sh) auto-discovers every
+    bin/Test* and runs it with NO arguments; like the other corpus drivers
+    (TestSQLCorpus, TestShellScanstatsVm2) this harness has no built-in
+    workload, so with no input there is simply nothing to diff.  It still
+    does the full differential run when an input file IS supplied. }
+  if ParamCount = 0 then begin
+    Writeln('SKIP    TestFuzzDiff: no <input.dbsqlfuzz> given (nothing to diff)');
+    Halt(0);
+  end;
   if ParamCount <> 1 then begin
     Writeln(StdErr, 'usage: TestFuzzDiff <input.dbsqlfuzz>');
     Halt(1);

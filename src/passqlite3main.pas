@@ -375,6 +375,18 @@ procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
   a full OP_ParseSchema → sqlite3_exec round trip on a btree that has
   no actual sqlite_master rows yet).
   ---------------------------------------------------------------------- }
+{ Port-local mInitFlags bit (above the C INITFLAG_AlterMask 0x0007 range):
+  set on the authoritative fresh schema load (sqlite3InitOne) so the
+  sqlite3InitCallback "already published" dedup guard — a workaround for the
+  dropped WHERE filter on the schema SELECT (see execParseSchemaImpl) — is
+  SUPPRESSED.  During InitOne the per-db schema was just reset, so a second
+  schema row whose object is already in the hash is a genuine duplicate that
+  must surface the same error C does (corrupt2-2.1: "index a3 already
+  exists").  Mid-statement OP_ParseSchema re-fires (execParseSchemaImpl) keep
+  the dedup because they legitimately re-enumerate already-published rows. }
+const
+  INITFLAG_FreshLoad = u32($00010000);
+
 type
   PInitData = ^TInitData;
   TInitData = record
@@ -777,6 +789,19 @@ begin
   end;
   sqlite3HashClear(@db^.aCollSeq);
 
+  { main.c:1442..1447 — clear each registered virtual-table Module's
+    eponymous table and drop its reference (which frees the Module struct
+    allocated by sqlite3VtabCreateModule) before clearing the aModule hash.
+    sqlite3HashClear only frees the internal hash nodes, not the Module
+    payloads; omitting this loop leaked every registered module
+    (memsubsys2-3.x/4.x residual). }
+  pElem := db^.aModule.first;
+  while pElem <> nil do begin
+    pNextElem := passqlite3util.PHashElem(pElem^.next);
+    sqlite3VtabEponymousTableClear(db, PVtabModule(pElem^.data));
+    sqlite3VtabModuleUnref(db, PVtabModule(pElem^.data));
+    pElem := pNextElem;
+  end;
   sqlite3HashClear(@db^.aModule);
 
   { Deallocate the cached error string, if any. }
@@ -821,6 +846,19 @@ begin
     if Assigned(db^.trace.xV2) then
       db^.trace.xV2(SQLITE_TRACE_CLOSE, db^.pTraceArg, db, nil);
   end;
+
+  { main.c:1269 — force xDisconnect calls on all virtual tables.  This
+    finalizes any prepared statements the v-table modules cache internally
+    (e.g. fts3's aStmt[]/pSeekStmt) so the connectionIsBusy check below does
+    not see them as outstanding statements (which would leave the connection
+    a zombie with an unrolled-back transaction and a hot journal). }
+  passqlite3vtab.disconnectAllVtab(db);
+
+  { main.c:1278 — if a transaction is open, disconnectAllVtab() above will not
+    have called xDisconnect on vtabs in db^.aVTrans[].  sqlite3VtabRollback
+    does so; it must run before the active-statement check below because the
+    v-table implementation may store prepared statements internally. }
+  passqlite3vtab.sqlite3VtabRollback(db);
 
   { Legacy sqlite3_close() refuses if statements still pending. }
   if (forceZombie = 0) and (connectionIsBusy(db) <> 0) then begin
@@ -938,9 +976,21 @@ begin
     u64($00010000) or        { SQLITE_LoadExtension_Bit — main.c:3473 default-on }
     (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
     (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
-    u64($20000000) or        { SQLITE_DqsDDL — SQLITE_DQS=3 legacy default (main.c:3453..3462) }
-    u64($40000000) or        { SQLITE_DqsDML — SQLITE_DQS=3 legacy default }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
+    { NOTE: SQLITE_DqsDDL/SQLITE_DqsDML are intentionally NOT set here.
+      The reference oracle (../sqlite3/sqlite3) is compiled with
+      -DSQLITE_DQS=0 (verify: `PRAGMA compile_options` reports DQS=0), so
+      both DBCONFIG_DQS_DDL and DBCONFIG_DQS_DML default OFF (main.c
+      190531..190539, the #if (SQLITE_DQS&n) guards stay false at DQS=0).
+      The standalone shell must match that, otherwise `.dbconfig` reports
+      dqs_ddl/dqs_dml `on` vs the oracle's `off`.
+      The upstream Tcl *testfixture* is a separate build that defaults to
+      DQS=3 (the amalgamation default when SQLITE_DQS is not -D-overridden),
+      which is why indexexpr1-2100..2140 expect CREATE INDEX ON t1("y") to
+      demote the bare double-quoted identifier to a string.  That DQS=3
+      behaviour is re-enabled for the Tcl harness in PasTclSqlite.pas's
+      DbMain open path (sqlite3_db_config DQS_DDL/DQS_DML = 1), mirroring
+      the testfixture build flavour without disturbing shell parity. }
 
   sqlite3HashInit(@db^.aCollSeq);
   sqlite3HashInit(@db^.aModule);
@@ -961,7 +1011,13 @@ begin
     goto opendb_out;
   end;
 
-  if (zFilename = nil) or (zFilename[0] = #0) then
+  { main.c:3559 — only a NULL filename defaults to ":memory:".  An empty
+    string "" must flow through to sqlite3ParseUri and become a temporary
+    on-disk database (matching sqlite3 db "" in the Tcl suite); treating ""
+    as NULL here wrongly opened it in memory, so cache spilling never
+    occurred and PRAGMA lock_status reported "unknown" instead of
+    "unlocked" (tempdb2-1.1). }
+  if zFilename = nil then
     zFilename := ':memory:';
 
   { Port of main.c:3560 — peel URI parameters (mode=, cache=, vfs=, ...)
@@ -991,9 +1047,15 @@ begin
     goto opendb_out;
   end;
 
-  { Allocate stand-in schemas for main and temp.  Phase 8.1 stub:
-    sqlite3BtreeSchema is not ported, so we do not pull from BtShared. }
-  db^.aDb[0].pSchema := sqlite3SchemaGet(db, nil);
+  { main.c:3586..3591 — the MAIN schema must be fetched from (and owned by)
+    the main Btree so sqlite3BtreeClose's xFreeSchema/sqlite3DbFree path
+    tears it down at connection close; the temp schema (slot 1) is the
+    btree-less standalone schema freed explicitly in
+    sqlite3LeaveMutexAndCloseZombie.  Passing nil for slot 0 (the old
+    "sqlite3BtreeSchema not ported" stub) left the main schema — and the
+    bootstrapped sqlite_master Table installed into it — unreferenced by
+    any Btree, so it leaked at every db close (memsubsys2-3.x/4.x). }
+  db^.aDb[0].pSchema := sqlite3SchemaGet(db, db^.aDb[0].pBt);
   db^.aDb[1].pSchema := sqlite3SchemaGet(db, nil);
 
   db^.aDb[0].zDbSName     := 'main';
@@ -3276,7 +3338,8 @@ begin
         such guard at all; it is a port-local workaround for the dropped WHERE
         filter on the schema SELECT (see execParseSchemaImpl banner), so it
         must skip a row only when an object of the SAME type already exists. }
-      if zArg1 <> nil then begin
+      if (zArg1 <> nil)
+         and ((pData^.mInitFlags and INITFLAG_FreshLoad) = 0) then begin
         alreadyPublished := False;
         if (zArg0 <> nil)
            and (sqlite3StrICmp(zArg0, PAnsiChar('trigger')) = 0) then begin
@@ -3421,7 +3484,27 @@ begin
     reverse_unordered_selects=ON reverses the unordered schema scan and the
     sqlite_autoindex_<tab>_1 row is read first → "orphan index"
     (rowid-15.0). }
-  if iDb = 1 then
+  { vdbe.c:7152..7154 — honour the caller-supplied WHERE predicate so the
+    OP_ParseSchema re-fire after a CREATE re-prepares ONLY the just-written
+    row(s) (name=%Q AND sql=%Q), exactly as the reference does.  The
+    Select-with-WHERE codegen path is productive now (the old "drop WHERE"
+    banner above is stale), so we can stop iterating the entire schema and
+    drop reliance on the sqlite3InitCallback dedup guard for this path.
+    When zWhere matches a row whose name collides with an already-loaded
+    object (vtab2-5.3: two CREATE VIRTUAL TABLE statements whose lone-byte
+    names both fold to U+FFFD under UTF16), re-preparing the matched row hits
+    sqlite3StartTable's "table ... already exists" check, which prepare.c:50
+    wraps into "malformed database schema (...)" — the faithful C result. }
+  if zWhere <> nil then begin
+    if iDb = 1 then
+      zSql := sqlite3MPrintf(db,
+                'SELECT type,name,tbl_name,rootpage,sql FROM %s WHERE %s ORDER BY rowid',
+                [LEGACY_TEMP_SCHEMA_TABLE, zWhere])
+    else
+      zSql := sqlite3MPrintf(db,
+                'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s WHERE %s ORDER BY rowid',
+                [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE, zWhere]);
+  end else if iDb = 1 then
     zSql := sqlite3MPrintf(db,
               'SELECT type,name,tbl_name,rootpage,sql FROM %s ORDER BY rowid',
               [LEGACY_TEMP_SCHEMA_TABLE])
@@ -3437,7 +3520,15 @@ begin
   initData.iDb        := iDb;
   initData.pzErrMsg   := pzErrMsg;
   initData.rc         := SQLITE_OK;
-  initData.mInitFlags := 0;
+  { With the WHERE filter restored the SELECT visits only the targeted
+    row(s); re-preparing each matched row is the reference behaviour and
+    must not be suppressed by the port-local "already published" dedup
+    (which only exists to compensate for the dropped filter).  Set
+    INITFLAG_FreshLoad to turn that guard off for the filtered path. }
+  if zWhere <> nil then
+    initData.mInitFlags := INITFLAG_FreshLoad
+  else
+    initData.mInitFlags := 0;
   initData.nInitRow   := 0;
   initData.mxPage     := sqlite3BtreeLastPage(PBtree(db^.aDb[iDb].pBt));
 
@@ -3918,6 +4009,9 @@ var
   zSql8: PAnsiChar;
   rc: i32;
 begin
+  { complete.c — autoinit then bail on failure (mutex2-2.3). }
+  rc := sqlite3_initialize;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
   pVal := sqlite3ValueNew(nil);
   if pVal = nil then begin Result := SQLITE_NOMEM; Exit; end;
   sqlite3ValueSetStr(pVal, -1, zSql, SQLITE_UTF16NATIVE, SQLITE_STATIC);
@@ -4332,16 +4426,198 @@ begin
   sqlite3_mutex_leave(PTsqlite3(p^.db)^.mutex);
 end;
 
-{ vdbeapi.c:2172 — sqlite3_normalized_sql.  Return the normalized SQL
-  associated with a prepared statement.  The C reference is gated on
-  SQLITE_ENABLE_NORMALIZE which adds a zNormSql field to Vdbe and a
-  sqlite3Normalize() helper.  This port is built without
-  SQLITE_ENABLE_NORMALIZE (no zNormSql field on PVdbe), so we return nil
-  unconditionally — matching the symbol's exported-but-unsupported
-  behaviour expected by drivers that probe for it via dlsym. }
-function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
+{ tokenize.c:771 — addSpaceSeparator.  Insert a single space into pStr
+  if the current string ends with an identifier character. }
+procedure normAddSpaceSeparator(pStr: PSqlite3Str);
 begin
-  Result := nil;
+  if (pStr^.nChar <> 0)
+     and (sqlite3IsIdChar(u8((pStr^.zText + (pStr^.nChar - 1))^)) <> 0) then
+    sqlite3_str_append(pStr, ' ', 1);
+end;
+
+{ vdbeaux.c:103 — sqlite3VdbeUsesDoubleQuotedString.  zId is an already-
+  dequoted double-quoted identifier; return 1 if the prepared statement
+  recorded it (during resolve) as a string literal rather than a column
+  reference. }
+function normRawStrEq(a, b: PAnsiChar): i32;
+var
+  i: PtrInt;
+begin
+  i := 0;
+  while (a[i] = b[i]) do
+  begin
+    if a[i] = #0 then Exit(1);
+    Inc(i);
+  end;
+  Result := 0;
+end;
+
+function normUsesDoubleQuotedString(pVdbe: PVdbe; zId: PAnsiChar): i32;
+var
+  pStr: PDblquoteStr;
+begin
+  if pVdbe^.pDblStr = nil then Exit(0);
+  pStr := pVdbe^.pDblStr;
+  while pStr <> nil do
+  begin
+    if normRawStrEq(zId, PAnsiChar(@pStr^.z[0])) <> 0 then Exit(1);
+    pStr := pStr^.pNextStr;
+  end;
+  Result := 0;
+end;
+
+{ tokenize.c:782 — sqlite3Normalize.  Compute a normalization of zSql:
+  literals/variables -> '?', whitespace+comments collapsed, identifiers
+  lower-cased, keywords/punct upper-cased, and "IN (v1,v2,..)" lists
+  rewritten to "IN(?,?,?)".  Returns a sqlite3_free()-able buffer (here
+  via sqlite3_str_finish) or nil on OOM/tokenizer error. }
+function sqlite3Normalize(pVdbe: PVdbe; zSql: PAnsiChar): PAnsiChar;
+var
+  db: PTsqlite3;
+  i: i32;
+  n: i64;
+  tokenType: i32;
+  prevType: i32;
+  nParen: i32;
+  iStartIN: i32;
+  nParenAtIN: i32;
+  j: u32;
+  pStr: PSqlite3Str;
+  zId: PAnsiChar;
+  nId: i32;
+  eType: i32;
+begin
+  db := sqlite3VdbeDb(pVdbe);
+  tokenType := -1;
+  nParen := 0;
+  iStartIN := 0;
+  nParenAtIN := 0;
+  pStr := sqlite3_str_new(db);
+  i := 0;
+  while (zSql[i] <> #0) and (pStr^.accError = 0) do
+  begin
+    if tokenType <> TK_SPACE then
+      prevType := tokenType;
+    n := gGetTokenImpl(PByte(zSql + i), @tokenType);
+    if n <= 0 then Break;
+    case tokenType of
+      TK_COMMENT, TK_SPACE: ; { skip }
+      TK_NULL:
+        begin
+          if (prevType = TK_IS) or (prevType = TK_NOT) then
+            sqlite3_str_append(pStr, ' NULL', 5)
+          else
+          begin
+            { fall through to the literal arm }
+            sqlite3_str_append(pStr, '?', 1);
+          end;
+        end;
+      TK_STRING, TK_INTEGER, TK_FLOAT, TK_VARIABLE, TK_BLOB:
+        sqlite3_str_append(pStr, '?', 1);
+      TK_LP:
+        begin
+          Inc(nParen);
+          if prevType = TK_IN then
+          begin
+            iStartIN := i32(pStr^.nChar);
+            nParenAtIN := nParen;
+          end;
+          sqlite3_str_append(pStr, '(', 1);
+        end;
+      TK_RP:
+        begin
+          if (iStartIN > 0) and (nParen = nParenAtIN) then
+          begin
+            pStr^.nChar := u32(iStartIN + 1);
+            sqlite3_str_append(pStr, '?,?,?', 5);
+            iStartIN := 0;
+          end;
+          Dec(nParen);
+          sqlite3_str_append(pStr, ')', 1);
+        end;
+      TK_ID:
+        begin
+          iStartIN := 0;
+          j := pStr^.nChar;
+          if (sqlite3CtypeMap[u8(zSql[i])] and $80) <> 0 then
+          begin
+            zId := sqlite3DbStrNDup(db, zSql + i, u64(n));
+            if zId = nil then Break;
+            sqlite3Dequote(zId);
+            if (zSql[i] = '"') and (normUsesDoubleQuotedString(pVdbe, zId) <> 0) then
+            begin
+              sqlite3_str_append(pStr, '?', 1);
+              sqlite3DbFree(db, zId);
+            end
+            else
+            begin
+              nId := sqlite3Strlen30(zId);
+              eType := 0;
+              if (gGetTokenImpl(PByte(zId), @eType) = nId) and (eType = TK_ID) then
+              begin
+                normAddSpaceSeparator(pStr);
+                sqlite3_str_append(pStr, zId, nId);
+              end
+              else
+                sqlite3_str_appendf(pStr, '"%w"', [zId]);
+              sqlite3DbFree(db, zId);
+            end;
+          end
+          else
+          begin
+            normAddSpaceSeparator(pStr);
+            sqlite3_str_append(pStr, zSql + i, i32(n));
+          end;
+          while j < pStr^.nChar do
+          begin
+            (pStr^.zText + j)^ := AnsiChar(sqlite3Tolower(u8((pStr^.zText + j)^)));
+            Inc(j);
+          end;
+        end;
+      TK_SELECT:
+        begin
+          iStartIN := 0;
+          { deliberate fall-through to default }
+          if sqlite3IsIdChar(u8(zSql[i])) <> 0 then normAddSpaceSeparator(pStr);
+          j := pStr^.nChar;
+          sqlite3_str_append(pStr, zSql + i, i32(n));
+          while j < pStr^.nChar do
+          begin
+            (pStr^.zText + j)^ := AnsiChar(sqlite3Toupper(u8((pStr^.zText + j)^)));
+            Inc(j);
+          end;
+        end;
+    else
+      begin
+        if sqlite3IsIdChar(u8(zSql[i])) <> 0 then normAddSpaceSeparator(pStr);
+        j := pStr^.nChar;
+        sqlite3_str_append(pStr, zSql + i, i32(n));
+        while j < pStr^.nChar do
+        begin
+          (pStr^.zText + j)^ := AnsiChar(sqlite3Toupper(u8((pStr^.zText + j)^)));
+          Inc(j);
+        end;
+      end;
+    end;
+    Inc(i, i32(n));
+  end;
+  if tokenType <> TK_SEMI then sqlite3_str_append(pStr, ';', 1);
+  Result := sqlite3_str_finish(pStr);
+end;
+
+{ vdbeapi.c:2172 — sqlite3_normalized_sql.  Return the normalized SQL
+  associated with a prepared statement, computing it lazily on first
+  call (the SQLITE_PREPARE_NORMALIZE flag is ignored — the normalization
+  is derived on demand from the retained zSql text). }
+function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
+var
+  p: PVdbe;
+begin
+  p := PVdbe(pStmt);
+  if p = nil then Exit(nil);
+  if (p^.zNormSql = nil) and (p^.zSql <> nil) then
+    p^.zNormSql := sqlite3Normalize(p, p^.zSql);
+  Result := p^.zNormSql;
 end;
 
 { Phase 8.2.1 — sqlite3_stmt_scanstatus_* now reads the per-loop
@@ -5076,8 +5352,10 @@ begin
   end;
   oldLimit := db^.aLimit[limitId];
   if newLimit >= 0 then begin
-    if newLimit > aHardLimit[limitId] then newLimit := aHardLimit[limitId];
-    if (limitId = 0) and (newLimit < 100) then newLimit := 100;  { SQLITE_LIMIT_LENGTH floor }
+    if newLimit > aHardLimit[limitId] then
+      newLimit := aHardLimit[limitId]
+    else if (newLimit < SQLITE_MIN_LENGTH) and (limitId = 0) then  { 0 = SQLITE_LIMIT_LENGTH }
+      newLimit := SQLITE_MIN_LENGTH;
     db^.aLimit[limitId] := newLimit;
   end;
   Result := oldLimit;
@@ -5220,6 +5498,11 @@ begin
     SQLITE_TESTCTRL_PRNG_SAVE_OP:    sqlite3PrngSaveState;
     SQLITE_TESTCTRL_PRNG_RESTORE_OP: sqlite3PrngRestoreState;
 
+    { main.c:4327 — BITVEC_TEST(int sz, int *aProg).  Runs the bitvec
+      self-test program; returns its result code. }
+    SQLITE_TESTCTRL_BITVEC_TEST_OP:
+      Result := sqlite3BitvecBuiltinTest(iArg1, Pi32(pArg2));
+
     { main.c:4254 — PRNG_SEED(int x, sqlite3 *db).  If db has a schema
       cookie use it; else use x; then reset the PRNG. }
     SQLITE_TESTCTRL_PRNG_SEED_OP: begin
@@ -5241,10 +5524,11 @@ begin
     end;
 
     { main.c:4357 — PENDING_BYTE(unsigned int X).  Return existing
-      value; we do not actually rewrite a global since the pas pager
-      uses a compile-time PENDING_BYTE. }
+      value; if X>0 rewrite the (now writable) PENDING_BYTE global so the
+      test harness can move the locking page into reach of small DBs. }
     SQLITE_TESTCTRL_PENDING_BYTE_OP: begin
       Result := i32(PENDING_BYTE);
+      if iArg1 <> 0 then sqlite3SetPendingByte(u32(iArg1));
     end;
 
     { main.c:4379/4437 — ASSERT/ALWAYS just echo X. }
@@ -6251,6 +6535,10 @@ begin
   initData.iDb        := iDb;
   initData.rc         := SQLITE_OK;
   initData.pzErrMsg   := pzErrMsg;
+  { The synthetic bootstrap row re-prepares "CREATE TABLE x(...)" against the
+    already-installed sqlite_master; it relies on the dedup guard to no-op, so
+    do NOT set INITFLAG_FreshLoad here.  FreshLoad is applied below, only for
+    the on-disk schema-SELECT pass. }
   initData.mInitFlags := mFlags;
   initData.nInitRow   := 0;
   initData.mxPage     := 0;
@@ -6335,6 +6623,12 @@ begin
     db^.flags := db^.flags and (not SQLITE_LegacyFileFmt);
 
   Assert(db^.init.busy <> 0);
+  { Authoritative fresh load of the on-disk schema: this single pass walks
+    each sqlite_master row once over a schema that has no user objects yet, so
+    a row whose object is already in the hash is a genuine duplicate.  Enable
+    INITFLAG_FreshLoad to suppress the "already published" dedup so the same
+    "<obj> already exists" corruption C reports surfaces (corrupt2-2.1). }
+  initData.mInitFlags := initData.mInitFlags or INITFLAG_FreshLoad;
   initData.mxPage := sqlite3BtreeLastPage(pBt);
   zSql := sqlite3MPrintf(db,
             'SELECT*FROM"%w".%s ORDER BY rowid',
@@ -6410,6 +6704,10 @@ begin
 end;
 
 initialization
+  { Wire the auto-init hook so sqlite3_mutex_alloc (passqlite3os.pas) can
+    call sqlite3_initialize() for dynamic mutexes (mutex.c:292) without a
+    uses-cycle (os is lower-level than this unit). }
+  passqlite3os.gAutoInitHook := @sqlite3_initialize;
   vdbeParseSchemaExec := @execParseSchemaImpl;
   vdbeSqlExec := @execSqlExecImpl;
   vdbeRunVacuum := @runVacuumImpl;
@@ -6419,11 +6717,17 @@ initialization
     write arm (codegen.pas can't `uses passqlite3main`). }
   passqlite3codegen.gBusyTimeout :=
     passqlite3codegen.TBusyTimeoutFn(@sqlite3_busy_timeout);
+  { PRAGMA threads (pragma.c:2708..2718) -> sqlite3_limit. }
+  passqlite3codegen.gSqlite3Limit :=
+    passqlite3codegen.TSqlite3LimitFn(@sqlite3_limit);
   { 9.4.divbug.37 — wire sqlite3_wal_autocheckpoint + sqlite3WalDefaultHook
     pointer for PragTyp_WAL_AUTOCHECKPOINT (pragma.c:2421..2429). }
   passqlite3codegen.gWalAutoCheckpoint :=
     passqlite3codegen.TWalAutoCheckpointFn(@sqlite3_wal_autocheckpoint);
   passqlite3codegen.gWalDefaultHook := @sqlite3WalDefaultHook;
+  { PRAGMA shrink_memory (pragma.c:2439..2442) -> sqlite3_db_release_memory. }
+  passqlite3codegen.gDbReleaseMemory :=
+    passqlite3codegen.TDbReleaseMemoryFn(@sqlite3_db_release_memory);
   { Wire sqlite3_overload_function so sqlite3RegisterPerConnectionBuiltinFunctions
     (codegen.pas, func.c:2331) can register the per-connection MATCH placeholder
     at connection open.  Lives here to avoid a circular codegen->main uses. }

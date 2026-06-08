@@ -329,6 +329,12 @@ function sqlite3VtabCallDestroy(db: PTsqlite3; iDb: i32; zTab: PAnsiChar): i32;
   sqlite3VtabImportErrmsg. }
 function sqlite3VtabSync(db: PTsqlite3; pV: PVdbe): i32;
 
+{ main.c:1209 — force xDisconnect on every virtual table registered with db
+  (both schema tables and eponymous tables), so any prepared statements the
+  v-table modules cache internally are finalized before the close path checks
+  connectionIsBusy / rolls back. }
+procedure disconnectAllVtab(db: PTsqlite3);
+
 { vtab.c:1020 — invoke xRollback on every entry, then clear aVTrans. }
 function sqlite3VtabRollback(db: PTsqlite3): i32;
 
@@ -1227,6 +1233,38 @@ begin
   end;
 end;
 
+{ main.c:1209 — disconnectAllVtab. }
+procedure disconnectAllVtab(db: PTsqlite3);
+var
+  i:       i32;
+  p:       passqlite3util.PHashElem;
+  pSchema: passqlite3util.PSchema;
+  pTab:    Pointer;
+  pMod:    PVtabModule;
+begin
+  passqlite3codegen.sqlite3BtreeEnterAll(db);
+  for i := 0 to db^.nDb - 1 do begin
+    pSchema := passqlite3util.PSchema(db^.aDb[i].pSchema);
+    if pSchema <> nil then begin
+      p := pSchema^.tblHash.first;
+      while p <> nil do begin
+        pTab := p^.data;
+        if tabIsVirtual(pTab) then sqlite3VtabDisconnect(db, pTab);
+        p := PHashElem(p^.next);
+      end;
+    end;
+  end;
+  p := db^.aModule.first;
+  while p <> nil do begin
+    pMod := PVtabModule(p^.data);
+    if pMod^.pEpoTab <> nil then
+      sqlite3VtabDisconnect(db, pMod^.pEpoTab);
+    p := PHashElem(p^.next);
+  end;
+  sqlite3VtabUnlockList(db);
+  passqlite3codegen.sqlite3BtreeLeaveAll(db);
+end;
+
 function sqlite3VtabSync(db: PTsqlite3; pV: PVdbe): i32;
 var
   i:       i32;
@@ -1676,6 +1714,12 @@ begin
                                   or passqlite3codegen.TF_NoVisibleRowid));
         pNew^.nCol := 0;
         pNew^.aCol := nil;
+        { vtab.c:880..888 — WITHOUT ROWID virtual tables must either be
+          read-only (xUpdate=0) or else have a single-column PRIMARY KEY. }
+        if (not passqlite3codegen.HasRowid(pNew))
+        and (PVtabModule(pCtx^.pVTbl^.pMod)^.pModule^.xUpdate <> nil)
+        and (passqlite3codegen.sqlite3PrimaryKeyIndex(pNew)^.nKeyCol <> 1) then
+          rc := SQLITE_ERROR;
         if pNew^.pIndex <> nil then begin
           pTab^.pIndex := pNew^.pIndex;
           pNew^.pIndex := nil;

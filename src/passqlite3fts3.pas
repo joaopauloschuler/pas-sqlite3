@@ -731,6 +731,15 @@ function sqlite3Fts3PrepareStmt(p: PFts3Table; const zSql: PChar;
 function sqlite3Fts3PendingTermsFlush(p: PFts3Table): cint;
 procedure sqlite3Fts3PendingTermsClear(p: PFts3Table);
 
+{ Lightweight build-performance counters (TestFts3BuildPerf micro-bench, task
+  12.4). These are plain monotone counters; incrementing them is behaviour-
+  neutral.  fts3PerfReset zeroes them.  Not used by production paths. }
+var
+  gFts3PerfFlushCalls: Int64 = 0;   { sqlite3Fts3PendingTermsFlush invocations }
+  gFts3PerfPrepares:   Int64 = 0;   { fts3SqlStmt actual sqlite3_prepare calls }
+  gFts3PerfSegdirOps:  Int64 = 0;   { %_segdir REPLACE/DELETE/UPDATE stmt steps }
+procedure fts3PerfReset;
+
 { fts3_write.c — %_segments / %_segdir helpers used by fts3.c / fts3_aux.c. }
 function sqlite3Fts3ReadBlock(p: PFts3Table; iBlockid: sqlite3_int64;
   paBlob: PPChar; pnBlob: Pcint; pnLoad: Pcint): cint;
@@ -5232,8 +5241,17 @@ begin
   rc := SQLITE_OK;
   Assert((eStmt < Length(fts3AzSql)) and (eStmt >= 0));
 
+  { perf-counter: count %_segdir write-statement requests (task 12.4) }
+  case eStmt of
+    SQL_INSERT_SEGDIR, SQL_DELETE_SEGDIR_LEVEL, SQL_DELETE_SEGDIR_RANGE,
+    SQL_DELETE_SEGDIR_ENTRY, SQL_SHIFT_SEGDIR_ENTRY,
+    SQL_UPDATE_LEVEL_IDX, SQL_UPDATE_LEVEL:
+      Inc(gFts3PerfSegdirOps);
+  end;
+
   pStmt := p^.aStmt[eStmt];
   if pStmt = nil then begin
+    Inc(gFts3PerfPrepares);  { perf-counter: an actual prepare (cache miss) }
     bAllowVtab := 0;
     if eStmt = SQL_CONTENT_INSERT then
       zSql := PChar(sqlite3PfMprintf(PAnsiChar(fts3AzSql[eStmt]),
@@ -7362,6 +7380,7 @@ var
   rc, i: cint;
   pStmt: PVdbe;
 begin
+  Inc(gFts3PerfFlushCalls);  { perf-counter (task 12.4) }
   rc := SQLITE_OK;
   i := 0;
   while (rc = SQLITE_OK) and (i < p^.nIndex) do begin
@@ -7388,6 +7407,13 @@ begin
 
   if rc = SQLITE_OK then sqlite3Fts3PendingTermsClear(p);
   Result := rc;
+end;
+
+procedure fts3PerfReset;
+begin
+  gFts3PerfFlushCalls := 0;
+  gFts3PerfPrepares   := 0;
+  gFts3PerfSegdirOps  := 0;
 end;
 
 { ===================================================================== }

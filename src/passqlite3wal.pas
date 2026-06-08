@@ -304,6 +304,20 @@ begin
   p^ := val;
 end;
 
+{ In C, AtomicLoad/AtomicStore are type-generic and access exactly
+  sizeof(*p) bytes. The wal-index hash slots are ht_slot (16-bit), so they
+  need a 16-bit-wide access — the Pu32 wrappers above would read/write 4
+  bytes and clobber the adjacent hash slot. }
+function AtomicLoadHt(p: PHtSlot): ht_slot; inline;
+begin
+  Result := p^;
+end;
+
+procedure AtomicStoreHt(p: PHtSlot; val: ht_slot); inline;
+begin
+  p^ := val;
+end;
+
 { ============================================================
   BYTESWAP32 macro
   ============================================================ }
@@ -729,7 +743,7 @@ begin
     iKey := walNextHash(iKey);
   end;
   sLoc.aPgno[(idx - 1) and (HASHTABLE_NPAGE - 1)] := iPage;
-  AtomicStore(@sLoc.aHash[iKey], ht_slot(idx));
+  AtomicStoreHt(@sLoc.aHash[iKey], ht_slot(idx));
 
   Result := SQLITE_OK;
 end;
@@ -879,7 +893,11 @@ begin
       walSetWiPage(pWal, cint(iPg), aShare);
       if iPg = 0 then nHdr := WALINDEX_HDR_SIZE else nHdr := 0;
       nHdr32 := nHdr div SizeOf(u32);
-      Move((aShare + nHdr32)^, (aPrivate + nHdr32)^, WALINDEX_PGSZ - cint(nHdr));
+      { wal.c:1533 — memcpy(&aShare[nHdr32], &aPrivate[nHdr32], ...): copy the
+        recovered private hash/page-number page INTO the shared wal-index
+        page.  Pascal Move(src,dst,n) reverses memcpy's (dst,src,n) order, so
+        the source is aPrivate and the destination is aShare. }
+      Move((aPrivate + nHdr32)^, (aShare + nHdr32)^, WALINDEX_PGSZ - cint(nHdr));
 
       if iFrame <= iLast then break;
       Inc(iPg);
@@ -1327,7 +1345,7 @@ begin
     end;
     nCollide := HASHTABLE_NSLOT;
     iKey := walHash(pgno);
-    iH := AtomicLoad(@sLoc.aHash[iKey]);
+    iH := AtomicLoadHt(@sLoc.aHash[iKey]);
     while iH <> 0 do begin
       iFrame := iH + sLoc.iZero;
       if (iFrame <= iLast)
@@ -1340,7 +1358,7 @@ begin
         piRead^ := 0; Result := SQLITE_CORRUPT_BKPT; Exit;
       end;
       iKey := walNextHash(iKey);
-      iH := AtomicLoad(@sLoc.aHash[iKey]);
+      iH := AtomicLoadHt(@sLoc.aHash[iKey]);
     end;
     if iRead <> 0 then break;
     Dec(iHash);

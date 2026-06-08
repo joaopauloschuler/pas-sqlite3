@@ -223,6 +223,24 @@ function Tcl_UnsetVar(interp: PTclInterp; varName: PChar; flags: cint): cint; cd
   by the tclvar virtual table's xColumn (test_tclvar.c:270). }
 function Tcl_GetVar2Ex(interp: PTclInterp; part1, part2: PChar; flags: cint): PTclObj; cdecl; external 'tcl8.6';
 
+{ Tcl_ObjGetVar2 — two-part (object-keyed) variable read returning a
+  Tcl_Obj or nil.  Used by DbEvalRowInfo/DbEvalNextCmd -asdict path
+  (tclsqlite.c:1729, 1948, 1969). }
+function Tcl_ObjGetVar2(interp: PTclInterp; part1Ptr, part2Ptr: PTclObj; flags: cint): PTclObj; cdecl; external 'tcl8.6';
+
+{ Tcl dict C-API + shared-obj helpers for the -asdict / -withoutnulls
+  row-shaping paths in DbEvalRowInfo / DbEvalNextCmd (tclsqlite.c). }
+function Tcl_NewDictObj: PTclObj; cdecl; external 'tcl8.6';
+function Tcl_DictObjPut(interp: PTclInterp; dictPtr, keyPtr, valuePtr: PTclObj): cint; cdecl; external 'tcl8.6';
+function Tcl_DictObjRemove(interp: PTclInterp; dictPtr, keyPtr: PTclObj): cint; cdecl; external 'tcl8.6';
+{ Tcl_IsShared is a macro in tcl.h ((objPtr)->refCount > 1, or
+  Tcl_DbIsShared under TCL_MEM_DEBUG).  This build round-trips refcounts
+  through the Db* variants (see Tcl_IncrRefCount below), so call the
+  matching exported Tcl_DbIsShared and keep the Tcl_IsShared spelling for
+  a faithful port of the tclsqlite.c call sites. }
+function Tcl_DbIsShared(objPtr: PTclObj; afile: PChar; aline: cint): cint; cdecl; external 'tcl8.6';
+function Tcl_IsShared(objPtr: PTclObj): cint; inline;
+
 { Tcl_LinkVar — bind a Tcl variable to a C/Pascal storage location so
   reads/writes of the Tcl variable mirror the native variable.  Used by
   test2.c:740 to expose the I/O-error injection counters to the test
@@ -250,6 +268,7 @@ function Tcl_GetIntFromObj(interp: PTclInterp; objPtr: PTclObj; intPtr: pcint): 
 { String-arg accessors — used by the old-style argc/argv handlers in
   test1.c (sqlite3_mprintf_int etc.). }
 function Tcl_GetInt(interp: PTclInterp; src: PAnsiChar; intPtr: pcint): cint; cdecl; external 'tcl8.6';
+function Tcl_GetBoolean(interp: PTclInterp; src: PAnsiChar; boolPtr: pcint): cint; cdecl; external 'tcl8.6';
 function Tcl_GetDouble(interp: PTclInterp; src: PAnsiChar; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
 function Tcl_GetWideIntFromObj(interp: PTclInterp; objPtr: PTclObj; widePtr: PInt64): cint; cdecl; external 'tcl8.6';
 function Tcl_GetDoubleFromObj(interp: PTclInterp; objPtr: PTclObj; doublePtr: PDouble): cint; cdecl; external 'tcl8.6';
@@ -441,6 +460,11 @@ end;
 procedure Tcl_DecrRefCount(objPtr: PTclObj); inline;
 begin
   Tcl_DbDecrRefCount(objPtr, 'PasTclBridge', 0);
+end;
+
+function Tcl_IsShared(objPtr: PTclObj): cint; inline;
+begin
+  Result := Tcl_DbIsShared(objPtr, 'PasTclBridge', 0);
 end;
 
 { Eval `cmd` and read back the current obj-result as a Pascal AnsiString.
