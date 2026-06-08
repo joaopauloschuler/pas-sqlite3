@@ -9560,8 +9560,9 @@ begin
       end
       else
       begin
-        if sqlite3IsRowid(zCol) <> 0 then
-          iCol := -1
+        if (sqlite3IsRowid(zCol) <> 0)
+           and ((pTab^.tabFlags and TF_NoVisibleRowid) = 0) then
+          iCol := -1   { resolve.c:564 — VisibleRowid(pTab) gate }
         else
           iCol := pTab^.nCol;
       end;
@@ -9858,7 +9859,9 @@ begin
   end
   else
   begin
-    if sqlite3IsRowid(zCol) <> 0 then Result := -1
+    if (sqlite3IsRowid(zCol) <> 0)
+       and ((pTab^.tabFlags and TF_NoVisibleRowid) = 0) then
+      Result := -1   { resolve.c:564 — VisibleRowid(pTab) gate }
     else Result := -2;  { not found and not the rowid alias }
   end;
   if Result >= pTab^.nCol then Result := -2;
@@ -14540,6 +14543,44 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           which unconditionally frees+replaces pParse^.zErrMsg, clobbering
           the original error (memory: feedback_select1_6_8c). }
         if pParse^.nErr > 0 then Exit;
+        { resolver01-7.1/7.2 — NC_UEList outer result-alias fallback.
+          Mirror resolve.c:1950..1953 + 658..698: the inner subquery's
+          result-set list (and its other clauses) are resolved with the
+          OUTER select's NameContext as sNC.pNext, and that outer NC carries
+          NC_UEList = the outer p^.pEList.  Pre-resolve any inner bare TK_ID
+          that binds neither in the inner FROM nor the outer FROM but matches
+          an outer result-set ENAME_NAME alias, swapping it for a copy of the
+          aliased expr (resolveAlias, nSubquery=1) BEFORE the inner per-Select
+          resolver runs (which lacks the NC chain).  Gated only on the outer
+          pEList existing; runs across every compound arm and clause that can
+          contain a bare alias reference.
+
+          subquery-3.4.2 — this swap MUST run before the Step-2 correlation
+          detection below: an outer result-set alias inside the inner clauses
+          (e.g. inner HAVING `avg1 > avg2`) only becomes an outer-cursor
+          reference (`avg(a.y)`) AFTER the swap.  Detecting correlation first
+          would leave the subquery wrongly flagged uncorrelated → materialised
+          once → wrong rows.  Mirrors C where resolveAlias and correlation
+          tracking happen in a single resolve pass. }
+        if ((pInner^.selFlags and SF_HasTypeInfo) = 0)
+           and (p^.pEList <> nil) then
+        begin
+          pCompArm := pInner;
+          while (pCompArm <> nil) and (pParse^.nErr = 0) do
+          begin
+            ResolveOuterAliasIDsInList(pCompArm^.pEList,
+                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDs(pCompArm^.pWhere,
+                                 p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDs(pCompArm^.pHaving,
+                                 p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDsInList(pCompArm^.pGroupBy,
+                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            ResolveOuterAliasIDsInList(pCompArm^.pOrderBy,
+                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
+            pCompArm := pCompArm^.pPrior;
+          end;
+        end;
         { Step 2: detect outer refs across ALL inner clauses (not just
           pWhere) — correlation can live in pEList, pHaving, pGroupBy,
           pOrderBy.  Without this, an inner subquery whose ONLY outer
@@ -14720,36 +14761,8 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             pCompArm := pCompArm^.pPrior;
           end;
         end;
-        { resolver01-7.1/7.2 — NC_UEList outer result-alias fallback.
-          Mirror resolve.c:1950..1953 + 658..698: the inner subquery's
-          result-set list (and its other clauses) are resolved with the
-          OUTER select's NameContext as sNC.pNext, and that outer NC carries
-          NC_UEList = the outer p^.pEList.  Pre-resolve any inner bare TK_ID
-          that binds neither in the inner FROM nor the outer FROM but matches
-          an outer result-set ENAME_NAME alias, swapping it for a copy of the
-          aliased expr (resolveAlias, nSubquery=1) BEFORE the inner per-Select
-          resolver runs (which lacks the NC chain).  Gated only on the outer
-          pEList existing; runs across every compound arm and clause that can
-          contain a bare alias reference. }
-        if ((pInner^.selFlags and SF_HasTypeInfo) = 0)
-           and (p^.pEList <> nil) then
-        begin
-          pCompArm := pInner;
-          while (pCompArm <> nil) and (pParse^.nErr = 0) do
-          begin
-            ResolveOuterAliasIDsInList(pCompArm^.pEList,
-                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
-            ResolveOuterAliasIDs(pCompArm^.pWhere,
-                                 p^.pSrc, pCompArm^.pSrc, p^.pEList);
-            ResolveOuterAliasIDs(pCompArm^.pHaving,
-                                 p^.pSrc, pCompArm^.pSrc, p^.pEList);
-            ResolveOuterAliasIDsInList(pCompArm^.pGroupBy,
-                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
-            ResolveOuterAliasIDsInList(pCompArm^.pOrderBy,
-                                       p^.pSrc, pCompArm^.pSrc, p^.pEList);
-            pCompArm := pCompArm^.pPrior;
-          end;
-        end;
+        { (resolver01-7.1/7.2 outer result-alias swap now runs above, before
+          the Step-2 correlation detection — see subquery-3.4.2 note.) }
         { Step 4: resolve inner clauses against inner pSrc. }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
           sqlite3ResolveSelectNames(pParse, pInner, nil);
