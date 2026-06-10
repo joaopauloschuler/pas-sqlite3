@@ -12442,8 +12442,11 @@ begin
             db^.nDeferredCons    := pSvpt5g^.nDeferredCons;
             db^.nDeferredImmCons := pSvpt5g^.nDeferredImmCons;
           end;
-          if isTxnSvpt5g = 0 then begin
-            { Notify vtabs of the savepoint change. }
+          if (isTxnSvpt5g = 0) or (pOp^.p1 = SAVEPOINT_ROLLBACK) then begin
+            { Notify vtabs of the savepoint change — vdbe.c:3990.  The
+              ROLLBACK TO case must fire even for a transaction savepoint,
+              otherwise xRollbackTo() is never invoked and vtabs like FTS3
+              commit pending writes that were rolled back (vtab1-24.x). }
             rc := sqlite3VtabSavepoint(db, pOp^.p1, iSvpt5g);
             if rc <> SQLITE_OK then goto abort_due_to_error;
           end;
