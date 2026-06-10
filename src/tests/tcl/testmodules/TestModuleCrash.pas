@@ -241,6 +241,14 @@ begin
           rc := sqlite3OsTruncate(pRealFile, pWrite^.iOffset);
         ppPtr^ := pWrite^.pNext;
         pNextW := pWrite^.pNext;
+        { C does `if(pWrite==pFinal) break;` AFTER the switch — compare
+          before freeing, then stop processing if this was pFinal. }
+        if pWrite = pFinal then
+        begin
+          crash_free(pWrite);
+          pWrite := nil;
+          continue;
+        end;
         crash_free(pWrite);
         pWrite := pNextW;
       end;
@@ -277,14 +285,8 @@ begin
     end;
 
     { Loop-exit test mirrors C `if(pWrite==pFinal) break;` *after* the
-      switch.  In the action-1 arm we've already advanced past pFinal —
-      but pFinal pointed to the freed node, so check the *just-freed*
-      pWrite pointer reference is handled by the early `continue` in
-      arms 2/3 plus the arm-1 path: if the freed node was pFinal, the
-      loop naturally exits when the next iteration's `pWrite=*ppPtr`
-      reads the post-final tail.  Closer to C, however, do the explicit
-      check: if pFinal was just freed in arm-1, we've already moved on,
-      but the caller expects no more writes.  Emulate by scanning. }
+      switch — handled inside each arm above (arm 1 compares before
+      freeing the node; arms 2/3 compare directly). }
   end;
 
   if (rc = SQLITE_OK) and (isCrash <> 0) then

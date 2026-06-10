@@ -559,6 +559,25 @@ regressions without human triage.
     [X]) because three followups remain — see 9.4.2.g.11 for the
     list (`ifcapable crashtest`, WAL shm methods, the upstream
     `unixVfsObjFoo := unixVfsObj` record-copy issue).
+    - [X] **9.4.7.d.fix1** (2026-06-10) crash.test FAIL@270 + crash2.test
+      FAIL@83 (2026-06-09 sweep) — TWO harness gaps, no pager divergence:
+      (1) `btree_set_cache_size` (test3.c:584..607) was never ported, so
+      the `catch {set bt [btree_from_db db]; btree_set_cache_size $bt 10}`
+      line crashsql writes into the child script silently no-opped; the
+      child kept the default 2000-page cache, never spilled under the big
+      crash-2/3/4 workloads, synced the journal only twice, and exited
+      cleanly for every `-delay 3..5` case (`{0 {}}` instead of
+      `{1 {child process exited abnormally}}`).  Ported into
+      TestModuleTest1.pas (cmd table test3.c:678) reusing
+      sqlite3TestTextToPtr + engine sqlite3BtreeSetCacheSize
+      (passqlite3btree.pas:8353).  (2) TestModuleCrash.pas writeListSync
+      arm-1 (write-out-correctly) was missing C's post-switch
+      `if(pWrite==pFinal) break;` (test6.c:342) — only arms 2/3 had it —
+      so in SEQUENTIAL/SAFE_APPEND crash mode entries *past* the randomly
+      chosen pFinal could still be flushed/trashed.  Result: crash.test
+      890/890, crash2.test 83/83 (driver PASS), crash6 140/140,
+      crash7 293/293, crash8 45/45, journal1 + TestExplainParity
+      1026/1026 unchanged.
   - [ ] **9.4.7.e** `permutations.tcl` matrix — full upstream re-runs
     each test under ~30 build-flag combinations.  Land as
     optional second-tier gate (not in baseline CI).  Requires:
