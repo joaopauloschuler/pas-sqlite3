@@ -74152,6 +74152,8 @@ var
   nInit: i32;
   db:    PTsqlite3;
   pDup:  PExpr;
+  pSub:  PExpr;
+  iDummy: i32;
   aItem: PExprListItem;
 begin
   Result := pList;
@@ -74162,9 +74164,21 @@ begin
     for i := 0 to pAppend^.nExpr - 1 do begin
       pDup := sqlite3ExprDup(db, aItem[i].pExpr, 0);
       if (bIntToNull <> 0) and (pDup <> nil) then begin
-        if pDup^.op = TK_INTEGER then begin
-          sqlite3ExprDelete(db, pDup);
-          pDup := sqlite3ExprAlloc(db, TK_NULL, nil, 0);
+        { window.c:908..917 — skip COLLATE / likely() wrappers and use
+          sqlite3ExprIsInteger, mutating the integer node IN PLACE to
+          TK_NULL (keeping any COLLATE wrapper).  The previous top-level
+          TK_INTEGER-only check missed `PARTITION BY 6 COLLATE binary`,
+          which then survived into the rewritten subquery's ORDER BY as a
+          positional term 6 -> "1st ORDER BY term out of range"
+          (window1-52.3/52.4). }
+        iDummy := 0;
+        pSub := sqlite3ExprSkipCollateAndLikely(pDup);
+        if (pSub <> nil) and (sqlite3ExprIsInteger(pSub, @iDummy, nil) <> 0) then
+        begin
+          pSub^.op := TK_NULL;
+          pSub^.flags := pSub^.flags
+                         and (not (EP_IntValue or EP_IsTrue or EP_IsFalse));
+          pSub^.u.zToken := nil;
         end;
       end;
       Result := sqlite3ExprListAppend(pParse, Result, pDup);
