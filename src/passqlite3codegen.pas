@@ -12052,35 +12052,39 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     per resolve.c:679..683. }
   function ExprIsOrContainsAggregate(pX: PExpr): i32; forward;
   procedure ResolveOuterAliasIDsDepth(pW: PExpr; pInnerSrc: PSrcList;
-             pOuterEList: PExprList; nSub: i32); forward;
+             pOuterEList: PExprList; pAliasSrc: PSrcList; nSub: i32); forward;
   procedure WalkAliasDeepFromSubqueries(pSel: PSelect; pOuterEList: PExprList;
-             nSub: i32); forward;
+             pAliasSrc: PSrcList; nSub: i32); forward;
 
   procedure ResolveOuterAliasIDsInListDepth(pList: PExprList;
-             pInnerSrc: PSrcList; pOuterEList: PExprList; nSub: i32);
+             pInnerSrc: PSrcList; pOuterEList: PExprList; pAliasSrc: PSrcList;
+             nSub: i32);
   var k_: i32;
   begin
     if pList = nil then Exit;
     for k_ := 0 to pList^.nExpr - 1 do
       ResolveOuterAliasIDsDepth(ExprListItems(pList)[k_].pExpr,
-                                pInnerSrc, pOuterEList, nSub);
+                                pInnerSrc, pOuterEList, pAliasSrc, nSub);
   end;
 
   { Public entry points used by the top-level subquery-prep block keep the
     original signature (nSubquery=1, the inner subquery is one level out from
-    the matched alias).  pOuterSrc is no longer consulted for the FROM-column
-    short-circuit (ResolveOuterIDs owns outer-FROM binding) so it is ignored
-    here; the alias scan only needs the inner scope + the outer pEList. }
+    the matched alias).  pOuterSrc is threaded down as pAliasSrc: the FROM
+    list of the SAME NameContext that owns pOuterEList.  lookupName scans
+    that NC's pSrcList (resolve.c:445..620) BEFORE its NC_UEList alias arm
+    (resolve.c:658..698), so a bare name matching a real outer FROM column
+    must NOT be swapped for the alias (shell5-5.1: `nlz` inside the
+    recursive-step EXISTS binds Lzn.nlz, not the alias `nlz+1 AS nlz`). }
   procedure ResolveOuterAliasIDs(pW: PExpr; pOuterSrc, pInnerSrc: PSrcList;
                                  pOuterEList: PExprList);
   begin
-    ResolveOuterAliasIDsDepth(pW, pInnerSrc, pOuterEList, 1);
+    ResolveOuterAliasIDsDepth(pW, pInnerSrc, pOuterEList, pOuterSrc, 1);
   end;
 
   procedure ResolveOuterAliasIDsInList(pList: PExprList;
              pOuterSrc, pInnerSrc: PSrcList; pOuterEList: PExprList);
   begin
-    ResolveOuterAliasIDsInListDepth(pList, pInnerSrc, pOuterEList, 1);
+    ResolveOuterAliasIDsInListDepth(pList, pInnerSrc, pOuterEList, pOuterSrc, 1);
   end;
 
   { Descend into every clause / CTE body / FROM-subquery of pSel, scanning for
@@ -12090,7 +12094,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     nSubquery per NameContext level: an outer result alias is visible from
     arbitrarily-deep correlated subqueries / CTE bodies. }
   procedure WalkAliasDeepFromSubqueries(pSel: PSelect; pOuterEList: PExprList;
-             nSub: i32);
+             pAliasSrc: PSrcList; nSub: i32);
   var
     pWth_:  PWith;
     pBase_: PCte;
@@ -12114,12 +12118,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         begin
           if (pBody_^.selFlags and SF_HasTypeInfo) = 0 then
           begin
-            ResolveOuterAliasIDsInListDepth(pBody_^.pEList,   pBody_^.pSrc, pOuterEList, nSub);
-            ResolveOuterAliasIDsDepth(pBody_^.pWhere,         pBody_^.pSrc, pOuterEList, nSub);
-            ResolveOuterAliasIDsDepth(pBody_^.pHaving,        pBody_^.pSrc, pOuterEList, nSub);
-            ResolveOuterAliasIDsInListDepth(pBody_^.pGroupBy, pBody_^.pSrc, pOuterEList, nSub);
-            ResolveOuterAliasIDsInListDepth(pBody_^.pOrderBy, pBody_^.pSrc, pOuterEList, nSub);
-            WalkAliasDeepFromSubqueries(pBody_, pOuterEList, nSub);
+            ResolveOuterAliasIDsInListDepth(pBody_^.pEList,   pBody_^.pSrc, pOuterEList, pAliasSrc, nSub);
+            ResolveOuterAliasIDsDepth(pBody_^.pWhere,         pBody_^.pSrc, pOuterEList, pAliasSrc, nSub);
+            ResolveOuterAliasIDsDepth(pBody_^.pHaving,        pBody_^.pSrc, pOuterEList, pAliasSrc, nSub);
+            ResolveOuterAliasIDsInListDepth(pBody_^.pGroupBy, pBody_^.pSrc, pOuterEList, pAliasSrc, nSub);
+            ResolveOuterAliasIDsInListDepth(pBody_^.pOrderBy, pBody_^.pSrc, pOuterEList, pAliasSrc, nSub);
+            WalkAliasDeepFromSubqueries(pBody_, pOuterEList, pAliasSrc, nSub);
           end;
           pBody_ := pBody_^.pPrior;
         end;
@@ -12136,19 +12140,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       pDeep_ := pIt_d^.u4.pSubq^.pSelect;
       while pDeep_ <> nil do
       begin
-        ResolveOuterAliasIDsInListDepth(pDeep_^.pEList,   pDeep_^.pSrc, pOuterEList, nSub + 1);
-        ResolveOuterAliasIDsDepth(pDeep_^.pWhere,         pDeep_^.pSrc, pOuterEList, nSub + 1);
-        ResolveOuterAliasIDsDepth(pDeep_^.pHaving,        pDeep_^.pSrc, pOuterEList, nSub + 1);
-        ResolveOuterAliasIDsInListDepth(pDeep_^.pGroupBy, pDeep_^.pSrc, pOuterEList, nSub + 1);
-        ResolveOuterAliasIDsInListDepth(pDeep_^.pOrderBy, pDeep_^.pSrc, pOuterEList, nSub + 1);
-        WalkAliasDeepFromSubqueries(pDeep_, pOuterEList, nSub + 1);
+        ResolveOuterAliasIDsInListDepth(pDeep_^.pEList,   pDeep_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+        ResolveOuterAliasIDsDepth(pDeep_^.pWhere,         pDeep_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+        ResolveOuterAliasIDsDepth(pDeep_^.pHaving,        pDeep_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+        ResolveOuterAliasIDsInListDepth(pDeep_^.pGroupBy, pDeep_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+        ResolveOuterAliasIDsInListDepth(pDeep_^.pOrderBy, pDeep_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+        WalkAliasDeepFromSubqueries(pDeep_, pOuterEList, pAliasSrc, nSub + 1);
         pDeep_ := pDeep_^.pPrior;
       end;
     end;
   end;
 
   procedure ResolveOuterAliasIDsDepth(pW: PExpr; pInnerSrc: PSrcList;
-             pOuterEList: PExprList; nSub: i32);
+             pOuterEList: PExprList; pAliasSrc: PSrcList; nSub: i32);
   var
     j_:                i32;
     itemsE:            PExprListItem;
@@ -12172,6 +12176,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         ColumnInSrcList misses t4.b, and the outer alias `b` wrongly shadows the
         inner table's real column (in-23.0). }
       if BareColMaybeInner(pInnerSrc, pW^.u.zToken) then Exit;
+      { 9.4.divbug.93.a / shell5-5.1 — the alias's OWN NameContext FROM wins
+        over the alias too.  lookupName scans pNC->pSrcList (resolve.c:
+        445..620) before that same NC's NC_UEList alias arm (resolve.c:
+        658..698), so a bare name matching a real column of the alias-owner's
+        FROM binds as a correlated column, never the alias.  Recursive-step
+        `SELECT nlz+1 AS nlz FROM Lzn WHERE EXISTS(... nlz ...)`: the EXISTS's
+        `nlz` is Lzn.nlz, not a copy of `nlz+1` (which double-increments and
+        stops the recursion one step early).  Binding is left to the
+        ResolveOuterIDs / inner-resolver passes. }
+      if BareColMaybeInner(pAliasSrc, pW^.u.zToken) then Exit;
       { resolve.c:664..698 — scan outer NC_UEList pEList for an ENAME_NAME
         alias match. }
       itemsE := ExprListItems(pOuterEList);
@@ -12212,10 +12226,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
     if pW^.op = TK_DOT then Exit;
     if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
-    ResolveOuterAliasIDsDepth(pW^.pLeft,  pInnerSrc, pOuterEList, nSub);
-    ResolveOuterAliasIDsDepth(pW^.pRight, pInnerSrc, pOuterEList, nSub);
+    ResolveOuterAliasIDsDepth(pW^.pLeft,  pInnerSrc, pOuterEList, pAliasSrc, nSub);
+    ResolveOuterAliasIDsDepth(pW^.pRight, pInnerSrc, pOuterEList, pAliasSrc, nSub);
     if (pW^.flags and EP_xIsSelect) = 0 then
-      ResolveOuterAliasIDsInListDepth(pW^.x.pList, pInnerSrc, pOuterEList, nSub)
+      ResolveOuterAliasIDsInListDepth(pW^.x.pList, pInnerSrc, pOuterEList, pAliasSrc, nSub)
     else if pW^.x.pSelect <> nil then
     begin
       { with2-10.1 — the alias may be referenced inside a nested correlated
@@ -12227,12 +12241,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       begin
         if (pSub_^.selFlags and SF_HasTypeInfo) = 0 then
         begin
-          ResolveOuterAliasIDsInListDepth(pSub_^.pEList,   pSub_^.pSrc, pOuterEList, nSub + 1);
-          ResolveOuterAliasIDsDepth(pSub_^.pWhere,         pSub_^.pSrc, pOuterEList, nSub + 1);
-          ResolveOuterAliasIDsDepth(pSub_^.pHaving,        pSub_^.pSrc, pOuterEList, nSub + 1);
-          ResolveOuterAliasIDsInListDepth(pSub_^.pGroupBy, pSub_^.pSrc, pOuterEList, nSub + 1);
-          ResolveOuterAliasIDsInListDepth(pSub_^.pOrderBy, pSub_^.pSrc, pOuterEList, nSub + 1);
-          WalkAliasDeepFromSubqueries(pSub_, pOuterEList, nSub + 1);
+          ResolveOuterAliasIDsInListDepth(pSub_^.pEList,   pSub_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+          ResolveOuterAliasIDsDepth(pSub_^.pWhere,         pSub_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+          ResolveOuterAliasIDsDepth(pSub_^.pHaving,        pSub_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+          ResolveOuterAliasIDsInListDepth(pSub_^.pGroupBy, pSub_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+          ResolveOuterAliasIDsInListDepth(pSub_^.pOrderBy, pSub_^.pSrc, pOuterEList, pAliasSrc, nSub + 1);
+          WalkAliasDeepFromSubqueries(pSub_, pOuterEList, pAliasSrc, nSub + 1);
         end;
         pSub_ := pSub_^.pPrior;
       end;
