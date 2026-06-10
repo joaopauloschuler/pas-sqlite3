@@ -38081,21 +38081,33 @@ begin
       if (pTabList^.nSrc > 1)
          and SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil)
          and (pItem^.u4.pSubq^.pSelect <> nil)
-         { upfrom1-5.1 — do NOT flatten a *compound* (UNION ALL) FROM subquery
-           in this multi-source loop.  flattenSubquery faithfully rewrites the
-           OUTER p into a compound (select.c:4490..4527), but this Pas port's
-           compound dispatch (multiSelect) runs earlier in sqlite3Select, not
-           after the FROM-clause optimisation loop as in C (select.c:7884), so
-           a p turned compound here is never coded arm-by-arm: a fall-through
-           codes only the rightmost arm, and a recursive sqlite3Select
-           re-entry double-processes the half-analysed outer and SIGSEGVs at
-           finalize.  Leaving a compound subquery to materialise into an
-           ephemeral table (the pre-fe6d56d behaviour) keeps every arm and
-           matches the oracle (`UPDATE t3 SET (c,b)=(SELECT 3,4) FROM t1, t2`
-           with t2 a UNION ALL view -> [4 3]).  The single-source compound
-           flatten + safe re-dispatch is handled separately at
-           codegen.pas:33385 (commit 67f987a). }
-         and (pItem^.u4.pSubq^.pSelect^.pPrior = nil) then
+         { whereL-110 — compound (UNION ALL) FROM subqueries DO flatten in this
+           multi-source loop, exactly as in C (select.c:4400..4427 restriction
+           (17) permits them).  flattenSubquery rewrites the OUTER p into a
+           compound (select.c:4490..4527); in C the compound dispatch
+           (multiSelect, select.c:7884) runs right AFTER the FROM-clause
+           optimisation loop, so the rewritten p is coded arm-by-arm.  This Pas
+           port dispatches compounds BEFORE this loop, so when a flatten turns
+           p compound we re-dispatch via a recursive sqlite3Select call below
+           (same device as the single-source compound flatten at the
+           bDidSingleFlatten site).  NOTE upfrom1-5.1: an earlier attempt
+           (fe6d56d) that flattened compounds here WITHOUT the recursive
+           re-dispatch coded only the rightmost arm / SIGSEGVd; the re-dispatch
+           is what makes this sound.  The re-dispatch lands in this port's
+           UNION ALL compound dispatch arm, which only supports the dest set
+           listed at its gate (SRT_Output/EphemTab/Set/Mem/Coroutine/Exists/
+           Fifo/DistFifo/Queue/DistQueue) — for any other dest (notably
+           SRT_Upfrom: `UPDATE t3 SET (c,b)=(SELECT 3,4) FROM t1, t2` with t2
+           a UNION ALL view, upfrom1-5.1) keep the pre-fe6d56d behaviour of
+           materialising the compound subquery into an ephemeral table, which
+           keeps every arm and matches the oracle. }
+         and ((pItem^.u4.pSubq^.pSelect^.pPrior = nil)
+              or (pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
+              or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Mem)
+              or (pDest^.eDest = SRT_Coroutine) or (pDest^.eDest = SRT_Exists)
+              or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
+              or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue))
+         then
          { C also flattens FROM items that are the right operand of an outer
            join (flattenSubquery's isOuterJoin path wraps the substituted
            result columns in TK_IF_NULL_ROW).  This was previously skipped
@@ -38106,6 +38118,13 @@ begin
            faithfully (fts3join-4.2). }
       begin
         pSubFC := pItem^.u4.pSubq^.pSelect;
+        { Compound subquery: mark nested aggregate state on every arm first
+          (this port resolves it late) so the SF_Aggregate gate below and
+          flattenSubquery's per-arm restriction (17b) see it — same device as
+          the restart loop.  Non-compound subqueries keep the pre-existing
+          (pinned) behavior of this loop. }
+        if pSubFC^.pPrior <> nil then
+          selectMarkAggregateCompound(pParse, pSubFC);
         { C flattens CTE-backed FROM subqueries in this pass too; the only CTE
           skip is the MATERIALIZED (M10d_Yes) optimisation fence
           (select.c:7785).  NOT MATERIALIZED nested CTEs must flatten so that
@@ -38127,6 +38146,16 @@ begin
           if flattenSubquery(pParse, p, i, i32(Ord((p^.selFlags and SF_Aggregate) <> 0))) <> 0 then
           begin
             if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+            if p^.pPrior <> nil then
+            begin
+              { Flattening a compound (UNION ALL) FROM subquery rewrote the
+                outer p itself into a compound (select.c:4490..4527).  C falls
+                through to multiSelect at select.c:7884; this port's compound
+                dispatch already ran, so re-dispatch p through sqlite3Select
+                (same device as the single-source bDidSingleFlatten site). }
+              Result := sqlite3Select(pParse, p, pDest);
+              Exit;
+            end;
             pTabList := p^.pSrc;
             i := 0;    { C: i = -1 then for-loop i++ -> restart scan at 0 }
             Continue;
