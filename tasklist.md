@@ -922,6 +922,7 @@ regressions without human triage.
 - [ ] **9.4.divbug.94** 240 s watchdog timeouts, 0 subtests, formerly cited to closed buckets — sort4 (ex-63), e_fkey (ex-38), e_walauto (ex-87), fuzz (ex-89).  Timeout class: root-cause per-test slowness or raise the per-test budget knob before re-tagging.
 - [ ] **9.4.divbug.95** windowE regression (stale cite: closed **divbug.79** claims "windowE PASS") — 9 errors in the 2026-06-09 sweep.  Either the .79 fix regressed or the closure note was wrong; bisect against the .79 landing.
 - [ ] **9.4.divbug.96** ioerr.test live FAIL (stale cite: closed **divbug.90** claims "io PASS; no live FAILs") — FAILs after 3041 subtests in the 2026-06-09 sweep.  I/O-error-injection family; re-triage independently of the closed bucket.
+- [ ] **9.4.divbug.97** window1-61.1 prepare-time runaway (2026-06-10) — the dbsqlfuzz query with ~6 nested windowed scalar subqueries never finishes prepare: unbounded recursive `sqlite3SelectDup`/`exprDup_` (400+ dup frames on the stack, RSS grows ~120 MB/s) — the repeated pre-bind/alias-swap/window-rewrite passes keep re-duplicating already-duplicated subquery layers, so the tree grows without bound.  C prepares it in one resolver pass (resolve.c NC chain + window.c:958 sqlite3WindowRewrite dups each OVER ORDER BY only twice).  All other window1 subtests (316) now pass; this is the only blocker for window1 pas-strict.  Needs a dedup/once-only gate on the multi-pass resolver, or the real single-pass NC resolver port.
 
 ---
 
