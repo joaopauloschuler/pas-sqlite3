@@ -132,7 +132,9 @@ System Tcl on this host is **8.6** (`/usr/include/tcl8.6`, `/usr/bin/tclsh`).
 * **9.4.3.a** `TclTestDriver.pas` reads MANIFEST.txt, forks `tclsh` per
   test, emits `PASS|FAIL|SKIP <path> <assertions> <duration>`.
 * **9.4.4.a** First 10-test sweep (`select1`, `expr1`, `where1` family),
-  classify, populate `SKIP.md` + `DIVERGENCES.md` (new `9.4.divbug.*`).
+  classify, populate `SKIP.md` + the `9.4.divbug.*` ledger (kept as
+  checkbox bullets in `tasklist.md`; the local `DIVERGENCES.md`
+  skeleton was removed 2026-06-09).
 
 ## 7. Risks & open questions
 

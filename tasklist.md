@@ -319,7 +319,8 @@ regressions without human triage.
 > Reorganised 2026-05-13: each umbrella bullet (9.4.1 .. 9.4.5) is
 > immediately followed by its decomposed sub-arms; trailing
 > `9.4.divbug.N` cluster bullets sit at the end in numeric order
-> (matching `src/tests/tcl/DIVERGENCES.md`).
+> (this tasklist is the canonical divbug ledger; the old
+> `src/tests/tcl/DIVERGENCES.md` skeleton was removed).
 >
 > **Timing & timeout rules (read before launching a run — 2026-05-16).**
 > The driver applies a **20 s per-test watchdog**; the full MANIFEST
@@ -442,7 +443,7 @@ regressions without human triage.
   matching upstream's `make test` log shape.  The gate is "every
   `tcl-feature` test exits 0 or matches the upstream skip list".
   Per the skip-and-cite contract from 9.1.3.followup, divergences
-  surface into `src/tests/tcl/DIVERGENCES.md` rather than blocking
+  surface as `9.4.divbug.N` bullets in this tasklist rather than blocking
   the driver — each cluster becomes a `9.4.divbug.N` follow-up
   bullet for triage.
   - [X] **9.4.3.a** Driver skeleton `src/tests/TclTestDriver.pas`
@@ -546,6 +547,13 @@ regressions without human triage.
   - [X] **9.4.8.c** Strict gate
   - [X] **9.4.8.d** Coverage check
   - [X] **9.4.8.e** Regression archive
+  - [ ] **9.4.8.f** Unswept backlog — sweep the 229 STATUS.txt rows formerly cited as bare `unswept` (a deferral with no scheduled gate is a permanent skip).  Each STATUS.txt row cites its shard below; closing a shard means every row in it is re-tagged pas-strict / pas-soft (with a live divbug cite) / pas-skip (with a named blocker).
+    - [ ] **9.4.8.f.1** sweep shard 1/5 — alphabetical rows 1–46
+    - [ ] **9.4.8.f.2** sweep shard 2/5 — rows 47–92
+    - [ ] **9.4.8.f.3** sweep shard 3/5 — rows 93–138
+    - [ ] **9.4.8.f.4** sweep shard 4/5 — rows 139–184
+    - [ ] **9.4.8.f.5** sweep shard 5/5 — rows 185–229
+    - [ ] **9.4.8.f.6** re-probe long-running skips `writecrash.test` + `securedel2.test` — still 240 s watchdog timeouts with 0 subtests in the 2026-06-09 sweep (ex-divbug.84, closed; siblings select4/printf now PASS and were promoted to pas-strict)
 
 #### 9.4 — Missing routines still to port (engine + harness gaps)
 
@@ -559,7 +567,7 @@ regressions without human triage.
 - [X] **9.4.port.intarray-addr** Ported intarray_addr + siblings int64array_addr/doublearray_addr/textarray_addr Tcl cmds (TestModuleTest1.pas, test1.c:3836..3962/9110..9113); tabfunc01 now 1 err/140 (residual 1370 stale newer-version expectation — 3.53 oracle also returns 0 for generate_series(0,0,0)).
 - [X] **9.4.port.fs-schema-vtab** DONE — both modules ported+registered+load: TestModuleSchema.pas (test_schema.c, vtab2 0/18, vtabH 0/26) + TestModuleFs.pas fs/fsdir/fstree (test_fs.c, fts4content 0/128, no more "no such module: fs").
 
-#### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
+#### 9.4 divergence buckets (canonical ledger — STATUS.txt/SKIP.md cites resolve here)
 
 - [X] **9.4.divbug.1** `select1.test select1-4.4`
 - [X] **9.4.divbug.2** SQL error messages drop their format-arg tails
@@ -877,6 +885,10 @@ regressions without human triage.
   - [X] **9.4.divbug.92.007** `vtab2-5.3`
   - [X] **9.4.divbug.92.008** `with1-22.1`
   - [ ] **9.4.divbug.92.009** with5-310 live FAIL — recursive-CTE outer ORDER BY wrongly eliminated (dup outer SELECT binds result col iColumn=-1/rowid → WHERE_IPK ordered match drops sorter). ROOT → **9.4.port.coroutine-from**.p materialise/dup fix.
+- [ ] **9.4.divbug.93** shell-family live FAILs (stale-cite re-triage: formerly cited closed **divbug.63**) — shell1 (194 subtests run before FAIL) / shell2 / shell3 / shell4 / shell5 / shellA / shellB all FAIL in the 2026-06-09 sweep.  Root-cause anew; do not reuse the closed bucket.
+- [ ] **9.4.divbug.94** 240 s watchdog timeouts, 0 subtests, formerly cited to closed buckets — sort4 (ex-63), e_fkey (ex-38), e_walauto (ex-87), fuzz (ex-89).  Timeout class: root-cause per-test slowness or raise the per-test budget knob before re-tagging.
+- [ ] **9.4.divbug.95** windowE regression (stale cite: closed **divbug.79** claims "windowE PASS") — 9 errors in the 2026-06-09 sweep.  Either the .79 fix regressed or the closure note was wrong; bisect against the .79 landing.
+- [ ] **9.4.divbug.96** ioerr.test live FAIL (stale cite: closed **divbug.90** claims "io PASS; no live FAILs") — FAILs after 3041 subtests in the 2026-06-09 sweep.  I/O-error-injection family; re-triage independently of the closed bucket.
 
 ---
 
