@@ -467,6 +467,8 @@ set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
 # Faithful value is 1 (test_config.c:119); io.test / sync.test count this
 # directory fsync via $sqlite_sync_count.
 set ::sqlite_options(dirsync) 1        ;# unixSync performs the dir-fsync arm
+set ::sqlite_options(threadsafe) 1     ;# SQLITE_THREADSAFE=1 (test_config.c:662; sqlite3_threadsafe()==1)
+set ::sqlite_options(threadsafe1) 1    ;# THREADSAFE==1 (test_config.c:664)
 set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
 # pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
 # behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its
@@ -486,6 +488,10 @@ set ::sqlite_options(integrityck) 1
 # configslower: CONFIG_SLOWDOWN_FACTOR multiplier; like.test uses it as a numeric
 # scale for timing budgets. Mirror upstream test_config.c default (1.0).
 set ::sqlite_options(configslower) 1.0
+# casesensitivelike: test_config.c:71..76 — 1 only under
+# SQLITE_CASE_SENSITIVE_LIKE; default build (and the port) leave it off.
+# expr.test reads $sqlite_options(casesensitivelike) directly.
+set ::sqlite_options(casesensitivelike) 0
 # rtree: pas-sqlite3 omits the rtree virtual-table module — pin to 0 so
 # `ifcapable rtree { ... }` blocks (alterlegacy-14.x etc.) SKIP rather than
 # run and hit "no such module: rtree".
@@ -2145,12 +2151,17 @@ proc faultsim_test_result {args} {
 # tester.tcl:2529..2596.  shell*.test and sqldiff*.test call these to
 # locate the on-disk CLI binary; if missing they `finish_test ; return`
 # in the caller's context (via `return -code return`).  pas-sqlite3 builds
-# its CLI at bin/passqlite3 — but we leave the upstream lookup verbatim
-# so .test files transparently skip when the upstream name isn't present
-# on PATH.  Individual tests may override these procs to point at our
-# binary if/when wired.  Engine FCNTL/test1.c file_control_reservebytes
+# its CLI at bin/passqlite3 — so the one harness-local deviation below maps
+# the upstream binary name `sqlite3` to `passqlite3` (9.4.divbug.98): in an
+# upstream checkout the CLI is built next to testfixture under the *same*
+# name, so test_find_cli always exercises the shell built from the tree
+# under test.  Without the mapping the lookup either skipped (no bin/sqlite3)
+# or — worse, with the old /usr/bin TESTFIXTURE_HOME fallback — measured the
+# system /usr/bin/sqlite3.  Everything else is verbatim tester.tcl:2529..2596.
+# Engine FCNTL/test1.c file_control_reservebytes
 # is paired with this in TestModuleTest1.pas (test1.c:9258 / 7249..7276).
 proc test_binary_name {nm} {
+  if {$nm eq "sqlite3"} { set nm "passqlite3" }
   if {$::tcl_platform(platform) eq "windows"} {
     set ret "$nm.exe"
   } else {

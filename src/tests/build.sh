@@ -139,7 +139,15 @@ compile_test() {
   fi
   echo
   echo "Compiling $name.pas ..."
-  fpc $FPC_FLAGS "$src"
+  if [ "$name" = "TestFts5Varint" ]; then
+    # TestFts5Varint links only pure-Pascal units (no libc).  The global
+    # -k-lm -k-lz flags force a dynamic link whose fallback ELF interpreter
+    # (/lib/ld64.so.1) does not exist on this host -> rc=127 at run time.
+    # Compile it without the -k flags so FPC produces a static binary.
+    fpc ${FPC_FLAGS/-k-lm -k-lz/} "$src"
+  else
+    fpc $FPC_FLAGS "$src"
+  fi
   echo "$name compiled -> $BIN_DIR/$name"
 }
 

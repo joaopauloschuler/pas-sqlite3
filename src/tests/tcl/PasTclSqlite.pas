@@ -33,7 +33,7 @@ implementation
 uses SysUtils, passqlite3types, passqlite3util, passqlite3main, passqlite3vdbe,
      passqlite3parser,
      passqlite3codegen, passqlite3dbstat, passqlite3backup, passqlite3os,
-     passqlite3percentile, passqlite3regexp,
+     passqlite3percentile,
      TestModuleMd5, TestModuleTclvar, TestModuleBestindex,
      TestModuleTest1, TestModuleFunc,
      TestModuleMalloc, TestModuleEcho, TestModuleIoerr, TestModuleCrash,
@@ -5126,14 +5126,14 @@ begin
     flavour calls each *_init in sqlite3_extension_init / shell.c:
       * percentile / median / percentile_cont / percentile_disc
         (ext/misc/percentile.c — required by percentile.test)
-      * regexp / regexpi
-        (ext/misc/regexp.c — required by regexp1/regexp2.test)
-    Both Init functions are idempotent and tolerate being called even
-    when sqlite3_open_v2 reported a non-OK rc (no-op on nil handle). }
+    Note: regexp/regexpi are deliberately NOT auto-registered here.  The
+    upstream testfixture only gains regexp() via an explicit
+    `load_static_extension db regexp` (test1.c tclLoadStaticExtensionCmd,
+    handled by TestModuleTest1.pas); e_expr-18.1.x requires a bare
+    connection to fail `x REGEXP y` with "no such function: regexp". }
   if pHandle <> nil then
   begin
     sqlite3PercentileInit(pHandle);
-    sqlite3RegexpInit(pHandle);
     { 9.4.divbug.91 — register the md5sum() SQL aggregate on every new
       connection.  Upstream wires this via sqlite3_auto_extension() in
       autoinstall_test_functions (test_func.c:723..726); pas-sqlite3 has

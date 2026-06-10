@@ -12,13 +12,21 @@ PASS).  Format:
 
     - **<path>** — <reason>.  Cite: <Phase X.Y bullet | unported helper | etc.>
 
+**Policy (added 2026-06-09):** every entry must carry an explicit
+**RECHECK** gate — a tasklist bullet, divbug number, or sweep task on
+whose close the entry is re-probed.  A skip with only a *condition*
+("once X lands") and no gate is a permanent skip: nobody comes back to
+check whether the condition fired.  Proof: select4.test and printf.test
+sat in the long-running section after their blocking divbugs (84/86)
+closed, and both turned out to already PASS.
+
 ## Tester-shim helpers (`tester_min.tcl` does not yet expose them)
 
 - **../sqlite3/test/insert.test**       — needs `ifcapable`, `catchsql`,
   `do_catchsql_test`, `integrity_check`, `finish_test` (all landed
   g.1..g.5).  9.4.4.b re-sweep: now **hangs** past `insert-1.3` (60s
   driver timeout fires).  Reclassified as engine divergence —
-  see **9.4.divbug.7** in `DIVERGENCES.md`.  Kept here for the
+  see **9.4.divbug.7** in `tasklist.md`.  Kept here for the
   re-sweep gate but should move out once divbug.7 is rooted.
   RECHECK on 9.4.4.c.
 - **../sqlite3/test/update.test**       — shim helpers all landed; still
@@ -28,16 +36,18 @@ PASS).  Format:
   command name "reset_db"` at the end.  Most failures are
   **9.4.divbug.4** (out-of-memory) and **9.4.divbug.2** (truncated
   error messages).  Cite: 9.4.2.g.6 bullet (`do_eqp_test` pending)
-  and new sub-task for `reset_db`.
+  and new sub-task for `reset_db`.  RECHECK on 9.4.2.g.6 close
+  (and see 9.4.divbug.12 — the b.2 re-sweep SIGSEGV).
 - **../sqlite3/test/delete.test**       — shim helpers all landed.
   9.4.4.b re-sweep: 1 error / 23 sub-tests; SOURCE-ERROR is
   `unknown subcommand "one"` — the `db one` sub-command (single-row
   shortcut over `db eval`) is still unported (PasTclSqlite.pas;
   follow-up to 9.4.2.d..f).  Close to PASS once `db one` lands.
+  RECHECK on the 9.4.2.d..f follow-up close.
 - **../sqlite3/test/index.test**        — shim helpers landed.
   9.4.4.b re-sweep: **segfaults** at `index-3.3` after surfacing
   **9.4.divbug.3** (schema columns) on `index-1.1c/1.1d`.  Crash
-  reclassified as **9.4.divbug.8**.
+  reclassified as **9.4.divbug.8**.  RECHECK on divbug.8 close.
 - **../sqlite3/test/lastinsert.test**   — shim helpers landed.
   9.4.4.b re-sweep: **segfaults** at `lastinsert-1.1w` (64-bit
   rowid variant).  Reclassified as engine divergence
@@ -50,24 +60,22 @@ PASS).  Format:
 
 ## Promoted to PASS under 9.4.4.b (no longer in SKIP)
 
-- **../sqlite3/test/cast.test** — shim-skip via `ifcapable !cast`
-  body running (our `ifcapable` stub unconditionally executes the
-  BODY, so `!cast` calls `finish_test ; return`).  TclTestDriver
-  records 0 errors / 0 tests → PASS.  This is a *vacuous* PASS —
-  it will downgrade once the `ifcapable` stub gains real expression
-  evaluation (9.4.2.g.* follow-up).  For now it joins the PASS
-  bucket per the 9.4.4.b convention.
-- **../sqlite3/test/reindex.test** — same vacuous-PASS pattern via
-  `ifcapable {!reindex} { finish_test ; return }`.  Promoted out
-  of SKIP under 9.4.4.b.
+- **../sqlite3/test/cast.test** — ~~vacuous PASS via the old
+  `ifcapable` stub that unconditionally executed BODY~~.
+  **RESOLVED 2026-06-09:** `ifcapable` gained real expression
+  evaluation (tester_min.tcl, unset caps default to enabled);
+  cast.test now runs 134 real sub-tests and PASSes.
+- **../sqlite3/test/reindex.test** — ~~same vacuous-PASS pattern~~.
+  **RESOLVED 2026-06-09:** runs 33 real sub-tests, PASSes (e_reindex
+  115 sub-tests likewise).
 
 ## 9.4.4.b shim-completeness note
 
 After landing g.1..g.5 + g.7 every helper in the original SKIP
 list is shim-complete; remaining failures fall into:
 
-  - engine divergences (divbug.1..5, 7..10) — listed in
-    `DIVERGENCES.md`;
+  - engine divergences (divbug.1..5, 7..10) — listed as
+    `9.4.divbug.*` bullets in `tasklist.md`;
   - missing `db` sub-commands (`db one`, `reset_db`) — port-side
     follow-ups to 9.4.2.d..f, *not* shim limitations;
   - the lingering `do_eqp_test` helper (9.4.2.g.6) which only
@@ -131,8 +139,8 @@ Audited every `../sqlite3/test/*_common.tcl` (note: there is **no**
 ## 9.4.4.b.2 re-sweep result
 
 Re-ran the 10-test set under `bin/TclTestDriver` after fixing the
-driver's relative-path regression (see DIVERGENCES.md 9.4.4.b.2 run
-summary).  Every original SKIP entry is now shim-complete *and*
+driver's relative-path regression (see the 9.4.4.b.2 divbug bullets
+in tasklist.md).  Every original SKIP entry is now shim-complete *and*
 runs to completion or further:
 
 - **numcast.test** — now **PASS 51/51** (divbug.5 fixed).  Removed
@@ -159,28 +167,33 @@ Remaining shim/test-command gaps surfaced (port-side follow-ups,
 not divergences): `sqlite3_db_config`, `sqlite3_connection_pointer`,
 and `set ::AUTOVACUUM` in `tester_min.tcl`.
 
-## Long-running tests (exceed 20 s per-test watchdog) — drain shard budget
+## Long-running tests — watchdog timeouts
 
 These tests run to completion under upstream tclsh but exceed the
-TclTestDriver 20 s per-test watchdog under our port (multiple causes:
-many sub-tests, large pseudo-random fuzz loops, crash-injection vfs
-loops).  Skipping them lets shards finish so the strict gate becomes
-meaningful.  Re-evaluate once the driver gains a per-test budget knob
-or the underlying slowness is rooted.
+TclTestDriver per-test watchdog under our port.  2026-06-09 re-probe
+after divbug.84/86 closed: **select4.test now PASSes** (123 sub-tests,
+5.1 s) and **printf.test now PASSes** (1409 sub-tests, 0.5 s) — both
+promoted to pas-strict and removed from this list.  The two below
+still time out at the 240 s watchdog with 0 sub-tests completed.
 
-- **../sqlite3/test/select4.test** — 1043-line UNION/INTERSECT/EXCEPT
-  battery with a 31-iteration outer fuzz loop at :30 driving compound
-  SELECT permutations; consistently >30 s in the 9.4.divbug.84 probe.
-  Cite: **9.4.divbug.84**.
 - **../sqlite3/test/writecrash.test** — `for {set tn 1} {$bGo} {incr tn}`
   crash-injection loop at :38 walks every byte offset of every write
-  inside the VFS shim; >30 s.  Cite: **9.4.divbug.84**.
+  inside the VFS shim; 240 s timeout, 0 sub-tests (2026-06-09 sweep).
+  Cite + RECHECK: **9.4.8.f.6**.
 - **../sqlite3/test/securedel2.test** — generates 1000 pseudo-random
   64-bit blobs at :21 then runs three nested 850/5000/850-iteration
-  insert/delete loops at :39/:79/:88; >30 s.  Cite: **9.4.divbug.84**.
-- **../sqlite3/test/printf.test** — 1194 `do_test` invocations plus a
-  198-iteration field-width sweep at :3742 with an inner `while {1}`
-  loop at :3769; >30 s.  Cite: **9.4.divbug.86**.
+  insert/delete loops at :39/:79/:88; 240 s timeout, 0 sub-tests
+  (2026-06-09 sweep).  Cite + RECHECK: **9.4.8.f.6**.
+- **../sqlite3/test/soak.test** — meta-runner peer of all.test/quick.test;
+  by-design unrunnable here.  (a) dies at :70 on `clock_seconds` — only
+  test_thread.c registers it, and only in spawned-thread interps
+  (test_thread.c:119; the main-interp name is `clock_second`,
+  test_thread.c:643), so even the C testfixture's main interp lacks it;
+  (b) loops sourcing fuzz/fuzz_malloc/trans/corruptC for `TIMEOUT ≥ 3600` s
+  unless `-timeout N` arrives via `$argv` (soak.test:27..38), which the
+  stdin-fed driver never passes — guaranteed 240 s watchdog FAIL;
+  (c) fuzz.test itself already times out standalone (divbug.94).
+  Cite + RECHECK: **9.4.divbug.99**.
 
 ## Notes for future shim growth
 

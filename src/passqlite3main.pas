@@ -689,12 +689,22 @@ const
   );
 
 { ----------------------------------------------------------------------
-  connectionIsBusy — true if the connection has unfinalised statements.
+  connectionIsBusy — true if the connection has unfinalised statements
+  or unfinished sqlite3_backup objects.
   main.c:1240
   ---------------------------------------------------------------------- }
 function connectionIsBusy(db: PTsqlite3): i32;
+var
+  j: i32;
+  pBt: PBtree;
 begin
   if db^.pVdbe <> nil then begin Result := 1; Exit; end;
+  for j := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[j].pBt);
+    if (pBt <> nil) and (sqlite3BtreeIsInBackup(pBt) <> 0) then begin
+      Result := 1; Exit;
+    end;
+  end;
   Result := 0;
 end;
 
@@ -5425,11 +5435,13 @@ begin
   sqlite3_soft_heap_limit64(i64(n));
 end;
 
-{ btree.c:89 — sqlite3_enable_shared_cache.  This Pascal port is built
-  with the SQLITE_OMIT_SHARED_CACHE compile path: there is no
-  sqlite3GlobalConfig.sharedCacheEnabled to mutate.  Mirror the
-  loadext.c:91 omit-stub posture by accepting the call and returning
-  SQLITE_OK; future opens never enable shared cache regardless. }
+{ btree.c:89 — sqlite3_enable_shared_cache.  INTENTIONAL no-op: this
+  Pascal port is built with the SQLITE_OMIT_SHARED_CACHE compile path —
+  there is no sqlite3GlobalConfig.sharedCacheEnabled to mutate.  Mirror
+  the loadext.c:91 omit-stub posture by accepting the call and returning
+  SQLITE_OK; future opens never enable shared cache regardless.
+  Porting shared-cache mode is tracked as tasklist 6.41.1 (the oracle
+  HAS it; gates the shared*/thread* tcl tests via shared_cache=0). }
 function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
 begin
   Result := SQLITE_OK;
@@ -5463,6 +5475,7 @@ const
   SQLITE_TESTCTRL_PRNG_RESTORE_OP         = 6;
   SQLITE_TESTCTRL_FK_NO_ACTION_OP         = 7;
   SQLITE_TESTCTRL_BITVEC_TEST_OP          = 8;
+  SQLITE_TESTCTRL_FAULT_INSTALL_OP        = 9;
   SQLITE_TESTCTRL_PENDING_BYTE_OP         = 11;
   SQLITE_TESTCTRL_ASSERT_OP               = 12;
   SQLITE_TESTCTRL_ALWAYS_OP               = 13;
@@ -5502,6 +5515,15 @@ begin
       self-test program; returns its result code. }
     SQLITE_TESTCTRL_BITVEC_TEST_OP:
       Result := sqlite3BitvecBuiltinTest(iArg1, Pi32(pArg2));
+
+    { main.c:4314 — FAULT_INSTALL(xCallback).  Install xCallback as the
+      sqlite3FaultSim() hook (NULL cancels); as a self-test of the fault
+      simulator, sqlite3FaultSim(0) runs immediately and its value is the
+      return of sqlite3_test_control(). }
+    SQLITE_TESTCTRL_FAULT_INSTALL_OP: begin
+      sqlite3GlobalConfig.xTestCallback := pArg2;
+      Result := sqlite3FaultSim(0);
+    end;
 
     { main.c:4254 — PRNG_SEED(int x, sqlite3 *db).  If db has a schema
       cookie use it; else use x; then reset the PRNG. }

@@ -90,7 +90,7 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.24** Aggregate-with-ORDER-BY codegen
 - [~] **6.26** Window functions (window.c). DiagWindow: 0 divergences. Reopen if DiagWindow regresses.
 - [X] **6.27** schema-mutation + statistics
-- [~] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap). Inventory landed at `src/tests/STUB_INVENTORY.md` (21 actionable entries: 7 high / 6 med / 8 low). One small high-priority entry ported in 6.28 commit (`pas_openDirectory`, os_unix.c:3874..3894 → src/passqlite3os.pas:2331). Doable subtasks for the remaining six high-priority stubs (each cites the open Phase-6/9 bullet it blocks; see STUB_INVENTORY.md for full Pascal/C citations):
+- [~] **6.28** sweep — re-search for "stub" in the pascal source code and port from C to pascal in full any function or procedure still marked as "stub" that was missed (catch-all). OP_Vacuum, BtreeIncrVacuum done; incrVacuumStep / relocatePage / modifyPagePointer not ported (gated on productive ptrmap). Inventory landed at `src/tests/STUB_INVENTORY.md` (originally 21 actionable entries: 7 high / 6 med / 8 low; after the 6.28.x audit passes + 2026-06-09 re-audit: **0 actionable** — #4 landed in 6.28.4, #13 PMA disk-spill landed in 5.7.b with SORTER_PMA_ENABLED=True; remaining markers are stale banners or faithful INTENTIONAL no-ops). One small high-priority entry ported in 6.28 commit (`pas_openDirectory`, os_unix.c:3874..3894 → src/passqlite3os.pas:2331). Doable subtasks for the remaining six high-priority stubs (each cites the open Phase-6/9 bullet it blocks; see STUB_INVENTORY.md for full Pascal/C citations):
   - [X] **6.28.1** `whereLoopAddVirtual` deeper arms
   - [X] **6.28.2** `sqlite3OpenTableAndIndices` full body
   - [X] **6.28.3** `sqlite3NestedParse` body ported
@@ -193,6 +193,35 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.40.7** Snapshot Tcl trampolines NOT registered
 - [X] **6.40.8** Misc test SQL fns: added test_setsubtype/test_getsubtype to
 - [~] **6.40.9** WAL/blob harness cmds: ported blob_reopen, wal_checkpoint_v2, mmap_warm, interrupt, is_interrupted, utf8_to_utf8 + utf8To8Inplace (TestModuleTest1.pas; test1.c:1824/5984/6005/7685/8734, test_hexio.c:306). incrblob3 29→4 err, badutf2/mmapwarm cmds pass. TODO: port quota_glob (test_quota.c VFS shim — large).
+
+### 6.41 — Unported features the ORACLE HAS (real coverage gaps, surfaced by the 2026-06-09 empty-PASS audit)
+
+> These three are honest porting gaps where the oracle binary supports the
+> feature (per its `PRAGMA compile_options`), so tests COULD be verified
+> against it today — unlike the 6.40-era gaps gated on oracle absence.
+> Each currently empties its `.test` files via a `tester_min.tcl`
+> capability flag = 0 (the files record `PASS <path> 0 <ms>` — vacuous).
+> Flip the flag only when the feature lands.
+
+- [ ] **6.41.1** **Shared-cache mode** (ENGINE, L; btree.c shared-Btree
+  path + table-lock machinery). Port is deliberately on the
+  `SQLITE_OMIT_SHARED_CACHE` path — `sqlite3_enable_shared_cache` is an
+  accept-and-ignore stub (passqlite3main.pas:5428). Oracle HAS shared
+  cache. Gates `shared_cache=0` → empties shared3/4/6/7/8/A/B,
+  sharedlock, vtab_shared, walshared, ioerr4/5, fts3shared, fts4merge4,
+  notify2/3, thread001-005 and more (~13 zero-subtest PASS files + the
+  thread family).
+- [ ] **6.41.2** **mmap I/O** (ENGINE, M; pager xFetch/xUnfetch memory-map
+  read path, os_unix mmap methods, PRAGMA mmap_size). Port treats
+  SQLITE_MAX_MMAP_SIZE as 0 (tester_min.tcl:460 comment "mmap I/O not
+  ported"); oracle has MAX_MMAP_SIZE=0x7fff0000. Gates `mmap=0` →
+  empties mmap2, mmapcorrupt, bigmmap.
+- [ ] **6.41.3** **rtree extension** (EXT, L; ext/rtree/rtree.c ~4.5 kLOC
+  + geopoly). No rtree module exists anywhere in the Pascal sources;
+  oracle is compiled with ENABLE_RTREE. Gates `rtree=0` → empties
+  rtree.test (permutation driver) and contributes to vtabK skip.
+  Port order/precedent: follow the fts3 module pattern
+  (passqlite3fts3.pas, auto-registered at openDatabase).
 
 > NOTE (2026-05-22): securedel.test failures are NOT an engine porting gap — the
 > engine returns the correct `secure_delete` propagation when driven via the CLI;
@@ -319,7 +348,8 @@ regressions without human triage.
 > Reorganised 2026-05-13: each umbrella bullet (9.4.1 .. 9.4.5) is
 > immediately followed by its decomposed sub-arms; trailing
 > `9.4.divbug.N` cluster bullets sit at the end in numeric order
-> (matching `src/tests/tcl/DIVERGENCES.md`).
+> (this tasklist is the canonical divbug ledger; the old
+> `src/tests/tcl/DIVERGENCES.md` skeleton was removed).
 >
 > **Timing & timeout rules (read before launching a run — 2026-05-16).**
 > The driver applies a **20 s per-test watchdog**; the full MANIFEST
@@ -442,7 +472,7 @@ regressions without human triage.
   matching upstream's `make test` log shape.  The gate is "every
   `tcl-feature` test exits 0 or matches the upstream skip list".
   Per the skip-and-cite contract from 9.1.3.followup, divergences
-  surface into `src/tests/tcl/DIVERGENCES.md` rather than blocking
+  surface as `9.4.divbug.N` bullets in this tasklist rather than blocking
   the driver — each cluster becomes a `9.4.divbug.N` follow-up
   bullet for triage.
   - [X] **9.4.3.a** Driver skeleton `src/tests/TclTestDriver.pas`
@@ -529,6 +559,25 @@ regressions without human triage.
     [X]) because three followups remain — see 9.4.2.g.11 for the
     list (`ifcapable crashtest`, WAL shm methods, the upstream
     `unixVfsObjFoo := unixVfsObj` record-copy issue).
+    - [X] **9.4.7.d.fix1** (2026-06-10) crash.test FAIL@270 + crash2.test
+      FAIL@83 (2026-06-09 sweep) — TWO harness gaps, no pager divergence:
+      (1) `btree_set_cache_size` (test3.c:584..607) was never ported, so
+      the `catch {set bt [btree_from_db db]; btree_set_cache_size $bt 10}`
+      line crashsql writes into the child script silently no-opped; the
+      child kept the default 2000-page cache, never spilled under the big
+      crash-2/3/4 workloads, synced the journal only twice, and exited
+      cleanly for every `-delay 3..5` case (`{0 {}}` instead of
+      `{1 {child process exited abnormally}}`).  Ported into
+      TestModuleTest1.pas (cmd table test3.c:678) reusing
+      sqlite3TestTextToPtr + engine sqlite3BtreeSetCacheSize
+      (passqlite3btree.pas:8353).  (2) TestModuleCrash.pas writeListSync
+      arm-1 (write-out-correctly) was missing C's post-switch
+      `if(pWrite==pFinal) break;` (test6.c:342) — only arms 2/3 had it —
+      so in SEQUENTIAL/SAFE_APPEND crash mode entries *past* the randomly
+      chosen pFinal could still be flushed/trashed.  Result: crash.test
+      890/890, crash2.test 83/83 (driver PASS), crash6 140/140,
+      crash7 293/293, crash8 45/45, journal1 + TestExplainParity
+      1026/1026 unchanged.
   - [ ] **9.4.7.e** `permutations.tcl` matrix — full upstream re-runs
     each test under ~30 build-flag combinations.  Land as
     optional second-tier gate (not in baseline CI).  Requires:
@@ -546,6 +595,17 @@ regressions without human triage.
   - [X] **9.4.8.c** Strict gate
   - [X] **9.4.8.d** Coverage check
   - [X] **9.4.8.e** Regression archive
+  - [ ] **9.4.8.f** Unswept backlog — sweep the 229 STATUS.txt rows formerly cited as bare `unswept` (a deferral with no scheduled gate is a permanent skip).  Each STATUS.txt row cites its shard below; closing a shard means every row in it is re-tagged pas-strict / pas-soft (with a live divbug cite) / pas-skip (with a named blocker).
+    - [ ] **9.4.8.f.1** sweep shard 1/5 — alphabetical rows 1–46
+    - [ ] **9.4.8.f.2** sweep shard 2/5 — rows 47–92
+    - [ ] **9.4.8.f.3** sweep shard 3/5 — rows 93–138
+    - [ ] **9.4.8.f.4** sweep shard 4/5 — rows 139–184
+    - [ ] **9.4.8.f.5** sweep shard 5/5 — rows 185–229
+    - [ ] **9.4.8.f.6** re-probe long-running skips `writecrash.test` + `securedel2.test` — still 240 s watchdog timeouts with 0 subtests in the 2026-06-09 sweep (ex-divbug.84, closed; siblings select4/printf now PASS and were promoted to pas-strict)
+  - [ ] **9.4.8.g** PORTED-but-UNTESTED features (2026-06-09 empty-PASS audit) — Pascal code that ships with ZERO test coverage because the matching `ENABLE_*` option is absent from the oracle build, so `tester_min.tcl` declares the capability 0 and the gated `.test` files exit before their first `do_test` (recorded as vacuous `PASS <path> 0 <ms>`).  Fix shape per feature: build an oracle variant WITH the option, build the port with the matching define, flip the `sqlite_options` flag, sweep the gated tests, re-tag their STATUS.txt rows.  (Engine-side porting gaps where the CURRENT oracle already has the feature are tracked separately under **6.41**.)
+    - [ ] **9.4.8.g.1** **stat4** — fully ported behind `{$IFDEF SQLITE_ENABLE_STAT4}` (10.1.42.b.7; ~65 refs in passqlite3codegen.pas) with an opt-in `STAT4=1` gate already in build.sh; oracle lacks ENABLE_STAT4.  Build a `-DSQLITE_ENABLE_STAT4` oracle, flip `stat4=1`, sweep analyze3/5/6/8/D/E/F/G, skipscan5/6, tkt-cbd054fa6b (11 currently-empty files).
+    - [ ] **9.4.8.g.2** **icu** — ported (6.40.2 DONE) but `icu=0` / `icu_collations=0` because the oracle lacks libicu.  Build an `-DSQLITE_ENABLE_ICU` oracle linked against libicu, flip the flags, sweep icu.test (449 subtests) + fts3expr4.test (881).
+    - [ ] **9.4.8.g.3** **preupdate hook + snapshot API** — engine code ported (6.40.3 DONE) but `preupdate=0`/`snapshot=0` mirror the oracle (no ENABLE_PREUPDATE_HOOK / ENABLE_SNAPSHOT) and the snapshot Tcl trampolines are deliberately NOT registered (6.40.7).  Build an oracle with both options, register the trampolines, flip the flags, sweep hook2.test (568 subtests), preupdate.test, snapshot*.test (6 files).
 
 #### 9.4 — Missing routines still to port (engine + harness gaps)
 
@@ -559,7 +619,7 @@ regressions without human triage.
 - [X] **9.4.port.intarray-addr** Ported intarray_addr + siblings int64array_addr/doublearray_addr/textarray_addr Tcl cmds (TestModuleTest1.pas, test1.c:3836..3962/9110..9113); tabfunc01 now 1 err/140 (residual 1370 stale newer-version expectation — 3.53 oracle also returns 0 for generate_series(0,0,0)).
 - [X] **9.4.port.fs-schema-vtab** DONE — both modules ported+registered+load: TestModuleSchema.pas (test_schema.c, vtab2 0/18, vtabH 0/26) + TestModuleFs.pas fs/fsdir/fstree (test_fs.c, fts4content 0/128, no more "no such module: fs").
 
-#### 9.4 divergence buckets (cite `src/tests/tcl/DIVERGENCES.md`)
+#### 9.4 divergence buckets (canonical ledger — STATUS.txt/SKIP.md cites resolve here)
 
 - [X] **9.4.divbug.1** `select1.test select1-4.4`
 - [X] **9.4.divbug.2** SQL error messages drop their format-arg tails
@@ -673,7 +733,7 @@ regressions without human triage.
 - [X] **9.4.divbug.84** Long-running tests hit the 20 s per-test driver
 - [X] **9.4.divbug.85** `collate5.test`
 - [X] **9.4.divbug.86** Sibling-of-.84 driver-timeout family
-- [X] **9.4.divbug.87** result-divergence cluster — in2/in7/index9/insert/joinC/nulls1 PASS; residual mmapwarm (stale expectation, non-bug) + savepoint6 (timeout)
+- [X] **9.4.divbug.87** result-divergence cluster — in2/in7/index9/insert/joinC/nulls1 PASS; residual mmapwarm (resolved — doctored local expectation restored to upstream 507; see .056) + savepoint6 (timeout)
   - [X] **9.4.divbug.87.001** `backup4`
   - [X] **9.4.divbug.87.002** `backup5`
   - [X] **9.4.divbug.87.003** `badutf`
@@ -729,7 +789,7 @@ regressions without human triage.
   - [X] **9.4.divbug.87.053** `misc3`
   - [X] **9.4.divbug.87.054** `misc4`
   - [X] **9.4.divbug.87.055** `misc5`
-  - [ ] **9.4.divbug.87.056** mmapwarm live FAIL — STALE TEST EXPECTATION (test wants 507; port==oracle==506). Not an engine bug; don't chase.
+  - [X] **9.4.divbug.87.056** mmapwarm PASS 7/7 — root cause: local copy of ../sqlite3/test/mmapwarm.test had been edited 1.0 expectation 507→506 based on a shell-only repro (shells run with default PENDING_BYTE 0x40000000, so the pending-byte page never lands inside the 506-page db). Under the real harness (tester.tcl:102 / tester_min.tcl:1040 set pending byte 0x10000; page_size 1024 ⇒ locking page = page 65 is skipped by allocateBtreePage, btree.c:6764) BOTH the C testfixture and the Pascal port produce 507 — verified by building the stock testfixture (`make testfixture`, -DSQLITE_DEFAULT_PAGE_SIZE=1024): it also returned 507 and failed the doctored 506. Upstream mmapwarm.test has expected 507 since its 2017 introduction. Fix: restored ../sqlite3/test/mmapwarm.test 1.0 expectation to {507}. No engine or harness change; port==oracle==507 == upstream expectation.
   - [X] **9.4.divbug.87.057** `notnullfault`
   - [X] **9.4.divbug.87.058** `null`
   - [X] **9.4.divbug.87.059** nulls1 PASS
@@ -877,6 +937,19 @@ regressions without human triage.
   - [X] **9.4.divbug.92.007** `vtab2-5.3`
   - [X] **9.4.divbug.92.008** `with1-22.1`
   - [ ] **9.4.divbug.92.009** with5-310 live FAIL — recursive-CTE outer ORDER BY wrongly eliminated (dup outer SELECT binds result col iColumn=-1/rowid → WHERE_IPK ordered match drops sorter). ROOT → **9.4.port.coroutine-from**.p materialise/dup fix.
+- [X] **9.4.divbug.93** shell-family live FAILs (stale-cite re-triage: formerly cited closed **divbug.63**) — shell1 (194 subtests run before FAIL) / shell2 / shell3 / shell4 / shell5 / shellA / shellB all FAIL in the 2026-06-09 sweep.  Root-cause anew; do not reuse the closed bucket.  NOTE (2026-06-10, **divbug.98**): until now the shell family was spawning the *system* `/usr/bin/sqlite3` (TESTFIXTURE_HOME fallback bug); the CLI under test is now `bin/passqlite3` — re-triage against it (shell3 already flipped to PASS 16/16; shell2 still FAIL at 21 subtests).
+  RESOLVED (2026-06-10, commits c891da0 / 1198aab / +2): the remaining failures were genuine Phase-10 CLI-port divergences vs shell.c.in, fixed line-by-line.  **shell1 (194), shell2 (21), shell4 (21), shell8 (19), shellA (26), shellB scripts 9/10 now PASS**; shell1/shell2/shell4/shellA promoted to pas-strict (shell8 already was).  Root causes (all ported faithfully): dot-arg tokenizer (parseDotCmdArgs quoting/backslash-octal, quoted azArg[0]), C-ordered prefix-match dispatcher with per-arm length guards, booleanValue (integers + stderr complaint), dotCmdMode port (options, dotCmdError caret messages, `.mode` display incl. modeTitleDsply), exact usage-error arg counts (.echo/.headers/.timer/.nullvalue/.separator/.changes), .import (rc for .bail, dotCmdError messages, popen pipes, -v formats, heredoc line offset), .indexes (pragma_table_list query in split mode), modeDefault (BATCH/TTY with modeFree zeroing), QRF renderer gaps (x'<lowerhex>' blobs, --textjsonb jsonb()/json display, qbox/psql/split modes incl. -screenwidth flow, .width wrap + multi-line rows + mid-row separators, --border off, --escape ascii/symbol/off + VT100 zero-width, %#Q unistr() literals, relaxed quoting, --titlelimit, --wrap, multiinsert packing, SQLITE_LIMIT_LENGTH 'string or blob too big'), .testcase/.check capture of stderr + --error-prefix, .fullschema stat dump via insert renderer, edit() UDF, CLI -version/-help/-interactive/--/--escape, sqlite_log() nArg=2 (was 0, codegen), SQLITE_SOURCE_ID mirrors the oracle.
+  - [X] **9.4.divbug.93.a** shell5-5.1 (1 of 52) — ENGINE bug, not shell: a recursive CTE whose recursive-step WHERE is a *lone* EXISTS with deeply-nested correlated refs (zRenameRank's Lzn loop, shell.c.in:7218..7249) stops one step early (max(nlz)=0; oracle=1), so .import auto-rename emits `x_2` instead of `x_02`.  Repro: /tmp-style script in commit msg 1198aab; adding any direct `nlz` conjunct (`nlz<3 AND EXISTS(...)`) makes it agree.  Data/plan dependent (8-row ColNames + COLLATE NOCASE or printf-chain variants fail; smaller tables pass).  RECHECK after the WHERE/EXISTS planner work.
+    RESOLVED (2026-06-10): not planner/EXISTS codegen — name RESOLUTION.  In `SELECT nlz+1 AS nlz FROM Lzn WHERE EXISTS(... printf(...,nlz+1,...) ...)` the bare `nlz` inside the EXISTS was swapped by the ResolveOuterAliasIDs pre-pass for a copy of the outer result alias `nlz+1`, double-incrementing (`(nlz+1)+1` — EXPLAIN showed two Adds per branch vs the oracle's one) so the dup-test ran at depth nlz+1 and the recursion stopped one step early.  C's lookupName scans the alias-owning NameContext's pSrcList (resolve.c:445..620) BEFORE that NC's NC_UEList alias arm (resolve.c:658..698), so `nlz` binds Lzn.nlz.  Fixed by threading the alias-owner's FROM (pAliasSrc) through ResolveOuterAliasIDsDepth/WalkAliasDeepFromSubqueries and gating the alias swap on `BareColMaybeInner(pAliasSrc,...)`.  The `nlz<3 AND ...` variant agreed only by accident (both sides off-by-one symmetrically).  **shell5 PASS 52/52, promoted to pas-strict**; with1/with2/with3/resolver01/subquery2/having/select7/aggnested PASS; TestExplainParity 1026/1026.
+  - [X] **9.4.divbug.93.b** shellB fptest01.sql (9 of 13 checks) — ENGINE float parity, not shell: sqlite3AtoF/dtoa rounding differs from C (e.g. `'-.2e+127'+0.0` → ours dtostr -2.00000000000000000000000000e+126, oracle -1.99999999999999984973552324e+126; shell strtod() disagrees with the cast also).  Same family as TestFuzzDiff red.  RECHECK with the AtoF/dtoa parity work.
+    RESOLVED (2026-06-10): misdiagnosed — the engine's AtoF/dtoa were fine; the divergence was the *harness* `dtostr()`/`strtod()` UDFs.  Those UDFs exist precisely to compare SQLite against the C library (shell.c.in:1285..1315, test1.c:1031..1061), but the Pas port implemented them with FPC `StrToFloat`/`Format()` (~16 significant digits, zero-padded).  Rebound them to libc `strtod()`/`snprintf("%#+.*e")` in both passqlite3shell.pas and TestModuleTest1.pas.  **shellB PASS (9/9 scripts), promoted to pas-strict.**  Fixing the test-module dtostr also unmasked the real fpconv1-2.0 blocker (sweep line `FAIL fpconv1.test 6`): the two single-source flatten call sites in codegen were missing C's MATERIALIZED-CTE optimisation fence (select.c:7782..7788, flattener restriction 28), so `fp(y) AS MATERIALIZED (...random()...)` was flattened and each reference to `y` re-evaluated random() (pas EQP lacked the oracle's `MATERIALIZE fp` node); the multi-source loop and restart scan already had the fence — added it to both single-source sites.  **fpconv1 PASS (6/6)** — the AtoF/FpDecode round-trip subtests fpconv1-1.x/3.0 were already byte-parity.  with1/with2/with3/aggnested/upfrom1/select4/crash2 PASS; TestExplainParity 1026/1026.
+- [ ] **9.4.divbug.94** 240 s watchdog timeouts, 0 subtests, formerly cited to closed buckets — sort4 (ex-63), e_fkey (ex-38), e_walauto (ex-87), fuzz (ex-89).  Timeout class: root-cause per-test slowness or raise the per-test budget knob before re-tagging.
+- [X] **9.4.divbug.95** windowE regression (stale cite: closed **divbug.79** claims "windowE PASS") — sweep line read "9 errors" but that column is the subtest COUNT: only windowE-2.1 failed (1 of 9).  Root cause: `reportWindowMisuse` (codegen.pas:9037, the NC_AllowWin-cleared shim reached via the lean resolver when resolving a named WINDOW's PARTITION BY list) emitted "misuse of window function NAME()" unconditionally, but C's resolveExprStep checks the `pDef->xValue==0 && pWin` arm FIRST (resolve.c:1240..1244, before the misuse arm and regardless of NC_AllowWin): a step+finalize-only aggregate (x_count via sqlite3_create_aggregate) or scalar used with OVER must say "NAME() may not be used as a window function".  Fixed by adding the FuncDef lookup (exact-nArg then -2 fallback, mirroring resolve.c) inside reportWindowMisuse and selecting the arm-1 wording when xValue is nil.  windowE PASS (9/9); windowA/windowB/windowerr/window5/filter1 PASS; TestExplainParity 1026/1026.
+- [X] **9.4.divbug.96** ioerr.test live FAIL (stale cite: closed **divbug.90** claims "io PASS; no live FAILs") — FAILs after 3041 subtests in the 2026-06-09 sweep.  I/O-error-injection family; re-triage independently of the closed bucket.
+  - [X] **9.4.divbug.96.001** ioerr-2.172.3 (single live FAIL, expected 1 got 0): VACUUM with persist=1 hit the injected fault on its final I/O op (the `pager_end_transaction` db-shrink truncate, pager.c:2152) yet returned SQLITE_OK.  Root cause: `sqlite3_backup_step` (passqlite3backup.pas:495..497) compared the `sqlite3BtreeCommitPhaseTwo(p^.pDest, 0)` result against SQLITE_OK without assigning it into `rc` — C backup.c:535..538 does `SQLITE_OK==(rc = sqlite3BtreeCommitPhaseTwo(...))` — so commit-phase-two I/O errors on the VACUUM (BtreeCopyFile) path were swallowed and the step reported success.  Fixed to capture rc; ioerr.test now PASS 3041/3041 (~87 s).
+- [ ] **9.4.divbug.97** window1-61.1 prepare-time runaway (2026-06-10) — the dbsqlfuzz query with ~6 nested windowed scalar subqueries never finishes prepare: unbounded recursive `sqlite3SelectDup`/`exprDup_` (400+ dup frames on the stack, RSS grows ~120 MB/s) — the repeated pre-bind/alias-swap/window-rewrite passes keep re-duplicating already-duplicated subquery layers, so the tree grows without bound.  C prepares it in one resolver pass (resolve.c NC chain + window.c:958 sqlite3WindowRewrite dups each OVER ORDER BY only twice).  All other window1 subtests (316) now pass; this is the only blocker for window1 pas-strict.  Needs a dedup/once-only gate on the multi-pass resolver, or the real single-pass NC resolver port.
+- [X] **9.4.divbug.98** recover.test FAIL (2026-06-09 sweep, 1 subtest) — NOT an engine bug: harness measured the wrong CLI.  `test_find_cli` resolves `[file join $cmdlinearg(TESTFIXTURE_HOME) sqlite3]`; the driver never exported TESTFIXTURE_HOME, so tester_min.tcl's fallback `[file dirname [info nameofexec]]` = `/usr/bin` (plain tclsh) and recover.test spawned the *system* `/usr/bin/sqlite3` (3.45.1 — rejects `-noinit`), dying with `SOURCE-ERROR: unknown option: -noinit` after recover-1.1.1.  Fix (harness, 2 parts): (1) TclTestDriver.pas SetupChildEnvironment now exports `TESTFIXTURE_HOME=<binDir>` to the child tclsh (parent env wins if set), matching upstream tester.tcl:497 where TESTFIXTURE_HOME is the build-output dir; (2) tester_min.tcl test_binary_name maps the upstream binary name `sqlite3` → `passqlite3` (in an upstream checkout the CLI is built next to testfixture under the same name; ours is bin/passqlite3, whose `.recover` is the ported ext/recover).  recover.test PASS 20/20.  Collateral: shell3.test now PASS 16/16 and promoted to pas-strict (was FAIL in divbug.93 — it was measuring /usr/bin/sqlite3); shell2.test unchanged (still FAIL at 21 subtests, stays in divbug.93); sqldiff1.test unchanged (vacuous skip, no sqldiff binary); shell6/7/8/9 + analyzer1 stay PASS against the real CLI.  Flipping the CLI exposed two genuine Phase-10 shell gaps via avfs.test (was a false pas-strict PASS against the system shell): (a) shell.c.in:13289 `sqlite3_appendvfs_init(0,0,0)` runs in main BEFORE the db open, so `-append` can hand 'apndvfs' to sqlite3_open_v2 — the Pascal shell only registered it per-connection after a successful open ("no such vfs: apndvfs"); ported the main-startup call before the openDb arm in shellMain; (b) `.q` — shell.c.in:10448 dispatches quit via `cli_strncmp(azArg[0],"quit",n)`, any non-empty prefix matches; doMetaCommand only accepted the exact spellings — ported quit-prefix (and exit-prefix at length>=2, since C's exit arm at shell.c.in:9507 sits after echo/eqp).  avfs.test PASS 16/16; TestShellMeta 60/60, TestShellMisc 30/30, TestShellEcho 5/5, TestShellRepl 8/8; TestExplainParity 1026/1026.
+- [ ] **9.4.divbug.99** soak.test deferral (2026-06-09 sweep: FAIL, 0 subtests) — by-design unrunnable under TclTestDriver; pas-skip in STATUS.txt + SKIP.md entry.  Three independent blockers: (a) `SOURCE-ERROR: invalid command name "clock_seconds"` — the command is registered only by test_thread.c, and only in the *spawned-thread* interps (test_thread.c:119); the main-interp registration is spelled `clock_second` (test_thread.c:643), so even the C testfixture's main interp does not expose `clock_seconds` (test_thread.c / sqlthread is unported; no other test in the manifest needs it — sort4.test defines its own `proc clock_seconds`); (b) soak.test loops `for {…} {[clock_seconds] < $soak_finishtime}` with TIMEOUT≥3600 s unless `-timeout N` arrives via `$argv` (soak.test:27..38) — the driver feeds scripts on stdin with empty `$argv`, so the 240 s watchdog guarantees FAIL; (c) the first file it sources, fuzz.test, already FAILs standalone on the 240 s watchdog (**9.4.divbug.94**).  RECHECK when divbug.94 closes AND the driver grows per-test argv plumbing (a `--test-arg` knob or per-entry manifest args); at that point also decide whether to port test_thread.c's clock commands.
 
 ---
 

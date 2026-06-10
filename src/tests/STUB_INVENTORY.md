@@ -14,9 +14,12 @@ banner just was not rewritten), the inventory below is the productive
 list of behavioural stubs still in tree.
 
 After the 6.28.3 / 6.28.4 / 6.28.7 / 6.28.8 / 6.28.9 / 6.28.10 audit
-passes, only **2 actionable entries** remain out of the original 21:
-- #4 `sqlite3AddColumn` — DRIFTED-S (~25 lines C of small arms; landed in 6.28.4).
-- #13 `sqlite3VdbeSorter*` PMA disk-spill — DRIFTED-XL (~2400 lines C deferred to Phase 5.7.b).
+passes — and the 2026-06-09 re-audit — **0 actionable entries** remain
+out of the original 21:
+- #4 `sqlite3AddColumn` — DRIFTED-S; **landed in 6.28.4** (all 3 drift arms verified).
+- #13 `sqlite3VdbeSorter*` PMA disk-spill — **CLOSED**: the disk-spill
+  read-back landed in Phase 5.7.b.6..b.9 and `SORTER_PMA_ENABLED=True`
+  since 5.7.b.9 (passqlite3vdbe.pas; verified 5.7.b.10).
 All other entries are either CLOSED (was real, stale banner scrubbed)
 or INTENTIONAL (faithful empty body matching C's preprocessor-gated
 no-op).
@@ -220,22 +223,22 @@ Prio  : high|med|low   (blocks open tasklist bullet?)
   matching index ordering, mirroring the C error string verbatim.  No
   action.
 
-### 13. `sqlite3VdbeSorter*` family — DRIFTED-XL (PMA / disk-spill deferred)
+### 13. `sqlite3VdbeSorter*` family — CLOSED (PMA disk-spill landed, Phase 5.7.b; re-audited 2026-06-09)
 - Pascal: `src/passqlite3vdbe.pas:6232..6551` (banner +
   Init / Reset / Close / Write / Rewind / Next / Rowkey / Compare
   bodies, plus vdbeSorterMergeSort / vdbeSorterCompareRec /
   vdbeSorterListToArray / vdbeSorterCountRecords helpers).
 - C ref : `vdbesort.c` entire file.
-- Verdict: 6.28.9 audit found the in-memory single-PMA path is fully
+- Verdict: 6.28.9 audit found the in-memory single-PMA path fully
   ported (stable mergesort, KeyInfo+UnpackedRecord packing with
-  default_rc=0 fix from bug 6.13).  What remains is the
-  PmaReader / MergeEngine / SortSubtask disk-spill subsystem — ORDER
-  BY past the in-memory cap silently truncates to RAM-only sort
-  (no PMA spill).  Banner at vdbe.pas:6232 updated to reflect the
-  partial-port reality.
-- Prio  : med-low (only matters on sorts that exceed in-RAM cap).
-- Size  : XL — ~2400 lines C of disk-spill code.  DO NOT attempt as
-  "one small port"; tracked as a future Phase 5.7.b slice.
+  default_rc=0 fix from bug 6.13); at that time the
+  PmaReader / MergeEngine disk-spill read-back was still unported.
+  **2026-06-09 re-audit: CLOSED** — the disk-spill subsystem landed in
+  Phase 5.7.b.6..b.9 (write side + MergeEngine/IncrMerger read-back)
+  and `SORTER_PMA_ENABLED = True` since 5.7.b.9 (verified 5.7.b.10).
+  The stale "GATED OFF =False" banner above the const was rewritten in
+  the same re-audit.
+- Prio  : none (closed).
 
 ## Low priority — debug, OMIT_*, or already-faithful no-ops
 
@@ -349,10 +352,10 @@ write, edit/spreadsheet/web-browser pipe targets) — see tasklist 10.1.27,
 | Priority   | Count | Status after audit                                            |
 |------------|------:|---------------------------------------------------------------|
 | high       |     7 | 6 CLOSED (was real), 1 DRIFTED-S (#4, landed in 6.28.4)       |
-| med        |     6 | 5 CLOSED (was real, 6.28.9), 1 DRIFTED-XL (#13 PMA spill)     |
+| med        |     6 | 5 CLOSED (was real, 6.28.9), 1 CLOSED (#13 PMA, Phase 5.7.b)  |
 | low        |     8 | 7 INTENTIONAL/CLOSED (6.28.10), 1 closed in 6.28 (#21)        |
 | (intentional / shell deferred) | ~18 | tracked outside 6.28                          |
-| **total productive markers**   | ~256 raw / **2 actionable** (#4 done, #13 deferred-XL) |
+| **total productive markers**   | ~256 raw / **0 actionable** (#4 landed 6.28.4, #13 landed 5.7.b) |
 
 Audit summary (6.28.3 / 6.28.7 / 6.28.8 / 6.28.9 / 6.28.10): of the
 original 21 productive markers, 18 turned out to be real ports under

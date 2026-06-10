@@ -1135,6 +1135,7 @@ const
 var
   p       : PTestvfs;
   eCmd    : cint;
+  nMatch  : cint;
   zSub    : PChar;
   i       : cint;
   pFault  : PTestFaultInject;
@@ -1164,12 +1165,24 @@ begin
     Result := TCL_ERROR; Exit;
   end;
 
+  { test_vfs.c:1117 uses Tcl_GetIndexFromObjStruct, which accepts any
+    unambiguous prefix of a subcommand name (e.g. malloc_common.tcl's
+    shmfault helper says `cantopen` for `cantopenerr`).  Mirror that:
+    exact match wins outright; otherwise a unique prefix matches. }
   zSub := Tcl_GetString(objAt(objv, 1));
   eCmd := -1;
-  for i := 0 to N_SUB - 1 do
+  nMatch := 0;
+  for i := 0 to N_SUB - 1 do begin
     if StrComp(zSub, aSubcmd[i]) = 0 then begin
-      eCmd := i; Break;
+      eCmd := i; nMatch := 1; Break;
     end;
+    if (zSub^ <> #0) and (StrLComp(zSub, aSubcmd[i], StrLen(zSub)) = 0) then
+    begin
+      if nMatch = 0 then eCmd := i;
+      Inc(nMatch);
+    end;
+  end;
+  if nMatch <> 1 then eCmd := -1;
   if eCmd < 0 then begin
     Tcl_AppendResult(interp, PChar('bad subcommand "'),
       zSub, PChar('": must be one of: filter script ioerr fullerr cantopenerr devchar sectorsize delete'), nil);

@@ -75,7 +75,9 @@ type
 const
   SQLITE_VERSION        = '3.53.0';
   SQLITE_VERSION_NUMBER = 3053000;
-  SQLITE_SOURCE_ID      = '3.53.0 — see ../sqlite3/manifest.uuid';
+  { Mirrors the C oracle build's SQLITE_SOURCE_ID (sqlite3.h:151) so
+    sqlite3_sourceid()/sqlite_source_id() match the reference exactly. }
+  SQLITE_SOURCE_ID      = '2026-04-09 11:41:38 4525003a53a7fc63ca75c59b22c79608659ca12f0131f52c18637f829977alt1';
 
 // ---------------------------------------------------------------------------
 // Primary result codes  (sqlite3.h §1)

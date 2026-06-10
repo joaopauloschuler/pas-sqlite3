@@ -499,6 +499,13 @@ var
   zLogFile:             AnsiString = 'off';
   { 10.1.10 follow-up — stable backing array for spec.aWidth. }
   aUserWidth:           array of SmallInt;
+  { stable backing array for spec.aAlign (.mode --align). }
+  aUserAlign:           array of Byte;
+  { .dump prebuilds a fully quoted "tbl(col,...)" destination string;
+    when set, MODE_Insert emits it verbatim (no further quoting). }
+  gInsertTabRaw:        Boolean = False;
+  { stable backing for .fullschema's stat-table INSERT destination. }
+  gFullschemaTab:       AnsiString = '';
 
 { ----------------------------------------------------------------------
   Helpers — small utilities that mirror the cli_* family
@@ -506,8 +513,26 @@ var
   stderr writes go through the standard FPC I/O.
   ---------------------------------------------------------------------- }
 
+{ Direct stderr write that bypasses any .testcase capture — used for
+  the .check failure report, which the C shell emits with a raw
+  sqlite3_fprintf(stderr,...) rather than cli_printf. }
+procedure shellEPutZDirect(const z: AnsiString);
+begin
+  Flush(Output);
+  Write(StdErr, z);
+  Flush(StdErr);
+end;
+
 procedure shellEPutZ(const z: AnsiString); inline;
 begin
+  { When a .testcase capture is armed, the C shell's cli_output_capture
+    intercepts stderr writes too (cli_printf(stderr,...) appends to the
+    capture buffer) — route through the captured stdout in that case. }
+  if gTcCapturing then begin
+    Write(z);
+    Flush(Output);
+    Exit;
+  end;
   { Flush stdout before writing to stderr so that under 2>&1 (or any merged
     stream) the error message appears at the position it was emitted, not
     after all subsequent buffered stdout writes.  The C oracle's stderr is
@@ -562,6 +587,7 @@ begin
   { Mode defaults — shell.c.in main() roughly at 13072..13085 }
   p^.mode.eMode  := MODE_List;
   p^.mode.autoExplain := 1;           { shell.c.in:1697 modeDefault }
+  p^.mode.spec.iVersion := 1;         { marks the spec as live (modePop) }
   p^.mode.spec.eStyle := 12;          { QRF_STYLE_List }
   p^.mode.spec.bTitles := QRF_No;     { off by default; modeChangeBuiltin
                                         will overwrite from aModeInfo.bHdr
@@ -569,10 +595,9 @@ begin
   p^.mode.spec.zColumnSep := SEP_Column;
   p^.mode.spec.zRowSep := SEP_Row;
   p^.mode.spec.zNull := '';
-  p^.mode.spec.nCharLimit  := DFLT_CHAR_LIMIT;
-  p^.mode.spec.nLineLimit  := DFLT_LINE_LIMIT;
-  p^.mode.spec.nTitleLimit := DFLT_TITLE_LIMIT;
-  p^.mode.spec.nMultiInsert := DFLT_MULTI_INSERT;
+  { The char/line/title limits and multi-insert threshold are TTY-mode
+    defaults; modeDefaultPas (shell.c.in:1695 modeDefault) applies them
+    via modeChange(MODE_TTY) only for console sessions. }
 end;
 
 { ----------------------------------------------------------------------
@@ -700,25 +725,28 @@ type
   TShellArgArr3 = array[0..2] of PMem;
   PShellArgArr3 = ^TShellArgArr3;
 
+{ shell.c.in:1281..1314 — strtod(X)/dtostr(X[,n]) exist precisely to compare
+  SQLite's float<->text conversion against the C library, so they MUST call
+  libc strtod()/snprintf("%#+.*e") (9.4.divbug.93.b: FPC's StrToFloat and
+  SQLite's own mprintf cap at ~16 significant digits and zero-pad, which is
+  exactly the divergence fptest01.sql / fpconv1-2.0 catch). }
+function shell_c_strtod(nptr: PAnsiChar; endptr: PPAnsiChar): Double; cdecl;
+  external 'c' name 'strtod';
+function shell_c_snprintf(s: PAnsiChar; n: PtrUInt; fmt: PAnsiChar): i32; cdecl;
+  varargs; external 'c' name 'snprintf';
+
 procedure shellStrtodUdf(pCtx: Psqlite3_context;
                          nVal: i32; apVal: PPMem); cdecl;
 { shell.c.in:1285..1294 — strtod(X) via the C library, for fp parity probes. }
 var
   pArgs: PShellArgArr3;
   z: PAnsiChar;
-  d: Double;
 begin
   if nVal < 1 then Exit;
   pArgs := PShellArgArr3(apVal);
   z := PAnsiChar(sqlite3_value_text(pArgs^[0]));
   if z = nil then Exit;
-  d := 0;
-  try
-    d := StrToFloat(AnsiString(z), DefaultFormatSettings);
-  except
-    on EConvertError do d := 0;
-  end;
-  sqlite3_result_double(pCtx, d);
+  sqlite3_result_double(pCtx, shell_c_strtod(z, nil));
 end;
 
 procedure shellDtostrUdf(pCtx: Psqlite3_context;
@@ -728,15 +756,15 @@ var
   pArgs: PShellArgArr3;
   r: Double;
   n: i32;
-  z: PAnsiChar;
+  z: array[0..399] of AnsiChar;
 begin
   pArgs := PShellArgArr3(apVal);
   r := sqlite3_value_double(pArgs^[0]);
   if nVal >= 2 then n := sqlite3_value_int(pArgs^[1]) else n := 26;
   if n < 1 then n := 1;
   if n > 350 then n := 350;
-  z := sqlite3PfMprintf('%#+.*e', [n, r]);
-  sqlite3_result_text(pCtx, z, -1, @shellSqliteFreeDel);
+  shell_c_snprintf(@z[0], SizeOf(z), '%#+.*e', n, r);
+  sqlite3_result_text(pCtx, @z[0], -1, SQLITE_TRANSIENT);
 end;
 
 procedure shellAddSchemaUdf(pCtx: Psqlite3_context;
@@ -857,6 +885,98 @@ begin
   sqlite3_result_int(pCtx, ms);
 end;
 
+{ editFunc — faithful port of shell.c.in:1864..1989.
+  edit(VALUE) / edit(VALUE,EDITOR): write VALUE to a temp file, launch
+  the editor (EDITOR arg or $VISUAL), read the file back as the result.
+  Text values get \r\n -> \n conversion on read-back unless the input
+  already contained \r\n. }
+procedure shellEditUdf(pCtx: Psqlite3_context;
+                       nVal: i32; apVal: PPMem); cdecl;
+var
+  pArgs: PShellArgArr3;
+  zEditor, zTempFile, zCmd: AnsiString;
+  bBin: Boolean;
+  hasCRLF: Boolean;
+  rc: i32;
+  f: file of Byte;
+  data, back: AnsiString;
+  sz: SizeInt;
+  i, j: SizeInt;
+  r: u64;
+begin
+  pArgs := PShellArgArr3(apVal);
+  if nVal = 2 then
+    zEditor := AnsiString(PAnsiChar(sqlite3_value_text(pArgs^[1])))
+  else
+    zEditor := GetEnvironmentVariable('VISUAL');
+  if zEditor = '' then begin
+    sqlite3_result_error(pCtx, 'no editor for edit()', -1);
+    Exit;
+  end;
+  if sqlite3_value_type(pArgs^[0]) = SQLITE_NULL then begin
+    sqlite3_result_error(pCtx, 'NULL input to edit()', -1);
+    Exit;
+  end;
+  r := 0;
+  sqlite3_randomness(SizeOf(r), @r);
+  zTempFile := AnsiString(Format('temp%x', [r]));
+  bBin := sqlite3_value_type(pArgs^[0]) = SQLITE_BLOB;
+  sz := sqlite3_value_bytes(pArgs^[0]);
+  SetLength(data, sz);
+  if sz > 0 then begin
+    if bBin then
+      Move(sqlite3_value_blob(pArgs^[0])^, data[1], sz)
+    else
+      Move(sqlite3_value_text(pArgs^[0])^, data[1], sz);
+  end;
+  hasCRLF := (not bBin) and (Pos(#13#10, data) > 0);
+  AssignFile(f, string(zTempFile));
+  {$I-} Rewrite(f); {$I+}
+  if IOResult <> 0 then begin
+    sqlite3_result_error(pCtx, 'edit() cannot open temp file', -1);
+    Exit;
+  end;
+  if sz > 0 then BlockWrite(f, data[1], sz);
+  CloseFile(f);
+  zCmd := zEditor + ' "' + zTempFile + '"';
+  rc := fpsystem(zCmd);
+  if rc <> 0 then begin
+    sqlite3_result_error(pCtx, 'EDITOR returned non-zero', -1);
+    DeleteFile(string(zTempFile));
+    Exit;
+  end;
+  AssignFile(f, string(zTempFile));
+  {$I-} Reset(f); {$I+}
+  if IOResult <> 0 then begin
+    sqlite3_result_error(pCtx,
+      'edit() cannot reopen temp file after edit', -1);
+    Exit;
+  end;
+  sz := FileSize(f);
+  SetLength(back, sz);
+  if sz > 0 then BlockRead(f, back[1], sz);
+  CloseFile(f);
+  DeleteFile(string(zTempFile));
+  if bBin then
+    sqlite3_result_blob64(pCtx, PAnsiChar(back), sz, SQLITE_TRANSIENT)
+  else begin
+    if not hasCRLF then begin
+      { convert any new \r\n back into \n }
+      j := 0;
+      i := 1;
+      while i <= sz do begin
+        if (back[i] = #13) and (i < sz) and (back[i+1] = #10) then Inc(i);
+        Inc(j);
+        back[j] := back[i];
+        Inc(i);
+      end;
+      SetLength(back, j);
+    end;
+    sqlite3_result_text64(pCtx, PAnsiChar(back), Length(back),
+                          SQLITE_TRANSIENT, SQLITE_UTF8);
+  end;
+end;
+
 procedure registerShellBuiltins(db: Psqlite3);
 { shell.c.in:4590..4607 — registration block invoked from open_db().
   editFunc deferred (system() spawn + temp-file shuttle); everything
@@ -880,6 +1000,11 @@ begin
                           @shellPutsnlUdf, nil, nil);
   sqlite3_create_function(db, 'usleep', 1, FFlags, nil,
                           @shellUSleepUdf, nil, nil);
+  { shell.c.in:4607..4610 — edit(VALUE) / edit(VALUE,EDITOR). }
+  sqlite3_create_function(db, 'edit', 1, FFlags, nil,
+                          @shellEditUdf, nil, nil);
+  sqlite3_create_function(db, 'edit', 2, FFlags, nil,
+                          @shellEditUdf, nil, nil);
 end;
 
 { shell.c.in:4110 — shellReadFile.  Slurp the entire contents of zName into
@@ -1938,17 +2063,25 @@ begin
   if eMode < Length(aModeInfo) then
     modeChangeBuiltin(p, eMode)
   else if eMode = MODE_BATCH then begin
+    { shell.c.in:1671..1675 — modeFree() zeroes the whole mode before
+      rebuilding from MODE_List, so stale seps/limits do not leak. }
     savedFlags := p^.mode.mFlags;
+    FillChar(p^.mode, SizeOf(p^.mode), 0);
+    p^.mode.spec.iVersion := 1;
+    p^.mode.autoExplain := 1;
     modeChange(p, MODE_List);
     p^.mode.mFlags := savedFlags;
   end else if eMode = MODE_TTY then begin
     savedFlags := p^.mode.mFlags;
+    FillChar(p^.mode, SizeOf(p^.mode), 0);
+    p^.mode.spec.iVersion := 1;
+    p^.mode.autoExplain := 1;
     modeChange(p, MODE_QBox);
     p^.mode.bAutoScreenWidth   := 1;
-    p^.mode.spec.eText         := 2;       { QRF_TEXT_Relaxed }
+    p^.mode.spec.eText         := 7;       { QRF_TEXT_Relaxed }
     p^.mode.spec.nCharLimit    := DFLT_CHAR_LIMIT;
     p^.mode.spec.nLineLimit    := DFLT_LINE_LIMIT;
-    p^.mode.spec.bTextJsonb    := 1;
+    p^.mode.spec.bTextJsonb    := QRF_Yes;
     p^.mode.spec.nTitleLimit   := DFLT_TITLE_LIMIT;
     p^.mode.spec.nMultiInsert  := DFLT_MULTI_INSERT;
     p^.mode.mFlags             := savedFlags;
@@ -2027,6 +2160,17 @@ begin
   Result := sb;
 end;
 
+function sqlIdentStr(const z: AnsiString): AnsiString;
+var i: SizeInt;
+begin
+  if not identNeedsQuote(z) then Exit(z);
+  Result := '"';
+  for i := 1 to Length(z) do begin
+    if z[i] = '"' then Result := Result + '""' else Result := Result + z[i];
+  end;
+  Result := Result + '"';
+end;
+
 procedure outputSqlIdent(const z: AnsiString);
 var i: SizeInt;
 begin
@@ -2049,11 +2193,13 @@ var
   i, n: SizeInt;
   c: Byte;
 begin
-  needQuote := False;
+  { qrfCsvQuote (qrf.c:846..863): controls, space, '"', '#'? no — the
+    set is: 0x00..0x1f, ' ', '"', #39 single-quote, 0x7f..0xff. }
   n := Length(z);
+  needQuote := n = 0;   { empty fields are quoted ("") }
   for i := 1 to n do begin
     c := Byte(z[i]);
-    if (c <= $1f) or (c = Byte('"')) or (c >= $7f) then begin
+    if (c <= $20) or (c = Byte('"')) or (c = Byte('''')) or (c >= $7f) then begin
       needQuote := True;
       Break;
     end;
@@ -2114,6 +2260,175 @@ begin
     if z[i] = '''' then Write('''''') else Write(z[i]);
   end;
   Write('''');
+end;
+
+{ sqlQuotedStr — outputSqlQuoted as a returned string. }
+function sqlQuotedStr(const z: AnsiString): AnsiString;
+var i: SizeInt;
+begin
+  Result := '''';
+  for i := 1 to Length(z) do
+    if z[i] = '''' then Result := Result + ''''''
+    else Result := Result + z[i];
+  Result := Result + '''';
+end;
+
+{ %#Q-style SQL text literal (printf.c:884..947): when eEsc is not
+  QRF_ESC_Off and the text contains control characters, render as
+  unistr('...') with \u00XX escapes for control characters and
+  backslash doubling; otherwise plain %Q quoting. }
+function sqlQuotedQ(const z: AnsiString; eEsc: u8): AnsiString;
+const
+  hex: AnsiString = '0123456789abcdef';
+var
+  i: SizeInt;
+  b: Byte;
+  hasCtrl: Boolean;
+begin
+  hasCtrl := False;
+  if eEsc <> 1 then        { 1 = QRF_ESC_Off }
+    for i := 1 to Length(z) do
+      if Byte(z[i]) <= $1f then begin hasCtrl := True; Break; end;
+  if not hasCtrl then
+    Exit(sqlQuotedStr(z));
+  Result := 'unistr(''';
+  for i := 1 to Length(z) do begin
+    b := Byte(z[i]);
+    if z[i] = '''' then Result := Result + ''''''
+    else if z[i] = '\' then Result := Result + '\\'
+    else if b <= $1f then begin
+      Result := Result + '\u00';
+      if b >= $10 then Result := Result + '1' else Result := Result + '0';
+      Result := Result + hex[1 + (b and $f)];
+    end else
+      Result := Result + z[i];
+  end;
+  Result := Result + ''')';
+end;
+
+{ qrfEscape (ext/qrf/qrf.c) with an explicit escape mode:
+    1 (off)    — text passes through verbatim
+    2 (ascii)  — control chars (except \t, \n, \r-before-\n) as ^X
+    3 (symbol) — same set as U+2400+c control pictures
+    0 (auto)   — resolves to ascii (qrf.c:2818..2820) }
+function qrfEscapeE(const z: AnsiString; eEsc: u8): AnsiString;
+var
+  i, n: SizeInt;
+  c: Byte;
+begin
+  if eEsc = 1 then Exit(z);
+  Result := '';
+  n := Length(z);
+  for i := 1 to n do begin
+    c := Byte(z[i]);
+    if (c <= $1f) and (c <> 9) and (c <> 10)
+       and not ((c = 13) and (i < n) and (z[i+1] = #10)) then begin
+      if eEsc = 3 then
+        Result := Result + #$E2#$90 + AnsiChar($80 + c)
+      else begin
+        Result := Result + '^' + Chr(c + $40);
+      end;
+    end else
+      Result := Result + z[i];
+  end;
+end;
+
+{ qrfJsonbQuickCheck — ext/qrf/qrf.c:974..988.  Sanity-check that the
+  blob looks like JSONB (false positives possible, no false negatives). }
+function jsonbQuickCheck(const b: AnsiString): Boolean;
+var
+  x: Byte;
+  i, n: i32;
+  sz: u64;
+begin
+  Result := False;
+  if Length(b) = 0 then Exit;
+  x := Byte(b[1]) shr 4;
+  if x <= 11 then Exit(Length(b) = 1 + i32(x));
+  if x < 14 then n := i32(x) - 11 else n := 4 * (i32(x) - 13);
+  if Length(b) < 1 + n then Exit;
+  sz := Byte(b[2]);
+  for i := 1 to n - 1 do sz := (sz shl 8) + Byte(b[i + 2]);
+  Result := sz + u64(n) + 1 = u64(Length(b));
+end;
+
+{ qrfJsonbToJson — ext/qrf/qrf.c:1001..1036.  Translate a JSONB blob
+  into text JSON via "SELECT json(?1)" on a private :memory: handle. }
+var
+  gJTransDb:   PTsqlite3 = nil;
+  gJTransStmt: PVdbe = nil;
+
+function jsonbToJson(const b: AnsiString; out zJson: AnsiString): Boolean;
+var
+  rc: i32;
+  pzTail: PAnsiChar;
+begin
+  Result := False;
+  zJson := '';
+  if not jsonbQuickCheck(b) then Exit;
+  if gJTransStmt = nil then begin
+    if sqlite3_open(':memory:', @gJTransDb) <> SQLITE_OK then begin
+      sqlite3_close(gJTransDb); gJTransDb := nil; Exit;
+    end;
+    pzTail := nil;
+    if sqlite3_prepare_v2(gJTransDb, 'SELECT json(?1)', -1,
+                          @gJTransStmt, @pzTail) <> SQLITE_OK then begin
+      if gJTransStmt <> nil then sqlite3_finalize(gJTransStmt);
+      gJTransStmt := nil;
+      sqlite3_close(gJTransDb); gJTransDb := nil;
+      Exit;
+    end;
+  end else
+    sqlite3_reset(gJTransStmt);
+  sqlite3_bind_blob(gJTransStmt, 1, PAnsiChar(b), Length(b),
+                    SQLITE_TRANSIENT);
+  rc := sqlite3_step(gJTransStmt);
+  if rc = SQLITE_ROW then begin
+    if sqlite3_column_text(gJTransStmt, 0) = nil then zJson := ''
+    else zJson := AnsiString(PAnsiChar(sqlite3_column_text(gJTransStmt, 0)));
+    Result := True;
+  end;
+end;
+
+{ Blob as an SQL literal — qrfRenderValue QRF_BLOB_Sql arm
+  (ext/qrf/qrf.c:1135..1158): x'<lowercase hex>'. }
+function blobSqlLiteral(const b: AnsiString): AnsiString;
+const
+  hex: AnsiString = '0123456789abcdef';
+var
+  i: SizeInt;
+  c: Byte;
+begin
+  Result := 'x''';
+  for i := 1 to Length(b) do begin
+    c := Byte(b[i]);
+    Result := Result + hex[1 + ((c shr 4) and $f)] + hex[1 + (c and $f)];
+  end;
+  Result := Result + '''';
+end;
+
+function colBlobStr(pStmt: PVdbe; i: i32): AnsiString;
+var
+  n: i32;
+  pB: Pointer;
+begin
+  n := sqlite3_column_bytes(pStmt, i);
+  pB := sqlite3_column_blob(pStmt, i);
+  SetLength(Result, n);
+  if n > 0 then Move(pB^, Result[1], n);
+end;
+
+{ Render a BLOB column for SQL-quoting contexts (MODE_Quote/MODE_Insert
+  and qbox cells) — qrfRenderValue SQLITE_BLOB arm (qrf.c:1112..1158):
+  honour --textjsonb, otherwise x'<lowercase hex>'. }
+function renderBlobSql(p: PShellState; pStmt: PVdbe; i: i32): AnsiString;
+var
+  b, zJson: AnsiString;
+begin
+  b := colBlobStr(pStmt, i);
+  if (p^.mode.spec.bTextJsonb = QRF_Yes) and jsonbToJson(b, zJson) then
+    Exit('jsonb(' + sqlQuotedStr(zJson) + ')');
+  Result := blobSqlLiteral(b);
 end;
 
 procedure outputJsonString(const z: AnsiString);
@@ -2224,6 +2539,8 @@ type
     zColSep:     AnsiString;
     zRowSep:     AnsiString;
     insertTab:   AnsiString;        { MODE_Insert only }
+    insertRaw:   Boolean;           { insertTab is preformatted (dump) }
+    insNIns:     i64;               { multi-insert accumulator (qrf u.nIns) }
     lastStepRc:  i32;               { final step rc when columnar buffers }
     lineMaxNameLen: i32;            { MODE_Line auto-width; 0 = uncomputed }
   end;
@@ -2264,21 +2581,85 @@ begin
   Result := Result + '"';
 end;
 
+{ Simplified sqlite3_qrf_wcwidth (ext/qrf/qrf.c): width of a single
+  Unicode code point — 0 for combining marks, 2 for East-Asian wide
+  ranges, 1 otherwise. }
+function ucWcWidth(u: i32): i32;
+begin
+  if u < $300 then Exit(1);
+  { combining diacriticals and friends }
+  if ((u >= $300) and (u <= $36F))
+     or ((u >= $1AB0) and (u <= $1AFF))
+     or ((u >= $20D0) and (u <= $20FF))
+     or ((u >= $FE20) and (u <= $FE2F))
+     or (u = $200B) then Exit(0);
+  { East-Asian wide / fullwidth }
+  if ((u >= $1100) and (u <= $115F))
+     or ((u >= $2E80) and (u <= $A4CF))
+     or ((u >= $AC00) and (u <= $D7A3))
+     or ((u >= $F900) and (u <= $FAFF))
+     or ((u >= $FE30) and (u <= $FE4F))
+     or ((u >= $FF00) and (u <= $FF60))
+     or ((u >= $FFE0) and (u <= $FFE6))
+     or ((u >= $20000) and (u <= $3FFFD)) then Exit(2);
+  Result := 1;
+end;
+
+{ qrfIsVt100 — ext/qrf/qrf.c: byte length of a VT100 escape starting
+  at s[i] (which is ESC), or 0 if not a VT100 escape. }
+function vt100Len(const s: AnsiString; i: SizeInt): SizeInt;
+var j: SizeInt;
+begin
+  Result := 0;
+  if (i + 1 > Length(s)) or (s[i + 1] <> '[') then Exit;
+  j := i + 2;
+  while (j <= Length(s)) and (s[j] in ['0'..'9', ';']) do Inc(j);
+  if (j <= Length(s)) and (s[j] in ['m', 'A'..'H', 'J', 'K', 'S', 'T']) then
+    Result := j - i + 1;
+end;
+
 function utf8DispWidth(const s: AnsiString): i32;
-{ Approximate display width: count non-continuation UTF-8 bytes (one
-  glyph per code point, all glyphs treated as width 1).  Good enough
-  for ASCII / Latin / Greek / Cyrillic; CJK wide-char support arrives
-  with the full QRF port. }
+{ sqlite3_qrf_wcswidth: decode UTF-8 and sum per-code-point widths
+  (combining marks count 0, East-Asian wide chars count 2).  VT100
+  escape sequences contribute zero width. }
 var
-  i, n: i32;
+  i, n, u, len: i32;
   b: Byte;
 begin
   n := 0;
   i := 1;
   while i <= Length(s) do begin
     b := Byte(s[i]);
-    if (b and $C0) <> $80 then Inc(n);
-    Inc(i);
+    if b = $1b then begin
+      len := i32(vt100Len(s, i));
+      if len > 0 then begin
+        Inc(i, len);
+        Continue;
+      end;
+      Inc(n);
+      Inc(i);
+    end else if b < $80 then begin
+      Inc(n);
+      Inc(i);
+    end else begin
+      { decode multi-byte sequence (qrf.c sqlite3_qrf_decode_utf8) }
+      u := 0;
+      len := 1;
+      if ((b and $E0) = $C0) and (i < Length(s)) then begin
+        u := ((b and $1F) shl 6) or (Byte(s[i+1]) and $3F);
+        len := 2;
+      end else if ((b and $F0) = $E0) and (i + 1 < Length(s)) then begin
+        u := ((b and $0F) shl 12) or ((Byte(s[i+1]) and $3F) shl 6)
+             or (Byte(s[i+2]) and $3F);
+        len := 3;
+      end else if ((b and $F8) = $F0) and (i + 2 < Length(s)) then begin
+        u := ((b and $0F) shl 18) or ((Byte(s[i+1]) and $3F) shl 12)
+             or ((Byte(s[i+2]) and $3F) shl 6) or (Byte(s[i+3]) and $3F);
+        len := 4;
+      end;
+      if u > 0 then Inc(n, ucWcWidth(u)) else Inc(n);
+      Inc(i, len);
+    end;
   end;
   Result := n;
 end;
@@ -2296,8 +2677,50 @@ begin
     rs.insertTab := AnsiString(p^.zDestTable)
   else
     rs.insertTab := 'tab';
+  rs.insertRaw       := gInsertTabRaw;
+  rs.insNIns         := 0;
   rs.lastStepRc      := SQLITE_DONE;
   rs.lineMaxNameLen  := 0;
+end;
+
+function shellErrorLocation(p: PShellState): AnsiString; forward;
+
+type
+  TCellLines = array of AnsiString;
+
+{ qrfTitleLimit — ext/qrf/qrf.c:1046..1085: clamp a column title to N
+  display columns, converting tabs/newlines to spaces and adding "..."
+  when truncation occurs (only when N>=3). }
+function titleLimitStr(const zIn: AnsiString; NLim: i32): AnsiString;
+var
+  z: AnsiString;
+  i, cut, ell: SizeInt;
+  w: i32;
+  b: Byte;
+begin
+  z := zIn;
+  for i := 1 to Length(z) do
+    if z[i] in [#9, #10, #13] then z[i] := ' ';
+  if NLim <= 0 then Exit(z);
+  if utf8DispWidth(z) <= NLim then Exit(z);
+  { find the byte offsets where width reaches NLim-3 (ellipsis) / NLim }
+  w := 0;
+  ell := 0;
+  cut := Length(z);
+  i := 1;
+  while i <= Length(z) do begin
+    b := Byte(z[i]);
+    if (b and $C0) <> $80 then begin
+      if (w >= NLim - 3) and (ell = 0) then ell := i;
+      if w >= NLim then begin cut := i - 1; Break; end;
+      Inc(w);
+    end;
+    Inc(i);
+  end;
+  if (ell > 0) and (NLim >= 3) then
+    Result := Copy(z, 1, ell - 1) + '...'
+  else
+    Result := Copy(z, 1, cut);
 end;
 
 function colNameStr(pStmt: PVdbe; i: i32): AnsiString; inline;
@@ -2392,6 +2815,150 @@ begin
   end;
 end;
 
+{ qrfWrapLine — faithful port of ext/qrf/qrf.c.  Computes the byte
+  length of the next display line of zIn (1-based iPos), at most w
+  display columns wide, honoring newlines, tabs (8-col stops), VT100
+  zero-width escapes and optional word-wrapping. }
+procedure qrfWrapLineP(const zIn: AnsiString; iPos: SizeInt; w: i32;
+                       bWrap: Boolean; out nThis: SizeInt; out iNext: SizeInt);
+var
+  i, k, len: SizeInt;
+  n, u, wcw: i32;
+  b, brkB: Byte;
+  isAl1, isAl2: Boolean;
+  nLen: SizeInt;
+begin
+  nLen := Length(zIn);
+  if iPos > nLen then begin
+    nThis := 0;
+    iNext := iPos;
+    Exit;
+  end;
+  n := 0;
+  i := iPos;
+  brkB := 0;
+  while (i <= nLen) and (n <= w) do begin
+    b := Byte(zIn[i]);
+    brkB := b;
+    if b >= $C0 then begin
+      u := 0; len := 1;
+      if ((b and $E0) = $C0) and (i < nLen) then begin
+        u := ((b and $1F) shl 6) or (Byte(zIn[i+1]) and $3F); len := 2;
+      end else if ((b and $F0) = $E0) and (i + 1 < nLen) then begin
+        u := ((b and $0F) shl 12) or ((Byte(zIn[i+1]) and $3F) shl 6)
+             or (Byte(zIn[i+2]) and $3F); len := 3;
+      end else if ((b and $F8) = $F0) and (i + 2 < nLen) then begin
+        u := ((b and $0F) shl 18) or ((Byte(zIn[i+1]) and $3F) shl 12)
+             or ((Byte(zIn[i+2]) and $3F) shl 6) or (Byte(zIn[i+3]) and $3F);
+        len := 4;
+      end;
+      wcw := 1;
+      if u > 0 then wcw := ucWcWidth(u);
+      if wcw + n > w then Break;
+      Inc(i, len);
+      Inc(n, wcw);
+      Continue;
+    end;
+    if b >= $20 then begin
+      if n = w then Break;
+      Inc(n); Inc(i);
+      Continue;
+    end;
+    if b = 10 then Break;
+    if (b = 13) and (i < nLen) and (zIn[i+1] = #10) then begin
+      Inc(i);
+      brkB := 10;
+      Break;
+    end;
+    if b = 9 then begin
+      wcw := 8 - (n and 7);
+      if n + wcw > w then Break;
+      Inc(n, wcw);
+      Inc(i);
+      Continue;
+    end;
+    if b = $1b then begin
+      len := vt100Len(zIn, i);
+      if len > 0 then begin Inc(i, len); Continue; end;
+    end;
+    if n = w then Break;
+    Inc(n);
+    Inc(i);
+  end;
+  if i > nLen then begin
+    nThis := nLen - iPos + 1;
+    iNext := nLen + 1;
+    Exit;
+  end;
+  if brkB = 10 then begin
+    { line ends at the newline; consume it }
+    nThis := i - iPos;
+    if (nThis > 0) and (zIn[i] = #10) and (i > iPos)
+       and (zIn[i-1] = #13) then ;  { \r already included by CRLF arm }
+    iNext := i + 1;
+    Exit;
+  end;
+  { Mid-text break: maybe back up to a nicer split point (qrf.c). }
+  if bWrap and (i <= nLen) and not (zIn[i] in [' ', #9])
+     and (i > iPos) then begin
+    isAl1 := zIn[i] in ['0'..'9', 'A'..'Z', 'a'..'z'];
+    isAl2 := zIn[i-1] in ['0'..'9', 'A'..'Z', 'a'..'z'];
+    if isAl1 = isAl2 then begin
+      k := i - 1;
+      while (k >= iPos + (i - iPos) div 2) and not (zIn[k] in [' ', #9]) do
+        Dec(k);
+      if k < iPos + (i - iPos) div 2 then begin
+        k := i;
+        while k >= iPos + (i - iPos) div 2 do begin
+          if ((zIn[k-1] in ['0'..'9', 'A'..'Z', 'a'..'z'])
+              <> (zIn[k] in ['0'..'9', 'A'..'Z', 'a'..'z']))
+             and ((Byte(zIn[k]) and $C0) <> $80) then Break;
+          Dec(k);
+        end;
+      end;
+      if k >= iPos + (i - iPos) div 2 then i := k;
+    end;
+  end;
+  nThis := i - iPos;
+  while (i <= nLen) and (zIn[i] in [' ', #9, #13]) do Inc(i);
+  iNext := i;
+end;
+
+{ Split a cell into display lines via qrfWrapLineP.  w<=0 means only
+  split on newlines. }
+function wrapCellLines(const zIn: AnsiString; w: i32;
+                       wordWrap: Boolean): TCellLines;
+var
+  iPos, iNext, nThis, nOut: SizeInt;
+  effW: i32;
+begin
+  if w > 0 then effW := w else effW := 1000000;
+  SetLength(Result, 0);
+  nOut := 0;
+  iPos := 1;
+  if zIn = '' then begin
+    SetLength(Result, 1);
+    Result[0] := '';
+    Exit;
+  end;
+  while iPos <= Length(zIn) do begin
+    qrfWrapLineP(zIn, iPos, effW, wordWrap and (w > 0), nThis, iNext);
+    SetLength(Result, nOut + 1);
+    Result[nOut] := Copy(zIn, iPos, nThis);
+    { strip a trailing \r from CRLF line ends }
+    if (Length(Result[nOut]) > 0)
+       and (Result[nOut][Length(Result[nOut])] = #13) then
+      SetLength(Result[nOut], Length(Result[nOut]) - 1);
+    Inc(nOut);
+    if iNext <= iPos then Break;
+    iPos := iNext;
+  end;
+  if Length(Result) = 0 then begin
+    SetLength(Result, 1);
+    Result[0] := '';
+  end;
+end;
+
 procedure emitRowOne(var rs: TRenderState; pStmt: PVdbe);
 var
   i, ty: i32;
@@ -2399,22 +2966,59 @@ var
   isNull: Boolean;
   decl: PAnsiChar;
   isNumericTy: Boolean;
+  tclJ: SizeInt;
+  tclB: Byte;
+  insSb: AnsiString;
+  zNm: AnsiString;
+  lineMxW: i32;
+  lineWrapped: TCellLines;
 begin
   case rs.p^.mode.eMode of
     MODE_Off: Exit;
 
     MODE_Line:
-      { Upstream (shell.c.in aModeInfo[line]): eCSep=13 (": "), one column
-        per line, blank line BETWEEN records (not after the last).  No
-        leading padding — column-name flush left, then ": ", then value. }
+      { qrf.c QRF_STYLE_Line (2612..2669): one column per line, blank
+        line BETWEEN records; the column name (clamped to --titlelimit)
+        is RIGHT-aligned in a field as wide as the widest column name
+        (wcswidth), followed by spec.zColumnSep (default ": ").  Values
+        wrap at the remaining screen width, continuation lines indented
+        past the name+separator. }
       begin
+        if rs.lineMaxNameLen = 0 then
+          for i := 0 to rs.nCol - 1 do begin
+            ty := utf8DispWidth(titleLimitStr(colNameStr(pStmt, i),
+                                rs.p^.mode.spec.nTitleLimit));
+            if ty > rs.lineMaxNameLen then rs.lineMaxNameLen := ty;
+          end;
+        lineMxW := 1000000;
+        if rs.p^.mode.spec.nScreenWidth > 0 then begin
+          lineMxW := rs.p^.mode.spec.nScreenWidth
+                     - (i32(Length(rs.zColSep)) + rs.lineMaxNameLen);
+          if lineMxW < 1 then lineMxW := 1;
+        end;
         if rs.rowsEmitted > 0 then WriteLn;
         for i := 0 to rs.nCol - 1 do begin
           z := colTextStr(pStmt, i, isNull);
-          Write(colNameStr(pStmt, i));
-          Write(': ');
-          if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
-          WriteLn;
+          zNm := titleLimitStr(colNameStr(pStmt, i),
+                               rs.p^.mode.spec.nTitleLimit);
+          ty := rs.lineMaxNameLen - utf8DispWidth(zNm);
+          if ty > 0 then Write(StringOfChar(' ', ty));
+          Write(zNm);
+          Write(rs.zColSep);
+          if isNull then begin
+            Write(rs.zNull);
+            WriteLn;
+          end else begin
+            z := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
+            lineWrapped := wrapCellLines(z, lineMxW,
+                             rs.p^.mode.spec.bWordWrap <> 1);
+            for tclJ := 0 to High(lineWrapped) do begin
+              if tclJ > 0 then
+                Write(StringOfChar(' ',
+                  rs.lineMaxNameLen + i32(Length(rs.zColSep))));
+              WriteLn(lineWrapped[tclJ]);
+            end;
+          end;
         end;
       end;
 
@@ -2423,7 +3027,8 @@ begin
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(rs.zColSep);
           z := colTextStr(pStmt, i, isNull);
-          if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
+          if isNull then Write(rs.zNull)
+          else Write(qrfEscapeE(z, rs.p^.mode.spec.eEsc));
         end;
         Write(rs.zRowSep);
       end;
@@ -2447,39 +3052,58 @@ begin
             SQLITE_NULL:    Write('NULL');
             SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
             SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
-            SQLITE_TEXT:    outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+            SQLITE_TEXT:    Write(sqlQuotedQ(
+              specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc));
+            SQLITE_BLOB:    Write(renderBlobSql(rs.p, pStmt, i));
           else
-            outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+            Write(sqlQuotedQ(
+              specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc));
           end;
         end;
         Write(rs.zRowSep);
       end;
 
     MODE_Insert:
+      { qrf.c QRF_STYLE_Insert (2568..2611) — rows are packed onto one
+        INSERT statement (",\n  (...)" continuations) until the size
+        exceeds spec.nMultiInsert; 0 means one row per INSERT. }
       begin
-        Write('INSERT INTO ');
-        if identNeedsQuote(rs.insertTab) then begin
-          Write('"');
-          for i := 1 to Length(rs.insertTab) do begin
-            if rs.insertTab[i] = '"' then Write('""') else Write(rs.insertTab[i]);
+        insSb := '';
+        if (rs.insNIns = 0)
+           or (rs.insNIns >= i64(rs.p^.mode.spec.nMultiInsert)) then begin
+          if rs.insNIns <> 0 then begin
+            Write(';');
+            WriteLn;
+            rs.insNIns := 0;
           end;
-          Write('"');
+          insSb := 'INSERT INTO ';
+          if rs.insertRaw then
+            insSb := insSb + rs.insertTab
+          else if identNeedsQuote(rs.insertTab) then begin
+            insSb := insSb + '"';
+            for i := 1 to Length(rs.insertTab) do begin
+              if rs.insertTab[i] = '"' then insSb := insSb + '""'
+              else insSb := insSb + rs.insertTab[i];
+            end;
+            insSb := insSb + '"';
+          end else
+            insSb := insSb + rs.insertTab;
+          if rs.headersOn then begin
+            for i := 0 to rs.nCol - 1 do begin
+              if i = 0 then insSb := insSb + '(' else insSb := insSb + ',';
+              insSb := insSb + sqlIdentStr(colNameStr(pStmt, i));
+            end;
+            insSb := insSb + ')';
+          end;
+          insSb := insSb + ' VALUES(';
         end else
-          Write(rs.insertTab);
-        if rs.headersOn then begin
-          for i := 0 to rs.nCol - 1 do begin
-            if i = 0 then Write('(') else Write(',');
-            outputSqlIdent(colNameStr(pStmt, i));
-          end;
-          Write(')');
-        end;
-        Write(' VALUES(');
+          insSb := insSb + ','#10'  (';
         for i := 0 to rs.nCol - 1 do begin
-          if i > 0 then Write(',');
+          if i > 0 then insSb := insSb + ',';
           ty := sqlite3_column_type(pStmt, i);
-          if ty = SQLITE_NULL then begin Write('NULL'); Continue; end;
+          if ty = SQLITE_NULL then begin insSb := insSb + 'NULL'; Continue; end;
           if ty = SQLITE_INTEGER then begin
-            Write(IntToStr(sqlite3_column_int64(pStmt, i))); Continue;
+            insSb := insSb + IntToStr(sqlite3_column_int64(pStmt, i)); Continue;
           end;
           if ty = SQLITE_FLOAT then begin
             { Promote integer-valued doubles to a textual integer when the
@@ -2488,14 +3112,25 @@ begin
             decl := sqlite3_column_decltype(pStmt, i);
             isNumericTy := (decl <> nil) and (StrComp(decl, 'INTEGER') = 0);
             if isNumericTy and (Frac(sqlite3_column_double(pStmt, i)) = 0) then
-              Write(IntToStr(Trunc(sqlite3_column_double(pStmt, i))))
+              insSb := insSb + IntToStr(Trunc(sqlite3_column_double(pStmt, i)))
             else
-              Write(FloatToStr(sqlite3_column_double(pStmt, i)));
+              insSb := insSb + FloatToStr(sqlite3_column_double(pStmt, i));
             Continue;
           end;
-          outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+          if ty = SQLITE_BLOB then begin
+            insSb := insSb + renderBlobSql(rs.p, pStmt, i);
+            Continue;
+          end;
+          insSb := insSb + sqlQuotedQ(
+            specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc);
         end;
-        WriteLn(');');
+        rs.insNIns := rs.insNIns + Length(insSb) + 2;
+        if rs.insNIns >= i64(rs.p^.mode.spec.nMultiInsert) then begin
+          insSb := insSb + ');'#10;
+          rs.insNIns := 0;
+        end else
+          insSb := insSb + ')';
+        Write(insSb);
       end;
 
     MODE_Json:
@@ -2540,8 +3175,22 @@ begin
             SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
             SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
           else
-            z := colTextStr(pStmt, i, isNull);
-            outputCString(z);
+            if ty = SQLITE_BLOB then begin
+              { QRF_BLOB_Tcl (qrf.c:1160..1180) — every byte as \NNN. }
+              z := colBlobStr(pStmt, i);
+              Write('"');
+              for tclJ := 1 to Length(z) do begin
+                tclB := Byte(z[tclJ]);
+                Write('\');
+                Write(Chr(Ord('0') + ((tclB shr 6) and 3)));
+                Write(Chr(Ord('0') + ((tclB shr 3) and 7)));
+                Write(Chr(Ord('0') + (tclB and 7)));
+              end;
+              Write('"');
+            end else begin
+              z := colTextStr(pStmt, i, isNull);
+              outputCString(z);
+            end;
           end;
         end;
         Write(rs.zRowSep);
@@ -2603,6 +3252,13 @@ begin
   case rs.p^.mode.eMode of
     MODE_Json:
       if rs.rowsEmitted > 0 then WriteLn(']');
+    MODE_Insert:
+      { qrf.c:2890..2894 — close an open multi-row INSERT. }
+      if rs.insNIns <> 0 then begin
+        Write(';');
+        WriteLn;
+        rs.insNIns := 0;
+      end;
   end;
 end;
 
@@ -2633,61 +3289,176 @@ begin
   if pad > 0 then Write(StringOfChar(' ', pad));
 end;
 
-function colCellText(pStmt: PVdbe; i: i32; const zNull: AnsiString): AnsiString;
+{ qrfRelaxable — ext/qrf/qrf.c:813..841: under --quote relaxed, text
+  may appear unquoted when it cannot be mistaken for NULL, a number,
+  or quoted text. }
+function qrfRelaxable(const z, zNull: AnsiString): Boolean;
 var
-  isNull: Boolean;
-  z: AnsiString;
+  i, n: SizeInt;
 begin
-  z := colTextStr(pStmt, i, isNull);
-  if isNull then Result := zNull else Result := qrfEscapeCtrl(z);
+  if Length(z) = 0 then Exit(zNull <> '');
+  if (z[1] = '''') or (z[1] in [' ', #9, #10, #11, #12, #13]) then Exit(False);
+  n := Length(z);
+  if (z[n] = '''') or (z[n] in [' ', #9, #10, #11, #12, #13]) then Exit(False);
+  if z = zNull then Exit(False);
+  i := 1;
+  if z[1] in ['-', '+'] then i := 2;
+  if Copy(z, i, MaxInt) = 'Inf' then Exit(False);
+  if (i > n) or not (z[i] in ['0'..'9']) then Exit(True);
+  Inc(i);
+  while (i <= n) and (z[i] in ['0'..'9']) do Inc(i);
+  if i > n then Exit(False);
+  if z[i] = '.' then begin
+    Inc(i);
+    while (i <= n) and (z[i] in ['0'..'9']) do Inc(i);
+    if i > n then Exit(False);
+  end;
+  if (i <= n) and (z[i] in ['e', 'E']) then begin
+    Inc(i);
+    if (i <= n) and (z[i] in ['+', '-']) then Inc(i);
+    if (i > n) or not (z[i] in ['0'..'9']) then Exit(True);
+    Inc(i);
+    while (i <= n) and (z[i] in ['0'..'9']) do Inc(i);
+  end;
+  Result := i <= n;
 end;
 
-procedure emitColumnar(var rs: TRenderState; pStmt: PVdbe; firstRow: AnsiString);
-{ Buffer all remaining rows (`firstRow` already consumed via column-text
-  capture) and emit per-mode in MODE_Column / MODE_Table / MODE_Box.
-  `firstRow` is unused — kept for signature symmetry; the caller passes
-  '' and we read the current row from pStmt before stepping further.
+function colCellText(var rs: TRenderState; pStmt: PVdbe; i: i32): AnsiString;
+{ Spec-aware cell rendering for the columnar modes — mirrors
+  qrfRenderValue (ext/qrf/qrf.c:1087..1199) for the eText/eBlob/
+  bTextJsonb combinations the Pascal cut supports. }
+var
+  isNull: Boolean;
+  z, b, zJson: AnsiString;
+  ty: i32;
+  eText: u8;
+begin
+  ty := sqlite3_column_type(pStmt, i);
+  eText := rs.p^.mode.spec.eText;
+  case ty of
+    SQLITE_NULL:
+      Result := rs.zNull;
+    SQLITE_INTEGER:
+      Result := IntToStr(sqlite3_column_int64(pStmt, i));
+    SQLITE_FLOAT:
+      Result := specStr(PAnsiChar(sqlite3_column_text(pStmt, i)));
+    SQLITE_BLOB: begin
+      b := colBlobStr(pStmt, i);
+      if (rs.p^.mode.spec.bTextJsonb = QRF_Yes) and jsonbToJson(b, zJson) then begin
+        if eText = 2 then
+          Result := 'jsonb(' + sqlQuotedQ(zJson, rs.p^.mode.spec.eEsc) + ')'
+        else Result := zJson;
+      end else if (eText = 2) or (eText = 7) or (rs.p^.mode.spec.eBlob = 2) then
+        Result := blobSqlLiteral(b)
+      else begin
+        z := colTextStr(pStmt, i, isNull);
+        Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
+      end;
+    end;
+  else begin
+    z := colTextStr(pStmt, i, isNull);
+    if (eText = 7) and qrfRelaxable(z, rs.zNull) then
+      { QRF_TEXT_Relaxed — unambiguous text passes unquoted }
+      Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc)
+    else if (eText = 2) or (eText = 7) then
+      Result := sqlQuotedQ(z, rs.p^.mode.spec.eEsc)
+    else Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
+  end;
+  end;
+end;
 
-  Per-cell alignment follows upstream qrf.c:1995/1514: each cell remembers
-  its own SQLite type and renders right-aligned when INTEGER or FLOAT,
-  left-aligned otherwise.  A negative `.width N` overrides at the column
-  level and forces right-align regardless of types (qrf.c:1696). }
+{ Cut a UTF-8 string after at most w display columns (continuation
+  bytes do not count).  Returns the byte length of the prefix. }
+function utf8CutBytes(const z: AnsiString; w: i32): SizeInt;
+var
+  i: SizeInt;
+  n: i32;
+begin
+  n := 0;
+  i := 1;
+  while i <= Length(z) do begin
+    if (Byte(z[i]) and $C0) <> $80 then begin
+      if n = w then Break;
+      Inc(n);
+    end;
+    Inc(i);
+  end;
+  { do not split a codepoint: extend over continuation bytes }
+  while (i <= Length(z)) and ((Byte(z[i]) and $C0) = $80) do Inc(i);
+  Result := i - 1;
+end;
+
+
+{ (qrfWrapLineP / wrapCellLines moved before emitRowOne) }
+
+procedure emitColumnar(var rs: TRenderState; pStmt: PVdbe; firstRow: AnsiString);
+{ Buffer all rows and emit in MODE_Column / MODE_Table / MODE_Box /
+  MODE_QBox / MODE_Psql / MODE_Markdown.  Columns named in `.width`
+  (spec.aWidth) get a fixed width; longer content wraps onto extra
+  physical lines (char-wrap, or word-wrap under --wordwrap on).  When
+  any data row spans more than one physical line, a row separator is
+  drawn between consecutive data rows (box/table/psql), mirroring qrf.c.
+
+  Per-cell alignment follows upstream qrf.c: each cell renders
+  right-aligned when INTEGER or FLOAT, left-aligned otherwise; a
+  negative `.width N` forces right-align for the whole column. }
 var
   matrix:    array of array of AnsiString;
   cellRight: array of array of Boolean;
+  cellLines: array of array of TCellLines;
   headers:   array of AnsiString;
   widths:    array of i32;
+  fixedW:    array of i32;
   forceRight: array of Boolean;
+  nLines:    array of i32;
   ty: i32;
   i, c, w, rc, nCol: i32;
+  ln: i32;
   nRowBuf: i32;
   rcStep: i32;
-  isBox, isTable, isCol, isMd: Boolean;
+  isBox, isTable, isCol, isMd, isPsql: Boolean;
+  borderOff: Boolean;
+  anyMultiLine: Boolean;
+  wordWrap: Boolean;
+  scrW, nRowsFlow, nKCols, kk, jj, idx: i32;
+  flowW: array of i32;
+  flowTot: i32;
+  outAcc: AnsiString;
   glyphTL, glyphTR, glyphBL, glyphBR: AnsiString;
   glyphHB, glyphVB, glyphCx, glyphTU, glyphTD, glyphTL2, glyphTR2: AnsiString;
+  glyphML, glyphMR: AnsiString;
   glyphHdrHB, glyphHdrCx: AnsiString;
-  rowSep, hdrSep, footSep: AnsiString;
-  sb: AnsiString;
-  align: i32;
+  rowSep, hdrSep, footSep, midSep: AnsiString;
+  sb, cellTxt: AnsiString;
+  doRight: Boolean;
 begin
   if firstRow = '' then ; { unused }
   nCol := rs.nCol;
-  isBox   := rs.p^.mode.eMode = MODE_Box;
+  isBox   := (rs.p^.mode.eMode = MODE_Box) or (rs.p^.mode.eMode = MODE_QBox);
   isTable := rs.p^.mode.eMode = MODE_Table;
-  isCol   := rs.p^.mode.eMode = MODE_Column;
+  isPsql  := rs.p^.mode.eMode = MODE_Psql;
+  isCol   := (rs.p^.mode.eMode = MODE_Column)
+             or (rs.p^.mode.eMode = MODE_Split);
   isMd    := rs.p^.mode.eMode = MODE_Markdown;
+  borderOff := rs.p^.mode.spec.bBorder = 1;   { QRF_No }
+  { bWordWrap: QRF_Auto resolves to Yes (qrf.c:2859..2861). }
+  wordWrap := rs.p^.mode.spec.bWordWrap <> 1;
 
   SetLength(headers,    nCol);
   SetLength(widths,     nCol);
+  SetLength(fixedW,     nCol);
   SetLength(forceRight, nCol);
   for i := 0 to nCol - 1 do begin
     headers[i]    := colNameStr(pStmt, i);
     widths[i]     := utf8DispWidth(headers[i]);
+    fixedW[i]     := 0;
     forceRight[i] := False;
+    if (rs.p^.mode.spec.aWidth <> nil) and (i < rs.p^.mode.spec.nWidth)
+       and (rs.p^.mode.spec.aWidth[i] <> 0) then begin
+      fixedW[i] := Abs(rs.p^.mode.spec.aWidth[i]);
+      if rs.p^.mode.spec.aWidth[i] < 0 then forceRight[i] := True;
+    end;
   end;
-
-  { .width is applied below, after row capture, so a negative .width can
-    override the type-derived alignment without being clobbered by it. }
 
   { Buffer rows.  Start with the row already at pStmt (caller stepped to
     SQLITE_ROW once, then handed off without emitting). }
@@ -2697,9 +3468,7 @@ begin
   SetLength(matrix[0],    nCol);
   SetLength(cellRight[0], nCol);
   for c := 0 to nCol - 1 do begin
-    matrix[0, c] := colCellText(pStmt, c, rs.zNull);
-    w := utf8DispWidth(matrix[0, c]);
-    if w > widths[c] then widths[c] := w;
+    matrix[0, c] := colCellText(rs, pStmt, c);
     ty := sqlite3_column_type(pStmt, c);
     cellRight[0, c] := (ty = SQLITE_INTEGER) or (ty = SQLITE_FLOAT);
   end;
@@ -2715,9 +3484,7 @@ begin
     SetLength(matrix[nRowBuf],    nCol);
     SetLength(cellRight[nRowBuf], nCol);
     for c := 0 to nCol - 1 do begin
-      matrix[nRowBuf, c] := colCellText(pStmt, c, rs.zNull);
-      w := utf8DispWidth(matrix[nRowBuf, c]);
-      if w > widths[c] then widths[c] := w;
+      matrix[nRowBuf, c] := colCellText(rs, pStmt, c);
       ty := sqlite3_column_type(pStmt, c);
       cellRight[nRowBuf, c] := (ty = SQLITE_INTEGER) or (ty = SQLITE_FLOAT);
     end;
@@ -2725,15 +3492,102 @@ begin
   end;
   rs.lastStepRc := rcStep;
 
-  { User-supplied minimum widths via .width.  C uses the absolute value
-    for the cell padding; a negative .width forces right-align for every
-    cell in the column regardless of type (qrf.c:1696). }
-  for i := 0 to nCol - 1 do
-    if (rs.p^.mode.spec.aWidth <> nil) and (i < rs.p^.mode.spec.nWidth) then begin
-      w := Abs(rs.p^.mode.spec.aWidth[i]);
-      if w > widths[i] then widths[i] := w;
-      if rs.p^.mode.spec.aWidth[i] < 0 then forceRight[i] := True;
+  { A step error (e.g. SQLITE_TOOBIG) aborts rendering entirely — the C
+    qrf renderer produces no table when the statement fails mid-way. }
+  if (rcStep <> SQLITE_DONE) and (rcStep <> SQLITE_OK)
+     and (rcStep <> SQLITE_ROW) then
+    Exit;
+
+  { Wrap pass: split every cell into physical lines (fixed-width columns
+    wrap at their width) and derive the final column widths. }
+  SetLength(cellLines, nRowBuf);
+  SetLength(nLines, nRowBuf);
+  anyMultiLine := False;
+  for rc := 0 to nRowBuf - 1 do begin
+    SetLength(cellLines[rc], nCol);
+    nLines[rc] := 1;
+    for c := 0 to nCol - 1 do begin
+      cellLines[rc, c] := wrapCellLines(matrix[rc, c], fixedW[c], wordWrap);
+      if Length(cellLines[rc, c]) > nLines[rc] then
+        nLines[rc] := Length(cellLines[rc, c]);
     end;
+    if nLines[rc] > 1 then anyMultiLine := True;
+  end;
+  for c := 0 to nCol - 1 do begin
+    if fixedW[c] > 0 then
+      widths[c] := fixedW[c]
+    else begin
+      for rc := 0 to nRowBuf - 1 do
+        for ln := 0 to High(cellLines[rc, c]) do begin
+          w := utf8DispWidth(cellLines[rc, c][ln]);
+          if w > widths[c] then widths[c] := w;
+        end;
+      { --wrap N caps the natural width (qrf.c:2040..2042); rewrap. }
+      if (rs.p^.mode.spec.nWrap > 0) and (widths[c] > rs.p^.mode.spec.nWrap)
+      then begin
+        widths[c] := rs.p^.mode.spec.nWrap;
+        for rc := 0 to nRowBuf - 1 do begin
+          cellLines[rc, c] := wrapCellLines(matrix[rc, c], widths[c], wordWrap);
+          if Length(cellLines[rc, c]) > nLines[rc] then begin
+            nLines[rc] := Length(cellLines[rc, c]);
+            anyMultiLine := True;
+          end;
+        end;
+        { header may still be wider }
+        w := utf8DispWidth(headers[c]);
+        if w > widths[c] then widths[c] := w;
+      end;
+    end;
+  end;
+
+  { MODE_Split single-column flow layout (qrf.c split style): when a
+    screen width is known, flow the values of a one-column result set
+    top-to-bottom into as many side-by-side columns as fit. }
+  if (rs.p^.mode.eMode = MODE_Split) and (nCol = 1) then begin
+    scrW := rs.p^.mode.spec.nScreenWidth;
+    if (scrW <= 0) and (rs.p^.mode.bAutoScreenWidth <> 0)
+       and (stdout_tty_width > 0) then
+      scrW := stdout_tty_width;
+    if (scrW > 0) and (nRowBuf > 1) then begin
+      nRowsFlow := 0;
+      for kk := 1 to nRowBuf do begin
+        nKCols := (nRowBuf + kk - 1) div kk;
+        SetLength(flowW, nKCols);
+        flowTot := 2 * (nKCols - 1);
+        for jj := 0 to nKCols - 1 do begin
+          flowW[jj] := 0;
+          for idx := jj * kk to (jj + 1) * kk - 1 do
+            if idx < nRowBuf then begin
+              w := utf8DispWidth(matrix[idx, 0]);
+              if w > flowW[jj] then flowW[jj] := w;
+            end;
+          Inc(flowTot, flowW[jj]);
+        end;
+        if flowTot <= scrW then begin
+          nRowsFlow := kk;
+          Break;
+        end;
+      end;
+      if nRowsFlow = 0 then nRowsFlow := nRowBuf;
+      nKCols := (nRowBuf + nRowsFlow - 1) div nRowsFlow;
+      for jj := 0 to nRowsFlow - 1 do begin
+        sb := '';
+        for kk := 0 to nKCols - 1 do begin
+          idx := kk * nRowsFlow + jj;
+          if idx >= nRowBuf then Break;
+          if kk > 0 then sb := sb + '  ';
+          sb := sb + matrix[idx, 0];
+          w := flowW[kk] - utf8DispWidth(matrix[idx, 0]);
+          if w > 0 then sb := sb + StringOfChar(' ', w);
+        end;
+        while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
+          SetLength(sb, Length(sb) - 1);
+        WriteLn(sb);
+      end;
+      rs.rowsEmitted := nRowBuf;
+      Exit;
+    end;
+  end;
 
   { Glyphs. }
   if isBox then begin
@@ -2749,6 +3603,8 @@ begin
     glyphCx  := #$E2#$94#$BC; { ┼ }
     glyphTU  := #$E2#$94#$B4; { ┴ }
     glyphTD  := #$E2#$94#$AC; { ┬ }
+    glyphML  := #$E2#$94#$9C; { ├ }
+    glyphMR  := #$E2#$94#$A4; { ┤ }
     glyphTL2 := #$E2#$95#$9E; { ╞  DBL_123 }
     glyphTR2 := #$E2#$95#$A1; { ╡  DBL_134 }
     glyphHdrHB := #$E2#$95#$90; { ═  DBL_24 }
@@ -2757,7 +3613,17 @@ begin
     glyphTL := '+'; glyphTR := '+'; glyphBL := '+'; glyphBR := '+';
     glyphHB := '-'; glyphVB := '|';
     glyphCx := '+'; glyphTU := '+'; glyphTD := '+';
+    glyphML := '+'; glyphMR := '+';
     glyphTL2 := '+'; glyphTR2 := '+';
+    glyphHdrHB := '-'; glyphHdrCx := '+';
+  end else if isPsql then begin
+    { psql-style: no outer border; '|' between columns; '-'/'+' rule
+      between the header and the data only. }
+    glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
+    glyphHB := '-'; glyphVB := '|';
+    glyphCx := '+'; glyphTU := ''; glyphTD := '';
+    glyphML := ''; glyphMR := '';
+    glyphTL2 := ''; glyphTR2 := '';
     glyphHdrHB := '-'; glyphHdrCx := '+';
   end else if isMd then begin
     { Markdown — pipe borders, no top/bottom rules; the only horizontal
@@ -2765,6 +3631,7 @@ begin
     glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
     glyphHB := '-'; glyphVB := '|';
     glyphCx := '|'; glyphTU := ''; glyphTD := '';
+    glyphML := '|'; glyphMR := '|';
     glyphTL2 := '|'; glyphTR2 := '|';
     glyphHdrHB := '-'; glyphHdrCx := '|';
   end else begin
@@ -2772,15 +3639,18 @@ begin
     glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
     glyphHB := '-'; glyphVB := '';
     glyphCx := ''; glyphTU := ''; glyphTD := '';
+    glyphML := ''; glyphMR := '';
     glyphTL2 := ''; glyphTR2 := '';
     glyphHdrHB := '-'; glyphHdrCx := '';
   end;
 
-  { Helper to build the horizontal rule between rows (Box / Table). }
-  align := 0;
-  if align = 0 then ; { unused }
-
   if isBox or isTable then begin
+    if borderOff then begin
+      { .mode -border off: no outer border; separators have no caps. }
+      glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
+      glyphTL2 := ''; glyphTR2 := '';
+      glyphML := ''; glyphMR := '';
+    end;
     sb := glyphTL;
     for c := 0 to nCol - 1 do begin
       if c > 0 then sb := sb + glyphTD;
@@ -2804,6 +3674,24 @@ begin
     end;
     sb := sb + glyphBR;
     footSep := sb;
+
+    sb := glyphML;
+    for c := 0 to nCol - 1 do begin
+      if c > 0 then sb := sb + glyphCx;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHB;
+    end;
+    sb := sb + glyphMR;
+    midSep := sb;
+  end else if isPsql then begin
+    sb := '';
+    for c := 0 to nCol - 1 do begin
+      if c > 0 then sb := sb + glyphCx;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHdrHB;
+    end;
+    hdrSep := sb;
+    rowSep := '';
+    footSep := '';
+    midSep := '';
   end else if isMd then begin
     sb := glyphTL2;
     for c := 0 to nCol - 1 do begin
@@ -2814,90 +3702,116 @@ begin
     hdrSep := sb;
     rowSep := '';
     footSep := '';
+    midSep := '';
   end else begin
     rowSep := '';
     hdrSep := '';
     footSep := '';
+    midSep := '';
   end;
 
+  outAcc := '';
   { Emit. }
-  if isBox or isTable then WriteLn(rowSep);
+  if (isBox or isTable) and not borderOff then outAcc := outAcc + rowSep + #10;
 
-  if rs.headersOn or isBox or isTable or isMd then begin
-    if isBox or isTable or isMd then begin
-      Write(glyphVB);
+  if rs.headersOn or isBox or isTable or isMd or isPsql then begin
+    if isBox or isTable or isMd or isPsql then begin
+      sb := glyphVB;
+      if isPsql or borderOff then sb := '';
       for c := 0 to nCol - 1 do begin
-        if c > 0 then Write(glyphVB);
-        Write(' ');
-        { Header text centered for Box / Table / Markdown. }
+        if c > 0 then sb := sb + glyphVB;
+        sb := sb + ' ';
+        { Header text centered. }
         w := widths[c] - utf8DispWidth(headers[c]);
-        if w > 0 then Write(StringOfChar(' ', w div 2));
-        Write(headers[c]);
-        if w > 0 then Write(StringOfChar(' ', w - (w div 2)));
-        Write(' ');
+        if w > 0 then sb := sb + StringOfChar(' ', w div 2);
+        sb := sb + headers[c];
+        if w > 0 then sb := sb + StringOfChar(' ', w - (w div 2));
+        sb := sb + ' ';
       end;
-      WriteLn(glyphVB);
-      WriteLn(hdrSep);
+      if isPsql or borderOff then begin
+        while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
+          SetLength(sb, Length(sb) - 1);
+        outAcc := outAcc + sb + #10;
+      end else
+        outAcc := outAcc + sb + glyphVB + #10;
+      outAcc := outAcc + hdrSep + #10;
     end else begin
       { MODE_Column header row.  Upstream qrf.c (~2014) sets eTitleAlign
         to QRF_ALIGN_Center for the title row, then qrfRTrim strips
         trailing whitespace before the row separator. }
       for c := 0 to nCol - 1 do begin
-        if c > 0 then Write('  ');
+        if c > 0 then outAcc := outAcc + '  ';
         w := widths[c] - utf8DispWidth(headers[c]);
-        if w > 0 then Write(StringOfChar(' ', w div 2));
-        Write(headers[c]);
+        if w > 0 then outAcc := outAcc + StringOfChar(' ', w div 2);
+        outAcc := outAcc + headers[c];
         if (c < nCol - 1) and (w > 0) then
-          Write(StringOfChar(' ', w - (w div 2)));
+          outAcc := outAcc + StringOfChar(' ', w - (w div 2));
       end;
-      WriteLn;
+      outAcc := outAcc + #10;
       for c := 0 to nCol - 1 do begin
-        if c > 0 then Write('  ');
-        Write(StringOfChar('-', widths[c]));
+        if c > 0 then outAcc := outAcc + '  ';
+        outAcc := outAcc + StringOfChar('-', widths[c]);
       end;
-      WriteLn;
+      outAcc := outAcc + #10;
     end;
   end;
 
   for rc := 0 to nRowBuf - 1 do begin
-    if isBox or isTable or isMd then begin
-      Write(glyphVB);
-      for c := 0 to nCol - 1 do begin
-        if c > 0 then Write(glyphVB);
-        Write(' ');
-        w := widths[c] - utf8DispWidth(matrix[rc, c]);
-        if (cellRight[rc, c] or forceRight[c]) and (w > 0) then
-          Write(StringOfChar(' ', w));
-        Write(matrix[rc, c]);
-        if (not (cellRight[rc, c] or forceRight[c])) and (w > 0) then
-          Write(StringOfChar(' ', w));
-        Write(' ');
-      end;
-      WriteLn(glyphVB);
-    end else begin
-      { MODE_Column data row.  Upstream qrfRTrim trims trailing
-        whitespace on every Column row.  Build the full row into sb,
-        then RTrim spaces before emit so all-NULL rows collapse to an
-        empty line and trailing-NULL cells don't leak inter-column
-        padding (qrf.c:1247 qrfRTrim + 2247). }
+    if (rc > 0) and anyMultiLine and (isBox or isTable) then
+      outAcc := outAcc + midSep + #10;
+    for ln := 0 to nLines[rc] - 1 do begin
       sb := '';
+      if (isBox or isTable or isMd) and not borderOff then sb := glyphVB;
       for c := 0 to nCol - 1 do begin
-        if c > 0 then sb := sb + '  ';
-        w := widths[c] - utf8DispWidth(matrix[rc, c]);
-        if (cellRight[rc, c] or forceRight[c]) and (w > 0) then
-          sb := sb + StringOfChar(' ', w);
-        sb := sb + matrix[rc, c];
-        if (not (cellRight[rc, c] or forceRight[c]))
-           and (c < nCol - 1) and (w > 0) then
-          sb := sb + StringOfChar(' ', w);
+        if c > 0 then begin
+          if isBox or isTable or isMd or isPsql then sb := sb + glyphVB
+          else sb := sb + '  ';
+        end;
+        if ln <= High(cellLines[rc, c]) then
+          cellTxt := cellLines[rc, c][ln]
+        else
+          cellTxt := '';
+        doRight := cellRight[rc, c] or forceRight[c];
+        w := widths[c] - utf8DispWidth(cellTxt);
+        if isBox or isTable or isMd or isPsql then begin
+          sb := sb + ' ';
+          if doRight and (w > 0) then sb := sb + StringOfChar(' ', w);
+          sb := sb + cellTxt;
+          if (not doRight) and (w > 0) then sb := sb + StringOfChar(' ', w);
+          sb := sb + ' ';
+        end else begin
+          if doRight and (w > 0) then sb := sb + StringOfChar(' ', w);
+          sb := sb + cellTxt;
+          if (not doRight) and (c < nCol - 1) and (w > 0) then
+            sb := sb + StringOfChar(' ', w);
+        end;
       end;
-      while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
-        SetLength(sb, Length(sb) - 1);
-      WriteLn(sb);
+      if (isBox or isTable or isMd) and not borderOff then
+        outAcc := outAcc + sb + glyphVB + #10
+      else begin
+        { MODE_Column / MODE_Split / MODE_Psql — qrfRTrim trims trailing
+          whitespace on every data row (qrf.c:1247 + 2247). }
+        while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
+          SetLength(sb, Length(sb) - 1);
+        outAcc := outAcc + sb + #10;
+      end;
     end;
   end;
 
-  if isBox or isTable then WriteLn(footSep);
+  if (isBox or isTable) and not borderOff then outAcc := outAcc + footSep + #10;
+  if isCol and (isMd or isPsql) then ; { keep hints used }
+
+  { The C qrf renderer accumulates the whole rendered table in an
+    sqlite3_str bound to the database LENGTH limit; exceeding it aborts
+    with SQLITE_TOOBIG ("string or blob too big") and emits nothing. }
+  if rs.p^.db <> nil then begin
+    flowTot := sqlite3_limit(rs.p^.db, 0 {SQLITE_LIMIT_LENGTH}, -1);
+    if (flowTot > 0) and (Length(outAcc) > flowTot) then begin
+      shellEPutZ(shellErrorLocation(rs.p) + ' string or blob too big'#10);
+      Exit;
+    end;
+  end;
+  Write(outAcc);
 
   rs.rowsEmitted := nRowBuf;
 end;
@@ -2916,6 +3830,9 @@ begin
   isColumnar := (p^.mode.eMode = MODE_Column)
              or (p^.mode.eMode = MODE_Table)
              or (p^.mode.eMode = MODE_Box)
+             or (p^.mode.eMode = MODE_QBox)
+             or (p^.mode.eMode = MODE_Psql)
+             or (p^.mode.eMode = MODE_Split)
              or (p^.mode.eMode = MODE_Markdown);
 
   if isColumnar then begin
@@ -3231,44 +4148,104 @@ end;
   minimum needed for the REPL to be drivable and self-documenting.
   ---------------------------------------------------------------------- }
 
-function dotCmdName(const zLine: AnsiString): AnsiString;
-{ Extract the leading dot-command name from zLine (without the leading
-  '.', and stripped of trailing whitespace / arguments). }
-var i, j: SizeInt;
+{ resolve_backslashes — shell.c.in:4766..4818.  Interpret C-style
+  backslash escapes in-place: \a \b \t \n \v \f \r \" \' \\ \xHH \NNN
+  (octal).  Applied only to double-quoted dot-command tokens, exactly
+  as parseDotCmdArgs does. }
+function resolveBackslashes(const zIn: AnsiString): AnsiString;
+var
+  i, n: SizeInt;
+  c: AnsiChar;
+  v, hdv, nhd: i32;
 begin
-  Result := '';
+  n := Length(zIn);
   i := 1;
-  while (i <= Length(zLine)) and (zLine[i] in [' ', #9]) do Inc(i);
-  if (i > Length(zLine)) or (zLine[i] <> '.') then Exit;
-  Inc(i);
-  j := i;
-  while (j <= Length(zLine)) and not (zLine[j] in [' ', #9, #10, #13]) do Inc(j);
-  Result := Copy(zLine, i, j - i);
+  { C scans to the first backslash before rewriting; cosmetic only. }
+  Result := '';
+  while i <= n do begin
+    c := zIn[i];
+    if (c = '\') and (i < n) then begin
+      Inc(i);
+      c := zIn[i];
+      case c of
+        'a': c := #7;
+        'b': c := #8;
+        't': c := #9;
+        'n': c := #10;
+        'v': c := #11;
+        'f': c := #12;
+        'r': c := #13;
+        '"': c := '"';
+        '''': c := '''';
+        '\': c := '\';
+        'x': begin
+          nhd := 0; v := 0;
+          while (nhd < 2) and (i < n) do begin
+            case zIn[i+1] of
+              '0'..'9': hdv := Ord(zIn[i+1]) - Ord('0');
+              'a'..'f': hdv := Ord(zIn[i+1]) - Ord('a') + 10;
+              'A'..'F': hdv := Ord(zIn[i+1]) - Ord('A') + 10;
+            else
+              hdv := -1;
+            end;
+            if hdv < 0 then Break;
+            v := (v shl 4) or hdv;
+            Inc(i);
+            Inc(nhd);
+          end;
+          c := AnsiChar(v and $ff);
+        end;
+        '0'..'7': begin
+          v := Ord(c) - Ord('0');
+          if (i < n) and (zIn[i+1] in ['0'..'7']) then begin
+            Inc(i);
+            v := (v shl 3) + Ord(zIn[i]) - Ord('0');
+            if (i < n) and (zIn[i+1] in ['0'..'7']) then begin
+              Inc(i);
+              v := (v shl 3) + Ord(zIn[i]) - Ord('0');
+            end;
+          end;
+          c := AnsiChar(v and $ff);
+        end;
+      else
+        { unknown escape: keep the escaped character, drop the backslash }
+      end;
+      Result := Result + c;
+      Inc(i);
+    end else begin
+      Result := Result + c;
+      Inc(i);
+    end;
+  end;
 end;
 
-{ Tokenise a dot-command body into whitespace-separated arguments.
-  Honours single- and double-quoted runs (quotes are stripped) so that
-  `.separator " "` and `.nullvalue 'null'` parse exactly as upstream's
-  `do_meta_command` token loop (shell.c.in:8995..9070). }
-{ Per-line offset capture for shellDotError caret rendering.  We hold a
-  static 0-based offset array sized to the same upper bound as the args[]
-  buffer in doMetaCommand (16 slots); offsets are 1-based into zLine. }
+{ Tokenise a dot-command line into arguments — faithful port of
+  parseDotCmdArgs (shell.c.in:8925..8973).  Token 0 is the command name
+  itself (the leading '.' is skipped).  Quoted tokens ('...' or "...")
+  have their quotes stripped; inside double quotes a backslash escapes
+  the next character during scanning and the token is then run through
+  resolveBackslashes.  Single-quoted tokens are taken verbatim. }
+{ Per-line offset capture for shellDotError caret rendering.  Offsets
+  are 1-based into gDotOrig; slot i corresponds to token i (so iArg in
+  shellDotError matches the C aiOfst semantics with azArg[0]=cmd). }
 const
-  SHELL_MAX_DOT_ARGS = 16;
+  SHELL_MAX_DOT_ARGS = 18;
 var
   gDotOfst: array[0 .. SHELL_MAX_DOT_ARGS - 1] of i32;
   gDotOrig: AnsiString;  { last zLine fed through splitDotArgs }
 
-procedure splitDotArgs(const zLine: AnsiString; out args: array of AnsiString;
-                       out nArg: SizeInt);
-var i, n, k, iStart: SizeInt;
-    quote: AnsiChar;
-    cur: AnsiString;
-    trimmed: AnsiString;
+procedure splitDotArgs(const zLine: AnsiString; out zCmd: AnsiString;
+                       out args: array of AnsiString; out nArg: SizeInt);
+var
+  h, n: SizeInt;
+  nTok, iStart: SizeInt;
+  delim: AnsiChar;
+  cur, trimmed: AnsiString;
 begin
   nArg := 0;
-  { Mirror parseDotCmdArgs (shell.c.in:8925..8973): trim trailing whitespace
-    and a single trailing ';' so gDotOrig matches p->dot.zOrig byte-for-byte. }
+  zCmd := '';
+  { Trim trailing whitespace and a single trailing ';' so gDotOrig
+    matches p->dot.zOrig byte-for-byte (shell.c.in:8934..8941). }
   trimmed := zLine;
   while (Length(trimmed) > 0) and (trimmed[Length(trimmed)] in [' ', #9, #10, #13]) do
     SetLength(trimmed, Length(trimmed) - 1);
@@ -3280,57 +4257,42 @@ begin
   gDotOrig := trimmed;
   FillChar(gDotOfst, SizeOf(gDotOfst), 0);
   n := Length(trimmed);
-  i := 1;
-  { Upstream parser starts at h=1 (skips the leading '.') and treats the
-    command name as azArg[0]; we expose args[] without the cmd-name slot but
-    record offsets including it — gDotOfst[0]=cmd-name offset, gDotOfst[1+k]
-    =arg k offset, so iArg in shellDotError matches the C semantics. }
-  if (i <= n) and (trimmed[i] = '.') then Inc(i);
-  { Capture the cmd-name offset into gDotOfst[0]. }
-  while (i <= n) and (trimmed[i] in [' ', #9]) do Inc(i);
-  if i <= n then gDotOfst[0] := i32(i);
-  while (i <= n) and not (trimmed[i] in [' ', #9]) do Inc(i);
-  while i <= n do begin
-    while (i <= n) and (trimmed[i] in [' ', #9]) do Inc(i);
-    if i > n then Break;
-    iStart := i;
+  nTok := 0;
+  h := 2;                      { C starts at z[1], skipping the '.' }
+  while h <= n do begin
+    while (h <= n) and (trimmed[h] in [' ', #9, #10, #13]) do Inc(h);
+    if h > n then Break;
     cur := '';
-    if trimmed[i] in ['''', '"'] then begin
-      quote := trimmed[i];
-      Inc(i);
-      iStart := i;  { aiOfst points past opening quote (shell.c.in:8952) }
-      while (i <= n) and (trimmed[i] <> quote) do begin
-        if (trimmed[i] = '\') and (i < n) then begin
-          Inc(i);
-          case trimmed[i] of
-            'n': cur := cur + #10;
-            't': cur := cur + #9;
-            'r': cur := cur + #13;
-            '\': cur := cur + '\';
-            '''': cur := cur + '''';
-            '"': cur := cur + '"';
-          else
-            cur := cur + trimmed[i];
-          end;
-          Inc(i);
-        end else begin
-          cur := cur + trimmed[i];
-          Inc(i);
+    if trimmed[h] in ['''', '"'] then begin
+      delim := trimmed[h];
+      Inc(h);
+      iStart := h;             { aiOfst points past the opening quote }
+      while (h <= n) and (trimmed[h] <> delim) do begin
+        if (trimmed[h] = '\') and (delim = '"') and (h < n) then begin
+          cur := cur + trimmed[h];
+          Inc(h);
         end;
+        cur := cur + trimmed[h];
+        Inc(h);
       end;
-      if (i <= n) and (trimmed[i] = quote) then Inc(i);
+      if (h <= n) and (trimmed[h] = delim) then Inc(h);
+      if delim = '"' then cur := resolveBackslashes(cur);
     end else begin
-      while (i <= n) and not (trimmed[i] in [' ', #9]) do begin
-        cur := cur + trimmed[i];
-        Inc(i);
+      iStart := h;
+      while (h <= n) and not (trimmed[h] in [' ', #9, #10, #13]) do begin
+        cur := cur + trimmed[h];
+        Inc(h);
       end;
     end;
-    k := nArg;
-    if k <= High(args) then begin
-      args[k] := cur;
-      { gDotOfst[0] holds the cmd-name offset; arg k goes into slot k+1. }
-      if (k + 1) < SHELL_MAX_DOT_ARGS then gDotOfst[k + 1] := i32(iStart);
-      Inc(nArg);
+    if nTok < SHELL_MAX_DOT_ARGS then begin
+      gDotOfst[nTok] := i32(iStart);
+      if nTok = 0 then
+        zCmd := cur
+      else if (nTok - 1) <= High(args) then begin
+        args[nTok - 1] := cur;
+        nArg := nTok;
+      end;
+      Inc(nTok);
     end;
   end;
 end;
@@ -3384,6 +4346,33 @@ begin
   end;
   if zDetail <> '' then
     shellEPutZ(zLoc + ' ' + zDetail + #10);
+end;
+
+function shellIntegerValue(const z: AnsiString): i64; forward;
+
+{ booleanValue — faithful port of shell.c.in:4824..4841.  Accepts any
+  decimal or 0x-hex integer, on/yes -> 1, off/no -> 0 (case-insensitive);
+  anything else emits the upstream stderr complaint and returns 0. }
+function booleanValueSh(const zArg: AnsiString): i32;
+var
+  i, n: SizeInt;
+  zl: AnsiString;
+begin
+  n := Length(zArg);
+  if (n >= 2) and (zArg[1] = '0') and (zArg[2] = 'x') then begin
+    i := 2;
+    while (i < n) and (zArg[i+1] in ['0'..'9', 'a'..'f', 'A'..'F']) do Inc(i);
+  end else begin
+    i := 0;
+    while (i < n) and (zArg[i+1] in ['0'..'9']) do Inc(i);
+  end;
+  if (i > 0) and (i = n) then
+    Exit(i32(shellIntegerValue(zArg) and $ffffffff));
+  zl := LowerCase(zArg);
+  if (zl = 'on') or (zl = 'yes') then Exit(1);
+  if (zl = 'off') or (zl = 'no') then Exit(0);
+  shellEPutZ('ERROR: Not a boolean value: "' + zArg + '". Assuming "no".'#10);
+  Result := 0;
 end;
 
 function parseOnOff(const z: AnsiString; defaultVal: i32): i32;
@@ -4159,83 +5148,652 @@ begin
   shellSPutZ(Format('%12s: %s'#10, ['filename',     fn]));
 end;
 
-procedure cmdMode(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-var n: i32;
+{ modePush / modePop — shell.c.in:1733..1745.  Save/restore the output
+  mode around `.mode --once` and the split-mode dot-commands. }
+procedure modePushSh(p: PShellState);
 begin
-  if nArg < 1 then begin
-    shellSPutZ(Format('current output mode: %s'#10, [StrPas(@aModeInfo[p^.mode.eMode].zName[0])]));
-    Exit;
-  end;
-  n := modeFind(p, args[0]);
-  if n < 0 then begin
-    shellEPutZ(Format('Error: mode should be one of: ' +
-      'ascii box column csv html insert json line list markdown ' +
-      'qbox quote table tabs tcl'#10, []));
-    Exit;
-  end;
-  modeChange(p, u8(n));
-  if (nArg >= 2) and (n = MODE_Insert) then begin
-    zUserInsertTab := args[1];
-    p^.zDestTable := PAnsiChar(zUserInsertTab);
+  if p^.nPopMode = 0 then
+    p^.modePrior := p^.mode;
+end;
+
+procedure modePopSh(p: PShellState);
+begin
+  if p^.modePrior.spec.iVersion > 0 then begin
+    p^.mode := p^.modePrior;
+    FillChar(p^.modePrior, SizeOf(p^.modePrior), 0);
   end;
 end;
 
-procedure cmdHeaders(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-var v: i32;
+{ optionMatch — shell.c.in:4751..4760: does zStr match "-zOpt" or "--zOpt". }
+function shOptionMatch(const z, zOpt: AnsiString): Boolean;
+var s: AnsiString;
 begin
-  if nArg < 1 then begin
+  s := z;
+  if (Length(s) >= 1) and (s[1] = '-') then begin
+    Delete(s, 1, 1);
+    if (Length(s) >= 1) and (s[1] = '-') then Delete(s, 1, 1);
+    Result := s = zOpt;
+  end else
+    Result := False;
+end;
+
+{ pickStr — shell.c.in: exact-match against a choice list; returns the
+  0-based index or -1.  When pzErr is wanted, builds "should be a, b, or c". }
+function shPickStr(const zArg: AnsiString; const choices: array of AnsiString;
+                   out zErr: AnsiString): i32;
+var i: i32;
+begin
+  zErr := '';
+  for i := 0 to High(choices) do
+    if zArg = choices[i] then Exit(i);
+  zErr := 'should be';
+  for i := 0 to High(choices) do begin
+    if (i = High(choices)) and (i > 0) then zErr := zErr + ', or'
+    else if i > 0 then zErr := zErr + ',';
+    zErr := zErr + ' ' + choices[i];
+  end;
+  Result := -1;
+end;
+
+{ append_c_string — shell.c.in:2107: append z as a double-quoted C string. }
+function shCString(const z: AnsiString): AnsiString;
+var i: SizeInt;
+begin
+  Result := '"';
+  for i := 1 to Length(z) do
+    case z[i] of
+      '"':  Result := Result + '\"';
+      '\':  Result := Result + '\\';
+      #10:  Result := Result + '\n';
+      #13:  Result := Result + '\r';
+      #9:   Result := Result + '\t';
+    else
+      Result := Result + z[i];
+    end;
+  Result := Result + '"';
+end;
+
+{ modeTitleDsply — shell.c.in truth-table helper deciding how the
+  ".mode" display describes the title settings: 0=omit, 1="--titles
+  off", 2="--titles on", 3="--titles <encoding>". }
+function modeTitleDsply(p: PShellState; bAll: i32): i32;
+var
+  pI: ^TModeInfo;
+  bT, eT, bH, eH: i32;
+  v: u64;
+begin
+  pI := @aModeInfo[p^.mode.eMode];
+  bT := p^.mode.spec.bTitles;
+  eT := p^.mode.spec.eTitle;
+  bH := pI^.bHdr;
+  eH := pI^.eHdr;
+  v := u64($0133013311220102);
+  if bH = 0 then Exit(0);
+  if eT = 0 then eT := eH;
+  if bT = 0 then bT := bH;
+  if eT <> eH then v := v shr 32;
+  if bT <> bH then v := v shr 16;
+  if bT < 2 then v := v shr 8;
+  if bAll = 0 then v := v shr 4;
+  Result := i32(v and 3);
+end;
+
+{ dotCmdMode — faithful port of shell.c.in:7968..8484 at the level of
+  the options the Pascal QRF cut supports.  Arguments are processed
+  left to right; with no arguments (or with -v) the current mode and
+  non-default options are displayed as a re-usable ".mode ..." line. }
+function cmdMode(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
+var
+  eMode, iMode, i, k, chng, bAll: i32;
+  z, zErr, zW, zDesc, zSetting: AnsiString;
+  pI: ^TModeInfo;
+  w: i64;
+  nW, kk, dig: i32;
+  neg: Boolean;
+  savedMode: u8;
+  ii: i32;
+begin
+  Result := 0;
+  eMode := -1;
+  iMode := -1;
+  chng := 0;
+  bAll := 0;
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 2) and (z[1] = '-') and (z[2] = '-') then Delete(z, 1, 1);
+    if ((Length(z) = 0) or (z[1] <> '-')) and (iMode < 0) then begin
+      eMode := modeFind(p, args[i]);
+      if (eMode >= 0) and (eMode <> MODE_Www) then begin
+        iMode := i + 1;
+        modeChange(p, u8(eMode));
+        { (Legacy) trailing non-option argument = insert-mode table name. }
+        if (i + 1 < nArg) and ((Length(args[i+1]) = 0) or (args[i+1][1] <> '-')) then begin
+          Inc(i);
+          zUserInsertTab := args[i];
+          modeSetStr(p^.mode.spec.zTableName, PAnsiChar(zUserInsertTab));
+          p^.zDestTable := PAnsiChar(zUserInsertTab);
+        end;
+        chng := 1;
+      end else begin
+        shellDotError(p, i + 1, 'unknown mode',
+                      'Use ".help .mode" for more info');
+        Exit(1);
+      end;
+    end else if shOptionMatch(z, 'align') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      Inc(i);
+      SetLength(aUserAlign, Length(args[i]));
+      k := 0;
+      for kk := 1 to Length(args[i]) do begin
+        case args[i][kk] of
+          'l', 'L': aUserAlign[kk-1] := 0;
+          'c', 'C': aUserAlign[kk-1] := 1;
+          'r', 'R': aUserAlign[kk-1] := 2;
+        else
+          aUserAlign[kk-1] := 0; Inc(k);
+        end;
+      end;
+      p^.mode.spec.nAlign := Length(args[i]);
+      if Length(args[i]) > 0 then p^.mode.spec.aAlign := @aUserAlign[0]
+      else p^.mode.spec.aAlign := nil;
+      chng := 1;
+      if k <> 0 then begin
+        shellDotError(p, i + 1, 'bad alignment string',
+          'Should contain only characters L, C, and R.');
+        Exit(1);
+      end;
+    end else if (z = '-blob') or (z = '-blob-quote') then begin
+      Inc(i);
+      if i >= nArg then begin
+        shellDotError(p, i, 'missing argument', ''); Exit(1);
+      end;
+      k := shPickStr(args[i],
+            ['auto', 'text', 'sql', 'hex', 'tcl', 'json', 'size'], zErr);
+      if k >= 0 then p^.mode.spec.eBlob := u8(k);
+      chng := 1;
+    end else if shOptionMatch(z, 'border') then begin
+      Inc(i);
+      if i >= nArg then begin
+        shellDotError(p, i, 'missing argument', ''); Exit(1);
+      end;
+      k := shPickStr(args[i], ['auto', 'off', 'on'], zErr);
+      if k >= 0 then p^.mode.spec.bBorder := u8(k and 3);
+      chng := 1;
+    end else if (z = '-charlimit') or (z = '-linelimit')
+             or (z = '-titlelimit') or (z = '-multiinsert') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      zSetting := z;
+      Inc(i);
+      w := shellIntegerValue(args[i]);
+      if zSetting = '-charlimit' then p^.mode.spec.nCharLimit := i32(w)
+      else if zSetting = '-linelimit' then p^.mode.spec.nLineLimit := SmallInt(w)
+      else if zSetting = '-titlelimit' then p^.mode.spec.nTitleLimit := SmallInt(w)
+      else p^.mode.spec.nMultiInsert := u32(w);
+      chng := 1;
+    end else if (z = '-tablename') or (z = '-rowsep') or (z = '-colsep')
+             or (z = '-null') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      zSetting := z;
+      Inc(i);
+      if zSetting = '-tablename' then begin
+        zUserInsertTab := args[i];
+        modeSetStr(p^.mode.spec.zTableName, PAnsiChar(zUserInsertTab));
+        p^.zDestTable := PAnsiChar(zUserInsertTab);
+      end else if zSetting = '-rowsep' then begin
+        zUserRowSep := args[i];
+        modeSetStr(p^.mode.spec.zRowSep, PAnsiChar(zUserRowSep));
+      end else if zSetting = '-colsep' then begin
+        zUserColSep := args[i];
+        modeSetStr(p^.mode.spec.zColumnSep, PAnsiChar(zUserColSep));
+      end else begin
+        zUserNull := args[i];
+        modeSetStr(p^.mode.spec.zNull, PAnsiChar(zUserNull));
+      end;
+      chng := 1;
+    end else if shOptionMatch(z, 'escape') then begin
+      Inc(i);
+      if i >= nArg then begin
+        shellDotError(p, i, 'missing argument', ''); Exit(1);
+      end;
+      k := shPickStr(args[i], ['off', 'ascii', 'symbol'], zErr);
+      if k < 0 then begin
+        shellDotError(p, i + 1, 'unknown escape type', zErr);
+        Exit(1);
+      end;
+      p^.mode.spec.eEsc := u8(k + 1);
+      chng := 1;
+    end else if shOptionMatch(z, 'limits') then begin
+      Inc(i);
+      if i >= nArg then begin
+        shellDotError(p, i, 'missing argument', ''); Exit(1);
+      end;
+      k := shPickStr(args[i], ['on', 'off'], zErr);
+      if k = 0 then begin
+        p^.mode.spec.nLineLimit := DFLT_LINE_LIMIT;
+        p^.mode.spec.nCharLimit := DFLT_CHAR_LIMIT;
+        p^.mode.spec.nTitleLimit := DFLT_TITLE_LIMIT;
+      end else if k = 1 then begin
+        p^.mode.spec.nLineLimit := 0;
+        p^.mode.spec.nCharLimit := 0;
+        p^.mode.spec.nTitleLimit := 0;
+      end else begin
+        { Parse "L,C[,T]" with unsigned integers. }
+        zW := args[i] + ',';
+        nW := 0; w := 0; dig := 0; k := 0;
+        for kk := 1 to Length(zW) do begin
+          if zW[kk] in ['0'..'9'] then begin
+            w := w * 10 + (Ord(zW[kk]) - Ord('0')); Inc(dig);
+          end else if zW[kk] = ',' then begin
+            if dig = 0 then begin k := -1; Break; end;
+            case nW of
+              0: p^.mode.spec.nLineLimit := SmallInt(w);
+              1: p^.mode.spec.nCharLimit := i32(w);
+              2: p^.mode.spec.nTitleLimit := SmallInt(w);
+            end;
+            Inc(nW); w := 0; dig := 0;
+          end else begin
+            k := -1; Break;
+          end;
+        end;
+        if (k < 0) or (nW < 2) then begin
+          shellDotError(p, i + 1, 'bad argument',
+            'Should be "L,C,T" where L, C and T are unsigned integers');
+          Exit(1);
+        end;
+      end;
+      chng := 1;
+    end else if shOptionMatch(z, 'list') then begin
+      zDesc := 'available modes:';
+      for ii := 0 to High(aModeInfo) do begin
+        if ii = MODE_Www then Continue;
+        zDesc := zDesc + ' ' + StrPas(@aModeInfo[ii].zName[0]);
+      end;
+      shellSPutZ(zDesc + ' batch tty'#10);
+      chng := 1;
+    end else if shOptionMatch(z, 'once') then begin
+      p^.nPopMode := 0;
+      modePushSh(p);
+      p^.nPopMode := 1;
+    end else if shOptionMatch(z, 'noquote') then begin
+      p^.mode.spec.eText := 1;          { QRF_TEXT_Plain }
+      p^.mode.spec.eBlob := 0;          { QRF_BLOB_Auto }
+      chng := 1;
+    end else if shOptionMatch(z, 'quote') then begin
+      if (i + 1 < nArg)
+         and ((Length(args[i+1]) = 0) or (args[i+1][1] <> '-'))
+         and ((iMode > 0) or (args[i+1] = 'off') or (modeFind(p, args[i+1]) < 0))
+      then begin
+        Inc(i);
+        k := shPickStr(args[i], ['no', 'yes', '0', '1'], zErr);
+        if k >= 0 then
+          k := k and 1
+        else begin
+          k := shPickStr(args[i],
+                ['off', 'on', 'sql', 'csv', 'html', 'tcl', 'json', 'relaxed'],
+                zErr);
+          if k < 0 then begin
+            shellDotError(p, i + 1, 'unknown', zErr);
+            Exit(1);
+          end;
+        end;
+      end else
+        k := 1;
+      case k of
+        1: begin
+          zUserNull := 'NULL';
+          modeSetStr(p^.mode.spec.zNull, PAnsiChar(zUserNull));
+          p^.mode.spec.eText := 2;      { QRF_TEXT_Sql }
+        end;
+        2: p^.mode.spec.eText := 2;     { sql }
+        3: p^.mode.spec.eText := 3;     { csv     (QRF_TEXT_Csv)     }
+        4: p^.mode.spec.eText := 4;     { html    (QRF_TEXT_Html)    }
+        5: p^.mode.spec.eText := 5;     { tcl     (QRF_TEXT_Tcl)     }
+        6: p^.mode.spec.eText := 6;     { json    (QRF_TEXT_Json)    }
+        7: p^.mode.spec.eText := 7;     { relaxed (QRF_TEXT_Relaxed) }
+      else
+        p^.mode.spec.eText := 1;        { off -> plain }
+      end;
+      chng := 1;
+    end else if shOptionMatch(z, 'reset') then begin
+      { shell.c.in:8195..8198 — modeFree() then rebuild from the current
+        mode, wiping all accumulated option state. }
+      savedMode := p^.mode.eMode;
+      FillChar(p^.mode, SizeOf(p^.mode), 0);
+      p^.mode.spec.iVersion := 1;
+      p^.mode.autoExplain := 1;
+      modeChange(p, savedMode);
+    end else if shOptionMatch(z, 'screenwidth') or shOptionMatch(z, 'sw') then begin
+      Inc(i);
+      if i >= nArg then begin
+        shellDotError(p, i, 'missing argument', ''); Exit(1);
+      end;
+      k := shPickStr(args[i], ['off', 'auto'], zErr);
+      if k = 0 then begin
+        p^.mode.bAutoScreenWidth := 0;
+        p^.mode.spec.nScreenWidth := 0;
+      end else if k = 1 then
+        p^.mode.bAutoScreenWidth := 1
+      else begin
+        w := shellIntegerValue(args[i]);
+        p^.mode.bAutoScreenWidth := 0;
+        if w < 0 then w := 0;
+        if w > 32767 then w := 32767;
+        p^.mode.spec.nScreenWidth := SmallInt(w);
+      end;
+      chng := 1;
+    end else if shOptionMatch(z, 'textjsonb') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      Inc(i);
+      if booleanValueSh(args[i]) <> 0 then
+        p^.mode.spec.bTextJsonb := QRF_Yes
+      else
+        p^.mode.spec.bTextJsonb := QRF_No;
+      chng := 1;
+    end else if shOptionMatch(z, 'titles') or shOptionMatch(z, 'title') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      Inc(i);
+      k := shPickStr(args[i],
+            ['off', 'on', 'plain', 'sql', 'csv', 'html', 'tcl', 'json'], zErr);
+      if k < 0 then begin
+        shellDotError(p, i + 1, 'bad --titles value', zErr);
+        Exit(1);
+      end;
+      if k >= 1 then p^.mode.spec.bTitles := QRF_Yes
+      else p^.mode.spec.bTitles := QRF_No;
+      p^.mode.mFlags := p^.mode.mFlags and not MFLG_HDR;
+      if k > 1 then p^.mode.spec.eTitle := u8(k - 1)
+      else p^.mode.spec.eTitle := aModeInfo[p^.mode.eMode].eHdr;
+      chng := 1;
+    end else if shOptionMatch(z, 'widths') or shOptionMatch(z, 'width') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      Inc(i);
+      zW := args[i];
+      kk := 1;
+      nW := 0;
+      SetLength(aUserWidth, Length(zW) + 1);
+      while (kk <= Length(zW)) and (zW[kk] in [' ', #9]) do Inc(kk);
+      while kk <= Length(zW) do begin
+        w := 0; dig := 0;
+        neg := (zW[kk] = '-') and (kk < Length(zW)) and (zW[kk+1] in ['0'..'9']);
+        if neg then Inc(kk);
+        while (kk <= Length(zW)) and (zW[kk] in ['0'..'9']) do begin
+          w := w * 10 + (Ord(zW[kk]) - Ord('0'));
+          if w > 32767 then begin
+            shellDotError(p, i + 1, 'width too big',
+                          'Maximum column width is 32767');
+            Exit(1);
+          end;
+          Inc(dig); Inc(kk);
+        end;
+        if dig = 0 then begin
+          shellDotError(p, i + 1, 'syntax error',
+                        'should be a comma-separated list if integers');
+          Exit(1);
+        end;
+        if neg then w := -w;
+        aUserWidth[nW] := SmallInt(w);
+        Inc(nW);
+        if (kk <= Length(zW)) and (zW[kk] = ',') then Inc(kk);
+        while (kk <= Length(zW)) and (zW[kk] in [' ', #9]) do Inc(kk);
+      end;
+      p^.mode.spec.nWidth := nW;
+      if nW > 0 then p^.mode.spec.aWidth := @aUserWidth[0]
+      else p^.mode.spec.aWidth := nil;
+      chng := 1;
+    end else if shOptionMatch(z, 'wrap') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      Inc(i);
+      w := shellIntegerValue(args[i]);
+      if w < -32767 then w := -32767;
+      if w > 32767 then w := 32767;
+      p^.mode.spec.nWrap := SmallInt(w);
+      chng := 1;
+    end else if shOptionMatch(z, 'ww') then begin
+      p^.mode.spec.bWordWrap := QRF_Yes;
+      chng := 1;
+    end else if shOptionMatch(z, 'wordwrap') then begin
+      if i + 1 >= nArg then begin
+        shellDotError(p, i + 1, 'missing argument', ''); Exit(1);
+      end;
+      Inc(i);
+      if booleanValueSh(args[i]) <> 0 then
+        p^.mode.spec.bWordWrap := QRF_Yes
+      else
+        p^.mode.spec.bWordWrap := QRF_No;
+      chng := 1;
+    end else if shOptionMatch(z, 'v') or shOptionMatch(z, 'verbose') then
+      bAll := 1
+    else if (Length(z) >= 1) and (z[1] = '-') then begin
+      shellDotError(p, i + 1, 'bad option', 'Use ".help .mode" for more info');
+      Exit(1);
+    end else begin
+      if iMode > 0 then
+        shellDotError(p, i + 1, 'bad argument', 'Use ".help .mode" for more info')
+      else
+        shellDotError(p, i + 1, 'unknown mode', 'Use ".help .mode" for more info');
+      Exit(1);
+    end;
+    Inc(i);
+  end;
+
+  if (chng = 0) or (bAll <> 0) then begin
+    pI := @aModeInfo[p^.mode.eMode];
+    zDesc := '';
+    if p^.nPopMode <> 0 then zDesc := zDesc + '--once ';
+    zDesc := zDesc + StrPas(@pI^.zName[0]);
+    if (bAll <> 0) or ((p^.mode.spec.nAlign <> 0) and (pI^.eCx = 2)) then begin
+      zDesc := zDesc + ' --align "';
+      for ii := 0 to p^.mode.spec.nAlign - 1 do
+        case p^.mode.spec.aAlign[ii] and 3 of
+          2: zDesc := zDesc + 'R';
+          1: zDesc := zDesc + 'C';
+        else
+          zDesc := zDesc + 'L';
+        end;
+      zDesc := zDesc + '"';
+    end;
+    if (bAll <> 0)
+       or ((p^.mode.spec.bBorder = 1) <> ((pI^.mFlg and 1) <> 0)) then begin
+      if p^.mode.spec.bBorder = 1 then
+        zDesc := zDesc + ' --border off'
+      else
+        zDesc := zDesc + ' --border on';
+    end;
+    if (bAll <> 0) or (p^.mode.spec.eBlob <> 0) then begin
+      case p^.mode.spec.eBlob of
+        1: zDesc := zDesc + ' --blob-quote text';
+        2: zDesc := zDesc + ' --blob-quote sql';
+        3: zDesc := zDesc + ' --blob-quote hex';
+        4: zDesc := zDesc + ' --blob-quote tcl';
+        5: zDesc := zDesc + ' --blob-quote json';
+        6: zDesc := zDesc + ' --blob-quote size';
+      else
+        zDesc := zDesc + ' --blob-quote auto';
+      end;
+    end;
+    zSetting := '';
+    if aModeStr[pI^.eCSep] <> nil then zSetting := StrPas(aModeStr[pI^.eCSep]);
+    if (bAll <> 0) or ((aModeStr[pI^.eCSep] <> nil)
+       and (zSetting <> specStr(p^.mode.spec.zColumnSep))) then
+      zDesc := zDesc + ' --colsep ' + shCString(specStr(p^.mode.spec.zColumnSep));
+    if (bAll <> 0) or (p^.mode.spec.eEsc <> 0) then
+      zDesc := zDesc + ' --escape ' + StrPas(qrfEscNames[p^.mode.spec.eEsc and 3]);
+    if (bAll <> 0)
+       or ((p^.mode.spec.nLineLimit > 0) and (pI^.eCx > 0))
+       or (p^.mode.spec.nCharLimit > 0)
+       or ((p^.mode.spec.nTitleLimit > 0) and (pI^.eCx > 0)) then begin
+      if (p^.mode.spec.nLineLimit = 0) and (p^.mode.spec.nCharLimit = 0)
+         and (p^.mode.spec.nTitleLimit = 0) then
+        zDesc := zDesc + ' --limits off'
+      else if (p^.mode.spec.nLineLimit = DFLT_LINE_LIMIT)
+          and (p^.mode.spec.nCharLimit = DFLT_CHAR_LIMIT)
+          and (p^.mode.spec.nTitleLimit = DFLT_TITLE_LIMIT) then
+        zDesc := zDesc + ' --limits on'
+      else
+        zDesc := zDesc + Format(' --limits %d,%d,%d',
+          [p^.mode.spec.nLineLimit, p^.mode.spec.nCharLimit,
+           p^.mode.spec.nTitleLimit]);
+    end;
+    if (bAll <> 0)
+       or ((p^.mode.spec.nMultiInsert <> 0) and (p^.mode.spec.eStyle = 8)) then
+      zDesc := zDesc + Format(' --multiinsert %u', [p^.mode.spec.nMultiInsert]);
+    zSetting := '';
+    if aModeStr[pI^.eNull] <> nil then zSetting := StrPas(aModeStr[pI^.eNull]);
+    if (bAll <> 0) or ((aModeStr[pI^.eNull] <> nil)
+       and (zSetting <> specStr(p^.mode.spec.zNull))) then
+      zDesc := zDesc + ' --null ' + shCString(specStr(p^.mode.spec.zNull));
+    if (bAll <> 0)
+       or ((pI^.eText <> p^.mode.spec.eText)
+           and ((pI^.eText > 1) or (p^.mode.spec.eText > 1))) then
+      zDesc := zDesc + ' --quote '
+        + StrPas(qrfQuoteNames[p^.mode.spec.eText and 7]);
+    zSetting := '';
+    if aModeStr[pI^.eRSep] <> nil then zSetting := StrPas(aModeStr[pI^.eRSep]);
+    if (bAll <> 0) or ((aModeStr[pI^.eRSep] <> nil)
+       and (zSetting <> specStr(p^.mode.spec.zRowSep))) then
+      zDesc := zDesc + ' --rowsep ' + shCString(specStr(p^.mode.spec.zRowSep));
+    if (bAll <> 0)
+       or ((pI^.eCx <> 0) and ((p^.mode.spec.nScreenWidth > 0)
+           or (p^.mode.bAutoScreenWidth <> 0))) then begin
+      if p^.mode.bAutoScreenWidth <> 0 then
+        zDesc := zDesc + ' --sw auto'
+      else
+        zDesc := zDesc + Format(' --sw %d', [p^.mode.spec.nScreenWidth]);
+    end;
+    if (bAll <> 0) or (p^.mode.eMode = MODE_Insert) then
+      zDesc := zDesc + ' --tablename ' + shCString(specStr(p^.mode.spec.zTableName));
+    if (bAll <> 0) or (p^.mode.spec.bTextJsonb <> 0) then begin
+      if p^.mode.spec.bTextJsonb = QRF_Yes then
+        zDesc := zDesc + ' --textjsonb on'
+      else
+        zDesc := zDesc + ' --textjsonb off';
+    end;
+    case modeTitleDsply(p, bAll) of
+      1: zDesc := zDesc + ' --titles off';
+      2: zDesc := zDesc + ' --titles on';
+      3: begin
+        case p^.mode.spec.eTitle of
+          2: zDesc := zDesc + ' --titles sql';
+          3: zDesc := zDesc + ' --titles csv';
+          4: zDesc := zDesc + ' --titles html';
+          5: zDesc := zDesc + ' --titles tcl';
+          6: zDesc := zDesc + ' --titles json';
+        else
+          zDesc := zDesc + ' --titles plain';
+        end;
+      end;
+    end;
+    if (p^.mode.spec.nWidth > 0) and ((bAll <> 0) or (pI^.eCx = 2)) then begin
+      zSetting := ' --widths ';
+      for ii := 0 to p^.mode.spec.nWidth - 1 do begin
+        zDesc := zDesc + zSetting + IntToStr(p^.mode.spec.aWidth[ii]);
+        zSetting := ',';
+      end;
+    end else if bAll <> 0 then
+      zDesc := zDesc + ' --widths ""';
+    if (bAll <> 0) or ((pI^.eCx > 0) and (p^.mode.spec.bWordWrap <> 0)) then begin
+      if bAll <> 0 then begin
+        if p^.mode.spec.bWordWrap = QRF_Yes then
+          zDesc := zDesc + ' --wordwrap on'
+        else
+          zDesc := zDesc + ' --wordwrap off';
+      end;
+      if p^.mode.spec.nWrap <> 0 then
+        zDesc := zDesc + Format(' --wrap %d', [p^.mode.spec.nWrap]);
+      if bAll = 0 then zDesc := zDesc + ' --ww';
+    end;
+    shellSPutZ('.mode ' + zDesc + #10);
+  end;
+end;
+
+function cmdHeaders(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
+begin
+  Result := 0;
+  { shell.c.in:9752..9761 — exactly one argument or usage error. }
+  if nArg <> 1 then begin
     shellEPutZ('Usage: .headers on|off'#10);
-    Exit;
+    Exit(1);
   end;
-  v := parseOnOff(args[0], -1);
-  if v < 0 then begin
-    shellEPutZ('Error: not a boolean: '+args[0]+#10);
-    Exit;
-  end;
-  if v <> 0 then begin
-    p^.mode.spec.bTitles := QRF_Yes;
-    p^.mode.mFlags := p^.mode.mFlags or MFLG_HDR;
-  end else begin
+  if booleanValueSh(args[0]) <> 0 then
+    p^.mode.spec.bTitles := QRF_Yes
+  else
     p^.mode.spec.bTitles := QRF_No;
-    p^.mode.mFlags := p^.mode.mFlags and not MFLG_HDR;
-  end;
+  p^.mode.mFlags := p^.mode.mFlags or MFLG_HDR;
+  p^.mode.spec.eTitle := aModeInfo[p^.mode.eMode].eHdr;
 end;
 
-procedure cmdSeparator(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-{ The ShellState carries pre-allocated AnsiStrings via the parsed-arg
-  buffer; we keep stable copies in unit-level vars so the PAnsiChars
-  remain valid for the lifetime of the connection. }
+function cmdSeparator(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
+{ shell.c.in:11051..11062 — usage on bad arg count, but the separators
+  are still applied for any args present. }
 begin
-  if nArg < 1 then begin
+  Result := 0;
+  if (nArg < 1) or (nArg > 2) then begin
     shellEPutZ('Usage: .separator COL ?ROW?'#10);
-    Exit;
+    Result := 1;
   end;
-  zUserColSep := args[0];
-  if nArg >= 2 then zUserRowSep := args[1];
-  p^.mode.spec.zColumnSep := PAnsiChar(zUserColSep);
-  if nArg >= 2 then p^.mode.spec.zRowSep := PAnsiChar(zUserRowSep);
+  if nArg >= 1 then begin
+    zUserColSep := args[0];
+    p^.mode.spec.zColumnSep := PAnsiChar(zUserColSep);
+  end;
+  if nArg >= 2 then begin
+    zUserRowSep := args[1];
+    p^.mode.spec.zRowSep := PAnsiChar(zUserRowSep);
+  end;
 end;
 
-procedure cmdNullvalue(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+function cmdNullvalue(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 begin
-  if nArg < 1 then zUserNull := '' else zUserNull := args[0];
+  Result := 0;
+  { shell.c.in:10132..10139 — exactly one argument or usage error. }
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .nullvalue STRING'#10);
+    Exit(1);
+  end;
+  zUserNull := args[0];
   p^.mode.spec.zNull := PAnsiChar(zUserNull);
 end;
 
-procedure cmdEcho(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-var v: i32;
+function cmdEcho(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 begin
-  if nArg < 1 then v := 1 else v := parseOnOff(args[0], 1);
-  if v <> 0 then p^.mode.mFlags := p^.mode.mFlags or MFLG_ECHO
-              else p^.mode.mFlags := p^.mode.mFlags and not MFLG_ECHO;
+  Result := 0;
+  { shell.c.in:9461..9472 — exactly one argument or usage error. }
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .echo on|off'#10);
+    Exit(1);
+  end;
+  if booleanValueSh(args[0]) <> 0 then
+    p^.mode.mFlags := p^.mode.mFlags or MFLG_ECHO
+  else
+    p^.mode.mFlags := p^.mode.mFlags and not MFLG_ECHO;
 end;
 
-procedure cmdChanges(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-var v: i32;
+function cmdChanges(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 begin
-  if nArg < 1 then v := 1 else v := parseOnOff(args[0], 1);
-  if v <> 0 then p^.shellFlgs := p^.shellFlgs or SHFLG_CountChanges
-              else p^.shellFlgs := p^.shellFlgs and not SHFLG_CountChanges;
+  Result := 0;
+  { shell.c.in:9148..9159 — exactly one argument or usage error. }
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .changes on|off'#10);
+    Exit(1);
+  end;
+  if booleanValueSh(args[0]) <> 0 then
+    p^.shellFlgs := p^.shellFlgs or SHFLG_CountChanges
+  else
+    p^.shellFlgs := p^.shellFlgs and not SHFLG_CountChanges;
 end;
 
 procedure cmdTables(p: PShellState; const args: array of AnsiString;
@@ -4355,40 +5913,77 @@ begin
   end;
 end;
 
-procedure cmdIndexes(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-{ shell.c.in:9878..9970 — list indexes, filtering system-generated
-  sqlite_autoindex_* by default; --all / -a includes them.  This Pascal
-  cut also accepts a table-name argument for backwards compatibility
-  (the upstream form treats the trailing arg as a substring index-name
-  pattern, but most call-sites pass a table name). }
+function cmdIndexes(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
+{ shell.c.in:9878..9962 — faithful port.  Lists index names from
+  pragma_table_list × pragma_index_list across all attached schemas;
+  sqlite_autoindex entries are filtered unless --all / --sys, and a
+  trailing pattern is matched as a LIKE '%pat%' on the index name.
+  Runs in "split" mode under a mode push/pop. }
 var
-  sql, tab: AnsiString;
+  sql, zSep, zPattern, z: AnsiString;
   i: SizeInt;
-  allFlag: Boolean;
+  allFlag, sysFlag, exprFlag, debugFlag: i32;
 begin
-  allFlag := False;
-  tab := '';
+  Result := 0;
+  allFlag := 0; sysFlag := 0; exprFlag := 0; debugFlag := 0;
+  zPattern := '';
+  zSep := 'WHERE';
   for i := 0 to nArg - 1 do begin
-    if (args[i] = '--all') or (args[i] = '-a') or (args[i] = '-all') then
-      allFlag := True
-    else if (Length(args[i]) > 0) and (args[i][1] = '-') then begin
-      shellEPutZ(Format('Unknown option: "%s"'#10, [args[i]]));
-      Exit;
-    end else if tab = '' then
-      tab := args[i]
+    if (Length(args[i]) > 0) and (args[i][1] = '-') then begin
+      z := Copy(args[i], 2, MaxInt);
+      if (Length(z) > 0) and (z[1] = '-') then Delete(z, 1, 1);
+      if (z = 'all') or (z = 'a') then
+        allFlag := 1
+      else if z = 'sys' then begin
+        sysFlag := 1; allFlag := 0;
+      end else if z = 'expr' then begin
+        exprFlag := 1; allFlag := 0;
+      end else if z = 'debug' then
+        debugFlag := 1
+      else begin
+        shellDotError(p, i32(i) + 1, 'unknown option', '');
+        Exit(1);
+      end;
+    end else if zPattern = '' then
+      zPattern := args[i]
     else begin
-      shellEPutZ('Usage: .indexes ?-a|--all? ?TABLE?'#10);
-      Exit;
+      shellDotError(p, i32(i) + 1, 'unknown argument', '');
+      Exit(1);
     end;
   end;
-  sql := 'SELECT name FROM sqlite_schema WHERE type=''index''';
-  if tab <> '' then
-    sql := sql + ' AND tbl_name='''
-              + StringReplace(tab, '''', '''''', [rfReplaceAll]) + '''';
-  if not allFlag then
-    sql := sql + ' AND name NOT LIKE ''sqlite__%'' ESCAPE ''_''';
-  sql := sql + ' ORDER BY 1';
-  runStatementVerbose(p, sql);
+  openDb(p, 0);
+  sql :=
+    'SELECT if(t.schema=''main'',i.name,t.schema||''.''||i.name)'#10
+    + 'FROM pragma_table_list t, pragma_index_list(t.name,t.schema) i'#10;
+  if exprFlag <> 0 then begin
+    allFlag := 0;
+    sql := sql + zSep
+      + ' (EXISTS(SELECT 1 FROM pragma_index_xinfo(i.name) WHERE cid=-2)'#10
+      + '       OR'#10
+      + '       EXISTS(SELECT cid FROM pragma_table_xinfo(t.name) WHERE hidden=2'
+      + ' INTERSECT '
+      + ' SELECT cid FROM pragma_index_info(i.name)))'#10;
+    zSep := 'AND';
+  end;
+  if sysFlag <> 0 then begin
+    sql := sql + zSep + ' i.name LIKE ''sqlite__autoindex__%'' ESCAPE ''_'''#10;
+    zSep := 'AND';
+  end else if allFlag = 0 then begin
+    sql := sql + zSep + ' i.name NOT LIKE ''sqlite__%'' ESCAPE ''_'''#10;
+    zSep := 'AND';
+  end;
+  if zPattern <> '' then
+    sql := sql + zSep + ' i.name LIKE ''%'
+      + StringReplace(zPattern, '''', '''''', [rfReplaceAll]) + '%'''#10;
+  sql := sql + 'ORDER BY 1';
+  if debugFlag <> 0 then
+    shellSPutZ(sql + ';'#10)
+  else begin
+    modePushSh(p);
+    modeChange(p, MODE_Split);
+    runStatementVerbose(p, sql);
+    modePopSh(p);
+  end;
 end;
 
 procedure cmdDatabases(p: PShellState);
@@ -4894,13 +6489,14 @@ end;
 function cmdTimer(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 begin
   Result := 0;
-  if nArg < 1 then begin
+  { shell.c.in:11886..11901 — exactly one argument or usage error. }
+  if nArg <> 1 then begin
     shellEPutZ('Usage: .timer on|off|once'#10);
     Result := 1;
     Exit;
   end;
   if args[0] = 'once' then p^.enableTimer := 1
-  else p^.enableTimer := 2 * parseOnOff(args[0], 0);
+  else p^.enableTimer := u8(2 * booleanValueSh(args[0]));
 end;
 
 { 10.1.30 — `.eqp off|on|trace|trigger|full`  (shell.c.in:9479..9504) }
@@ -4928,19 +6524,18 @@ begin
       sqlite3_exec(p^.db, 'PRAGMA vdbe_trace=ON;', nil, nil, nil);
     end;
   end else
-    p^.mode.autoEQP := u8(parseOnOff(args[0], 0));
+    p^.mode.autoEQP := u8(booleanValueSh(args[0]));
 end;
 
 { 10.1.31 — `.explain auto|on|off`  (shell.c.in:9515..9523) }
 
 procedure cmdExplain(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
 begin
-  if nArg < 1 then begin
-    p^.mode.autoExplain := 1;
-    Exit;
-  end;
+  { shell.c.in:9515..9523 — with no argument this is a no-op; "auto"
+    sets autoExplain=1; anything else goes through booleanValue. }
+  if nArg < 1 then Exit;
   if args[0] = 'auto' then p^.mode.autoExplain := 1
-  else p^.mode.autoExplain := u8(parseOnOff(args[0], 0));
+  else p^.mode.autoExplain := u8(booleanValueSh(args[0]));
 end;
 
 { 10.1.34 — `.shell` / `.system COMMAND ...`  (shell.c.in:11243..11264).
@@ -5211,7 +6806,8 @@ begin
   savedLineno  := p^.lineno;
   savedZIn     := p^.zInFile;
   curInputText := @f;
-  p^.lineno    := 0;
+  { p->lineno is reset inside processInput (after the nesting-limit
+    check), mirroring shell.c.in:12438. }
   p^.zInFile   := PAnsiChar(zName);
   processInput(p);
   CloseFile(f);
@@ -5594,7 +7190,6 @@ end;
   to a TEMP database to keep the REPL alive.
   ---------------------------------------------------------------------- }
 
-function shellIntegerValue(const z: AnsiString): i64; forward;
 
 { 10.1.27.d — shellFilenameFromUri (shell.c.in:5807..5834).
   Given a URI of the form 'file:NAME?QUERY', return the percent-decoded
@@ -5885,12 +7480,13 @@ begin
       else if z = '-keep'  then begin end
       else if z = '-show'  then begin end
       else begin
-        shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+        { shell.c.in:8597 — dotCmdError(p, i, "unknown option", 0). }
+        shellDotError(p, i32(i) + 1, 'unknown option', '');
         Exit;
       end;
     end else if zFile = '' then begin
       if (z = 'memory') and isOnce then begin
-        shellEPutZ('Error: cannot redirect to "memory"'#10);
+        shellDotError(p, 0, 'cannot redirect to "memory"', '');
         Exit;
       end;
       if z = 'off' then zFile := '/dev/null'
@@ -5900,7 +7496,8 @@ begin
         Exit;
       end;
     end else begin
-      shellEPutZ(Format('Error: surplus argument: %s'#10, [z]));
+      { shell.c.in:8622 — dotCmdError(p, i, "surplus argument", 0). }
+      shellDotError(p, i32(i) + 1, 'surplus argument', '');
       Exit;
     end;
     Inc(i);
@@ -6290,6 +7887,22 @@ end;
   tables / IF NOT EXISTS) and then the INSERT INTO ... VALUES(...) data
   via MODE_Insert, optionally with an explicit (rowid,col,...) column
   list when --preserve-rowids is in effect. }
+{ db_int — shell.c.in:4955..4967: run a one-row integer query. }
+function shellDbInt(p: PShellState; const zSql: AnsiString): i32;
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+begin
+  Result := 0;
+  pStmt := nil;
+  if sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail) = SQLITE_OK
+     then begin
+    if sqlite3_step(pStmt) = SQLITE_ROW then
+      Result := sqlite3_column_int(pStmt, 0);
+  end;
+  if pStmt <> nil then sqlite3_finalize(pStmt);
+end;
+
 procedure dumpOneObject(p: PShellState; const zName, zType, zSql: AnsiString);
 var
   pStmt: PVdbe;
@@ -6305,12 +7918,16 @@ begin
   noSys    := (p^.shellFlgs and SHFLG_DumpNoSys)    <> 0;
 
   if (zName = 'sqlite_sequence') and not noSys then begin
-    if p^.writableSchema = 0 then begin
-      WriteLn('PRAGMA writable_schema=ON;');
-      p^.writableSchema := 1;
+    { shell.c.in:3550..3566 — only emit the sqlite_sequence preamble when
+      the table is non-empty (Forum 2024-10-13T17:10:01z). }
+    if shellDbInt(p, 'SELECT count(*) FROM sqlite_sequence') > 0 then begin
+      if p^.writableSchema = 0 then begin
+        WriteLn('PRAGMA writable_schema=ON;');
+        p^.writableSchema := 1;
+      end;
+      WriteLn('CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);');
+      WriteLn('DELETE FROM sqlite_sequence;');
     end;
-    WriteLn('CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);');
-    WriteLn('DELETE FROM sqlite_sequence;');
   end else if (sqlite3_strglob('sqlite_stat?', PAnsiChar(zName)) = 0)
               and not noSys then begin
     if not dataOnly then WriteLn('ANALYZE sqlite_schema;');
@@ -6387,11 +8004,13 @@ begin
   savedMode := p^.mode;
   sIns := sTable;
   p^.zDestTable := PAnsiChar(sIns);
+  gInsertTabRaw := True;        { sTable is already fully quoted }
   p^.mode.eMode := MODE_Insert;
   p^.mode.spec.bTitles := QRF_No;
   stepAndRender(p, pStmt);
   p^.mode := savedMode;
   p^.zDestTable := nil;
+  gInsertTabRaw := False;
   sqlite3_finalize(pStmt);
 end;
 
@@ -7273,16 +8892,8 @@ const
     ' WHERE type<>''meta'' AND sql NOTNULL' +
     '   AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\''' +
     ' ORDER BY x';
-  zStat1Q  =
-    'SELECT ''INSERT INTO sqlite_stat1 VALUES('' || quote(tbl) || '','' || ' +
-    'quote(idx) || '','' || quote(stat) || '')'' ' +
-    'FROM sqlite_stat1';
-  zStat4Q  =
-    'SELECT ''INSERT INTO sqlite_stat4 VALUES('' || ' +
-    'quote(tbl) || '','' || quote(idx) || '','' || ' +
-    'quote(neq) || '','' || quote(nlt) || '','' || ' +
-    'quote(ndlt) || '','' || quote(sample) || '')'' ' +
-    'FROM sqlite_stat4';
+  zStat1Q  = 'SELECT * FROM sqlite_stat1';
+  zStat4Q  = 'SELECT * FROM sqlite_stat4';
 var
   pStmt: PVdbe;
   pzTail: PAnsiChar;
@@ -7292,6 +8903,7 @@ var
   qList: array[0..2] of AnsiString;
   i, ii: i32;
   haveStat: Boolean;
+  savedMode: TShellMode;
 begin
   for ii := 0 to nArg - 1 do begin
     if (args[ii] = '--indent') or (args[ii] = '-indent') then
@@ -7336,9 +8948,23 @@ begin
       if pStmt <> nil then sqlite3_finalize(pStmt);
       Continue;
     end;
-    while sqlite3_step(pStmt) = SQLITE_ROW do begin
-      zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
-      if zText <> nil then WriteLn(AnsiString(zText) + ';');
+    if i > 0 then begin
+      { shell.c.in:9739..9748 — the stat tables are dumped through the
+        MODE_Insert renderer (so multi-row INSSERT packing applies). }
+      savedMode := p^.mode;
+      if i = 1 then gFullschemaTab := 'sqlite_stat1'
+      else gFullschemaTab := 'sqlite_stat4';
+      p^.zDestTable := PAnsiChar(gFullschemaTab);
+      p^.mode.eMode := MODE_Insert;
+      p^.mode.spec.bTitles := QRF_No;
+      stepAndRender(p, pStmt);
+      p^.mode := savedMode;
+      p^.zDestTable := nil;
+    end else begin
+      while sqlite3_step(pStmt) = SQLITE_ROW do begin
+        zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
+        if zText <> nil then WriteLn(AnsiString(zText) + ';');
+      end;
     end;
     sqlite3_finalize(pStmt);
   end;
@@ -8115,10 +9741,10 @@ begin
     Inc(p^.nTestErr);
     { Restore stdout so the failure diagnostic goes to the real stderr;
       the comparator file stays on disk until outputReset below. }
-    shellEPutZ(Format('%s:%d: .check failed for testcase %s'#10,
+    shellEPutZDirect(Format('%s:%d: .check failed for testcase %s'#10,
       [AnsiString(p^.zInFile), iStart, testcaseName]));
-    shellEPutZ(Format('Expected: [%s]'#10, [zPattern]));
-    shellEPutZ(Format('Got:      [%s]'#10, [zTest]));
+    shellEPutZDirect(Format('Expected: [%s]'#10, [zPattern]));
+    shellEPutZDirect(Format('Got:      [%s]'#10, [zTest]));
   end;
 
   if bKeep = 0 then begin
@@ -9064,7 +10690,7 @@ const
     '  suff = iif(name IN (SELECT * FROM RepeatedNames),' +
     '   printf(''_%s'', substring(' +
     '    printf(''%.*c%0.*d'',(SELECT max(nlz) FROM Lzn)+1,''0'',1,t.cpos),' +
-    '    2)),'' '')';
+    '    2)),'''')';
   zCollectVar: PAnsiChar =
     'SELECT ''(''||x''0a''' +
     ' || group_concat(' +
@@ -9143,8 +10769,8 @@ begin
   pDb := nil;
 end;
 
-procedure cmdImport(p: PShellState; const args: array of AnsiString;
-                   nArg: SizeInt);
+function cmdImport(p: PShellState; const args: array of AnsiString;
+                   nArg: SizeInt): i32;
 var
   sCtx: TImportCtx;
   xRead: TImportReader;
@@ -9170,6 +10796,8 @@ var
   nEndMark: i32;
   ckEnd: i32;
   iStart, savedLn: i64;
+  iLineOffset: i64;
+  zSchema2: AnsiString;
   atEof: Boolean;
 begin
   { 10.1.24.b — failIfSafeMode gate at .import entry.  Mirrors C
@@ -9188,6 +10816,8 @@ begin
         [string(AnsiString(p^.zInFile)), Int64(p^.lineno)]));
     Halt(1);
   end;
+  Result := 1;   { error paths Exit with rc=1; success resets below }
+  iLineOffset := 0;
   importInit(sCtx);
   if p^.mode.eMode = MODE_Ascii then
     xRead := @asciiReadOneField
@@ -9207,7 +10837,8 @@ begin
       if zFile = '' then zFile := args[i]
       else if zTable = '' then zTable := args[i]
       else begin
-        shellEPutZ(Format('Error: unknown argument: %s'#10, [args[i]]));
+        { shell.c.in:7518 — dotCmdError(p, i, "unknown argument", 0). }
+        shellDotError(p, i32(i) + 1, 'unknown argument', '');
         Exit;
       end;
     end else if zArg = '-v' then
@@ -9232,29 +10863,32 @@ begin
       if Length(args[i]) > 0 then sCtx.cQEscape := Ord(args[i][1]);
     end else if zArg = '-colsep' then begin
       if i = nArg - 1 then begin
-        shellEPutZ('Error: missing argument: -colsep'#10);
+        shellDotError(p, i32(i) + 1, 'missing argument', '');
         Exit;
       end;
       Inc(i);
       if Length(args[i]) > 0 then sCtx.cColSep := Ord(args[i][1]);
     end else if zArg = '-rowsep' then begin
       if i = nArg - 1 then begin
-        shellEPutZ('Error: missing argument: -rowsep'#10);
+        shellDotError(p, i32(i) + 1, 'missing argument', '');
         Exit;
       end;
       Inc(i);
       if Length(args[i]) > 0 then sCtx.cRowSep := Ord(args[i][1]);
     end else begin
-      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+      { shell.c.in:7554 — dotCmdError(p, i, "unknown option", 0). }
+      shellDotError(p, i32(i) + 1, 'unknown option', '');
       Exit;
     end;
     Inc(i);
   end;
   if zTable = '' then begin
+    { shell.c.in:7560..7562 — dotCmdError(p, nArg, 0,
+        "Missing %s argument\n", zFile==0 ? "FILE" : "TABLE"). }
     if zFile = '' then
-      shellEPutZ('Error: Missing FILE argument'#10)
+      shellDotError(p, -1, '', 'Missing FILE argument'#10)
     else
-      shellEPutZ('Error: Missing TABLE argument'#10);
+      shellDotError(p, -1, '', 'Missing TABLE argument'#10);
     Exit;
   end;
   seenInterrupt := 0;
@@ -9298,7 +10932,7 @@ begin
       { Mirror C dotCmdError(p, 0, 0, "cannot open \"%s\"", zFile) which
         keeps the original "|cmd" string in the message — sCtx.zFile is
         only swapped to "<pipe>" on success.  shell.c.in:7644. }
-      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      shellDotError(p, -1, '', Format('cannot open "%s"', [zFile]));
       importCleanup(sCtx);
       Exit;
     end;
@@ -9315,6 +10949,7 @@ begin
     pContent := sqlite3_str_new(p^.db);
     ckEnd := 1;
     iStart := p^.lineno;
+    iLineOffset := p^.lineno;     { shell.c.in:7612 }
     sCtx.zFile := AnsiString(p^.zInFile);
     sCtx.nLine := i32(p^.lineno + 1);
     atEof := False;
@@ -9357,16 +10992,18 @@ begin
   end else begin
     sCtx.inHandle := FpOpen(string(zFile), O_RDONLY);
     if sCtx.inHandle = THandle(-1) then begin
-      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      { shell.c.in:7644 — dotCmdError(p, 0, 0, "cannot open \"%s\""). }
+      shellDotError(p, -1, '', Format('cannot open "%s"', [zFile]));
       Exit;
     end;
     sCtx.inOpen := True;
   end;
 
   if eVerbose >= 1 then begin
+    { shell.c.in:7648..7658 — separators printed as C strings. }
     ch := AnsiChar(Byte(sCtx.cColSep));
-    shellSPutZ(Format('Column separator "%s", row separator "%s"'#10,
-      [string(ch), string(AnsiChar(Byte(sCtx.cRowSep)))]));
+    shellSPutZ('Column separator ' + cEscapeStr(ch)
+      + ', row separator ' + cEscapeStr(AnsiChar(Byte(sCtx.cRowSep))) + #10);
   end;
 
   hasFile := True;
@@ -9414,13 +11051,12 @@ begin
       importCleanup(sCtx);
       Exit;
     end;
-    if zSchema <> '' then
-      zCreate := 'CREATE TABLE "' +
-        StringReplace(zSchema, '"', '""', [rfReplaceAll]) + '"."' +
-        StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs
-    else
-      zCreate := 'CREATE TABLE "' +
-        StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs;
+    { shell.c.in:7684 — the schema name defaults to "main". }
+    if zSchema = '' then zSchema2 := 'main' else zSchema2 := zSchema;
+    { shell.c.in:7699 — zCreate gains a trailing newline ("%z%z\n"). }
+    zCreate := 'CREATE TABLE "' +
+      StringReplace(zSchema2, '"', '""', [rfReplaceAll]) + '"."' +
+      StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs + #10;
     if eVerbose >= 1 then shellSPutZ(zCreate + #10);
     rc := sqlite3_exec(p^.db, PAnsiChar(zCreate), nil, nil, nil);
     if rc <> SQLITE_OK then begin
@@ -9452,7 +11088,11 @@ begin
   else
     nCol := 0;
   sqlite3_finalize(pStmt);
-  if nCol = 0 then begin importCleanup(sCtx); Exit; end;
+  if nCol = 0 then begin
+    importCleanup(sCtx);
+    Result := 0;            { shell.c.in:7741 — no columns, no error }
+    Exit;
+  end;
 
   { Build INSERT INTO "schema"."table" VALUES(?,?,...,?). }
   if zSchema <> '' then
@@ -9542,8 +11182,10 @@ begin
   if needCommit <> 0 then sqlite3_exec(p^.db, 'COMMIT', nil, nil, nil);
   if eVerbose > 0 then
     shellSPutZ(Format('Added %d rows with %d errors using %d lines of input'#10,
-      [sCtx.nRow, sCtx.nErr, sCtx.nLine - 1]));
+      [sCtx.nRow, sCtx.nErr, sCtx.nLine - 1 - iLineOffset]));
   importCleanup(sCtx);
+  { shell.c.in:7846 — return sCtx.nErr ? 1 : 0. }
+  if sCtx.nErr <> 0 then Result := 1 else Result := 0;
 end;
 
 { ----------------------------------------------------------------------
@@ -10942,96 +12584,168 @@ begin
     already 0 and the C trailing reset is harmless in the Pas build. }
 end;
 
+{ Prefix match — cli_strncmp(azArg[0], zFull, n)==0 with n=strlen(azArg[0]):
+  true when zCmd is a non-empty prefix of zFull (case-sensitive). }
+function pmatch(const zCmd, zFull: AnsiString): Boolean;
+begin
+  Result := (Length(zCmd) > 0) and (Length(zCmd) <= Length(zFull))
+            and (Copy(zFull, 1, Length(zCmd)) = zCmd);
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
   args: array[0..15] of AnsiString;
   nArg: SizeInt;
   i: SizeInt;
+  nL: SizeInt;
+  c1: AnsiChar;
 begin
   Result := 0;
-  zCmd := dotCmdName(zLine);
-  if zCmd = '' then Exit;
   for i := 0 to High(args) do args[i] := '';
-  splitDotArgs(zLine, args, nArg);
+  splitDotArgs(zLine, zCmd, args, nArg);
+  { shell.c.in:9001 — no tokens, no error. }
+  if (zCmd = '') and (gDotOfst[0] = 0) then Exit;
+  nL := Length(zCmd);
+  if nL > 0 then c1 := zCmd[1] else c1 := #0;
 
-  if (zCmd = 'quit') or (zCmd = 'exit') then begin Result := 2; Exit; end;
-  if zCmd = 'help'      then begin cmdHelp(args, nArg); Exit; end;
-  if zCmd = 'stats'     then begin Result := cmdStats(p, args, nArg); Exit; end;
-  if zCmd = 'trace'     then begin Result := cmdTrace(p, args, nArg); Exit; end;
-  if zCmd = 'show'      then begin Result := cmdShow(p, nArg); Exit; end;
-  if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;
-  { shell.c.in:9752 dispatches headers via cli_strncmp(azArg[0],"headers",n),
-    so any non-empty prefix of "headers" (e.g. ".header") matches. }
-  if (zCmd <> '') and (Length(zCmd) <= 7)
-     and (Copy('headers', 1, Length(zCmd)) = zCmd) then
-  begin cmdHeaders(p, args, nArg); Exit; end;
-  if (zCmd = 'separator') or (zCmd = 'sep') then begin cmdSeparator(p, args, nArg); Exit; end;
-  if zCmd = 'nullvalue' then begin cmdNullvalue(p, args, nArg); Exit; end;
-  if zCmd = 'echo'      then begin cmdEcho(p, args, nArg); Exit; end;
-  if zCmd = 'changes'   then begin cmdChanges(p, args, nArg); Exit; end;
-  if zCmd = 'tables'    then begin cmdTables(p, args, nArg); Exit; end;
-  if zCmd = 'indexes'   then begin cmdIndexes(p, args, nArg); Exit; end;
-  if zCmd = 'databases' then begin cmdDatabases(p); Exit; end;
-  if zCmd = 'schema'    then begin cmdSchema(p, args, nArg); Exit; end;
-  if zCmd = 'timer'     then begin Result := cmdTimer(p, args, nArg); Exit; end;
-  if zCmd = 'eqp'       then begin Result := cmdEqp(p, args, nArg); Exit; end;
-  if zCmd = 'explain'   then begin cmdExplain(p, args, nArg); Exit; end;
-  if (zCmd = 'shell') or (zCmd = 'system') then begin
-    Result := cmdShell(p, args, nArg, zCmd); Exit;
+  { The dispatch chain below mirrors do_meta_command (shell.c.in:9007..
+    12066) arm-for-arm, including the per-arm minimum-length guards, so
+    abbreviated commands resolve to the same handler as the C shell. }
+  if (c1 = 'a') and pmatch(zCmd, 'auth') then begin
+    Result := cmdAuth(p, args, nArg); Exit;
   end;
-  if zCmd = 'cd'        then begin Result := cmdCd(p, args, nArg); Exit; end;
-  if zCmd = 'log'       then begin Result := cmdLog(args, nArg); Exit; end;
-  if zCmd = 'dbinfo'    then begin Result := cmdDbinfo(p, args, nArg); Exit; end;
-  if (zCmd = 'crlf') or (zCmd = 'crnl') then begin cmdCrnl(p, args, nArg); Exit; end;
-  if zCmd = 'binary'    then begin cmdBinary; Result := 1; Exit; end;
-  if zCmd = 'breakpoint' then begin cmdBreakpoint; Exit; end;
-  if zCmd = 'width'     then begin cmdWidth(p, args, nArg); Exit; end;
-  if zCmd = 'parameter' then begin cmdParameter(p, args, nArg); Exit; end;
-  if zCmd = 'read'      then begin cmdRead(p, args, nArg); Exit; end;
-  if zCmd = 'import'    then begin cmdImport(p, args, nArg); Exit; end;
-  if (zCmd = 'backup') or (zCmd = 'save') then begin
-    Result := cmdBackup(p, args, nArg, zCmd); Exit;
-  end;
-  if zCmd = 'restore'   then begin Result := cmdRestore(p, args, nArg); Exit; end;
-  if zCmd = 'clone'     then begin Result := cmdClone(p, args, nArg); Exit; end;
-  if zCmd = 'open'      then begin cmdOpen(p, args, nArg); Exit; end;
-  if zCmd = 'connection' then begin Result := cmdConnection(p, args, nArg); Exit; end;
-  if zCmd = 'unmodule'  then begin Result := cmdUnmodule(p, args, nArg); Exit; end;
-  if zCmd = 'vfsinfo'   then begin cmdVfsinfo(p, args, nArg); Exit; end;
-  if zCmd = 'vfslist'   then begin cmdVfslist(p); Exit; end;
-  if zCmd = 'vfsname'   then begin cmdVfsname(p, args, nArg); Exit; end;
-  if zCmd = 'filectrl'  then begin Result := cmdFilectrl(p, args, nArg); Exit; end;
-  if zCmd = 'testctrl'  then begin
-    Result := cmdTestctrl(p, args, nArg); Exit;
-  end;
-  if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
-  if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
-  if zCmd = 'expert'    then begin cmdExpert(p, args, nArg); Result := 1; Exit; end;
-  if zCmd = 'recover'   then begin cmdRecover(p, args, nArg); Exit; end;
-  if zCmd = 'session'   then begin cmdSession(p, args, nArg); Exit; end;
-  { .iotrace: upstream is SQLITE_ENABLE_IOTRACE-gated; in the non-debug
-    build it falls through to the unknown-command arm, so do NOT route. }
-  if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
-     or (zCmd = 'treetrace') then
-  begin cmdTraceFlags(zCmd, args, nArg); Exit; end;
-  if zCmd = 'testcase'  then begin Result := cmdTestcase(p, args, nArg); Exit; end;
-  if zCmd = 'check'     then begin Result := cmdCheck(p, args, nArg); Exit; end;
-  if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
-  if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
-    Result := cmdScanstats(p, args, nArg); Exit;
-  end;
-  if (zCmd = 'output') or (zCmd = 'once') or (zCmd = 'excel')
-     or (zCmd = 'www') then begin
-    cmdOutput(p, args, nArg, zCmd); Exit;
-  end;
-  if zCmd = 'dbtotxt' then begin cmdDbtotxt(p); Exit; end;
-  if zCmd = 'dump' then begin cmdDump(p, args, nArg); Exit; end;
-  if zCmd = 'sha3sum' then begin Result := cmdSha3sum(p, args, nArg); Exit; end;
-  if (zCmd = 'archive') or (zCmd = 'ar') then begin
+  if (c1 = 'a') and pmatch(zCmd, 'archive') then begin
     cmdArchive(p, args, nArg); Exit;
   end;
-  if zCmd = 'print' then begin
+  if ((c1 = 'b') and (nL >= 3) and pmatch(zCmd, 'backup'))
+     or ((c1 = 's') and (nL >= 3) and pmatch(zCmd, 'save')) then begin
+    Result := cmdBackup(p, args, nArg, zCmd); Exit;
+  end;
+  if (c1 = 'b') and (nL >= 3) and pmatch(zCmd, 'bail') then begin
+    Result := cmdBail(args, nArg); Exit;
+  end;
+  if (c1 = 'b') and (nL >= 3) and pmatch(zCmd, 'binary') then begin
+    cmdBinary; Result := 1; Exit;
+  end;
+  if (c1 = 'b') and (nL >= 3) and pmatch(zCmd, 'breakpoint') then begin
+    cmdBreakpoint; Exit;
+  end;
+  if zCmd = 'cd' then begin
+    Result := cmdCd(p, args, nArg); Exit;
+  end;
+  if (c1 = 'c') and (nL >= 3) and pmatch(zCmd, 'changes') then begin
+    Result := cmdChanges(p, args, nArg); Exit;
+  end;
+  if (c1 = 'c') and (nL >= 3) and pmatch(zCmd, 'check') then begin
+    Result := cmdCheck(p, args, nArg); Exit;
+  end;
+  if (c1 = 'c') and pmatch(zCmd, 'clone') then begin
+    Result := cmdClone(p, args, nArg); Exit;
+  end;
+  if (c1 = 'c') and pmatch(zCmd, 'connection') then begin
+    Result := cmdConnection(p, args, nArg); Exit;
+  end;
+  if (c1 = 'c') and (nL = 4)
+     and (pmatch(zCmd, 'crlf') or pmatch(zCmd, 'crnl')) then begin
+    cmdCrnl(p, args, nArg); Exit;
+  end;
+  if (c1 = 'd') and (nL > 1) and pmatch(zCmd, 'databases') then begin
+    cmdDatabases(p); Exit;
+  end;
+  if (c1 = 'd') and (nL >= 3) and pmatch(zCmd, 'dbconfig') then begin
+    cmdDbconfig(p, args, nArg); Exit;
+  end;
+  if (c1 = 'd') and (nL >= 3) and pmatch(zCmd, 'dbinfo') then begin
+    Result := cmdDbinfo(p, args, nArg); Exit;
+  end;
+  if (c1 = 'r') and pmatch(zCmd, 'recover') then begin
+    cmdRecover(p, args, nArg); Exit;
+  end;
+  if (c1 = 'd') and pmatch(zCmd, 'dump') then begin
+    cmdDump(p, args, nArg); Exit;
+  end;
+  if (c1 = 'e') and pmatch(zCmd, 'echo') then begin
+    Result := cmdEcho(p, args, nArg); Exit;
+  end;
+  if (c1 = 'd') and (nL >= 3) and pmatch(zCmd, 'dbtotxt') then begin
+    cmdDbtotxt(p); Exit;
+  end;
+  if (c1 = 'e') and pmatch(zCmd, 'eqp') then begin
+    Result := cmdEqp(p, args, nArg); Exit;
+  end;
+  if (c1 = 'e') and pmatch(zCmd, 'exit') then begin
+    { shell.c.in:9507..9510 — optional integer exit code. }
+    if (nArg >= 1) and (shellIntegerValue(args[0]) <> 0) then
+      Halt(i32(shellIntegerValue(args[0])));
+    Result := 2; Exit;
+  end;
+  if (c1 = 'e') and pmatch(zCmd, 'explain') then begin
+    cmdExplain(p, args, nArg); Exit;
+  end;
+  if (c1 = 'e') and pmatch(zCmd, 'expert') then begin
+    cmdExpert(p, args, nArg); Result := 1; Exit;
+  end;
+  if (c1 = 'f') and pmatch(zCmd, 'filectrl') then begin
+    Result := cmdFilectrl(p, args, nArg); Exit;
+  end;
+  if (c1 = 'f') and pmatch(zCmd, 'fullschema') then begin
+    cmdFullschema(p, args, nArg); Exit;
+  end;
+  if (c1 = 'h') and pmatch(zCmd, 'headers') then begin
+    Result := cmdHeaders(p, args, nArg); Exit;
+  end;
+  if (c1 = 'h') and pmatch(zCmd, 'help') then begin
+    cmdHelp(args, nArg); Exit;
+  end;
+  if (c1 = 'i') and pmatch(zCmd, 'import') then begin
+    Result := cmdImport(p, args, nArg); Exit;
+  end;
+  if (c1 = 'i') and pmatch(zCmd, 'imposter') then begin
+    Result := cmdImposter(p, args, nArg); Exit;
+  end;
+  if (c1 = 'i') and (pmatch(zCmd, 'indices') or pmatch(zCmd, 'indexes')) then begin
+    Result := cmdIndexes(p, args, nArg); Exit;
+  end;
+  if (c1 = 'i') and pmatch(zCmd, 'intck') then begin
+    Result := cmdIntck(p, args, nArg); Exit;
+  end;
+  { .iotrace: upstream is SQLITE_ENABLE_IOTRACE-gated; in the non-debug
+    build it falls through to the unknown-command arm, so do NOT route. }
+  if (c1 = 'l') and (nL >= 5) and pmatch(zCmd, 'limits') then begin
+    Result := cmdLimit(p, args, nArg); Exit;
+  end;
+  if (c1 = 'l') and (nL > 2) and pmatch(zCmd, 'lint') then begin
+    cmdLint(p, args, nArg); Exit;
+  end;
+  if (c1 = 'l') and pmatch(zCmd, 'load') then begin
+    Result := cmdLoad(p, args, nArg); Exit;
+  end;
+  if (c1 = 'l') and pmatch(zCmd, 'log') then begin
+    Result := cmdLog(args, nArg); Exit;
+  end;
+  if (c1 = 'm') and pmatch(zCmd, 'mode') then begin
+    Result := cmdMode(p, args, nArg); Exit;
+  end;
+  if zCmd = 'nonce' then begin
+    Result := cmdNonce(p, args, nArg); Exit;
+  end;
+  if (c1 = 'n') and pmatch(zCmd, 'nullvalue') then begin
+    Result := cmdNullvalue(p, args, nArg); Exit;
+  end;
+  if (c1 = 'o') and (nL >= 2) and pmatch(zCmd, 'open') then begin
+    cmdOpen(p, args, nArg); Exit;
+  end;
+  if ((c1 = 'o') and (pmatch(zCmd, 'output')
+                      or ((nL >= 2) and pmatch(zCmd, 'once'))))
+     or ((c1 = 'e') and (zCmd = 'excel'))
+     or ((c1 = 'w') and (zCmd = 'www')) then begin
+    cmdOutput(p, args, nArg, zCmd); Exit;
+  end;
+  if (c1 = 'p') and (nL >= 3) and pmatch(zCmd, 'parameter') then begin
+    cmdParameter(p, args, nArg); Exit;
+  end;
+  if (c1 = 'p') and (nL >= 3) and pmatch(zCmd, 'print') then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');
       Write(args[i]);
@@ -11039,22 +12753,88 @@ begin
     WriteLn;
     Exit;
   end;
-  { 10.1a.1.1..5  bite-sized handlers (.bail/.timeout/.version/.prompt/.nonce). }
-  if zCmd = 'bail'      then begin Result := cmdBail(args, nArg); Exit; end;
-  if zCmd = 'timeout'   then begin Result := cmdTimeout(p, args, nArg); Exit; end;
-  if zCmd = 'version'   then begin Result := cmdVersion(p); Exit; end;
-  if zCmd = 'prompt'    then begin Result := cmdPrompt(args, nArg); Exit; end;
-  if zCmd = 'nonce'     then begin Result := cmdNonce(p, args, nArg); Exit; end;
-  if zCmd = 'auth'      then begin Result := cmdAuth(p, args, nArg); Exit; end;
-  { 10.1a.1.6/.9/.10  .limit / .load / .intck — dot-command wrappers. }
-  if (zCmd = 'limit') or (zCmd = 'limits') then begin
-    Result := cmdLimit(p, args, nArg); Exit;
+  if (c1 = 'p') and (nL >= 3) and pmatch(zCmd, 'progress') then begin
+    Result := cmdProgress(p, args, nArg); Exit;
   end;
-  if zCmd = 'intck'     then begin Result := cmdIntck(p, args, nArg); Exit; end;
-  if zCmd = 'load'      then begin Result := cmdLoad(p, args, nArg); Exit; end;
-  { 10.1a.1.7/.8  .imposter / .progress — TESTCTRL_IMPOSTER + progress_handler. }
-  if zCmd = 'imposter'  then begin Result := cmdImposter(p, args, nArg); Exit; end;
-  if zCmd = 'progress'  then begin Result := cmdProgress(p, args, nArg); Exit; end;
+  if (c1 = 'p') and pmatch(zCmd, 'prompt') then begin
+    Result := cmdPrompt(args, nArg); Exit;
+  end;
+  if (c1 = 'q') and pmatch(zCmd, 'quit') then begin
+    Result := 2; Exit;
+  end;
+  if (c1 = 'r') and (nL >= 3) and pmatch(zCmd, 'read') then begin
+    cmdRead(p, args, nArg); Exit;
+  end;
+  if (c1 = 'r') and (nL >= 3) and pmatch(zCmd, 'restore') then begin
+    Result := cmdRestore(p, args, nArg); Exit;
+  end;
+  if (c1 = 's') and (pmatch(zCmd, 'scanstats') or pmatch(zCmd, 'scanstatus')) then begin
+    Result := cmdScanstats(p, args, nArg); Exit;
+  end;
+  if (c1 = 's') and pmatch(zCmd, 'schema') then begin
+    cmdSchema(p, args, nArg); Exit;
+  end;
+  if ((c1 = 's') and (nL = 11) and (zCmd = 'selecttrace'))
+     or ((c1 = 't') and (nL = 9) and (zCmd = 'treetrace')) then begin
+    cmdTraceFlags(zCmd, args, nArg); Exit;
+  end;
+  if (c1 = 's') and (nL >= 3) and pmatch(zCmd, 'session') then begin
+    cmdSession(p, args, nArg); Exit;
+  end;
+  if (c1 = 's') and pmatch(zCmd, 'separator') then begin
+    Result := cmdSeparator(p, args, nArg); Exit;
+  end;
+  if (c1 = 's') and (nL >= 4) and pmatch(zCmd, 'sha3sum') then begin
+    Result := cmdSha3sum(p, args, nArg); Exit;
+  end;
+  if (c1 = 's') and (pmatch(zCmd, 'shell') or pmatch(zCmd, 'system')) then begin
+    Result := cmdShell(p, args, nArg, zCmd); Exit;
+  end;
+  if (c1 = 's') and pmatch(zCmd, 'show') then begin
+    Result := cmdShow(p, nArg); Exit;
+  end;
+  if (c1 = 's') and pmatch(zCmd, 'stats') then begin
+    Result := cmdStats(p, args, nArg); Exit;
+  end;
+  if (c1 = 't') and (nL > 1) and pmatch(zCmd, 'tables') then begin
+    cmdTables(p, args, nArg); Exit;
+  end;
+  if zCmd = 'testcase' then begin
+    Result := cmdTestcase(p, args, nArg); Exit;
+  end;
+  if (c1 = 't') and (nL >= 8) and pmatch(zCmd, 'testctrl') then begin
+    Result := cmdTestctrl(p, args, nArg); Exit;
+  end;
+  if (c1 = 't') and (nL > 4) and pmatch(zCmd, 'timeout') then begin
+    Result := cmdTimeout(p, args, nArg); Exit;
+  end;
+  if (c1 = 't') and (nL >= 5) and pmatch(zCmd, 'timer') then begin
+    Result := cmdTimer(p, args, nArg); Exit;
+  end;
+  if (c1 = 't') and pmatch(zCmd, 'trace') then begin
+    Result := cmdTrace(p, args, nArg); Exit;
+  end;
+  if (c1 = 'u') and pmatch(zCmd, 'unmodule') then begin
+    Result := cmdUnmodule(p, args, nArg); Exit;
+  end;
+  if (c1 = 'v') and pmatch(zCmd, 'version') then begin
+    Result := cmdVersion(p); Exit;
+  end;
+  if (c1 = 'v') and pmatch(zCmd, 'vfsinfo') then begin
+    cmdVfsinfo(p, args, nArg); Exit;
+  end;
+  if (c1 = 'v') and pmatch(zCmd, 'vfslist') then begin
+    cmdVfslist(p); Exit;
+  end;
+  if (c1 = 'v') and pmatch(zCmd, 'vfsname') then begin
+    cmdVfsname(p, args, nArg); Exit;
+  end;
+  if (c1 = 'w') and pmatch(zCmd, 'wheretrace') then begin
+    cmdTraceFlags('wheretrace', args, nArg); Exit;
+  end;
+  if (c1 = 'w') and pmatch(zCmd, 'width') then begin
+    cmdWidth(p, args, nArg); Exit;
+  end;
 
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));
@@ -11098,12 +12878,16 @@ begin
   zSql := '';
   qss := 0;     { QSS_Start — shell.c.in:12436 }
   if p^.inputNesting = MAX_INPUT_NESTING then begin
-    shellEPutZ(Format('%s: Input nesting limit (%d) reached at line %d.'#10,
+    { shell.c.in:12428..12432 — the message reports the caller's line
+      number (p->lineno is only reset to 0 after this check). }
+    shellEPutZ(Format('%s: Input nesting limit (%d) reached at line %d.' +
+      ' Check recursion.'#10,
       [string(AnsiString(p^.zInFile)), MAX_INPUT_NESTING, p^.lineno]));
     Result := 1;
     Exit;
   end;
   Inc(p^.inputNesting);
+  p^.lineno := 0;          { shell.c.in:12438 }
   continuePromptReset;     { shell.c.in:12439 }
   while (errCnt = 0) or (bail_on_error = 0)
         or ((p^.inFile = nil) and (stdin_is_interactive <> 0)) do
@@ -11183,6 +12967,11 @@ begin
       if p^.nPopOutput > 0 then begin
         outputReset(p);
         p^.nPopOutput := 0;
+      end;
+      { shell.c.in:12518..12521 — pop a --once mode after the SQL line. }
+      if p^.nPopMode <> 0 then begin
+        modePopSh(p);
+        p^.nPopMode := 0;
       end;
     end else if (zSql <> '') and QSS_PLAINWHITE(qss) then begin
       { shell.c.in:12524..12528 — accumulator went all-whitespace after
@@ -11564,7 +13353,7 @@ var
   zFilename, zVfs, zInitFile, zMode: AnsiString;
   initialSql: AnsiString;
   noInit, readStdin: Boolean;
-  rc, k, threads: i32;
+  rc, k, threads, j2: i32;
   szArg: i64;
   cmdQueue: TDeferredCmdArr;
   positional: TDeferredCmdArr;
@@ -11610,7 +13399,9 @@ begin
     if (argA = '') or (argA[1] <> '-') or (i > nOptsEnd) then begin
       { positional argument: first non-flag becomes the dbname (if not
         already set), rest are deferred SQL/dot-commands. }
-      if (not haveDbName) and ((Length(argA) = 0) or (argA[1] <> '-')) then begin
+      if not haveDbName then begin
+        { shell.c.in:13044 — the first positional (even one starting with
+          '-' once nOptsEnd has been set by "--") names the database. }
         zFilename := argA;
         haveDbName := True;
       end else begin
@@ -11747,6 +13538,24 @@ begin
     Inc(i);
   end;
 
+  { shell.c.in:13289 — `sqlite3_appendvfs_init(0,0,0)` runs in main right
+    after the pass-1 flag loop, BEFORE the database is opened, so that
+    `-append` (openMode=SHELL_OPEN_APPENDVFS) can hand 'apndvfs' to
+    sqlite3_open_v2.  The per-connection call in openDb's extension block
+    (passqlite3shell.pas Phase 10.1.84 arm) runs only after a successful
+    open and therefore cannot satisfy the open itself (avfs-4.x: the CLI
+    died with "no such vfs: apndvfs"). }
+  sqlite3AppendvfsInit(nil);
+
+  { shell.c.in:13294 — modeDefault(&data): batch sessions (piped stdin and
+    stdout) run in MODE_BATCH (= list); console sessions in MODE_TTY. }
+  state.mode.spec.iVersion := 1;
+  state.mode.autoExplain := 1;
+  if (stdin_is_interactive <> 0) or (stdout_is_console <> 0) then
+    modeChange(@state, MODE_TTY)
+  else
+    modeChange(@state, MODE_BATCH);
+
   { ---------------- Open default db ---------------- }
   if not haveDbName then zFilename := ':memory:';
   state.aAuxDb[0].zDbFilename := PAnsiChar(zFilename);
@@ -11785,11 +13594,20 @@ begin
     else if z = '-escape' then begin
       Inc(i);
       if not cmdlineOptionValue(n, i, optVal) then Exit(1);
-      for k := 0 to High(qrfEscNames) do
-        if SameText(string(optVal), string(AnsiString(qrfEscNames[k]))) then begin
-          state.mode.spec.eEsc := u8(k);
+      k := -1;
+      for j2 := 0 to High(qrfEscNames) do
+        if SameText(string(optVal), string(AnsiString(qrfEscNames[j2]))) then begin
+          state.mode.spec.eEsc := u8(j2);
+          k := j2;
           Break;
         end;
+      if k < 0 then begin
+        { shell.c.in:13355..13362 — bad --escape value is fatal. }
+        shellEPutZ(Format(
+          'unknown control character escape mode "%s" - choices:' +
+          ' auto off ascii symbol'#10, [optVal]));
+        Exit(1);
+      end;
     end else if z = '-separator' then begin
       Inc(i);
       if not cmdlineOptionValue(n, i, optVal) then Exit(1);
@@ -11824,7 +13642,10 @@ begin
     else if z = '-bail' then
       { already set in pass 1 }
     else if z = '-version' then begin
-      shellSPutZ(AnsiString(sqlite3_libversion) + ' (64-bit)' + sLineBreak);
+      { shell.c.in:13423..13426 — "%s %s (%d-bit)" with the sourceid. }
+      shellSPutZ(AnsiString(sqlite3_libversion) + ' '
+        + AnsiString(sqlite3_sourceid)
+        + Format(' (%d-bit)', [8 * SizeOf(Pointer)]) + sLineBreak);
       Exit(0);
     end else if z = '-interactive' then
       stdin_is_interactive := 1
@@ -11840,7 +13661,8 @@ begin
          or (z = '-threadsafe') or (z = '-nonce') then
       Inc(i, 1)         { same as 1-arg here; pass 1 already consumed }
     else if z = '-help' then begin
-      printUsage(False);
+      { shell.c.in:13471 usage(1) — the usage text goes to stderr. }
+      printUsage(True);
       Exit(0);
     end else if z = '-cmd' then begin
       Inc(i);
@@ -11901,6 +13723,12 @@ begin
     end else begin
       rc := runOneSqlLine(@state, positional[k].z, 'cmdline',
                           positional[k].iArg);
+      { shell.c.in:13554..13557 — pop a --once mode after each
+        command-line SQL argument. }
+      if state.nPopMode <> 0 then begin
+        modePopSh(@state);
+        state.nPopMode := 0;
+      end;
       if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
     end;
   end;
@@ -11908,6 +13736,12 @@ begin
   { ---------------- REPL or bail ---------------- }
   if readStdin then begin
     state.zInFile := zStdinName;
+    { shell.c.in:13569..13575 — interactive banner (also when -interactive
+      forces stdin_is_interactive with piped input). }
+    if stdin_is_interactive <> 0 then
+      shellSPutZ('SQLite version ' + AnsiString(sqlite3_libversion) + ' '
+        + Copy(AnsiString(sqlite3_sourceid), 1, 19) + #10
+        + 'Enter ".help" for usage hints.'#10);
     { 10.3.a — on-disk history persistence at ~/.passqlite3_history
       (linenoise-style load-on-start / save-on-exit; gated on
       stdin_is_interactive like shell.c.in:13569..13609).  Honours
