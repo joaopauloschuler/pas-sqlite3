@@ -11047,6 +11047,117 @@ procedure resolveOutOfRangeError(pParse: PParse; zType: PAnsiChar;
 { Forward — searchWith is defined later (codegen.pas ~30574) but the
   CteColumnMatches helper inside sqlite3ResolveSelectNames needs it. }
 function searchWith(pWth: PWith; pItem: PSrcItem; ppContext: PPointer): PCte; forward;
+function cannotBeFunction(pParse: PParse; pFrom: PSrcItem): i32; forward;
+
+{ misc1-25.0 — C's expand phase (sqlite3SelectExpand) walks compound ORDER BY
+  expression subqueries via sqlite3WalkSelect, so a FROM term `name(args)`
+  whose name resolves to an in-scope CTE raises "'name' is not a function"
+  (select.c:5723 resolveFromTermToCte -> cannotBeFunction select.c:5582..5588)
+  BEFORE resolveCompoundOrderBy ever runs.  This port's expand pass does not
+  walk ORDER BY subqueries, so without this check such a term is later
+  misreported as "%r ORDER BY term does not match any column in the result
+  set".  These two walkers reproduce exactly the expand-phase CTE/tab-func
+  check over an ORDER BY term's subqueries, honouring WITH scoping via the
+  same pOuter linkage sqlite3WithPush (build.c) establishes. }
+procedure orderByCteFnCheckSelect(pParse: PParse; pSel: PSelect;
+  pWth: PWith); forward;
+
+procedure orderByCteFnCheckExpr(pParse: PParse; pE: PExpr; pWth: PWith);
+var
+  i:      i32;
+  pItems: PExprListItem;
+begin
+  if (pE = nil) or (pParse^.nErr <> 0) then Exit;
+  orderByCteFnCheckExpr(pParse, pE^.pLeft, pWth);
+  orderByCteFnCheckExpr(pParse, pE^.pRight, pWth);
+  if ExprUseXSelect(pE) then
+    orderByCteFnCheckSelect(pParse, pE^.x.pSelect, pWth)
+  else if pE^.x.pList <> nil then
+  begin
+    pItems := ExprListItems(pE^.x.pList);
+    for i := 0 to pE^.x.pList^.nExpr - 1 do
+      orderByCteFnCheckExpr(pParse, pItems[i].pExpr, pWth);
+  end;
+end;
+
+procedure orderByCteFnCheckSelect(pParse: PParse; pSel: PSelect; pWth: PWith);
+var
+  pCur:        PWith;
+  pSavedOuter: PWith;
+  i:           i32;
+  pSrcItems:   PSrcItem;
+  pCt:         PCte;
+  pCtx:        Pointer;
+  pListItems:  PExprListItem;
+begin
+  while (pSel <> nil) and (pParse^.nErr = 0) do
+  begin
+    { sqlite3WithPush equivalent: bring this select's own WITH clause into
+      scope, chained to the outer scope via pOuter (restored on exit). }
+    pCur := pWth;
+    pSavedOuter := nil;
+    if pSel^.pWith <> nil then
+    begin
+      pSavedOuter := pSel^.pWith^.pOuter;
+      pSel^.pWith^.pOuter := pWth;
+      pCur := pSel^.pWith;
+    end;
+    if pSel^.pSrc <> nil then
+    begin
+      pSrcItems := SrcListItems(pSel^.pSrc);
+      for i := 0 to pSel^.pSrc^.nSrc - 1 do
+      begin
+        if pParse^.nErr <> 0 then Break;
+        if SrcItemIsSubquery(pSrcItems[i].fg)
+           and (pSrcItems[i].u4.pSubq <> nil) then
+          orderByCteFnCheckSelect(pParse, pSrcItems[i].u4.pSubq^.pSelect, pCur)
+        else if (pSrcItems[i].zName <> nil)
+           { isTabFunc — `name(args)` syntax (select.c:5583). }
+           and ((pSrcItems[i].fg.fgBits and u8($08)) <> 0)
+           { schema-qualified term cannot be a CTE (select.c:5686..5693). }
+           and (((pSrcItems[i].fg.fgBits3 and u8($01)) <> 0)
+                or (pSrcItems[i].u4.zDatabase = nil))
+           { notCte fence (select.c:5694..5701) — fgBits2 bit 2. }
+           and ((pSrcItems[i].fg.fgBits2 and u8($04)) = 0) then
+        begin
+          pCtx := nil;
+          pCt := searchWith(pCur, @pSrcItems[i], @pCtx);
+          if pCt <> nil then
+            cannotBeFunction(pParse, @pSrcItems[i]);   { select.c:5723 }
+        end;
+      end;
+    end;
+    { Walk this select's expression slots so nested subqueries anywhere in
+      the term are covered, exactly as sqlite3WalkSelectExpr does. }
+    if pParse^.nErr = 0 then
+    begin
+      if pSel^.pEList <> nil then
+      begin
+        pListItems := ExprListItems(pSel^.pEList);
+        for i := 0 to pSel^.pEList^.nExpr - 1 do
+          orderByCteFnCheckExpr(pParse, pListItems[i].pExpr, pCur);
+      end;
+      orderByCteFnCheckExpr(pParse, pSel^.pWhere, pCur);
+      if pSel^.pGroupBy <> nil then
+      begin
+        pListItems := ExprListItems(pSel^.pGroupBy);
+        for i := 0 to pSel^.pGroupBy^.nExpr - 1 do
+          orderByCteFnCheckExpr(pParse, pListItems[i].pExpr, pCur);
+      end;
+      orderByCteFnCheckExpr(pParse, pSel^.pHaving, pCur);
+      if pSel^.pOrderBy <> nil then
+      begin
+        pListItems := ExprListItems(pSel^.pOrderBy);
+        for i := 0 to pSel^.pOrderBy^.nExpr - 1 do
+          orderByCteFnCheckExpr(pParse, pListItems[i].pExpr, pCur);
+      end;
+      orderByCteFnCheckExpr(pParse, pSel^.pLimit, pCur);
+    end;
+    if pSel^.pWith <> nil then
+      pSel^.pWith^.pOuter := pSavedOuter;
+    pSel := pSel^.pPrior;
+  end;
+end;
 
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
@@ -15289,6 +15400,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if pOrderBy = nil then Exit;
     if p^.pEList = nil then Exit;
     pItems := ExprListItems(pOrderBy);
+    { misc1-25.0 — C's expand phase walks ORDER BY expression subqueries and
+      raises "'name' is not a function" for a tab-func FROM term that matches
+      an in-scope CTE BEFORE compound ORDER BY resolution runs (select.c:5723).
+      This port expands lazily, so run the equivalent check here, ahead of the
+      term-matching loop, so that error wins over "does not match any column". }
+    for i := 0 to pOrderBy^.nExpr - 1 do
+    begin
+      orderByCteFnCheckExpr(pParse, pItems[i].pExpr, pParse^.pWith);
+      if pParse^.nErr <> 0 then Exit;
+    end;
     { resolve.c:1606..1608 — clear the per-term done flag (fg.done, eBits bit 2
       = $04).  Under PARSE_MODE_RENAME iOrderByCol is left untouched, so done
       tracking must use fg.done exactly as C does. }
