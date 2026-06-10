@@ -34032,7 +34032,27 @@ begin
       { Inferred-column form `WITH RECURSIVE r AS (...)`: derive column
         names from the leftmost (anchor) SELECT's pEList BEFORE running
         SelectPrep on the compound, so the recursive arm's `r.col`
-        references can resolve against pTab^.aCol. }
+        references can resolve against pTab^.aCol.
+
+        select.c:5796..5806 — C EXPANDS the setup-term chain first
+        (sqlite3WalkSelect on pRecTerm, with pRecTerm->pWith temporarily
+        set to pSel->pWith and zCteErr armed), and only THEN derives the
+        column list from the expanded leftmost pEList (select.c:5831).
+        Without that expand, an anchor of the form `SELECT t.*, ... FROM t`
+        leaves a raw `t.*` in pEList, the inferred pTab column set is
+        wrong, and the recursive arm's `q.id` reference fails with
+        "no such column" instead of reaching the recursive-query checks
+        (window1-15.0). }
+      pSavedWith := pParse^.pWith;
+      pParse^.pWith := PWith(pWthC);
+      pCt^.zCteErr := PAnsiChar('circular reference: %s');
+      Assert(pRecTerm^.pWith = nil);
+      pRecTerm^.pWith := pSel^.pWith;
+      sqlite3SelectExpand(pParse, pRecTerm);
+      pRecTerm^.pWith := nil;
+      pCt^.zCteErr := nil;
+      pParse^.pWith := pSavedWith;
+      if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
       pLeft := pSel;
       while pLeft^.pPrior <> nil do pLeft := pLeft^.pPrior;
       if pLeft^.pEList <> nil then
