@@ -3150,7 +3150,8 @@ function  sqlite3ReadSchema(pParse: PParse): i32;
 { sqlite3Reprepare / sqlite3_prepare* (incl. UTF-16 variants) live in
   passqlite3main (Phase 7.1.3 / 8.2). }
 
-{ Stubs needed by vdbeaux.c / main.c callers }
+{ Fallbacks for codegen-only test programs (sqlite3RunParser here is
+  shadowed by the real parser in passqlite3parser.pas — see its body) }
 procedure sqlite3RunParser(pParse: PParse; zSql: PAnsiChar);
 function  sqlite3SafetyCheckOk(db: PTsqlite3): i32;
 function  sqlite3SafetyCheckSickOrOk(db: PTsqlite3): i32;
@@ -57802,10 +57803,15 @@ begin
   end;
 end;
 
-{ sqlite3RunParser — stub; Phase 7 will call the real Lemon-generated parser }
+{ sqlite3RunParser — INTENTIONAL fallback, NOT the engine parser.  The
+  real parser is the full tokenize.c port in passqlite3parser.pas
+  (sqlite3RunParser there), which passqlite3main calls directly and
+  which registers itself with this unit via the gNestedRunParser hook
+  at init (see sqlite3NestedParse).  This body is reachable only from
+  codegen-only test programs that deliberately do not link the parser
+  unit; in the shipped library it is shadowed and never runs. }
 procedure sqlite3RunParser(pParse: PParse; zSql: PAnsiChar);
 begin
-  { Phase 7: invoke sqlite3Parser (Lemon-generated) and tokenizer }
   sqlite3ErrorMsg(pParse, 'parser not yet implemented (Phase 7)');
   pParse^.rc := SQLITE_ERROR;
 end;

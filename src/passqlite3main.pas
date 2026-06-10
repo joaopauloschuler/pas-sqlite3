@@ -5425,11 +5425,13 @@ begin
   sqlite3_soft_heap_limit64(i64(n));
 end;
 
-{ btree.c:89 — sqlite3_enable_shared_cache.  This Pascal port is built
-  with the SQLITE_OMIT_SHARED_CACHE compile path: there is no
-  sqlite3GlobalConfig.sharedCacheEnabled to mutate.  Mirror the
-  loadext.c:91 omit-stub posture by accepting the call and returning
-  SQLITE_OK; future opens never enable shared cache regardless. }
+{ btree.c:89 — sqlite3_enable_shared_cache.  INTENTIONAL no-op: this
+  Pascal port is built with the SQLITE_OMIT_SHARED_CACHE compile path —
+  there is no sqlite3GlobalConfig.sharedCacheEnabled to mutate.  Mirror
+  the loadext.c:91 omit-stub posture by accepting the call and returning
+  SQLITE_OK; future opens never enable shared cache regardless.
+  Porting shared-cache mode is tracked as tasklist 6.41.1 (the oracle
+  HAS it; gates the shared*/thread* tcl tests via shared_cache=0). }
 function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
 begin
   Result := SQLITE_OK;

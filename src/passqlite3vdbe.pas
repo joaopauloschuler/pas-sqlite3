@@ -7081,40 +7081,33 @@ begin
 end;
 
 { ============================================================================
-  Phase 5.7 — vdbesort.c external sorter (in-memory engine C-faithful;
-  PMA disk-spill compiled but not yet triggered — see SORTER_PMA_ENABLED).
+  Phase 5.7 — vdbesort.c external sorter (COMPLETE: in-memory engine +
+  PMA disk-spill both live; SORTER_PMA_ENABLED=True since 5.7.b.9).
 
   Phase 5.7.b.5 replaced the bespoke array-mergesort with C's real
   bottom-up linked-list merge engine (vdbeSorterMerge / vdbeSorterSort /
   vdbeSorterGetCompare / the vdbeSorterCompare* family operating on
   SRVAL/nVal with typeMask Int/Text fast paths) and the C-exact
-  sqlite3VdbeSorterInit / Write / Rewind / Next / Rowkey / Compare.  The
-  write-side PMA path (vdbeSorterListToPMA / vdbeSorterFlushPMA) is fully
-  ported and compiled, but the spill TRIGGER in sqlite3VdbeSorterWrite is
-  GATED OFF behind the module const SORTER_PMA_ENABLED=False (see below).
-  With the gate off, every sort stays in RAM exactly as before — the
-  read-back merge machinery (MergeEngine / IncrMerger / Rewind-merge)
-  lands in 5.7.b.6..b.9, and 5.7.b.9 flips SORTER_PMA_ENABLED to True.
+  sqlite3VdbeSorterInit / Write / Rewind / Next / Rowkey / Compare.
+  5.7.b.6..b.9 then landed the read-back merge machinery (MergeEngine /
+  IncrMerger / Rewind-merge) and 5.7.b.9 flipped SORTER_PMA_ENABLED to
+  True: sorts that exceed the in-RAM cap now spill to on-disk PMAs and
+  merge back exactly as vdbesort.c does (verified 5.7.b.10).
   ============================================================================ }
 
 const
   { ----------------------------------------------------------------------
-    SORTER_PMA_ENABLED — 5.7.b.5 spill-trigger gate.
+    SORTER_PMA_ENABLED — 5.7.b.5 spill-trigger gate, ENABLED since
+    5.7.b.9 (read-back merge landed in 5.7.b.6..b.9, verified b.10).
 
     C's sqlite3VdbeSorterWrite flushes the in-memory list to an on-disk
-    PMA (vdbesort.c:1849..1854) whenever memory fills.  The PMA write side
-    (vdbeSorterListToPMA / vdbeSorterFlushPMA / PmaWriter) is ported and
-    compiled, BUT the read-back side (MergeEngine / IncrMerger and the
-    PMA arms of Rewind/Next/Rowkey/Compare) does NOT exist until
-    5.7.b.6..b.9.  If we let the flush fire now, a sort that spills would
-    discard everything but the final PMA at Rewind — silent data loss.
-
-    Therefore the spill block is kept fully faithful (bFlush computation,
-    szPMA/iMemory reset) but the actual vdbeSorterFlushPMA() call is
-    guarded by this const.  With it False the behaviour is identical to
-    the pre-5.7.b in-memory sorter (no spill, no data loss, gate green).
-
-    *** 5.7.b.9 MUST flip this to True AND verify the merge read-back. ***
+    PMA (vdbesort.c:1849..1854) whenever memory fills.  Both sides are
+    ported: the write side (vdbeSorterListToPMA / vdbeSorterFlushPMA /
+    PmaWriter) and the read-back side (MergeEngine / IncrMerger and the
+    PMA arms of Rewind/Next/Rowkey/Compare).  The const remains only as
+    a documented kill-switch: setting it False reverts to the pre-5.7.b
+    RAM-only sorter (historical gate while read-back was unported, when
+    an early flush would have lost all but the final PMA at Rewind).
     ---------------------------------------------------------------------- }
   SORTER_PMA_ENABLED = True;   { 5.7.b.9: spill + merge read-back enabled }
 
