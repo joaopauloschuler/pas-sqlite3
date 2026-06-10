@@ -2231,6 +2231,66 @@ begin
   Result := Result + '''';
 end;
 
+{ %#Q-style SQL text literal (printf.c:884..947): when eEsc is not
+  QRF_ESC_Off and the text contains control characters, render as
+  unistr('...') with \u00XX escapes for control characters and
+  backslash doubling; otherwise plain %Q quoting. }
+function sqlQuotedQ(const z: AnsiString; eEsc: u8): AnsiString;
+const
+  hex: AnsiString = '0123456789abcdef';
+var
+  i: SizeInt;
+  b: Byte;
+  hasCtrl: Boolean;
+begin
+  hasCtrl := False;
+  if eEsc <> 1 then        { 1 = QRF_ESC_Off }
+    for i := 1 to Length(z) do
+      if Byte(z[i]) <= $1f then begin hasCtrl := True; Break; end;
+  if not hasCtrl then
+    Exit(sqlQuotedStr(z));
+  Result := 'unistr(''';
+  for i := 1 to Length(z) do begin
+    b := Byte(z[i]);
+    if z[i] = '''' then Result := Result + ''''''
+    else if z[i] = '\' then Result := Result + '\\'
+    else if b <= $1f then begin
+      Result := Result + '\u00';
+      if b >= $10 then Result := Result + '1' else Result := Result + '0';
+      Result := Result + hex[1 + (b and $f)];
+    end else
+      Result := Result + z[i];
+  end;
+  Result := Result + ''')';
+end;
+
+{ qrfEscape (ext/qrf/qrf.c) with an explicit escape mode:
+    1 (off)    — text passes through verbatim
+    2 (ascii)  — control chars (except \t, \n, \r-before-\n) as ^X
+    3 (symbol) — same set as U+2400+c control pictures
+    0 (auto)   — resolves to ascii (qrf.c:2818..2820) }
+function qrfEscapeE(const z: AnsiString; eEsc: u8): AnsiString;
+var
+  i, n: SizeInt;
+  c: Byte;
+begin
+  if eEsc = 1 then Exit(z);
+  Result := '';
+  n := Length(z);
+  for i := 1 to n do begin
+    c := Byte(z[i]);
+    if (c <= $1f) and (c <> 9) and (c <> 10)
+       and not ((c = 13) and (i < n) and (z[i+1] = #10)) then begin
+      if eEsc = 3 then
+        Result := Result + #$E2#$90 + AnsiChar($80 + c)
+      else begin
+        Result := Result + '^' + Chr(c + $40);
+      end;
+    end else
+      Result := Result + z[i];
+  end;
+end;
+
 { qrfJsonbQuickCheck — ext/qrf/qrf.c:974..988.  Sanity-check that the
   blob looks like JSONB (false positives possible, no false negatives). }
 function jsonbQuickCheck(const b: AnsiString): Boolean;
@@ -2680,7 +2740,20 @@ begin
           if ty > 0 then Write(StringOfChar(' ', ty));
           Write(colNameStr(pStmt, i));
           Write(rs.zColSep);
-          if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
+          if isNull then Write(rs.zNull)
+          else begin
+            { qrf.c:2649..2663 — multi-line values continue on fresh
+              lines indented past the name field + separator. }
+            z := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
+            for tclJ := 1 to Length(z) do begin
+              if z[tclJ] = #10 then begin
+                WriteLn;
+                Write(StringOfChar(' ',
+                  rs.lineMaxNameLen + Length(rs.zColSep)));
+              end else
+                Write(z[tclJ]);
+            end;
+          end;
           WriteLn;
         end;
       end;
@@ -2690,7 +2763,8 @@ begin
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(rs.zColSep);
           z := colTextStr(pStmt, i, isNull);
-          if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
+          if isNull then Write(rs.zNull)
+          else Write(qrfEscapeE(z, rs.p^.mode.spec.eEsc));
         end;
         Write(rs.zRowSep);
       end;
@@ -2714,10 +2788,12 @@ begin
             SQLITE_NULL:    Write('NULL');
             SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
             SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
-            SQLITE_TEXT:    outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+            SQLITE_TEXT:    Write(sqlQuotedQ(
+              specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc));
             SQLITE_BLOB:    Write(renderBlobSql(rs.p, pStmt, i));
           else
-            outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+            Write(sqlQuotedQ(
+              specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc));
           end;
         end;
         Write(rs.zRowSep);
@@ -2767,7 +2843,8 @@ begin
             Write(renderBlobSql(rs.p, pStmt, i));
             Continue;
           end;
-          outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+          Write(sqlQuotedQ(
+            specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc));
         end;
         WriteLn(');');
       end;
@@ -2943,19 +3020,20 @@ begin
     SQLITE_BLOB: begin
       b := colBlobStr(pStmt, i);
       if (rs.p^.mode.spec.bTextJsonb = QRF_Yes) and jsonbToJson(b, zJson) then begin
-        if eText = 2 then Result := 'jsonb(' + sqlQuotedStr(zJson) + ')'
+        if eText = 2 then
+          Result := 'jsonb(' + sqlQuotedQ(zJson, rs.p^.mode.spec.eEsc) + ')'
         else Result := zJson;
       end else if (eText = 2) or (rs.p^.mode.spec.eBlob = 2) then
         Result := blobSqlLiteral(b)
       else begin
         z := colTextStr(pStmt, i, isNull);
-        Result := qrfEscapeCtrl(z);
+        Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
       end;
     end;
   else begin
     z := colTextStr(pStmt, i, isNull);
-    if eText = 2 then Result := sqlQuotedStr(z)
-    else Result := qrfEscapeCtrl(z);
+    if eText = 2 then Result := sqlQuotedQ(z, rs.p^.mode.spec.eEsc)
+    else Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
   end;
   end;
 end;
@@ -3078,8 +3156,12 @@ var
   nRowBuf: i32;
   rcStep: i32;
   isBox, isTable, isCol, isMd, isPsql: Boolean;
+  borderOff: Boolean;
   anyMultiLine: Boolean;
   wordWrap: Boolean;
+  scrW, nRowsFlow, nKCols, kk, jj, idx: i32;
+  flowW: array of i32;
+  flowTot: i32;
   glyphTL, glyphTR, glyphBL, glyphBR: AnsiString;
   glyphHB, glyphVB, glyphCx, glyphTU, glyphTD, glyphTL2, glyphTR2: AnsiString;
   glyphML, glyphMR: AnsiString;
@@ -3096,6 +3178,7 @@ begin
   isCol   := (rs.p^.mode.eMode = MODE_Column)
              or (rs.p^.mode.eMode = MODE_Split);
   isMd    := rs.p^.mode.eMode = MODE_Markdown;
+  borderOff := rs.p^.mode.spec.bBorder = 1;   { QRF_No }
   wordWrap := rs.p^.mode.spec.bWordWrap = QRF_Yes;
 
   SetLength(headers,    nCol);
@@ -3173,6 +3256,55 @@ begin
     end;
   end;
 
+  { MODE_Split single-column flow layout (qrf.c split style): when a
+    screen width is known, flow the values of a one-column result set
+    top-to-bottom into as many side-by-side columns as fit. }
+  if (rs.p^.mode.eMode = MODE_Split) and (nCol = 1) then begin
+    scrW := rs.p^.mode.spec.nScreenWidth;
+    if (scrW <= 0) and (rs.p^.mode.bAutoScreenWidth <> 0)
+       and (stdout_tty_width > 0) then
+      scrW := stdout_tty_width;
+    if (scrW > 0) and (nRowBuf > 1) then begin
+      nRowsFlow := 0;
+      for kk := 1 to nRowBuf do begin
+        nKCols := (nRowBuf + kk - 1) div kk;
+        SetLength(flowW, nKCols);
+        flowTot := 2 * (nKCols - 1);
+        for jj := 0 to nKCols - 1 do begin
+          flowW[jj] := 0;
+          for idx := jj * kk to (jj + 1) * kk - 1 do
+            if idx < nRowBuf then begin
+              w := utf8DispWidth(matrix[idx, 0]);
+              if w > flowW[jj] then flowW[jj] := w;
+            end;
+          Inc(flowTot, flowW[jj]);
+        end;
+        if flowTot <= scrW then begin
+          nRowsFlow := kk;
+          Break;
+        end;
+      end;
+      if nRowsFlow = 0 then nRowsFlow := nRowBuf;
+      nKCols := (nRowBuf + nRowsFlow - 1) div nRowsFlow;
+      for jj := 0 to nRowsFlow - 1 do begin
+        sb := '';
+        for kk := 0 to nKCols - 1 do begin
+          idx := kk * nRowsFlow + jj;
+          if idx >= nRowBuf then Break;
+          if kk > 0 then sb := sb + '  ';
+          sb := sb + matrix[idx, 0];
+          w := flowW[kk] - utf8DispWidth(matrix[idx, 0]);
+          if w > 0 then sb := sb + StringOfChar(' ', w);
+        end;
+        while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
+          SetLength(sb, Length(sb) - 1);
+        WriteLn(sb);
+      end;
+      rs.rowsEmitted := nRowBuf;
+      Exit;
+    end;
+  end;
+
   { Glyphs. }
   if isBox then begin
     { Upstream qrf.c: top corners + below-header separator use rounded
@@ -3229,6 +3361,12 @@ begin
   end;
 
   if isBox or isTable then begin
+    if borderOff then begin
+      { .mode -border off: no outer border; separators have no caps. }
+      glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
+      glyphTL2 := ''; glyphTR2 := '';
+      glyphML := ''; glyphMR := '';
+    end;
     sb := glyphTL;
     for c := 0 to nCol - 1 do begin
       if c > 0 then sb := sb + glyphTD;
@@ -3289,12 +3427,12 @@ begin
   end;
 
   { Emit. }
-  if isBox or isTable then WriteLn(rowSep);
+  if (isBox or isTable) and not borderOff then WriteLn(rowSep);
 
   if rs.headersOn or isBox or isTable or isMd or isPsql then begin
     if isBox or isTable or isMd or isPsql then begin
       sb := glyphVB;
-      if isPsql then sb := '';
+      if isPsql or borderOff then sb := '';
       for c := 0 to nCol - 1 do begin
         if c > 0 then sb := sb + glyphVB;
         sb := sb + ' ';
@@ -3305,7 +3443,7 @@ begin
         if w > 0 then sb := sb + StringOfChar(' ', w - (w div 2));
         sb := sb + ' ';
       end;
-      if isPsql then begin
+      if isPsql or borderOff then begin
         while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
           SetLength(sb, Length(sb) - 1);
         WriteLn(sb);
@@ -3338,7 +3476,7 @@ begin
       WriteLn(midSep);
     for ln := 0 to nLines[rc] - 1 do begin
       sb := '';
-      if isBox or isTable or isMd then sb := glyphVB;
+      if (isBox or isTable or isMd) and not borderOff then sb := glyphVB;
       for c := 0 to nCol - 1 do begin
         if c > 0 then begin
           if isBox or isTable or isMd or isPsql then sb := sb + glyphVB
@@ -3363,7 +3501,7 @@ begin
             sb := sb + StringOfChar(' ', w);
         end;
       end;
-      if isBox or isTable or isMd then
+      if (isBox or isTable or isMd) and not borderOff then
         WriteLn(sb + glyphVB)
       else begin
         { MODE_Column / MODE_Split / MODE_Psql — qrfRTrim trims trailing
@@ -3375,7 +3513,7 @@ begin
     end;
   end;
 
-  if isBox or isTable then WriteLn(footSep);
+  if (isBox or isTable) and not borderOff then WriteLn(footSep);
   if isCol and (isMd or isPsql) then ; { keep hints used }
 
   rs.rowsEmitted := nRowBuf;
@@ -3397,6 +3535,7 @@ begin
              or (p^.mode.eMode = MODE_Box)
              or (p^.mode.eMode = MODE_QBox)
              or (p^.mode.eMode = MODE_Psql)
+             or (p^.mode.eMode = MODE_Split)
              or (p^.mode.eMode = MODE_Markdown);
 
   if isColumnar then begin
@@ -12861,7 +13000,7 @@ var
   zFilename, zVfs, zInitFile, zMode: AnsiString;
   initialSql: AnsiString;
   noInit, readStdin: Boolean;
-  rc, k, threads: i32;
+  rc, k, threads, j2: i32;
   szArg: i64;
   cmdQueue: TDeferredCmdArr;
   positional: TDeferredCmdArr;
@@ -13102,11 +13241,20 @@ begin
     else if z = '-escape' then begin
       Inc(i);
       if not cmdlineOptionValue(n, i, optVal) then Exit(1);
-      for k := 0 to High(qrfEscNames) do
-        if SameText(string(optVal), string(AnsiString(qrfEscNames[k]))) then begin
-          state.mode.spec.eEsc := u8(k);
+      k := -1;
+      for j2 := 0 to High(qrfEscNames) do
+        if SameText(string(optVal), string(AnsiString(qrfEscNames[j2]))) then begin
+          state.mode.spec.eEsc := u8(j2);
+          k := j2;
           Break;
         end;
+      if k < 0 then begin
+        { shell.c.in:13355..13362 — bad --escape value is fatal. }
+        shellEPutZ(Format(
+          'unknown control character escape mode "%s" - choices:' +
+          ' auto off ascii symbol'#10, [optVal]));
+        Exit(1);
+      end;
     end else if z = '-separator' then begin
       Inc(i);
       if not cmdlineOptionValue(n, i, optVal) then Exit(1);
@@ -13222,6 +13370,12 @@ begin
     end else begin
       rc := runOneSqlLine(@state, positional[k].z, 'cmdline',
                           positional[k].iArg);
+      { shell.c.in:13554..13557 — pop a --once mode after each
+        command-line SQL argument. }
+      if state.nPopMode <> 0 then begin
+        modePopSh(@state);
+        state.nPopMode := 0;
+      end;
       if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
     end;
   end;
