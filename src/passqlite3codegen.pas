@@ -40493,6 +40493,13 @@ begin
         { Windowed coroutine subquery WITH outer ORDER BY: drain the sorter and
           yield each row.  Mirrors selectInnerLoop SRT_Coroutine (select.c:1448). }
         sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+      else if pDest^.eDest = SRT_Mem then
+        { generateSortTail SRT_Mem (select.c:1849..1852) — scalar subquery:
+          the result columns are already in pDest^.iSdst from the OP_Column
+          loop above and the injected LIMIT 1 terminates the drain below.
+          Emitting OP_ResultRow here instead leaked the subquery's rows into
+          the outer statement's result set (window1-33.2: [6 6 6 1] for
+          [6 1]). }
       else
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
       { LIMIT on sorter drain — generateSortTail (select.c:1740..1748).
