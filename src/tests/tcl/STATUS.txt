@@ -797,7 +797,7 @@ pas-strict	../sqlite3/test/snapshot3.test	-
 pas-strict	../sqlite3/test/snapshot4.test	-
 pas-strict	../sqlite3/test/snapshot_fault.test	-
 pas-strict	../sqlite3/test/snapshot_up.test	-
-pas-skip	../sqlite3/test/soak.test	9.4.divbug.99
+pas-strict	../sqlite3/test/soak.test	-
 pas-strict	../sqlite3/test/softheap1.test	-
 pas-skip	../sqlite3/test/sort.test	9.4.8.f.4
 pas-strict	../sqlite3/test/sort2.test	-

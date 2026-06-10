@@ -141,7 +141,7 @@ type
     Ms       : LongInt;
   end;
 const
-  PER_TEST_TIMEOUT_OVERRIDES: array[0..7] of TPerTestTimeout = (
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..8] of TPerTestTimeout = (
     (BaseName: 'securedel2.test'; Ms: 900000),
     (BaseName: 'select4.test';    Ms: 900000),
     (BaseName: 'writecrash.test'; Ms: 900000),
@@ -162,8 +162,44 @@ const
     (BaseName: 'incrvacuum2.test'; Ms: 300000),
     { crash.test runs 917 crash-injection subtests in ~94 s (measured pas,
       2026-06-10, PASS) — legitimately past the 30s default, no engine bug. }
-    (BaseName: 'crash.test'; Ms: 300000)
+    (BaseName: 'crash.test'; Ms: 300000),
+    { 9.4.divbug.99 — soak.test with the injected `-timeout 1` argv (see
+      PER_TEST_ARGV_OVERRIDES) runs one fuzz.test quick-mode iteration:
+      175 subtests in ~35 s measured (pas, 2026-06-10, PASS) — just past
+      the 30 s default. }
+    (BaseName: 'soak.test'; Ms: 300000)
   );
+
+type
+  TPerTestArgv = record
+    BaseName : string;        { ExtractFileName, lowercase }
+    Argv     : string;        { Tcl list assigned to ::argv }
+  end;
+const
+  { 9.4.divbug.99 — per-test ::argv injection.  Upstream runs these
+    wrapper tests as `testfixture test/foo.test ARGS...`; this driver
+    feeds every script on stdin, so ::argv is normally cleared (see
+    BuildScript).  soak.test:27..38 reads `-timeout N` from $argv and
+    otherwise defaults to TIMEOUT=3600 s (soak.test:24), which can never
+    finish under the per-test watchdog.  `-timeout 1` gives the shortest
+    upstream-sanctioned soak: the run loop (soak.test:75) always executes
+    at least one iteration — fuzz.test in quick mode (G(isquick)=1 →
+    ::REPEATS 20, fuzz.test:30..32) — then stops once 1 s has elapsed. }
+  PER_TEST_ARGV_OVERRIDES: array[0..0] of TPerTestArgv = (
+    (BaseName: 'soak.test'; Argv: '-timeout 1')
+  );
+
+function ArgvForTest(const testAbsPath: string): string;
+var
+  i  : Integer;
+  bn : string;
+begin
+  bn := LowerCase(ExtractFileName(testAbsPath));
+  for i := Low(PER_TEST_ARGV_OVERRIDES) to High(PER_TEST_ARGV_OVERRIDES) do
+    if PER_TEST_ARGV_OVERRIDES[i].BaseName = bn then
+      Exit(PER_TEST_ARGV_OVERRIDES[i].Argv);
+  Result := '';
+end;
 
 var
   gTimeoutMs : LongInt = -1;   { --timeout override in ms; -1 = unset }
@@ -515,8 +551,11 @@ begin
       leaves a stray "-" in ::argv that memleak.test (`set FILELIST $argv`)
       then tries to `source` as a filename. }
     sb.Add('set ::argv0 {' + testAbsPath + '}');
-    sb.Add('set ::argv {}');
-    sb.Add('set ::argc 0');
+    { 9.4.divbug.99: per-test argv injection (see PER_TEST_ARGV_OVERRIDES)
+      mirrors `testfixture test/foo.test ARGS...`; everyone else gets the
+      empty ::argv described above. }
+    sb.Add('set ::argv {' + ArgvForTest(testAbsPath) + '}');
+    sb.Add('set ::argc [llength $::argv]');
     { tester.tcl:498 — cmdlinearg(INFO_SCRIPT) is the normalized path of the
       running test script.  Upstream derives it from [info script]; here the
       .test is sourced via the monkey-patched [source] so [info script] would
