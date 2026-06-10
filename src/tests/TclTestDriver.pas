@@ -141,7 +141,11 @@ type
     Ms       : LongInt;
   end;
 const
-  PER_TEST_TIMEOUT_OVERRIDES: array[0..8] of TPerTestTimeout = (
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..9] of TPerTestTimeout = (
+    { sort4.test — multi-threaded sorter stress: 7 sorter_test configs x 10
+      repeats over a 100k-row table; ~204 s measured (pas, 2026-06-10, PASS),
+      legitimately past the 30 s default. }
+    (BaseName: 'sort4.test'; Ms: 300000),
     (BaseName: 'securedel2.test'; Ms: 900000),
     (BaseName: 'select4.test';    Ms: 900000),
     (BaseName: 'writecrash.test'; Ms: 900000),

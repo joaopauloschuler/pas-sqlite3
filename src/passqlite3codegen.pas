@@ -72579,11 +72579,13 @@ var
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
 begin
-  if (argc = 0) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+  { date.c isDate: only argc==0 reads the current time.  A NULL argument
+    falls through to z = sqlite3_value_text(argv[0]) == 0 → return 1 →
+    NULL result (handled below by parseDateTime on a nil string). }
+  if argc = 0 then begin
     { date.c:1117..1119 — argc==0 reads the current time; gated on
       sqlite3NotPureFunc.  When it fails the error is set; leave it. }
-    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
+    if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
     emitDateYMD(pCtx, y2, m2, d2);
@@ -72611,9 +72613,11 @@ var
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
 begin
-  if (argc = 0) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
-    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
+  { date.c isDate: only argc==0 reads the current time.  A NULL argument
+    falls through to z = sqlite3_value_text(argv[0]) == 0 → return 1 →
+    NULL result (handled below by parseDateTime on a nil string). }
+  if argc = 0 then begin
+    if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
     snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]);
@@ -72683,9 +72687,11 @@ var
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
 begin
-  if (argc = 0) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
-    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
+  { date.c isDate: only argc==0 reads the current time.  A NULL argument
+    falls through to z = sqlite3_value_text(argv[0]) == 0 → return 1 →
+    NULL result (handled below by parseDateTime on a nil string). }
+  if argc = 0 then begin
+    if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
     emitDateTime(pCtx, y2, m2, d2, h2, mn2, s2, False);
@@ -72709,9 +72715,11 @@ var
   dt: TDateTime2;
   z: PAnsiChar;
 begin
-  if (argc = 0) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
-    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
+  { date.c isDate: only argc==0 reads the current time.  A NULL argument
+    falls through to z = sqlite3_value_text(argv[0]) == 0 → return 1 →
+    NULL result (handled below by parseDateTime on a nil string). }
+  if argc = 0 then begin
+    if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     sqlite3_result_double(pCtx, currentJD); Exit;
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
@@ -72738,9 +72746,11 @@ begin
     always positive for supported dates, so iJD div 1000 floors correctly
     (Pascal div truncates toward zero, but the operand is positive here). }
   dt.useSubsec := False;
-  if (argc = 0) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
-    if (argc = 0) and (sqlite3NotPureFunc(pCtx) = 0) then Exit;
+  { date.c isDate: only argc==0 reads the current time.  A NULL argument
+    falls through to z = sqlite3_value_text(argv[0]) == 0 → return 1 →
+    NULL result (handled below by parseDateTime on a nil string). }
+  if argc = 0 then begin
+    if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     jd := currentJD;
   end else begin
     z := sqlite3_value_text(Psqlite3_value(argv^));
@@ -72779,18 +72789,25 @@ var
   ty, tm, td, th, tmn: i32;
   ts: Double;
 begin
-  if argc < 2 then begin sqlite3_result_null(pCtx); Exit; end;
-  zFmt  := sqlite3_value_text(Psqlite3_value(argv^));
-  zDate := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if argc = 0 then begin sqlite3_result_null(pCtx); Exit; end;
+  zFmt := sqlite3_value_text(Psqlite3_value(argv^));
   if (zFmt = nil) then begin sqlite3_result_null(pCtx); Exit; end;
-  if (zDate = nil) then begin
-    { date.c:1424 isDate(context, argc-1, argv+1) with a NULL/absent date arg
-      → current-time path, gated on sqlite3NotPureFunc.  When it fails the
-      error is set; leave it (C `return`). }
+  if argc = 1 then begin
+    { date.c:1424 isDate(context, argc-1, argv+1) with argc-1==0 → isDate's
+      argc==0 path (date.c:1117..1119): current time, gated on
+      sqlite3NotPureFunc.  When the gate fails the error is set; leave it
+      (C `return`). }
     if sqlite3NotPureFunc(pCtx) = 0 then Exit;
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
-  end else if not parseDateTime(pCtx, zDate, dt) then begin
+  end else begin
+  zDate := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zDate = nil) then begin
+    { date.c isDate with a NULL time-value: eType==SQLITE_NULL falls through
+      to z = sqlite3_value_text(argv[0]) == 0 → return 1 → NULL result. }
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  if not parseDateTime(pCtx, zDate, dt) then begin
     { Parse failed — if NotPureFunc set an error (e.g. 'now' inside a
       CHECK/gencol/index), leave it; otherwise emit NULL (C `return` with a
       fresh NULL result register). }
@@ -72806,6 +72823,7 @@ begin
     jd := dt.jd;
     y2 := dt.yr; m2 := dt.mo; d2 := dt.dy;
     h2 := dt.hr; mn2 := dt.mi; s2 := dt.s;
+  end;
   end;
   { date.c:1422..1424 — accumulate into a length-capped StrAccum so a huge
     format string raises SQLITE_TOOBIG instead of smashing a fixed buffer.
