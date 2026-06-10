@@ -5465,6 +5465,7 @@ const
   SQLITE_TESTCTRL_PRNG_RESTORE_OP         = 6;
   SQLITE_TESTCTRL_FK_NO_ACTION_OP         = 7;
   SQLITE_TESTCTRL_BITVEC_TEST_OP          = 8;
+  SQLITE_TESTCTRL_FAULT_INSTALL_OP        = 9;
   SQLITE_TESTCTRL_PENDING_BYTE_OP         = 11;
   SQLITE_TESTCTRL_ASSERT_OP               = 12;
   SQLITE_TESTCTRL_ALWAYS_OP               = 13;
@@ -5504,6 +5505,15 @@ begin
       self-test program; returns its result code. }
     SQLITE_TESTCTRL_BITVEC_TEST_OP:
       Result := sqlite3BitvecBuiltinTest(iArg1, Pi32(pArg2));
+
+    { main.c:4314 — FAULT_INSTALL(xCallback).  Install xCallback as the
+      sqlite3FaultSim() hook (NULL cancels); as a self-test of the fault
+      simulator, sqlite3FaultSim(0) runs immediately and its value is the
+      return of sqlite3_test_control(). }
+    SQLITE_TESTCTRL_FAULT_INSTALL_OP: begin
+      sqlite3GlobalConfig.xTestCallback := pArg2;
+      Result := sqlite3FaultSim(0);
+    end;
 
     { main.c:4254 — PRNG_SEED(int x, sqlite3 *db).  If db has a schema
       cookie use it; else use x; then reset the PRNG. }

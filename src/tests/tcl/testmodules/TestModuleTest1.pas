@@ -130,6 +130,9 @@ const
   SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS_OP = 29;
   { sqlite3.h — opcode 8 (BITVEC_TEST).  Mirrored locally. }
   SQLITE_TESTCTRL_BITVEC_TEST_OP = 8;
+  { sqlite3.h — opcode 9 (FAULT_INSTALL).  Mirrored locally; the engine
+    handler lives in passqlite3main testCtrlImpl. }
+  SQLITE_TESTCTRL_FAULT_INSTALL_OP = 9;
   { sqlite3.h — opcodes 5/6 (PRNG_SAVE/PRNG_RESTORE).  Mirrored locally. }
   SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
   SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
@@ -10706,6 +10709,191 @@ begin
   if clientData = nil then ;
 end;
 
+{ test1.c:2189..2220 — testFunc.  User-defined SQL function exercising
+  the sqlite_set_result() API.  Arguments come in TYPE/VALUE pairs; TYPE
+  is one of int/int64/string/double/null/value (case-insensitive). }
+procedure t1TestFunc(context: Psqlite3_context; argc: cint;
+  argv: PPsqlite3_value); cdecl;
+var
+  pArg:  PPsqlite3_value;
+  zArg0: PAnsiChar;
+begin
+  pArg := argv;
+  while argc >= 2 do
+  begin
+    zArg0 := PAnsiChar(sqlite3_value_text(pArg[0]));
+    if zArg0 <> nil then
+    begin
+      if sqlite3StrICmp(zArg0, PAnsiChar('int')) = 0 then
+        sqlite3_result_int(context, sqlite3_value_int(pArg[1]))
+      else if sqlite3StrICmp(zArg0, PAnsiChar('int64')) = 0 then
+        sqlite3_result_int64(context, sqlite3_value_int64(pArg[1]))
+      else if sqlite3StrICmp(zArg0, PAnsiChar('string')) = 0 then
+        sqlite3_result_text(context,
+          PAnsiChar(sqlite3_value_text(pArg[1])), -1, SQLITE_TRANSIENT)
+      else if sqlite3StrICmp(zArg0, PAnsiChar('double')) = 0 then
+        sqlite3_result_double(context, sqlite3_value_double(pArg[1]))
+      else if sqlite3StrICmp(zArg0, PAnsiChar('null')) = 0 then
+        sqlite3_result_null(context)
+      else if sqlite3StrICmp(zArg0, PAnsiChar('value')) = 0 then
+        sqlite3_result_value(context, pArg[sqlite3_value_int(pArg[1])])
+      else
+      begin
+        sqlite3_result_error(context,
+          PAnsiChar('first argument should be one of: int int64 string double null value'), -1);
+        Exit;
+      end;
+    end
+    else
+    begin
+      sqlite3_result_error(context,
+        PAnsiChar('first argument should be one of: int int64 string double null value'), -1);
+      Exit;
+    end;
+    Dec(argc, 2);
+    pArg := PPsqlite3_value(PtrUInt(pArg) + 2 * SizeOf(Pointer));
+  end;
+end;
+
+{ test1.c:2227..2249 — test_register_func (old-style argc/argv handler).
+  Usage: sqlite_register_test_function DB NAME.  Registers testFunc on
+  DB under NAME. }
+function test_register_func(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  db: PTsqlite3;
+  rc: i32;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' DB FUNCTION-NAME'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, av[1], @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_create_function(db, av[2], -1, SQLITE_UTF8, nil,
+    @t1TestFunc, nil, nil);
+  if rc <> 0 then
+  begin
+    Tcl_AppendResult(interp, sqlite3ErrStr(rc), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if sqlite3TestErrCode(interp, db, rc) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
+{ test1.c:4830..4849 — test_sleep (old-style argc/argv handler).
+  Usage: sqlite3_sleep MILLISECONDS. }
+function test_sleep(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  ms: cint;
+  av: PPAnsiCharArr;
+begin
+  av := argv;
+  if argc <> 2 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' MILLISECONDS'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetInt(interp, av[1], @ms) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_sleep(ms)));
+  Result := TCL_OK;
+end;
+
+{ test2.c:582..618 — the sqlite3FaultSim() callback bridge.  The script
+  installed by sqlite3_test_control_fault_install is evaluated with the
+  integer argument appended; its integer result becomes the
+  sqlite3FaultSim() return value. }
+var
+  faultSimInterp:     PTclInterp = nil;
+  faultSimScriptSize: cint       = 0;
+  faultSimScript:     PAnsiChar  = nil;
+
+function faultSimCallback(x: i32): i32; cdecl;
+var
+  zInt: string[31];
+  rc:   cint;
+  i:    cint;
+begin
+  { Convert x to text (the C code hand-rolls this to avoid re-entering
+    sqlite3 routines; Str() is a pure RTL conversion). }
+  Str(x, zInt);
+  for i := 1 to Length(zInt) do
+    (faultSimScript + faultSimScriptSize + i - 1)^ := zInt[i];
+  (faultSimScript + faultSimScriptSize + Length(zInt))^ := #0;
+  rc := Tcl_Eval(faultSimInterp, faultSimScript);
+  if rc <> TCL_OK then
+  begin
+    Flush(StdErr);
+    WriteLn(StdErr, 'fault simulator script failed: [',
+      string(faultSimScript), ']');
+    rc := SQLITE_ERROR;
+  end
+  else
+    rc := StrToIntDef(Trim(string(Tcl_GetStringResult(faultSimInterp))), 0);
+  Tcl_ResetResult(faultSimInterp);
+  Result := rc;
+end;
+
+{ test2.c:627..663 — faultInstallCmd (old-style argc/argv handler).
+  Usage: sqlite3_test_control_fault_install ?SCRIPT?.  Arrange to invoke
+  SCRIPT (with the sqlite3FaultSim() argument appended) whenever
+  sqlite3FaultSim() is called; an empty/absent SCRIPT cancels the
+  callback. }
+function faultInstallCmd(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+var
+  zScript: PAnsiChar;
+  nScript: cint;
+  rc:      cint;
+  av:      PPAnsiCharArr;
+begin
+  av := argv;
+  if (argc <> 1) and (argc <> 2) then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av[0], PChar(' SCRIPT'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  if argc = 2 then
+    zScript := av[1]
+  else
+    zScript := PAnsiChar('');
+  nScript := cint(strlen(zScript));
+  if faultSimScript <> nil then
+  begin
+    FreeMem(faultSimScript);
+    faultSimScript := nil;
+  end;
+  if nScript = 0 then
+    rc := sqlite3_test_control(SQLITE_TESTCTRL_FAULT_INSTALL_OP, Pi32(nil))
+  else
+  begin
+    GetMem(faultSimScript, nScript + 100);
+    Move(zScript^, faultSimScript^, nScript);
+    (faultSimScript + nScript)^ := ' ';
+    faultSimScriptSize := nScript + 1;
+    faultSimInterp := interp;
+    rc := sqlite3_test_control(SQLITE_TESTCTRL_FAULT_INSTALL_OP,
+      Pi32(@faultSimCallback));
+  end;
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(rc));
+  Result := TCL_OK;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -11328,6 +11516,17 @@ begin
     in C; the pas Sqlitetest2_Init is a stub, so register it here). }
   Tcl_CreateCommand(interp, PChar('sqlite3BitvecBuiltinTest'),
     @testBitvecBuiltinTest, nil, nil);
+  { func.test — test1.c:9084 sqlite_register_test_function. }
+  Tcl_CreateCommand(interp, PChar('sqlite_register_test_function'),
+    @test_register_func, nil, nil);
+  { misc1.test — test1.c:9133 sqlite3_sleep. }
+  Tcl_CreateCommand(interp, PChar('sqlite3_sleep'),
+    @test_sleep, nil, nil);
+  { misc1.test — test2.c:734 sqlite3_test_control_fault_install (registered
+    by Sqlitetest2_Init in C; the pas Sqlitetest2_Init is a stub, so
+    register it here). }
+  Tcl_CreateCommand(interp, PChar('sqlite3_test_control_fault_install'),
+    @faultInstallCmd, nil, nil);
   { test1.c:9200 — tcl_objproc. }
   Tcl_CreateObjCommand(interp, PChar('tcl_objproc'),
     @runAsObjProc, nil, nil);

@@ -488,6 +488,10 @@ set ::sqlite_options(integrityck) 1
 # configslower: CONFIG_SLOWDOWN_FACTOR multiplier; like.test uses it as a numeric
 # scale for timing budgets. Mirror upstream test_config.c default (1.0).
 set ::sqlite_options(configslower) 1.0
+# casesensitivelike: test_config.c:71..76 — 1 only under
+# SQLITE_CASE_SENSITIVE_LIKE; default build (and the port) leave it off.
+# expr.test reads $sqlite_options(casesensitivelike) directly.
+set ::sqlite_options(casesensitivelike) 0
 # rtree: pas-sqlite3 omits the rtree virtual-table module — pin to 0 so
 # `ifcapable rtree { ... }` blocks (alterlegacy-14.x etc.) SKIP rather than
 # run and hit "no such module: rtree".
