@@ -9624,6 +9624,7 @@ begin
           PAnsiChar('no such column: '
                     + AnsiString(zTab) + '.' + AnsiString(zCol)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
       end;
       Exit;
     end;
@@ -9719,6 +9720,7 @@ begin
           sqlite3ErrorMsg(pParse,
             PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
       end;
     end;
     Exit;
@@ -9747,6 +9749,7 @@ begin
                   + AnsiString(pE^.pRight^.pLeft^.u.zToken) + '.'
                   + AnsiString(pE^.pRight^.pRight^.u.zToken)));
       sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+      pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
       Exit;
     end;
     if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
@@ -9759,6 +9762,7 @@ begin
                   + AnsiString(pE^.pLeft^.u.zToken) + '.'
                   + AnsiString(pE^.pRight^.u.zToken)));
       sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+      pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
     end;
     Exit;
   end;
@@ -13889,6 +13893,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                       + AnsiString(pE^.pLeft^.u.zToken) + '.'
                       + AnsiString(pE^.pRight^.u.zToken)));
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
           Exit;
         end
         else if (cnt = 1) and bMatchWrap and (pMatch <> nil) then
@@ -13995,6 +14000,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                       + AnsiString(pE^.pLeft^.u.zToken) + '.'
                       + AnsiString(pE^.pRight^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
       end;
       Exit;
     end;
@@ -14178,6 +14184,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         sqlite3ErrorMsg(pParse,
           PAnsiChar('ambiguous column name: ' + AnsiString(pE^.u.zToken)));
         sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
         Exit;
       end;
       if cnt = 1 then
@@ -14278,6 +14285,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             sqlite3ErrorMsg(pParse,
               PAnsiChar('ambiguous column name: ' + AnsiString(pE^.u.zToken)));
             sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+            pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
             Exit;
           end;
           pItem := pRowidMatch;
@@ -14338,6 +14346,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           { resolve.c:796 — record the offending token offset so the CLI
             caret marker can anchor under the column name. }
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
         end;
       end;
       Exit;
@@ -14376,6 +14385,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             sqlite3ErrorMsg(pParse,
               PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
           sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+          pParse^.parseFlags := pParse^.parseFlags or $200; { resolve.c:797 checkSchema }
         end;
         Exit;
       end;
