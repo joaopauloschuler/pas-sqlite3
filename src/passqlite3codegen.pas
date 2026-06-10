@@ -73647,6 +73647,17 @@ begin
   pNew^.eEnd       := p^.eEnd;
   pNew^.eExclude   := p^.eExclude;
   pNew^.bImplicitFrame := p^.bImplicitFrame;
+  { window.c:2398..2402 — the register/cursor bookkeeping fields must be
+    copied too.  exprCodeBetween dups a window-function LHS at codegen time
+    (after WindowCodeStep allocated regResult); without regResult on the
+    copy, ExprCodeTarget's EP_WinFunc arm falls through to the scalar
+    function emitter and `count() OVER w NOT BETWEEN ...` dies with
+    "unknown function: count()" (window1-30.0). }
+  pNew^.regResult  := p^.regResult;
+  pNew^.regAccum   := p^.regAccum;
+  pNew^.iArgCol    := p^.iArgCol;
+  pNew^.iEphCsr    := p^.iEphCsr;
+  pNew^.bExprArgs  := p^.bExprArgs;
   pNew^.pStart     := sqlite3ExprDup(db, p^.pStart, 0);
   pNew^.pEnd       := sqlite3ExprDup(db, p^.pEnd, 0);
   pNew^.pFilter    := sqlite3ExprDup(db, p^.pFilter, 0);
