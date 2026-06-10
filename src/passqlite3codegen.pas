@@ -11910,6 +11910,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     This pre-resolution runs against the OUTER p^.pEList before the inner
     per-Select resolver; it only fires for bare TK_IDs that bind neither in
     the inner FROM nor the outer FROM, so it cannot mask a real column. }
+  { window1-43.x — forward decl (definition at the HAVING-alias block below)
+    so the subquery-alias arm can reject "misuse of aliased window function"
+    per resolve.c:679..683. }
+  function ExprIsOrContainsAggregate(pX: PExpr): i32; forward;
   procedure ResolveOuterAliasIDsDepth(pW: PExpr; pInnerSrc: PSrcList;
              pOuterEList: PExprList; nSub: i32); forward;
   procedure WalkAliasDeepFromSubqueries(pSel: PSelect; pOuterEList: PExprList;
@@ -12042,6 +12046,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
            and (sqlite3StrICmp(zAs, pW^.u.zToken) = 0) then
         begin
           pOrig := itemsE[j_].pExpr;
+          { resolve.c:679..683 — an alias whose target contains a window
+            function may only be referenced from the SAME NameContext
+            (pNC==pTopNC).  This resolver runs exclusively for references
+            INSIDE a subquery (nSub>=1), i.e. pNC!=pTopNC always, so any
+            window-containing alias here is "misuse of aliased window
+            function" (window1-43.1.2 / 43.2.5 / 43.2.6:
+            `... count() OVER() AS m ... ORDER BY (SELECT m)`). }
+          if ExprIsOrContainsAggregate(pOrig) = 2 then
+          begin
+            sqlite3ErrorMsg(pParse,
+              PAnsiChar('misuse of aliased window function '
+                        + AnsiString(zAs)));
+            Exit;
+          end;
           { resolve.c:684..687 — row value misused guard. }
           if sqlite3ExprVectorSize(pOrig) <> 1 then
           begin
@@ -14620,6 +14638,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
             pCompArm := pCompArm^.pPrior;
           end;
         end;
+        { window1-43.1.2 — the alias swap above may have raised "misuse of
+          aliased window function NAME" (resolve.c:679..683 WRC_Abort).  Stop
+          here so the Step-4 inner sqlite3ResolveSelectNames doesn't clobber
+          it with "no such column: NAME" (Pas sqlite3ErrorMsg overwrites). }
+        if pParse^.nErr > 0 then Exit;
         { Step 2: detect outer refs across ALL inner clauses (not just
           pWhere) — correlation can live in pEList, pHaving, pGroupBy,
           pOrderBy.  Without this, an inner subquery whose ONLY outer
@@ -15452,13 +15475,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
-  { 9.4.divbug.70.c — forward decl so that the alias arm below can
-    consult ExprIsOrContainsAggregate when descending into the args of
-    an aggregate function call inside HAVING.  Mirrors resolve.c:670..683
-    aliased-aggregate misuse detection (NC_AllowAgg=0 context applies
-    inside another aggregate's argument list). }
-  function ExprIsOrContainsAggregate(pX: PExpr): i32; forward;
-
+  { 9.4.divbug.70.c — ExprIsOrContainsAggregate is consulted by the alias
+    arm below when descending into the args of an aggregate function call
+    inside HAVING (resolve.c:670..683 aliased-aggregate misuse detection);
+    its forward declaration moved up next to ResolveOuterAliasIDsDepth's
+    (window1-43.x uses it there too). }
   function IsAggregateFunctionCall(pX: PExpr): Boolean;
   var
     pDef: PTFuncDef;
