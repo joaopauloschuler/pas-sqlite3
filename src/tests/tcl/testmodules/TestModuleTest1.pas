@@ -7063,6 +7063,28 @@ begin
   if clientData = nil then ;
 end;
 
+{ coveridxscan — test_malloc.c:1186..1213 test_config_cis.
+  Enable/disable SQLITE_CONFIG_COVERING_INDEX_SCAN; return sqlite3ErrName(rc). }
+function tcl_test_config_cis(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  rc, bUseCis: cint;
+begin
+  if objc <> 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('BOOL'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[1], @bUseCis) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_config(SQLITE_CONFIG_COVERING_INDEX_SCAN, bUseCis);
+  Tcl_SetResult(interp, t1ErrName(rc), TCL_STATIC);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { 9.4.divbug.62.d — test_malloc.c:1220..1241 test_config_pmasz.
   Set the minimum PMA size via SQLITE_CONFIG_PMASZ. }
 function tcl_test_config_pmasz(clientData: TClientData; interp: PTclInterp;
@@ -11380,6 +11402,10 @@ begin
     @tcl_test_config_uri, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_config_pmasz'),
     @tcl_test_config_pmasz, nil, nil);
+  { coveridxscan — sqlite3_config_cis
+    (test_malloc.c:1186..1213, registered at test_malloc.c:1498). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_config_cis'),
+    @tcl_test_config_cis, nil, nil);
   { 9.4.divbug.62.f — sqlite3_config_alt_pcache stub
     (test_malloc.c:927..966, registered at test_malloc.c:1488).
     Validates args; install is a no-op since test_pcache.c is not
