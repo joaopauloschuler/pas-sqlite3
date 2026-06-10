@@ -38419,6 +38419,14 @@ begin
        and (pItem^.u4.pSubq^.pSelect^.pGroupBy = nil)
        and (pItem^.u4.pSubq^.pSelect^.pHaving = nil)
        and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_HasAgg) = 0)
+       { MATERIALIZED-CTE optimisation fence (select.c:7782..7788,
+         restriction 28) — flattening an AS MATERIALIZED CTE re-evaluates
+         its result expressions at every column reference, so a
+         non-deterministic body (random()) yields different values per
+         use (fpconv1-2.0). }
+       and not (((pItem^.fg.fgBits2 and u8($02)) <> 0)          { isCte }
+                and (pItem^.u2.pCteUse <> nil)
+                and (pItem^.u2.pCteUse^.eM10d = u8(0)))         { M10d_Yes }
     then
     begin
       if flattenSubquery(pParse, p, 0, 0) <> 0 then
@@ -42278,6 +42286,13 @@ begin
        and (pItem^.u4.pSubq^.pSelect^.pGroupBy = nil)
        and (pItem^.u4.pSubq^.pSelect^.pHaving = nil)
        and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_HasAgg) = 0)
+       { MATERIALIZED-CTE optimisation fence (select.c:7782..7788,
+         restriction 28) — see the analysis-phase single-source site;
+         flattening an AS MATERIALIZED CTE breaks non-deterministic
+         bodies (fpconv1-2.0). }
+       and not (((pItem^.fg.fgBits2 and u8($02)) <> 0)          { isCte }
+                and (pItem^.u2.pCteUse <> nil)
+                and (pItem^.u2.pCteUse^.eM10d = u8(0)))         { M10d_Yes }
     then
     begin
       if flattenSubquery(pParse, p, 0, 0) <> 0 then
