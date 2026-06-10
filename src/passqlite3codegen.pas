@@ -9038,14 +9038,36 @@ function reportWindowMisuse(pParse: PParse; pE: PExpr): Boolean;
 var
   items: PExprListItem;
   i: i32;
+  nArg: i32;
+  pDef: PTFuncDef;
 begin
   Result := False;
   if (pE = nil) or (pParse = nil) then Exit;
   if (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
      and exprIsWindowFunc(pE) then
   begin
-    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
-      'misuse of window function %s()', [pE^.u.zToken]));
+    { resolve.c:1240..1244 — the `pDef->xValue==0 && pWin` arm fires BEFORE
+      the misuse arm (resolve.c:1245..1257) and regardless of NC_AllowWin:
+      a function with no xValue callback (a scalar, or a step+finalize-only
+      aggregate registered via sqlite3_create_function) used with OVER is
+      "NAME() may not be used as a window function", never "misuse of
+      window function NAME()".  windowE-2.1. }
+    if ((pE^.flags and EP_xIsSelect) = 0)
+       and ExprUseXList(pE) and (pE^.x.pList <> nil) then
+      nArg := pE^.x.pList^.nExpr
+    else
+      nArg := 0;
+    pDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg,
+                                pParse^.db^.enc, 0);
+    if pDef = nil then
+      pDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                  pParse^.db^.enc, 0);
+    if (pDef <> nil) and (not Assigned(pDef^.xValue)) then
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        '%s() may not be used as a window function', [pE^.u.zToken]))
+    else
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'misuse of window function %s()', [pE^.u.zToken]));
     sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
     Result := True;
     Exit;
