@@ -10955,7 +10955,15 @@ begin
   for i := 0 to High(args) do args[i] := '';
   splitDotArgs(zLine, args, nArg);
 
-  if (zCmd = 'quit') or (zCmd = 'exit') then begin Result := 2; Exit; end;
+  { shell.c.in:10448 — quit dispatches via cli_strncmp(azArg[0],"quit",n):
+    any non-empty prefix (.q/.qu/.qui/.quit) matches (avfs.test scripts use
+    `.q`).  exit (shell.c.in:9507) is prefix-matched too, but in the C chain
+    it sits AFTER echo (9461) and eqp (9479), so `.e` resolves to echo there;
+    require length>=2 here so the single-letter form keeps falling through
+    to the e-arms below exactly as before. }
+  if (Length(zCmd) <= 4) and (Copy('quit', 1, Length(zCmd)) = zCmd) then begin Result := 2; Exit; end;
+  if (Length(zCmd) >= 2) and (Length(zCmd) <= 4)
+     and (Copy('exit', 1, Length(zCmd)) = zCmd) then begin Result := 2; Exit; end;
   if zCmd = 'help'      then begin cmdHelp(args, nArg); Exit; end;
   if zCmd = 'stats'     then begin Result := cmdStats(p, args, nArg); Exit; end;
   if zCmd = 'trace'     then begin Result := cmdTrace(p, args, nArg); Exit; end;
@@ -11746,6 +11754,15 @@ begin
     end;
     Inc(i);
   end;
+
+  { shell.c.in:13289 — `sqlite3_appendvfs_init(0,0,0)` runs in main right
+    after the pass-1 flag loop, BEFORE the database is opened, so that
+    `-append` (openMode=SHELL_OPEN_APPENDVFS) can hand 'apndvfs' to
+    sqlite3_open_v2.  The per-connection call in openDb's extension block
+    (passqlite3shell.pas Phase 10.1.84 arm) runs only after a successful
+    open and therefore cannot satisfy the open itself (avfs-4.x: the CLI
+    died with "no such vfs: apndvfs"). }
+  sqlite3AppendvfsInit(nil);
 
   { ---------------- Open default db ---------------- }
   if not haveDbName then zFilename := ':memory:';
