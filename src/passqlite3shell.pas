@@ -862,6 +862,98 @@ begin
   sqlite3_result_int(pCtx, ms);
 end;
 
+{ editFunc — faithful port of shell.c.in:1864..1989.
+  edit(VALUE) / edit(VALUE,EDITOR): write VALUE to a temp file, launch
+  the editor (EDITOR arg or $VISUAL), read the file back as the result.
+  Text values get \r\n -> \n conversion on read-back unless the input
+  already contained \r\n. }
+procedure shellEditUdf(pCtx: Psqlite3_context;
+                       nVal: i32; apVal: PPMem); cdecl;
+var
+  pArgs: PShellArgArr3;
+  zEditor, zTempFile, zCmd: AnsiString;
+  bBin: Boolean;
+  hasCRLF: Boolean;
+  rc: i32;
+  f: file of Byte;
+  data, back: AnsiString;
+  sz: SizeInt;
+  i, j: SizeInt;
+  r: u64;
+begin
+  pArgs := PShellArgArr3(apVal);
+  if nVal = 2 then
+    zEditor := AnsiString(PAnsiChar(sqlite3_value_text(pArgs^[1])))
+  else
+    zEditor := GetEnvironmentVariable('VISUAL');
+  if zEditor = '' then begin
+    sqlite3_result_error(pCtx, 'no editor for edit()', -1);
+    Exit;
+  end;
+  if sqlite3_value_type(pArgs^[0]) = SQLITE_NULL then begin
+    sqlite3_result_error(pCtx, 'NULL input to edit()', -1);
+    Exit;
+  end;
+  r := 0;
+  sqlite3_randomness(SizeOf(r), @r);
+  zTempFile := AnsiString(Format('temp%x', [r]));
+  bBin := sqlite3_value_type(pArgs^[0]) = SQLITE_BLOB;
+  sz := sqlite3_value_bytes(pArgs^[0]);
+  SetLength(data, sz);
+  if sz > 0 then begin
+    if bBin then
+      Move(sqlite3_value_blob(pArgs^[0])^, data[1], sz)
+    else
+      Move(sqlite3_value_text(pArgs^[0])^, data[1], sz);
+  end;
+  hasCRLF := (not bBin) and (Pos(#13#10, data) > 0);
+  AssignFile(f, string(zTempFile));
+  {$I-} Rewrite(f); {$I+}
+  if IOResult <> 0 then begin
+    sqlite3_result_error(pCtx, 'edit() cannot open temp file', -1);
+    Exit;
+  end;
+  if sz > 0 then BlockWrite(f, data[1], sz);
+  CloseFile(f);
+  zCmd := zEditor + ' "' + zTempFile + '"';
+  rc := fpsystem(zCmd);
+  if rc <> 0 then begin
+    sqlite3_result_error(pCtx, 'EDITOR returned non-zero', -1);
+    DeleteFile(string(zTempFile));
+    Exit;
+  end;
+  AssignFile(f, string(zTempFile));
+  {$I-} Reset(f); {$I+}
+  if IOResult <> 0 then begin
+    sqlite3_result_error(pCtx,
+      'edit() cannot reopen temp file after edit', -1);
+    Exit;
+  end;
+  sz := FileSize(f);
+  SetLength(back, sz);
+  if sz > 0 then BlockRead(f, back[1], sz);
+  CloseFile(f);
+  DeleteFile(string(zTempFile));
+  if bBin then
+    sqlite3_result_blob64(pCtx, PAnsiChar(back), sz, SQLITE_TRANSIENT)
+  else begin
+    if not hasCRLF then begin
+      { convert any new \r\n back into \n }
+      j := 0;
+      i := 1;
+      while i <= sz do begin
+        if (back[i] = #13) and (i < sz) and (back[i+1] = #10) then Inc(i);
+        Inc(j);
+        back[j] := back[i];
+        Inc(i);
+      end;
+      SetLength(back, j);
+    end;
+    sqlite3_result_text64(pCtx, PAnsiChar(back), Length(back),
+                          SQLITE_TRANSIENT, SQLITE_UTF8);
+  end;
+end;
+
 procedure registerShellBuiltins(db: Psqlite3);
 { shell.c.in:4590..4607 — registration block invoked from open_db().
   editFunc deferred (system() spawn + temp-file shuttle); everything
@@ -885,6 +977,11 @@ begin
                           @shellPutsnlUdf, nil, nil);
   sqlite3_create_function(db, 'usleep', 1, FFlags, nil,
                           @shellUSleepUdf, nil, nil);
+  { shell.c.in:4607..4610 — edit(VALUE) / edit(VALUE,EDITOR). }
+  sqlite3_create_function(db, 'edit', 1, FFlags, nil,
+                          @shellEditUdf, nil, nil);
+  sqlite3_create_function(db, 'edit', 2, FFlags, nil,
+                          @shellEditUdf, nil, nil);
 end;
 
 { shell.c.in:4110 — shellReadFile.  Slurp the entire contents of zName into
@@ -2054,11 +2151,13 @@ var
   i, n: SizeInt;
   c: Byte;
 begin
-  needQuote := False;
+  { qrfCsvQuote (qrf.c:846..863): controls, space, '"', '#'? no — the
+    set is: 0x00..0x1f, ' ', '"', #39 single-quote, 0x7f..0xff. }
   n := Length(z);
+  needQuote := n = 0;   { empty fields are quoted ("") }
   for i := 1 to n do begin
     c := Byte(z[i]);
-    if (c <= $1f) or (c = Byte('"')) or (c >= $7f) then begin
+    if (c <= $20) or (c = Byte('"')) or (c = Byte('''')) or (c >= $7f) then begin
       needQuote := True;
       Break;
     end;
@@ -2379,21 +2478,63 @@ begin
   Result := Result + '"';
 end;
 
+{ Simplified sqlite3_qrf_wcwidth (ext/qrf/qrf.c): width of a single
+  Unicode code point — 0 for combining marks, 2 for East-Asian wide
+  ranges, 1 otherwise. }
+function ucWcWidth(u: i32): i32;
+begin
+  if u < $300 then Exit(1);
+  { combining diacriticals and friends }
+  if ((u >= $300) and (u <= $36F))
+     or ((u >= $1AB0) and (u <= $1AFF))
+     or ((u >= $20D0) and (u <= $20FF))
+     or ((u >= $FE20) and (u <= $FE2F))
+     or (u = $200B) then Exit(0);
+  { East-Asian wide / fullwidth }
+  if ((u >= $1100) and (u <= $115F))
+     or ((u >= $2E80) and (u <= $A4CF))
+     or ((u >= $AC00) and (u <= $D7A3))
+     or ((u >= $F900) and (u <= $FAFF))
+     or ((u >= $FE30) and (u <= $FE4F))
+     or ((u >= $FF00) and (u <= $FF60))
+     or ((u >= $FFE0) and (u <= $FFE6))
+     or ((u >= $20000) and (u <= $3FFFD)) then Exit(2);
+  Result := 1;
+end;
+
 function utf8DispWidth(const s: AnsiString): i32;
-{ Approximate display width: count non-continuation UTF-8 bytes (one
-  glyph per code point, all glyphs treated as width 1).  Good enough
-  for ASCII / Latin / Greek / Cyrillic; CJK wide-char support arrives
-  with the full QRF port. }
+{ sqlite3_qrf_wcswidth: decode UTF-8 and sum per-code-point widths
+  (combining marks count 0, East-Asian wide chars count 2). }
 var
-  i, n: i32;
+  i, n, u, len: i32;
   b: Byte;
 begin
   n := 0;
   i := 1;
   while i <= Length(s) do begin
     b := Byte(s[i]);
-    if (b and $C0) <> $80 then Inc(n);
-    Inc(i);
+    if b < $80 then begin
+      Inc(n);
+      Inc(i);
+    end else begin
+      { decode multi-byte sequence (qrf.c sqlite3_qrf_decode_utf8) }
+      u := 0;
+      len := 1;
+      if ((b and $E0) = $C0) and (i < Length(s)) then begin
+        u := ((b and $1F) shl 6) or (Byte(s[i+1]) and $3F);
+        len := 2;
+      end else if ((b and $F0) = $E0) and (i + 1 < Length(s)) then begin
+        u := ((b and $0F) shl 12) or ((Byte(s[i+1]) and $3F) shl 6)
+             or (Byte(s[i+2]) and $3F);
+        len := 3;
+      end else if ((b and $F8) = $F0) and (i + 2 < Length(s)) then begin
+        u := ((b and $0F) shl 18) or ((Byte(s[i+1]) and $3F) shl 12)
+             or ((Byte(s[i+2]) and $3F) shl 6) or (Byte(s[i+3]) and $3F);
+        len := 4;
+      end;
+      if u > 0 then Inc(n, ucWcWidth(u)) else Inc(n);
+      Inc(i, len);
+    end;
   end;
   Result := n;
 end;
@@ -2522,15 +2663,23 @@ begin
     MODE_Off: Exit;
 
     MODE_Line:
-      { Upstream (shell.c.in aModeInfo[line]): eCSep=13 (": "), one column
-        per line, blank line BETWEEN records (not after the last).  No
-        leading padding — column-name flush left, then ": ", then value. }
+      { qrf.c QRF_STYLE_Line (2612..2669): one column per line, blank
+        line BETWEEN records; the column name is RIGHT-aligned in a
+        field as wide as the widest column name (wcswidth), followed by
+        spec.zColumnSep (default ": "). }
       begin
+        if rs.lineMaxNameLen = 0 then
+          for i := 0 to rs.nCol - 1 do begin
+            ty := utf8DispWidth(colNameStr(pStmt, i));
+            if ty > rs.lineMaxNameLen then rs.lineMaxNameLen := ty;
+          end;
         if rs.rowsEmitted > 0 then WriteLn;
         for i := 0 to rs.nCol - 1 do begin
           z := colTextStr(pStmt, i, isNull);
+          ty := rs.lineMaxNameLen - utf8DispWidth(colNameStr(pStmt, i));
+          if ty > 0 then Write(StringOfChar(' ', ty));
           Write(colNameStr(pStmt, i));
-          Write(': ');
+          Write(rs.zColSep);
           if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
           WriteLn;
         end;
@@ -6176,7 +6325,8 @@ begin
   savedLineno  := p^.lineno;
   savedZIn     := p^.zInFile;
   curInputText := @f;
-  p^.lineno    := 0;
+  { p->lineno is reset inside processInput (after the nesting-limit
+    check), mirroring shell.c.in:12438. }
   p^.zInFile   := PAnsiChar(zName);
   processInput(p);
   CloseFile(f);
@@ -10052,7 +10202,7 @@ const
     '  suff = iif(name IN (SELECT * FROM RepeatedNames),' +
     '   printf(''_%s'', substring(' +
     '    printf(''%.*c%0.*d'',(SELECT max(nlz) FROM Lzn)+1,''0'',1,t.cpos),' +
-    '    2)),'' '')';
+    '    2)),'''')';
   zCollectVar: PAnsiChar =
     'SELECT ''(''||x''0a''' +
     ' || group_concat(' +
@@ -10131,8 +10281,8 @@ begin
   pDb := nil;
 end;
 
-procedure cmdImport(p: PShellState; const args: array of AnsiString;
-                   nArg: SizeInt);
+function cmdImport(p: PShellState; const args: array of AnsiString;
+                   nArg: SizeInt): i32;
 var
   sCtx: TImportCtx;
   xRead: TImportReader;
@@ -10176,6 +10326,7 @@ begin
         [string(AnsiString(p^.zInFile)), Int64(p^.lineno)]));
     Halt(1);
   end;
+  Result := 1;   { error paths Exit with rc=1; success resets below }
   importInit(sCtx);
   if p^.mode.eMode = MODE_Ascii then
     xRead := @asciiReadOneField
@@ -10290,7 +10441,7 @@ begin
       { Mirror C dotCmdError(p, 0, 0, "cannot open \"%s\"", zFile) which
         keeps the original "|cmd" string in the message — sCtx.zFile is
         only swapped to "<pipe>" on success.  shell.c.in:7644. }
-      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      shellDotError(p, -1, '', Format('cannot open "%s"', [zFile]));
       importCleanup(sCtx);
       Exit;
     end;
@@ -10349,7 +10500,8 @@ begin
   end else begin
     sCtx.inHandle := FpOpen(string(zFile), O_RDONLY);
     if sCtx.inHandle = THandle(-1) then begin
-      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      { shell.c.in:7644 — dotCmdError(p, 0, 0, "cannot open \"%s\""). }
+      shellDotError(p, -1, '', Format('cannot open "%s"', [zFile]));
       Exit;
     end;
     sCtx.inOpen := True;
@@ -10444,7 +10596,11 @@ begin
   else
     nCol := 0;
   sqlite3_finalize(pStmt);
-  if nCol = 0 then begin importCleanup(sCtx); Exit; end;
+  if nCol = 0 then begin
+    importCleanup(sCtx);
+    Result := 0;            { shell.c.in:7741 — no columns, no error }
+    Exit;
+  end;
 
   { Build INSERT INTO "schema"."table" VALUES(?,?,...,?). }
   if zSchema <> '' then
@@ -10536,6 +10692,8 @@ begin
     shellSPutZ(Format('Added %d rows with %d errors using %d lines of input'#10,
       [sCtx.nRow, sCtx.nErr, sCtx.nLine - 1]));
   importCleanup(sCtx);
+  { shell.c.in:7846 — return sCtx.nErr ? 1 : 0. }
+  if sCtx.nErr <> 0 then Result := 1 else Result := 0;
 end;
 
 { ----------------------------------------------------------------------
@@ -12049,7 +12207,7 @@ begin
     cmdHelp(args, nArg); Exit;
   end;
   if (c1 = 'i') and pmatch(zCmd, 'import') then begin
-    cmdImport(p, args, nArg); Exit;
+    Result := cmdImport(p, args, nArg); Exit;
   end;
   if (c1 = 'i') and pmatch(zCmd, 'imposter') then begin
     Result := cmdImposter(p, args, nArg); Exit;
@@ -12228,12 +12386,16 @@ begin
   zSql := '';
   qss := 0;     { QSS_Start — shell.c.in:12436 }
   if p^.inputNesting = MAX_INPUT_NESTING then begin
-    shellEPutZ(Format('%s: Input nesting limit (%d) reached at line %d.'#10,
+    { shell.c.in:12428..12432 — the message reports the caller's line
+      number (p->lineno is only reset to 0 after this check). }
+    shellEPutZ(Format('%s: Input nesting limit (%d) reached at line %d.' +
+      ' Check recursion.'#10,
       [string(AnsiString(p^.zInFile)), MAX_INPUT_NESTING, p^.lineno]));
     Result := 1;
     Exit;
   end;
   Inc(p^.inputNesting);
+  p^.lineno := 0;          { shell.c.in:12438 }
   continuePromptReset;     { shell.c.in:12439 }
   while (errCnt = 0) or (bail_on_error = 0)
         or ((p^.inFile = nil) and (stdin_is_interactive <> 0)) do
