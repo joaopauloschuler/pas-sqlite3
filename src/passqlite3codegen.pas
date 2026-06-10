@@ -69296,7 +69296,11 @@ begin
   MakeFD(aBuiltinFuncs[20], 0, FUNC_VENC, @lastInsertRowid,nil, 'last_insert_rowid');
   MakeFD(aBuiltinFuncs[21], 0, FUNC_VENC, @changesFunc,    nil, 'changes');
   MakeFD(aBuiltinFuncs[22], 0, FUNC_VENC, @totalChangesFunc,nil,'total_changes');
-  MakeFD(aBuiltinFuncs[23],-1, FUNC_ENC or SQLITE_FUNC_INLINE,  @coalesceFunc,   nil, 'coalesce');
+  { func.c:3428 — INLINE_FUNC(coalesce, -4, ...): nArg=-4 means "2 or more
+    arguments required" (callback.c:314), so coalesce() / coalesce(x) fail
+    resolution with "wrong number of arguments" instead of reaching the
+    inline codegen arm (which assumes n>=2). }
+  MakeFD(aBuiltinFuncs[23],-4, FUNC_ENC or SQLITE_FUNC_INLINE,  @coalesceFunc,   nil, 'coalesce');
   aBuiltinFuncs[23].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
   MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC or SQLITE_FUNC_INLINE,  @ifnullFunc,     nil, 'ifnull');
   aBuiltinFuncs[24].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
