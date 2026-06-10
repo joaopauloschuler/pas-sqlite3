@@ -660,13 +660,21 @@ end;
 { Copy the parent environment into p.Environment, overriding TCLLIBPATH so it
   contains gBinDir (prepended if already set).  FPC's TProcess replaces — never
   merges — the inherited environment when p.Environment is non-empty, so every
-  existing variable must be carried across explicitly. }
+  existing variable must be carried across explicitly.
+
+  9.4.divbug.98: also export TESTFIXTURE_HOME=gBinDir (unless the parent
+  already set it).  Upstream tester.tcl:497 sets cmdlinearg(TESTFIXTURE_HOME)
+  to [file dirname [info nameofexec]] — the directory holding the testfixture
+  build outputs (sqlite3 CLI, sqldiff, ...).  Our scripts run under a plain
+  /usr/bin/tclsh, so the tester_min.tcl fallback resolved to /usr/bin and
+  test_find_cli picked up the *system* /usr/bin/sqlite3 (3.45.1, no -noinit)
+  instead of the CLI built from the tree under test (recover.test FAIL). }
 procedure SetupChildEnvironment(p: TProcess);
 var
   i: Integer;
   e, nm, want, cur: string;
   eqPos: Integer;
-  haveTcllib: Boolean;
+  haveTcllib, haveTfh: Boolean;
 begin
   cur := GetEnvironmentVariable('TCLLIBPATH');
   if cur <> '' then
@@ -674,6 +682,7 @@ begin
   else
     want := gBinDir;
   haveTcllib := False;
+  haveTfh := False;
   for i := 1 to GetEnvironmentVariableCount do
   begin
     e := GetEnvironmentString(i);
@@ -685,10 +694,15 @@ begin
       haveTcllib := True;
     end
     else
+    begin
+      if nm = 'TESTFIXTURE_HOME' then haveTfh := True;
       p.Environment.Add(e);
+    end;
   end;
   if not haveTcllib then
     p.Environment.Add('TCLLIBPATH=' + want);
+  if not haveTfh then
+    p.Environment.Add('TESTFIXTURE_HOME=' + ExcludeTrailingPathDelimiter(gBinDir));
 end;
 
 { 9.4.7.g: RunOneCapture is the parallel-safe core — caller passes the

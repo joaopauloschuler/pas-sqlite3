@@ -2151,12 +2151,17 @@ proc faultsim_test_result {args} {
 # tester.tcl:2529..2596.  shell*.test and sqldiff*.test call these to
 # locate the on-disk CLI binary; if missing they `finish_test ; return`
 # in the caller's context (via `return -code return`).  pas-sqlite3 builds
-# its CLI at bin/passqlite3 — but we leave the upstream lookup verbatim
-# so .test files transparently skip when the upstream name isn't present
-# on PATH.  Individual tests may override these procs to point at our
-# binary if/when wired.  Engine FCNTL/test1.c file_control_reservebytes
+# its CLI at bin/passqlite3 — so the one harness-local deviation below maps
+# the upstream binary name `sqlite3` to `passqlite3` (9.4.divbug.98): in an
+# upstream checkout the CLI is built next to testfixture under the *same*
+# name, so test_find_cli always exercises the shell built from the tree
+# under test.  Without the mapping the lookup either skipped (no bin/sqlite3)
+# or — worse, with the old /usr/bin TESTFIXTURE_HOME fallback — measured the
+# system /usr/bin/sqlite3.  Everything else is verbatim tester.tcl:2529..2596.
+# Engine FCNTL/test1.c file_control_reservebytes
 # is paired with this in TestModuleTest1.pas (test1.c:9258 / 7249..7276).
 proc test_binary_name {nm} {
+  if {$nm eq "sqlite3"} { set nm "passqlite3" }
   if {$::tcl_platform(platform) eq "windows"} {
     set ret "$nm.exe"
   } else {
