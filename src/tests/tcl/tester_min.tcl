@@ -467,6 +467,8 @@ set ::sqlite_options(icu_collations) 0 ;# no SQLITE_ENABLE_ICU_COLLATIONS
 # Faithful value is 1 (test_config.c:119); io.test / sync.test count this
 # directory fsync via $sqlite_sync_count.
 set ::sqlite_options(dirsync) 1        ;# unixSync performs the dir-fsync arm
+set ::sqlite_options(threadsafe) 1     ;# SQLITE_THREADSAFE=1 (test_config.c:662; sqlite3_threadsafe()==1)
+set ::sqlite_options(threadsafe1) 1    ;# THREADSAFE==1 (test_config.c:664)
 set ::sqlite_options(threadsafe2) 0    ;# THREADSAFE=1 build (oracle lacks THREADSAFE=2)
 # pas-sqlite3 OMITS the shared-cache subsystem entirely (SQLITE_OMIT_SHARED_CACHE
 # behaviour): sqlite3_enable_shared_cache is a no-op and each connection gets its

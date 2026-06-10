@@ -133,6 +133,15 @@ const
   { sqlite3.h — opcodes 5/6 (PRNG_SAVE/PRNG_RESTORE).  Mirrored locally. }
   SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
   SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
+  { sqlite3.h — opcodes used by the `sqlite3_test_control` Tcl command
+    (test1.c:8026 test_test_control) and `optimization_control`
+    (test1.c:8301).  Mirrored locally (see comment above). }
+  SQLITE_TESTCTRL_FK_NO_ACTION_OP       = 7;
+  SQLITE_TESTCTRL_OPTIMIZATIONS_OP      = 15;
+  SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP = 17;
+  SQLITE_TESTCTRL_LOCALTIME_FAULT_OP    = 18;
+  SQLITE_TESTCTRL_SORTER_MMAP_OP        = 24;
+  SQLITE_TESTCTRL_IMPOSTER_OP           = 25;
   SEEK_SET = 0;
 
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -10471,6 +10480,232 @@ begin
   if clientData = nil then ;
 end;
 
+{ test1.c:8023..8126 — TCLCMD: sqlite3_test_control VERB ARGS...
+  The aVerb[] name table and per-verb argument shapes mirror the C
+  test_test_control exactly.  LOCALTIME_FAULT: the C harness passes the
+  testLocaltime callback as a third argument; the Pascal engine's
+  LOCALTIME_FAULT op ignores/clears xAltLocaltime, so only the integer
+  is forwarded (passqlite3main.pas LOCALTIME_FAULT_OP). }
+function test_test_control(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+const
+  aVerbName: array[0..5] of PChar = (
+    'SQLITE_TESTCTRL_LOCALTIME_FAULT',
+    'SQLITE_TESTCTRL_SORTER_MMAP',
+    'SQLITE_TESTCTRL_IMPOSTER',
+    'SQLITE_TESTCTRL_INTERNAL_FUNCTIONS',
+    'SQLITE_TESTCTRL_FK_NO_ACTION',
+    nil);
+  aVerbFlag: array[0..4] of cint = (
+    SQLITE_TESTCTRL_LOCALTIME_FAULT_OP,
+    SQLITE_TESTCTRL_SORTER_MMAP_OP,
+    SQLITE_TESTCTRL_IMPOSTER_OP,
+    SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP,
+    SQLITE_TESTCTRL_FK_NO_ACTION_OP);
+var
+  iVerb:   cint;
+  iFlag:   cint;
+  val:     cint;
+  onOff:   cint;
+  tnum:    cint;
+  db:      PTsqlite3;
+  zDbName: PAnsiChar;
+begin
+  if objc < 2 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('VERB ARGS...'));
+    Result := TCL_ERROR; Exit;
+  end;
+  iVerb := 0;
+  if Tcl_GetIndexFromObj(interp, objv[1], @aVerbName[0], PChar('VERB'), 0,
+      @iVerb) <> TCL_OK then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  iFlag := aVerbFlag[iVerb];
+  case iFlag of
+    SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP:
+    begin
+      db := nil;
+      if objc <> 3 then
+      begin
+        Tcl_WrongNumArgs(interp, 2, objv, PChar('DB'));
+        Result := TCL_ERROR; Exit;
+      end;
+      if getDbPointer(interp, Tcl_GetString(objv[2]), @db) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      sqlite3_test_control(SQLITE_TESTCTRL_INTERNAL_FUNCTIONS_OP, db);
+    end;
+    SQLITE_TESTCTRL_LOCALTIME_FAULT_OP:
+    begin
+      if objc <> 3 then
+      begin
+        Tcl_WrongNumArgs(interp, 2, objv, PChar('0|1|2'));
+        Result := TCL_ERROR; Exit;
+      end;
+      if Tcl_GetIntFromObj(interp, objv[2], @val) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      sqlite3_test_control(iFlag, val);
+    end;
+    SQLITE_TESTCTRL_FK_NO_ACTION_OP:
+    begin
+      val := 0;
+      db := nil;
+      if objc <> 4 then
+      begin
+        Tcl_WrongNumArgs(interp, 2, objv, PChar('DB BOOLEAN'));
+        Result := TCL_ERROR; Exit;
+      end;
+      if getDbPointer(interp, Tcl_GetString(objv[2]), @db) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      if Tcl_GetBooleanFromObj(interp, objv[3], @val) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      sqlite3_test_control(SQLITE_TESTCTRL_FK_NO_ACTION_OP, db, val);
+    end;
+    SQLITE_TESTCTRL_SORTER_MMAP_OP:
+    begin
+      if objc <> 4 then
+      begin
+        Tcl_WrongNumArgs(interp, 2, objv, PChar('DB LIMIT'));
+        Result := TCL_ERROR; Exit;
+      end;
+      if getDbPointer(interp, Tcl_GetString(objv[2]), @db) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      if Tcl_GetIntFromObj(interp, objv[3], @val) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      sqlite3_test_control(SQLITE_TESTCTRL_SORTER_MMAP_OP, db, val);
+    end;
+    SQLITE_TESTCTRL_IMPOSTER_OP:
+    begin
+      if objc <> 6 then
+      begin
+        Tcl_WrongNumArgs(interp, 2, objv, PChar('DB dbName onOff tnum'));
+        Result := TCL_ERROR; Exit;
+      end;
+      if getDbPointer(interp, Tcl_GetString(objv[2]), @db) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      zDbName := Tcl_GetString(objv[3]);
+      if Tcl_GetIntFromObj(interp, objv[4], @onOff) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      if Tcl_GetIntFromObj(interp, objv[5], @tnum) <> 0 then
+      begin
+        Result := TCL_ERROR; Exit;
+      end;
+      sqlite3_test_control(SQLITE_TESTCTRL_IMPOSTER_OP, db, zDbName,
+        onOff, tnum);
+    end;
+  end;
+  Tcl_ResetResult(interp);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
+{ test1.c:8289..8362 — TCLCMD: optimization_control DB OPT BOOLEAN
+  Enable or disable query optimizations via
+  SQLITE_TESTCTRL_OPTIMIZATIONS.  OPT may be a single name or a list of
+  names (the C code matches with strstr, so any substring hit counts).
+  Each invocation overrides all prior invocations.  The name→mask table
+  is a verbatim port of test1.c aOpt[]; masks come from
+  passqlite3codegen (sqliteInt.h:1898..1933). }
+type
+  TOptCtrlEntry = record
+    zOptName: PAnsiChar;
+    mask:     u32;
+  end;
+
+const
+  { sqliteInt.h:1902/1933 — not yet mirrored in passqlite3codegen. }
+  SQLITE_FactorOutConst = u32($00000008);
+  SQLITE_AllOpts        = u32($ffffffff);
+
+  aOptCtrl: array[0..17] of TOptCtrlEntry = (
+    (zOptName: 'all';               mask: SQLITE_AllOpts),
+    (zOptName: 'none';              mask: 0),
+    (zOptName: 'query-flattener';   mask: SQLITE_QueryFlattener),
+    (zOptName: 'groupby-order';     mask: SQLITE_GroupByOrder),
+    (zOptName: 'factor-constants';  mask: SQLITE_FactorOutConst),
+    (zOptName: 'distinct-opt';      mask: SQLITE_DistinctOpt),
+    (zOptName: 'cover-idx-scan';    mask: SQLITE_CoverIdxScan),
+    (zOptName: 'order-by-idx-join'; mask: SQLITE_OrderByIdxJoin),
+    (zOptName: 'order-by-subquery'; mask: SQLITE_OrderBySubq),
+    (zOptName: 'transitive';        mask: SQLITE_Transitive),
+    (zOptName: 'omit-noop-join';    mask: SQLITE_OmitNoopJoin),
+    (zOptName: 'stat4';             mask: SQLITE_Stat4),
+    (zOptName: 'skip-scan';         mask: SQLITE_SkipScan),
+    (zOptName: 'push-down';         mask: SQLITE_PushDown),
+    (zOptName: 'balanced-merge';    mask: SQLITE_BalancedMerge),
+    (zOptName: 'propagate-const';   mask: SQLITE_PropagateConst),
+    (zOptName: 'one-pass';          mask: SQLITE_OnePass),
+    (zOptName: 'exists-to-join';    mask: SQLITE_ExistsToJoin));
+
+function optimization_control(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  i:     cint;
+  db:    PTsqlite3;
+  zOpt:  AnsiString;
+  onoff: cint;
+  mask:  u32;
+  cnt:   cint;
+begin
+  mask := 0;
+  cnt := 0;
+  if objc <> 4 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB OPT BOOLEAN'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  if Tcl_GetBooleanFromObj(interp, objv[3], @onoff) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  zOpt := AnsiString(Tcl_GetString(objv[2]));
+  for i := 0 to High(aOptCtrl) do
+  begin
+    { C: strstr(zOpt, aOpt[i].zOptName) — substring match. }
+    if Pos(AnsiString(aOptCtrl[i].zOptName), zOpt) > 0 then
+    begin
+      mask := mask or aOptCtrl[i].mask;
+      Inc(cnt);
+    end;
+  end;
+  if onoff <> 0 then
+    mask := not mask;
+  if cnt = 0 then
+  begin
+    Tcl_AppendResult(interp,
+      PChar('unknown optimization - should be one of:'), Pointer(nil));
+    for i := 0 to High(aOptCtrl) do
+      Tcl_AppendResult(interp, PChar(' '), aOptCtrl[i].zOptName,
+        Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS_OP, db, i32(mask));
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(cint(i32(mask))));
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test1.c:9106..9322 — register the subset of Sqlitetest1_Init commands
   needed by the 9.4.4.c sweep. }
 function Sqlitetest1_Init(interp: PTclInterp): cint; cdecl;
@@ -10493,6 +10728,12 @@ begin
     @test_sqlite3_log, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_db_config'),
     @test_sqlite3_db_config, nil, nil);
+  { alter/altercol/fkey2/sort/... — test1.c:9295 sqlite3_test_control. }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_test_control'),
+    @test_test_control, nil, nil);
+  { join2/merge1/selectB/skipscan1/... — test1.c:9196 optimization_control. }
+  Tcl_CreateObjCommand(interp, PChar('optimization_control'),
+    @optimization_control, nil, nil);
   { misc8.test — test1.c:9187 dbconfig_maindbname_icecube. }
   Tcl_CreateObjCommand(interp, PChar('dbconfig_maindbname_icecube'),
     @test_dbconfig_maindbname_icecube, nil, nil);
