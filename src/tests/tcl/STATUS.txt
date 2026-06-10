@@ -773,7 +773,7 @@ pas-skip	../sqlite3/test/shared_err.test	9.4.8.f.4
 pas-strict	../sqlite3/test/sharedlock.test	-
 pas-soft	../sqlite3/test/shell1.test	9.4.divbug.93
 pas-soft	../sqlite3/test/shell2.test	9.4.divbug.93
-pas-soft	../sqlite3/test/shell3.test	9.4.divbug.93
+pas-strict	../sqlite3/test/shell3.test	-
 pas-soft	../sqlite3/test/shell4.test	9.4.divbug.93
 pas-soft	../sqlite3/test/shell5.test	9.4.divbug.93
 pas-strict	../sqlite3/test/shell6.test	-
@@ -797,7 +797,7 @@ pas-strict	../sqlite3/test/snapshot3.test	-
 pas-strict	../sqlite3/test/snapshot4.test	-
 pas-strict	../sqlite3/test/snapshot_fault.test	-
 pas-strict	../sqlite3/test/snapshot_up.test	-
-pas-strict	../sqlite3/test/soak.test	-
+pas-skip	../sqlite3/test/soak.test	9.4.divbug.99
 pas-strict	../sqlite3/test/softheap1.test	-
 pas-skip	../sqlite3/test/sort.test	9.4.8.f.4
 pas-strict	../sqlite3/test/sort2.test	-

@@ -184,6 +184,16 @@ still time out at the 240 s watchdog with 0 sub-tests completed.
   64-bit blobs at :21 then runs three nested 850/5000/850-iteration
   insert/delete loops at :39/:79/:88; 240 s timeout, 0 sub-tests
   (2026-06-09 sweep).  Cite + RECHECK: **9.4.8.f.6**.
+- **../sqlite3/test/soak.test** — meta-runner peer of all.test/quick.test;
+  by-design unrunnable here.  (a) dies at :70 on `clock_seconds` — only
+  test_thread.c registers it, and only in spawned-thread interps
+  (test_thread.c:119; the main-interp name is `clock_second`,
+  test_thread.c:643), so even the C testfixture's main interp lacks it;
+  (b) loops sourcing fuzz/fuzz_malloc/trans/corruptC for `TIMEOUT ≥ 3600` s
+  unless `-timeout N` arrives via `$argv` (soak.test:27..38), which the
+  stdin-fed driver never passes — guaranteed 240 s watchdog FAIL;
+  (c) fuzz.test itself already times out standalone (divbug.94).
+  Cite + RECHECK: **9.4.divbug.99**.
 
 ## Notes for future shim growth
 
