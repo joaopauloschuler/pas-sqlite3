@@ -69660,7 +69660,7 @@ begin
   aBuiltinFuncs[36].pUserData := @likeInfoNorm;
   aBuiltinFuncs[37].pUserData := @likeInfoNorm;
   aBuiltinFuncs[38].pUserData := @globInfo;
-  MakeFD(aBuiltinFuncs[39], 0, FUNC_ENC or SQLITE_FUNC_BUILTIN,
+  MakeFD(aBuiltinFuncs[39], 2, FUNC_ENC or SQLITE_FUNC_BUILTIN,
     @errlogFunc, nil, 'sqlite_log');
   { Phase 6.9-bis 11g.2.f sub-progress 30 — unlikely()/likely()/likelihood()
     inline registrations.  Mirrors func.c:
