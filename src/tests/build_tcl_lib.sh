@@ -50,10 +50,16 @@ fi
 # instrumentation in passqlite3os.pas (task 9.4.7.c) and the test2.c
 # counter wiring in TestModuleIoerr.  The default engine build (build.sh)
 # does NOT pass this, so the production .so stays byte-for-byte unaffected.
+# -dSQLITE_NO_SYNC mirrors the upstream testfixture link (main.mk:1797
+# passes -DSQLITE_NO_SYNC=1): full_fsync becomes an fstat-only no-op
+# (os_unix.c:3810..3814) so WAL-heavy tests (e_walauto etc.) are not
+# bound by real disk fsync latency.  The SQLITE_TEST sync counters
+# still increment.  Production builds never define this.
 FPC_CMD=(fpc
   -MObjFPC -Scghi -O1
   -Cg
   -dSQLITE_TEST
+  -dSQLITE_NO_SYNC
   "${PREUPDATE_FLAGS[@]}"
   "${UNLOCK_NOTIFY_FLAGS[@]}"
   -Fu"$TCL_DIR"

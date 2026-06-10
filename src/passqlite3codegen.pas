@@ -65116,10 +65116,13 @@ begin
     Both arms emit returnSingleInt(v, db->xWalCallback==sqlite3WalDefaultHook
     ? PTR_TO_INT(db->pWalArg) : 0).  9.4.divbug.37: prior fall-through into
     the constant-default block ignored writes, so `PRAGMA wal_autocheckpoint
-    = N` failed to overwrite a user-installed wal_hook (e_walhook-6.1.2). }
+    = N` failed to overwrite a user-installed wal_hook (e_walhook-6.1.2).
+    NOTE: must use the function-level zRight (built at the top with the
+    minusFlag sign restored, pragma.c:463..467) — re-deriving from
+    pValue^.z drops the '-' so `PRAGMA wal_autocheckpoint = -4` installed
+    a 4-frame hook instead of disabling autocheckpoint (e_walauto-1.1.9). }
   if SameText(zName, 'wal_autocheckpoint') then begin
     if pValue <> nil then begin
-      SetString(zRight, pValue^.z, pValue^.n);
       if Assigned(gWalAutoCheckpoint) then
         gWalAutoCheckpoint(db, sqlite3Atoi(PChar(zRight)));
     end;

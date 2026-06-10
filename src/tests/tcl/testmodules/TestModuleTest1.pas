@@ -9973,6 +9973,35 @@ begin
   Result := TCL_OK;
 end;
 
+{ test1.c:7745..7776 — test_wal_autocheckpoint.
+  Usage: sqlite3_wal_autocheckpoint db VALUE. }
+function test_wal_autocheckpoint(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  db:   PTsqlite3;
+  rc:   cint;
+  iVal: cint;
+begin
+  if objc <> 3 then
+  begin
+    Tcl_WrongNumArgs(interp, 1, objv, PChar('DB VALUE'));
+    Result := TCL_ERROR; Exit;
+  end;
+  if (getDbPointer(interp, Tcl_GetString(objv[1]), @db) <> 0)
+     or (Tcl_GetIntFromObj(nil, objv[2], @iVal) <> TCL_OK) then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+  rc := sqlite3_wal_autocheckpoint(db, iVal);
+  Tcl_ResetResult(interp);
+  if rc <> SQLITE_OK then
+  begin
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(t1ErrName(rc), -1));
+    Result := TCL_ERROR; Exit;
+  end;
+  Result := TCL_OK;
+end;
+
 { test1.c:8734..8758 — test_mmap_warm.
   Usage: sqlite3_mmap_warm DB ?DBNAME?. }
 function test_mmap_warm(clientData: TClientData; interp: PTclInterp;
@@ -11555,6 +11584,9 @@ begin
     @test_blob_reopen, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_wal_checkpoint_v2'),
     @test_wal_checkpoint_v2, nil, nil);
+  { test1.c:9289 — sqlite3_wal_autocheckpoint (e_walauto). }
+  Tcl_CreateObjCommand(interp, PChar('sqlite3_wal_autocheckpoint'),
+    @test_wal_autocheckpoint, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_mmap_warm'),
     @test_mmap_warm, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('utf8_to_utf8'),

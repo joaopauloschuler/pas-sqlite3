@@ -919,6 +919,28 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+{ os_unix.c:3778 full_fsync — the actual syncing arm only.  The
+  SQLITE_TEST sync counters stay at the call sites (they bump
+  unconditionally in C too, os_unix.c:3800..3803).  Under
+  SQLITE_NO_SYNC (the upstream testfixture is linked with
+  -DSQLITE_NO_SYNC=1, main.mk:1797) syncing is a no-op, but C still
+  calls fstat() to validate the descriptor so IO-error injection has
+  a hook (os_unix.c:3810..3814).  Mirror that here so the Tcl test
+  build (build_tcl_lib.sh -dSQLITE_NO_SYNC) matches testfixture I/O
+  behaviour; the production build never defines SQLITE_NO_SYNC and
+  keeps the real fsync. }
+function pas_full_fsync(fd: cint): cint;
+{$ifdef SQLITE_NO_SYNC}
+var
+  buf: Stat;
+begin
+  Result := FpFStat(fd, buf);
+end;
+{$else}
+begin
+  Result := c_fsync(fd);
+end;
+{$endif}
 function c_close_early(fd: cint): cint; cdecl;
   external 'c' name 'close';
 { posix_fallocate(3): pre-allocate disk space for an open file.
@@ -1980,7 +2002,7 @@ begin
     Inc(sqlite3_fullsync_count);
   Inc(sqlite3_sync_count);
   {$endif}
-  rc := c_fsync(pf^.h);
+  rc := pas_full_fsync(pf^.h);
   {$ifdef SQLITE_TEST}
   { os_unix.c:3931 — SimulateIOError( rc=1 ) }
   if SimulateIOError then rc := 1;
@@ -2001,7 +2023,7 @@ begin
       {$ifdef SQLITE_TEST}
       Inc(sqlite3_sync_count);
       {$endif}
-      c_fsync(dirfd);
+      pas_full_fsync(dirfd);
       c_close_early(dirfd);
     end;
     pf^.ctrlFlags := pf^.ctrlFlags and (not UNIXFILE_DIRSYNC);
@@ -2708,7 +2730,7 @@ begin
       {$ifdef SQLITE_TEST}
       Inc(sqlite3_sync_count);
       {$endif}
-      c_fsync(dfd);
+      pas_full_fsync(dfd);
       FpClose(dfd);
     end;
   end;
