@@ -733,7 +733,7 @@ regressions without human triage.
 - [X] **9.4.divbug.84** Long-running tests hit the 20 s per-test driver
 - [X] **9.4.divbug.85** `collate5.test`
 - [X] **9.4.divbug.86** Sibling-of-.84 driver-timeout family
-- [X] **9.4.divbug.87** result-divergence cluster — in2/in7/index9/insert/joinC/nulls1 PASS; residual mmapwarm (stale expectation, non-bug) + savepoint6 (timeout)
+- [X] **9.4.divbug.87** result-divergence cluster — in2/in7/index9/insert/joinC/nulls1 PASS; residual mmapwarm (resolved — doctored local expectation restored to upstream 507; see .056) + savepoint6 (timeout)
   - [X] **9.4.divbug.87.001** `backup4`
   - [X] **9.4.divbug.87.002** `backup5`
   - [X] **9.4.divbug.87.003** `badutf`
@@ -789,7 +789,7 @@ regressions without human triage.
   - [X] **9.4.divbug.87.053** `misc3`
   - [X] **9.4.divbug.87.054** `misc4`
   - [X] **9.4.divbug.87.055** `misc5`
-  - [ ] **9.4.divbug.87.056** mmapwarm live FAIL — STALE TEST EXPECTATION (test wants 507; port==oracle==506). Not an engine bug; don't chase.
+  - [X] **9.4.divbug.87.056** mmapwarm PASS 7/7 — root cause: local copy of ../sqlite3/test/mmapwarm.test had been edited 1.0 expectation 507→506 based on a shell-only repro (shells run with default PENDING_BYTE 0x40000000, so the pending-byte page never lands inside the 506-page db). Under the real harness (tester.tcl:102 / tester_min.tcl:1040 set pending byte 0x10000; page_size 1024 ⇒ locking page = page 65 is skipped by allocateBtreePage, btree.c:6764) BOTH the C testfixture and the Pascal port produce 507 — verified by building the stock testfixture (`make testfixture`, -DSQLITE_DEFAULT_PAGE_SIZE=1024): it also returned 507 and failed the doctored 506. Upstream mmapwarm.test has expected 507 since its 2017 introduction. Fix: restored ../sqlite3/test/mmapwarm.test 1.0 expectation to {507}. No engine or harness change; port==oracle==507 == upstream expectation.
   - [X] **9.4.divbug.87.057** `notnullfault`
   - [X] **9.4.divbug.87.058** `null`
   - [X] **9.4.divbug.87.059** nulls1 PASS
