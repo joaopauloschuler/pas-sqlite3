@@ -725,25 +725,28 @@ type
   TShellArgArr3 = array[0..2] of PMem;
   PShellArgArr3 = ^TShellArgArr3;
 
+{ shell.c.in:1281..1314 — strtod(X)/dtostr(X[,n]) exist precisely to compare
+  SQLite's float<->text conversion against the C library, so they MUST call
+  libc strtod()/snprintf("%#+.*e") (9.4.divbug.93.b: FPC's StrToFloat and
+  SQLite's own mprintf cap at ~16 significant digits and zero-pad, which is
+  exactly the divergence fptest01.sql / fpconv1-2.0 catch). }
+function shell_c_strtod(nptr: PAnsiChar; endptr: PPAnsiChar): Double; cdecl;
+  external 'c' name 'strtod';
+function shell_c_snprintf(s: PAnsiChar; n: PtrUInt; fmt: PAnsiChar): i32; cdecl;
+  varargs; external 'c' name 'snprintf';
+
 procedure shellStrtodUdf(pCtx: Psqlite3_context;
                          nVal: i32; apVal: PPMem); cdecl;
 { shell.c.in:1285..1294 — strtod(X) via the C library, for fp parity probes. }
 var
   pArgs: PShellArgArr3;
   z: PAnsiChar;
-  d: Double;
 begin
   if nVal < 1 then Exit;
   pArgs := PShellArgArr3(apVal);
   z := PAnsiChar(sqlite3_value_text(pArgs^[0]));
   if z = nil then Exit;
-  d := 0;
-  try
-    d := StrToFloat(AnsiString(z), DefaultFormatSettings);
-  except
-    on EConvertError do d := 0;
-  end;
-  sqlite3_result_double(pCtx, d);
+  sqlite3_result_double(pCtx, shell_c_strtod(z, nil));
 end;
 
 procedure shellDtostrUdf(pCtx: Psqlite3_context;
@@ -753,15 +756,15 @@ var
   pArgs: PShellArgArr3;
   r: Double;
   n: i32;
-  z: PAnsiChar;
+  z: array[0..399] of AnsiChar;
 begin
   pArgs := PShellArgArr3(apVal);
   r := sqlite3_value_double(pArgs^[0]);
   if nVal >= 2 then n := sqlite3_value_int(pArgs^[1]) else n := 26;
   if n < 1 then n := 1;
   if n > 350 then n := 350;
-  z := sqlite3PfMprintf('%#+.*e', [n, r]);
-  sqlite3_result_text(pCtx, z, -1, @shellSqliteFreeDel);
+  shell_c_snprintf(@z[0], SizeOf(z), '%#+.*e', n, r);
+  sqlite3_result_text(pCtx, @z[0], -1, SQLITE_TRANSIENT);
 end;
 
 procedure shellAddSchemaUdf(pCtx: Psqlite3_context;

@@ -120,6 +120,17 @@ function c_strftime(s: PAnsiChar; maxsize: csize_t; format: PAnsiChar;
   timeptr: PCTm): csize_t; cdecl;
   external 'c' name 'strftime';
 
+{ test1.c:1031..1061 — strtod(X)/dtostr(X[,N]) exist precisely to compare
+  SQLite's float<->text conversion against the C library (fpconv1-2.0
+  diffs dtostr(y,24) against format('%!.24e',y) and demands >=17 digits
+  of agreement).  They MUST go through libc strtod()/snprintf("%#+.*e"):
+  FPC's Format()/TryStrToFloat stop at ~16 significant digits and
+  zero-pad, which is exactly the divergence fpconv1-2.0 catches. }
+function c_strtod(nptr: PAnsiChar; endptr: PPAnsiChar): Double; cdecl;
+  external 'c' name 'strtod';
+function c_snprintf(s: PAnsiChar; n: csize_t; fmt: PAnsiChar): cint; cdecl;
+  varargs; external 'c' name 'snprintf';
+
 const
   { sqliteInt.h — index 12, defined in C but not yet exposed in this port. }
   SQLITE_LIMIT_PARSER_DEPTH = 12;
@@ -6298,8 +6309,8 @@ begin
   if argc = 0 then ;
 end;
 
-{ test1.c:1031..1040 — strtod(X): C-library text→double via Pascal's
-  StrToFloat (close enough — these tests probe rounding parity). }
+{ test1.c:1031..1040 — strtod(X): text→double via the C library's
+  strtod(), exactly as the C harness does (rounding-parity probe). }
 procedure shellStrtod(pCtx: Psqlite3_context; nVal: cint;
   apVal: PPsqlite3_value); cdecl;
 type
@@ -6307,17 +6318,12 @@ type
   TValueArr = array[0..15] of Psqlite3_value;
 var
   z:  PAnsiChar;
-  d:  Double;
   pa: PValueArr;
-  fs: TFormatSettings;
 begin
   pa := PValueArr(apVal);
   z := PAnsiChar(sqlite3_value_text(pa^[0]));
   if z = nil then Exit;
-  fs := DefaultFormatSettings;
-  fs.DecimalSeparator := '.';
-  if not TryStrToFloat(AnsiString(z), d, fs) then d := 0;
-  sqlite3_result_double(pCtx, d);
+  sqlite3_result_double(pCtx, c_strtod(z, nil));
   if nVal = 0 then ;
 end;
 
@@ -6331,7 +6337,6 @@ var
   r:    Double;
   n:    cint;
   z:    array[0..399] of AnsiChar;
-  s:    AnsiString;
   pa:   PValueArr;
 begin
   pa := PValueArr(apVal);
@@ -6339,12 +6344,9 @@ begin
   if nVal >= 2 then n := sqlite3_value_int(pa^[1]) else n := 26;
   if n < 1 then n := 1;
   if n > 350 then n := 350;
-  { Pascal has no '%#+.*e'; emulate: sign-forced, decimal point present. }
-  s := Format('%.*e', [n, r]);
-  if (Length(s) > 0) and (s[1] <> '-') then s := '+' + s;
-  { Ensure decimal point — Format with non-zero precision always emits one. }
-  FillChar(z[0], SizeOf(z), 0);
-  Move(PAnsiChar(s)^, z[0], Length(s));
+  { libc sprintf("%#+.*e") — the exact correctly-rounded expansion the C
+    harness emits; FPC's Format() is NOT equivalent (16-digit cap). }
+  c_snprintf(@z[0], SizeOf(z), '%#+.*e', n, r);
   sqlite3_result_text(pCtx, @z[0], -1, SQLITE_TRANSIENT);
 end;
 
