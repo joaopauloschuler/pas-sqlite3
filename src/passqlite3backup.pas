@@ -492,9 +492,17 @@ begin
           rc := sqlite3PagerCommitPhaseOne(pDestPager, nil, 0);
         end;
 
-        if (rc = SQLITE_OK) and
-           ((sqlite3BtreeCommitPhaseTwo(p^.pDest, 0)) = SQLITE_OK) then
-          rc := SQLITE_DONE;
+        { backup.c:535..539 — rc must capture the CommitPhaseTwo result:
+            if( SQLITE_OK==rc
+             && SQLITE_OK==(rc = sqlite3BtreeCommitPhaseTwo(p->pDest, 0)) )
+              rc = SQLITE_DONE;
+          A phase-two failure (e.g. an I/O error in the
+          pager_end_transaction truncate) must propagate into rc. }
+        if rc = SQLITE_OK then begin
+          rc := sqlite3BtreeCommitPhaseTwo(p^.pDest, 0);
+          if rc = SQLITE_OK then
+            rc := SQLITE_DONE;
+        end;
       end;
     end;
 
