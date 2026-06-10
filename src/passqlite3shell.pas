@@ -504,6 +504,8 @@ var
   { .dump prebuilds a fully quoted "tbl(col,...)" destination string;
     when set, MODE_Insert emits it verbatim (no further quoting). }
   gInsertTabRaw:        Boolean = False;
+  { stable backing for .fullschema's stat-table INSERT destination. }
+  gFullschemaTab:       AnsiString = '';
 
 { ----------------------------------------------------------------------
   Helpers — small utilities that mirror the cli_* family
@@ -511,8 +513,26 @@ var
   stderr writes go through the standard FPC I/O.
   ---------------------------------------------------------------------- }
 
+{ Direct stderr write that bypasses any .testcase capture — used for
+  the .check failure report, which the C shell emits with a raw
+  sqlite3_fprintf(stderr,...) rather than cli_printf. }
+procedure shellEPutZDirect(const z: AnsiString);
+begin
+  Flush(Output);
+  Write(StdErr, z);
+  Flush(StdErr);
+end;
+
 procedure shellEPutZ(const z: AnsiString); inline;
 begin
+  { When a .testcase capture is armed, the C shell's cli_output_capture
+    intercepts stderr writes too (cli_printf(stderr,...) appends to the
+    capture buffer) — route through the captured stdout in that case. }
+  if gTcCapturing then begin
+    Write(z);
+    Flush(Output);
+    Exit;
+  end;
   { Flush stdout before writing to stderr so that under 2>&1 (or any merged
     stream) the error message appears at the position it was emitted, not
     after all subsequent buffered stdout writes.  The C oracle's stderr is
@@ -2040,11 +2060,19 @@ begin
   if eMode < Length(aModeInfo) then
     modeChangeBuiltin(p, eMode)
   else if eMode = MODE_BATCH then begin
+    { shell.c.in:1671..1675 — modeFree() zeroes the whole mode before
+      rebuilding from MODE_List, so stale seps/limits do not leak. }
     savedFlags := p^.mode.mFlags;
+    FillChar(p^.mode, SizeOf(p^.mode), 0);
+    p^.mode.spec.iVersion := 1;
+    p^.mode.autoExplain := 1;
     modeChange(p, MODE_List);
     p^.mode.mFlags := savedFlags;
   end else if eMode = MODE_TTY then begin
     savedFlags := p^.mode.mFlags;
+    FillChar(p^.mode, SizeOf(p^.mode), 0);
+    p^.mode.spec.iVersion := 1;
+    p^.mode.autoExplain := 1;
     modeChange(p, MODE_QBox);
     p^.mode.bAutoScreenWidth   := 1;
     p^.mode.spec.eText         := 7;       { QRF_TEXT_Relaxed }
@@ -2127,6 +2155,17 @@ begin
       sb := sb + z[i];
   end;
   Result := sb;
+end;
+
+function sqlIdentStr(const z: AnsiString): AnsiString;
+var i: SizeInt;
+begin
+  if not identNeedsQuote(z) then Exit(z);
+  Result := '"';
+  for i := 1 to Length(z) do begin
+    if z[i] = '"' then Result := Result + '""' else Result := Result + z[i];
+  end;
+  Result := Result + '"';
 end;
 
 procedure outputSqlIdent(const z: AnsiString);
@@ -2498,6 +2537,7 @@ type
     zRowSep:     AnsiString;
     insertTab:   AnsiString;        { MODE_Insert only }
     insertRaw:   Boolean;           { insertTab is preformatted (dump) }
+    insNIns:     i64;               { multi-insert accumulator (qrf u.nIns) }
     lastStepRc:  i32;               { final step rc when columnar buffers }
     lineMaxNameLen: i32;            { MODE_Line auto-width; 0 = uncomputed }
   end;
@@ -2562,9 +2602,23 @@ begin
   Result := 1;
 end;
 
+{ qrfIsVt100 — ext/qrf/qrf.c: byte length of a VT100 escape starting
+  at s[i] (which is ESC), or 0 if not a VT100 escape. }
+function vt100Len(const s: AnsiString; i: SizeInt): SizeInt;
+var j: SizeInt;
+begin
+  Result := 0;
+  if (i + 1 > Length(s)) or (s[i + 1] <> '[') then Exit;
+  j := i + 2;
+  while (j <= Length(s)) and (s[j] in ['0'..'9', ';']) do Inc(j);
+  if (j <= Length(s)) and (s[j] in ['m', 'A'..'H', 'J', 'K', 'S', 'T']) then
+    Result := j - i + 1;
+end;
+
 function utf8DispWidth(const s: AnsiString): i32;
 { sqlite3_qrf_wcswidth: decode UTF-8 and sum per-code-point widths
-  (combining marks count 0, East-Asian wide chars count 2). }
+  (combining marks count 0, East-Asian wide chars count 2).  VT100
+  escape sequences contribute zero width. }
 var
   i, n, u, len: i32;
   b: Byte;
@@ -2573,7 +2627,15 @@ begin
   i := 1;
   while i <= Length(s) do begin
     b := Byte(s[i]);
-    if b < $80 then begin
+    if b = $1b then begin
+      len := i32(vt100Len(s, i));
+      if len > 0 then begin
+        Inc(i, len);
+        Continue;
+      end;
+      Inc(n);
+      Inc(i);
+    end else if b < $80 then begin
       Inc(n);
       Inc(i);
     end else begin
@@ -2613,8 +2675,49 @@ begin
   else
     rs.insertTab := 'tab';
   rs.insertRaw       := gInsertTabRaw;
+  rs.insNIns         := 0;
   rs.lastStepRc      := SQLITE_DONE;
   rs.lineMaxNameLen  := 0;
+end;
+
+function shellErrorLocation(p: PShellState): AnsiString; forward;
+
+type
+  TCellLines = array of AnsiString;
+
+{ qrfTitleLimit — ext/qrf/qrf.c:1046..1085: clamp a column title to N
+  display columns, converting tabs/newlines to spaces and adding "..."
+  when truncation occurs (only when N>=3). }
+function titleLimitStr(const zIn: AnsiString; NLim: i32): AnsiString;
+var
+  z: AnsiString;
+  i, cut, ell: SizeInt;
+  w: i32;
+  b: Byte;
+begin
+  z := zIn;
+  for i := 1 to Length(z) do
+    if z[i] in [#9, #10, #13] then z[i] := ' ';
+  if NLim <= 0 then Exit(z);
+  if utf8DispWidth(z) <= NLim then Exit(z);
+  { find the byte offsets where width reaches NLim-3 (ellipsis) / NLim }
+  w := 0;
+  ell := 0;
+  cut := Length(z);
+  i := 1;
+  while i <= Length(z) do begin
+    b := Byte(z[i]);
+    if (b and $C0) <> $80 then begin
+      if (w >= NLim - 3) and (ell = 0) then ell := i;
+      if w >= NLim then begin cut := i - 1; Break; end;
+      Inc(w);
+    end;
+    Inc(i);
+  end;
+  if (ell > 0) and (NLim >= 3) then
+    Result := Copy(z, 1, ell - 1) + '...'
+  else
+    Result := Copy(z, 1, cut);
 end;
 
 function colNameStr(pStmt: PVdbe; i: i32): AnsiString; inline;
@@ -2709,6 +2812,150 @@ begin
   end;
 end;
 
+{ qrfWrapLine — faithful port of ext/qrf/qrf.c.  Computes the byte
+  length of the next display line of zIn (1-based iPos), at most w
+  display columns wide, honoring newlines, tabs (8-col stops), VT100
+  zero-width escapes and optional word-wrapping. }
+procedure qrfWrapLineP(const zIn: AnsiString; iPos: SizeInt; w: i32;
+                       bWrap: Boolean; out nThis: SizeInt; out iNext: SizeInt);
+var
+  i, k, len: SizeInt;
+  n, u, wcw: i32;
+  b, brkB: Byte;
+  isAl1, isAl2: Boolean;
+  nLen: SizeInt;
+begin
+  nLen := Length(zIn);
+  if iPos > nLen then begin
+    nThis := 0;
+    iNext := iPos;
+    Exit;
+  end;
+  n := 0;
+  i := iPos;
+  brkB := 0;
+  while (i <= nLen) and (n <= w) do begin
+    b := Byte(zIn[i]);
+    brkB := b;
+    if b >= $C0 then begin
+      u := 0; len := 1;
+      if ((b and $E0) = $C0) and (i < nLen) then begin
+        u := ((b and $1F) shl 6) or (Byte(zIn[i+1]) and $3F); len := 2;
+      end else if ((b and $F0) = $E0) and (i + 1 < nLen) then begin
+        u := ((b and $0F) shl 12) or ((Byte(zIn[i+1]) and $3F) shl 6)
+             or (Byte(zIn[i+2]) and $3F); len := 3;
+      end else if ((b and $F8) = $F0) and (i + 2 < nLen) then begin
+        u := ((b and $0F) shl 18) or ((Byte(zIn[i+1]) and $3F) shl 12)
+             or ((Byte(zIn[i+2]) and $3F) shl 6) or (Byte(zIn[i+3]) and $3F);
+        len := 4;
+      end;
+      wcw := 1;
+      if u > 0 then wcw := ucWcWidth(u);
+      if wcw + n > w then Break;
+      Inc(i, len);
+      Inc(n, wcw);
+      Continue;
+    end;
+    if b >= $20 then begin
+      if n = w then Break;
+      Inc(n); Inc(i);
+      Continue;
+    end;
+    if b = 10 then Break;
+    if (b = 13) and (i < nLen) and (zIn[i+1] = #10) then begin
+      Inc(i);
+      brkB := 10;
+      Break;
+    end;
+    if b = 9 then begin
+      wcw := 8 - (n and 7);
+      if n + wcw > w then Break;
+      Inc(n, wcw);
+      Inc(i);
+      Continue;
+    end;
+    if b = $1b then begin
+      len := vt100Len(zIn, i);
+      if len > 0 then begin Inc(i, len); Continue; end;
+    end;
+    if n = w then Break;
+    Inc(n);
+    Inc(i);
+  end;
+  if i > nLen then begin
+    nThis := nLen - iPos + 1;
+    iNext := nLen + 1;
+    Exit;
+  end;
+  if brkB = 10 then begin
+    { line ends at the newline; consume it }
+    nThis := i - iPos;
+    if (nThis > 0) and (zIn[i] = #10) and (i > iPos)
+       and (zIn[i-1] = #13) then ;  { \r already included by CRLF arm }
+    iNext := i + 1;
+    Exit;
+  end;
+  { Mid-text break: maybe back up to a nicer split point (qrf.c). }
+  if bWrap and (i <= nLen) and not (zIn[i] in [' ', #9])
+     and (i > iPos) then begin
+    isAl1 := zIn[i] in ['0'..'9', 'A'..'Z', 'a'..'z'];
+    isAl2 := zIn[i-1] in ['0'..'9', 'A'..'Z', 'a'..'z'];
+    if isAl1 = isAl2 then begin
+      k := i - 1;
+      while (k >= iPos + (i - iPos) div 2) and not (zIn[k] in [' ', #9]) do
+        Dec(k);
+      if k < iPos + (i - iPos) div 2 then begin
+        k := i;
+        while k >= iPos + (i - iPos) div 2 do begin
+          if ((zIn[k-1] in ['0'..'9', 'A'..'Z', 'a'..'z'])
+              <> (zIn[k] in ['0'..'9', 'A'..'Z', 'a'..'z']))
+             and ((Byte(zIn[k]) and $C0) <> $80) then Break;
+          Dec(k);
+        end;
+      end;
+      if k >= iPos + (i - iPos) div 2 then i := k;
+    end;
+  end;
+  nThis := i - iPos;
+  while (i <= nLen) and (zIn[i] in [' ', #9, #13]) do Inc(i);
+  iNext := i;
+end;
+
+{ Split a cell into display lines via qrfWrapLineP.  w<=0 means only
+  split on newlines. }
+function wrapCellLines(const zIn: AnsiString; w: i32;
+                       wordWrap: Boolean): TCellLines;
+var
+  iPos, iNext, nThis, nOut: SizeInt;
+  effW: i32;
+begin
+  if w > 0 then effW := w else effW := 1000000;
+  SetLength(Result, 0);
+  nOut := 0;
+  iPos := 1;
+  if zIn = '' then begin
+    SetLength(Result, 1);
+    Result[0] := '';
+    Exit;
+  end;
+  while iPos <= Length(zIn) do begin
+    qrfWrapLineP(zIn, iPos, effW, wordWrap and (w > 0), nThis, iNext);
+    SetLength(Result, nOut + 1);
+    Result[nOut] := Copy(zIn, iPos, nThis);
+    { strip a trailing \r from CRLF line ends }
+    if (Length(Result[nOut]) > 0)
+       and (Result[nOut][Length(Result[nOut])] = #13) then
+      SetLength(Result[nOut], Length(Result[nOut]) - 1);
+    Inc(nOut);
+    if iNext <= iPos then Break;
+    iPos := iNext;
+  end;
+  if Length(Result) = 0 then begin
+    SetLength(Result, 1);
+    Result[0] := '';
+  end;
+end;
+
 procedure emitRowOne(var rs: TRenderState; pStmt: PVdbe);
 var
   i, ty: i32;
@@ -2718,43 +2965,57 @@ var
   isNumericTy: Boolean;
   tclJ: SizeInt;
   tclB: Byte;
+  insSb: AnsiString;
+  zNm: AnsiString;
+  lineMxW: i32;
+  lineWrapped: TCellLines;
 begin
   case rs.p^.mode.eMode of
     MODE_Off: Exit;
 
     MODE_Line:
       { qrf.c QRF_STYLE_Line (2612..2669): one column per line, blank
-        line BETWEEN records; the column name is RIGHT-aligned in a
-        field as wide as the widest column name (wcswidth), followed by
-        spec.zColumnSep (default ": "). }
+        line BETWEEN records; the column name (clamped to --titlelimit)
+        is RIGHT-aligned in a field as wide as the widest column name
+        (wcswidth), followed by spec.zColumnSep (default ": ").  Values
+        wrap at the remaining screen width, continuation lines indented
+        past the name+separator. }
       begin
         if rs.lineMaxNameLen = 0 then
           for i := 0 to rs.nCol - 1 do begin
-            ty := utf8DispWidth(colNameStr(pStmt, i));
+            ty := utf8DispWidth(titleLimitStr(colNameStr(pStmt, i),
+                                rs.p^.mode.spec.nTitleLimit));
             if ty > rs.lineMaxNameLen then rs.lineMaxNameLen := ty;
           end;
+        lineMxW := 1000000;
+        if rs.p^.mode.spec.nScreenWidth > 0 then begin
+          lineMxW := rs.p^.mode.spec.nScreenWidth
+                     - (i32(Length(rs.zColSep)) + rs.lineMaxNameLen);
+          if lineMxW < 1 then lineMxW := 1;
+        end;
         if rs.rowsEmitted > 0 then WriteLn;
         for i := 0 to rs.nCol - 1 do begin
           z := colTextStr(pStmt, i, isNull);
-          ty := rs.lineMaxNameLen - utf8DispWidth(colNameStr(pStmt, i));
+          zNm := titleLimitStr(colNameStr(pStmt, i),
+                               rs.p^.mode.spec.nTitleLimit);
+          ty := rs.lineMaxNameLen - utf8DispWidth(zNm);
           if ty > 0 then Write(StringOfChar(' ', ty));
-          Write(colNameStr(pStmt, i));
+          Write(zNm);
           Write(rs.zColSep);
-          if isNull then Write(rs.zNull)
-          else begin
-            { qrf.c:2649..2663 — multi-line values continue on fresh
-              lines indented past the name field + separator. }
+          if isNull then begin
+            Write(rs.zNull);
+            WriteLn;
+          end else begin
             z := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
-            for tclJ := 1 to Length(z) do begin
-              if z[tclJ] = #10 then begin
-                WriteLn;
+            lineWrapped := wrapCellLines(z, lineMxW,
+                             rs.p^.mode.spec.bWordWrap <> 1);
+            for tclJ := 0 to High(lineWrapped) do begin
+              if tclJ > 0 then
                 Write(StringOfChar(' ',
-                  rs.lineMaxNameLen + Length(rs.zColSep)));
-              end else
-                Write(z[tclJ]);
+                  rs.lineMaxNameLen + i32(Length(rs.zColSep))));
+              WriteLn(lineWrapped[tclJ]);
             end;
           end;
-          WriteLn;
         end;
       end;
 
@@ -2800,32 +3061,46 @@ begin
       end;
 
     MODE_Insert:
+      { qrf.c QRF_STYLE_Insert (2568..2611) — rows are packed onto one
+        INSERT statement (",\n  (...)" continuations) until the size
+        exceeds spec.nMultiInsert; 0 means one row per INSERT. }
       begin
-        Write('INSERT INTO ');
-        if rs.insertRaw then
-          Write(rs.insertTab)
-        else if identNeedsQuote(rs.insertTab) then begin
-          Write('"');
-          for i := 1 to Length(rs.insertTab) do begin
-            if rs.insertTab[i] = '"' then Write('""') else Write(rs.insertTab[i]);
+        insSb := '';
+        if (rs.insNIns = 0)
+           or (rs.insNIns >= i64(rs.p^.mode.spec.nMultiInsert)) then begin
+          if rs.insNIns <> 0 then begin
+            Write(';');
+            WriteLn;
+            rs.insNIns := 0;
           end;
-          Write('"');
+          insSb := 'INSERT INTO ';
+          if rs.insertRaw then
+            insSb := insSb + rs.insertTab
+          else if identNeedsQuote(rs.insertTab) then begin
+            insSb := insSb + '"';
+            for i := 1 to Length(rs.insertTab) do begin
+              if rs.insertTab[i] = '"' then insSb := insSb + '""'
+              else insSb := insSb + rs.insertTab[i];
+            end;
+            insSb := insSb + '"';
+          end else
+            insSb := insSb + rs.insertTab;
+          if rs.headersOn then begin
+            for i := 0 to rs.nCol - 1 do begin
+              if i = 0 then insSb := insSb + '(' else insSb := insSb + ',';
+              insSb := insSb + sqlIdentStr(colNameStr(pStmt, i));
+            end;
+            insSb := insSb + ')';
+          end;
+          insSb := insSb + ' VALUES(';
         end else
-          Write(rs.insertTab);
-        if rs.headersOn then begin
-          for i := 0 to rs.nCol - 1 do begin
-            if i = 0 then Write('(') else Write(',');
-            outputSqlIdent(colNameStr(pStmt, i));
-          end;
-          Write(')');
-        end;
-        Write(' VALUES(');
+          insSb := insSb + ','#10'  (';
         for i := 0 to rs.nCol - 1 do begin
-          if i > 0 then Write(',');
+          if i > 0 then insSb := insSb + ',';
           ty := sqlite3_column_type(pStmt, i);
-          if ty = SQLITE_NULL then begin Write('NULL'); Continue; end;
+          if ty = SQLITE_NULL then begin insSb := insSb + 'NULL'; Continue; end;
           if ty = SQLITE_INTEGER then begin
-            Write(IntToStr(sqlite3_column_int64(pStmt, i))); Continue;
+            insSb := insSb + IntToStr(sqlite3_column_int64(pStmt, i)); Continue;
           end;
           if ty = SQLITE_FLOAT then begin
             { Promote integer-valued doubles to a textual integer when the
@@ -2834,19 +3109,25 @@ begin
             decl := sqlite3_column_decltype(pStmt, i);
             isNumericTy := (decl <> nil) and (StrComp(decl, 'INTEGER') = 0);
             if isNumericTy and (Frac(sqlite3_column_double(pStmt, i)) = 0) then
-              Write(IntToStr(Trunc(sqlite3_column_double(pStmt, i))))
+              insSb := insSb + IntToStr(Trunc(sqlite3_column_double(pStmt, i)))
             else
-              Write(FloatToStr(sqlite3_column_double(pStmt, i)));
+              insSb := insSb + FloatToStr(sqlite3_column_double(pStmt, i));
             Continue;
           end;
           if ty = SQLITE_BLOB then begin
-            Write(renderBlobSql(rs.p, pStmt, i));
+            insSb := insSb + renderBlobSql(rs.p, pStmt, i);
             Continue;
           end;
-          Write(sqlQuotedQ(
-            specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc));
+          insSb := insSb + sqlQuotedQ(
+            specStr(sqlite3_column_text(pStmt, i)), rs.p^.mode.spec.eEsc);
         end;
-        WriteLn(');');
+        rs.insNIns := rs.insNIns + Length(insSb) + 2;
+        if rs.insNIns >= i64(rs.p^.mode.spec.nMultiInsert) then begin
+          insSb := insSb + ');'#10;
+          rs.insNIns := 0;
+        end else
+          insSb := insSb + ')';
+        Write(insSb);
       end;
 
     MODE_Json:
@@ -2968,6 +3249,13 @@ begin
   case rs.p^.mode.eMode of
     MODE_Json:
       if rs.rowsEmitted > 0 then WriteLn(']');
+    MODE_Insert:
+      { qrf.c:2890..2894 — close an open multi-row INSERT. }
+      if rs.insNIns <> 0 then begin
+        Write(';');
+        WriteLn;
+        rs.insNIns := 0;
+      end;
   end;
 end;
 
@@ -2998,6 +3286,40 @@ begin
   if pad > 0 then Write(StringOfChar(' ', pad));
 end;
 
+{ qrfRelaxable — ext/qrf/qrf.c:813..841: under --quote relaxed, text
+  may appear unquoted when it cannot be mistaken for NULL, a number,
+  or quoted text. }
+function qrfRelaxable(const z, zNull: AnsiString): Boolean;
+var
+  i, n: SizeInt;
+begin
+  if Length(z) = 0 then Exit(zNull <> '');
+  if (z[1] = '''') or (z[1] in [' ', #9, #10, #11, #12, #13]) then Exit(False);
+  n := Length(z);
+  if (z[n] = '''') or (z[n] in [' ', #9, #10, #11, #12, #13]) then Exit(False);
+  if z = zNull then Exit(False);
+  i := 1;
+  if z[1] in ['-', '+'] then i := 2;
+  if Copy(z, i, MaxInt) = 'Inf' then Exit(False);
+  if (i > n) or not (z[i] in ['0'..'9']) then Exit(True);
+  Inc(i);
+  while (i <= n) and (z[i] in ['0'..'9']) do Inc(i);
+  if i > n then Exit(False);
+  if z[i] = '.' then begin
+    Inc(i);
+    while (i <= n) and (z[i] in ['0'..'9']) do Inc(i);
+    if i > n then Exit(False);
+  end;
+  if (i <= n) and (z[i] in ['e', 'E']) then begin
+    Inc(i);
+    if (i <= n) and (z[i] in ['+', '-']) then Inc(i);
+    if (i > n) or not (z[i] in ['0'..'9']) then Exit(True);
+    Inc(i);
+    while (i <= n) and (z[i] in ['0'..'9']) do Inc(i);
+  end;
+  Result := i <= n;
+end;
+
 function colCellText(var rs: TRenderState; pStmt: PVdbe; i: i32): AnsiString;
 { Spec-aware cell rendering for the columnar modes — mirrors
   qrfRenderValue (ext/qrf/qrf.c:1087..1199) for the eText/eBlob/
@@ -3023,7 +3345,7 @@ begin
         if eText = 2 then
           Result := 'jsonb(' + sqlQuotedQ(zJson, rs.p^.mode.spec.eEsc) + ')'
         else Result := zJson;
-      end else if (eText = 2) or (rs.p^.mode.spec.eBlob = 2) then
+      end else if (eText = 2) or (eText = 7) or (rs.p^.mode.spec.eBlob = 2) then
         Result := blobSqlLiteral(b)
       else begin
         z := colTextStr(pStmt, i, isNull);
@@ -3032,7 +3354,11 @@ begin
     end;
   else begin
     z := colTextStr(pStmt, i, isNull);
-    if eText = 2 then Result := sqlQuotedQ(z, rs.p^.mode.spec.eEsc)
+    if (eText = 7) and qrfRelaxable(z, rs.zNull) then
+      { QRF_TEXT_Relaxed — unambiguous text passes unquoted }
+      Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc)
+    else if (eText = 2) or (eText = 7) then
+      Result := sqlQuotedQ(z, rs.p^.mode.spec.eEsc)
     else Result := qrfEscapeE(z, rs.p^.mode.spec.eEsc);
   end;
   end;
@@ -3059,76 +3385,8 @@ begin
   Result := i - 1;
 end;
 
-type
-  TCellLines = array of AnsiString;
 
-{ Split a cell into display lines: embedded newlines always split;
-  when w>0 the segments are additionally wrapped at w display columns
-  (breaking at a space when wordWrap, hard otherwise) — qrf.c's
-  word/char-wrap behaviour for fixed-width columns. }
-function wrapCellLines(const zIn: AnsiString; w: i32;
-                       wordWrap: Boolean): TCellLines;
-var
-  segs: TCellLines;
-  seg, rest: AnsiString;
-  i, nOut, cut: SizeInt;
-  j: SizeInt;
-begin
-  { split on \n (and drop \r before \n) }
-  SetLength(segs, 0);
-  seg := '';
-  for i := 1 to Length(zIn) do begin
-    if zIn[i] = #10 then begin
-      if (Length(seg) > 0) and (seg[Length(seg)] = #13) then
-        SetLength(seg, Length(seg) - 1);
-      SetLength(segs, Length(segs) + 1);
-      segs[High(segs)] := seg;
-      seg := '';
-    end else
-      seg := seg + zIn[i];
-  end;
-  SetLength(segs, Length(segs) + 1);
-  segs[High(segs)] := seg;
-
-  SetLength(Result, 0);
-  nOut := 0;
-  for i := 0 to High(segs) do begin
-    rest := segs[i];
-    if w <= 0 then begin
-      SetLength(Result, nOut + 1);
-      Result[nOut] := rest;
-      Inc(nOut);
-      Continue;
-    end;
-    repeat
-      if utf8DispWidth(rest) <= w then begin
-        SetLength(Result, nOut + 1);
-        Result[nOut] := rest;
-        Inc(nOut);
-        Break;
-      end;
-      cut := utf8CutBytes(rest, w);
-      if wordWrap then begin
-        j := cut;
-        while (j > 1) and (rest[j] <> ' ') and (rest[j + 1] <> ' ') do Dec(j);
-        if j > 1 then begin
-          while (j > 1) and (rest[j] = ' ') do Dec(j);
-          if rest[j] <> ' ' then cut := j;
-        end;
-      end;
-      SetLength(Result, nOut + 1);
-      Result[nOut] := Copy(rest, 1, cut);
-      Inc(nOut);
-      rest := Copy(rest, cut + 1, MaxInt);
-      if wordWrap then
-        while (Length(rest) > 0) and (rest[1] = ' ') do Delete(rest, 1, 1);
-    until rest = '';
-  end;
-  if Length(Result) = 0 then begin
-    SetLength(Result, 1);
-    Result[0] := '';
-  end;
-end;
+{ (qrfWrapLineP / wrapCellLines moved before emitRowOne) }
 
 procedure emitColumnar(var rs: TRenderState; pStmt: PVdbe; firstRow: AnsiString);
 { Buffer all rows and emit in MODE_Column / MODE_Table / MODE_Box /
@@ -3162,6 +3420,7 @@ var
   scrW, nRowsFlow, nKCols, kk, jj, idx: i32;
   flowW: array of i32;
   flowTot: i32;
+  outAcc: AnsiString;
   glyphTL, glyphTR, glyphBL, glyphBR: AnsiString;
   glyphHB, glyphVB, glyphCx, glyphTU, glyphTD, glyphTL2, glyphTR2: AnsiString;
   glyphML, glyphMR: AnsiString;
@@ -3179,7 +3438,8 @@ begin
              or (rs.p^.mode.eMode = MODE_Split);
   isMd    := rs.p^.mode.eMode = MODE_Markdown;
   borderOff := rs.p^.mode.spec.bBorder = 1;   { QRF_No }
-  wordWrap := rs.p^.mode.spec.bWordWrap = QRF_Yes;
+  { bWordWrap: QRF_Auto resolves to Yes (qrf.c:2859..2861). }
+  wordWrap := rs.p^.mode.spec.bWordWrap <> 1;
 
   SetLength(headers,    nCol);
   SetLength(widths,     nCol);
@@ -3229,6 +3489,12 @@ begin
   end;
   rs.lastStepRc := rcStep;
 
+  { A step error (e.g. SQLITE_TOOBIG) aborts rendering entirely — the C
+    qrf renderer produces no table when the statement fails mid-way. }
+  if (rcStep <> SQLITE_DONE) and (rcStep <> SQLITE_OK)
+     and (rcStep <> SQLITE_ROW) then
+    Exit;
+
   { Wrap pass: split every cell into physical lines (fixed-width columns
     wrap at their width) and derive the final column widths. }
   SetLength(cellLines, nRowBuf);
@@ -3253,6 +3519,21 @@ begin
           w := utf8DispWidth(cellLines[rc, c][ln]);
           if w > widths[c] then widths[c] := w;
         end;
+      { --wrap N caps the natural width (qrf.c:2040..2042); rewrap. }
+      if (rs.p^.mode.spec.nWrap > 0) and (widths[c] > rs.p^.mode.spec.nWrap)
+      then begin
+        widths[c] := rs.p^.mode.spec.nWrap;
+        for rc := 0 to nRowBuf - 1 do begin
+          cellLines[rc, c] := wrapCellLines(matrix[rc, c], widths[c], wordWrap);
+          if Length(cellLines[rc, c]) > nLines[rc] then begin
+            nLines[rc] := Length(cellLines[rc, c]);
+            anyMultiLine := True;
+          end;
+        end;
+        { header may still be wider }
+        w := utf8DispWidth(headers[c]);
+        if w > widths[c] then widths[c] := w;
+      end;
     end;
   end;
 
@@ -3426,8 +3707,9 @@ begin
     midSep := '';
   end;
 
+  outAcc := '';
   { Emit. }
-  if (isBox or isTable) and not borderOff then WriteLn(rowSep);
+  if (isBox or isTable) and not borderOff then outAcc := outAcc + rowSep + #10;
 
   if rs.headersOn or isBox or isTable or isMd or isPsql then begin
     if isBox or isTable or isMd or isPsql then begin
@@ -3446,34 +3728,34 @@ begin
       if isPsql or borderOff then begin
         while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
           SetLength(sb, Length(sb) - 1);
-        WriteLn(sb);
+        outAcc := outAcc + sb + #10;
       end else
-        WriteLn(sb + glyphVB);
-      WriteLn(hdrSep);
+        outAcc := outAcc + sb + glyphVB + #10;
+      outAcc := outAcc + hdrSep + #10;
     end else begin
       { MODE_Column header row.  Upstream qrf.c (~2014) sets eTitleAlign
         to QRF_ALIGN_Center for the title row, then qrfRTrim strips
         trailing whitespace before the row separator. }
       for c := 0 to nCol - 1 do begin
-        if c > 0 then Write('  ');
+        if c > 0 then outAcc := outAcc + '  ';
         w := widths[c] - utf8DispWidth(headers[c]);
-        if w > 0 then Write(StringOfChar(' ', w div 2));
-        Write(headers[c]);
+        if w > 0 then outAcc := outAcc + StringOfChar(' ', w div 2);
+        outAcc := outAcc + headers[c];
         if (c < nCol - 1) and (w > 0) then
-          Write(StringOfChar(' ', w - (w div 2)));
+          outAcc := outAcc + StringOfChar(' ', w - (w div 2));
       end;
-      WriteLn;
+      outAcc := outAcc + #10;
       for c := 0 to nCol - 1 do begin
-        if c > 0 then Write('  ');
-        Write(StringOfChar('-', widths[c]));
+        if c > 0 then outAcc := outAcc + '  ';
+        outAcc := outAcc + StringOfChar('-', widths[c]);
       end;
-      WriteLn;
+      outAcc := outAcc + #10;
     end;
   end;
 
   for rc := 0 to nRowBuf - 1 do begin
     if (rc > 0) and anyMultiLine and (isBox or isTable) then
-      WriteLn(midSep);
+      outAcc := outAcc + midSep + #10;
     for ln := 0 to nLines[rc] - 1 do begin
       sb := '';
       if (isBox or isTable or isMd) and not borderOff then sb := glyphVB;
@@ -3502,19 +3784,31 @@ begin
         end;
       end;
       if (isBox or isTable or isMd) and not borderOff then
-        WriteLn(sb + glyphVB)
+        outAcc := outAcc + sb + glyphVB + #10
       else begin
         { MODE_Column / MODE_Split / MODE_Psql — qrfRTrim trims trailing
           whitespace on every data row (qrf.c:1247 + 2247). }
         while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
           SetLength(sb, Length(sb) - 1);
-        WriteLn(sb);
+        outAcc := outAcc + sb + #10;
       end;
     end;
   end;
 
-  if (isBox or isTable) and not borderOff then WriteLn(footSep);
+  if (isBox or isTable) and not borderOff then outAcc := outAcc + footSep + #10;
   if isCol and (isMd or isPsql) then ; { keep hints used }
+
+  { The C qrf renderer accumulates the whole rendered table in an
+    sqlite3_str bound to the database LENGTH limit; exceeding it aborts
+    with SQLITE_TOOBIG ("string or blob too big") and emits nothing. }
+  if rs.p^.db <> nil then begin
+    flowTot := sqlite3_limit(rs.p^.db, 0 {SQLITE_LIMIT_LENGTH}, -1);
+    if (flowTot > 0) and (Length(outAcc) > flowTot) then begin
+      shellEPutZ(shellErrorLocation(rs.p) + ' string or blob too big'#10);
+      Exit;
+    end;
+  end;
+  Write(outAcc);
 
   rs.rowsEmitted := nRowBuf;
 end;
@@ -4916,6 +5210,31 @@ begin
   Result := Result + '"';
 end;
 
+{ modeTitleDsply — shell.c.in truth-table helper deciding how the
+  ".mode" display describes the title settings: 0=omit, 1="--titles
+  off", 2="--titles on", 3="--titles <encoding>". }
+function modeTitleDsply(p: PShellState; bAll: i32): i32;
+var
+  pI: ^TModeInfo;
+  bT, eT, bH, eH: i32;
+  v: u64;
+begin
+  pI := @aModeInfo[p^.mode.eMode];
+  bT := p^.mode.spec.bTitles;
+  eT := p^.mode.spec.eTitle;
+  bH := pI^.bHdr;
+  eH := pI^.eHdr;
+  v := u64($0133013311220102);
+  if bH = 0 then Exit(0);
+  if eT = 0 then eT := eH;
+  if bT = 0 then bT := bH;
+  if eT <> eH then v := v shr 32;
+  if bT <> bH then v := v shr 16;
+  if bT < 2 then v := v shr 8;
+  if bAll = 0 then v := v shr 4;
+  Result := i32(v and 3);
+end;
+
 { dotCmdMode — faithful port of shell.c.in:7968..8484 at the level of
   the options the Pascal QRF cut supports.  Arguments are processed
   left to right; with no arguments (or with -v) the current mode and
@@ -5140,7 +5459,12 @@ begin
       end;
       chng := 1;
     end else if shOptionMatch(z, 'reset') then begin
+      { shell.c.in:8195..8198 — modeFree() then rebuild from the current
+        mode, wiping all accumulated option state. }
       savedMode := p^.mode.eMode;
+      FillChar(p^.mode, SizeOf(p^.mode), 0);
+      p^.mode.spec.iVersion := 1;
+      p^.mode.autoExplain := 1;
       modeChange(p, savedMode);
     end else if shOptionMatch(z, 'screenwidth') or shOptionMatch(z, 'sw') then begin
       Inc(i);
@@ -5355,6 +5679,21 @@ begin
         zDesc := zDesc + ' --textjsonb on'
       else
         zDesc := zDesc + ' --textjsonb off';
+    end;
+    case modeTitleDsply(p, bAll) of
+      1: zDesc := zDesc + ' --titles off';
+      2: zDesc := zDesc + ' --titles on';
+      3: begin
+        case p^.mode.spec.eTitle of
+          2: zDesc := zDesc + ' --titles sql';
+          3: zDesc := zDesc + ' --titles csv';
+          4: zDesc := zDesc + ' --titles html';
+          5: zDesc := zDesc + ' --titles tcl';
+          6: zDesc := zDesc + ' --titles json';
+        else
+          zDesc := zDesc + ' --titles plain';
+        end;
+      end;
     end;
     if (p^.mode.spec.nWidth > 0) and ((bAll <> 0) or (pI^.eCx = 2)) then begin
       zSetting := ' --widths ';
@@ -8550,16 +8889,8 @@ const
     ' WHERE type<>''meta'' AND sql NOTNULL' +
     '   AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\''' +
     ' ORDER BY x';
-  zStat1Q  =
-    'SELECT ''INSERT INTO sqlite_stat1 VALUES('' || quote(tbl) || '','' || ' +
-    'quote(idx) || '','' || quote(stat) || '')'' ' +
-    'FROM sqlite_stat1';
-  zStat4Q  =
-    'SELECT ''INSERT INTO sqlite_stat4 VALUES('' || ' +
-    'quote(tbl) || '','' || quote(idx) || '','' || ' +
-    'quote(neq) || '','' || quote(nlt) || '','' || ' +
-    'quote(ndlt) || '','' || quote(sample) || '')'' ' +
-    'FROM sqlite_stat4';
+  zStat1Q  = 'SELECT * FROM sqlite_stat1';
+  zStat4Q  = 'SELECT * FROM sqlite_stat4';
 var
   pStmt: PVdbe;
   pzTail: PAnsiChar;
@@ -8569,6 +8900,7 @@ var
   qList: array[0..2] of AnsiString;
   i, ii: i32;
   haveStat: Boolean;
+  savedMode: TShellMode;
 begin
   for ii := 0 to nArg - 1 do begin
     if (args[ii] = '--indent') or (args[ii] = '-indent') then
@@ -8613,9 +8945,23 @@ begin
       if pStmt <> nil then sqlite3_finalize(pStmt);
       Continue;
     end;
-    while sqlite3_step(pStmt) = SQLITE_ROW do begin
-      zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
-      if zText <> nil then WriteLn(AnsiString(zText) + ';');
+    if i > 0 then begin
+      { shell.c.in:9739..9748 — the stat tables are dumped through the
+        MODE_Insert renderer (so multi-row INSSERT packing applies). }
+      savedMode := p^.mode;
+      if i = 1 then gFullschemaTab := 'sqlite_stat1'
+      else gFullschemaTab := 'sqlite_stat4';
+      p^.zDestTable := PAnsiChar(gFullschemaTab);
+      p^.mode.eMode := MODE_Insert;
+      p^.mode.spec.bTitles := QRF_No;
+      stepAndRender(p, pStmt);
+      p^.mode := savedMode;
+      p^.zDestTable := nil;
+    end else begin
+      while sqlite3_step(pStmt) = SQLITE_ROW do begin
+        zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
+        if zText <> nil then WriteLn(AnsiString(zText) + ';');
+      end;
     end;
     sqlite3_finalize(pStmt);
   end;
@@ -9392,10 +9738,10 @@ begin
     Inc(p^.nTestErr);
     { Restore stdout so the failure diagnostic goes to the real stderr;
       the comparator file stays on disk until outputReset below. }
-    shellEPutZ(Format('%s:%d: .check failed for testcase %s'#10,
+    shellEPutZDirect(Format('%s:%d: .check failed for testcase %s'#10,
       [AnsiString(p^.zInFile), iStart, testcaseName]));
-    shellEPutZ(Format('Expected: [%s]'#10, [zPattern]));
-    shellEPutZ(Format('Got:      [%s]'#10, [zTest]));
+    shellEPutZDirect(Format('Expected: [%s]'#10, [zPattern]));
+    shellEPutZDirect(Format('Got:      [%s]'#10, [zTest]));
   end;
 
   if bKeep = 0 then begin
@@ -10447,6 +10793,8 @@ var
   nEndMark: i32;
   ckEnd: i32;
   iStart, savedLn: i64;
+  iLineOffset: i64;
+  zSchema2: AnsiString;
   atEof: Boolean;
 begin
   { 10.1.24.b — failIfSafeMode gate at .import entry.  Mirrors C
@@ -10466,6 +10814,7 @@ begin
     Halt(1);
   end;
   Result := 1;   { error paths Exit with rc=1; success resets below }
+  iLineOffset := 0;
   importInit(sCtx);
   if p^.mode.eMode = MODE_Ascii then
     xRead := @asciiReadOneField
@@ -10597,6 +10946,7 @@ begin
     pContent := sqlite3_str_new(p^.db);
     ckEnd := 1;
     iStart := p^.lineno;
+    iLineOffset := p^.lineno;     { shell.c.in:7612 }
     sCtx.zFile := AnsiString(p^.zInFile);
     sCtx.nLine := i32(p^.lineno + 1);
     atEof := False;
@@ -10647,9 +10997,10 @@ begin
   end;
 
   if eVerbose >= 1 then begin
+    { shell.c.in:7648..7658 — separators printed as C strings. }
     ch := AnsiChar(Byte(sCtx.cColSep));
-    shellSPutZ(Format('Column separator "%s", row separator "%s"'#10,
-      [string(ch), string(AnsiChar(Byte(sCtx.cRowSep)))]));
+    shellSPutZ('Column separator ' + cEscapeStr(ch)
+      + ', row separator ' + cEscapeStr(AnsiChar(Byte(sCtx.cRowSep))) + #10);
   end;
 
   hasFile := True;
@@ -10697,13 +11048,12 @@ begin
       importCleanup(sCtx);
       Exit;
     end;
-    if zSchema <> '' then
-      zCreate := 'CREATE TABLE "' +
-        StringReplace(zSchema, '"', '""', [rfReplaceAll]) + '"."' +
-        StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs
-    else
-      zCreate := 'CREATE TABLE "' +
-        StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs;
+    { shell.c.in:7684 — the schema name defaults to "main". }
+    if zSchema = '' then zSchema2 := 'main' else zSchema2 := zSchema;
+    { shell.c.in:7699 — zCreate gains a trailing newline ("%z%z\n"). }
+    zCreate := 'CREATE TABLE "' +
+      StringReplace(zSchema2, '"', '""', [rfReplaceAll]) + '"."' +
+      StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs + #10;
     if eVerbose >= 1 then shellSPutZ(zCreate + #10);
     rc := sqlite3_exec(p^.db, PAnsiChar(zCreate), nil, nil, nil);
     if rc <> SQLITE_OK then begin
@@ -10829,7 +11179,7 @@ begin
   if needCommit <> 0 then sqlite3_exec(p^.db, 'COMMIT', nil, nil, nil);
   if eVerbose > 0 then
     shellSPutZ(Format('Added %d rows with %d errors using %d lines of input'#10,
-      [sCtx.nRow, sCtx.nErr, sCtx.nLine - 1]));
+      [sCtx.nRow, sCtx.nErr, sCtx.nLine - 1 - iLineOffset]));
   importCleanup(sCtx);
   { shell.c.in:7846 — return sCtx.nErr ? 1 : 0. }
   if sCtx.nErr <> 0 then Result := 1 else Result := 0;
