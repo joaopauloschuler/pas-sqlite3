@@ -11643,6 +11643,21 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
     if ExprRefsOuterID(pW^.pLeft,  pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
     if ExprRefsOuterID(pW^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+    { window1-25.2 — resolve.c:1321..1323 walks pWin->pPartition/pOrderBy/
+      pFilter with the outer-chained NameContext, so a bare outer column
+      whose ONLY appearance is inside an OVER (...) clause still correlates
+      the subquery.  Without this descent the gate misses
+      `... IN (SELECT row_number() OVER (ORDER BY t1_id) FROM t3)` and the
+      ResolveOuterIDs pre-bind never runs -> "no such column: t1_id". }
+    if ExprHasProperty(pW, EP_WinFunc) and (pW^.y.pWin <> nil) then
+    begin
+      if ExprListRefsOuterID(pW^.y.pWin^.pPartition, pOuterSrc, pInnerSrc) then
+      begin Result := True; Exit; end;
+      if ExprListRefsOuterID(pW^.y.pWin^.pOrderBy,   pOuterSrc, pInnerSrc) then
+      begin Result := True; Exit; end;
+      if ExprRefsOuterID(pW^.y.pWin^.pFilter,        pOuterSrc, pInnerSrc) then
+      begin Result := True; Exit; end;
+    end;
     if (pW^.flags and EP_xIsSelect) = 0 then
     begin
       if ExprListRefsOuterID(pW^.x.pList, pOuterSrc, pInnerSrc) then
