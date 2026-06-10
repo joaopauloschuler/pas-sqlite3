@@ -141,7 +141,7 @@ type
     Ms       : LongInt;
   end;
 const
-  PER_TEST_TIMEOUT_OVERRIDES: array[0..6] of TPerTestTimeout = (
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..7] of TPerTestTimeout = (
     (BaseName: 'securedel2.test'; Ms: 900000),
     (BaseName: 'select4.test';    Ms: 900000),
     (BaseName: 'writecrash.test'; Ms: 900000),
@@ -159,7 +159,10 @@ const
       wal_checkpoint; incremental_vacuum(1)), ~7-9 fsyncs each — not a hang,
       just fsync-bound (~93s pas / ~77s C), so it blows past the 30s default
       on both engines.  Page/freelist/ptrmap logic is byte-identical to C. }
-    (BaseName: 'incrvacuum2.test'; Ms: 300000)
+    (BaseName: 'incrvacuum2.test'; Ms: 300000),
+    { crash.test runs 917 crash-injection subtests in ~94 s (measured pas,
+      2026-06-10, PASS) — legitimately past the 30s default, no engine bug. }
+    (BaseName: 'crash.test'; Ms: 300000)
   );
 
 var
