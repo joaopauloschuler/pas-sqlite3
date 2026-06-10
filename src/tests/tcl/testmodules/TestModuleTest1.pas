@@ -2563,6 +2563,43 @@ begin
   if clientData = nil then ;
 end;
 
+{ test3.c:580..607 — btree_set_cache_size ID NCACHE.
+  Set the size of the cache used by btree $ID.  ID is the "%p" text of a
+  Btree* (from btree_from_db); the Btree may belong to an open SQLite
+  connection, so take the controlling handle's mutex first.
+  9.4.7.d (crashsql child runs `btree_set_cache_size $bt 10`). }
+function btree_set_cache_size(clientData: TClientData; interp: PTclInterp;
+  argc: cint; argv: PPAnsiCharArr): cint; cdecl;
+type
+  TArgvArr = array[0..16] of PAnsiChar;
+  PArgvArr = ^TArgvArr;
+var
+  av:     PArgvArr;
+  nCache: cint;
+  pBt:    PBtree;
+begin
+  av := PArgvArr(argv);
+  if argc <> 3 then
+  begin
+    Tcl_AppendResult(interp, PChar('wrong # args: should be "'),
+      av^[0], PChar(' BT NCACHE"'), Pointer(nil));
+    Result := TCL_ERROR; Exit;
+  end;
+  pBt := PBtree(sqlite3TestTextToPtr(av^[1]));
+  if Tcl_GetInt(interp, av^[2], @nCache) <> 0 then
+  begin
+    Result := TCL_ERROR; Exit;
+  end;
+
+  sqlite3_mutex_enter(PTsqlite3(pBt^.db)^.mutex);
+  sqlite3BtreeEnter(pBt);
+  sqlite3BtreeSetCacheSize(pBt, nCache);
+  sqlite3BtreeLeave(pBt);
+  sqlite3_mutex_leave(PTsqlite3(pBt^.db)^.mutex);
+  Result := TCL_OK;
+  if clientData = nil then ;
+end;
+
 { test3.c:429..502 — btree_varint_test START MULTIPLIER COUNT INCREMENT.
   Round-trips integers through sqlite3PutVarint / sqlite3GetVarint to
   validate the codec.  Mirrors C 1:1 including the inner 19x getVarint
@@ -11068,6 +11105,9 @@ begin
   { 9.4.divbug.88.011 — btree_from_db.  test3.c:676. }
   Tcl_CreateCommand(interp, PChar('btree_from_db'),
     @btree_from_db, nil, nil);
+  { 9.4.7.d — btree_set_cache_size.  test3.c:678. }
+  Tcl_CreateCommand(interp, PChar('btree_set_cache_size'),
+    @btree_set_cache_size, nil, nil);
   { types.test — raw b-tree harness commands.  test3.c:664..674. }
   Tcl_CreateCommand(interp, PChar('btree_open'),
     @btree_open, nil, nil);
