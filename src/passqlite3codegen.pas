@@ -36906,29 +36906,83 @@ end;
   Fix: a subquery that carries SF_HasTypeInfo but was never actually expanded
   (SF_Expanded clear) is a victim of the premature stamp; drop SF_HasTypeInfo
   so the resolution below performs the real expand+resolve, matching the named
-  path. }
+  path.
+
+  window1-34.2 — the victims are not only the window list's TOP-LEVEL
+  x.pSelect: the AddTypeInfo walker stamps every Select it reaches, so a
+  subquery nested in the victim's own ORDER BY (`... OVER (ORDER BY (SELECT
+  ... ORDER BY (SELECT total(d) FROM (SELECT 1 AS d))))`) and that nested
+  subquery's FROM subqueries are stamped too.  Their later sqlite3Select
+  then skips SelectPrep entirely, the FROM item keeps pSTab=nil, and
+  disableUnusedSubqueryResultColumns AVs on the nil Table.  Walk the whole
+  expression tree and every nested Select, clearing each premature stamp
+  (SF_HasTypeInfo set, SF_Expanded clear) on the way. }
 procedure clearPrematureWinSubqTypeInfo(pList: PExprList);
-var
-  items: PExprListItem;
-  i: i32;
-  pE: PExpr;
-  pInner: PSelect;
-begin
-  if pList = nil then Exit;
-  items := ExprListItems(pList);
-  for i := 0 to pList^.nExpr - 1 do
+
+  procedure clearExpr(pE: PExpr); forward;
+  procedure clearSel(pSel: PSelect); forward;
+
+  procedure clearList(pL: PExprList);
+  var
+    items_: PExprListItem;
+    i_: i32;
   begin
-    pE := items[i].pExpr;
-    if pE = nil then continue;
-    if (pE^.flags and EP_xIsSelect) <> 0 then
+    if pL = nil then Exit;
+    items_ := ExprListItems(pL);
+    for i_ := 0 to pL^.nExpr - 1 do
+      clearExpr(items_[i_].pExpr);
+  end;
+
+  procedure clearSel(pSel: PSelect);
+  var
+    base_: PSrcItem;
+    pIt_:  PSrcItem;
+    j_:    i32;
+  begin
+    while pSel <> nil do
     begin
-      pInner := pE^.x.pSelect;
-      if (pInner <> nil)
-         and ((pInner^.selFlags and SF_HasTypeInfo) <> 0)
-         and ((pInner^.selFlags and SF_Expanded) = 0) then
-        pInner^.selFlags := pInner^.selFlags and (not u32(SF_HasTypeInfo));
+      if ((pSel^.selFlags and SF_HasTypeInfo) <> 0)
+         and ((pSel^.selFlags and SF_Expanded) = 0) then
+        pSel^.selFlags := pSel^.selFlags and (not u32(SF_HasTypeInfo));
+      clearList(pSel^.pEList);
+      clearExpr(pSel^.pWhere);
+      clearList(pSel^.pGroupBy);
+      clearExpr(pSel^.pHaving);
+      clearList(pSel^.pOrderBy);
+      if pSel^.pSrc <> nil then
+      begin
+        base_ := SrcListItems(pSel^.pSrc);
+        for j_ := 0 to pSel^.pSrc^.nSrc - 1 do
+        begin
+          pIt_ := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+          if SrcItemIsSubquery(pIt_^.fg) and (pIt_^.u4.pSubq <> nil) then
+            clearSel(pIt_^.u4.pSubq^.pSelect);
+        end;
+      end;
+      pSel := pSel^.pPrior;
     end;
   end;
+
+  procedure clearExpr(pE: PExpr);
+  begin
+    if pE = nil then Exit;
+    if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+    clearExpr(pE^.pLeft);
+    clearExpr(pE^.pRight);
+    if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil) then
+    begin
+      clearList(pE^.y.pWin^.pPartition);
+      clearList(pE^.y.pWin^.pOrderBy);
+      clearExpr(pE^.y.pWin^.pFilter);
+    end;
+    if (pE^.flags and EP_xIsSelect) <> 0 then
+      clearSel(pE^.x.pSelect)
+    else
+      clearList(pE^.x.pList);
+  end;
+
+begin
+  clearList(pList);
 end;
 
 { Phase 6.26 helper — gather window functions in pSel and finish the
