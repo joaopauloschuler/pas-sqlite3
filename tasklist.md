@@ -194,6 +194,35 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.40.8** Misc test SQL fns: added test_setsubtype/test_getsubtype to
 - [~] **6.40.9** WAL/blob harness cmds: ported blob_reopen, wal_checkpoint_v2, mmap_warm, interrupt, is_interrupted, utf8_to_utf8 + utf8To8Inplace (TestModuleTest1.pas; test1.c:1824/5984/6005/7685/8734, test_hexio.c:306). incrblob3 29→4 err, badutf2/mmapwarm cmds pass. TODO: port quota_glob (test_quota.c VFS shim — large).
 
+### 6.41 — Unported features the ORACLE HAS (real coverage gaps, surfaced by the 2026-06-09 empty-PASS audit)
+
+> These three are honest porting gaps where the oracle binary supports the
+> feature (per its `PRAGMA compile_options`), so tests COULD be verified
+> against it today — unlike the 6.40-era gaps gated on oracle absence.
+> Each currently empties its `.test` files via a `tester_min.tcl`
+> capability flag = 0 (the files record `PASS <path> 0 <ms>` — vacuous).
+> Flip the flag only when the feature lands.
+
+- [ ] **6.41.1** **Shared-cache mode** (ENGINE, L; btree.c shared-Btree
+  path + table-lock machinery). Port is deliberately on the
+  `SQLITE_OMIT_SHARED_CACHE` path — `sqlite3_enable_shared_cache` is an
+  accept-and-ignore stub (passqlite3main.pas:5428). Oracle HAS shared
+  cache. Gates `shared_cache=0` → empties shared3/4/6/7/8/A/B,
+  sharedlock, vtab_shared, walshared, ioerr4/5, fts3shared, fts4merge4,
+  notify2/3, thread001-005 and more (~13 zero-subtest PASS files + the
+  thread family).
+- [ ] **6.41.2** **mmap I/O** (ENGINE, M; pager xFetch/xUnfetch memory-map
+  read path, os_unix mmap methods, PRAGMA mmap_size). Port treats
+  SQLITE_MAX_MMAP_SIZE as 0 (tester_min.tcl:460 comment "mmap I/O not
+  ported"); oracle has MAX_MMAP_SIZE=0x7fff0000. Gates `mmap=0` →
+  empties mmap2, mmapcorrupt, bigmmap.
+- [ ] **6.41.3** **rtree extension** (EXT, L; ext/rtree/rtree.c ~4.5 kLOC
+  + geopoly). No rtree module exists anywhere in the Pascal sources;
+  oracle is compiled with ENABLE_RTREE. Gates `rtree=0` → empties
+  rtree.test (permutation driver) and contributes to vtabK skip.
+  Port order/precedent: follow the fts3 module pattern
+  (passqlite3fts3.pas, auto-registered at openDatabase).
+
 > NOTE (2026-05-22): securedel.test failures are NOT an engine porting gap — the
 > engine returns the correct `secure_delete` propagation when driven via the CLI;
 > the residual `{1 0}` is a Tcl-bridge prepared-statement-caching interaction with
@@ -554,6 +583,10 @@ regressions without human triage.
     - [ ] **9.4.8.f.4** sweep shard 4/5 — rows 139–184
     - [ ] **9.4.8.f.5** sweep shard 5/5 — rows 185–229
     - [ ] **9.4.8.f.6** re-probe long-running skips `writecrash.test` + `securedel2.test` — still 240 s watchdog timeouts with 0 subtests in the 2026-06-09 sweep (ex-divbug.84, closed; siblings select4/printf now PASS and were promoted to pas-strict)
+  - [ ] **9.4.8.g** PORTED-but-UNTESTED features (2026-06-09 empty-PASS audit) — Pascal code that ships with ZERO test coverage because the matching `ENABLE_*` option is absent from the oracle build, so `tester_min.tcl` declares the capability 0 and the gated `.test` files exit before their first `do_test` (recorded as vacuous `PASS <path> 0 <ms>`).  Fix shape per feature: build an oracle variant WITH the option, build the port with the matching define, flip the `sqlite_options` flag, sweep the gated tests, re-tag their STATUS.txt rows.  (Engine-side porting gaps where the CURRENT oracle already has the feature are tracked separately under **6.41**.)
+    - [ ] **9.4.8.g.1** **stat4** — fully ported behind `{$IFDEF SQLITE_ENABLE_STAT4}` (10.1.42.b.7; ~65 refs in passqlite3codegen.pas) with an opt-in `STAT4=1` gate already in build.sh; oracle lacks ENABLE_STAT4.  Build a `-DSQLITE_ENABLE_STAT4` oracle, flip `stat4=1`, sweep analyze3/5/6/8/D/E/F/G, skipscan5/6, tkt-cbd054fa6b (11 currently-empty files).
+    - [ ] **9.4.8.g.2** **icu** — ported (6.40.2 DONE) but `icu=0` / `icu_collations=0` because the oracle lacks libicu.  Build an `-DSQLITE_ENABLE_ICU` oracle linked against libicu, flip the flags, sweep icu.test (449 subtests) + fts3expr4.test (881).
+    - [ ] **9.4.8.g.3** **preupdate hook + snapshot API** — engine code ported (6.40.3 DONE) but `preupdate=0`/`snapshot=0` mirror the oracle (no ENABLE_PREUPDATE_HOOK / ENABLE_SNAPSHOT) and the snapshot Tcl trampolines are deliberately NOT registered (6.40.7).  Build an oracle with both options, register the trampolines, flip the flags, sweep hook2.test (568 subtests), preupdate.test, snapshot*.test (6 files).
 
 #### 9.4 — Missing routines still to port (engine + harness gaps)
 
