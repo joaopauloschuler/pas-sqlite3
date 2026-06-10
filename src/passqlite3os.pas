@@ -2744,6 +2744,13 @@ function unixAccess(pVfs: Psqlite3_vfs; zPath: PChar;
 var
   buf : Stat;
 begin
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:6888 — SimulateIOError( return SQLITE_IOERR_ACCESS ) }
+  if SimulateIOError then begin
+    Result := SQLITE_IOERR_ACCESS;
+    Exit;
+  end;
+  {$endif}
   if flags = SQLITE_ACCESS_EXISTS then begin
     { os_unix.c ~6910: stat succeeds AND (not a regular zero-size file) }
     if (FpStat(zPath, buf) = 0) and
