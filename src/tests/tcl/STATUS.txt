@@ -781,7 +781,7 @@ pas-strict	../sqlite3/test/shell7.test	-
 pas-strict	../sqlite3/test/shell8.test	-
 pas-strict	../sqlite3/test/shell9.test	-
 pas-strict	../sqlite3/test/shellA.test	-
-pas-soft	../sqlite3/test/shellB.test	9.4.divbug.93.b
+pas-strict	../sqlite3/test/shellB.test	-
 pas-strict	../sqlite3/test/shmlock.test	-
 pas-strict	../sqlite3/test/shortread1.test	-
 pas-strict	../sqlite3/test/shrink.test	-
