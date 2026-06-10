@@ -689,12 +689,22 @@ const
   );
 
 { ----------------------------------------------------------------------
-  connectionIsBusy — true if the connection has unfinalised statements.
+  connectionIsBusy — true if the connection has unfinalised statements
+  or unfinished sqlite3_backup objects.
   main.c:1240
   ---------------------------------------------------------------------- }
 function connectionIsBusy(db: PTsqlite3): i32;
+var
+  j: i32;
+  pBt: PBtree;
 begin
   if db^.pVdbe <> nil then begin Result := 1; Exit; end;
+  for j := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[j].pBt);
+    if (pBt <> nil) and (sqlite3BtreeIsInBackup(pBt) <> 0) then begin
+      Result := 1; Exit;
+    end;
+  end;
   Result := 0;
 end;
 

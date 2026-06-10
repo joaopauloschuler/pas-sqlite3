@@ -2033,6 +2033,17 @@ begin
     rc := pagerUndoCallback(pPager, pList^.pgno);
     pList := pList^.pDirty;
   end;
+
+  { pager.c:3131 — Normally, if a transaction is rolled back, any backup
+    processes are updated as data is copied out of the rollback journal and
+    into the database. This is not generally possible with a WAL database,
+    as rollback involves simply truncating the log file. Therefore, if one
+    or more frames have already been written to the log (and therefore
+    also copied into the backup databases) as part of this transaction,
+    the backups must be restarted. }
+  if Assigned(sqlite3PagerBackupRestartFn) then
+    sqlite3PagerBackupRestartFn(pPager^.pBackup);
+
   Result := rc;
 end;
 
@@ -4615,6 +4626,11 @@ begin
 
   if pagerFlushOnCommit(pPager, 1) = 0 then
   begin
+    { pager.c:6493 — If this is an in-memory db, or no pages have been
+      written to, or this function has already been called, it is mostly
+      a no-op.  However, any backup in progress needs to be restarted. }
+    if Assigned(sqlite3PagerBackupRestartFn) then
+      sqlite3PagerBackupRestartFn(pPager^.pBackup);
     Exit(SQLITE_OK);
   end;
 
