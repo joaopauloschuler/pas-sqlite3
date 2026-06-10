@@ -12748,8 +12748,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         outer aggregate (it only sets NC_HasWin on its own SELECT).  So a
         subquery like (SELECT min(a) OVER()) referencing an outer column must
         stay a window function bound to the inner SELECT, not pull the outer
-        query into aggregate mode (colname-9.330). }
-      if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil) then
+        query into aggregate mode (colname-9.330).
+        window1-38.10 — C's IsWindowFunc (sqliteInt.h) excludes
+        eFrmType==TK_FILTER: an aggregate with a FILTER clause but no OVER
+        is still an ordinary aggregate (resolve.c:1334 walks just its
+        pFilter), so it must remain eligible for outward promotion. }
+      if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil)
+         and (pX^.y.pWin^.eFrmType <> TK_FILTER) then
         isAgg := False;
       if isAgg then
       begin
@@ -12978,7 +12983,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         pDef := sqlite3FindFunction(pParse^.db, pX^.u.zToken, -1,
                                     pParse^.db^.enc, 0);
       isAgg := (pDef <> nil) and Assigned(pDef^.xFinalize);
-      if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil) then
+      { window1-38.10 — like the fixed-op2 variant above: TK_FILTER means a
+        FILTER-only aggregate (no OVER), which C still treats as a plain
+        aggregate (IsWindowFunc excludes TK_FILTER). }
+      if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil)
+         and (pX^.y.pWin^.eFrmType <> TK_FILTER) then
         isAgg := False;
       if isAgg then
       begin
@@ -12990,6 +12999,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
            or ((pX^.pLeft <> nil) and (pX^.pLeft^.op = TK_ORDER)
                and ((pX^.pLeft^.flags and EP_xIsSelect) = 0)
                and ExprListArgRefsOuterCursor(pX^.pLeft^.x.pList, pInnerSrc));
+        { window1-38.10 / filter1-6.1 — sqlite3ReferencesSrcList (called from
+          resolve.c:1338's pNC2 climb) includes the FILTER predicate via
+          walkWindowList, so FILTER refs anchor the aggregate exactly like
+          argument refs: a FILTER referencing only the OUTER FROM promotes
+          the aggregate to the outer query (where, sitting in the outer
+          WHERE, it becomes "misuse of aggregate: AVG()"). }
+        if ExprHasProperty(pX, EP_WinFunc) and (pX^.y.pWin <> nil)
+           and (pX^.y.pWin^.pFilter <> nil) then
+        begin
+          if ExprRefsOuterCursor(pX^.y.pWin^.pFilter, pInnerSrc) then
+            refInner := True;
+          if ExprRefsOuterCursor(pX^.y.pWin^.pFilter, pOuterSrc) then
+            refOuter := True;
+        end;
         { sqlite3ReferencesSrcList 0x01 bit: correlated reference to the
           inner FROM inside a nested expression-subquery of the args
           (aggnested-4.1). }
