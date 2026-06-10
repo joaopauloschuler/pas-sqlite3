@@ -40436,6 +40436,18 @@ begin
       { generateSortTail — drain the sorter, emit ResultRow per row.
         OFFSET applies post-sort via OP_IfPos; LIMIT not supported here
         (gated off above). }
+      { explainTempTable("ORDER BY") — generateSortTail entry
+        (select.c:1702..1711).  This hand-rolled window-arm sorter never
+        gets planner help (nOBSat is always 0 here), so it is always the
+        plain "USE TEMP B-TREE FOR ORDER BY" form.  Without this node the
+        EQP tree under-reports the per-window-layer sorts (window1-23.3
+        expects 2 ORDER nodes, 23.6 expects 3). }
+      i := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp4(v, OP_Explain, i, pParse^.addrExplain, 0,
+                        sqlite3MPrintf(pParse^.db,
+                                       'USE TEMP B-TREE FOR %s',
+                                       ['ORDER BY']),
+                        P4_DYNAMIC);
       Inc(pParse^.nMem); regSortOutW := pParse^.nMem;
       iSortTabW := pParse^.nTab; Inc(pParse^.nTab);
       addrSortBrkW := sqlite3VdbeMakeLabel(pParse);
