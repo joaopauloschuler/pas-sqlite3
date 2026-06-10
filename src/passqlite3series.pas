@@ -52,6 +52,19 @@ const
   SMALLEST_INT64 : i64 = i64($8000000000000000);
   LARGEST_UINT64 : u64 = u64($FFFFFFFFFFFFFFFF);
 
+  { True to cause run-time checking of the start=, stop=, and/or step=
+    parameters.  The only reason to do this is for testing the
+    constraint checking logic for virtual tables in the SQLite core.
+    series.c:343..348.  Upstream's testfixture is built with
+    -DSQLITE_SERIES_CONSTRAINT_VERIFY=1 (main.mk TESTFIXTURE_FLAGS);
+    the TCL test build here passes -dSQLITE_TEST, so key off that.
+    The plain shell build keeps 0, matching the plain C shell. }
+  {$IFDEF SQLITE_TEST}
+  SQLITE_SERIES_CONSTRAINT_VERIFY = 1;
+  {$ELSE}
+  SQLITE_SERIES_CONSTRAINT_VERIFY = 0;
+  {$ENDIF}
+
   { Column numbers — series.c:229..233 }
   SERIES_COLUMN_ROWID = -1;
   SERIES_COLUMN_VALUE = 0;
@@ -559,8 +572,13 @@ begin
       Inc(pUse, j);
       Inc(nArg);
       pUse^.argvIndex := nArg;
-      if i >= 3 then pUse^.omit := 1 else pUse^.omit := 1;
-      { SQLITE_SERIES_CONSTRAINT_VERIFY=0 in upstream → omit always 1 }
+      { omit = !SQLITE_SERIES_CONSTRAINT_VERIFY || i>=3 — series.c:833..834.
+        With CONSTRAINT_VERIFY (testfixture build) the VDBE re-checks the
+        start/stop/step constraints against the normalized column values. }
+      if (SQLITE_SERIES_CONSTRAINT_VERIFY = 0) or (i >= 3) then
+        pUse^.omit := 1
+      else
+        pUse^.omit := 0;
     end;
   end;
 

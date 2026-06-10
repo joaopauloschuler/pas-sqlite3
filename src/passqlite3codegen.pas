@@ -37480,6 +37480,68 @@ begin
   Result := 1;
 end;
 
+{ tabfunc01-1370 (testfixture parity) — residual re-check of func-arg
+  constraints for the Pas-only eponymous-vtab fast-arms below.
+
+  C has no such fast-arms: every vtab scan goes through sqlite3WhereBegin,
+  whose per-loop body codegen re-evaluates any constraint term the vtab's
+  xBestIndex consumed without setting aConstraintUsage[].omit (wherecode.c:
+  1616 only disableTerm()s omitMask bits; the rest land in the residual
+  walk at wherecode.c:2587).  The fast-arms drive xBestIndex directly and
+  previously assumed every consumed constraint was also omitted — true for
+  the production builds of json_each / generate_series etc., but NOT for
+  the testfixture build where -DSQLITE_SERIES_CONSTRAINT_VERIFY=1 makes
+  seriesBestIndex leave omit=0 on start/stop/step so the core re-checks
+  them (e.g. step=0 is normalized to 1 by seriesFilter, the re-check
+  1<>0 then filters every row → empty result).
+
+  vtabFuncArgNeedsRecheck reports whether any consumed constraint has
+  omit=0; vtabFuncArgRecheck emits `hidden-col = +arg` tests (the same
+  expression shape sqlite3WhereTabFuncArgs builds) jumping to addrSkip on
+  mismatch, mirroring the residual walk's sqlite3ExprIfFalse coding. }
+function vtabFuncArgNeedsRecheck(vtabBI_OK: Boolean; nFuncArg: i32;
+  const idxUsage: array of passqlite3vtab.Tsqlite3_index_constraint_usage
+  ): Boolean;
+var
+  iFA: i32;
+begin
+  Result := False;
+  if (not vtabBI_OK) or (nFuncArg <= 0) then Exit;
+  for iFA := 0 to nFuncArg - 1 do
+    if (idxUsage[iFA].argvIndex >= 1) and (idxUsage[iFA].omit = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure vtabFuncArgRecheck(pParse: PParse; pItem: PSrcItem; pTab: PTable2;
+  iCsr: i32; nFuncArg: i32; const hiddenIdx: array of i32;
+  const idxUsage: array of passqlite3vtab.Tsqlite3_index_constraint_usage;
+  addrSkip: i32);
+var
+  iFA:     i32;
+  pColRef: PExpr;
+  pCmp:    PExpr;
+begin
+  for iFA := 0 to nFuncArg - 1 do
+  begin
+    if (idxUsage[iFA].argvIndex < 1) or (idxUsage[iFA].omit <> 0) then
+      Continue;
+    pColRef := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+    if pColRef = nil then Exit;
+    pColRef^.iTable  := iCsr;
+    pColRef^.iColumn := i16(hiddenIdx[iFA]);
+    pColRef^.y.pTab  := pTab;
+    pCmp := sqlite3PExpr(pParse, TK_EQ, pColRef,
+              sqlite3PExpr(pParse, TK_UPLUS,
+                sqlite3ExprDup(pParse^.db,
+                  ExprListItems(pItem^.u1.pFuncArg)[iFA].pExpr, 0), nil));
+    sqlite3ExprIfFalse(pParse, pCmp, addrSkip, SQLITE_JUMPIFNULL);
+    sqlite3ExprDelete(pParse^.db, pCmp);
+  end;
+end;
+
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 var
@@ -37726,6 +37788,8 @@ var
   idxConstraints: array of passqlite3vtab.Tsqlite3_index_constraint;
   idxUsage:      array of passqlite3vtab.Tsqlite3_index_constraint_usage;
   idxInfo:       passqlite3vtab.Tsqlite3_index_info;
+  needRCVF:      Boolean;       { any consumed constraint with omit=0? }
+  addrSkipRCVF:  i32;           { skip-row label for vtabFuncArgRecheck }
   vtabOrderBy:   passqlite3vtab.Tsqlite3_index_orderby;
   pMMExpr:       PExpr;
   pVTab2:        passqlite3vtab.PVTable;
@@ -41068,7 +41132,20 @@ begin
         else
           addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
                                              addrEnd, regAgg);
+        { Re-check consumed-but-not-omitted func-arg constraints
+          (testfixture SQLITE_SERIES_CONSTRAINT_VERIFY parity — see
+          vtabFuncArgRecheck above).  Mismatched rows skip the count. }
+        needRCVF := vtabFuncArgNeedsRecheck(vtabBI_OK, nFuncArg, idxUsage);
+        addrSkipRCVF := 0;
+        if needRCVF then
+        begin
+          addrSkipRCVF := sqlite3VdbeMakeLabel(pParse);
+          vtabFuncArgRecheck(pParse, pItem, pTab, iCsr, nFuncArg,
+                             hiddenIdx, idxUsage, addrSkipRCVF);
+        end;
         sqlite3VdbeAddOp2(v, OP_AddImm, regCount, 1);
+        if needRCVF then
+          sqlite3VdbeResolveLabel(v, addrSkipRCVF);
         sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
 
         sqlite3VdbeResolveLabel(v, addrEnd);
@@ -41493,11 +41570,20 @@ begin
           else
             addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
                                                 addrEnd, regAgg);
-          if p^.pWhere <> nil then
+          { Re-check consumed-but-not-omitted func-arg constraints
+            (testfixture SQLITE_SERIES_CONSTRAINT_VERIFY parity — see
+            vtabFuncArgRecheck above).  Mismatched rows skip the
+            accumulator update, like a failed pWhere. }
+          needRCVF := vtabFuncArgNeedsRecheck(vtabBI_OK, nFuncArg, idxUsage);
+          if (p^.pWhere <> nil) or needRCVF then
           begin
             addrSkip := sqlite3VdbeMakeLabel(pParse);
-            sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
-                               SQLITE_JUMPIFNULL);
+            if needRCVF then
+              vtabFuncArgRecheck(pParse, pItem, pTab, iCsr, nFuncArg,
+                                 hiddenIdx, idxUsage, addrSkip);
+            if p^.pWhere <> nil then
+              sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                                 SQLITE_JUMPIFNULL);
             updateAccumulatorSimple(pParse, pAggI2, regAcc);
             sqlite3VdbeResolveLabel(v, addrSkip);
           end
@@ -42216,10 +42302,18 @@ begin
         eTabType=TABTYP_VTAB routes through OP_VColumn.  When p^.pWhere
         is present, evaluate it before the result emit and jump to the
         VNext on false (skip the row). }
-      if (p^.pWhere <> nil) or (p^.iOffset <> 0) then
+      { Re-check consumed-but-not-omitted func-arg constraints
+        (testfixture SQLITE_SERIES_CONSTRAINT_VERIFY parity — see
+        vtabFuncArgRecheck above).  Mismatched rows jump to addrSkip
+        (→ OP_VNext), exactly like a failed pWhere. }
+      needRCVF := vtabFuncArgNeedsRecheck(vtabBI_OK, nFuncArg, idxUsage);
+      if (p^.pWhere <> nil) or (p^.iOffset <> 0) or needRCVF then
         addrSkip := sqlite3VdbeMakeLabel(pParse)
       else
         addrSkip := 0;
+      if needRCVF then
+        vtabFuncArgRecheck(pParse, pItem, pTab, iCsr, nFuncArg,
+                           hiddenIdx, idxUsage, addrSkip);
       if p^.pWhere <> nil then
         sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
                            SQLITE_JUMPIFNULL);
