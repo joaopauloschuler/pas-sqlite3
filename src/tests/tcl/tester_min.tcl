@@ -987,7 +987,13 @@ proc crashsql {args} {
   puts $f "catch { install_malloc_faultsim 1 }"
   puts $f "sqlite3_crash_enable 1 $dfltvfs"
   puts $f "sqlite3_crashparams $blocksize $dc $crashdelay $cfile"
-  puts $f "catch { sqlite3_test_control_pending_byte \$::sqlite_pending_byte }"
+  # tester.tcl:1794 — INTERPOLATE the parent's pending-byte value into the
+  # child script (upstream has no catch and no deferred \$: the child has no
+  # ::sqlite_pending_byte variable of its own).  A deferred reference makes
+  # the child silently keep the default PENDING_BYTE (0x40000000) while the
+  # parent uses 0x10000, so child-written pages at the parent's locking page
+  # read back as corruption (walcrash-5/6, 9.4.divbug.100).
+  puts $f "sqlite3_test_control_pending_byte $::sqlite_pending_byte"
   puts $f "catch { autoinstall_test_functions }"
 
   if {$opendb ne ""} {

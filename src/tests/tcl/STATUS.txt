@@ -1120,9 +1120,9 @@ pas-strict	../sqlite3/test/walbig.test	-
 pas-skip	../sqlite3/test/walblock.test	9.4.8.f.5
 pas-skip	../sqlite3/test/walckptnoop.test	9.4.8.f.5
 pas-skip	../sqlite3/test/walcksum.test	9.4.8.f.5
-pas-soft	../sqlite3/test/walcrash.test	9.4.divbug.100
+pas-strict	../sqlite3/test/walcrash.test	-
 pas-skip	../sqlite3/test/walcrash2.test	9.4.8.f.5
-pas-soft	../sqlite3/test/walcrash3.test	9.4.divbug.100
+pas-strict	../sqlite3/test/walcrash3.test	-
 pas-skip	../sqlite3/test/walcrash4.test	9.4.8.f.5
 pas-skip	../sqlite3/test/walfault.test	9.4.8.f.5
 pas-skip	../sqlite3/test/walfault2.test	9.4.8.f.5

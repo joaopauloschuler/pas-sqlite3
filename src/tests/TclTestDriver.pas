@@ -141,7 +141,7 @@ type
     Ms       : LongInt;
   end;
 const
-  PER_TEST_TIMEOUT_OVERRIDES: array[0..9] of TPerTestTimeout = (
+  PER_TEST_TIMEOUT_OVERRIDES: array[0..11] of TPerTestTimeout = (
     { sort4.test — multi-threaded sorter stress: 7 sorter_test configs x 10
       repeats over a 100k-row table; ~204 s measured (pas, 2026-06-10, PASS),
       legitimately past the 30 s default. }
@@ -171,7 +171,16 @@ const
       PER_TEST_ARGV_OVERRIDES) runs one fuzz.test quick-mode iteration:
       175 subtests in ~35 s measured (pas, 2026-06-10, PASS) — just past
       the 30 s default. }
-    (BaseName: 'soak.test'; Ms: 300000)
+    (BaseName: 'soak.test'; Ms: 300000),
+    { 9.4.divbug.100 — walcrash.test runs 6 sections x 99 crashsql child
+      spawns each (2970 subtests); ~517 s measured (pas, 2026-06-10, PASS,
+      NO_SYNC build) — crash/recovery iteration cost, not a hang. }
+    (BaseName: 'walcrash.test'; Ms: 1200000),
+    { 9.4.divbug.100 — walcrash3.test section 2 runs up to 9998 crashsql
+      child spawns (walcrash3.test:100, `$i<10000`); 20996 subtests in
+      ~1278 s measured (pas, 2026-06-10, PASS), but iteration count is
+      stochastic — keep headroom (the C oracle takes ~70 min). }
+    (BaseName: 'walcrash3.test'; Ms: 7200000)
   );
 
 type

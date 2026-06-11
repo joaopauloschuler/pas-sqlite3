@@ -3496,7 +3496,6 @@ function unixLockSharedMemory(pDbFd: PunixFile; pShmNode: PunixShmNode): cint;
 var
   lock    : FLock;
   rc      : cint;
-  shmStat : Stat;
 begin
   rc := SQLITE_OK;
   lock.l_whence := SEEK_SET;
@@ -3523,17 +3522,15 @@ begin
     rc := unixShmSystemLock(pDbFd, F_WRLCK, UNIX_SHM_DMS, 1);
     if rc = SQLITE_OK then
     begin
-      { Only truncate when the SHM is truly empty (<= 3 bytes).
-        F_GETLK does not report locks held by the calling process
-        (Linux POSIX advisory lock semantics), so when two connections
-        in the same process race here the second one sees F_UNLCK and
-        would incorrectly truncate an already-initialized SHM.
-        Checking the file size is the reliable in-process proxy. }
-      if (FpFStat(pShmNode^.hShm, shmStat) <> 0) or (shmStat.st_size <= 3) then
-      begin
-        if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
-          rc := SQLITE_IOERR_SHMOPEN;
-      end;
+      { os_unix.c:4906 — the first connection to attach must truncate the
+        -shm file (to 3 bytes, an upstream debugging aid) UNCONDITIONALLY:
+        a leftover -shm from a crashed process carries an internally-valid
+        wal-index header, so without this truncation recovery is skipped
+        and stale frame counts are trusted (9.4.divbug.100, walcrash.test).
+        In-process second connections never reach this path — they reuse
+        pInode^.pShmNode in unixOpenSharedMemory, exactly as in C. }
+      if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
+        rc := SQLITE_IOERR_SHMOPEN;
     end;
   end
   else if lock.l_type = SmallInt(F_WRLCK) then
@@ -3551,8 +3548,8 @@ end;
 { os_unix.c ~4953: unixOpenSharedMemory
   Open (or attach to an existing) shared-memory segment for pDbFd.
   Creates the -shm file alongside the database file.
-  Simplified from C: no global inode list; each pDbFd owns its own pShmNode
-  (intra-process sharing deferred — cross-process works via mmap MAP_SHARED). }
+  As in C, in-process connections on the same inode share one pShmNode
+  (via pInode^.pShmNode); cross-process sharing works via mmap MAP_SHARED. }
 function unixOpenSharedMemory(pDbFd: PunixFile): cint;
 var
   p        : PunixShm;

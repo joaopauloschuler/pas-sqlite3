@@ -85,6 +85,9 @@ type
 
 var
   g: TCrashGlobal;
+  { Debug trace mirroring test6.c TRACE_CRASHTEST printfs; enabled at
+    runtime via the CRASHTRACE env var (temporary diagnostic aid). }
+  crashTrace: Boolean = False;
   sqlite3CrashTestEnable: cint = 0;
   crashVfs: sqlite3_vfs;
   crashVfsRegistered: Boolean = False;
@@ -189,6 +192,15 @@ begin
     pFinal := pWrite;
   end;
 
+  if crashTrace and (pFile <> nil) then
+  begin
+    if isCrash <> 0 then
+      WriteLn('Sync ', pFile^.zName, ' (is a crash)')
+    else
+      WriteLn('Sync ', pFile^.zName, ' (is not a crash)');
+    Flush(Output);
+  end;
+
   ppPtr := @g.pWriteList;
   pWrite := ppPtr^;
   while (rc = SQLITE_OK) and (pWrite <> nil) do
@@ -230,6 +242,19 @@ begin
         eAction := 2
       else
         eAction := 1;
+    end;
+
+    if crashTrace and (isCrash <> 0) then
+    begin
+      case eAction of
+        1: WriteLn('Writing ', pWrite^.nBuf, ' bytes @ ', pWrite^.iOffset,
+                   ' (', pWrite^.pFile^.zName, ')');
+        2: WriteLn('Omiting ', pWrite^.nBuf, ' bytes @ ', pWrite^.iOffset,
+                   ' (', pWrite^.pFile^.zName, ')');
+        3: WriteLn('Trashing @ ', pWrite^.iOffset,
+                   ' (', pWrite^.pFile^.zName, ')');
+      end;
+      Flush(Output);
     end;
 
     case eAction of
@@ -491,6 +516,42 @@ end;
 function cfDeviceCharacteristics(pFile: Psqlite3_file): cint; cdecl;
 begin
   Result := g.iDeviceChars;
+end;
+
+{ test6.c:548..570 — pass-throughs for WAL support.  These dispatch on
+  the REAL file's pMethods directly (C calls pReal->pMethods->xShm*,
+  not the sqlite3OsXxx wrappers).  Without these, the pager's
+  sqlite3PagerWalSupported() sees xShmMap==nil and silently refuses
+  `PRAGMA journal_mode=WAL`, so the crash-armed WAL file is never
+  created and cfSync never fires (root cause of 9.4.divbug.100). }
+function cfShmLock(pFile: Psqlite3_file; ofst, n, flags: cint): cint; cdecl;
+var
+  pReal: Psqlite3_file;
+begin
+  pReal := PCrashFile(pFile)^.pRealFile;
+  Result := pReal^.pMethods^.xShmLock(pReal, ofst, n, flags);
+end;
+procedure cfShmBarrier(pFile: Psqlite3_file); cdecl;
+var
+  pReal: Psqlite3_file;
+begin
+  pReal := PCrashFile(pFile)^.pRealFile;
+  pReal^.pMethods^.xShmBarrier(pReal);
+end;
+function cfShmUnmap(pFile: Psqlite3_file; delFlag: cint): cint; cdecl;
+var
+  pReal: Psqlite3_file;
+begin
+  pReal := PCrashFile(pFile)^.pRealFile;
+  Result := pReal^.pMethods^.xShmUnmap(pReal, delFlag);
+end;
+function cfShmMap(pFile: Psqlite3_file; iRegion, sz, w: cint;
+  pp: PPointer): cint; cdecl;
+var
+  pReal: Psqlite3_file;
+begin
+  pReal := PCrashFile(pFile)^.pRealFile;
+  Result := pReal^.pMethods^.xShmMap(pReal, iRegion, sz, w, pp);
 end;
 
 { test6.c:607..659 — open: open real file, allocate cache, slurp content
@@ -887,7 +948,11 @@ begin
   CrashFileVtab.xFileControl          := @cfFileControl;
   CrashFileVtab.xSectorSize           := @cfSectorSize;
   CrashFileVtab.xDeviceCharacteristics:= @cfDeviceCharacteristics;
-  { Shm methods left nil — WAL crash testing is a 9.4.7.d.followup.2. }
+  { test6.c:589..592 — WAL shm pass-throughs (9.4.divbug.100). }
+  CrashFileVtab.xShmMap               := @cfShmMap;
+  CrashFileVtab.xShmLock              := @cfShmLock;
+  CrashFileVtab.xShmBarrier           := @cfShmBarrier;
+  CrashFileVtab.xShmUnmap             := @cfShmUnmap;
 end;
 
 {$endif SQLITE_TEST}
@@ -898,6 +963,7 @@ begin
   InitCrashFileVtab;
   FillChar(g, SizeOf(g), 0);
   g.iSectorSize := SQLITE_DEFAULT_SECTOR_SIZE;
+  crashTrace := GetEnvironmentVariable('CRASHTRACE') <> '';
   Tcl_CreateObjCommand(interp, PChar('sqlite3_crash_enable'),
     @crashEnableCmd, nil, nil);
   Tcl_CreateObjCommand(interp, PChar('sqlite3_crashparams'),
