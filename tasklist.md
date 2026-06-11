@@ -222,6 +222,30 @@ FPC porting traps that recur often enough to call out up-front:
   rtree.test (permutation driver) and contributes to vtabK skip.
   Port order/precedent: follow the fts3 module pattern
   (passqlite3fts3.pas, auto-registered at openDatabase).
+- [ ] **6.41.4** **`PRAGMA compile_options` / `sqlite3_compileoption_used`
+  divergence** (API, S; passqlite3main.pas:3676 `sqlite3azCompileOpt`).
+  The port's table reports only 6 entries (`COMPILER=fpc`,
+  `DIRECT_OVERFLOW_READ`, `ENABLE_MATH_FUNCTIONS`, `OMIT_DEPRECATED`,
+  `OMIT_LOAD_EXTENSION`, `THREADSAFE=1`) vs. the oracle's ~55 (audited
+  2026-06-10): missing all `MAX_*`/`DEFAULT_*` values plus `DQS=0`,
+  `STRICT_SUBTYPE`, `TEMP_STORE=1`, `ATOMIC_INTRINSICS=1`,
+  `MUTEX_PTHREADS`, `SYSTEM_MALLOC`, `HAVE_ISNAN`,
+  `MALLOC_SOFT_LIMIT=1024`, and the `ENABLE_*` extension set (those
+  follow 6.40.1/6.41.x as the features land). Worse, two entries are
+  affirmatively WRONG vs. the oracle: it claims `OMIT_DEPRECATED` and
+  `OMIT_LOAD_EXTENSION` while the oracle build compiles BOTH features
+  in (neither appears in its compile_options). Also `passqlite3.inc:47`
+  defines `SQLITE_OMIT_AUTOINIT`, which the oracle does not. Any test
+  branching on `sqlite_compileoption_used()` /
+  `sqlite_compileoption_get()` / `PRAGMA compile_options` for an option
+  in the gap silently takes a different path on the two engines —
+  latent wrong-branch divergence, same symptom class as the
+  `ifcapable` pins in tester_min.tcl. Fix: regenerate
+  `sqlite3azCompileOpt` from the oracle's actual
+  `PRAGMA compile_options` (minus DEBUG/EXPLAIN_COMMENTS/API_ARMOR
+  which are oracle-build-only, and COMPILER=), dropping the two false
+  OMIT_* claims; keep entries for not-yet-ported ENABLE_* features OUT
+  until each lands (they'd advertise capabilities the engine lacks).
 
 > NOTE (2026-05-22): securedel.test failures are NOT an engine porting gap — the
 > engine returns the correct `secure_delete` propagation when driven via the CLI;
