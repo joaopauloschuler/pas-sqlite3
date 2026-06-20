@@ -5408,6 +5408,35 @@ begin
   Result := TCL_OK;
 end;
 
+{ test_thread.c:368..381 — clock_seconds_proc.  "More or less the same as
+  the regular tcl [clock seconds]" but always available as a native
+  command.  soak.test:70/:75 drives its run-duration loop off
+  [clock_seconds]; upstream registers this spelling in spawned-thread
+  interps (test_thread.c:119) and the `clock_second` spelling in the
+  main interp (test_thread.c:643).  We register both spellings (plus
+  clock_milliseconds) below — sqlthread itself is unported. }
+function ClockSecondsCmd(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  now: TTclTime;
+begin
+  Tcl_GetTime(@now);
+  Tcl_SetObjResult(interp, Tcl_NewIntObj(cint(now.sec)));
+  Result := TCL_OK;
+end;
+
+{ test_thread.c:383..395 — clock_milliseconds_proc. }
+function ClockMillisecondsCmd(clientData: TClientData; interp: PTclInterp;
+  objc: cint; objv: PPTclObj): cint; cdecl;
+var
+  now: TTclTime;
+begin
+  Tcl_GetTime(@now);
+  Tcl_SetObjResult(interp, Tcl_NewWideIntObj(
+    (Int64(now.sec) * 1000) + (now.usec div 1000)));
+  Result := TCL_OK;
+end;
+
 function Sqlite3_Init(interp: PTclInterp): cint; cdecl;
 var
   rc: cint;
@@ -5430,6 +5459,19 @@ begin
   { 9.4.divbug.88.012..020 — corrupt*.test prologue requires this. }
   Tcl_CreateObjCommand(interp, PChar('nonzero_reserved_bytes'),
     @NonzeroReservedBytes, nil, nil);
+  { 9.4.divbug.99 — test_thread.c clock commands.  SqlitetestThread_Init
+    registers `clock_second` + `clock_milliseconds` in the main interp
+    (test_thread.c:643..644) and tclScriptThread registers the
+    `clock_seconds` spelling in spawned-thread interps
+    (test_thread.c:119).  soak.test:70 needs [clock_seconds], so all
+    three spellings are registered here (no thread interps in this
+    port). }
+  Tcl_CreateObjCommand(interp, PChar('clock_seconds'),
+    @ClockSecondsCmd, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('clock_second'),
+    @ClockSecondsCmd, nil, nil);
+  Tcl_CreateObjCommand(interp, PChar('clock_milliseconds'),
+    @ClockMillisecondsCmd, nil, nil);
   { 9.4.8.d — opcode coverage probes (see PasOpcodeCoverage{Enable,Dump}). }
   Tcl_CreateObjCommand(interp, PChar('pas_opcode_coverage_enable'),
     @PasOpcodeCoverageEnable, nil, nil);

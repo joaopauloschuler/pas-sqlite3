@@ -191,6 +191,17 @@ function Tcl_NewWideIntObj(wideValue: Int64): PTclObj; cdecl; external 'tcl8.6';
 function Tcl_NewDoubleObj(doubleValue: Double): PTclObj; cdecl; external 'tcl8.6';
 function Tcl_NewByteArrayObj(bytes: Pointer; length: cint): PTclObj; cdecl; external 'tcl8.6';
 
+{ Wall-clock time.  tcl.h Tcl_Time {long sec; long usec;} +
+  Tcl_GetTime(Tcl_Time*) — used by test_thread.c:368..395
+  (clock_seconds_proc / clock_milliseconds_proc). }
+type
+  PTclTime = ^TTclTime;
+  TTclTime = record
+    sec  : clong;   { seconds since the epoch }
+    usec : clong;   { microseconds within the second }
+  end;
+procedure Tcl_GetTime(timePtr: PTclTime); cdecl; external 'tcl8.6';
+
 { Lists.  tclsqlite.c:1046 (NewListObj), :753 (ListObjAppendElement),
   :1042 (ListObjGetElements). }
 function Tcl_NewListObj(objc: cint; objv: PPTclObj): PTclObj; cdecl; external 'tcl8.6';

@@ -265,7 +265,7 @@ pas-strict	../sqlite3/test/e_delete.test	-
 pas-strict	../sqlite3/test/e_droptrigger.test	-
 pas-strict	../sqlite3/test/e_dropview.test	-
 pas-skip	../sqlite3/test/e_expr.test	9.4.8.f.1
-pas-soft	../sqlite3/test/e_fkey.test	9.4.divbug.94
+pas-strict	../sqlite3/test/e_fkey.test	-
 pas-skip	../sqlite3/test/e_fts3.test	9.4.8.f.1
 pas-strict	../sqlite3/test/e_insert.test	-
 pas-strict	../sqlite3/test/e_reindex.test	-
@@ -277,7 +277,7 @@ pas-strict	../sqlite3/test/e_update.test	-
 pas-strict	../sqlite3/test/e_uri.test	-
 pas-skip	../sqlite3/test/e_vacuum.test	9.4.8.f.1
 pas-strict	../sqlite3/test/e_wal.test	-
-pas-soft	../sqlite3/test/e_walauto.test	9.4.divbug.94
+pas-strict	../sqlite3/test/e_walauto.test	-
 pas-skip	../sqlite3/test/e_walckpt.test	9.4.8.f.1
 pas-strict	../sqlite3/test/e_walhook.test	-
 pas-strict	../sqlite3/test/emptytable.test	-
@@ -797,7 +797,7 @@ pas-strict	../sqlite3/test/snapshot3.test	-
 pas-strict	../sqlite3/test/snapshot4.test	-
 pas-strict	../sqlite3/test/snapshot_fault.test	-
 pas-strict	../sqlite3/test/snapshot_up.test	-
-pas-skip	../sqlite3/test/soak.test	9.4.divbug.99
+pas-strict	../sqlite3/test/soak.test	-
 pas-strict	../sqlite3/test/softheap1.test	-
 pas-skip	../sqlite3/test/sort.test	9.4.8.f.4
 pas-strict	../sqlite3/test/sort2.test	-

@@ -919,6 +919,28 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+{ os_unix.c:3778 full_fsync — the actual syncing arm only.  The
+  SQLITE_TEST sync counters stay at the call sites (they bump
+  unconditionally in C too, os_unix.c:3800..3803).  Under
+  SQLITE_NO_SYNC (the upstream testfixture is linked with
+  -DSQLITE_NO_SYNC=1, main.mk:1797) syncing is a no-op, but C still
+  calls fstat() to validate the descriptor so IO-error injection has
+  a hook (os_unix.c:3810..3814).  Mirror that here so the Tcl test
+  build (build_tcl_lib.sh -dSQLITE_NO_SYNC) matches testfixture I/O
+  behaviour; the production build never defines SQLITE_NO_SYNC and
+  keeps the real fsync. }
+function pas_full_fsync(fd: cint): cint;
+{$ifdef SQLITE_NO_SYNC}
+var
+  buf: Stat;
+begin
+  Result := FpFStat(fd, buf);
+end;
+{$else}
+begin
+  Result := c_fsync(fd);
+end;
+{$endif}
 function c_close_early(fd: cint): cint; cdecl;
   external 'c' name 'close';
 { posix_fallocate(3): pre-allocate disk space for an open file.
@@ -1980,7 +2002,7 @@ begin
     Inc(sqlite3_fullsync_count);
   Inc(sqlite3_sync_count);
   {$endif}
-  rc := c_fsync(pf^.h);
+  rc := pas_full_fsync(pf^.h);
   {$ifdef SQLITE_TEST}
   { os_unix.c:3931 — SimulateIOError( rc=1 ) }
   if SimulateIOError then rc := 1;
@@ -2001,7 +2023,7 @@ begin
       {$ifdef SQLITE_TEST}
       Inc(sqlite3_sync_count);
       {$endif}
-      c_fsync(dirfd);
+      pas_full_fsync(dirfd);
       c_close_early(dirfd);
     end;
     pf^.ctrlFlags := pf^.ctrlFlags and (not UNIXFILE_DIRSYNC);
@@ -2708,7 +2730,7 @@ begin
       {$ifdef SQLITE_TEST}
       Inc(sqlite3_sync_count);
       {$endif}
-      c_fsync(dfd);
+      pas_full_fsync(dfd);
       FpClose(dfd);
     end;
   end;
@@ -2722,6 +2744,13 @@ function unixAccess(pVfs: Psqlite3_vfs; zPath: PChar;
 var
   buf : Stat;
 begin
+  {$ifdef SQLITE_TEST}
+  { os_unix.c:6888 — SimulateIOError( return SQLITE_IOERR_ACCESS ) }
+  if SimulateIOError then begin
+    Result := SQLITE_IOERR_ACCESS;
+    Exit;
+  end;
+  {$endif}
   if flags = SQLITE_ACCESS_EXISTS then begin
     { os_unix.c ~6910: stat succeeds AND (not a regular zero-size file) }
     if (FpStat(zPath, buf) = 0) and
@@ -3467,7 +3496,6 @@ function unixLockSharedMemory(pDbFd: PunixFile; pShmNode: PunixShmNode): cint;
 var
   lock    : FLock;
   rc      : cint;
-  shmStat : Stat;
 begin
   rc := SQLITE_OK;
   lock.l_whence := SEEK_SET;
@@ -3494,17 +3522,15 @@ begin
     rc := unixShmSystemLock(pDbFd, F_WRLCK, UNIX_SHM_DMS, 1);
     if rc = SQLITE_OK then
     begin
-      { Only truncate when the SHM is truly empty (<= 3 bytes).
-        F_GETLK does not report locks held by the calling process
-        (Linux POSIX advisory lock semantics), so when two connections
-        in the same process race here the second one sees F_UNLCK and
-        would incorrectly truncate an already-initialized SHM.
-        Checking the file size is the reliable in-process proxy. }
-      if (FpFStat(pShmNode^.hShm, shmStat) <> 0) or (shmStat.st_size <= 3) then
-      begin
-        if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
-          rc := SQLITE_IOERR_SHMOPEN;
-      end;
+      { os_unix.c:4906 — the first connection to attach must truncate the
+        -shm file (to 3 bytes, an upstream debugging aid) UNCONDITIONALLY:
+        a leftover -shm from a crashed process carries an internally-valid
+        wal-index header, so without this truncation recovery is skipped
+        and stale frame counts are trusted (9.4.divbug.100, walcrash.test).
+        In-process second connections never reach this path — they reuse
+        pInode^.pShmNode in unixOpenSharedMemory, exactly as in C. }
+      if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
+        rc := SQLITE_IOERR_SHMOPEN;
     end;
   end
   else if lock.l_type = SmallInt(F_WRLCK) then
@@ -3522,8 +3548,8 @@ end;
 { os_unix.c ~4953: unixOpenSharedMemory
   Open (or attach to an existing) shared-memory segment for pDbFd.
   Creates the -shm file alongside the database file.
-  Simplified from C: no global inode list; each pDbFd owns its own pShmNode
-  (intra-process sharing deferred — cross-process works via mmap MAP_SHARED). }
+  As in C, in-process connections on the same inode share one pShmNode
+  (via pInode^.pShmNode); cross-process sharing works via mmap MAP_SHARED. }
 function unixOpenSharedMemory(pDbFd: PunixFile): cint;
 var
   p        : PunixShm;
